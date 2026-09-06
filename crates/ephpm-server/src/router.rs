@@ -187,14 +187,54 @@ pub(crate) struct SiteRoots {
     /// scope, and the input to [`vhost_state_root`]. Equal to `document_root`
     /// whenever no per-site declaration applies. **Never override-controlled.**
     pub(crate) container: PathBuf,
+    /// This vhost's `auto_prepend_file`, if its override declared one: an
+    /// absolute path to a regular file **inside `container`**, already
+    /// containment-checked by [`crate::site_overrides`].
+    ///
+    /// Applied as a per-request INI directive next to `open_basedir` (see
+    /// [`Router::handle_php`]), so it runs inside this tenant's sandbox with
+    /// exactly the reach the tenant's own `index.php` has. It cannot widen that
+    /// sandbox — it lives inside it, and PHP re-checks the realpath against
+    /// `open_basedir` when it opens the file.
+    ///
+    /// `None` for every site without a declaration, in worker mode, and in
+    /// single-site mode.
+    pub(crate) auto_prepend_file: Option<PathBuf>,
+    /// Set when this site's override file exists but could not be honoured, in
+    /// which case the site **refuses to serve** (503) instead of falling back
+    /// to its container.
+    ///
+    /// `document_root` is a *narrowing* instruction, so the old "every failure
+    /// serves the container" fallback resolved **wider** than the operator
+    /// asked for — a half-written override published the `vendor/` and
+    /// `storage/logs/` it existed to hide. Refusing one site is contained
+    /// (other tenants are untouched), loud, and visible to a health check.
+    /// Enforced at the single gate in [`Router::handle`], so it covers the
+    /// static, PHP and WebSocket paths at once.
+    pub(crate) unusable: Option<&'static str>,
+    /// Keys in this site's override file that ePHPm did not understand, sorted.
+    ///
+    /// **Diagnostic only** — nothing routes on it. It rides the resolution so
+    /// [`Router::site_roots`] can warn about a *transition* rather than on
+    /// every [`SITE_CONFIG_TTL`] re-read; an unchanged file would otherwise
+    /// emit the same line every two seconds for the life of the process. Empty
+    /// for the overwhelming majority of sites, so the per-request clone of this
+    /// struct allocates nothing new.
+    pub(crate) unknown_keys: Vec<String>,
 }
 
 impl SiteRoots {
-    /// Both roots are the same directory — the shape that predates per-site
-    /// overrides, used for the default document root and wherever no container
-    /// is distinguishable.
+    /// Both roots are the same directory and nothing is prepended — the shape
+    /// that predates per-site overrides, used for the default document root and
+    /// wherever no container is distinguishable.
     fn flat(root: PathBuf) -> Self {
-        Self { container: root.clone(), document_root: root }
+        Self {
+            container: root.clone(),
+            document_root: root,
+            auto_prepend_file: None,
+            unusable: None,
+            unknown_keys: Vec::new(),
+        }
     }
 
     /// `true` when a per-site override actually moved this site's web root.
@@ -411,6 +451,15 @@ pub struct Router {
     /// restart, ignores the override when the preview is created", which is
     /// precisely the provisioning flow this exists for.
     site_overrides_dir: Option<PathBuf>,
+    /// Whether this server can honour a per-site `auto_prepend_file`.
+    ///
+    /// [`crate::site_overrides::PrependSupport::NoWorkerMode`] in worker mode,
+    /// where the worker script owns the request loop and there is no
+    /// per-request prepend position — the same limitation that makes
+    /// `[[middleware]] library = "php:…"` a startup error there. Resolved once
+    /// in [`Router::new`] and carried into every override read so the warning
+    /// naming the inert key is emitted per site, at startup.
+    prepend_support: crate::site_overrides::PrependSupport,
     /// Resolved per-site roots, keyed by **canonical site key**, expiring after
     /// [`SITE_CONFIG_TTL`].
     ///
@@ -840,6 +889,18 @@ const SITE_CONFIG_TTL: Duration = CANONICAL_ROOT_TTL;
 /// number of entries; past it, resolution simply happens per request.
 const SITE_ROOTS_CACHE_MAX: usize = 4096;
 
+thread_local! {
+    /// Whether *this* PHP execution thread has written a per-site
+    /// `auto_prepend_file` INI directive that it has not since cleared.
+    ///
+    /// Set and read only on an execution-pool thread, inside the same closure
+    /// that calls `PhpRuntime::set_request_ini` — so it tracks exactly the
+    /// thread whose PHP context the directive lives in. See the clearing logic
+    /// in [`Router::handle_php`] for why the clear is conditional rather than
+    /// unconditional.
+    static WROTE_SITE_PREPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A resolved [`SiteRoots`] plus when it was resolved, for [`SITE_CONFIG_TTL`].
 struct CachedSiteRoots {
     roots: SiteRoots,
@@ -850,19 +911,34 @@ struct CachedSiteRoots {
 ///
 /// `overrides_dir` is `[server] site_overrides_dir` — a directory outside
 /// `sites_dir`, so no tenant can write it (see [`crate::site_overrides`] for why
-/// that placement is the whole design). Every failure mode (absent, unreadable,
-/// malformed, or declaring a `document_root` that escapes its container)
-/// collapses to "serve the container", which is the behaviour that predates this
-/// mechanism.
+/// that placement is the whole design).
+///
+/// An **absent** file resolves to "serve the container", the behaviour that
+/// predates this mechanism. A file that exists but cannot be honoured —
+/// unreadable, malformed, or declaring a `document_root` that escapes its
+/// container — does **not**: it sets [`SiteRoots::unusable`] and the site
+/// refuses to serve. Collapsing that case to "serve the container" resolved
+/// *wider* than the operator asked for, which is the containment bug the
+/// `unusable` field exists to fix.
 ///
 /// Note what this function structurally cannot do: it returns a [`SiteRoots`]
 /// whose `container` is the argument it was given. There is no path by which an
 /// override file influences the container, and therefore none by which it
-/// influences `open_basedir`.
-fn resolve_site_roots(container: PathBuf, overrides_dir: &Path, site_key: &str) -> SiteRoots {
-    match crate::site_overrides::load(overrides_dir, site_key, &container).document_root {
-        Some(document_root) => SiteRoots { document_root, container },
-        None => SiteRoots::flat(container),
+/// influences `open_basedir` — including via `auto_prepend_file`, which is
+/// validated *against* the container and can only ever name a file inside it.
+fn resolve_site_roots(
+    container: PathBuf,
+    overrides_dir: &Path,
+    site_key: &str,
+    prepend: crate::site_overrides::PrependSupport,
+) -> SiteRoots {
+    let over = crate::site_overrides::load(overrides_dir, site_key, &container, prepend);
+    SiteRoots {
+        document_root: over.document_root.unwrap_or_else(|| container.clone()),
+        container,
+        auto_prepend_file: over.auto_prepend_file,
+        unusable: over.unusable,
+        unknown_keys: over.unknown_keys,
     }
 }
 
@@ -1031,6 +1107,11 @@ impl Router {
             websocket_files: config.server.websocket_files.clone(),
             sites_dir: config.server.sites_dir.clone(),
             site_overrides_dir,
+            prepend_support: if config.php.is_worker_mode() {
+                crate::site_overrides::PrependSupport::NoWorkerMode
+            } else {
+                crate::site_overrides::PrependSupport::Yes
+            },
             site_roots_cache: dashmap::DashMap::new(),
             sites_domain_suffix: config
                 .server
@@ -1215,6 +1296,8 @@ impl Router {
             return;
         }
         let mut declared: Vec<String> = Vec::new();
+        let mut prepends: Vec<String> = Vec::new();
+        let mut unusable: Vec<String> = Vec::new();
         // Collect keys first: `site_roots` takes its own map guards, and holding
         // an iteration guard over `self.sites` across that is fine (different
         // map), but the borrow of `site.container` is not — clone the pairs.
@@ -1225,6 +1308,40 @@ impl Router {
             if roots.declared() {
                 declared.push(format!("{host} -> {}", roots.document_root.display()));
             }
+            if let Some(prepend) = &roots.auto_prepend_file {
+                prepends.push(format!("{host} -> {}", prepend.display()));
+            }
+            if let Some(reason) = roots.unusable {
+                unusable.push(format!("{host} ({reason})"));
+            }
+        }
+        // The last fail-open case, and the only one that cannot be fixed by
+        // failing closed: an override file named for no known vhost is never
+        // read at all, so the site it was meant for serves its whole container
+        // with no error anywhere. ePHPm cannot 503 a site whose file it never
+        // opens — "no file" is the legitimate default — but it can say the
+        // file is there and being ignored, which is the actionable half.
+        //
+        // Startup only, and a *name* mismatch is the whole signal: a daemon
+        // that derives the filename from a different identifier than the vhost
+        // directory produces a fleet that silently ignores every override it
+        // writes. Lazily-discovered vhosts are not known yet at this point, so
+        // the message says so rather than claiming the file is garbage.
+        self.warn_about_orphaned_overrides();
+
+        // Loudest of the three, and at startup: a site in this state serves
+        // nothing at all, and the operator should find out from the boot log
+        // rather than from a 503.
+        if !unusable.is_empty() {
+            unusable.sort_unstable();
+            tracing::error!(
+                overrides_dir = %self.site_overrides_dir.as_deref().unwrap_or(Path::new("")).display(),
+                count = unusable.len(),
+                sites = %unusable.join("; "),
+                "per-site overrides that cannot be honoured — these vhosts REFUSE TO SERVE (503) \
+                 rather than fall back to serving their whole container, which would publish the \
+                 files the override exists to hide. Fix or remove the file"
+            );
         }
         if !declared.is_empty() {
             declared.sort_unstable();
@@ -1237,6 +1354,75 @@ impl Router {
                  container, so PHP can require from above the web root"
             );
         }
+        // Named separately and at INFO for the same reason the roots are: a
+        // prepend that silently did not run presents only as "the app behaves
+        // as if the deployment injected nothing", with no other symptom.
+        if !prepends.is_empty() {
+            prepends.sort_unstable();
+            tracing::info!(
+                overrides_dir = %self.site_overrides_dir.as_deref().unwrap_or(Path::new("")).display(),
+                count = prepends.len(),
+                sites = %prepends.join("; "),
+                "per-site auto_prepend_file overrides applied — these vhosts execute the named \
+                 file before every PHP request; each file is inside its own site container, so \
+                 it has exactly the reach that tenant's own index.php has"
+            );
+        }
+    }
+
+    /// Name any `<key>.toml` in the overrides directory that matches no vhost
+    /// discovered at startup.
+    ///
+    /// The filename must be the **canonical site key** — the same string that
+    /// names the vhost directory. A daemon that derives it from a different
+    /// identifier writes files ePHPm never opens, and the symptom is a site
+    /// quietly serving its whole checkout with nothing in any log. That is the
+    /// one override failure that cannot be made to fail closed (a site with no
+    /// file is legitimately serving its container), so naming the stray file is
+    /// the only thing left to do about it.
+    ///
+    /// Runs once, at startup. A directory that cannot be listed is not an
+    /// error — this is a diagnostic, not a gate.
+    fn warn_about_orphaned_overrides(&self) {
+        let orphans = self.orphaned_override_stems();
+        if orphans.is_empty() {
+            return;
+        }
+        let dir = self.site_overrides_dir.as_deref().unwrap_or(Path::new(""));
+        tracing::warn!(
+            overrides_dir = %dir.display(),
+            count = orphans.len(),
+            files = %orphans.join(", "),
+            "per-site override files that match no virtual host discovered at startup — these \
+             are NOT being read, and any site they were meant for is serving its whole \
+             container. The filename must be the canonical site key (the vhost directory name). \
+             Harmless if the vhost is created later and discovered lazily, or if these are \
+             leftovers from torn-down sites"
+        );
+    }
+
+    /// The `<stem>` of every `*.toml` in the overrides directory that matches no
+    /// vhost known at startup, sorted.
+    ///
+    /// Split out from [`Router::warn_about_orphaned_overrides`] so the
+    /// classification — which files count as orphaned — is assertable rather
+    /// than only observable in a log line. Empty when the mechanism is off or
+    /// the directory cannot be listed.
+    fn orphaned_override_stems(&self) -> Vec<String> {
+        let Some(dir) = self.site_overrides_dir.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut orphans: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml")))
+            .filter_map(|e| e.path().file_stem()?.to_str().map(str::to_ascii_lowercase))
+            .filter(|stem| !self.sites.contains_key(stem))
+            .collect();
+        orphans.sort_unstable();
+        orphans
     }
 
     /// This vhost's [`SiteRoots`], reading its override file at most once per
@@ -1260,12 +1446,54 @@ impl Router {
             return hit.roots.clone();
         }
 
-        let roots = resolve_site_roots(container, overrides_dir, site_key);
+        let roots = resolve_site_roots(container, overrides_dir, site_key, self.prepend_support);
 
-        // Log a transition rather than every re-read: once when a site first
-        // resolves to an overridden root, and again whenever it changes. A 2s
-        // TTL means the unconditional version would emit a line every two
-        // seconds per site, forever.
+        // Everything below logs a *transition* rather than every re-read: once
+        // when a site first resolves to something, and again whenever it
+        // changes. A 2s TTL means the unconditional version would emit a line
+        // every two seconds per site, forever.
+
+        // An override naming keys this build does not implement is an operator
+        // instruction that is not happening, so it is reported at WARN. #463's
+        // complaint was the `debug` line nobody reads — but a WARN every two
+        // seconds per site, forever, would be the same failure with extra
+        // steps, so it is gated on the key set actually changing.
+        let previously_unknown =
+            self.site_roots_cache.get(site_key).map(|hit| hit.roots.unknown_keys.clone());
+        if previously_unknown.as_ref() != Some(&roots.unknown_keys)
+            && !roots.unknown_keys.is_empty()
+        {
+            tracing::warn!(
+                path = %overrides_dir.join(format!("{site_key}.toml")).display(),
+                site = site_key,
+                keys = %roots.unknown_keys.join(", "),
+                did_you_mean = %crate::site_overrides::did_you_mean(&roots.unknown_keys)
+                    .unwrap_or_else(|| "-".to_string()),
+                understood = %crate::site_overrides::understood_keys(),
+                "per-site override declares keys this ePHPm does not understand — they are \
+                 IGNORED, so whatever behaviour they were meant to produce is not happening"
+            );
+        }
+
+        let previous_prepend =
+            self.site_roots_cache.get(site_key).map(|hit| hit.roots.auto_prepend_file.clone());
+        if let Some(previous_prepend) = previous_prepend
+            && previous_prepend != roots.auto_prepend_file
+        {
+            match &roots.auto_prepend_file {
+                Some(script) => tracing::info!(
+                    site = site_key,
+                    auto_prepend_file = %script.display(),
+                    "per-site auto_prepend_file override changed — this file now runs before \
+                     every PHP request for this vhost"
+                ),
+                None => tracing::info!(
+                    site = site_key,
+                    "per-site auto_prepend_file override removed — no file is prepended"
+                ),
+            }
+        }
+
         let previous =
             self.site_roots_cache.get(site_key).map(|hit| hit.roots.document_root.clone());
         if previous.as_ref() != Some(&roots.document_root) {
@@ -2480,6 +2708,47 @@ impl Router {
             tracing::Span::current().record("ephpm.site", key);
         }
 
+        // This site's override file exists but could not be honoured, so the
+        // site refuses to serve rather than fall back to serving its whole
+        // container (issue #463).
+        //
+        // `document_root` is a NARROWING instruction. The previous behaviour —
+        // every override failure degrades to "serve the container" — was safe
+        // for availability and the wrong direction for containment: a
+        // provisioning daemon interrupted mid-write, or a typo'd path, put the
+        // tenant's `vendor/`, `.git` and `storage/logs/laravel.log` on the web,
+        // which is precisely what the operator wrote the override to prevent.
+        // Laravel logs routinely carry stack traces with database credentials.
+        //
+        // Refusing is scoped to this ONE site on purpose: refusing to start
+        // would let a single bad tenant file kill every tenant, and serving the
+        // container is the exposure being fixed. It is also the only outcome a
+        // health check notices, which was the half of #429 that actually
+        // mattered — the silent version had a green health check.
+        //
+        // The gate sits here, immediately after the single host->tenant
+        // derivation and before any routing decision, so it covers the static,
+        // PHP and WebSocket-upgrade paths from one place. `Retry-After` is the
+        // override re-read window: a half-written file resolves itself within
+        // it, with no restart.
+        if let Some(reason) = site_roots.unusable {
+            counter!("ephpm_site_override_unusable_total").increment(1);
+            tracing::warn!(
+                site = site_key.as_deref().unwrap_or("-"),
+                reason,
+                "refusing to serve: this site's override file cannot be honoured, and serving \
+                 its container instead would publish files the override exists to hide"
+            );
+            let mut resp = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "503 Service Unavailable: this site's configuration could not be applied",
+            );
+            resp.headers_mut()
+                .insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("2"));
+            self.apply_response_headers(&mut resp);
+            return Ok((resp, "site_override_unusable"));
+        }
+
         // Everything below routes against the WEB root: index files, the
         // fallback chain, static-file containment and PHP-script containment.
         // The container travels separately inside `site_roots` and is what
@@ -3053,7 +3322,16 @@ impl Router {
         // asset URLs against it); `site_container` is the isolation boundary. The
         // two are the same path unless the per-site web-root convention moved
         // this vhost's root — see `SiteRoots`.
-        let SiteRoots { document_root, container: site_container } = roots;
+        let SiteRoots {
+            document_root,
+            container: site_container,
+            auto_prepend_file,
+            // Both diagnostic; `unusable` was already turned into a 503 at the
+            // single gate in `handle`, so a request that reaches PHP has an
+            // override that was fully honoured.
+            unusable: _,
+            unknown_keys: _,
+        } = roots;
         // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
         // default under `[server] preview`). Enforced HERE — the single point
         // every PHP dispatch converges on (the per-request pool and
@@ -3394,6 +3672,14 @@ impl Router {
         } else {
             None
         };
+        // This vhost's `auto_prepend_file`, rendered once here rather than per
+        // execution: the path is already absolute, containment-checked and
+        // verbatim-stripped by `site_overrides`, so all that remains is the
+        // `OsStr` -> `str` conversion the FFI needs. `None` for every site that
+        // declared none, in single-site mode, and in worker mode.
+        let site_prepend: Option<String> =
+            auto_prepend_file.as_deref().map(|p| p.to_string_lossy().into_owned());
+
         // disable_shell_exec is applied globally via the generated php.ini
         // (zend_disable_functions runs once at MINIT and removes the
         // functions from the function table; runtime ini changes don't
@@ -3554,6 +3840,57 @@ impl Router {
                 PhpRuntime::set_request_ini("sys_temp_dir", &dirs.temp.to_string_lossy());
                 PhpRuntime::set_request_ini("upload_tmp_dir", &dirs.temp.to_string_lossy());
                 PhpRuntime::set_request_ini("session.save_path", &dirs.sessions.to_string_lossy());
+            }
+
+            // Per-site `auto_prepend_file` (issue #463): the one channel by
+            // which an operator's override file can hand a single vhost a PHP
+            // file to run before its script. `php_execute_script` opens it with
+            // ZEND_REQUIRE inside the very request configured above, so it
+            // inherits this tenant's `open_basedir`, temp/session dirs, OPcache
+            // vhost, database session and KV keyspace — the same argument that
+            // makes the `php:` middleware lane multi-tenant-safe.
+            //
+            // The path is absolute and was containment-checked against the site
+            // container when the override was read; PHP re-checks its realpath
+            // against `open_basedir` when it opens it, so a post-validation
+            // symlink swap fatals rather than reads.
+            //
+            // # Why the clear is explicit, and why it is conditional
+            //
+            // A directive naming *executable code* must not survive onto the
+            // next request this thread serves — a neighbouring tenant running
+            // another site's prepend would be the worst failure this file can
+            // have. PHP already unwinds `set_request_ini` entries
+            // (`zend_ini_deactivate()` runs before the next request's set is
+            // applied), and driving real HTTP through a **one-thread** pool
+            // confirms it: alternating tenants on the single shared PHP context,
+            // the neighbour neither executes the prepend nor sees it in
+            // `ini_get`. That is the same property per-vhost `open_basedir`
+            // already rests on. The write below re-asserts it rather than
+            // relying on it, because this directive is the one that names code.
+            //
+            // Conditional on having written one, rather than unconditional:
+            // writing `""` on every request would clobber a global
+            // `[php] ini_overrides` prepend for every site that declares none,
+            // turning a documented setting off as a side effect. A thread that
+            // has never written a per-site prepend leaves the directive
+            // untouched; once it has, it takes responsibility for clearing it.
+            // A replacement thread (wedged-thread recovery) starts `false` with
+            // a fresh PHP context, which is the correct initial state.
+            //
+            // Known wrinkle, verified by probe and documented in the guide:
+            // after a site's prepend is withdrawn, `ini_get('auto_prepend_file')`
+            // on a thread that had run it can still *report* the old path even
+            // though `php_execute_script` no longer runs anything — the value
+            // PHP executes from is cleared, the string `ini_get` reports lags.
+            // It is confined to the site that had the prepend (a different
+            // vhost reads empty) and affects reporting only.
+            if let Some(prepend) = &site_prepend {
+                PhpRuntime::set_request_ini("auto_prepend_file", prepend);
+                WROTE_SITE_PREPEND.with(|w| w.set(true));
+            } else if WROTE_SITE_PREPEND.with(std::cell::Cell::get) {
+                PhpRuntime::set_request_ini("auto_prepend_file", "");
+                WROTE_SITE_PREPEND.with(|w| w.set(false));
             }
 
             // OPcache clustered invalidation (Phase 1): if the watcher told us
@@ -9704,7 +10041,29 @@ echo "post response";
             self.build(None)
         }
 
+        /// Router in persistent worker mode, where a per-site
+        /// `auto_prepend_file` has no per-request position to run in.
+        fn worker_router(&self) -> Router {
+            self.build_with_php(
+                Some(self.overrides.clone()),
+                PhpConfig { mode: ephpm_config::PhpMode::Worker, ..test_php_config() },
+            )
+        }
+
+        /// Drop a PHP file into a site container, creating parents. Returns the
+        /// path in the spelling the override resolver produces.
+        fn php(&self, key: &str, relative: &str) -> PathBuf {
+            let path = self.sites.join(key).join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"<?php $_SERVER['PREVIEW'] = 1;").unwrap();
+            path.canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap()
+        }
+
         fn build(&self, overrides_dir: Option<PathBuf>) -> Router {
+            self.build_with_php(overrides_dir, test_php_config())
+        }
+
+        fn build_with_php(&self, overrides_dir: Option<PathBuf>, php: PhpConfig) -> Router {
             let config = Config {
                 server: ServerConfig {
                     listen: "0.0.0.0:8080".to_string(),
@@ -9713,7 +10072,7 @@ echo "post response";
                     site_overrides_dir: overrides_dir,
                     ..ServerConfig::default()
                 },
-                php: test_php_config(),
+                php,
                 db: DbConfig::default(),
                 kv: KvConfig::default(),
                 cluster: ClusterConfig::default(),
@@ -9804,6 +10163,384 @@ echo "post response";
                 "open_basedir must stay the container for {declaration:?}, got {basedir}"
             );
         }
+    }
+
+    // ── Per-site `auto_prepend_file` (#463) ────────────────────────
+
+    /// The whole point of #463, at the layer that matters: a tenant's override
+    /// file reaches the request path carrying a prepend, per vhost, and only
+    /// for the vhost that declared it.
+    ///
+    /// Before this, `auto_prepend_file` landed in `RawOverride`'s flattened
+    /// `unknown` table and was dropped — `roots.auto_prepend_file` did not
+    /// exist, so switchboard had no channel for the preview `env:` injection
+    /// that `switchboard#4` needs.
+    #[test]
+    fn site_override_carries_a_per_site_auto_prepend_file() {
+        let f = fleet();
+        f.site("wp.test", &["web"]);
+        f.site("plain.test", &[]);
+        let script = f.php("wp.test", "bootstrap/preview-env.php");
+        f.override_for(
+            "wp.test",
+            "document_root = \"web\"\nauto_prepend_file = \"bootstrap/preview-env.php\"\n",
+        );
+
+        let router = f.router();
+        assert_eq!(
+            router.resolve_site("wp.test").roots.auto_prepend_file,
+            Some(script),
+            "the declaring vhost must carry its prepend into the request path"
+        );
+        assert_eq!(
+            router.resolve_site("plain.test").roots.auto_prepend_file,
+            None,
+            "a sibling tenant with no override must not inherit another site's prepend"
+        );
+    }
+
+    /// The security-critical half. `auto_prepend_file` names a file PHP
+    /// executes on every request for the vhost, so a declaration that resolves
+    /// outside the site container is a tenant-escape primitive — it must never
+    /// reach `SiteRoots`, whatever the file says.
+    ///
+    /// The traversal targets are made to *exist*, so the only thing that can
+    /// reject them is the containment logic itself rather than a missing file.
+    #[test]
+    fn site_override_prepend_escaping_the_container_never_reaches_the_request_path() {
+        let f = fleet();
+        f.site("hostile.test", &["web"]);
+        // A real file one level above the container, and one above the fleet.
+        fs::write(f.sites.join("evil.php"), b"<?php").unwrap();
+        fs::write(f.dir.path().join("evil.php"), b"<?php").unwrap();
+
+        for declaration in [
+            "auto_prepend_file = \"../evil.php\"\n",
+            "auto_prepend_file = \"../../evil.php\"\n",
+            "auto_prepend_file = \"web/../../evil.php\"\n",
+            "auto_prepend_file = \"/etc/passwd\"\n",
+            "auto_prepend_file = \"C:\\\\Windows\\\\win.ini\"\n",
+            // A directory is not a script.
+            "auto_prepend_file = \"web\"\n",
+            // And a file that simply is not there.
+            "auto_prepend_file = \"missing.php\"\n",
+        ] {
+            f.override_for("hostile.test", declaration);
+            let roots = f.router().resolve_site("hostile.test").roots;
+            assert_eq!(
+                roots.auto_prepend_file, None,
+                "{declaration:?} must not become an executed prepend"
+            );
+            assert!(
+                roots.unusable.is_some(),
+                "{declaration:?} is a key we implement with a value we refused — the site must \
+                 fail closed, not serve as if the operator had asked for nothing"
+            );
+        }
+    }
+
+    /// A rejected prepend takes the site out of service rather than serving it
+    /// without the environment it was told to inject.
+    ///
+    /// This is the direction change: the two keys are still validated
+    /// independently, but "one key failed, serve anyway" is exactly the silent
+    /// wrong answer #463 was filed about — a preview that renders stock
+    /// WordPress instead of the showcase, with a green health check.
+    #[test]
+    fn site_override_rejected_prepend_takes_the_site_out_of_service() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["web", "vendor"]);
+        f.override_for(
+            "laravel.test",
+            "document_root = \"web\"\nauto_prepend_file = \"../../escape.php\"\n",
+        );
+
+        let roots = f.router().resolve_site("laravel.test").roots;
+        assert!(roots.unusable.is_some(), "a refused prepend must fail closed");
+        assert_eq!(roots.auto_prepend_file, None);
+        // The container is never override-controlled, even in this state.
+        assert_eq!(roots.container, site);
+    }
+
+    /// A prepend lives *inside* the sandbox; it cannot widen it. The
+    /// `open_basedir` entry is still the container, and the prepend resolves
+    /// within it — which is precisely why executing it is safe: it has the
+    /// reach that tenant's own `index.php` already has.
+    #[test]
+    fn site_override_prepend_is_inside_the_open_basedir_it_cannot_widen() {
+        let f = fleet();
+        let site = f.site("wp.test", &["web"]);
+        let script = f.php("wp.test", "bootstrap/preview-env.php");
+        f.override_for(
+            "wp.test",
+            "document_root = \"web\"\nauto_prepend_file = \"bootstrap/preview-env.php\"\n",
+        );
+
+        let roots = f.router().resolve_site("wp.test").roots;
+        let basedir =
+            vhost_open_basedir_value(&roots.container, &vhost_state_root(&roots.container));
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let container_entry = basedir.split(separator).next().unwrap();
+
+        assert_eq!(container_entry, site.display().to_string(), "basedir is still the container");
+        assert!(
+            script
+                .starts_with(site.canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap()),
+            "the prepend must resolve inside the vhost's own open_basedir, got {}",
+            script.display()
+        );
+    }
+
+    /// Worker mode boots the app once and owns the request loop, so there is no
+    /// per-request prepend position — the same limitation that makes a `php:`
+    /// middleware mount a startup error there. The key is dropped (loudly, at
+    /// `warn`, once per site at startup) rather than run once at boot for
+    /// whichever tenant happened to be first. `document_root` is a routing
+    /// decision and still applies.
+    #[test]
+    fn site_override_prepend_is_inert_in_worker_mode() {
+        let f = fleet();
+        let site = f.site("wp.test", &["web"]);
+        f.php("wp.test", "bootstrap/preview-env.php");
+        f.override_for(
+            "wp.test",
+            "document_root = \"web\"\nauto_prepend_file = \"bootstrap/preview-env.php\"\n",
+        );
+
+        let roots = f.worker_router().resolve_site("wp.test").roots;
+        assert_eq!(roots.auto_prepend_file, None, "worker mode has nowhere to run a prepend");
+        assert_eq!(
+            roots.document_root,
+            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
+        );
+    }
+
+    /// With the mechanism off there is no channel at all — an override file
+    /// sitting on disk cannot inject a prepend into a server that was not told
+    /// to read overrides.
+    #[test]
+    fn site_override_prepend_requires_the_mechanism_to_be_enabled() {
+        let f = fleet();
+        f.site("wp.test", &[]);
+        f.php("wp.test", "preview-env.php");
+        f.override_for("wp.test", "auto_prepend_file = \"preview-env.php\"\n");
+
+        assert_eq!(
+            f.router_without_overrides().resolve_site("wp.test").roots.auto_prepend_file,
+            None,
+        );
+    }
+
+    /// Removing the key takes effect without a restart, on the same
+    /// [`SITE_CONFIG_TTL`] window the document root uses — a preview whose
+    /// injected environment is revoked must stop running the file.
+    #[test]
+    fn site_override_prepend_can_be_withdrawn() {
+        let f = fleet();
+        f.site("wp.test", &[]);
+        let script = f.php("wp.test", "preview-env.php");
+        f.override_for("wp.test", "auto_prepend_file = \"preview-env.php\"\n");
+
+        let router = f.router();
+        assert_eq!(router.resolve_site("wp.test").roots.auto_prepend_file, Some(script));
+
+        f.remove_override("wp.test");
+        router.site_roots_cache.clear(); // stand in for the TTL elapsing
+        assert_eq!(router.resolve_site("wp.test").roots.auto_prepend_file, None);
+    }
+
+    // ── The 503 gate: an unusable override must not serve (#463) ───
+
+    /// End to end, through `handle`: a site whose override cannot be honoured
+    /// answers **503**, and the files the override existed to hide are not on
+    /// the web.
+    ///
+    /// This is the containment-direction fix, asserted where it is observable.
+    /// The **control** is what makes it meaningful: with a *valid* override the
+    /// same request for `/vendor/secrets.txt` is already 404 (it is above the
+    /// declared web root), and with **no** override at all it is **200** — the
+    /// old fallback. So the assertion is not "404 happens to be returned", it
+    /// is "a broken override behaves like the narrow root, not the wide one".
+    #[tokio::test]
+    async fn unusable_site_override_serves_503_instead_of_the_container() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["public", "vendor"]);
+        fs::write(site.join("vendor").join("secrets.txt"), b"DB_PASSWORD=hunter2").unwrap();
+        fs::write(site.join("public").join("index.html"), b"<h1>app</h1>").unwrap();
+
+        let host = |h: &str| {
+            Request::builder()
+                .method("GET")
+                .uri("/vendor/secrets.txt")
+                .header("Host", h)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Control 1 — no override: the container IS the web root, so the
+        // secret is served. This is the exposure the mechanism exists to close.
+        let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "control: with no override the container is served, secrets and all"
+        );
+
+        // Control 2 — a valid override: the secret is above the web root.
+        f.override_for("laravel.test", "document_root = \"public\"\n");
+        let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a valid override hides vendor/");
+
+        // The change under test — a half-written override. This used to fall
+        // back to control 1 (200, secret served). It must now refuse.
+        for broken in [
+            "document_root = \"pub",              // truncated mid-write
+            "document_root = \"does-not-exist\"", // typo'd path
+            "document_root = \"../../etc\"",      // traversal
+        ] {
+            f.override_for("laravel.test", broken);
+            let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "broken override {broken:?} must refuse to serve, not fall back to the container"
+            );
+            assert_eq!(
+                resp.headers().get(hyper::header::RETRY_AFTER).map(|v| v.to_str().unwrap()),
+                Some("2"),
+                "the 503 should tell the client when the override re-read window elapses"
+            );
+        }
+    }
+
+    /// The 503 is scoped to the site with the broken file. Refusing to start,
+    /// or refusing globally, would let one bad tenant file kill every tenant —
+    /// the reason this is a per-site failure and not a startup one.
+    #[tokio::test]
+    async fn an_unusable_override_does_not_affect_other_tenants() {
+        let f = fleet();
+        let broken = f.site("broken.test", &[]);
+        let healthy = f.site("healthy.test", &[]);
+        fs::write(broken.join("index.html"), b"broken").unwrap();
+        fs::write(healthy.join("index.html"), b"healthy").unwrap();
+        f.override_for("broken.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let get = |h: &str| {
+            Request::builder()
+                .method("GET")
+                .uri("/index.html")
+                .header("Host", h)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let router = f.router();
+
+        assert_eq!(
+            router.handle(get("broken.test"), addr, false).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            router.handle(get("healthy.test"), addr, false).await.unwrap().status(),
+            StatusCode::OK,
+            "one tenant's broken override must not take down its neighbours"
+        );
+    }
+
+    /// The one remaining fail-open case is at least *named*.
+    ///
+    /// A file whose name is not a canonical site key is never opened, so the
+    /// site it was meant for serves its whole container and nothing anywhere
+    /// says why. ePHPm cannot fail closed on it — a site with no override file
+    /// is legitimately serving its container — so the startup scan reports it.
+    ///
+    /// Asserts the classification, which is the part that can rot: a file that
+    /// *does* match a vhost must not be reported, or the warning becomes noise
+    /// every operator learns to ignore.
+    #[test]
+    fn an_override_named_for_no_vhost_is_named_at_startup() {
+        let f = fleet();
+        f.site("pr-42.preview.test", &["web"]);
+        f.override_for("pr-42.preview.test", "document_root = \"web\"\n"); // matches
+        f.override_for("preview-1234", "document_root = \"web\"\n"); // does not
+        fs::write(f.overrides.join("notes.txt"), b"not an override").unwrap(); // not .toml
+
+        let router = f.router();
+        let orphans = router.orphaned_override_stems();
+        assert_eq!(
+            orphans,
+            vec!["preview-1234".to_string()],
+            "only the .toml whose stem matches no vhost is an orphan"
+        );
+        // And the matching one really did apply, so this is not a vacuous pass.
+        assert!(router.resolve_site("pr-42.preview.test").roots.declared());
+    }
+
+    /// The 503 must not reach the reserved `/_ephpm/` namespace.
+    ///
+    /// Those endpoints are the node's own health, not a tenant's, and they are
+    /// dispatched ahead of the host→tenant derivation. If the gate were ever
+    /// moved earlier, one tenant's broken override file would start failing the
+    /// health checks of every load balancer that probes with that `Host` — a
+    /// fleet outage caused by exactly the per-site failure this is supposed to
+    /// contain. Pinned because the ordering is invisible at the call site.
+    #[tokio::test]
+    async fn an_unusable_override_does_not_break_the_node_health_endpoints() {
+        let f = fleet();
+        f.site("broken.test", &[]);
+        f.override_for("broken.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let router = f.router();
+        for path in ["/_ephpm/health", "/_ephpm/ready"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("Host", "broken.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let status = router.handle(req, addr, false).await.unwrap().status();
+            assert_ne!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} is the NODE's health, not this tenant's — a broken per-site override \
+                 must not fail it"
+            );
+        }
+    }
+
+    /// Fixing the file brings the site back within the re-read window — the
+    /// 503 is a live state, not a latch that needs a restart.
+    #[tokio::test]
+    async fn a_repaired_override_brings_the_site_back() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["public"]);
+        fs::write(site.join("public").join("index.html"), b"<h1>app</h1>").unwrap();
+        f.override_for("laravel.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let get = || {
+            Request::builder()
+                .method("GET")
+                .uri("/index.html")
+                .header("Host", "laravel.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let router = f.router();
+        assert_eq!(
+            router.handle(get(), addr, false).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        f.override_for("laravel.test", "document_root = \"public\"\n");
+        router.site_roots_cache.clear(); // stand in for SITE_CONFIG_TTL elapsing
+        assert_eq!(
+            router.handle(get(), addr, false).await.unwrap().status(),
+            StatusCode::OK,
+            "repairing the file must restore service without a restart"
+        );
     }
 
     /// Create a directory symlink, or return `false` when the platform refuses
@@ -10117,37 +10854,51 @@ echo "post response";
     /// `site_overrides`' own tests — the site keeps serving its container.
     /// The writer is trusted, but ePHPm does not take that on faith.
     #[test]
-    fn site_override_bad_declarations_serve_the_container() {
+    fn site_override_bad_declarations_take_the_site_out_of_service() {
         let f = fleet();
         let site = f.site("evil.test", &[]);
 
         for bad in ["../../etc", "..", "/etc", "/", r"C:\Windows", "nope", "web/../.."] {
             f.override_for("evil.test", &format!("document_root = {bad:?}\n"));
-            assert_eq!(
-                f.router().resolve_site("evil.test").roots.document_root,
-                site,
-                "bad declaration {bad:?} must fall back to the container"
+            let roots = f.router().resolve_site("evil.test").roots;
+            assert!(
+                roots.unusable.is_some(),
+                "bad declaration {bad:?} must take the site out of service — falling back to the \
+                 container serves MORE than the operator asked for, which is what the \
+                 declaration existed to prevent"
             );
+            // The container is never override-controlled, even in this state.
+            assert_eq!(roots.container, site);
         }
     }
 
     /// A half-written or malformed override must not break the site — a daemon
     /// interrupted mid-write is a real state.
     #[test]
-    fn site_override_malformed_serves_the_container() {
+    fn site_override_malformed_takes_the_site_out_of_service() {
         let f = fleet();
         let site = f.site("broken.test", &["web"]);
 
         for text in ["document_root =\n", "[[[\n", "not toml at all: {{{\n"] {
             f.override_for("broken.test", text);
-            assert_eq!(f.router().resolve_site("broken.test").roots.document_root, site);
+            let roots = f.router().resolve_site("broken.test").roots;
+            assert!(
+                roots.unusable.is_some(),
+                "a half-written override ({text:?}) must not resolve to the container — that is \
+                 how a daemon interrupted mid-write published vendor/ and storage/logs/"
+            );
+            assert_eq!(roots.container, site);
         }
     }
 
     /// The override filename MUST be the canonical site key. A daemon writing
     /// `preview-1234.toml` while the vhost is `pr-42.preview.test` fails open —
-    /// the site serves its container — which is safe but silent, and is exactly
-    /// why the docs spell the naming requirement out.
+    /// the site serves its container — because a file ePHPm never opens is
+    /// indistinguishable from no file at all. It is the one override failure
+    /// that cannot be made to fail closed, so
+    /// [`Router::warn_about_orphaned_overrides`] names the stray file at
+    /// startup instead (pinned by
+    /// [`tests::an_override_named_for_no_vhost_is_named_at_startup`]).
     #[test]
     fn site_override_named_for_another_key_is_ignored() {
         let f = fleet();

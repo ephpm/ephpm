@@ -74,16 +74,24 @@ Tokyo node:
   bobs-recipes.com → primary (Bob is in Japan)
 ```
 
-Configuration via per-site `site.toml`:
+Configuration via a per-site override file:
+
+> **Placement note.** These sketches predate the shipped per-site override
+> mechanism and put the file *inside* the vhost directory. That placement was
+> since rejected — a vhost's `open_basedir` includes its own container, so a
+> tenant's own PHP could rewrite the file and choose its own replication role.
+> If this design is built, its file belongs in
+> [`[server] site_overrides_dir`](/guides/virtual-hosts/#per-site-document-root-frameworks-with-a-public-directory),
+> outside `sites_dir`, like every other per-site override.
 
 ```toml
-# Frankfurt: /var/www/sites/alice-blog.com/site.toml
+# Frankfurt: <site_overrides_dir>/alice-blog.com.toml
 [db.sqlite.replication]
 role = "primary"
 ```
 
 ```toml
-# Tokyo: /var/www/sites/alice-blog.com/site.toml
+# Tokyo: <site_overrides_dir>/alice-blog.com.toml
 [db.sqlite.replication]
 role = "replica"
 primary_grpc_url = "frankfurt:7948"   # the primary's cluster channel address
@@ -167,7 +175,7 @@ bind = "0.0.0.0:7946"
 join = ["frankfurt:7946", "tokyo:7946", "saopaulo:7946"]
 ```
 
-Each site has a `site.toml` in its directory specifying which region is primary. All other regions are replicas that sync automatically.
+Each site has an operator-owned override file (outside `sites_dir`) specifying which region is primary. All other regions are replicas that sync automatically.
 
 **What users experience:**
 

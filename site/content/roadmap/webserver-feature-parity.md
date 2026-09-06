@@ -27,7 +27,7 @@ followed by the small remaining backlog.
 | Brotli compression | Done (HTTP responses; preferred over gzip when client supports `br`) |
 | Timeouts (request, idle, header read) | Done (`server.timeouts`) |
 | Virtual hosts | Done (`server.sites_dir`) |
-| Per-site config overrides | Done (drop a `site.toml` in each vhost directory) |
+| Per-site config overrides | Partial (`server.site_overrides_dir`, one operator-owned `<site-key>.toml` **outside** `sites_dir`, carrying `document_root` + `auto_prepend_file`) |
 | Request size limits | Done (`server.request.max_body_size`) |
 | Keep-alive | Done (HTTP/1.1 keep-alive with idle timeout) |
 | Rate limiting | Done (`server.limits.per_ip_rate`) |
@@ -66,7 +66,7 @@ How ephpm stacks up against the traditional servers PHP developers reach for. Ev
 | Access logging | CustomLog | access_log | log (structured JSON) | **Yes** (`server.logging.access`) |
 | Timeouts (read header / read body / write / idle) | Timeout, KeepAlive | client_body_timeout, etc. | read_body, read_header, etc. | **Yes** (`server.timeouts`) |
 | Virtual hosts | `<VirtualHost>` | `server` blocks | Site blocks | **Yes** (`server.sites_dir`, directory-based + lazy discovery) |
-| Per-vhost config overrides | per-vhost block | per-server block | per-site block | **Yes** (`site.toml` in each vhost dir) |
+| Per-vhost config overrides | per-vhost block | per-server block | per-site block | **Partial** — one operator-owned `<site-key>.toml` in `server.site_overrides_dir`, **outside** `sites_dir`, carrying `document_root` and `auto_prepend_file` only. A file *inside* the vhost directory is deliberately not read: it would sit inside that tenant's own `open_basedir` |
 | Request size limits | LimitRequestBody | client_max_body_size | request_body max_size | **Yes** (`server.request.max_body_size`) |
 | Keep-alive tuning | KeepAliveTimeout | keepalive_timeout | idle timeout | **Yes** (`server.timeouts.idle`) |
 | HTTP/2 | mod_http2 | listen ... http2 | Automatic | **Yes** (ALPN negotiation on TLS) |

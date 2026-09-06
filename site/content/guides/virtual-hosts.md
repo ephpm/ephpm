@@ -63,6 +63,8 @@ site_overrides_dir = "/var/lib/ephpm/site-overrides"   # NOT inside sites_dir
 document_root = "public"    # relative to the site container
 ```
 
+The file understands exactly two keys — `document_root` here, and [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
+
 ```
 /var/www/sites/alice-blog.com/     ← the site CONTAINER
   composer.json                    ← no longer reachable over HTTP
@@ -96,34 +98,111 @@ For the same reason ePHPm does not read an application's own manifest (`ephpm.ya
 
 The file must be `<site-key>.toml`, where `<site-key>` is the [canonical site key](#site-identity-the-canonical-site-key) — the same validated `[a-z0-9._-]` string that names the vhost directory, selects `<dir>/<key>.db` and derives the `pdo_mysql` credential. For `Host: alice-blog.com` served from `/var/www/sites/alice-blog.com/`, that is `alice-blog.com.toml`.
 
-**An override under any other name is silently ignored** and the site serves its container. If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory — a daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a site that works but ignores its override, with no error anywhere.
+**An override under any other name is not read at all**, and the site serves its container. This is the one override failure that cannot fail closed — a file ePHPm never opens is indistinguishable from no file — so it is *reported* instead: startup names every `*.toml` in the directory whose stem matches no known vhost.
 
-#### Failure modes, all of which serve the container
+```
+WARN per-site override files that match no virtual host discovered at startup —
+     these are NOT being read, and any site they were meant for is serving its
+     whole container   files=preview-1234
+```
 
-Every way an override can go wrong degrades to "serve the site container" — the pre-override behaviour — with a `WARN` naming the site and the reason:
+If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory. A daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a fleet that silently ignores every override it writes. The warning is harmless for a vhost created after startup and discovered lazily, or for leftovers from torn-down sites.
+
+#### Failure modes: a broken override takes the site out of service
+
+An override that **cannot be honoured makes that one site answer `503`** with `Retry-After: 2`, rather than falling back to serving its container.
+
+That is the opposite of what earlier versions did, and the reason is worth stating plainly. `document_root` is a *narrowing* instruction — you wrote it to stop serving `vendor/` and `storage/logs/laravel.log`. Falling back to the container when it cannot be applied is safe for *availability* and the **wrong direction for containment**: a provisioning daemon interrupted mid-write, or one typo in a path, published exactly the files the override existed to hide, with a warning nobody read and a green health check. A site that is briefly down during its own provisioning is normal; a site that briefly publishes its `.git` and its database credentials is not.
 
 | Situation | Result |
 |---|---|
 | No override file for this site | Container is the web root (the normal case) |
 | Provisioning daemon down or lagging, override not yet written | **Container is the web root** — the site serves its whole checkout until the override lands |
-| Override is malformed TOML, or half-written | Container, with a warning |
-| `document_root` is absolute, contains `..`, or has a drive prefix | Container, with a warning |
-| `document_root` names a missing directory, or a file | Container, with a warning |
-| `document_root` is a symlink resolving outside the container | Container, with a warning |
-| `document_root = "."` | Container (the explicit spelling of "no separate web root") |
-| Override contains keys this ePHPm version doesn't know | Ignored; known keys still apply |
+| `document_root = "."`, `""`, or the key absent | Container is the web root (the explicit spelling of "no separate web root") |
+| Override is malformed TOML, or half-written | **503**, `ERROR` at startup, `WARN` per request |
+| Override exists but cannot be read (permissions, I/O) | **503** |
+| `document_root` is absolute, contains `..`, or has a drive prefix | **503** |
+| `document_root` names a missing directory, or a file | **503** |
+| `document_root` is a symlink resolving outside the container | **503** |
+| `auto_prepend_file` names a path outside the container, a directory, or a missing file | **503** |
+| `auto_prepend_file` set while `[php] mode = "worker"` | Key ignored with a `WARN`; the site still serves (see below) |
+| Override contains keys this ePHPm version doesn't know | Ignored — with a `WARN` naming the file, the site, every unrecognised key, and a "did you mean" hint. Recognised keys still apply |
 
-The second row is the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing**, not that the feature is broken. Startup logs every site whose root an override moved, so `grep` the boot log for `per-site document root overrides applied` to see what is actually in effect.
+Row two remains the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing entirely**, which ePHPm cannot distinguish from a site that has none. Only a file that *exists* and is broken produces a 503. Startup names both cases: `grep` the boot log for `per-site document root overrides applied` and for `per-site overrides that cannot be honoured`.
+
+Two consequences worth planning for:
+
+- **Write override files atomically** (write to a temp file, then rename). A non-atomic write has a window in which the file is truncated, and during that window the site 503s instead of serving.
+- **Upgrading to this behaviour can surface latent breakage.** A site whose override has been quietly broken — and quietly serving its whole container — starts returning 503 after the upgrade. That is the point, but check the boot log for `per-site overrides that cannot be honoured` after rolling it out.
+
+**Why an unknown key is still tolerated when every `ephpm.toml` section rejects one.** This is the one config surface in ePHPm that is not `deny_unknown_fields`, and the leniency is now as narrow as it can be: everything ePHPm *understood and could not do* fails closed, per the table above. What stays lenient is only a key it did not understand at all. Three things separate that from `ephpm.toml`:
+
+- **Different author, different release cadence — by design.** `ephpm.toml` is written by the operator who chose the binary. This file is written by a separate provisioning program, deliberately (that is the whole point of it being a *derived, operator-owned artifact*), so the assumption that the config author knows which binary they are running does not hold.
+- **The skew has a direction, and it is the bad one.** In the motivating deployment the daemon is built from source on demand while ePHPm comes from tagged releases, so the *writer leads the server*. Under strict parsing, the next daemon release that adds a key would take every site it manages off its web root simultaneously, from a routine deploy of a different program. A missing feature is better than a fleet outage.
+- **The strict reaction is unbounded here.** For `ephpm.toml`, strict means one node fails to start while the operator is watching it. Here it would mean every site failing at once, asynchronously, on a running fleet.
+
+A schema-version field in the file was considered as the "make skew explicit" answer and rejected: it renames the problem. A daemon adding a key must bump the version or the key fails closed; bumping it makes every server that does not know that version reject the file — the same outage with a nicer message. What did change is the silence: a misspelled `documnet_root` now names itself in the log, next to the site it broke, with a suggestion.
 
 Overrides are re-read at most every 2 seconds, so writing, editing or removing one takes effect on a running server within that window — on sites discovered at startup as well as previews created later. No restart, no filesystem watcher.
 
 Note that the declared path is validated as if hostile — relative only, no `..`, canonicalized and required to resolve inside the container — even though the writer is trusted. "The provisioning daemon validated it" is a claim about another program's current behaviour, not something ePHPm can enforce.
 
+### Per-site `auto_prepend_file` (bootstrap one site before every request)
+
+`[php] ini_file` / `ini_overrides` are **process-global**, so an `auto_prepend_file` set there fires for every tenant at one fixed path — useless in a fleet where each site is a different application. The override file gives a single vhost its own:
+
+```toml
+# /var/lib/ephpm/site-overrides/pr-42-owner-repo.toml
+document_root     = "."                      # this repo has no separate web root
+auto_prepend_file = ".preview-env.php"       # relative to the site CONTAINER
+```
+
+The named file runs at global scope immediately before that vhost's script, on every PHP request to that site — PHP's own `auto_prepend_file`, scoped to one tenant. The motivating case is a preview host injecting per-deployment environment into an app whose document root *is* its repository root, where there is nowhere else to put a bootstrap hook:
+
+```php
+<?php // .preview-env.php
+$_SERVER['EPHPM_SEED_TOKEN'] = '…';
+putenv('APP_ENV=preview');
+```
+
+**Where to put the file.** The path is resolved against the **site container**, not the web root — the same base `document_root` uses — precisely so a secret-bearing bootstrap file can live *above* the web root where no URL reaches it:
+
+```
+/var/www/sites/alice-blog.com/
+  .preview-env.php     ← above the web root: not reachable over HTTP at all
+  public/
+    index.php
+```
+
+When the document root *is* the container (`document_root = "."`), name the file with a leading dot. `[server.static]` `hidden_files` defaults to `"deny"`, so `GET /.preview-env.php` is refused — and `hidden_files` gates *serving*, never PHP's own `include`, so the prepend still runs.
+
+**What it can and cannot do.** A prepend runs inside the tenant's own request, so it inherits that tenant's `open_basedir`, temp and session directories, OPcache vhost, database session and KV keyspace. It has exactly the reach that tenant's `index.php` already has, and not one byte more:
+
+| | Behaviour |
+|---|---|
+| Path base | The site **container** (may be above the document root) |
+| Refused | Absolute paths, drive prefixes, `..`, backslashes, anything resolving outside the container (including through a symlink), a directory, a missing file |
+| `open_basedir` | Unchanged — the container. A prepend lives *inside* the sandbox; it cannot widen it |
+| Scope | Global, like PHP's own `auto_prepend_file` — variables it defines are visible to the application script |
+| Working directory | PHP `chdir`s to the primary script's directory first, exactly as for a stock `auto_prepend_file` |
+| Relationship to the global setting | A per-site value **replaces** the global `[php]` one for that request. A site that declares none keeps whatever the global config set |
+| Worker mode | **Not supported.** The worker script owns the request loop, so there is no per-request prepend position — the key is ignored with a `WARN` naming the site. Use the framework's own middleware (PSR-15 / Octane) |
+| Failure at validation | The site **refuses to serve** (503) — running without the environment it was told to inject is the silent wrong answer this key exists to fix |
+| Failure at runtime | If the file is deleted after validation, PHP's `require` of it is fatal and the request 500s |
+
+Two independent boundaries keep this contained. ePHPm canonicalizes the declared path and requires it to resolve inside the container before handing it to PHP. PHP then opens it through its stream layer, which checks the **realpath** against `open_basedir` — and `open_basedir` is derived from the container and is never override-controlled. So a tenant that swaps a validated prepend file for a symlink out of its container after the check has run gets a fatal at include time, not a read.
+
+Adding, changing or removing the key takes effect within the same 2-second window as `document_root`, with no restart. Startup names every site that has one: `grep` the boot log for `per-site auto_prepend_file overrides applied`.
+
+**One reporting wrinkle.** After a site's prepend is *withdrawn*, `ini_get('auto_prepend_file')` inside that site can still return the old path for the life of the process, even though nothing is prepended any more. The value PHP executes from is cleared — the string `ini_get` reports lags behind it. It is confined to the site that had the prepend (another vhost reads empty, verified by driving both tenants through a single shared PHP thread), and it affects reporting only. Trust the behaviour, not `ini_get`, and check the boot log to see what is actually in effect.
+
 ### Other per-site configuration
 
-Beyond the document root, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the site container plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
+Beyond the document root and `auto_prepend_file`, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the site container plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
 
-A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` overrides) is planned for [Phase 2](#phase-2-per-site-overrides-future). Until then, if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop.
+**The override file is deliberately not an `ini` channel.** It carries exactly two keys, and an arbitrary INI table is refused rather than unimplemented. In the deployment this mechanism exists for, the operator's daemon derives the file from a manifest committed *inside the tenant's repository* — so every value in it is transitively tenant-influenced. `open_basedir`, `include_path`, `sys_temp_dir`, `upload_tmp_dir`, `session.save_path` and `error_log` are precisely the directives ePHPm derives per vhost to keep tenants apart, and a file that could set them would hand that boundary to the thing it defends against. `auto_prepend_file` is safe under the opposite argument: it can only ever name a file *inside* the tenant's own container.
+
+So if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop. A bounded set of named, individually-clamped per-site resource knobs may arrive later; a free-form `ini` table will not.
 
 ### SQLite Database Location
 
@@ -554,12 +633,16 @@ When `sites_dir` is not configured, the router behaves identically to today (sin
 | Per-site `pdo_mysql` | One MySQL listener, per-site credentials (`DB_USER` / `DB_PASSWORD` injected per request); the connection's database is fixed by the credential it authenticates with |
 | Per-site temp + sessions | Each vhost gets a private state root; `open_basedir` contains only that vhost's own directories |
 
-### Phase 2: Per-Site Overrides (future)
+### Phase 2: Per-Site Overrides (partly implemented)
 
-| Feature | Description |
-|---------|-------------|
-| Per-site `site.toml` | Optional overrides for `index_files`, `fallback`, `php.memory_limit`, etc. Merged with global config |
-| Per-site metrics | Add `host` label to Prometheus metrics for per-site traffic visibility |
+| Feature | Status |
+|---------|--------|
+| Operator-owned `<site-key>.toml` in `[server] site_overrides_dir` | **Implemented** — carries `document_root` and `auto_prepend_file`. See [Per-site document root](#per-site-document-root-frameworks-with-a-public-directory) and [Per-site `auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) |
+| Per-site `index_files` / `fallback` | Not implemented. No consumer has asked for it; the global values apply to every site |
+| Per-site PHP resource limits (`memory_limit`, `max_execution_time`) | Not implemented. If it lands it will be named, typed, individually-clamped fields — **not** a free-form `ini` table, for the reason given in [Other per-site configuration](#other-per-site-configuration) |
+| Per-site metrics | Not implemented — a `host` label on Prometheus metrics for per-site traffic visibility |
+
+The earlier design for this phase put a `site.toml` **inside** the site directory. That was abandoned: a vhost's `open_basedir` includes its own container, so a config file placed there is rewritable by that site's own PHP. The shipped mechanism reads only an operator-owned file outside `sites_dir`.
 
 ### Phase 3: Operational Features (future)
 
