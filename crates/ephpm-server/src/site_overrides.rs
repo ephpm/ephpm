@@ -126,9 +126,12 @@ pub(crate) struct SiteOverride {
     /// The document root the operator declared, already validated as a
     /// contained, existing directory under the site container.
     ///
-    /// `None` when the file is absent, unreadable, malformed, declares nothing,
-    /// or declares something that failed validation — all of which collapse to
-    /// the same safe outcome: the container is the document root.
+    /// `None` means **the container is the web root**, and it is only ever set
+    /// that way when nothing was declared: no file, no `document_root` key, or
+    /// the explicit `"."`. A declaration that could not be honoured sets
+    /// [`unusable`](Self::unusable) instead and leaves this `None` — a caller
+    /// that resolved to the container from a *failed* narrowing instruction
+    /// would be serving more than the operator asked for.
     pub(crate) document_root: Option<PathBuf>,
     /// A PHP file to execute immediately before this vhost's script, on every
     /// request — PHP's own `auto_prepend_file`, scoped to one site. Already
@@ -142,6 +145,23 @@ pub(crate) struct SiteOverride {
     /// `None` under all the same failure modes as `document_root`, plus worker
     /// mode ([`PrependSupport::NoWorkerMode`]).
     pub(crate) auto_prepend_file: Option<PathBuf>,
+    /// Set when the override file **exists but cannot be honoured**: it is
+    /// unreadable, it is not valid TOML, or a key this binary implements
+    /// carries a value it had to reject. The value is a short, stable reason
+    /// for the log and the operator.
+    ///
+    /// The caller must refuse to serve this site rather than fall back to the
+    /// container. `document_root` is a *narrowing* instruction, so the old
+    /// fallback was wider than what the operator asked for: a daemon
+    /// interrupted mid-write published the `vendor/`, `.git` and
+    /// `storage/logs/` that the override existed to hide, with a warning and a
+    /// green health check. Refusing one site is contained, loud, and the only
+    /// outcome a health check catches.
+    ///
+    /// `None` for an absent file (the documented "container is the web root"
+    /// default) and for a file that declares nothing, or only things this
+    /// binary does not implement.
+    pub(crate) unusable: Option<&'static str>,
     /// The keys in the file that this ePHPm does not understand, sorted.
     ///
     /// Diagnostic only — nothing routes on it. Returned rather than logged here
@@ -195,35 +215,71 @@ impl Expect {
 /// those paths rely on. A daemon that writes files under any other name simply
 /// has no effect: the site serves its container.
 ///
-/// # Failure is always the safe direction
+/// # Failing "safe" used to mean failing WIDER, which is not safe
 ///
-/// There is deliberately no error type. Every way this can go wrong produces the
-/// behaviour the site had before an override existed, having logged why.
+/// This module used to say "failure is always the safe direction: every way this
+/// can go wrong produces the behaviour the site had before an override existed."
+/// That conflated two different kinds of safe. `document_root` is a
+/// **narrowing** instruction — the operator wrote it to stop serving `vendor/`,
+/// `.git` and `storage/logs/laravel.log`. Falling back to the container when it
+/// cannot be applied is safe for *availability* and the wrong direction for
+/// *containment*: a daemon interrupted mid-write published the very files the
+/// override existed to hide, with a warning and a green health check.
 ///
-/// # Why an unknown key does not fail the file
+/// So the fallback now depends on whether the operator asked for anything:
 ///
-/// Every `[section]` in `ephpm-config` is `deny_unknown_fields`, because there a
-/// misspelled key is an operator instruction that silently became a no-op and
-/// the cost of catching it is a startup error the operator sees immediately.
-/// Neither half of that holds here, and the asymmetry is what decides it:
+/// | State | Outcome |
+/// |---|---|
+/// | No file | Container is the web root. The default, not a failure. |
+/// | `document_root = "."` / empty | Container is the web root. Explicitly requested. |
+/// | File unreadable, or not valid TOML | [`SiteOverride::unusable`] — the site refuses to serve |
+/// | A key we implement, with a value we cannot honour | [`SiteOverride::unusable`] — the site refuses to serve |
+/// | A key we do not implement at all | Ignored, loudly. The site serves. |
 ///
-/// * **There is no startup to fail.** This file is read lazily, per site, with a
-///   short TTL. "Fail closed" can only mean *discarding the whole file*, which
-///   throws away `document_root` too — and a site that loses its declared web
-///   root serves its entire container, publishing `vendor/`, `.git` and
-///   `storage/logs/`. Refusing the file is a **worse** outcome than tolerating
-///   the key, not a safer one.
-/// * **The writer ships on its own schedule.** The provisioning daemon and the
-///   server are upgraded independently and in either order. A daemon that
-///   learns a key one release before the fleet does would, under
-///   `deny_unknown_fields`, take every site it manages off its web root at once.
+/// Refusing to serve is deliberately scoped to **one site**: refusing to start
+/// would let a single bad tenant file kill every tenant, and serving the
+/// container is what this section exists to stop. It is also the only outcome a
+/// health check catches, which is the half of #429 that actually mattered.
 ///
-/// So the key is ignored — and returned in
-/// [`SiteOverride::unknown_keys`] for the caller to report at `warn`, with the
-/// file, the site, the keys and a [`did_you_mean`] hint. The thing #463
-/// actually found was not the tolerance but the `debug` line nobody reads: a
-/// misspelled `documnet_root` now names itself in the log next to the site it
-/// broke.
+/// # Why an unknown key still does not fail the file
+///
+/// Every `[section]` in `ephpm-config` is `deny_unknown_fields` — #429's lesson,
+/// where `per_site = true` on a binary predating the knob parsed fine and came up
+/// in the wrong mode with every health check green. That lesson is honoured
+/// above: everything this binary *understood and could not do* now fails closed.
+/// What stays lenient is the strictly narrower case of a key it did not
+/// understand at all, and three properties separate that from `ephpm.toml`:
+///
+/// * **Different author, different release cadence — by design.** `ephpm.toml`
+///   is written by the operator who chose the binary. This file is written by a
+///   separate program, deliberately (see the derived-artifact argument above),
+///   so #429's assumption that the config author knows which binary they are
+///   running does not hold.
+/// * **The skew has a direction, and it is the bad one.** On the motivating
+///   fleet the daemon is built from source on demand while ePHPm comes from
+///   tagged releases, so the *writer leads*. Under `deny_unknown_fields` the
+///   next daemon release that adds a key takes every site it manages off its web
+///   root simultaneously, from a routine deploy of another repository. A missing
+///   feature is better than a fleet outage.
+/// * **The strict reaction is unbounded here.** For `ephpm.toml`, strict means
+///   one node fails to start while the operator is watching it. Here it means
+///   every site fails at once, asynchronously, on a running fleet.
+///
+/// A schema-version field was considered as the "make skew explicit" answer and
+/// **rejected**: it renames the problem rather than solving it. A daemon adding
+/// a key must bump the version or the key fails closed; bumping it makes every
+/// server that does not know that version reject the file — the same fleet
+/// outage with a better error message. Avoiding that needs the daemon to
+/// negotiate down to the server's version, which is a capability channel this
+/// architecture deliberately does not have (the daemon writes files; it never
+/// reads ePHPm). An `x-` experimental-key prefix has the same two-phase trap:
+/// the rename from `x-foo` to `foo` is itself the breaking deploy. Unknown key
+/// names *are* the skew signal; nothing is gained by encoding it twice.
+///
+/// So the key is ignored — and returned in [`SiteOverride::unknown_keys`] for
+/// the caller to report at `warn`, with the file, the site, the keys and a
+/// [`did_you_mean`] hint. The thing #463 actually found was not the tolerance
+/// but the `debug` line nobody reads.
 pub(crate) fn load(
     overrides_dir: &Path,
     site_key: &str,
@@ -232,49 +288,62 @@ pub(crate) fn load(
 ) -> SiteOverride {
     let path = overrides_dir.join(format!("{site_key}.toml"));
 
+    // A file that exists but cannot be understood is NOT "no override": the
+    // operator asked for something and we do not know what. Serving the
+    // container would publish whatever the file was written to hide.
+    let unusable = |reason: &'static str, detail: &dyn std::fmt::Display| {
+        tracing::warn!(
+            path = %path.display(),
+            site = site_key,
+            reason,
+            detail = %detail,
+            "per-site override exists but cannot be honoured — this site will REFUSE TO SERVE \
+             (503) rather than fall back to serving its whole container, which is what the \
+             override was written to prevent"
+        );
+        SiteOverride { unusable: Some(reason), ..SiteOverride::default() }
+    };
+
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         // Absent is the normal case for a site with no override. Not an error,
-        // not logged — most sites in a fleet will never have one.
+        // not logged — most sites in a fleet will never have one, and "no file"
+        // is the documented way to say "the container is the web root".
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SiteOverride::default(),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                site = site_key,
-                error = %e,
-                "per-site override could not be read — serving the site container"
-            );
-            return SiteOverride::default();
-        }
+        Err(e) => return unusable("override file could not be read", &e),
     };
 
     let raw: RawOverride = match toml::from_str(&text) {
         Ok(raw) => raw,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                site = site_key,
-                error = %e,
-                "per-site override is not valid TOML — serving the site container"
-            );
-            return SiteOverride::default();
-        }
+        Err(e) => return unusable("override file is not valid TOML", &e),
     };
 
     let mut unknown_keys: Vec<String> = raw.unknown.keys().cloned().collect();
     unknown_keys.sort_unstable();
 
-    let document_root = raw
-        .document_root
-        .as_deref()
-        .and_then(|declared| validate_declared_root(container, declared, site_key));
+    let document_root = match raw.document_root.as_deref() {
+        Some(declared) => match validate_declared_root(container, declared, site_key) {
+            Ok(resolved) => resolved,
+            Err(reason) => return unusable(reason, &declared),
+        },
+        None => None,
+    };
 
-    let auto_prepend_file = raw.auto_prepend_file.as_deref().and_then(|declared| {
-        match prepend {
-            PrependSupport::Yes => validate_declared_prepend(container, declared, site_key),
-            // Not a silent drop: worker mode is a deliberate, permanent
-            // limitation of the mechanism and the operator has to hear about it
-            // once per site, at startup (`seed_site_roots` reads every site).
+    let auto_prepend_file = match raw.auto_prepend_file.as_deref() {
+        Some(declared) => match prepend {
+            PrependSupport::Yes => match validate_declared_prepend(container, declared, site_key) {
+                Ok(resolved) => resolved,
+                Err(reason) => return unusable(reason, &declared),
+            },
+            // NOT unusable, and the distinction is the whole rule: a value this
+            // binary understood and could not honour fails closed, but a
+            // *feature this binary does not implement here* belongs in the same
+            // forward-compatibility bucket as an unknown key. Worker mode is a
+            // permanent, server-wide capability gap, not a broken file — and
+            // failing closed on it would take down every site on a
+            // worker-mode fleet the moment the daemon started writing the key,
+            // which is exactly the outage the leniency argument exists to
+            // prevent.
             PrependSupport::NoWorkerMode => {
                 tracing::warn!(
                     path = %path.display(),
@@ -282,15 +351,17 @@ pub(crate) fn load(
                     declared,
                     "per-site override declares auto_prepend_file, but `[php] mode = \"worker\"` \
                      cannot run one — the worker script owns the request loop, so there is no \
-                     per-request prepend position. Use the framework's own middleware (PSR-15 / \
-                     Octane) or switch the site to `mode = \"per_request\"`"
+                     per-request prepend position. The key is IGNORED and the site still serves. \
+                     Use the framework's own middleware (PSR-15 / Octane) or switch to \
+                     `mode = \"per_request\"`"
                 );
                 None
             }
-        }
-    });
+        },
+        None => None,
+    };
 
-    SiteOverride { document_root, auto_prepend_file, unknown_keys }
+    SiteOverride { document_root, auto_prepend_file, unknown_keys, unusable: None }
 }
 
 /// The "did you mean" clause for a set of unrecognized keys, or `None` when no
@@ -312,20 +383,49 @@ pub(crate) fn understood_keys() -> String {
     KNOWN_KEYS.join(", ")
 }
 
-/// Validate a declared `document_root` against its site container, returning the
-/// resolved absolute path or `None` (with a warning) if it must be rejected.
+/// Validate a declared `document_root` against its site container.
 ///
-/// `"."` is accepted as "the container", because that is the natural spelling of
-/// "this repository has no separate web root" and a daemon translating an
-/// application manifest will emit it verbatim. It returns `None` — same outcome
-/// as no override at all — rather than a rejection warning.
-fn validate_declared_root(container: &Path, declared: &str, site_key: &str) -> Option<PathBuf> {
-    let trimmed = declared.trim().trim_end_matches('/');
-    // "." / "./" / "" all mean "the container is the web root".
-    if trimmed.is_empty() || trimmed == "." {
+/// * `Ok(Some(path))` — resolved, contained, and a directory.
+/// * `Ok(None)` — the declaration explicitly means "the container is the web
+///   root". `"."` is accepted for this because it is the natural spelling of
+///   "this repository has no separate web root" and a daemon translating an
+///   application manifest will emit it verbatim; the empty string is the same
+///   for a daemon that rendered an empty template variable.
+/// * `Err(reason)` — the operator asked to narrow the web root and we cannot.
+///   The caller turns this into [`SiteOverride::unusable`] rather than serving
+///   the container, because serving the container is *wider* than what was
+///   asked for and is exactly what the declaration existed to prevent.
+fn validate_declared_root(
+    container: &Path,
+    declared: &str,
+    site_key: &str,
+) -> Result<Option<PathBuf>, &'static str> {
+    let Some(trimmed) = normalize_declared(declared) else {
+        // "." / "./" / "" all mean "the container is the web root".
+        return Ok(None);
+    };
+    resolve_contained(container, trimmed, site_key, "document_root", Expect::Directory).map(Some)
+}
+
+/// Trim a declared path and decide whether it says anything at all.
+///
+/// `None` means "declared nothing" — the empty string, `"."` or `"./"`. Anything
+/// else is returned with trailing slashes stripped, for the containment checks
+/// to judge.
+///
+/// The emptiness test runs on the value **before** trailing slashes are
+/// stripped, which matters: `"/"` strips to `""`, and reading that as "declared
+/// nothing" would have quietly turned the absolute filesystem root into "serve
+/// the container" instead of the rejection it is. All-slash values are handed
+/// on so [`resolve_contained`]'s absolute-path check refuses them by name.
+fn normalize_declared(declared: &str) -> Option<&str> {
+    let trimmed = declared.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
         return None;
     }
-    resolve_contained(container, trimmed, site_key, "document_root", Expect::Directory)
+    let stripped = trimmed.trim_end_matches('/');
+    // `"/"`, `"//"`, … — an absolute root, not an absent declaration.
+    Some(if stripped.is_empty() { trimmed } else { stripped })
 }
 
 /// Validate a declared `auto_prepend_file` against its site container.
@@ -344,15 +444,26 @@ fn validate_declared_root(container: &Path, declared: &str, site_key: &str) -> O
 ///    `include_path`, and `php_execute_script` has already `chdir`-ed into the
 ///    *primary script's* directory by then — so a relative value would name a
 ///    different file depending on which entrypoint the request hit.
-fn validate_declared_prepend(container: &Path, declared: &str, site_key: &str) -> Option<PathBuf> {
-    let trimmed = declared.trim().trim_end_matches('/');
-    // Empty is "declared nothing", matching how `document_root` spells it. A
+///
+/// Same `Ok(Some)` / `Ok(None)` / `Err(reason)` contract as
+/// [`validate_declared_root`]. A rejected prepend does not *widen* anything the
+/// way a rejected document root does, but it is still a key this binary
+/// implements whose value it could not honour — and running a preview without
+/// the environment it was told to inject is the silent-wrong-answer failure
+/// #463 was filed about. It fails closed for consistency and for that reason.
+fn validate_declared_prepend(
+    container: &Path,
+    declared: &str,
+    site_key: &str,
+) -> Result<Option<PathBuf>, &'static str> {
+    // Empty is "declared nothing", matching how `document_root` spells it — a
     // daemon that renders an empty template variable gets a no-op, not a
-    // warning it cannot act on.
-    if trimmed.is_empty() {
-        return None;
-    }
-    resolve_contained(container, trimmed, site_key, "auto_prepend_file", Expect::File)
+    // site-down. `"."` is caught by the same helper and then, being a
+    // directory, could never have been a prepend anyway.
+    let Some(trimmed) = normalize_declared(declared) else {
+        return Ok(None);
+    };
+    resolve_contained(container, trimmed, site_key, "auto_prepend_file", Expect::File).map(Some)
 }
 
 /// The containment core shared by both declared paths.
@@ -374,18 +485,17 @@ fn resolve_contained(
     site_key: &str,
     key: &'static str,
     expect: Expect,
-) -> Option<PathBuf> {
-    let reject = |reason: &str| {
+) -> Result<PathBuf, &'static str> {
+    let reject = |reason: &'static str| {
         tracing::warn!(
             container = %container.display(),
             site = site_key,
             key,
             declared = trimmed,
             reason,
-            "per-site override declared a path that was rejected — the site behaves as if the \
-             key were absent"
+            "per-site override declared a path that was rejected"
         );
-        None::<PathBuf>
+        Err::<PathBuf, &'static str>(reason)
     };
 
     let relative = Path::new(trimmed);
@@ -435,7 +545,7 @@ fn resolve_contained(
     // sides canonicalized, so their prefixes agree); only the value handed
     // onwards is simplified. Same hazard, same fix, same helper as
     // `[php.worker] script`.
-    Some(ephpm_config::strip_verbatim_prefix(target))
+    Ok(ephpm_config::strip_verbatim_prefix(target))
 }
 
 /// The known key an unrecognized one was most plausibly meant to be, if any.
@@ -741,9 +851,35 @@ mod tests {
     #[test]
     fn prepend_naming_a_directory_is_rejected() {
         let f = fixture();
-        for bad in ["web", ".", "./"] {
-            f.write(&format!("auto_prepend_file = {bad:?}\n"));
-            assert_eq!(f.load().auto_prepend_file, None, "for {bad:?}");
+        f.write("auto_prepend_file = \"web\"\n");
+        let over = f.load();
+        assert_eq!(over.auto_prepend_file, None);
+        assert!(over.unusable.is_some(), "a directory is not a script — fail closed");
+
+        // `.` and `./` spell "declared nothing", not "prepend the container".
+        for empty in [".", "./"] {
+            f.write(&format!("auto_prepend_file = {empty:?}\n"));
+            let over = f.load();
+            assert_eq!(over.auto_prepend_file, None, "for {empty:?}");
+            assert_eq!(over.unusable, None, "for {empty:?}");
+        }
+    }
+
+    /// `"/"` trims to the empty string, and reading that as "declared nothing"
+    /// would silently turn the absolute filesystem root into "serve the
+    /// container". It is a rejection, on both keys.
+    #[test]
+    fn a_bare_slash_is_a_rejection_not_an_absent_declaration() {
+        for key in ["document_root", "auto_prepend_file"] {
+            for slashes in ["/", "//", " / "] {
+                let f = fixture();
+                f.write(&format!("{key} = {slashes:?}\n"));
+                assert!(
+                    f.load().unusable.is_some(),
+                    "{key} = {slashes:?} is an absolute root and must be refused, not read as \
+                     an absent declaration"
+                );
+            }
         }
     }
 
@@ -758,13 +894,90 @@ mod tests {
     /// keys are validated independently so a daemon bug in one does not put a
     /// site's `vendor/` on the web.
     #[test]
-    fn rejected_prepend_leaves_the_document_root_applied() {
+    fn rejected_prepend_makes_the_file_unusable() {
         let f = fixture();
         f.write("document_root = \"web\"\nauto_prepend_file = \"../escape.php\"\n");
 
         let over = f.load();
-        assert_eq!(over.document_root, Some(resolved(&f.container.join("web"))));
+        assert!(over.unusable.is_some(), "a refused prepend must fail closed");
+        // Deliberately NOT handed back: a caller reading `document_root` alone
+        // would serve a site whose operator asked for something we could not
+        // do, which is the silent wrong answer #463 exists to stop.
+        assert_eq!(over.document_root, None);
         assert_eq!(over.auto_prepend_file, None);
+    }
+
+    /// **The containment-direction fix.** `document_root` is a *narrowing*
+    /// instruction, so falling back to the container when it cannot be applied
+    /// serves MORE than the operator asked for — the `vendor/`, `.git` and
+    /// `storage/logs/laravel.log` the declaration existed to hide. Every way of
+    /// failing to honour a declared root must therefore be `unusable`.
+    ///
+    /// The second assertion is the one that pins the direction: `document_root`
+    /// must be `None`, so no caller can reach the old wider fallback by reading
+    /// that field alone.
+    #[test]
+    fn a_document_root_that_cannot_be_honoured_never_widens_to_the_container() {
+        let f = fixture();
+        std::fs::write(f.container.join("index.php"), b"<?php").unwrap();
+        for bad in ["nope", "..", "../../etc", "/etc", r"C:\Windows", "vendor/../..", "index.php"] {
+            f.write(&format!("document_root = {bad:?}\n"));
+            let over = f.load();
+            assert!(
+                over.unusable.is_some(),
+                "declared root {bad:?} could not be honoured, so the site must fail closed \
+                 rather than serve its whole container"
+            );
+            assert_eq!(over.document_root, None, "for {bad:?}");
+        }
+    }
+
+    /// The states that are NOT failures and must keep serving: an absent file,
+    /// and a file that explicitly says the container is the web root.
+    #[test]
+    fn no_declaration_is_not_a_failure() {
+        let f = fixture();
+        assert_eq!(f.load().unusable, None, "absent file is the documented default");
+
+        for text in ["", "# just a comment\n", "document_root = \".\"\n", "document_root = \"\"\n"]
+        {
+            f.write(text);
+            let over = f.load();
+            assert_eq!(over.unusable, None, "for {text:?}");
+            assert_eq!(over.document_root, None, "for {text:?}");
+        }
+    }
+
+    /// A key this binary does not implement *at all* stays in the
+    /// forward-compatibility bucket: ignored, reported, site keeps serving.
+    /// Failing closed here is what would let a leading provisioning daemon take
+    /// a whole fleet off its web roots with one routine deploy.
+    #[test]
+    fn an_unknown_key_does_not_make_the_file_unusable() {
+        let f = fixture();
+        f.write("document_root = \"web\"\na_key_from_a_newer_daemon = \"x\"\n");
+
+        let over = f.load();
+        assert_eq!(over.unusable, None, "an unimplemented key must not take the site down");
+        assert_eq!(over.document_root, Some(resolved(&f.container.join("web"))));
+        assert_eq!(over.unknown_keys, vec!["a_key_from_a_newer_daemon".to_string()]);
+    }
+
+    /// Worker mode is a server-wide *capability gap*, not a broken file, so it
+    /// belongs in the same bucket as an unknown key. Failing closed on it would
+    /// take down every site on a worker-mode fleet the moment the provisioning
+    /// daemon started writing `auto_prepend_file` — the outage the leniency
+    /// argument exists to prevent.
+    #[test]
+    fn worker_mode_is_a_capability_gap_not_an_unusable_file() {
+        let f = fixture();
+        f.php("preview-env.php");
+        f.write("document_root = \"web\"\nauto_prepend_file = \"preview-env.php\"\n");
+
+        let over = f.load_worker();
+        assert_eq!(over.unusable, None, "worker mode must not take the site down");
+        assert_eq!(over.auto_prepend_file, None);
+        assert_eq!(over.document_root, Some(resolved(&f.container.join("web"))));
     }
 
     /// Worker mode has no per-request prepend position, so the key is dropped
@@ -779,6 +992,7 @@ mod tests {
         let over = f.load_worker();
         assert_eq!(over.auto_prepend_file, None, "worker mode cannot run a per-site prepend");
         assert_eq!(over.document_root, Some(resolved(&f.container.join("web"))));
+        assert_eq!(over.unusable, None, "a capability gap is not a broken file");
     }
 
     // ── Declarations rejected even though the writer is trusted ────────
@@ -788,7 +1002,9 @@ mod tests {
         for bad in ["..", "../", "../../etc", "web/../../..", "a/../../b", r"..\..\Windows"] {
             let f = fixture();
             f.write(&format!("document_root = {bad:?}\n"));
-            assert_eq!(f.load().document_root, None, "traversal {bad:?} must be rejected");
+            let over = f.load();
+            assert_eq!(over.document_root, None, "traversal {bad:?} must be rejected");
+            assert!(over.unusable.is_some(), "traversal {bad:?} must also fail closed");
         }
     }
 
@@ -797,7 +1013,9 @@ mod tests {
         for bad in ["/", "/etc", "/etc/passwd", r"C:\Windows", r"\\server\share"] {
             let f = fixture();
             f.write(&format!("document_root = {bad:?}\n"));
-            assert_eq!(f.load().document_root, None, "absolute path {bad:?} must be rejected");
+            let over = f.load();
+            assert_eq!(over.document_root, None, "absolute path {bad:?} must be rejected");
+            assert!(over.unusable.is_some(), "absolute path {bad:?} must also fail closed");
         }
     }
 
@@ -806,14 +1024,18 @@ mod tests {
         let f = fixture();
         std::fs::write(f.container.join("index.php"), b"<?php").unwrap();
         f.write("document_root = \"index.php\"\n");
-        assert_eq!(f.load().document_root, None);
+        let over = f.load();
+        assert_eq!(over.document_root, None);
+        assert!(over.unusable.is_some());
     }
 
     #[test]
     fn declaration_naming_a_missing_directory_is_rejected() {
         let f = fixture();
         f.write("document_root = \"nope\"\n");
-        assert_eq!(f.load().document_root, None);
+        let over = f.load();
+        assert_eq!(over.document_root, None);
+        assert!(over.unusable.is_some());
     }
 
     /// The lexical check cannot see through a symlink; canonical containment
@@ -830,11 +1052,12 @@ mod tests {
         }
         f.write("document_root = \"escape\"\n");
 
+        let over = f.load();
         assert_eq!(
-            f.load().document_root,
-            None,
+            over.document_root, None,
             "a symlink resolving outside the container must be rejected"
         );
+        assert!(over.unusable.is_some(), "and must fail closed, not serve the container");
     }
 
     /// A symlink that stays inside the container is fine — `web -> releases/42`
@@ -886,7 +1109,7 @@ mod tests {
     /// A malformed override must not break the site. The writer is trusted, but
     /// a half-written file (a daemon interrupted mid-write) is a real state.
     #[test]
-    fn malformed_override_serves_the_container() {
+    fn malformed_override_takes_the_site_out_of_service() {
         for text in [
             "document_root =\n",
             "document_root = web\n",
@@ -898,7 +1121,15 @@ mod tests {
         ] {
             let f = fixture();
             f.write(text);
-            assert_eq!(f.load(), SiteOverride::default(), "for {text:?}");
+            let over = f.load();
+            assert!(
+                over.unusable.is_some(),
+                "a half-written file ({text:?}) means the operator asked for something we \
+                 cannot read — serving the container instead publishes exactly what the \
+                 override was written to hide"
+            );
+            assert_eq!(over.document_root, None, "for {text:?}");
+            assert_eq!(over.auto_prepend_file, None, "for {text:?}");
         }
     }
 

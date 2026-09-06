@@ -228,11 +228,19 @@ pub struct ServerConfig {
     /// already has. It is honoured in per-request mode only; worker mode owns
     /// the request loop and warns that the key is inert.
     ///
-    /// Unrecognized keys are **ignored with a `WARN`** naming the file, the
-    /// site, the keys and a "did you mean" hint — the one lenient surface
-    /// outside `ephpm.toml`, because this file is read lazily per site so
-    /// "fail closed" could only mean discarding `document_root` too and putting
-    /// that tenant's whole container back on the web.
+    /// A key ePHPm *implements* whose value it cannot honour — an unreadable or
+    /// malformed file, a path that escapes the container, a missing directory —
+    /// takes **that one site** out of service (503) rather than falling back to
+    /// serving its container. `document_root` is a *narrowing* instruction, so
+    /// the old fallback resolved wider than the operator asked for and
+    /// published the files the override existed to hide.
+    ///
+    /// A key ePHPm does **not** implement at all is ignored with a `WARN`
+    /// naming the file, the site, the keys and a "did you mean" hint. That is
+    /// the one lenient surface outside `ephpm.toml`, and it is deliberate: this
+    /// file is written by a separately-released provisioning daemon, so strict
+    /// parsing would let one of its routine deploys take every site it manages
+    /// off its web root at once.
     ///
     /// A site with no override file behaves **exactly** as it always has: the
     /// container is the document root and nothing is prepended. Nothing about an
@@ -267,8 +275,8 @@ pub struct ServerConfig {
     /// container (a directory for `document_root`, a regular file for
     /// `auto_prepend_file`). "The daemon validated it" is a claim about another
     /// codebase's current behaviour, not an invariant ePHPm can enforce. A
-    /// rejected or malformed override logs a warning and the site behaves as if
-    /// the key were absent.
+    /// rejected or malformed override logs a warning and takes that site out of
+    /// service — never a silent fallback to the wider root.
     ///
     /// For `auto_prepend_file` that containment check is the first of two
     /// independent boundaries: PHP opens the file through its stream layer,

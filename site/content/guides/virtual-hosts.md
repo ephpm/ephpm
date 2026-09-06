@@ -100,24 +100,40 @@ The file must be `<site-key>.toml`, where `<site-key>` is the [canonical site ke
 
 **An override under any other name is silently ignored** and the site serves its container. If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory — a daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a site that works but ignores its override, with no error anywhere.
 
-#### Failure modes, all of which serve the container
+#### Failure modes: a broken override takes the site out of service
 
-Every way an override can go wrong degrades to "serve the site container" — the pre-override behaviour — with a `WARN` naming the site and the reason:
+An override that **cannot be honoured makes that one site answer `503`** with `Retry-After: 2`, rather than falling back to serving its container.
+
+That is the opposite of what earlier versions did, and the reason is worth stating plainly. `document_root` is a *narrowing* instruction — you wrote it to stop serving `vendor/` and `storage/logs/laravel.log`. Falling back to the container when it cannot be applied is safe for *availability* and the **wrong direction for containment**: a provisioning daemon interrupted mid-write, or one typo in a path, published exactly the files the override existed to hide, with a warning nobody read and a green health check. A site that is briefly down during its own provisioning is normal; a site that briefly publishes its `.git` and its database credentials is not.
 
 | Situation | Result |
 |---|---|
 | No override file for this site | Container is the web root (the normal case) |
 | Provisioning daemon down or lagging, override not yet written | **Container is the web root** — the site serves its whole checkout until the override lands |
-| Override is malformed TOML, or half-written | Container, with a warning |
-| `document_root` is absolute, contains `..`, or has a drive prefix | Container, with a warning |
-| `document_root` names a missing directory, or a file | Container, with a warning |
-| `document_root` is a symlink resolving outside the container | Container, with a warning |
-| `document_root = "."` | Container (the explicit spelling of "no separate web root") |
-| Override contains keys this ePHPm version doesn't know | Ignored — with a `WARN` naming the file, the site, every unrecognised key, and a "did you mean" hint for near-misses. Recognised keys still apply |
+| `document_root = "."`, `""`, or the key absent | Container is the web root (the explicit spelling of "no separate web root") |
+| Override is malformed TOML, or half-written | **503**, `ERROR` at startup, `WARN` per request |
+| Override exists but cannot be read (permissions, I/O) | **503** |
+| `document_root` is absolute, contains `..`, or has a drive prefix | **503** |
+| `document_root` names a missing directory, or a file | **503** |
+| `document_root` is a symlink resolving outside the container | **503** |
+| `auto_prepend_file` names a path outside the container, a directory, or a missing file | **503** |
+| `auto_prepend_file` set while `[php] mode = "worker"` | Key ignored with a `WARN`; the site still serves (see below) |
+| Override contains keys this ePHPm version doesn't know | Ignored — with a `WARN` naming the file, the site, every unrecognised key, and a "did you mean" hint. Recognised keys still apply |
 
-The second row is the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing**, not that the feature is broken. Startup logs every site whose root an override moved, so `grep` the boot log for `per-site document root overrides applied` to see what is actually in effect.
+Row two remains the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing entirely**, which ePHPm cannot distinguish from a site that has none. Only a file that *exists* and is broken produces a 503. Startup names both cases: `grep` the boot log for `per-site document root overrides applied` and for `per-site overrides that cannot be honoured`.
 
-**Why an unknown key is tolerated here when every `ephpm.toml` section rejects one.** This is the one config surface in ePHPm that is not `deny_unknown_fields`, and the asymmetry is deliberate. There is no startup to fail: override files are read lazily, per site. "Fail closed" could only mean discarding the whole file — which throws away `document_root` too, and a site that loses its declared web root serves its **entire container**, publishing `vendor/`, `.git` and `storage/logs/`. Refusing the file is a worse outcome than ignoring one key, not a safer one. And because the writer is usually a provisioning daemon upgraded on its own schedule, a daemon that learns a key one release ahead of the fleet would otherwise take every site it manages off its web root at once. So the key is ignored — but loudly, which is the part that changed: a misspelled `documnet_root` now names itself in the log next to the site it broke.
+Two consequences worth planning for:
+
+- **Write override files atomically** (write to a temp file, then rename). A non-atomic write has a window in which the file is truncated, and during that window the site 503s instead of serving.
+- **Upgrading to this behaviour can surface latent breakage.** A site whose override has been quietly broken — and quietly serving its whole container — starts returning 503 after the upgrade. That is the point, but check the boot log for `per-site overrides that cannot be honoured` after rolling it out.
+
+**Why an unknown key is still tolerated when every `ephpm.toml` section rejects one.** This is the one config surface in ePHPm that is not `deny_unknown_fields`, and the leniency is now as narrow as it can be: everything ePHPm *understood and could not do* fails closed, per the table above. What stays lenient is only a key it did not understand at all. Three things separate that from `ephpm.toml`:
+
+- **Different author, different release cadence — by design.** `ephpm.toml` is written by the operator who chose the binary. This file is written by a separate provisioning program, deliberately (that is the whole point of it being a *derived, operator-owned artifact*), so the assumption that the config author knows which binary they are running does not hold.
+- **The skew has a direction, and it is the bad one.** In the motivating deployment the daemon is built from source on demand while ePHPm comes from tagged releases, so the *writer leads the server*. Under strict parsing, the next daemon release that adds a key would take every site it manages off its web root simultaneously, from a routine deploy of a different program. A missing feature is better than a fleet outage.
+- **The strict reaction is unbounded here.** For `ephpm.toml`, strict means one node fails to start while the operator is watching it. Here it would mean every site failing at once, asynchronously, on a running fleet.
+
+A schema-version field in the file was considered as the "make skew explicit" answer and rejected: it renames the problem. A daemon adding a key must bump the version or the key fails closed; bumping it makes every server that does not know that version reject the file — the same outage with a nicer message. What did change is the silence: a misspelled `documnet_root` now names itself in the log, next to the site it broke, with a suggestion.
 
 Overrides are re-read at most every 2 seconds, so writing, editing or removing one takes effect on a running server within that window — on sites discovered at startup as well as previews created later. No restart, no filesystem watcher.
 
@@ -163,7 +179,7 @@ When the document root *is* the container (`document_root = "."`), name the file
 | Working directory | PHP `chdir`s to the primary script's directory first, exactly as for a stock `auto_prepend_file` |
 | Relationship to the global setting | A per-site value **replaces** the global `[php]` one for that request. A site that declares none keeps whatever the global config set |
 | Worker mode | **Not supported.** The worker script owns the request loop, so there is no per-request prepend position — the key is ignored with a `WARN` naming the site. Use the framework's own middleware (PSR-15 / Octane) |
-| Failure at validation | The key is ignored with a `WARN`; the site serves normally *without* the prepend. It is **not** a security gate — use a [`php:` middleware mount](/guides/native-middleware/#the-php-lane-experimental) for policy that must fail closed |
+| Failure at validation | The site **refuses to serve** (503) — running without the environment it was told to inject is the silent wrong answer this key exists to fix |
 | Failure at runtime | If the file is deleted after validation, PHP's `require` of it is fatal and the request 500s |
 
 Two independent boundaries keep this contained. ePHPm canonicalizes the declared path and requires it to resolve inside the container before handing it to PHP. PHP then opens it through its stream layer, which checks the **realpath** against `open_basedir` — and `open_basedir` is derived from the container and is never override-controlled. So a tenant that swaps a validated prepend file for a symlink out of its container after the check has run gets a fatal at include time, not a read.

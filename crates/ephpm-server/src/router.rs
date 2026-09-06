@@ -200,6 +200,18 @@ pub(crate) struct SiteRoots {
     /// `None` for every site without a declaration, in worker mode, and in
     /// single-site mode.
     pub(crate) auto_prepend_file: Option<PathBuf>,
+    /// Set when this site's override file exists but could not be honoured, in
+    /// which case the site **refuses to serve** (503) instead of falling back
+    /// to its container.
+    ///
+    /// `document_root` is a *narrowing* instruction, so the old "every failure
+    /// serves the container" fallback resolved **wider** than the operator
+    /// asked for — a half-written override published the `vendor/` and
+    /// `storage/logs/` it existed to hide. Refusing one site is contained
+    /// (other tenants are untouched), loud, and visible to a health check.
+    /// Enforced at the single gate in [`Router::handle`], so it covers the
+    /// static, PHP and WebSocket paths at once.
+    pub(crate) unusable: Option<&'static str>,
     /// Keys in this site's override file that ePHPm did not understand, sorted.
     ///
     /// **Diagnostic only** — nothing routes on it. It rides the resolution so
@@ -220,6 +232,7 @@ impl SiteRoots {
             container: root.clone(),
             document_root: root,
             auto_prepend_file: None,
+            unusable: None,
             unknown_keys: Vec::new(),
         }
     }
@@ -919,6 +932,7 @@ fn resolve_site_roots(
         document_root: over.document_root.unwrap_or_else(|| container.clone()),
         container,
         auto_prepend_file: over.auto_prepend_file,
+        unusable: over.unusable,
         unknown_keys: over.unknown_keys,
     }
 }
@@ -1278,6 +1292,7 @@ impl Router {
         }
         let mut declared: Vec<String> = Vec::new();
         let mut prepends: Vec<String> = Vec::new();
+        let mut unusable: Vec<String> = Vec::new();
         // Collect keys first: `site_roots` takes its own map guards, and holding
         // an iteration guard over `self.sites` across that is fine (different
         // map), but the borrow of `site.container` is not — clone the pairs.
@@ -1291,6 +1306,23 @@ impl Router {
             if let Some(prepend) = &roots.auto_prepend_file {
                 prepends.push(format!("{host} -> {}", prepend.display()));
             }
+            if let Some(reason) = roots.unusable {
+                unusable.push(format!("{host} ({reason})"));
+            }
+        }
+        // Loudest of the three, and at startup: a site in this state serves
+        // nothing at all, and the operator should find out from the boot log
+        // rather than from a 503.
+        if !unusable.is_empty() {
+            unusable.sort_unstable();
+            tracing::error!(
+                overrides_dir = %self.site_overrides_dir.as_deref().unwrap_or(Path::new("")).display(),
+                count = unusable.len(),
+                sites = %unusable.join("; "),
+                "per-site overrides that cannot be honoured — these vhosts REFUSE TO SERVE (503) \
+                 rather than fall back to serving their whole container, which would publish the \
+                 files the override exists to hide. Fix or remove the file"
+            );
         }
         if !declared.is_empty() {
             declared.sort_unstable();
@@ -2602,6 +2634,47 @@ impl Router {
             tracing::Span::current().record("ephpm.site", key);
         }
 
+        // This site's override file exists but could not be honoured, so the
+        // site refuses to serve rather than fall back to serving its whole
+        // container (issue #463).
+        //
+        // `document_root` is a NARROWING instruction. The previous behaviour —
+        // every override failure degrades to "serve the container" — was safe
+        // for availability and the wrong direction for containment: a
+        // provisioning daemon interrupted mid-write, or a typo'd path, put the
+        // tenant's `vendor/`, `.git` and `storage/logs/laravel.log` on the web,
+        // which is precisely what the operator wrote the override to prevent.
+        // Laravel logs routinely carry stack traces with database credentials.
+        //
+        // Refusing is scoped to this ONE site on purpose: refusing to start
+        // would let a single bad tenant file kill every tenant, and serving the
+        // container is the exposure being fixed. It is also the only outcome a
+        // health check notices, which was the half of #429 that actually
+        // mattered — the silent version had a green health check.
+        //
+        // The gate sits here, immediately after the single host->tenant
+        // derivation and before any routing decision, so it covers the static,
+        // PHP and WebSocket-upgrade paths from one place. `Retry-After` is the
+        // override re-read window: a half-written file resolves itself within
+        // it, with no restart.
+        if let Some(reason) = site_roots.unusable {
+            counter!("ephpm_site_override_unusable_total").increment(1);
+            tracing::warn!(
+                site = site_key.as_deref().unwrap_or("-"),
+                reason,
+                "refusing to serve: this site's override file cannot be honoured, and serving \
+                 its container instead would publish files the override exists to hide"
+            );
+            let mut resp = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "503 Service Unavailable: this site's configuration could not be applied",
+            );
+            resp.headers_mut()
+                .insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("2"));
+            self.apply_response_headers(&mut resp);
+            return Ok((resp, "site_override_unusable"));
+        }
+
         // Everything below routes against the WEB root: index files, the
         // fallback chain, static-file containment and PHP-script containment.
         // The container travels separately inside `site_roots` and is what
@@ -3179,6 +3252,10 @@ impl Router {
             document_root,
             container: site_container,
             auto_prepend_file,
+            // Both diagnostic; `unusable` was already turned into a 503 at the
+            // single gate in `handle`, so a request that reaches PHP has an
+            // override that was fully honoured.
+            unusable: _,
             unknown_keys: _,
         } = roots;
         // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
@@ -10080,14 +10157,23 @@ echo "post response";
                 roots.auto_prepend_file, None,
                 "{declaration:?} must not become an executed prepend"
             );
+            assert!(
+                roots.unusable.is_some(),
+                "{declaration:?} is a key we implement with a value we refused — the site must \
+                 fail closed, not serve as if the operator had asked for nothing"
+            );
         }
     }
 
-    /// A rejected prepend must not cost the site its `document_root`. The two
-    /// keys are validated independently, so one bad value in a generated file
-    /// cannot put the tenant's `vendor/` on the web as a side effect.
+    /// A rejected prepend takes the site out of service rather than serving it
+    /// without the environment it was told to inject.
+    ///
+    /// This is the direction change: the two keys are still validated
+    /// independently, but "one key failed, serve anyway" is exactly the silent
+    /// wrong answer #463 was filed about — a preview that renders stock
+    /// WordPress instead of the showcase, with a green health check.
     #[test]
-    fn site_override_rejected_prepend_leaves_the_document_root_applied() {
+    fn site_override_rejected_prepend_takes_the_site_out_of_service() {
         let f = fleet();
         let site = f.site("laravel.test", &["web", "vendor"]);
         f.override_for(
@@ -10096,11 +10182,9 @@ echo "post response";
         );
 
         let roots = f.router().resolve_site("laravel.test").roots;
+        assert!(roots.unusable.is_some(), "a refused prepend must fail closed");
         assert_eq!(roots.auto_prepend_file, None);
-        assert_eq!(
-            roots.document_root,
-            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
-        );
+        // The container is never override-controlled, even in this state.
         assert_eq!(roots.container, site);
     }
 
@@ -10189,6 +10273,138 @@ echo "post response";
         f.remove_override("wp.test");
         router.site_roots_cache.clear(); // stand in for the TTL elapsing
         assert_eq!(router.resolve_site("wp.test").roots.auto_prepend_file, None);
+    }
+
+    // ── The 503 gate: an unusable override must not serve (#463) ───
+
+    /// End to end, through `handle`: a site whose override cannot be honoured
+    /// answers **503**, and the files the override existed to hide are not on
+    /// the web.
+    ///
+    /// This is the containment-direction fix, asserted where it is observable.
+    /// The **control** is what makes it meaningful: with a *valid* override the
+    /// same request for `/vendor/secrets.txt` is already 404 (it is above the
+    /// declared web root), and with **no** override at all it is **200** — the
+    /// old fallback. So the assertion is not "404 happens to be returned", it
+    /// is "a broken override behaves like the narrow root, not the wide one".
+    #[tokio::test]
+    async fn unusable_site_override_serves_503_instead_of_the_container() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["public", "vendor"]);
+        fs::write(site.join("vendor").join("secrets.txt"), b"DB_PASSWORD=hunter2").unwrap();
+        fs::write(site.join("public").join("index.html"), b"<h1>app</h1>").unwrap();
+
+        let host = |h: &str| {
+            Request::builder()
+                .method("GET")
+                .uri("/vendor/secrets.txt")
+                .header("Host", h)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Control 1 — no override: the container IS the web root, so the
+        // secret is served. This is the exposure the mechanism exists to close.
+        let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "control: with no override the container is served, secrets and all"
+        );
+
+        // Control 2 — a valid override: the secret is above the web root.
+        f.override_for("laravel.test", "document_root = \"public\"\n");
+        let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a valid override hides vendor/");
+
+        // The change under test — a half-written override. This used to fall
+        // back to control 1 (200, secret served). It must now refuse.
+        for broken in [
+            "document_root = \"pub",              // truncated mid-write
+            "document_root = \"does-not-exist\"", // typo'd path
+            "document_root = \"../../etc\"",      // traversal
+        ] {
+            f.override_for("laravel.test", broken);
+            let resp = f.router().handle(host("laravel.test"), addr, false).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "broken override {broken:?} must refuse to serve, not fall back to the container"
+            );
+            assert_eq!(
+                resp.headers().get(hyper::header::RETRY_AFTER).map(|v| v.to_str().unwrap()),
+                Some("2"),
+                "the 503 should tell the client when the override re-read window elapses"
+            );
+        }
+    }
+
+    /// The 503 is scoped to the site with the broken file. Refusing to start,
+    /// or refusing globally, would let one bad tenant file kill every tenant —
+    /// the reason this is a per-site failure and not a startup one.
+    #[tokio::test]
+    async fn an_unusable_override_does_not_affect_other_tenants() {
+        let f = fleet();
+        let broken = f.site("broken.test", &[]);
+        let healthy = f.site("healthy.test", &[]);
+        fs::write(broken.join("index.html"), b"broken").unwrap();
+        fs::write(healthy.join("index.html"), b"healthy").unwrap();
+        f.override_for("broken.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let get = |h: &str| {
+            Request::builder()
+                .method("GET")
+                .uri("/index.html")
+                .header("Host", h)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let router = f.router();
+
+        assert_eq!(
+            router.handle(get("broken.test"), addr, false).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            router.handle(get("healthy.test"), addr, false).await.unwrap().status(),
+            StatusCode::OK,
+            "one tenant's broken override must not take down its neighbours"
+        );
+    }
+
+    /// Fixing the file brings the site back within the re-read window — the
+    /// 503 is a live state, not a latch that needs a restart.
+    #[tokio::test]
+    async fn a_repaired_override_brings_the_site_back() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["public"]);
+        fs::write(site.join("public").join("index.html"), b"<h1>app</h1>").unwrap();
+        f.override_for("laravel.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let get = || {
+            Request::builder()
+                .method("GET")
+                .uri("/index.html")
+                .header("Host", "laravel.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let router = f.router();
+        assert_eq!(
+            router.handle(get(), addr, false).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        f.override_for("laravel.test", "document_root = \"public\"\n");
+        router.site_roots_cache.clear(); // stand in for SITE_CONFIG_TTL elapsing
+        assert_eq!(
+            router.handle(get(), addr, false).await.unwrap().status(),
+            StatusCode::OK,
+            "repairing the file must restore service without a restart"
+        );
     }
 
     /// Create a directory symlink, or return `false` when the platform refuses
@@ -10502,30 +10718,40 @@ echo "post response";
     /// `site_overrides`' own tests — the site keeps serving its container.
     /// The writer is trusted, but ePHPm does not take that on faith.
     #[test]
-    fn site_override_bad_declarations_serve_the_container() {
+    fn site_override_bad_declarations_take_the_site_out_of_service() {
         let f = fleet();
         let site = f.site("evil.test", &[]);
 
         for bad in ["../../etc", "..", "/etc", "/", r"C:\Windows", "nope", "web/../.."] {
             f.override_for("evil.test", &format!("document_root = {bad:?}\n"));
-            assert_eq!(
-                f.router().resolve_site("evil.test").roots.document_root,
-                site,
-                "bad declaration {bad:?} must fall back to the container"
+            let roots = f.router().resolve_site("evil.test").roots;
+            assert!(
+                roots.unusable.is_some(),
+                "bad declaration {bad:?} must take the site out of service — falling back to the \
+                 container serves MORE than the operator asked for, which is what the \
+                 declaration existed to prevent"
             );
+            // The container is never override-controlled, even in this state.
+            assert_eq!(roots.container, site);
         }
     }
 
     /// A half-written or malformed override must not break the site — a daemon
     /// interrupted mid-write is a real state.
     #[test]
-    fn site_override_malformed_serves_the_container() {
+    fn site_override_malformed_takes_the_site_out_of_service() {
         let f = fleet();
         let site = f.site("broken.test", &["web"]);
 
         for text in ["document_root =\n", "[[[\n", "not toml at all: {{{\n"] {
             f.override_for("broken.test", text);
-            assert_eq!(f.router().resolve_site("broken.test").roots.document_root, site);
+            let roots = f.router().resolve_site("broken.test").roots;
+            assert!(
+                roots.unusable.is_some(),
+                "a half-written override ({text:?}) must not resolve to the container — that is \
+                 how a daemon interrupted mid-write published vendor/ and storage/logs/"
+            );
+            assert_eq!(roots.container, site);
         }
     }
 
