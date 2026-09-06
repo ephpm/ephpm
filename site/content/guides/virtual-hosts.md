@@ -63,7 +63,7 @@ site_overrides_dir = "/var/lib/ephpm/site-overrides"   # NOT inside sites_dir
 document_root = "public"    # relative to the site container
 ```
 
-The file understands exactly two keys — `document_root` here, and [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below. Anything else is ignored with a warning; see [Failure modes](#failure-modes-all-of-which-serve-the-container).
+The file understands exactly two keys — `document_root` here, and [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
 
 ```
 /var/www/sites/alice-blog.com/     ← the site CONTAINER
