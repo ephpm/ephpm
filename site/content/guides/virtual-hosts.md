@@ -98,7 +98,15 @@ For the same reason ePHPm does not read an application's own manifest (`ephpm.ya
 
 The file must be `<site-key>.toml`, where `<site-key>` is the [canonical site key](#site-identity-the-canonical-site-key) — the same validated `[a-z0-9._-]` string that names the vhost directory, selects `<dir>/<key>.db` and derives the `pdo_mysql` credential. For `Host: alice-blog.com` served from `/var/www/sites/alice-blog.com/`, that is `alice-blog.com.toml`.
 
-**An override under any other name is silently ignored** and the site serves its container. If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory — a daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a site that works but ignores its override, with no error anywhere.
+**An override under any other name is not read at all**, and the site serves its container. This is the one override failure that cannot fail closed — a file ePHPm never opens is indistinguishable from no file — so it is *reported* instead: startup names every `*.toml` in the directory whose stem matches no known vhost.
+
+```
+WARN per-site override files that match no virtual host discovered at startup —
+     these are NOT being read, and any site they were meant for is serving its
+     whole container   files=preview-1234
+```
+
+If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory. A daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a fleet that silently ignores every override it writes. The warning is harmless for a vhost created after startup and discovered lazily, or for leftovers from torn-down sites.
 
 #### Failure modes: a broken override takes the site out of service
 

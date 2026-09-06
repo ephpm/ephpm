@@ -911,10 +911,15 @@ struct CachedSiteRoots {
 ///
 /// `overrides_dir` is `[server] site_overrides_dir` — a directory outside
 /// `sites_dir`, so no tenant can write it (see [`crate::site_overrides`] for why
-/// that placement is the whole design). Every failure mode (absent, unreadable,
-/// malformed, or declaring a `document_root` that escapes its container)
-/// collapses to "serve the container", which is the behaviour that predates this
-/// mechanism.
+/// that placement is the whole design).
+///
+/// An **absent** file resolves to "serve the container", the behaviour that
+/// predates this mechanism. A file that exists but cannot be honoured —
+/// unreadable, malformed, or declaring a `document_root` that escapes its
+/// container — does **not**: it sets [`SiteRoots::unusable`] and the site
+/// refuses to serve. Collapsing that case to "serve the container" resolved
+/// *wider* than the operator asked for, which is the containment bug the
+/// `unusable` field exists to fix.
 ///
 /// Note what this function structurally cannot do: it returns a [`SiteRoots`]
 /// whose `container` is the argument it was given. There is no path by which an
@@ -1310,6 +1315,20 @@ impl Router {
                 unusable.push(format!("{host} ({reason})"));
             }
         }
+        // The last fail-open case, and the only one that cannot be fixed by
+        // failing closed: an override file named for no known vhost is never
+        // read at all, so the site it was meant for serves its whole container
+        // with no error anywhere. ePHPm cannot 503 a site whose file it never
+        // opens — "no file" is the legitimate default — but it can say the
+        // file is there and being ignored, which is the actionable half.
+        //
+        // Startup only, and a *name* mismatch is the whole signal: a daemon
+        // that derives the filename from a different identifier than the vhost
+        // directory produces a fleet that silently ignores every override it
+        // writes. Lazily-discovered vhosts are not known yet at this point, so
+        // the message says so rather than claiming the file is garbage.
+        self.warn_about_orphaned_overrides();
+
         // Loudest of the three, and at startup: a site in this state serves
         // nothing at all, and the operator should find out from the boot log
         // rather than from a 503.
@@ -1349,6 +1368,61 @@ impl Router {
                  it has exactly the reach that tenant's own index.php has"
             );
         }
+    }
+
+    /// Name any `<key>.toml` in the overrides directory that matches no vhost
+    /// discovered at startup.
+    ///
+    /// The filename must be the **canonical site key** — the same string that
+    /// names the vhost directory. A daemon that derives it from a different
+    /// identifier writes files ePHPm never opens, and the symptom is a site
+    /// quietly serving its whole checkout with nothing in any log. That is the
+    /// one override failure that cannot be made to fail closed (a site with no
+    /// file is legitimately serving its container), so naming the stray file is
+    /// the only thing left to do about it.
+    ///
+    /// Runs once, at startup. A directory that cannot be listed is not an
+    /// error — this is a diagnostic, not a gate.
+    fn warn_about_orphaned_overrides(&self) {
+        let orphans = self.orphaned_override_stems();
+        if orphans.is_empty() {
+            return;
+        }
+        let dir = self.site_overrides_dir.as_deref().unwrap_or(Path::new(""));
+        tracing::warn!(
+            overrides_dir = %dir.display(),
+            count = orphans.len(),
+            files = %orphans.join(", "),
+            "per-site override files that match no virtual host discovered at startup — these \
+             are NOT being read, and any site they were meant for is serving its whole \
+             container. The filename must be the canonical site key (the vhost directory name). \
+             Harmless if the vhost is created later and discovered lazily, or if these are \
+             leftovers from torn-down sites"
+        );
+    }
+
+    /// The `<stem>` of every `*.toml` in the overrides directory that matches no
+    /// vhost known at startup, sorted.
+    ///
+    /// Split out from [`Router::warn_about_orphaned_overrides`] so the
+    /// classification — which files count as orphaned — is assertable rather
+    /// than only observable in a log line. Empty when the mechanism is off or
+    /// the directory cannot be listed.
+    fn orphaned_override_stems(&self) -> Vec<String> {
+        let Some(dir) = self.site_overrides_dir.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut orphans: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("toml")))
+            .filter_map(|e| e.path().file_stem()?.to_str().map(str::to_ascii_lowercase))
+            .filter(|stem| !self.sites.contains_key(stem))
+            .collect();
+        orphans.sort_unstable();
+        orphans
     }
 
     /// This vhost's [`SiteRoots`], reading its override file at most once per
@@ -10374,6 +10448,35 @@ echo "post response";
         );
     }
 
+    /// The one remaining fail-open case is at least *named*.
+    ///
+    /// A file whose name is not a canonical site key is never opened, so the
+    /// site it was meant for serves its whole container and nothing anywhere
+    /// says why. ePHPm cannot fail closed on it — a site with no override file
+    /// is legitimately serving its container — so the startup scan reports it.
+    ///
+    /// Asserts the classification, which is the part that can rot: a file that
+    /// *does* match a vhost must not be reported, or the warning becomes noise
+    /// every operator learns to ignore.
+    #[test]
+    fn an_override_named_for_no_vhost_is_named_at_startup() {
+        let f = fleet();
+        f.site("pr-42.preview.test", &["web"]);
+        f.override_for("pr-42.preview.test", "document_root = \"web\"\n"); // matches
+        f.override_for("preview-1234", "document_root = \"web\"\n"); // does not
+        fs::write(f.overrides.join("notes.txt"), b"not an override").unwrap(); // not .toml
+
+        let router = f.router();
+        let orphans = router.orphaned_override_stems();
+        assert_eq!(
+            orphans,
+            vec!["preview-1234".to_string()],
+            "only the .toml whose stem matches no vhost is an orphan"
+        );
+        // And the matching one really did apply, so this is not a vacuous pass.
+        assert!(router.resolve_site("pr-42.preview.test").roots.declared());
+    }
+
     /// The 503 must not reach the reserved `/_ephpm/` namespace.
     ///
     /// Those endpoints are the node's own health, not a tenant's, and they are
@@ -10790,8 +10893,12 @@ echo "post response";
 
     /// The override filename MUST be the canonical site key. A daemon writing
     /// `preview-1234.toml` while the vhost is `pr-42.preview.test` fails open —
-    /// the site serves its container — which is safe but silent, and is exactly
-    /// why the docs spell the naming requirement out.
+    /// the site serves its container — because a file ePHPm never opens is
+    /// indistinguishable from no file at all. It is the one override failure
+    /// that cannot be made to fail closed, so
+    /// [`Router::warn_about_orphaned_overrides`] names the stray file at
+    /// startup instead (pinned by
+    /// [`tests::an_override_named_for_no_vhost_is_named_at_startup`]).
     #[test]
     fn site_override_named_for_another_key_is_ignored() {
         let f = fleet();
