@@ -24,6 +24,7 @@
 //! | Situation | Verdict | Result |
 //! |---|---|---|
 //! | Path outside `prefix` | `CONTINUE` | PHP runs unchanged; `X-Api-Gate: bypass` appended to the response |
+//! | No vhost matched, `require_vhost = true` | `RESPOND` | `404` JSON, PHP never runs (off by default — see *Tenancy* below) |
 //! | Missing / unknown `X-Api-Key` | `RESPOND` | `401` JSON, PHP never runs |
 //! | Key revoked at runtime (KV) | `RESPOND` | `403` JSON, PHP never runs |
 //! | Over the request budget | `RESPOND` | `429` JSON + `Retry-After`, PHP never runs |
@@ -79,6 +80,28 @@
 //! | `prefix` (string) | `"/api/"` | only paths with this prefix are gated |
 //! | `strip_prefix` (string) | unset | removed from the front of the path on `REWRITE` |
 //! | `requests_per_window` (integer) | `100` | budget per tenant per 10-second window |
+//! | `require_vhost` (bool) | `false` | deny requests that matched no virtual host — see the tenancy note |
+//!
+//! # Tenancy: what `vhost_id() == None` means
+//!
+//! [`Request::vhost_id`] is the router's canonical site key, and `None` is
+//! **two** different situations that the ABI (minor 3) cannot tell apart:
+//!
+//! 1. **This node has no tenancy configured** — no `sites_dir`, no
+//!    `[[site]]`, so there is nothing to match and *every* request is `None`.
+//!    That is the majority deployment shape.
+//! 2. **A multi-site node matched nothing** — the `Host` is unrecognised and
+//!    the request is being served from the default document root.
+//!
+//! A module that denies on `None` unconditionally therefore denies 100% of
+//! traffic on shape 1 (issue #453). Denial has to be an operator opt-in, which
+//! is what `require_vhost` is: it defaults to **false**, and the default
+//! behaviour is to treat "no tenant" as one untenanted bucket
+//! ([`ephpm_middleware::UNMATCHED_VHOST`]) — the same choice the stock
+//! `ratelimit` and `maintenance-mode` modules make. The three-way handling in
+//! [`ApiGate::invoke`] is the block the native-middleware guide quotes; a
+//! lockstep test (`tests/guide_snippet.rs`) fails the build if the guide and
+//! this source diverge.
 //!
 //! # Failure posture
 //!
@@ -88,6 +111,9 @@
 //! unavailable, the request is allowed with a warning. Dropping all traffic
 //! because the counter tier hiccuped turns a soft protection into a hard
 //! outage — the same trade-off the builtin `ratelimit` module makes.
+//! Tenancy is **fail-open by default and fail-closed on request**, for the
+//! reason above: the safe default cannot be one that black-holes the most
+//! common node shape.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,6 +146,13 @@ pub struct ApiGate {
     keys: HashMap<String, String>,
     /// Requests allowed per tenant per [`WINDOW_SECS`] window.
     budget: i64,
+    /// Deny a request whose `Host` matched no virtual host. **Off by
+    /// default**, and that default is load-bearing: on a node with no
+    /// `sites_dir` and no `[[site]]` there is nothing to match, so
+    /// `vhost_id()` is `None` on every request and denying would drop all
+    /// traffic (issue #453). Only an operator who knows the node is
+    /// multi-tenant can turn this on.
+    require_vhost: bool,
 }
 
 impl ApiGate {
@@ -193,8 +226,14 @@ impl Middleware for ApiGate {
         if budget <= 0 {
             return Err("`requests_per_window` must be > 0".into());
         }
+        // Absent means false: a module cannot detect for itself whether the
+        // node has virtual hosting, so denying "no tenant" is opt-in.
+        let require_vhost = match config.get("require_vhost") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(v) => v.as_bool().ok_or("`require_vhost` must be a boolean")?,
+        };
 
-        Ok(Self { prefix, strip_prefix, keys, budget })
+        Ok(Self { prefix, strip_prefix, keys, budget, require_vhost })
     }
 
     fn invoke(&self, req: &Request<'_>) -> Response {
@@ -206,6 +245,33 @@ impl Middleware for ApiGate {
         }
 
         let host = req.host();
+
+        // ── The request's tenant scope ────────────────────────────────────
+        // GUIDE-SNIPPET-BEGIN: tenant-scope
+        // Three-way, and only the middle branch is a policy decision.
+        //
+        // `vhost_id()` is the router's canonical site key. `None` does *not*
+        // mean "hostile": it is every request on a single-site node (no
+        // `sites_dir`, no `[[site]]`, so nothing to match) and an unmatched
+        // `Host` on a multi-site one — and the ABI cannot tell those two
+        // apart (issue #453). A bare `let Some(site) = … else { deny }`
+        // therefore denies 100% of traffic on the most common node shape.
+        let vhost = match req.vhost_id() {
+            // A router-resolved tenant. Scope per-site state to this key —
+            // never to `http_host()`, which the client chose.
+            Some(site) => site,
+            // No tenant, and the operator has declared this node multi-tenant
+            // (`require_vhost = true`), so an unmatched `Host` really is
+            // unknown: deny. Opt-in only, for the reason above.
+            None if self.require_vhost => return Self::reject(404, "unknown host"),
+            // No tenant and tenancy is not in use: serve the request as the
+            // single untenanted bucket. `UNMATCHED_VHOST` is unspellable as a
+            // site key, so it cannot collide with a real tenant, and every
+            // unmatched request shares one budget instead of minting a fresh
+            // one per `Host` value (issue #390).
+            None => ephpm_middleware::UNMATCHED_VHOST,
+        };
+        // GUIDE-SNIPPET-END: tenant-scope
 
         // ── RESPOND: authentication (fail-closed) ─────────────────────────
         let Some(tenant) = req.header("X-Api-Key").and_then(|key| self.keys.get(key)) else {
@@ -224,10 +290,6 @@ impl Middleware for ApiGate {
         // ── RESPOND: fixed-window rate limit (fail-open) ──────────────────
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let window = now / WINDOW_SECS;
-        // `vhost_id()` is the canonical site key, `None` when the request
-        // matched no vhost. Bucket those together rather than trusting the
-        // header — otherwise varying `Host` mints a fresh budget.
-        let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
         let key = Self::window_key(vhost, tenant, window);
 
         // One atomic call: increment, and stamp the TTL only if this call
@@ -312,6 +374,11 @@ mod tests {
     /// one store, and a shared tenant would let one test's revocation marker
     /// or window counter decide another test's verdict.
     fn gate_for(tenant: &str) -> ApiGate {
+        gate_with(tenant, false)
+    }
+
+    /// [`gate_for`] with an explicit `require_vhost` setting.
+    fn gate_with(tenant: &str, require_vhost: bool) -> ApiGate {
         let mut keys = serde_json::Map::new();
         keys.insert(format!("k-{tenant}"), serde_json::Value::String(tenant.to_owned()));
         ApiGate::init(&serde_json::json!({
@@ -319,6 +386,7 @@ mod tests {
             "prefix": "/api/",
             "strip_prefix": "/api/v1",
             "requests_per_window": 3,
+            "require_vhost": require_vhost,
         }))
         .expect("init")
     }
@@ -461,5 +529,67 @@ mod tests {
         }
         // Tenant b is unaffected on its first request.
         assert_ne!(invoke(&mw, "vh-split", "/api/x", &b).__status(), 429);
+    }
+
+    /// Issue #453 — the regression this module's tenant-scope block exists to
+    /// prevent, and the one the guide's old snippet would have caused.
+    ///
+    /// A single-site node (no `sites_dir`, no `[[site]]`) matches no virtual
+    /// host, so `Router::resolve_site` returns no key and `vhost_id()` is
+    /// `None` on **every** request — the empty site key below is exactly what
+    /// the router passes in that shape. An authenticated request there must
+    /// still be served. A module written as
+    /// `let Some(site) = req.vhost_id() else { return deny };` fails this
+    /// test with a 404, which is what it would do to 100% of production
+    /// traffic on the majority deployment shape.
+    #[test]
+    fn a_single_site_node_is_served_not_denied() {
+        setup_kv();
+        let resp = invoke(&gate_for("solo"), "", "/api/v1/users", &key_header("solo"));
+        assert_eq!(
+            resp.__action(),
+            ACTION_REWRITE,
+            "an untenanted node must be served, not treated as an unknown host"
+        );
+        assert_eq!(resp.__status(), 0, "no short-circuit response");
+        assert_eq!(find(resp.__headers(), "X-Api-Tenant"), Some("solo"));
+    }
+
+    /// The untenanted bucket is a real, collision-proof scope rather than a
+    /// hole: two requests with no vhost share one budget instead of minting a
+    /// fresh one, and the key they share is the sentinel no site key can spell.
+    #[test]
+    fn untenanted_requests_share_one_budget() {
+        setup_kv();
+        let mw = gate_for("bucket");
+        let mut limited = false;
+        for _ in 0..12 {
+            if invoke(&mw, "", "/api/v1/x", &key_header("bucket")).__status() == 429 {
+                limited = true;
+                break;
+            }
+        }
+        assert!(limited, "untenanted requests must count into one shared budget");
+        assert!(
+            ApiGate::window_key(ephpm_middleware::UNMATCHED_VHOST, "bucket", 0)
+                .contains("_UNMATCHED"),
+            "the shared bucket is keyed by the sentinel, not by a client-supplied host"
+        );
+    }
+
+    /// Denying "no tenant" is legitimate — for an operator who knows the node
+    /// is multi-tenant. It has to be that operator's explicit choice, which is
+    /// what `require_vhost` is; the same request that is served above is
+    /// refused here, and only because the config said so.
+    #[test]
+    fn require_vhost_denies_only_when_the_operator_opted_in() {
+        setup_kv();
+        let resp = invoke(&gate_with("strict", true), "", "/api/v1/users", &key_header("strict"));
+        assert_eq!(resp.__action(), ACTION_RESPOND);
+        assert_eq!(resp.__status(), 404);
+        // A resolved tenant is unaffected by the knob.
+        let ok =
+            invoke(&gate_with("strict2", true), "vh-known", "/api/v1/x", &key_header("strict2"));
+        assert_eq!(ok.__action(), ACTION_REWRITE);
     }
 }
