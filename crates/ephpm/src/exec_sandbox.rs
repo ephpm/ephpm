@@ -176,44 +176,250 @@ pub fn run(
 /// Create and chown the tenant's private state root (`state_root`, `tmp`,
 /// `sessions`) so the dropped command can write session/temp files there.
 ///
-/// Best-effort ownership: the directories are created while still root, tightened
-/// to `0700`, and `chown`ed to the tenant. Mirrors the router's
-/// `ensure_vhost_private_dirs` so an exec'd tenant CLI shares the same private
-/// temp/session tree its HTTP requests use.
+/// This runs **as root, before the privilege drop**, on a tree whose base
+/// (`$TMPDIR/ephpm-vhosts`) is owned by the untrusted tenant uid this feature
+/// exists to contain. Every path component below the trusted temp anchor is
+/// therefore attacker-controlled, so the function never trusts a path *string*
+/// below the anchor: it walks the tree one component at a time with
+/// `openat(O_NOFOLLOW | O_DIRECTORY)`, refusing (`bail!`) any component that is a
+/// symlink, and then tightens (`fchmod`) and hands over (`fchown`) each directory
+/// **through the open file descriptor** — never a path — so a name swapped
+/// mid-operation (TOCTOU) can never redirect the chmod/chown onto a target
+/// outside the tree.
+///
+/// This closes the symlink-follow privilege escalation that a naïve
+/// `chown`/`set_permissions`/`create_dir_all` on `state_root/tmp` (planted by the
+/// tenant as e.g. `state_root/tmp -> /root`) would otherwise turn into local
+/// root. It mirrors the intent of the sibling `privdrop::chown_tree`, which
+/// already uses `lchown` for the same reason, but goes further with `openat`
+/// traversal so even an active mid-operation swap is defeated rather than merely
+/// the static-symlink case.
+///
+/// # Residual TOCTOU
+///
+/// The tenant uid we hand ownership to is the **same** principal that owns the
+/// enclosing `ephpm-vhosts` base, so the only thing an attacker can substitute
+/// for one of our freshly-`mkdir`ed components is (a) a symlink — refused by
+/// `O_NOFOLLOW` — or (b) another directory *they already own*, which `fchown`ing
+/// to that same uid grants them nothing they did not already have. There is no
+/// cross-principal target reachable, which is exactly the escalation the HIGH
+/// finding described.
 #[cfg(target_os = "linux")]
 fn prepare_state_root(
     site: &ephpm_server::router::SandboxSite,
     uid: u32,
     gid: u32,
 ) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
 
     use anyhow::Context as _;
 
-    let tmp = site.state_root.join("tmp");
-    let sessions = site.state_root.join("sessions");
-    for dir in [&site.state_root, &tmp, &sessions] {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+    // The trusted anchor: the system temp dir (root-owned, sticky on a stock
+    // host). We allow the anchor itself to resolve through a symlink (it is
+    // system config, not tenant-writable), but everything below it is opened
+    // O_NOFOLLOW.
+    let anchor = std::env::temp_dir();
+    let rel = site.state_root.strip_prefix(&anchor).with_context(|| {
+        format!(
+            "tenant state root {} is not under the trusted temp anchor {} — refusing \
+             to prepare it",
+            site.state_root.display(),
+            anchor.display()
+        )
+    })?;
+
+    let anchor_fd = open_anchor_dir(&anchor)
+        .with_context(|| format!("failed to open temp anchor {}", anchor.display()))?;
+
+    // Walk each component below the anchor, creating missing ones, refusing any
+    // symlink. `current` ends pointing at the state root itself.
+    let mut current = anchor_fd;
+    for comp in rel.components() {
+        let Component::Normal(name) = comp else {
+            anyhow::bail!(
+                "refusing tenant state root {}: unexpected path component {comp:?} \
+                 (only plain names are allowed below the temp anchor)",
+                site.state_root.display()
+            );
+        };
+        current =
+            open_or_create_dir_nofollow(&current, name.as_bytes(), 0o700).with_context(|| {
+                format!(
+                    "failed to safely open/create state-root component {:?}",
+                    name.to_string_lossy()
+                )
+            })?;
     }
+
+    // Create the two children under the (now fd-pinned) state root.
+    let tmp_fd = open_or_create_dir_nofollow(&current, b"tmp", 0o700)
+        .context("failed to safely open/create the tenant tmp directory")?;
+    let sessions_fd = open_or_create_dir_nofollow(&current, b"sessions", 0o700)
+        .context("failed to safely open/create the tenant sessions directory")?;
+
+    // Hand ownership over via the open fds — never a path — so no symlink or
+    // renamed target can be substituted. Children first, then the root.
+    fchown_dir(&tmp_fd, uid, gid).context("failed to chown the tenant tmp directory")?;
+    fchown_dir(&sessions_fd, uid, gid).context("failed to chown the tenant sessions directory")?;
     // 0700 on the root so only the tenant uid may traverse it.
-    let _ = std::fs::set_permissions(&site.state_root, std::fs::Permissions::from_mode(0o700));
-    for dir in [&site.state_root, &tmp, &sessions] {
-        chown(dir, uid, gid).with_context(|| format!("failed to chown {}", dir.display()))?;
+    fchmod_dir(&current, 0o700).context("failed to tighten the tenant state root to 0700")?;
+    fchown_dir(&current, uid, gid).context("failed to chown the tenant state root")?;
+    Ok(())
+}
+
+/// Open the trusted temp anchor as a directory fd.
+///
+/// The anchor (e.g. `/tmp`) is system configuration rather than tenant-writable,
+/// so this deliberately *follows* a symlinked anchor (some distributions symlink
+/// `/tmp`) but requires the final target to be a directory (`O_DIRECTORY`).
+/// Everything traversed *below* this fd is opened `O_NOFOLLOW`.
+#[cfg(target_os = "linux")]
+fn open_anchor_dir(path: &std::path::Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)?;
+    Ok(file.into())
+}
+
+/// Open `name` beneath `parent` as a directory fd, creating it if absent, and
+/// **refusing any symlink** (`O_NOFOLLOW`).
+///
+/// Returns an [`OwnedFd`](std::os::fd::OwnedFd) pinned to the opened inode, so
+/// callers can `fchown`/`fchmod` it without a path and hence without a
+/// symlink/rename race. Because the parent directory can be tenant-writable, a
+/// bounded retry tolerates a concurrent `mkdir`/`rmdir` race but caps the loop so
+/// an active attacker forces a loud failure rather than a spin.
+#[cfg(target_os = "linux")]
+fn open_or_create_dir_nofollow(
+    parent: &std::os::fd::OwnedFd,
+    name: &[u8],
+    mode: libc::mode_t,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    use anyhow::Context as _;
+
+    let cname = std::ffi::CString::new(name)
+        .map_err(|_| anyhow::anyhow!("path component contains an interior NUL byte"))?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let shown = String::from_utf8_lossy(name).into_owned();
+
+    for _ in 0..16 {
+        // SAFETY: `parent` is a live directory fd for the whole call, `cname` is a
+        // valid NUL-terminated string that outlives it, and `flags` includes
+        // O_NOFOLLOW so the final component is never dereferenced as a symlink.
+        // A non-negative return is a freshly-owned descriptor wrapped in OwnedFd
+        // immediately (closed on drop); the error path reads errno right away.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), cname.as_ptr(), flags, 0) };
+        if fd >= 0 {
+            // SAFETY: `fd` is a fresh, exclusively-owned descriptor (>= 0)
+            // returned by openat; wrapping it transfers ownership so it is closed
+            // exactly once on drop.
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOENT) => {
+                // SAFETY: same argument validity as the openat above; mkdirat
+                // takes a checked path pointer and a scalar mode, return checked.
+                let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), mode) };
+                if rc != 0 {
+                    let mkerr = std::io::Error::last_os_error();
+                    if mkerr.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(mkerr).with_context(|| {
+                            format!("mkdirat failed while preparing state-root component {shown:?}")
+                        });
+                    }
+                    // EEXIST: lost the create race; loop to open it (still
+                    // O_NOFOLLOW, so a symlink planted in the gap is refused).
+                }
+                // Loop to open the (now-existing) directory O_NOFOLLOW.
+            }
+            // O_NOFOLLOW on a symlink surfaces as ELOOP; O_DIRECTORY on a
+            // symlink-to-directory surfaces as ENOTDIR on Linux. Either way the
+            // link was NOT followed and no fd was opened, so the target is never
+            // touched — we just probe (lstat) to report the precise reason.
+            Some(libc::ELOOP) => anyhow::bail!(
+                "refusing to operate on state-root component {shown:?}: it is a \
+                 symlink (symlink attack on the tenant-owned state-root tree)"
+            ),
+            Some(libc::ENOTDIR) => {
+                if symlink_present_at(parent, &cname) {
+                    anyhow::bail!(
+                        "refusing to operate on state-root component {shown:?}: it \
+                         is a symlink (symlink attack on the tenant-owned \
+                         state-root tree)"
+                    );
+                }
+                anyhow::bail!(
+                    "refusing to operate on state-root component {shown:?}: it \
+                     exists but is not a directory"
+                );
+            }
+            _ => {
+                return Err(err)
+                    .with_context(|| format!("openat failed for state-root component {shown:?}"));
+            }
+        }
+    }
+    anyhow::bail!(
+        "gave up opening/creating state-root component {shown:?} after repeated \
+         races — refusing (possible active symlink attack on the tenant-owned \
+         state-root tree)"
+    )
+}
+
+/// Return `true` if `name` beneath `parent` currently exists and is a symlink.
+///
+/// Used only to word the refusal precisely on the `openat` error path — the
+/// actual security enforcement is `O_NOFOLLOW`, which already declined to follow
+/// the link. `fstatat` with `AT_SYMLINK_NOFOLLOW` never dereferences it.
+#[cfg(target_os = "linux")]
+fn symlink_present_at(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `parent` is a live directory fd for the call, `name` is a valid
+    // NUL-terminated C string, `st` is a correctly-sized, writable `stat` buffer,
+    // and AT_SYMLINK_NOFOLLOW means the link itself (not its target) is stat'd.
+    let rc = unsafe {
+        libc::fstatat(parent.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if rc != 0 {
+        return false;
+    }
+    // SAFETY: fstatat returned 0, so `st` is fully initialized.
+    let st = unsafe { st.assume_init() };
+    (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+/// `fchown(2)` a directory through its open fd (never a path).
+#[cfg(target_os = "linux")]
+fn fchown_dir(fd: &std::os::fd::OwnedFd, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `fd` is a live directory descriptor for the duration of the call;
+    // fchown operates on the already-opened inode (no path, no symlink race) and
+    // the return value is checked.
+    if unsafe { libc::fchown(fd.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// `chown(2)` a path to `uid`/`gid`.
+/// `fchmod(2)` a directory through its open fd (never a path).
 #[cfg(target_os = "linux")]
-fn chown(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
+fn fchmod_dir(fd: &std::os::fd::OwnedFd, mode: libc::mode_t) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
 
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    // SAFETY: `c` is a valid NUL-terminated C string that outlives the call; the
-    // return value is checked immediately.
-    if unsafe { libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) } != 0 {
+    // SAFETY: `fd` is a live directory descriptor for the duration of the call;
+    // fchmod operates on the already-opened inode (no path, no symlink race) and
+    // the return value is checked.
+    if unsafe { libc::fchmod(fd.as_raw_fd(), mode) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -283,9 +489,16 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
     ]);
 
     // Read-only: the minimum non-secret /etc a program needs (name resolution,
-    // the loader cache, timezone) plus entropy and /proc for self-inspection.
+    // the loader cache, timezone) plus entropy and /proc/self for self-inspection.
     // Deliberately NOT /etc wholesale — that would expose /etc/ephpm and
     // /etc/shadow. Each is an individual path, so only these leaves are granted.
+    //
+    // Deliberately `/proc/self`, NOT `/proc` wholesale: the exec'd command shares
+    // the `ephpm-web` uid with the *running server*, so a broad `/proc` grant
+    // would let it read the server's `/proc/<server-pid>/environ` and `maps`
+    // (same-uid `0400`) and exfiltrate the server's environment (any `EPHPM_*`
+    // secrets) and address layout. An interpreter/shell needs only its own
+    // `/proc/self/*`; per-pid entries for *other* pids stay unreachable.
     let ro: Vec<PathBuf> = existing(&[
         Path::new("/etc/passwd"),
         Path::new("/etc/group"),
@@ -297,7 +510,7 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
         Path::new("/etc/hosts"),
         Path::new("/dev/urandom"),
         Path::new("/dev/random"),
-        Path::new("/proc"),
+        Path::new("/proc/self"),
     ]);
 
     let status = Ruleset::default()
@@ -404,4 +617,106 @@ pub fn run(
          this platform. (The --no-sandbox DB-bind-only path is not implemented in \
          this build.)"
     )
+}
+
+/// Regression tests for the HIGH symlink-follow privilege escalation in
+/// `prepare_state_root` (the root-privileged setup phase).
+///
+/// These reproduce the reviewed escape — a tenant-planted symlink where a
+/// `state_root` component or `state_root/tmp` should be — and assert the fixed
+/// code **refuses** it and never touches the link's target. They run rootless
+/// (the refusal happens at `openat(O_NOFOLLOW)`, before any `fchown`), and the
+/// `chmod` tell deterministically fails against the pre-fix `create_dir_all` +
+/// `set_permissions` + `chown` implementation, which follows the symlink and
+/// operates on the target.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use ephpm_server::router::SandboxSite;
+
+    /// A unique scratch base directly under the trusted temp anchor, so it is a
+    /// valid `state_root` prefix for [`super::prepare_state_root`].
+    fn unique_base(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base =
+            std::env::temp_dir().join(format!("ephpm-exec-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create scratch base");
+        base
+    }
+
+    fn site_at(state_root: PathBuf) -> SandboxSite {
+        SandboxSite {
+            key: "symtest".to_string(),
+            container: state_root.clone(),
+            document_root: state_root.clone(),
+            state_root,
+            open_basedir: String::new(),
+        }
+    }
+
+    fn current_ids() -> (u32, u32) {
+        // SAFETY: getuid/getgid take no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        // SAFETY: getuid/getgid take no arguments and cannot fail.
+        let gid = unsafe { libc::getgid() };
+        (uid, gid)
+    }
+
+    #[test]
+    fn refuses_symlinked_state_root_component_and_leaves_target_untouched() {
+        let base = unique_base("symcomp");
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).expect("create target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod target 0755");
+        let state_root = base.join("site");
+        std::os::unix::fs::symlink(&target, &state_root).expect("plant symlink");
+        let (uid, gid) = current_ids();
+        let result = super::prepare_state_root(&site_at(state_root), uid, gid);
+        assert!(result.is_err(), "prepare_state_root must refuse a symlinked component");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("symlink"), "error must name the symlink refusal, got: {msg}");
+        let mode = std::fs::metadata(&target).expect("stat target").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target's mode must be untouched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refuses_symlinked_tmp_child_and_leaves_target_untouched() {
+        let base = unique_base("symtmp");
+        let target = base.join("escalate-here");
+        std::fs::create_dir_all(&target).expect("create target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod target 0755");
+        let state_root = base.join("site");
+        std::fs::create_dir_all(&state_root).expect("create real state_root");
+        std::os::unix::fs::symlink(&target, state_root.join("tmp")).expect("plant tmp symlink");
+        let (uid, gid) = current_ids();
+        let result = super::prepare_state_root(&site_at(state_root), uid, gid);
+        assert!(result.is_err(), "prepare_state_root must refuse a symlinked tmp child");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("symlink"), "error must name the symlink refusal, got: {msg}");
+        let mode = std::fs::metadata(&target).expect("stat target").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target's mode must be untouched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn creates_clean_state_root_tree() {
+        let base = unique_base("clean");
+        let state_root = base.join("site");
+        let (uid, gid) = current_ids();
+        super::prepare_state_root(&site_at(state_root.clone()), uid, gid)
+            .expect("clean prepare_state_root should succeed");
+        assert!(state_root.is_dir(), "state root created");
+        assert!(state_root.join("tmp").is_dir(), "tmp created");
+        assert!(state_root.join("sessions").is_dir(), "sessions created");
+        let mode = std::fs::metadata(&state_root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "state root tightened to 0700");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
