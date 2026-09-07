@@ -14,7 +14,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 |------|------:|----------|
 | `basic.rs` | 3 | 404 errors, PHP rendering, static file serving |
 | `http.rs` | 9 | HEAD no body, POST body, content-type static, ETag 304, gzip compression, 413 body too large, cache-control, X-Forwarded-For, fallback to index.php |
-| `php.rs` | 7 | `$_GET`, `$_SERVER` vars, `exit()` output, `http_response_code()`, `$_COOKIE`, `php://input`, custom response header |
+| `php.rs` | 12 | `$_GET`, `$_SERVER` vars, `exit()` output, `http_response_code()`, `$_COOKIE`, `php://input`, custom response header, HTTP auth vars (`PHP_AUTH_USER`/`PW`, `AUTH_TYPE`, empty password, Bearer, no `REMOTE_USER`) |
 | `phpinfo.rs` | 2 | PHP version matching, health check |
 | `php_config.rs` | 1 | PHP configuration validation |
 | `php_extended.rs` | 6 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods, additional PHP behavior |
