@@ -5602,6 +5602,10 @@ void ephpm_set_ws_ops(const EphpmWsOps *ops)
 #include "Zend/zend_extensions.h"
 #include "Zend/zend_highlight.h"
 #include "ext/standard/basic_functions.h"
+/* zend_str_tolower_dup (module-registry lookup) and zend_pass_function (the
+ * fake execute_data frame) for the --rf/--rc/--re/--rz/--ri handlers. */
+#include "Zend/zend_operators.h"
+#include "Zend/zend_execute.h"
 
 /*
  * ub_write callback that writes directly to stdout.
@@ -6245,6 +6249,176 @@ static void cli_usage(void)
 }
 
 /*
+ * Look up an internal class entry by name, the way the engine keys them:
+ * lowercased, in CG(class_table).
+ *
+ * Used to reach the Reflection* class entries. php-cli references the
+ * `reflection_*_ptr` globals directly, but ext/reflection ships no installed
+ * header, so those symbols have no declaration available to this translation
+ * unit. The class table lookup is the same object by a portable route, and it
+ * deliberately does NOT go through zend_lookup_class(): every Reflection class
+ * is internal and always registered, so autoloading is not wanted here.
+ */
+static zend_class_entry *cli_find_class(const char *name)
+{
+    size_t len = strlen(name);
+    char *lcname = zend_str_tolower_dup(name, len);
+    zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), lcname, len);
+    efree(lcname);
+    return ce;
+}
+
+/*
+ * `--rf`/`--rc`/`--re`/`--rz`: construct `new <class_name>($what)` and print it,
+ * mirroring php_cli.c's PHP_CLI_MODE_REFLECTION_* block instruction for
+ * instruction. Returns the exit status (1 when the constructor threw).
+ *
+ * Two details are load-bearing and are the reason this is native C rather than
+ * a `zend_eval_string` of `echo new ReflectionX($name)`:
+ *
+ *   1. The zeroed `zend_execute_data` frame (with `func` pointed at
+ *      `zend_pass_function`) installed around the constructor call is what
+ *      makes the engine report any diagnostic raised during construction as
+ *      "in Unknown on line 0". Evaluated code carries the eval's own filename
+ *      and line instead. That is observable today: on PHP 8.5,
+ *      `--rf Class::method` constructs ReflectionMethod with one argument and
+ *      the resulting deprecation notice is part of the output php-cli prints.
+ *   2. The exception path prints the raw `message` property and swallows the
+ *      exception, so a message containing formatting or newlines is reproduced
+ *      byte for byte, and no uncaught-exception fatal is ever emitted.
+ *
+ * The caller runs this under a bailout guard; nothing here starts one.
+ */
+static int cli_reflection_print(const char *class_name, const char *what)
+{
+    zend_class_entry *pce = cli_find_class(class_name);
+    if (!pce) {
+        /* Not reachable in a stock build — ext/reflection is always compiled
+         * in — but refusing loudly beats a NULL deref if it ever is. */
+        php_printf("Exception: %s is not available in this build.\n", class_name);
+        return 1;
+    }
+
+    zval arg, ref;
+    ZVAL_STRING(&arg, what);
+    object_init_ex(&ref, pce);
+
+    zend_execute_data execute_data;
+    zend_execute_data *orig_execute_data = EG(current_execute_data);
+    memset(&execute_data, 0, sizeof(zend_execute_data));
+    execute_data.func = (zend_function *)&zend_pass_function;
+    EG(current_execute_data) = &execute_data;
+    zend_call_known_instance_method_with_1_params(
+        pce->constructor, Z_OBJ(ref), NULL, &arg);
+    /* php-cli leaves the fake frame installed (it exits straight afterwards);
+     * this CLI keeps running, so the real frame is put back. */
+    EG(current_execute_data) = orig_execute_data;
+
+    int status = 0;
+    if (EG(exception)) {
+        zval rv;
+        zval *msg = zend_read_property_ex(
+            zend_ce_exception, EG(exception), ZSTR_KNOWN(ZEND_STR_MESSAGE),
+            /* silent */ false, &rv);
+        php_printf("Exception: %s\n", Z_STRVAL_P(msg));
+        zend_object_release(EG(exception));
+        EG(exception) = NULL;
+        status = 1;
+    } else {
+        zend_print_zval(&ref, 0);
+        zend_write("\n", 1);
+    }
+    zval_ptr_dtor(&ref);
+    zval_ptr_dtor(&arg);
+    return status;
+}
+
+/*
+ * `--ri`/`--rextinfo`: php-cli's PHP_CLI_MODE_REFLECTION_EXT_INFO branch.
+ *
+ * Three behaviours that a `ReflectionExtension::info()` shim does not have:
+ *   - `main` is php-cli's magic name for the core ini table
+ *     (`display_ini_entries(NULL)`), checked only after the module registry
+ *     misses, so a real extension named "main" would still win;
+ *   - a genuinely absent extension is exit status 1, not 0 (issue #358 — the
+ *     diagnostic text already matched, so a script testing `php --ri <ext>`
+ *     to detect an extension got "present" for everything);
+ *   - the registry lookup is by lowercased name, so `--ri JSON` resolves.
+ *
+ * Returns the exit status. The caller runs this under a bailout guard.
+ */
+static int cli_reflection_ext_info(const char *what)
+{
+    size_t len = strlen(what);
+    char *lcname = zend_str_tolower_dup(what, len);
+    zend_module_entry *module = zend_hash_str_find_ptr(&module_registry, lcname, len);
+    int status = 0;
+
+    if (module == NULL) {
+        if (strcmp(what, "main") == 0) {
+            display_ini_entries(NULL);
+        } else {
+            php_printf("Extension '%s' not present.\n", what);
+            status = 1;
+        }
+    } else {
+        php_info_print_module(module);
+    }
+
+    efree(lcname);
+    return status;
+}
+
+/*
+ * Bailout-protected dispatch for the five reflection options. `opt` is the
+ * php_getopt code from cli_options[] (10 = --rf, 11 = --rc, 12 = --re,
+ * 13 = --rz, 14 = --ri).
+ *
+ * `--rf` splits on "::" exactly as php-cli does — any occurrence, so
+ * `A::B::C` reflects method `B::C` of class `A` and reports `Class "A" does
+ * not exist`, which is what php-cli reports too.
+ */
+static int cli_reflection_protected(int opt, const char *what)
+{
+    /* volatile: written between SETJMP and a possible longjmp, read after. */
+    volatile int status = 0;
+
+    zend_try {
+        if (opt == 14) {
+            status = cli_reflection_ext_info(what);
+        } else {
+            const char *class_name;
+            switch (opt) {
+            case 10: /* --rf */
+                class_name = strstr(what, "::") ? "ReflectionMethod"
+                                                : "ReflectionFunction";
+                break;
+            case 11: /* --rc */
+                class_name = "ReflectionClass";
+                break;
+            case 12: /* --re */
+                class_name = "ReflectionExtension";
+                break;
+            default: /* 13, --rz */
+                class_name = "ReflectionZendExtension";
+                break;
+            }
+            status = cli_reflection_print(class_name, what);
+        }
+    } zend_catch {
+        status = (int)EG(exit_status);
+        if (status == 0) {
+            status = 1;
+        }
+    } zend_end_try();
+
+    /* php-cli carries the status in EG(exit_status) and re-reads it at its
+     * `out:` label; keep the two in step for anything that looks later. */
+    EG(exit_status) = status;
+    return status;
+}
+
+/*
  * PHP CLI main entry point. Parses argc/argv using php_getopt with
  * the same option table as the real PHP CLI, then dispatches to the
  * appropriate PHP APIs.
@@ -6358,55 +6532,31 @@ int ephpm_cli_main(int argc, char **argv)
         case 13: /* --rz / --rzendextension <name> */
         case 14: /* --ri / --rextinfo   <name> */
         {
-            /* Reflection info flags, matching php-cli. Implemented via the
-             * always-compiled Reflection extension, and bailout-protected.
+            /* Reflection info flags. These run php_cli.c's own algorithm in C
+             * (see cli_reflection_protected) rather than evaluating a
+             * `echo new ReflectionX(...)` snippet, because the eval route
+             * cannot reproduce two observable php-cli behaviours:
              *
-             * The name is bound as $__ephpm_r rather than interpolated into
-             * the snippet: a name containing a quote would otherwise change
-             * the code being evaluated.
+             *   - the error context. php-cli constructs the Reflection object
+             *     under a zeroed execute_data frame, so a diagnostic raised by
+             *     the constructor reads "in Unknown on line 0". Evaluated code
+             *     stamps the eval's own name and line. On PHP 8.5 this is not
+             *     hypothetical: `--rf Class::method` builds a ReflectionMethod
+             *     from one argument, which is deprecated, and the notice is
+             *     part of the output.
+             *   - `--rf Class::method` at all. The eval always built a
+             *     ReflectionFunction, so a method name was simply "not a
+             *     function" (issue #358).
              *
-             * A bad name is caught and reported as php-cli reports it —
-             * `Exception: <message>` on stdout, NOT an uncaught-exception
-             * fatal — and, like php-cli, the process then exits 1 (issue
-             * #335: php_cli.c sets EG(exit_status) = 1 in exactly this
-             * branch; the previous comment here claimed status 0 was
-             * php-cli's, which was wrong).
+             * A bad name is reported as php-cli reports it — `Exception:
+             * <message>` on stdout, NOT an uncaught-exception fatal — and,
+             * like php-cli, the process then exits 1 (issue #335).
              *
-             * The status is carried out of PHP by exit(1) in the catch block
-             * rather than by a C-side sentinel: cli_eval_protected already
-             * unwraps PHP 8's unwind-exit and returns EG(exit_status), which
-             * is the same path `-r 'exit(1);'` takes.
-             *
-             * --ri keeps its own message for an absent extension ("Extension
-             * 'x' not present."), also php-cli's. php-cli exits 1 there too,
-             * but that is a different php_cli.c branch (PHP_CLI_MODE_-
-             * REFLECTION_EXT_INFO) whose `--ri main` special case ePHPm does
-             * not implement, so it is left alone here rather than half-matched.
-             */
-            zval reflect_name;
-            ZVAL_STRING(&reflect_name, php_optarg ? php_optarg : "");
-            zend_hash_str_update(
-                &EG(symbol_table), "__ephpm_r", sizeof("__ephpm_r") - 1, &reflect_name);
-
-            const char *expr;
-            switch (c) {
-            case 10: expr = "echo new ReflectionFunction($__ephpm_r), \"\\n\";"; break;
-            case 11: expr = "echo new ReflectionClass($__ephpm_r), \"\\n\";"; break;
-            case 12: expr = "echo new ReflectionExtension($__ephpm_r), \"\\n\";"; break;
-            case 13: expr = "echo new ReflectionZendExtension($__ephpm_r), \"\\n\";"; break;
-            default: /* --ri */
-                expr = "if (!extension_loaded($__ephpm_r)) {"
-                       "  echo \"Extension '\", $__ephpm_r, \"' not present.\\n\";"
-                       "} else { (new ReflectionExtension($__ephpm_r))->info(); }";
-                break;
-            }
-            char code[1024];
-            snprintf(code, sizeof(code),
-                "try { %s } catch (Throwable $e) {"
-                "  echo 'Exception: ', $e->getMessage(), \"\\n\"; exit(1); }",
-                expr);
+             * --ri is a different php_cli.c branch with its own rules
+             * (`main`, and exit 1 for an absent extension); see
+             * cli_reflection_ext_info. */
             cli_begin(&orig_ub_write);
-            result = cli_eval_protected(code, "ephpm php reflection");
+            result = cli_reflection_protected(c, php_optarg ? php_optarg : "");
             php_output_end_all();
             cli_end(orig_ub_write);
             return result;

@@ -1,7 +1,9 @@
 //! `ephpm php` CLI conformance — fatal-error reporting, exit statuses,
 //! startup-time `-d` (OPcache/JIT activation, issue #331), the cli-SAPI
-//! process-title functions (issue #316), and the end-of-request lifecycle
-//! (shutdown functions / destructors / exit-status-from-shutdown, issue #334).
+//! process-title functions (issue #316), the reflection flags
+//! (`--rf`/`--rc`/`--ri`, issues #335 and #358), and the end-of-request
+//! lifecycle (shutdown functions / destructors / exit-status-from-shutdown,
+//! issue #334).
 //!
 //! Regression cover for **issue #321**: on v0.7.0 a fatal error or an uncaught
 //! exception under `ephpm php -r` produced **no output at all and exit 0**,
@@ -693,6 +695,160 @@ fn reflection_of_present_symbol_exits_zero() {
         run.stderr
     );
     assert_eq!(run.code, 0, "a successful --rf must exit 0");
+}
+
+/// `--rf Class::method` reflects a **method**: php-cli branches on `strstr(…,
+/// "::")` and constructs `ReflectionMethod` instead of `ReflectionFunction`.
+/// ePHPm always built a `ReflectionFunction`, so every method name came back
+/// as `Exception: Function Class::method() does not exist` with exit 1 — a
+/// name php-cli reflects fine (issue #358).
+///
+/// On PHP 8.5 php-cli's single-argument `ReflectionMethod` construction is
+/// itself deprecated, and the notice is part of the output (`display_errors`
+/// routes it to **stdout** under the CLI). ePHPm reproduces it, including the
+/// `in Unknown on line 0` context that comes from the zeroed `execute_data`
+/// frame php_cli.c installs around the constructor call — which is why this
+/// path is native C and not an evaluated `new ReflectionMethod(...)` snippet.
+/// The notice text is version-dependent, so it is not asserted here; the
+/// byte-exact comparison lives in the conformance corpus
+/// (`tests/cli-conformance/142-reflection-rf-method`).
+#[test]
+fn reflection_of_class_method_prints_a_method_and_exits_zero() {
+    let Some(bin) = cli_binary() else {
+        eprintln!("EPHPM_CLI_BINARY unset — skipping ephpm php CLI tests");
+        return;
+    };
+
+    let run = run_php(&bin, &["-n", "--rf", "ArrayObject::count"], "");
+    assert!(
+        run.stdout.contains("Method [ <internal"),
+        "--rf ArrayObject::count did not reflect a method:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        !run.output().contains("does not exist"),
+        "--rf ArrayObject::count still reported the method missing:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "--rf on an existing method must exit 0 like php-cli");
+}
+
+/// The failure half of `--rf Class::method`: php-cli reports the *method*
+/// missing (`Method C::m() does not exist`), not the function, and exits 1.
+/// Asserting the message keeps the fix from degrading into "any `::` name
+/// fails with the old `Function …` wording, which also exits 1".
+#[test]
+fn reflection_of_missing_class_method_exits_one() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+
+    let missing_method = run_php(&bin, &["-n", "--rf", "ArrayObject::no_such_method_xyz"], "");
+    assert!(
+        missing_method
+            .stdout
+            .contains("Exception: Method ArrayObject::no_such_method_xyz() does not exist"),
+        "--rf on a missing method lost php-cli's diagnostic:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        missing_method.stdout,
+        missing_method.stderr
+    );
+    assert_eq!(missing_method.code, 1, "--rf on a missing method must exit 1 like php-cli");
+
+    // A `::` name whose *class* is missing is reported against the class.
+    let missing_class = run_php(&bin, &["-n", "--rf", "NoSuchClass_xyz::count"], "");
+    assert!(
+        missing_class.stdout.contains("Exception: Class \"NoSuchClass_xyz\" does not exist"),
+        "--rf on a missing class in a method name lost php-cli's diagnostic:\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        missing_class.stdout,
+        missing_class.stderr
+    );
+    assert_eq!(missing_class.code, 1, "--rf on a missing class must exit 1 like php-cli");
+}
+
+/// `--ri <ext>` on an extension that is **not** loaded: php-cli prints
+/// `Extension 'x' not present.` and sets `EG(exit_status) = 1`
+/// (`PHP_CLI_MODE_REFLECTION_EXT_INFO`). ePHPm printed the identical line and
+/// exited **0**, so the common `php --ri <ext> >/dev/null || install_it`
+/// probe reported every extension present (issue #358).
+///
+/// This is the same *shape* as #335 but a different php_cli.c branch, so it
+/// needs its own assertion — `reflection_of_missing_symbol_exits_one` covers
+/// `--rf`/`--rc` and would stay green with `--ri` still returning 0.
+#[test]
+fn ri_on_absent_extension_exits_one() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "--ri", "no_such_extension_xyz"], "");
+    assert_eq!(
+        run.stdout, "Extension 'no_such_extension_xyz' not present.\n",
+        "--ri on an absent extension lost php-cli's diagnostic:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.code, 1, "--ri on an absent extension must exit 1 like php-cli");
+}
+
+/// The other half: `--ri` on a **present** extension prints its info block and
+/// exits 0. Without this, "make the absent case exit 1" could regress into
+/// "always exit 1" unnoticed. `json` is compiled into every PHP 8 build, so
+/// the case holds on any SDK.
+#[test]
+fn ri_on_present_extension_exits_zero() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "--ri", "json"], "");
+    assert!(
+        run.stdout.contains("json support => enabled"),
+        "--ri json did not print the extension info block:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "--ri on a present extension must exit 0");
+}
+
+/// `--ri main` is php-cli's magic name for the core ini table
+/// (`display_ini_entries(NULL)`), checked only after the module registry
+/// misses. ePHPm treated it as an extension name and answered
+/// `Extension 'main' not present.` (issue #358).
+///
+/// The table's *contents* are configure-time defaults and cannot be compared
+/// against a distro php, which is why the conformance case
+/// (`146-reflection-ri-main`) is skipped and this assertion is the real cover.
+#[test]
+fn ri_main_prints_the_core_ini_table() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "--ri", "main"], "");
+    assert!(
+        run.stdout.contains("Directive => Local Value => Master Value"),
+        "--ri main did not print the core ini table:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        !run.output().contains("not present"),
+        "--ri main was still treated as an extension name:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("precision =>"),
+        "--ri main printed a table without core directives:\n--- stdout ---\n{}",
+        run.stdout
+    );
+    assert_eq!(run.code, 0, "--ri main must exit 0 like php-cli");
 }
 
 /// An unrecognized option: php-cli's `php_getopt(…, show_err = 1)` writes

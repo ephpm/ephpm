@@ -1,0 +1,16 @@
+# `--ri main` is php-cli's magic name for the core ini table
+# (display_ini_entries(NULL)), not an extension name. ePHPm did not implement
+# it and reported "Extension 'main' not present." instead (issue #358); it now
+# prints the same table php-cli does.
+#
+# The table itself cannot be compared: it is a dump of every core ini
+# directive's compiled-in default, and four of those are packaging facts by
+# definition — `extension_dir` and `include_path` are configure-time paths,
+# the static SDK registers an extra `StaticPHP.version` entry, and
+# `zend.signal_check` only exists in a ZEND_SIGNALS build. Same category as
+# 129-modules-list and 130-ini-flag.
+#
+# The behavior this case exists to document — `main` is the ini table, exit 0,
+# and NOT "Extension 'main' not present." — is pinned from the ephpm side by
+# crates/ephpm-e2e/tests/cli.rs::ri_main_prints_the_core_ini_table.
+skip = "the core ini table is a dump of configure-time defaults (extension_dir, include_path, SDK-specific entries) that differ between the embedded SDK build and a distro php by definition"
