@@ -102,7 +102,7 @@ impl BuiltinModule {
     /// `init` panicked. Either way the caller must fail startup (fail-fast,
     /// like a dlopened module whose `init` returns non-zero).
     pub fn init<T: Middleware>(config: &serde_json::Value) -> Result<Self, String> {
-        let instance = catch_unwind(AssertUnwindSafe(|| T::init(config)))
+        let instance = catch_unwind(AssertUnwindSafe(|| crate::init_checked::<T>(config)))
             .map_err(|_| "middleware init panicked".to_owned())??;
         let instance = Arc::new(instance);
         let run = {
@@ -134,7 +134,7 @@ impl BuiltinModule {
     pub fn init_response<T: ResponseMiddleware>(
         config: &serde_json::Value,
     ) -> Result<Self, String> {
-        let instance = catch_unwind(AssertUnwindSafe(|| T::init(config)))
+        let instance = catch_unwind(AssertUnwindSafe(|| crate::init_checked::<T>(config)))
             .map_err(|_| "middleware init panicked".to_owned())??;
         let instance = Arc::new(instance);
         let run = {
@@ -278,6 +278,39 @@ mod tests {
 
     fn probe(mode: &str) -> BuiltinModule {
         BuiltinModule::init::<Probe>(&serde_json::json!({ "mode": mode })).expect("init")
+    }
+
+    /// A module that declares its key set (as all ten in-tree builtins do).
+    struct Strict;
+
+    impl Middleware for Strict {
+        const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["mode"]);
+
+        fn init(_config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self)
+        }
+
+        fn invoke(&self, _req: &Request<'_>) -> Response {
+            Response::cont()
+        }
+    }
+
+    #[test]
+    fn a_declared_key_set_is_enforced_on_this_lane() {
+        BuiltinModule::init::<Strict>(&serde_json::json!({ "mode": "on" })).expect("control");
+        let err = BuiltinModule::init::<Strict>(&serde_json::json!({ "mode": "on", "moed": 1 }))
+            .expect_err("unknown key must fail the mount");
+        assert!(err.contains("unknown config key `moed`"), "{err}");
+        assert!(err.contains("did you mean `mode`"), "{err}");
+    }
+
+    #[test]
+    fn a_module_that_declares_nothing_stays_lenient() {
+        // `Probe` leaves `CONFIG_KEYS` at its default — the position a
+        // third-party module built against an older kit is in. It must still
+        // mount, unknown keys and all.
+        BuiltinModule::init::<Probe>(&serde_json::json!({ "mode": "continue", "extra": 1 }))
+            .expect("an undeclared module must not be made strict behind its back");
     }
 
     #[test]

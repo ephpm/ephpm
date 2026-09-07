@@ -212,6 +212,15 @@ fn opt_string(config: &serde_json::Value, key: &str, default: &str) -> Result<St
 }
 
 impl Middleware for MaintenanceMode {
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&[
+        "key_template",
+        "retry_after",
+        "body",
+        "content_type",
+        "bypass_ips",
+        "bypass_paths",
+    ]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let key_template = opt_string(config, "key_template", DEFAULT_KEY_TEMPLATE)?;
         if key_template.is_empty() {

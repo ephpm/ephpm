@@ -135,9 +135,17 @@ pub struct MiddlewareMount {
     /// equal `order` keep their declaration order. Required — no default.
     pub order: u32,
 
-    /// Arbitrary configuration table for the module, serialised to JSON and
-    /// passed to its `init`. On a `php:` mount the same JSON is what
+    /// Configuration table for the module, serialised to JSON and passed to
+    /// its `init`. On a `php:` mount the same JSON is what
     /// `ephpm_middleware_config()` returns to the script.
+    ///
+    /// The table's *shape* belongs to the module, so it is not validated here.
+    /// It is not unchecked, though: every in-tree builtin declares the keys it
+    /// reads (`ephpm_middleware::Middleware::CONFIG_KEYS`) and a mount naming
+    /// a key its module does not read fails startup, rather than running the
+    /// module's defaults with no diagnostic (issue #473). A third-party
+    /// `dlopen`ed module is checked only if it made the same declaration; a
+    /// `php:` mount's payload is the script's own business.
     ///
     /// Default: unset (the module's `init` receives NULL; a `php:` mount's
     /// `ephpm_middleware_config()` returns `null`).

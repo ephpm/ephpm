@@ -48,6 +48,9 @@ fn opt_string(
 }
 
 impl Middleware for SecurityHeaders {
+    const CONFIG_KEYS: Option<&'static [&'static str]> =
+        Some(&["hsts", "csp", "frame_options", "content_type_options", "referrer_policy"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         Ok(Self {
             hsts: opt_bool(config, "hsts", true)?,

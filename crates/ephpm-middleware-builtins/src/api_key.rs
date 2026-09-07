@@ -173,6 +173,11 @@ impl ApiKey {
 }
 
 impl Middleware for ApiKey {
+    // `keys` is a free-form map of API key -> consumer id: its keys are
+    // operator data, not schema names, so nothing inside it is checkable.
+    const CONFIG_KEYS: Option<&'static [&'static str]> =
+        Some(&["keys", "kv_key_template", "header", "query_param", "consumer_header"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let opt_str = |key: &str| -> Result<Option<String>, String> {
             match config.get(key) {
@@ -317,6 +322,30 @@ mod tests {
         // Valid minimal configs.
         assert!(ApiKey::init(&serde_json::json!({ "keys": { "k": "c" } })).is_ok());
         assert!(ApiKey::init(&serde_json::json!({ "kv_key_template": "apikey:<key>" })).is_ok());
+    }
+
+    /// A misspelled `header` used to leave the module reading the *default*
+    /// `X-Api-Key` (issue #473): an operator who moved the credential to a
+    /// different header still had every request authenticated against the
+    /// header they thought they had stopped using, and the deployment looked
+    /// healthy because the happy path kept working.
+    #[test]
+    fn a_misspelled_key_is_a_startup_error_not_a_silent_default() {
+        let typo = serde_json::json!({ "keys": { "k": "c" }, "heder": "X-Tenant-Key" });
+        let err = ephpm_middleware::init_checked::<ApiKey>(&typo)
+            .map(|_| ())
+            .expect_err("an unknown key must refuse the mount");
+        assert!(err.contains("unknown config key `heder`"), "{err}");
+        assert!(err.contains("did you mean `header`"), "{err}");
+
+        // The default the typo used to fall back to, and the honoured key —
+        // so this test fails if the check ever stops being reached.
+        let lenient = api_key(serde_json::json!({ "keys": { "k": "c" } }));
+        assert_eq!(invoke(&lenient, &hdr("X-Api-Key", "k")).__action(), ACTION_REWRITE);
+        let correct =
+            api_key(serde_json::json!({ "keys": { "k": "c" }, "header": "X-Tenant-Key" }));
+        assert_401(&invoke(&correct, &hdr("X-Api-Key", "k")), "missing api key");
+        assert_eq!(invoke(&correct, &hdr("X-Tenant-Key", "k")).__action(), ACTION_REWRITE);
     }
 
     #[test]

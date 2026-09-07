@@ -11,14 +11,17 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 **Every section rejects keys it does not recognize**, failing startup with an error that names the offending key. This covers `[server]` and all its subsections, `[php]`, `[db]` and all its subsections, `[kv]`, `[cluster]`, `[opcache]`, and `[[middleware]]` / `[[server.proxy]]` blocks.
 
+That now includes the **contents** of a `[[middleware]]` mount's `config` table for the ten built-in modules, which each declare the keys they read: `config = { per_ip_rp = 50 }` on a `ratelimit` mount fails startup with a "did you mean `per_ip_rps`?" instead of silently running the default limit. See [Native middleware → Unknown `config` keys](/guides/native-middleware/#unknown-config-keys) for what stays unchecked (free-form maps, and third-party modules that have not declared a key set).
+
 A key this binary does not declare is far more likely to be a typo — or a knob from a newer version — than something safe to ignore, and ignoring it silently turns an explicit instruction into a no-op that every health check reports green. The case that prompted this: `per_site = true` on a binary predating the knob parsed fine, was dropped on the floor, and brought the node up in whole-database clustered mode with every tenant sharing one database.
 
 The forward-compatibility cost is intended. A config naming a knob your binary does not implement now fails loudly instead of quietly running something else. **If you are upgrading and startup fails naming a key, that key was already doing nothing** — remove it, or upgrade to a build that implements it.
 
-Three things stay lenient on purpose:
+Four things stay lenient on purpose:
 
 - **Unknown *top-level* keys** (outside any section). `EPHPM_`-prefixed environment variables are merged as top-level keys and not all of them are configuration — ePHPm's own Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`, and the e2e harness sets `EPHPM_URL` / `EPHPM_BINARY`. Rejecting these would stop the server starting as a Windows service.
 - **`[db.sqlite.sqld]`**, which exists only so pre-v0.7.0 configs keep parsing (see below).
+- **The `config` payload of a third-party (`dlopen`ed) middleware module**, unless that module declares its key set. The host does not know an out-of-tree module's schema and cannot check it for them; the authoring kit lets a module opt in, and every in-tree module has.
 - **Unknown keys in a per-site override file** (`<[server] site_overrides_dir>/<site-key>.toml`) — a different file, not part of `ephpm.toml`. It understands `document_root` and `auto_prepend_file`; a key it does not implement at all is ignored with a `WARN` naming the file, the site, the keys and a "did you mean" hint, because that file is written by a separately-released provisioning daemon and strict parsing would let one of its deploys take a whole fleet off its web roots. A key ePHPm *does* implement with a value it cannot honour is **not** lenient — that site refuses to serve (503) rather than fall back to serving its container. See [Virtual Hosts → Failure modes](/guides/virtual-hosts/#failure-modes-a-broken-override-takes-the-site-out-of-service).
 
 Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sqld]`, `cdc_experimental`, `engine` — remain accepted and warn.

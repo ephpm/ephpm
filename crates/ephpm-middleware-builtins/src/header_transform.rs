@@ -97,17 +97,31 @@ fn parse_remove(section: &serde_json::Value, path: &str) -> Result<Vec<String>, 
 }
 
 /// Fetch a top-level section object (`request` / `response`), defaulting to a
-/// JSON null (an empty section) when absent. Rejects a non-object section.
+/// JSON null (an empty section) when absent. Rejects a non-object section, and
+/// any key inside it that is not `set` or `remove`.
+///
+/// The section keys are checked here rather than by
+/// [`Middleware::CONFIG_KEYS`], which describes only the top level: this is
+/// the one builtin whose config nests, and `response = { st = {...} }` is
+/// exactly as silent a no-op as a misspelled top-level key (issue #473). Note
+/// `remove` counts as *known* in both sections — `request.remove` is known and
+/// deliberately refused below, which is a better message than "unknown key".
+/// The header names inside `set` are operator data and stay unchecked.
 fn section<'a>(config: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value, String> {
     const NULL: serde_json::Value = serde_json::Value::Null;
     match config.get(key) {
         None | Some(serde_json::Value::Null) => Ok(&NULL),
-        Some(v @ serde_json::Value::Object(_)) => Ok(v),
+        Some(v @ serde_json::Value::Object(_)) => {
+            ephpm_middleware::config::reject_unknown_keys(v, key, &["set", "remove"])?;
+            Ok(v)
+        }
         Some(other) => Err(format!("`{key}` must be an object, got {other}")),
     }
 }
 
 impl Middleware for HeaderTransform {
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["request", "response"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let request = section(config, "request")?;
         let response = section(config, "response")?;
@@ -206,6 +220,37 @@ mod tests {
 
     fn get<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    // ── config strictness (issue #473) ────────────────────────────────────
+
+    /// The only builtin whose config nests, so the top-level `CONFIG_KEYS`
+    /// declaration is not enough on its own: a key misspelled *inside* a
+    /// section is exactly as silent a no-op as one misspelled outside it.
+    #[test]
+    fn an_unknown_key_inside_a_section_is_rejected() {
+        let err = HeaderTransform::init(&serde_json::json!({
+            "response": { "sett": { "X-Frame-Options": "DENY" } }
+        }))
+        .map(|_| ())
+        .expect_err("an unknown section key must refuse the mount");
+        assert!(err.contains("unknown config key `response.sett`"), "{err}");
+        assert!(err.contains("did you mean `response.set`"), "{err}");
+
+        // Header names inside `set` are operator data — never key-checked.
+        let mw = init(serde_json::json!({ "response": { "set": { "X-Anything": "1" } } }));
+        assert_eq!(get(&invoke_response(&mw, vec![]), "X-Anything"), Some("1"));
+    }
+
+    /// `request.remove` is *known* and deliberately refused with a message
+    /// explaining the ABI limit — the key check must not replace that with a
+    /// less useful "unknown key".
+    #[test]
+    fn request_remove_keeps_its_own_explanation() {
+        let err = HeaderTransform::init(&serde_json::json!({ "request": { "remove": ["X-A"] } }))
+            .map(|_| ())
+            .expect_err("request.remove must be refused");
+        assert!(err.contains("is not supported"), "{err}");
     }
 
     // ── request phase ─────────────────────────────────────────────────────

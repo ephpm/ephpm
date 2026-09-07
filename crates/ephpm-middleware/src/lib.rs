@@ -51,6 +51,7 @@
 pub mod abi;
 #[cfg(feature = "host")]
 pub mod builtin;
+pub mod config;
 #[cfg(feature = "host")]
 pub mod host;
 
@@ -83,8 +84,48 @@ pub const UNMATCHED_VHOST: &str = "_UNMATCHED";
 /// The trait a Rust-authored middleware implements. [`declare!`] generates
 /// the C ABI exports around it.
 pub trait Middleware: Sized + Send + Sync + 'static {
+    /// Every top-level `config` key this module accepts, or `None` to opt out
+    /// of the check.
+    ///
+    /// When a module declares its key set, both execution lanes reject a mount
+    /// whose `config` carries a key that is not in it — see [`init_checked`],
+    /// which is what actually runs the check, and the [`config`] module for
+    /// the reasoning. The failure is a startup failure naming the mount, the
+    /// key, and (for a near miss) the key that was probably meant.
+    ///
+    /// Declaring is **opt-in** and the default is `None`, meaning "this module
+    /// has not told the host its key set, so nothing can be checked" — the
+    /// pre-#473 behaviour. That default exists for third-party modules, which
+    /// are built against their own copy of this crate and cannot be assumed to
+    /// have been updated. **All ten in-tree builtins declare their keys**:
+    /// they ship inside the same binary as this check, so there is no
+    /// cross-version skew to tolerate.
+    ///
+    /// Only the top level is described here. A module whose config nests
+    /// (sections, e.g. `header_transform`'s `request` / `response`) checks the
+    /// inner objects itself with
+    /// [`config::reject_unknown_keys`]. Free-form maps whose keys are operator
+    /// *data* rather than schema names — API keys, hostnames, header names —
+    /// must not be checked at all.
+    ///
+    /// ```
+    /// # use ephpm_middleware::{Middleware, Request, Response};
+    /// # struct M;
+    /// impl Middleware for M {
+    ///     const CONFIG_KEYS: Option<&'static [&'static str]> =
+    ///         Some(&["burst", "key_headers", "per_ip_rps"]);
+    /// #   fn init(_c: &serde_json::Value) -> Result<Self, String> { Ok(M) }
+    /// #   fn invoke(&self, _r: &Request<'_>) -> Response { Response::cont() }
+    ///     // ...
+    /// }
+    /// ```
+    const CONFIG_KEYS: Option<&'static [&'static str]> = None;
+
     /// Construct from the mount's `config` block (JSON-serialised from
     /// `ephpm.toml`). Returning `Err` aborts server startup with the message.
+    ///
+    /// Callers go through [`init_checked`], never this directly, so that
+    /// [`Self::CONFIG_KEYS`] is enforced before a module inspects a payload.
     ///
     /// # Errors
     ///
@@ -106,6 +147,25 @@ pub trait Middleware: Sized + Send + Sync + 'static {
     fn describe() -> &'static str {
         ""
     }
+}
+
+/// Enforce [`Middleware::CONFIG_KEYS`], then build the module.
+///
+/// The single construction path for both execution lanes — the in-process
+/// [`builtin::BuiltinModule`] registry and the [`declare!`] C ABI glue — so a
+/// module cannot be strict on one lane and lenient on the other. A module that
+/// declares no key set (the default) reaches its own `init` unchanged.
+///
+/// # Errors
+///
+/// The unknown-key message from [`config::reject_unknown_keys`], or whatever
+/// the module's own `init` returned. Both abort server startup; the host adds
+/// the mount name.
+pub fn init_checked<T: Middleware>(config: &serde_json::Value) -> Result<T, String> {
+    if let Some(accepted) = T::CONFIG_KEYS {
+        config::reject_unknown_keys(config, "", accepted)?;
+    }
+    T::init(config)
 }
 
 /// The optional **response phase** of a middleware. A module implements this
@@ -850,7 +910,11 @@ macro_rules! declare {
                     }
                 };
 
-                let built = std::panic::catch_unwind(|| <$ty as $crate::Middleware>::init(&config));
+                // `init_checked`, not `Middleware::init`: a module that declares
+                // `CONFIG_KEYS` is strict on this lane too, so the dlopened
+                // shells over the in-tree builtins behave like the in-process
+                // registry (issue #473).
+                let built = std::panic::catch_unwind(|| $crate::init_checked::<$ty>(&config));
                 match built {
                     Ok(Ok(instance)) => {
                         let _ = INSTANCE.set(instance);

@@ -188,6 +188,8 @@ impl RequestId {
 }
 
 impl Middleware for RequestId {
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["header", "trust_inbound"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let header = opt_string(config, "header", "X-Request-Id")?;
         if header.is_empty() {
