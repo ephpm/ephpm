@@ -1,13 +1,15 @@
 # `ephpm exec` — Run a Command Inside a Virtual Host's Tenant Sandbox
 
-> **Status: design spike — not implemented.** Nothing on this page ships. It is
-> a written proposal for a new `ephpm exec --site <key> -- <command...>`
-> subcommand, backed by the current code it would reuse (every file reference
-> below was read while writing this). Anything described in the future tense is
-> *planned*, not present. There is no `exec` subcommand in
-> `crates/ephpm/src/main.rs` today — the CLI surface is `serve` / `dev` / `php`
-> / `kv` / `cache` / service management. Treat the sandboxed form as
-> **Linux-only** for the reasons in [Windows](#windows-the-honest-story).
+> **Status: design spike + working proof-of-concept.** The containment core —
+> uid drop + Landlock filesystem scope + the uid-keyed egress firewall — is
+> **implemented and confirmed on a live preview node** (see
+> [PoC status](#poc-status--implemented-and-confirmed-on-a-preview-node-linux)).
+> A `Commands::Exec` subcommand now exists in `crates/ephpm/src/main.rs`
+> (`crates/ephpm/src/exec_sandbox.rs`). Parts still described in the future tense
+> — the per-site DB bind (#471), per-site-clustered owner-refusal, `setrlimit`
+> caps, and the switchboard integration — are **planned, not present**, and are
+> called out where they appear. Treat the sandboxed form as **Linux-only** for
+> the reasons in [Windows](#windows-the-honest-story).
 
 ## Why this exists — three things it unifies
 
@@ -344,51 +346,109 @@ The line: switchboard stays the privileged control plane (fetch, configure,
 sequence, talk to the daemon); `ephpm exec` becomes the sandboxed execution
 primitive it delegates the actual tenant-scoped work to.
 
-## PoC status — deliberately not written (judgment call)
+## PoC status — implemented and confirmed on a preview node (Linux)
 
-The brief allows an optional PoC proving *uid drop + Landlock filesystem scope +
-running a command* (no DB bind required). **This spike ships design only, no
-PoC**, for one honest reason: the entire sandbox path is `cfg(target_os =
-"linux")`, and this spike was produced on a Windows host where that code cannot
-be compiled, `clippy`-checked under the Linux `cfg`, or run. A PoC I cannot
-build or exercise here would be untested `cfg(linux)` unsafe FFI + a new
-`landlock` crate dependency added blind — that *removes* risk from the design on
-paper while *adding* the risk of shipping broken platform-gated code that CI's
-stub-mode legs (which don't set the Linux sandbox cfg meaningfully) wouldn't
-catch. That trade is backwards for a spike whose job is to de-risk.
+**A working proof-of-concept ships alongside this doc** and was confirmed on a
+live preview node (Debian 13, kernel 6.12, glibc 2.41). It proves the security
+property this design exists for — *uid drop + Landlock filesystem scope + the
+egress firewall*, no DB bind — and closes the exact root-RCE hole the switchboard
+build step exposes.
 
-What the PoC *would* look like, kept cheap for whoever picks it up on Linux:
+What shipped, all of it stub-mode-clean (no PHP SDK needed) and
+`clippy`-pedantic + `-D warnings` clean:
 
-- New `Commands::Exec { site, config, timeout, no_sandbox, command: Vec<String> }`
-  in `crates/ephpm/src/main.rs`, `--` capturing the trailing command (clap
-  `trailing_var_arg` + `allow_hyphen_values`, mirroring how `Php { args }`
-  already slurps PHP flags).
-- A `crates/ephpm/src/exec_sandbox.rs` (or a small `ephpm-sandbox` crate) with a
-  `#[cfg(target_os = "linux")]` impl and a `#[cfg(not)]` refuse-stub, matching
-  the `privdrop` shape exactly.
-- Reuse `privdrop`'s `resolve_user` + the `setgroups`/`setgid`/`setuid` sequence
-  verbatim (factor it out of `ephpm-server::privdrop` into a shared spot so both
-  the server drop and exec drop share one audited implementation).
-- Add `landlock = "0.4"` (pure Rust, ABI 1–4, MSRV-compatible) for the
-  filesystem ruleset; `libc` (already a dep) for `setrlimit`.
-- Prove it with a Linux integration test: `ephpm exec --site t -- cat
-  /etc/ephpm/ephpm.toml` is denied (Landlock), `id -u` prints `997` (drop), and
-  a command under the docroot succeeds — no PHP SDK needed for any of it.
+- `Commands::Exec { config, site, timeout, no_sandbox, command }` in
+  `crates/ephpm/src/main.rs` — `--` captures the trailing command (clap
+  `trailing_var_arg` + `allow_hyphen_values`), mirroring `Php { args }`.
+- `crates/ephpm/src/exec_sandbox.rs` — a `#[cfg(target_os = "linux")]` impl and a
+  `#[cfg(not)]` refuse-stub, matching the `privdrop` shape. Layer order:
+  resolve site → `PR_SET_NO_NEW_PRIVS` → Landlock (ABI v1, best-effort, refuse if
+  `NotEnforced`) → irreversible uid drop → `chdir` → `execvp`. `--timeout` arms
+  `alarm(2)` (survives `execve`; default `SIGALRM` terminates).
+- `ephpm_server::router::resolve_sandbox_site(config, key)` — the site derivation
+  reused verbatim from the request path (`resolve_site` → container +
+  `vhost_state_root`), so the exec sandbox is not a *second*, divergent
+  derivation of tenant identity (issues #290/#291). Pinned by
+  `router::tests::resolve_sandbox_site_matches_request_derivation_and_fails_closed`.
+- `privdrop::drop_to_user(uid, gid)` — the `setgroups`/`setgid`/`setuid` +
+  fail-closed verification, **factored out** of `drop_privileges` so the server
+  drop and the exec drop share one audited implementation; `resolve_user` /
+  `resolve_group` are now `pub` for the same reuse.
+- `landlock = "0.4"` added Linux-only (`libc` was already a dep).
 
-Estimated at more than "a couple hours" once clippy-pedantic + nightly-fmt +
-stub-mode-still-builds + a Linux CI leg to actually exercise it are included,
-and none of it is meaningfully verifiable from this host — so per the brief's
-own guidance ("if a PoC would be more than a couple hours … don't"), it is left
-as the first implementation step, not part of the spike.
+### The confirmed before/after (identical benign probe, run twice)
+
+The site config used was a throwaway (`sites_dir` under `/tmp`), but the probe
+read the node's **real** `/etc/ephpm/ephpm.toml` — the file that holds the
+cluster gossip secret, owned `640 ephpm-web:ephpm-web` (uid 997).
+
+| Probe check | Baseline: run as **root** | Via `ephpm exec --site` | Closed by |
+|---|---|---|---|
+| `id` | `uid=0(root)` | `uid=997(ephpm-web) gid=989` | **uid drop** (`setuid`, irreversible) |
+| `whoami` | `root` | `ephpm-web` | uid drop |
+| write `/root/.sb-poc` | YES | **NO** | Landlock (path not granted) + DAC |
+| read `/etc/shadow` (`open`) | YES | **NO** | DAC (997 ∉ `shadow`) + Landlock |
+| read `/etc/ephpm/ephpm.toml` (`open`) | YES | **NO** | **Landlock only** — see below |
+| `test -r /etc/ephpm/ephpm.toml` (`access(2)`) | YES | **YES** | *nothing* — the tell |
+
+**The sharpest evidence is the last two rows.** `/etc/ephpm/ephpm.toml` is owned
+by uid 997, so after the drop DAC *still permits* the read — `test -r`
+(`access(2)`, which Landlock does not intercept) returns **YES** exactly as it
+did for root. But the actual `open()` returns **NO**. The only layer that can
+account for that gap is **Landlock**: the uid drop alone does not close the
+secret read, Landlock does. That is the whole design's leverage made visible in
+one probe. Landlock reported `FullyEnforced` at ABI v1 on the 6.12 kernel — no
+partial negotiation.
+
+### Firewall layer confirmed too
+
+The uid-997 drop arms the host's `inet ephpm_egress` nftables table with zero
+extra ePHPm code (it keys on `skuid`, `meta skuid != 997 accept`). Demonstrated
+on the node: **root** connects to `127.0.0.1:22` (bypasses the table); the
+**tenant (997)** hangs on the same loopback connect and is `alarm`-killed by
+`--timeout` (`127.0.0.0/8 drop` for 997) — while the tenant's connect to the
+*allowed* public DNS `1.1.1.1:53` **succeeds**. So it is specifically the
+uid-keyed egress policy, not a blanket network cut, and it arms automatically.
+
+### Honest limits / caveats
+
+- **Landlock ABI floor.** The impl pins ABI **v1** best-effort and refuses if the
+  kernel reports `NotEnforced` (fail-closed). It has not been exercised below
+  ABI v1 (a mount-namespace fallback is a follow-up, not built).
+- **`access(2)` is Landlock-blind.** As the table shows, a tenant can still learn
+  a path is DAC-readable via `test -r`; it just cannot `open` it. Code that keys
+  a decision on `access(2)` rather than a real open would be misled — an
+  in-kernel property of Landlock, worth stating.
+- **`--no-sandbox` on Linux removes all containment** (loudly warned) and exists
+  only for the future Windows DB-bind path; on non-Linux the subcommand refuses.
+- **`setrlimit` / cgroup caps not built** — only the `alarm(2)` wall-clock
+  timeout is. Memory/CPU/pids ceilings are follow-up.
+- The DB bind (`TODO(#471)`) and per-site-clustered owner-refusal are **not**
+  wired — out of scope for proving containment, marked `TODO` in the module.
+
+### Intended switchboard call site (follow-up, not in this PR)
+
+Switchboard runs manifest `build:` / `seed:` steps as **root** today — the RCE
+surface. The one-line change is to run each step as, instead of `bash -c "$step"`:
+
+```text
+ephpm exec --config /etc/ephpm/ephpm.toml --site <key> -- bash -c "$step"
+```
+
+which inherits the uid drop, Landlock scope, and egress lock. Rewriting
+switchboard's deployer is a separate change in that repo, deliberately not made
+here.
 
 ## Open questions for review
 
-- **Factor `privdrop` credential-drop into a shared module?** Both the server
-  drop and exec drop want the identical audited `setgroups`/`setgid`/`setuid` +
-  fail-closed verification. One copy, two callers.
-- **Landlock ABI floor.** Preview nodes are 6.12 (ABI 4+ available). What is the
-  minimum supported kernel — refuse below Landlock ABI 3, or fall back to a
-  mount namespace? Refusing is simpler and fail-closed.
+- ~~**Factor `privdrop` credential-drop into a shared module?**~~ **Done in the
+  PoC** — `privdrop::drop_to_user(uid, gid)` is the one audited
+  `setgroups`/`setgid`/`setuid` + fail-closed copy, called by both the server
+  drop and `ephpm exec`.
+- **Landlock ABI floor.** Preview nodes are 6.12; the PoC pins ABI **v1**
+  best-effort and refuses on `NotEnforced` (fail-closed, confirmed
+  `FullyEnforced` on the node). Open: raise the pinned ABI for finer rights, or
+  add a mount-namespace fallback below v1? Refusing is simplest.
 - **cgroup placement.** Is a transient per-exec cgroup (memory/pids cap) worth
   it for a first cut, or are `setrlimit` + wall-clock timeout sufficient? This
   spike says rlimits are sufficient to start.

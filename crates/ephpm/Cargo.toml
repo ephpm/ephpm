@@ -60,6 +60,13 @@ tracing-subscriber.workspace = true
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 
+# Landlock filesystem sandbox for `ephpm exec` (see src/exec_sandbox.rs). Pure
+# Rust, ABI 1–4, no CAP_SYS_ADMIN, MSRV-compatible. Linux-only: the crate only
+# builds meaningfully on Linux and the sandboxed exec path is `cfg(target_os =
+# "linux")`. Other Unixes (macOS) refuse the subcommand at runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 windows-sys = { version = "0.59", features = [

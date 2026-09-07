@@ -5905,6 +5905,97 @@ fn vhost_open_basedir_value(document_root: &Path, state_root: &Path) -> String {
     format!("{}{separator}{}", document_root.display(), state_root.display())
 }
 
+/// A virtual host's filesystem sandbox profile, resolved for an out-of-request
+/// caller such as `ephpm exec --site <key>`.
+///
+/// This is the **same** derivation a request goes through
+/// ([`Router::resolve_site`] → [`Router::site_roots`] →
+/// [`vhost_state_root`]), exposed as a one-shot so a CLI can reconstruct a
+/// tenant's on-disk boundary without standing up a full [`Router`] or, worse,
+/// re-deriving it from a `Host` header (the exact divergence issues #290/#291
+/// exist to prevent). The `key` passed in is treated as an already-canonical
+/// site key (the vhost directory name), normalized and allowlist-checked here
+/// the same way `resolve_site` treats a stripped host.
+pub struct SandboxSite {
+    /// The canonical, normalized, allowlist-clean site key.
+    pub key: String,
+    /// The site **container** — the vhost directory. This is the
+    /// `open_basedir` boundary and the input to [`vhost_state_root`], exactly
+    /// as on the request path (never the `public/` web root).
+    pub container: PathBuf,
+    /// The web root — the container, or its override-declared `public/`-style
+    /// subdirectory. Where an exec'd command should `chdir` and what
+    /// `DOCUMENT_ROOT` would be. Equal to `container` when no override applies.
+    pub document_root: PathBuf,
+    /// This tenant's private temp/session root under `ephpm-vhosts/`.
+    pub state_root: PathBuf,
+    /// The `open_basedir`-shaped path list (`container:state_root`) — the two
+    /// filesystem locations a sandbox should grant read/write, and the string
+    /// a `--no-sandbox` PHP path would still set as the PHP directive.
+    pub open_basedir: String,
+}
+
+/// Resolve `--site <key>` to its filesystem sandbox profile against a loaded
+/// [`Config`], reusing the request-path derivation verbatim.
+///
+/// Fails closed the same way a request does: an invalid key, a config without
+/// `[server] sites_dir` (single-site mode has no tenant to name), or a key with
+/// no matching directory under `sites_dir` all error rather than falling back
+/// to a wider default document root.
+///
+/// # Errors
+///
+/// Returns an error if `key` is not a valid site key, if `[server] sites_dir`
+/// is unset, or if `sites_dir/<key>` is not an existing directory.
+pub fn resolve_sandbox_site(config: &Config, key: &str) -> anyhow::Result<SandboxSite> {
+    let clean = normalize_host_key(key);
+    if !is_valid_site_key(&clean) {
+        anyhow::bail!("invalid site key {key:?} (must be a bare vhost name, no slashes or dots)");
+    }
+
+    let sites_dir = config.server.sites_dir.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[server] sites_dir is not configured — `ephpm exec --site` requires \
+             multi-tenant (vhost) mode; there is no per-site sandbox to enter in \
+             single-site mode"
+        )
+    })?;
+
+    let container = sites_dir.join(&clean);
+    if !container.is_dir() {
+        anyhow::bail!("no virtual host {clean:?}: {} is not a directory", container.display());
+    }
+
+    // Reuse the override-aware web-root resolution the router uses. Without a
+    // configured overrides dir the roots are flat (document_root == container).
+    let roots = match config.server.effective_site_overrides_dir() {
+        Some(overrides_dir) => {
+            let prepend = if config.php.is_worker_mode() {
+                crate::site_overrides::PrependSupport::NoWorkerMode
+            } else {
+                crate::site_overrides::PrependSupport::Yes
+            };
+            resolve_site_roots(container.clone(), overrides_dir, &clean, prepend)
+        }
+        None => SiteRoots::flat(container.clone()),
+    };
+
+    // The state root and open_basedir key on the CONTAINER, not the web root —
+    // matching `Router::handle` (which passes `site_container` to
+    // `ensure_vhost_private_dirs` and `vhost_open_basedir_value`) so a site that
+    // gains or loses a `public/` never re-homes its sessions/temp.
+    let state_root = vhost_state_root(&roots.container);
+    let open_basedir = vhost_open_basedir_value(&roots.container, &state_root);
+
+    Ok(SandboxSite {
+        key: clean,
+        container: roots.container,
+        document_root: roots.document_root,
+        state_root,
+        open_basedir,
+    })
+}
+
 /// Per-vhost private state root — the parent directory that holds this
 /// tenant's `tmp/` and `sessions/` subdirectories.
 ///
@@ -6550,6 +6641,54 @@ mod tests {
             .header("host", host)
             .body(Empty::<Bytes>::new())
             .unwrap()
+    }
+
+    /// `resolve_sandbox_site` (the `ephpm exec` site derivation) must agree with
+    /// the request path — state root and `open_basedir` key on the CONTAINER —
+    /// and fail closed for an unknown site, an invalid key, and single-site mode.
+    #[test]
+    fn resolve_sandbox_site_matches_request_derivation_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let sites_dir = root.path().join("sites");
+        fs::create_dir_all(sites_dir.join("shop")).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: root.path().join("docroot"),
+                sites_dir: Some(sites_dir.clone()),
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+
+        let site = super::resolve_sandbox_site(&config, "shop").unwrap();
+        assert_eq!(site.key, "shop");
+        assert_eq!(site.container, sites_dir.join("shop"));
+        // No overrides dir configured, so the web root is the container itself.
+        assert_eq!(site.document_root, sites_dir.join("shop"));
+        // The state root and open_basedir are derived from the CONTAINER,
+        // byte-identical to what `Router::handle` builds per request.
+        assert_eq!(site.state_root, super::vhost_state_root(&site.container));
+        assert_eq!(
+            site.open_basedir,
+            super::vhost_open_basedir_value(&site.container, &site.state_root)
+        );
+
+        // A host key normalizes the same way a request host does.
+        assert_eq!(super::resolve_sandbox_site(&config, "SHOP").unwrap().key, "shop");
+
+        // Fail closed: unknown site, traversal-shaped key, and single-site mode.
+        assert!(super::resolve_sandbox_site(&config, "does-not-exist").is_err());
+        assert!(super::resolve_sandbox_site(&config, "../etc").is_err());
+
+        let mut single = config;
+        single.server.sites_dir = None;
+        assert!(super::resolve_sandbox_site(&single, "shop").is_err());
     }
 
     /// `[server] preview = true` stamps `X-Ephpm-Preview: 1` on every
