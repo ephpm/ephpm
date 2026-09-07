@@ -48,6 +48,14 @@ sudo ./ephpm install
 
 Multi-tenant hosting gives every virtual host its own Turso database, cache keyspace and session state. Native WebSockets are held by the server and dispatched to PHP per event. Two execution modes: a worker mode that boots your framework once, and a per-request mode that behaves like PHP-FPM.
 
+## Preview environments
+
+Open a pull request and it deploys as a running site at its own hostname, with its own database, cache keyspace and session state — the same isolation every virtual host gets. Merge or close the PR and the site is removed, database included.
+
+Two pieces do it: a daemon that fetches the branch, builds it and installs it as a vhost, and a small PHP application that receives the GitHub webhooks — itself running on ePHPm. You run both on your own cluster; there is no hosted service.
+
+[PR previews for your app →](/guides/pr-previews/) · [Running the preview bot →](/guides/preview-bot/)
+
 ## Runs
 
 WordPress · Laravel · Symfony · any PSR-15 application
