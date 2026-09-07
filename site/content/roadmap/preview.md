@@ -20,7 +20,10 @@
 >   [DNS-01 ACME lane](/guides/tls-acme/#dns-01-challenge-wildcards) issues the
 >   `*.preview.<domain>` wildcard in-process — no out-of-band certbot/lego step.
 > - **What is still design:** multi-PHP-version routing, stale-preview GC and
->   per-preview disk quotas, sandboxed (containerized) build steps, and
+>   per-preview disk quotas, sandboxed build steps
+>   ([`ephpm exec`](/roadmap/ephpm-exec-sandboxed-vhost/) — reuse ePHPm's
+>   per-vhost isolation instead of a container, since switchboard currently runs
+>   `build:`/`seed:` as root, unsandboxed), and
 >   scale-out past one VM. Cluster mode exists but is not live-validated.
 >
 > **How it works and how to install it now live in the
