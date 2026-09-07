@@ -11,6 +11,8 @@ type = "docs"
 
 ePHPm is an application server for PHP, written in Rust. The Zend engine is compiled in as a static library and executed via FFI on the server's own worker threads — there is no PHP-FPM pool and no FastCGI socket between the web server and the interpreter. HTTP is served by hyper on tokio; the PHP context lives on the same threads that accept the connection.
 
+It is a drop-in replacement for that stack. Point it at a document root and your application runs unmodified — the same code, the same drivers, the same framework configuration. There is nothing to port and no ePHPm-specific API you have to adopt.
+
 The services a PHP application normally reaches over a network are compiled in beside it. The database is **Turso**, the pure-Rust rewrite of SQLite, with MVCC and concurrent writers. The cache is a **DashMap**. Both live in the server process, and there are two ways to reach them.
 
 Existing code keeps its drivers. **litewire** puts Turso behind the MySQL, PostgreSQL, Hrana and TDS wire protocols, so a `pdo_mysql` connection to `127.0.0.1:3306` works untouched, and the cache answers RESP2, so any Redis client library connects and talks the protocol it expects. Nothing has to change to run.
