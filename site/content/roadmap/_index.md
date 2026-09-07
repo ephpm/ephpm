@@ -18,6 +18,7 @@ These pages describe targets, not currently-shipped behavior. For what works tod
 - **[The Deploy Story](deploy-warmup/)** — post-invalidation warmup, `ephpm doctor <framework>`, `cache status`, thin deploy hooks.
 - **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot. **Shipped end to end** — the runtime half plus the [`ephpm/switchboard`](https://github.com/ephpm/switchboard) daemon, the [`ephpm/switchboard-api`](https://github.com/ephpm/switchboard-api) webhook receiver, and in-process wildcard certs via DNS-01. See the [PR Preview Bot guide](/guides/preview-bot/) to install it; this roadmap page now holds only the remaining design items (multi-PHP routing, GC/quotas, sandboxed builds, scale-out).
 - **[OPcache Clustering & Per-Vhost Preload](opcache-clustering/)** — Phase 1 (cluster-wide invalidation) shipped in 0.4.0; per-vhost preload and worker-mode invalidation remain.
+- **[`ephpm exec` — Sandboxed Vhost Commands](ephpm-exec-sandboxed-vhost/)** — run an arbitrary command inside a virtual host's tenant sandbox (uid-drop + Landlock + per-site DB bind). Unifies switchboard's build sandbox, issue #471 (CLI DB access), and operator cron/migrations.
 - **[Symfony Runtime Adapter](symfony-runtime-driver/)** — native `ephpm` adapter under `symfony/runtime`, on top of the shipped worker-mode engine.
 - **[Kubernetes Operator](kubernetes/)** — first-class K8s deployment.
 - **[Edge Deployments](edge/)** — running ePHPm at the edge.

@@ -99,14 +99,46 @@ pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
     // directory that exists is surfaced.
     chown_runtime_dirs(config, uid, gid)?;
 
+    drop_to_user(uid, gid)?;
+
+    tracing::info!(
+        uid,
+        gid,
+        "dropped privileges: process now runs unprivileged (single non-root uid — \
+         NOT per-tenant; cross-tenant isolation still rests on open_basedir + \
+         disable_functions)"
+    );
+    Ok(())
+}
+
+/// The irreversible credential drop itself: `setgroups` → `setgid` → `setuid`,
+/// then a fail-closed verification that the drop took and cannot be undone.
+///
+/// Factored out of [`drop_privileges`] so the one-shot sandboxed exec path
+/// (`ephpm exec`) and the long-running server share a single audited
+/// implementation of the sequence. This function performs **only** the
+/// credential syscalls — it does not `chown` anything, resolve names, or log a
+/// summary; the caller owns that context. The process must be `euid == 0` when
+/// this is called (checked by [`drop_privileges`]; the exec path checks it too).
+///
+/// # Errors
+///
+/// Returns an error if any `set*id` syscall fails, if the post-drop identity is
+/// not exactly `(uid, gid)`, or if root can still be regained afterwards
+/// (`seteuid(0)` succeeds) — a reversible or partial drop must never be mistaken
+/// for a real one.
+#[cfg(unix)]
+// The real/effective uid/gid names are intentionally parallel here.
+#[allow(clippy::similar_names)]
+pub fn drop_to_user(uid: u32, gid: u32) -> anyhow::Result<()> {
     // Order is load-bearing: drop supplementary groups and the gid while still
     // uid 0, then the uid last. Doing setuid first would forfeit the privilege
     // needed for setgroups/setgid.
     //
     // SAFETY: setgroups/setgid/setuid are the documented POSIX credential
-    // syscalls. We are single-purpose here (startup), pass a valid pointer/len
-    // for the one-element group list, and check every return value below. glibc
-    // applies these process-wide across all threads.
+    // syscalls. We pass a valid pointer/len for the one-element group list and
+    // check every return value below. glibc applies these process-wide across
+    // all threads.
     let groups = [gid as libc::gid_t];
     let rc = unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) };
     if rc != 0 {
@@ -144,14 +176,6 @@ pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
     if unsafe { libc::seteuid(0) } == 0 {
         anyhow::bail!("privilege drop is reversible (seteuid(0) succeeded) — refusing to serve");
     }
-
-    tracing::info!(
-        uid,
-        gid,
-        "dropped privileges: process now runs unprivileged (single non-root uid — \
-         NOT per-tenant; cross-tenant isolation still rests on open_basedir + \
-         disable_functions)"
-    );
     Ok(())
 }
 
@@ -260,8 +284,17 @@ fn set_mode(path: &std::path::Path, mode: u32) {
 
 /// Resolve a user spec (numeric uid or name) to `(uid, primary_gid)`.
 /// `primary_gid` is `Some` only for a named user resolved via `getpwnam`.
+///
+/// Public so the `ephpm exec` sandbox can resolve its target tenant user
+/// through the same audited lookup the server drop uses (e.g. `ephpm-web` →
+/// `(997, Some(989))`).
+///
+/// # Errors
+///
+/// Returns an error if `spec` is a name containing an interior NUL byte or if
+/// no such user exists (`getpwnam` returned NULL).
 #[cfg(unix)]
-fn resolve_user(spec: &str) -> anyhow::Result<(u32, Option<u32>)> {
+pub fn resolve_user(spec: &str) -> anyhow::Result<(u32, Option<u32>)> {
     if let Ok(uid) = spec.parse::<u32>() {
         return Ok((uid, None));
     }
@@ -281,8 +314,16 @@ fn resolve_user(spec: &str) -> anyhow::Result<(u32, Option<u32>)> {
 }
 
 /// Resolve a group spec (numeric gid or name) to a gid.
+///
+/// Public for the same reason as [`resolve_user`] — the `ephpm exec` sandbox
+/// resolves an explicit tenant group through it.
+///
+/// # Errors
+///
+/// Returns an error if `spec` is a name containing an interior NUL byte or if
+/// no such group exists (`getgrnam` returned NULL).
 #[cfg(unix)]
-fn resolve_group(spec: &str) -> anyhow::Result<u32> {
+pub fn resolve_group(spec: &str) -> anyhow::Result<u32> {
     if let Ok(gid) = spec.parse::<u32>() {
         return Ok(gid);
     }

@@ -30,6 +30,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod exec_sandbox;
 mod fatal_signal;
 mod service;
 
@@ -97,6 +98,48 @@ enum Commands {
         /// Arguments to pass to the PHP interpreter
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Run a command inside a virtual host's tenant sandbox (Linux only).
+    ///
+    /// Resolves `--site <key>` to the vhost's filesystem boundary, scopes the
+    /// command to that boundary with Landlock (denying `/etc/ephpm`, `/root`,
+    /// `/etc/shadow`, and everything else), then irreversibly drops to the
+    /// tenant uid/gid before exec — so the process runs as the unprivileged
+    /// `ephpm-web` user the host `ephpm_egress` firewall already jails.
+    ///
+    /// This is the sandboxed execution primitive a control plane (switchboard)
+    /// should call for build/seed steps instead of running them as root. See
+    /// `site/content/roadmap/ephpm-exec-sandboxed-vhost.md`.
+    #[command(disable_help_flag = true)]
+    Exec {
+        /// Path to the configuration file (holds `[server] sites_dir` and the
+        /// per-site derivation). Whoever can read this can already impersonate
+        /// any tenant, so config-file permissions are the authorization gate.
+        #[arg(short, long, default_value = "/etc/ephpm/ephpm.toml")]
+        config: PathBuf,
+
+        /// The virtual host key (the vhost directory name under `sites_dir`).
+        #[arg(short, long)]
+        site: String,
+
+        /// Wall-clock timeout in seconds. `0` (default) means no timeout. The
+        /// deadline is armed with `alarm(2)` and survives `execve`, so it fires
+        /// even inside the exec'd command (default `SIGALRM` disposition
+        /// terminates the process).
+        #[arg(short, long, default_value_t = 0u64)]
+        timeout: u64,
+
+        /// Skip the Landlock scope and uid drop, running the command with the
+        /// caller's privileges. Loudly labelled and never the default — only
+        /// for platforms/paths where the sandbox is unavailable. On Linux this
+        /// removes all containment; prefer omitting it.
+        #[arg(long)]
+        no_sandbox: bool,
+
+        /// The command and its arguments, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
     },
 
     /// Inspect or manipulate the KV store on a running server
@@ -329,6 +372,10 @@ fn run() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         Some(Commands::Php { args }) => run_php(&php_cli_args(&args)),
+        Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
+            ensure_cli_tracing();
+            exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
+        }
         Some(Commands::Kv { host, port, password, user, subcommand }) => {
             let auth = KvAuth::resolve(user, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
