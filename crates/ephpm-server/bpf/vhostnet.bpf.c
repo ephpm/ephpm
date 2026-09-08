@@ -43,7 +43,48 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define LOOPBACK4_BE bpf_htonl(0x7f000001) // 127.0.0.1, network byte order
+// ---- loopback classification (shared by bind + connect, v4 + v6) -----------
+//
+// Linux treats the ENTIRE 127.0.0.0/8 range as loopback (RFC 1122 §3.2.1.3),
+// not just 127.0.0.1, and an IPv4-mapped IPv6 address `::ffff:a.b.c.d` reaches
+// the same IPv4 stack as `a.b.c.d`. Classifying only the exact literals
+// 127.0.0.1 / ::1 as loopback let a tagged tenant reach a neighbour's loopback
+// sidecar by aliasing the destination (127.0.0.2, ::ffff:127.0.0.1, ...):
+// do_connect() saw `is_loopback == 0`, skipped the port-ownership check, and
+// allowed the connect. These helpers are the single source of truth for both
+// hooks so the two sides can never drift apart again.
+//
+// Everything is compared in NETWORK byte order (the on-wire order of the UAPI
+// user_ip4 / user_ip6 context fields), so masks/literals are wrapped in
+// bpf_htonl(). All loads are of the aligned 32-bit context words, so the
+// verifier is happy and there are no unaligned reads.
+
+// 127.0.0.0/8 in network byte order.
+static __always_inline int is_loopback4_be(__u32 ip_be)
+{
+    return (ip_be & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
+}
+
+// Classify a 128-bit IPv6 address (four network-order 32-bit words) as loopback:
+//   * ::1                         -> loopback
+//   * ::ffff:a.b.c.d (v4-mapped)  -> loopback IFF a.b.c.d is in 127.0.0.0/8
+// An IPv4-mapped address that embeds a NON-loopback v4 (e.g. ::ffff:1.1.1.1)
+// is deliberately NOT loopback — it belongs to the egress allowlist layer, same
+// as the bare IPv4 would. IPv4-COMPATIBLE addresses (::a.b.c.d, RFC 4291
+// §2.5.5.1 deprecated) are intentionally not folded in: Linux does not route
+// them onto the v4 loopback, so there is no reachable bypass, and treating the
+// ::/96 prefix as "classify by embedded v4" would misclassify ::1 itself
+// (embedded 0.0.0.1, outside 127/8) as non-loopback.
+static __always_inline int is_loopback6(const __u32 ip6[4])
+{
+    // ::1 (network order: high 96 bits zero, low word == 1).
+    if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == 0 && ip6[3] == bpf_htonl(1))
+        return 1;
+    // ::ffff:0:0/96 — IPv4-mapped: first 80 bits zero, next 16 bits 0xffff.
+    if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == bpf_htonl(0x0000ffff))
+        return is_loopback4_be(ip6[3]);
+    return 0;
+}
 
 // Compile-time ceiling for the real-port pool/ownership maps. ePHPm fills only
 // the configured sidecar_port_range (default 20000-32767 ~= 12768) at load; this
@@ -159,7 +200,18 @@ static __always_inline __u32 quota_max(void)
 }
 
 // ---- bind: pool allocation + quota + transparent rewrite -------------------
-
+//
+// NOTE ON LOOPBACK CLASSIFICATION: unlike do_connect(), do_bind() does NOT gate
+// on the destination address — it rewrites the port of EVERY bind by a tagged
+// task (loopback, wildcard 0.0.0.0/::, or a specific address) to a private real
+// port the vhost owns. So there is no exact-127.0.0.1/::1 classification here to
+// keep in sync with the connect side; the is_loopback4_be/is_loopback6 helpers
+// are a connect-side concern only. This is safe because the security boundary is
+// the connect-side ownership check (port_owner keyed on the real port): whatever
+// address a sidecar binds, a peer tenant reaching its real port is denied there.
+// A tagged bind to a wildcard address is still rewritten and owned, so a peer
+// aliasing it via 127.x now hits that same ownership deny once connect classifies
+// the whole 127.0.0.0/8 + mapped range as loopback.
 static __always_inline int do_bind(struct bpf_sock_addr *ctx)
 {
     __u32 *vhostp = current_vhost();
@@ -245,13 +297,13 @@ static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback
 SEC("cgroup/connect4")
 int vhost_connect4(struct bpf_sock_addr *ctx)
 {
-    return do_connect(ctx, ctx->user_ip4 == LOOPBACK4_BE);
+    // Whole 127.0.0.0/8, not just 127.0.0.1 — see is_loopback4_be().
+    return do_connect(ctx, is_loopback4_be(ctx->user_ip4));
 }
 
 SEC("cgroup/connect6")
 int vhost_connect6(struct bpf_sock_addr *ctx)
 {
-    int lo = ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
-             ctx->user_ip6[2] == 0 && ctx->user_ip6[3] == bpf_htonl(1); // ::1
-    return do_connect(ctx, lo);
+    // ::1 and IPv4-mapped loopback (::ffff:127.x) — see is_loopback6().
+    return do_connect(ctx, is_loopback6(ctx->user_ip6));
 }
