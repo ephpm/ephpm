@@ -85,7 +85,6 @@ impl std::fmt::Debug for WorkerBody {
 /// An owned HTTP request handed to a worker thread. Owns every string buffer so
 /// the borrowed [`EphpmWorkerRequest`] view stays valid for the whole iteration
 /// (until `send_response`).
-#[derive(Debug)]
 pub struct WorkerRequestOwned {
     /// HTTP method (`GET`, `POST`, ...).
     pub method: String,
@@ -105,6 +104,34 @@ pub struct WorkerRequestOwned {
     pub server_vars: Vec<CServerVar>,
     /// HTTP headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
+}
+
+/// Hand-written for the same reason as [`PhpRequest`](crate::request::PhpRequest)'s:
+/// `server_vars` holds the request's whole `$_SERVER`, which since #386 includes
+/// `PHP_AUTH_PW` alongside the per-site `DB_PASSWORD`, and `headers` holds the
+/// `Authorization` header they came from. Values for secret-bearing names are
+/// replaced with a placeholder — see `request::is_secret_name`.
+impl std::fmt::Debug for WorkerRequestOwned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let server_vars = crate::request::redacted_pairs(
+            self.server_vars
+                .iter()
+                .map(|(k, v)| (k.to_str().unwrap_or_default(), v.to_str().unwrap_or_default())),
+        );
+        let headers = crate::request::redacted_pairs(
+            self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        );
+        f.debug_struct("WorkerRequestOwned")
+            .field("method", &self.method)
+            .field("uri", &self.uri)
+            .field("query_string", &self.query_string)
+            .field("cookie_data", &"<redacted>")
+            .field("content_type", &self.content_type)
+            .field("body", &self.body)
+            .field("server_vars", &server_vars)
+            .field("headers", &headers)
+            .finish()
+    }
 }
 
 /// A response produced by a worker for one request: either fully buffered

@@ -202,3 +202,125 @@ async fn custom_response_header_reaches_client() {
         "PHP header('X-Custom: ok') must appear in the HTTP response"
     );
 }
+
+// ── HTTP authentication $_SERVER variables (issue #386) ──────────────────
+//
+// `auth_vars.php` prints each key as either `NAME = [value]` or `NAME unset`,
+// so these tests can tell "absent" from "present but empty" — a distinction
+// php-src makes and applications branch on.
+
+/// Fetch `auth_vars.php` with an explicit Authorization header. The header is
+/// set verbatim rather than via `basic_auth()` so the exact bytes on the wire
+/// are what the test says they are.
+async fn auth_vars(header: Option<&str>) -> String {
+    let base_url = required_env("EPHPM_URL");
+    let url = format!("{base_url}/auth_vars.php");
+
+    let mut req = reqwest::Client::new().get(&url);
+    if let Some(value) = header {
+        req = req.header("Authorization", value);
+    }
+    let resp = req
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+
+    assert_eq!(resp.status().as_u16(), 200);
+    resp.text().await.expect("failed to read body")
+}
+
+/// The headline compatibility gap: an app reading `$_SERVER['PHP_AUTH_USER']`
+/// must see the decoded credential, as it would under mod_php or PHP-FPM.
+#[tokio::test]
+async fn basic_auth_populates_php_auth_vars() {
+    // base64("alice:s3cret")
+    let body = auth_vars(Some("Basic YWxpY2U6czNjcmV0")).await;
+
+    assert!(
+        body.contains("PHP_AUTH_USER = [alice]"),
+        "PHP_AUTH_USER must carry the decoded username:\n{body}"
+    );
+    assert!(
+        body.contains("PHP_AUTH_PW = [s3cret]"),
+        "PHP_AUTH_PW must carry the decoded password:\n{body}"
+    );
+    assert!(
+        body.contains("AUTH_TYPE = [Basic]"),
+        "AUTH_TYPE must report the scheme:\n{body}"
+    );
+    // The raw header stays available, as on stock SAPIs.
+    assert!(
+        body.contains("HTTP_AUTHORIZATION = [Basic YWxpY2U6czNjcmV0]"),
+        "HTTP_AUTHORIZATION must survive alongside the derived vars:\n{body}"
+    );
+}
+
+/// php-src registers PHP_AUTH_PW only for a non-empty password, so `bob:`
+/// leaves the key unset rather than empty.
+#[tokio::test]
+async fn empty_password_leaves_php_auth_pw_unset() {
+    // base64("bob:")
+    let body = auth_vars(Some("Basic Ym9iOg==")).await;
+
+    assert!(
+        body.contains("PHP_AUTH_USER = [bob]"),
+        "username must still be registered:\n{body}"
+    );
+    assert!(
+        body.contains("PHP_AUTH_PW unset"),
+        "an empty password must leave PHP_AUTH_PW unset, not empty:\n{body}"
+    );
+}
+
+/// Non-Basic schemes get an AUTH_TYPE and nothing else; the token itself stays
+/// readable through HTTP_AUTHORIZATION.
+#[tokio::test]
+async fn bearer_sets_auth_type_only() {
+    let body = auth_vars(Some("Bearer some.jwt.token")).await;
+
+    assert!(
+        body.contains("AUTH_TYPE = [Bearer]"),
+        "AUTH_TYPE must report a non-Basic scheme:\n{body}"
+    );
+    assert!(
+        body.contains("PHP_AUTH_USER unset"),
+        "Bearer must not produce PHP_AUTH_USER:\n{body}"
+    );
+    assert!(
+        body.contains("PHP_AUTH_PW unset"),
+        "Bearer must not produce PHP_AUTH_PW:\n{body}"
+    );
+}
+
+/// Without an Authorization header none of the keys exist, so
+/// `isset($_SERVER['PHP_AUTH_USER'])` is false — the check every HTTP Basic
+/// challenge loop starts with.
+#[tokio::test]
+async fn no_authorization_header_leaves_all_auth_vars_unset() {
+    let body = auth_vars(None).await;
+
+    for key in ["AUTH_TYPE", "PHP_AUTH_USER", "PHP_AUTH_PW", "PHP_AUTH_DIGEST"] {
+        assert!(
+            body.contains(&format!("{key} unset")),
+            "{key} must be absent without an Authorization header:\n{body}"
+        );
+    }
+}
+
+/// REMOTE_USER denotes a user the *server* authenticated. ePHPm validates
+/// nothing here, so it must never be synthesised from a client-supplied
+/// header — an app trusting it would otherwise accept any asserted identity.
+#[tokio::test]
+async fn remote_user_is_never_derived_from_the_header() {
+    // base64("admin:hunter2")
+    let body = auth_vars(Some("Basic YWRtaW46aHVudGVyMg==")).await;
+
+    assert!(
+        body.contains("REMOTE_USER unset"),
+        "REMOTE_USER must never be derived from an unvalidated header:\n{body}"
+    );
+    assert!(
+        body.contains("PHP_AUTH_USER = [admin]"),
+        "sanity: the credential itself is still exposed:\n{body}"
+    );
+}

@@ -90,6 +90,34 @@ Key distinction after fallback rewrites (e.g. `/blog/hello` -> `/index.php`):
 
 HTTP headers are mapped to `HTTP_*` variables, except `Content-Type` -> `CONTENT_TYPE` and `Content-Length` -> `CONTENT_LENGTH` (no `HTTP_` prefix per CGI spec).
 
+### HTTP Authentication Variables
+
+An incoming `Authorization` header is decoded into the `$_SERVER` keys stock PHP SAPIs provide, so applications that implement their own HTTP Basic challenge loop (`if (!isset($_SERVER['PHP_AUTH_USER'])) { ... 401 ... }`) work unchanged.
+
+| Variable | Set when | Value |
+|----------|----------|-------|
+| `AUTH_TYPE` | Any `Authorization` header with a valid scheme token | The scheme as the client cased it — `Basic`, `Digest`, `Bearer`, ... |
+| `PHP_AUTH_USER` | `Basic` credential whose decoded payload contains a `:` | Bytes before the first colon (may be empty) |
+| `PHP_AUTH_PW` | As above, and the password is non-empty | Bytes after the first colon |
+| `PHP_AUTH_DIGEST` | `Digest` credential | The header with the `Digest ` prefix removed |
+
+The raw header remains available as `HTTP_AUTHORIZATION`, as it is on other SAPIs. Behaviour follows php-src's `php_handle_auth_data()`:
+
+- The scheme is matched case-insensitively, and the trailing space is part of the match — a bare `Authorization: Basic` with no payload yields only `AUTH_TYPE`.
+- The base64 payload is decoded leniently (PHP's non-strict decoder): characters outside the alphabet are skipped and padding is optional, so a payload Apache or PHP-FPM accepts is accepted here too.
+- A decoded payload with no `:` yields no credentials at all.
+- An empty password leaves `PHP_AUTH_PW` **unset** (not empty), matching php-src; an empty username *is* registered.
+- Duplicate `Authorization` headers: the first wins.
+
+Two deliberate differences from php-src:
+
+- **Interior NUL bytes suppress both credential keys.** php-src operates on C strings and would truncate the password at the NUL; ePHPm emits nothing so the application re-challenges rather than failing an auth check against a silently shortened secret.
+- **`AUTH_TYPE` is set for every scheme**, including `Bearer` and `Negotiate`. php-src never sets `AUTH_TYPE` itself — it is a CGI meta-variable the front-end server supplies (RFC 3875 §4.1.1), and under nginx/FPM it is usually absent. ePHPm is the front-end, so it reports what the client offered.
+
+**These variables are client-supplied, not verified.** `AUTH_TYPE` reports the scheme the client sent and `PHP_AUTH_USER` / `PHP_AUTH_PW` the credential it offered; ePHPm has validated none of it, exactly as on any other SAPI. Do not treat the presence of `AUTH_TYPE` as proof of authentication. `REMOTE_USER` is deliberately never derived from the header, because it denotes a user the *server* authenticated — synthesising it would let any client assert any identity to an application that trusts it. Use the `jwt` middleware if you want the server to reject unauthenticated requests before PHP runs.
+
+`PHP_AUTH_PW` is a cleartext password in `$_SERVER`. ePHPm does not log, trace or serialise `$_SERVER` anywhere (span attributes are a fixed five-field allowlist), and the `Debug` output of the internal request structs redacts secret-bearing names.
+
 ### Thread Safety
 
 PHP is compiled with ZTS (Zend Thread Safety). Each execution-pool thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds are ZTS as well — the Windows php-sdk's static `php8embed.lib` is a ZTS build and requests execute concurrently there too.
