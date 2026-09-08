@@ -142,6 +142,51 @@ ephpm php -l < src/Controller.php      # No syntax errors detected in Standard i
 cat src/Controller.php | ephpm php -w  # stripped source on stdout
 ```
 
+### Reflection flags
+
+The five php-cli reflection flags are implemented against the always-compiled
+Reflection extension and follow php-cli's own dispatch:
+
+| Flag | Subject | Prints |
+|------|---------|--------|
+| `--rf` / `--rfunction` | `function`, or `Class::method` | `ReflectionFunction` — or `ReflectionMethod` when the name contains `::` |
+| `--rc` / `--rclass` | class name | `ReflectionClass` |
+| `--re` / `--rextension` | extension name | `ReflectionExtension` |
+| `--rz` / `--rzendextension` | Zend extension name | `ReflectionZendExtension` |
+| `--ri` / `--rextinfo` | extension name, or `main` | the extension's `phpinfo` block — or, for `main`, the core ini table |
+
+```bash
+ephpm php --rf strlen                 # Function [ <internal:Core> function strlen ] { … }
+ephpm php --rf ArrayObject::count     # Method [ <internal:SPL, …> public method count ] { … }
+ephpm php --ri json                   # json support => enabled
+ephpm php --ri main                   # Directive => Local Value => Master Value …
+```
+
+`main` is not an extension: it is php-cli's magic name for
+`display_ini_entries(NULL)`, the table of core ini directives with their local
+and master values. It is only consulted after the module registry misses, so a
+real extension named `main` would still win.
+
+A subject that does not resolve prints `Exception: <message>` on stdout — not
+an uncaught-exception fatal — and exits `1`. `--ri` on an extension that is not
+loaded prints `Extension '<name>' not present.` and also exits `1`, so
+`ephpm php --ri <ext> >/dev/null` is a usable presence probe. A flag that
+succeeds exits `0`.
+
+On PHP 8.5, `--rf Class::method` emits a `Deprecated: Calling
+ReflectionMethod::__construct() with 1 argument is deprecated …` notice on
+**stdout** before the dump. That is php-cli's output too, verbatim — including
+the `in Unknown on line 0` context — because php-cli constructs the object the
+same way.
+
+> **Fixed after v0.9.1.** Up to and including v0.9.1, `--rf Class::method`
+> always built a `ReflectionFunction`, so every method name came back as
+> `Exception: Function Class::method() does not exist`; `--ri` on an absent
+> extension printed the right diagnostic but exited `0`, so a script probing
+> `php --ri <ext>` saw every extension as present; and `--ri main` was treated
+> as an extension name and reported absent
+> ([#358](https://github.com/ephpm/ephpm/issues/358)).
+
 ### Errors and exit codes
 
 Diagnostics go where php-cli sends them. `display_errors` defaults to on and
@@ -156,7 +201,9 @@ error yields `255`; a syntax error under `-l` yields `255` (with
 `Errors parsing <name>` on stdout); a script file that cannot be opened prints
 `Could not open input file: <path>` and yields `1`; a reflection flag whose
 subject does not resolve (`--rf nosuchfunc`, `--rc NoSuchClass`) prints
-`Exception: <message>` on stdout and yields `1`.
+`Exception: <message>` on stdout and yields `1`, and `--ri` on an extension
+that is not loaded yields `1` as well (see [Reflection
+flags](#reflection-flags)).
 
 An **unrecognized option** — or one missing its required argument — is a hard
 error, again as in php-cli: the diagnostic
