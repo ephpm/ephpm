@@ -1,4 +1,4 @@
-//! The ten in-tree official ePHPm middleware modules as plain Rust library
+//! The in-tree official ePHPm middleware modules as plain Rust library
 //! code.
 //!
 //! Each module here is an ordinary [`ephpm_middleware::Middleware`]
@@ -9,13 +9,20 @@
 //!
 //! The modules, by phase:
 //!
-//! - **Request phase** ([`ephpm_middleware::Middleware`]): [`jwt`], [`cors`],
-//!   [`ratelimit`], [`security_headers`], [`api_key`], [`ip_allowlist`],
-//!   [`maintenance_mode`], [`redirect`].
+//! - **Request phase** ([`ephpm_middleware::Middleware`]): [`jwt`],
+//!   [`session_cookie`], [`cors`], [`ratelimit`], [`security_headers`],
+//!   [`api_key`], [`ip_allowlist`], [`maintenance_mode`], [`redirect`].
 //! - **Request + response phase** (also
 //!   [`ephpm_middleware::ResponseMiddleware`], registered in the server via
 //!   [`ephpm_middleware::builtin::BuiltinModule::init_response`]):
 //!   [`request_id`], [`header_transform`].
+//!
+//! [`hs256`] is not a middleware: it is the token-verification core that
+//! [`jwt`] (API bearer tokens) and [`session_cookie`] (browser sessions) both
+//! call, so the two gates can differ in policy and failure behaviour without
+//! ever differing in crypto. [`session_cookie`] additionally enforces a
+//! per-tenant `site` binding (issue #396) so a session minted for one preview
+//! cannot open another.
 //!
 //! The sibling `ephpm-middleware-<name>` crates in the `ephpm/middleware`
 //! (examples) repository are thin cdylib shells: they re-export these types
@@ -39,6 +46,7 @@
 pub mod api_key;
 pub mod cors;
 pub mod header_transform;
+pub mod hs256;
 pub mod ip_allowlist;
 pub mod jwt;
 pub mod maintenance_mode;
@@ -46,6 +54,7 @@ pub mod ratelimit;
 pub mod redirect;
 pub mod request_id;
 pub mod security_headers;
+pub mod session_cookie;
 
 #[cfg(test)]
 mod config_strictness_tests {
@@ -93,6 +102,10 @@ mod config_strictness_tests {
         strict::<crate::security_headers::SecurityHeaders>(
             &json!({ "hsts": true }),
             "referer_policy",
+        );
+        strict::<crate::session_cookie::SessionCookie>(
+            &json!({ "secret": "s3cret", "login_url": "https://login.example/start" }),
+            "require_sites",
         );
     }
 
