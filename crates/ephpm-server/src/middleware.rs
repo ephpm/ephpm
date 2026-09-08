@@ -148,6 +148,11 @@ pub type BuiltinBuilder = fn(&serde_json::Value) -> Result<BuiltinModule, String
 /// per module: the short name and the crate name, with `-` and `_`
 /// interchangeable — e.g. `"jwt"`, `"ephpm-middleware-jwt"`,
 /// `"ephpm_middleware_jwt"`. (`"ratelimit"` also answers to `"rate-limit"`.)
+///
+/// Adding an entry here also means checking [`crate::router`]'s ingest-strip
+/// list: any module that forwards data to PHP in a request header (`jwt` and
+/// `session-cookie`'s `claims_header`) must have that header name stripped at
+/// ingest, or a client can forge it on a path the module's `match` glob skips.
 #[must_use]
 pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
     let canonical = name.replace('_', "-");
@@ -163,6 +168,9 @@ pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
         }
         "security-headers" | "ephpm-middleware-security-headers" => {
             BuiltinModule::init::<ephpm_middleware_builtins::security_headers::SecurityHeaders>
+        }
+        "session-cookie" | "ephpm-middleware-session-cookie" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::session_cookie::SessionCookie>
         }
         "api-key" | "ephpm-middleware-api-key" => {
             BuiltinModule::init::<ephpm_middleware_builtins::api_key::ApiKey>
@@ -981,6 +989,7 @@ mod tests {
     /// config strictness is fails the test below.
     const BUILTIN_NAMES: &[&str] = &[
         "jwt",
+        "session-cookie",
         "cors",
         "ratelimit",
         "security-headers",
@@ -1137,6 +1146,10 @@ mod tests {
             "ephpm_middleware_ratelimit",
             "ephpm-middleware-security-headers",
             "ephpm_middleware_security_headers",
+            "session-cookie",
+            "session_cookie",
+            "ephpm-middleware-session-cookie",
+            "ephpm_middleware_session_cookie",
             "api-key",
             "api_key",
             "ephpm-middleware-api-key",
@@ -1162,6 +1175,61 @@ mod tests {
         for name in ["", "jwtx", "my-auth", "jwt.so", "./jwt", "middleware/jwt", "JWT"] {
             assert!(builtin(name).is_none(), "\"{name}\" should NOT resolve as builtin");
         }
+    }
+
+    /// `session-cookie` mounted from the static registry: an unauthenticated
+    /// browser request short-circuits the chain with a redirect to the login
+    /// service, and PHP never runs. The mount is `match`-scoped so the test
+    /// also covers a skipped path continuing normally.
+    #[test]
+    fn builtin_session_cookie_redirects_an_unauthenticated_request() {
+        let mounts = vec![builtin_mount(
+            "session-cookie",
+            Some("/app/*"),
+            10,
+            serde_json::json!({
+                "secret": "shared-with-the-login-service",
+                "login_url": "https://login.example/start",
+                "return_to_param": "next",
+                "site_param": "site",
+            }),
+        )];
+        let chain = MiddlewareChain::load(&mounts).expect("load builtin session-cookie");
+
+        // No cookie on a matching path → 302 to the login service, carrying a
+        // same-origin return-to and the canonical site key. The 5th arg to
+        // RequestCtx::new is the resolved site key (issue #390/#396).
+        let ctx = RequestCtx::new(
+            "GET",
+            "/app/dashboard.php",
+            "tab=1",
+            "203.0.113.7",
+            "pr-42.preview.example",
+            &[],
+        )
+        .with_scheme(true);
+        match chain.evaluate(&ctx, "/app/dashboard.php") {
+            ChainVerdict::Respond { status, headers, .. } => {
+                assert_eq!(status, 302);
+                assert_eq!(
+                    find_header(&headers, "Location"),
+                    Some(
+                        "https://login.example/start?next=%2Fapp%2Fdashboard.php%3Ftab%3D1\
+                         &site=pr-42.preview.example"
+                    )
+                );
+                assert_eq!(find_header(&headers, "Cache-Control"), Some("no-store"));
+            }
+            ChainVerdict::Continue { .. } => {
+                panic!("an unauthenticated request must not reach PHP")
+            }
+        }
+
+        // A path outside the `match` glob is not gated at all.
+        let open =
+            RequestCtx::new("GET", "/health.php", "", "203.0.113.7", "pr-42.preview.example", &[])
+                .with_scheme(true);
+        assert!(matches!(chain.evaluate(&open, "/health.php"), ChainVerdict::Continue { .. }));
     }
 
     /// The full four-module chain, loaded purely from the static registry —

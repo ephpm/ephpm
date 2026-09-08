@@ -19,17 +19,22 @@ There are **two ways a compiled module runs** — plus an experimental
 which trades the "before PHP, before the body" position for not needing a
 compiler at all:
 
-- **Built-in (static registry).** Ten official modules — `jwt`, `cors`,
-  `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`,
-  `maintenance-mode`, `redirect`, `request-id`, and `header-transform` — are
-  compiled into **every** ePHPm binary. `library = "jwt"` just works: no
-  shared library on disk, no `dlopen`, no special build. Two of them
-  (`request-id`, `header-transform`) also run in the **response phase**.
+- **Built-in (static registry).** Eleven official modules — `jwt`,
+  `session-cookie`, `cors`, `ratelimit`, `security-headers`, `api-key`,
+  `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, and
+  `header-transform` — are compiled into **every** ePHPm binary. `library =
+  "jwt"` just works: no shared library on disk, no `dlopen`, no special build.
+  Two of them (`request-id`, `header-transform`) also run in the **response
+  phase**.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
   box with the stock release binaries on every platform — see
-  [the dynamic lane](#the-dynamic-lane).
+  [the dynamic lane](#the-dynamic-lane). A worked, shipped example lives in
+  the workspace: [the GitHub OAuth gate](/guides/github-auth-middleware/)
+  (`crates/ephpm-middleware-github-auth`), which authenticates a browser user
+  against GitHub and issues the stateless signed session that `session-cookie`
+  verifies.
 
 ## Quick start
 
@@ -161,9 +166,9 @@ Two things are deliberately *not* checked:
 
 The `library` value is checked against the **builtin registry first**.
 Each built-in answers to its short name and its crate name, with `-` and
-`_` interchangeable: `jwt`, `cors`, `ratelimit` (also `rate-limit`),
-`security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`,
-`redirect`, `request-id`, `header-transform`, and the
+`_` interchangeable: `jwt`, `session-cookie`, `cors`, `ratelimit` (also
+`rate-limit`), `security-headers`, `api-key`, `ip-allowlist`,
+`maintenance-mode`, `redirect`, `request-id`, `header-transform`, and the
 `ephpm-middleware-*` / `ephpm_middleware_*` long forms. Builtin mounts
 never touch the filesystem.
 
@@ -307,7 +312,7 @@ files too — ships as
 
 ## The built-in modules
 
-All ten are compiled into every ePHPm binary and run in-process — mount
+All eleven are compiled into every ePHPm binary and run in-process — mount
 them by short name (`library = "jwt"`) with no shared library on disk.
 `request-id` and `header-transform` additionally run in the response phase.
 Loadable cdylib builds of the same implementations (for the dlopen lane, or
@@ -371,6 +376,92 @@ therefore trust `HTTP_X_JWT_CLAIMS` regardless of request path.
 > defense), so it never surfaces as `$_SERVER['HTTP_PROXY']`.
 
 v1 is HS256 only — RS256/JWKS is not implemented.
+
+### `session-cookie`
+
+Gates a whole site in a **browser** on a signed session cookie minted by an
+external identity service, and redirects unauthenticated visitors to that
+service. Same crypto core as `jwt`, different threat model: a token in a
+cookie instead of a header, and a redirect instead of a `401`, because a
+browser can do nothing useful with a `401`. They are separate modules on
+purpose — no key in the `jwt` config can turn its `401`s into redirects, and
+no key here can silently stop redirecting.
+
+**ePHPm never calls the identity provider.** Verification is one HMAC over
+bytes already in the request: no network call on the request path, no
+provider rate limits, no OAuth client secret on the serving nodes.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `secret` (string) | **required** | HS256 shared secret — the same key the login service signs with |
+| `login_url` (string) | **required** | where to send unauthenticated browsers. Must be an `https://`/`http://` URL or a same-origin absolute path; `javascript:`/`//host` fail startup |
+| `cookie` (string) | `"ephpm_session"` | name of the cookie carrying the token |
+| `return_to_param` (string) | unset — no return-to is sent | query parameter on `login_url` carrying the validated, same-origin return path |
+| `site_param` (string) | unset | query parameter carrying this request's canonical site key, so one login service can serve many sites |
+| `issuer` (string) | unset | required `iss` claim value |
+| `audience` (string) | unset | required `aud` claim value (string or array member) |
+| `claims_header` (string) | unset | forward the verified claims JSON to PHP in this request header |
+| `require_https` (bool) | `true` | refuse to accept a session cookie on a cleartext request (loopback exempt) |
+| `require_site` (bool) | `true` | require the token's `site` claim to equal the request's canonical site key — the per-tenant binding (issue #396) |
+
+```toml
+[[middleware]]
+library = "session-cookie"
+order   = 10
+config  = {
+  secret          = "shared-with-the-login-service",
+  login_url       = "https://previews.example/auth/start",
+  return_to_param = "next",
+  site_param      = "site",
+  claims_header   = "X-Session-Claims",
+}
+```
+
+Verification is exactly `jwt`'s (signature first, constant-time HMAC, `alg`
+pinned to HS256, `exp` required, `nbf`/`iss`/`aud` enforced when configured),
+**plus** the per-tenant `site` binding below. Every rejection produces the
+same redirect, so a client cannot learn *why* it was refused.
+
+#### Per-tenant binding (`require_site`, issue #396)
+
+On a multi-tenant preview host every preview resolves to its own **canonical
+site key** — the one tenant identity the router derives (the same value that
+selects the per-site database and KV keyspace), exposed to a module as
+`req.vhost_id()`. The issuer (see the [GitHub OAuth
+gate](/guides/github-auth-middleware/)) binds each session to one preview by
+putting that key in a `site` claim.
+
+With the default `require_site = true`, this gate requires the cookie's `site`
+claim to **equal the request's canonical site key**. A session minted for
+preview A therefore does **not** open preview B; a token with no `site` claim,
+or one bound to another site, fails closed. Without this check a session
+legitimately issued for one preview was a valid session for *every* preview on
+the node — that was the cross-tenant replay of #396.
+
+If `require_site` is on and the request matched **no** known virtual host
+(an unrecognised `Host`, or a single-site node where there is no vhost to
+resolve), the gate cannot bind the session to a tenant and refuses with a hard
+`403`. Set `require_site = false` **only** on a genuinely single-tenant
+deployment whose login service mints site-less tokens — an explicit,
+documented opt-out that turns the `site` check off entirely, never something
+to reach for to "make it work" on a preview host.
+
+#### Return-to, HTTPS, and the login service's half
+
+The redirect is `302` for `GET`/`HEAD`, `303` otherwise (so an unauthenticated
+`POST` becomes a `GET` of the login page, not a re-submit), and carries
+`Cache-Control: no-store` and `Vary: Cookie`. `return_to` is taken from **the
+path the browser requested**, never a client `?next=`; it must be a single
+absolute path (no `//`, `\`, control bytes, `#`, or non-ASCII) under 2048
+bytes, is percent-encoded aggressively, and is otherwise dropped — the login
+service must still validate whatever it receives. `require_https` refuses a
+session cookie on cleartext (loopback exempt) using the host's
+trusted-proxy-aware verdict, not a client `X-Forwarded-Proto`. The login
+service authenticates the visitor once, mints an HS256 JWT with the same
+`secret`, a future `exp`, and a `site` claim equal to the site key it was told
+via `site_param`, and sets it as a `Secure; HttpOnly` cookie on the site's
+domain. There is no revocation: `exp` (kept short) is the only thing that ends
+a session early; rotating `secret` invalidates all sessions at once.
 
 ### `ratelimit`
 

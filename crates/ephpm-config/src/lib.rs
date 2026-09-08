@@ -113,9 +113,9 @@ pub struct MiddlewareMount {
     ///    the rest of the value is a path to a `.php` file, relative to the
     ///    request's document root. See [`MiddlewareMount::php_script`].
     /// 2. Otherwise the value is checked against the builtin registry (`jwt`,
-    ///    `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
-    ///    `ephpm-middleware-*` long forms are compiled into every binary — no
-    ///    dlopen).
+    ///    `cors`, `ratelimit`/`rate-limit`, `security-headers`,
+    ///    `session-cookie` and their `ephpm-middleware-*` long forms are
+    ///    compiled into every binary — no dlopen).
     /// 3. Anything else is a shared library: either a bare name (resolved
     ///    through the middleware search path with a platform suffix, e.g.
     ///    `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
