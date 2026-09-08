@@ -445,10 +445,12 @@ fn set_no_new_privs() -> anyhow::Result<()> {
 ///
 /// Grants read/write beneath the site container and its private state root,
 /// read+execute beneath the standard system directories a program needs to run,
-/// and read on a minimal, non-secret slice of `/etc` (name resolution + the
-/// dynamic loader cache) plus entropy sources. Everything else — crucially
-/// `/etc/ephpm` (the cluster secret), `/root`, and `/etc/shadow` — is denied by
-/// Landlock's default-deny once `restrict_self` runs.
+/// read on a minimal, non-secret slice of `/etc` (name resolution + the dynamic
+/// loader cache) plus entropy sources, and read on the **public** system CA
+/// trust-store directories so an in-sandbox HTTPS client can verify certificates
+/// (issue #485). Everything else — crucially `/etc/ephpm` (the cluster secret),
+/// `/etc/ssl/private` (TLS private keys), `/root`, and `/etc/shadow` — is denied
+/// by Landlock's default-deny once `restrict_self` runs.
 ///
 /// Uses ABI v1 (the widest kernel support) in best-effort mode, and refuses to
 /// run if the kernel does not enforce Landlock at all — a fail-closed posture,
@@ -513,6 +515,37 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
         Path::new("/proc/self"),
     ]);
 
+    // Read-only: the system CA trust store, so an HTTPS client inside the sandbox
+    // can verify server certificates (issue #485). Without this every outbound TLS
+    // handshake fails with `curl: (77) error setting certificate file` — no
+    // WordPress core download, `composer install`, wp.org fetch, or `git clone
+    // https://…` can run. The tenant egress firewall deliberately *allows* public
+    // TCP because build steps are expected to reach the internet, so an
+    // HTTPS-incapable sandbox is not useful; the CA store is public, non-secret
+    // data, so reading it is safe.
+    //
+    // These are the **public** cert directories only. It is deliberately NOT
+    // `/etc/ssl/private` / `/etc/pki/tls/private` (TLS private keys) and NOT
+    // `/etc/ssl`, `/etc/pki`, or `/etc` wholesale — widening to a parent would
+    // re-expose `/etc/ephpm` (the cluster secret) and `/etc/shadow`, which the
+    // paragraph above guarantees stay unreachable. Granted **read-only**: no write
+    // right is added on any of them.
+    //
+    // Directories (not the bundle files) are granted so the distro's symlink
+    // indirection resolves, because Landlock checks the *resolved* target path,
+    // not the link:
+    //   * Debian/Ubuntu/Alpine keep the concatenated bundle and the hashed `*.0`
+    //     symlinks in `/etc/ssl/certs`; the per-cert symlinks point into
+    //     `/usr/share/ca-certificates`, already covered by the `/usr` read+exec
+    //     grant above.
+    //   * RHEL/Alma/Fedora point `/etc/pki/tls/certs/ca-bundle.crt` (and
+    //     `cert.pem`) at `/etc/pki/ca-trust/extracted/…`, so the real target tree
+    //     `/etc/pki/ca-trust` is granted too — not merely the symlink entry dir
+    //     `/etc/pki/tls/certs` — or the resolved read is still denied.
+    // Non-present paths are dropped by `existing`, so the RHEL paths on a Debian
+    // host (and vice versa) are silently skipped rather than erroring.
+    let ca: Vec<PathBuf> = existing(&ca_trust_dirs());
+
     let status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
@@ -525,6 +558,8 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
         .context("landlock: add read/exec rules")?
         .add_rules(path_beneath_rules(&ro, read_only))
         .context("landlock: add read-only rules")?
+        .add_rules(path_beneath_rules(&ca, read_only))
+        .context("landlock: add CA trust-store read rules")?
         .restrict_self()
         .context("landlock: restrict_self")?;
 
@@ -561,6 +596,39 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
 #[cfg(target_os = "linux")]
 fn existing(paths: &[&std::path::Path]) -> Vec<std::path::PathBuf> {
     paths.iter().filter(|p| p.exists()).map(|p| p.to_path_buf()).collect()
+}
+
+/// The well-known system CA trust-store directories granted **read-only** so an
+/// HTTPS client inside the sandbox can verify server certificates (issue #485).
+///
+/// This is a fixed, built-in list rather than a config knob: HTTPS working is a
+/// baseline expectation of a build sandbox (composer, wp.org, `git clone
+/// https://…`), not something an operator should have to configure, and a
+/// misconfigured/empty override would silently break every outbound TLS
+/// handshake. The paths are well-known, public, and read-only, so there is no
+/// per-deployment variation to express.
+///
+/// Every entry is a **public**, non-secret directory. The list deliberately
+/// excludes the private-key siblings (`/etc/ssl/private`, `/etc/pki/tls/private`)
+/// and never returns `/etc/ssl`, `/etc/pki`, or `/etc` as a whole — granting a
+/// parent would re-expose `/etc/ephpm` (the cluster secret) and `/etc/shadow`.
+/// Both the Debian family (`/etc/ssl/certs`) and the RHEL family
+/// (`/etc/pki/tls/certs` plus the `/etc/pki/ca-trust` tree the bundle symlinks
+/// resolve into) are included so a general `ephpm exec` works on either; callers
+/// pass the result through [`existing`], so a path absent on this host is skipped
+/// rather than erroring.
+#[cfg(target_os = "linux")]
+fn ca_trust_dirs() -> [&'static std::path::Path; 3] {
+    [
+        // Debian / Ubuntu / Alpine: concatenated bundle + hashed `*.0` symlinks
+        // (per-cert links resolve into /usr/share/ca-certificates, under /usr).
+        std::path::Path::new("/etc/ssl/certs"),
+        // RHEL / Alma / Fedora: the symlink entry dir (ca-bundle.crt, cert.pem).
+        std::path::Path::new("/etc/pki/tls/certs"),
+        // RHEL / Alma / Fedora: the real extracted-bundle tree those links point
+        // at — Landlock checks the resolved target, so this must be granted too.
+        std::path::Path::new("/etc/pki/ca-trust"),
+    ]
 }
 
 /// `execvp` the command, replacing this process image. Returns only on failure.
@@ -703,6 +771,44 @@ mod tests {
         let mode = std::fs::metadata(&target).expect("stat target").permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "symlink target's mode must be untouched");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The CA trust-store allowlist (issue #485) must grant only **public** cert
+    /// directories and must never widen the read scope to a private-key sibling
+    /// or to a parent that would re-expose the cluster secret (`/etc/ephpm`) or
+    /// `/etc/shadow`. This guards the security bound of the fix independently of
+    /// whether any given path happens to exist on the test host.
+    #[test]
+    fn ca_trust_dirs_are_public_cert_dirs_only() {
+        use std::path::Path;
+
+        let dirs = super::ca_trust_dirs();
+
+        // The two distro-family public trust stores are present.
+        assert!(
+            dirs.contains(&Path::new("/etc/ssl/certs")),
+            "Debian/Alpine trust store must be granted"
+        );
+        assert!(
+            dirs.contains(&Path::new("/etc/pki/ca-trust")),
+            "RHEL extracted-bundle target tree must be granted"
+        );
+
+        for p in dirs {
+            let s = p.to_str().expect("ascii path");
+            // Never a TLS private-key directory.
+            assert!(!s.contains("private"), "must never grant a private-key dir: {s}");
+            // Never the cluster secret.
+            assert!(
+                !Path::new(s).starts_with("/etc/ephpm"),
+                "must never grant the cluster-secret dir: {s}"
+            );
+            // Never a bare parent that would pull in private-key / secret siblings.
+            assert!(
+                !matches!(s, "/etc" | "/etc/ssl" | "/etc/pki"),
+                "must not widen to a parent of the cert dirs: {s}"
+            );
+        }
     }
 
     #[test]
