@@ -712,6 +712,41 @@ impl Store {
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a
     /// replicator implementation to write its own local copy without
     /// re-entering itself. All other callers should use [`Store::set`].
+    ///
+    /// # An overwrite is atomic — the key is never absent
+    ///
+    /// The replacement goes through a single [`DashMap::insert`], which swaps
+    /// the value under the shard's own write lock and hands back what was
+    /// there. A concurrent `get` therefore reads either the old value or the
+    /// new one, never `None`.
+    ///
+    /// This used to reclaim the old entry's bytes by `remove`-ing it *before*
+    /// the insert, leaving a window — widened by the memory check and the
+    /// TTL-index maintenance that sat inside it — in which the key genuinely
+    /// did not exist. A read landing in that window was a spurious miss on a
+    /// key nobody had deleted: a stampede on a cache key, a logged-out user on
+    /// a session key, a `WAIT` observer woken to nothing (#452).
+    ///
+    /// # Memory accounting
+    ///
+    /// Because the old entry now stays in the map across the budget check,
+    /// `mem_used` already counts it, so only the *delta* is reserved. The
+    /// predicate is arithmetically identical to the remove-first form
+    /// (`current - old + new <= limit`), so the eviction threshold has not
+    /// moved. Reconciliation afterwards uses the entry `insert` actually
+    /// returned rather than the peeked size: a writer that lands in between
+    /// changes what is replaced, and crediting the peek would leak or
+    /// double-count those bytes.
+    ///
+    /// # An over-budget write keeps the old value
+    ///
+    /// When the budget refuses the write, whatever is already stored is left
+    /// alone and `false` is returned. This matches Redis under `noeviction`,
+    /// where an OOM-rejected `SET` does not delete the existing key. In the
+    /// remove-first form the removal had already happened by the time the
+    /// check failed, so a rejected write silently *destroyed* the value it was
+    /// merely failing to replace — data loss from a write that reported
+    /// failure.
     pub fn set_local(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         // Try compression if configured and size is above threshold.
         let (data, compressed) = if self.config.compression.algo != CompressionAlgo::None
@@ -736,24 +771,37 @@ impl Store {
         let new_size = entry.mem_size;
         let has_ttl = entry.expires_at.is_some();
 
-        // Remove old entry first so we can reclaim its memory.
-        if let Some((_, old)) = self.data.remove(&key) {
-            self.mem_sub(old.mem_size);
-        }
+        // PEEK the bytes already charged for this key — deliberately not a
+        // remove. The old entry has to stay visible for the whole
+        // check-and-insert (see the doc comment), and `mem_used` already
+        // counts it, so only the growth needs reserving. The peek can race
+        // with another writer; the reconcile after the insert is what makes
+        // the accounting correct, not this number.
+        let old_size = self.data.get(&key).map_or(0, |old| old.mem_size);
 
-        // Check memory limit before inserting.
-        if !self.ensure_memory(new_size) {
-            // Old TTL-index entry (if any) was already stripped by the remove
-            // above via the same-key insert below not happening; ensure the
-            // hint doesn't linger on a rejected write.
-            self.ttl_keys.remove(&key);
+        // Reserve the extra bytes with NO shard guard held: `ensure_memory` ->
+        // `evict_lru` takes write locks on arbitrary shards (possibly this
+        // one) and would deadlock under a guard. `set_nx` and
+        // `incr_by_with_ttl` make the same trade for the same reason.
+        if !self.ensure_memory(new_size.saturating_sub(old_size)) {
+            // Leave the existing entry — and its TTL hint — untouched.
+            self.log_write_rejected(&key, new_size);
             return false;
         }
 
-        self.mem_add(new_size);
         // Maintain the TTL side index: add on TTL'd writes, remove on the
         // TTL-less overwrite of a previously-TTL'd key. Set-membership is
         // idempotent so a re-write with the same TTL state is a no-op.
+        //
+        // This runs before the insert (it borrows `key`, which the insert
+        // consumes), so there is a moment where the index disagrees with the
+        // entry. That is not the same class of bug: `ttl_keys` is only a
+        // *hint* for `expire_pass`, which re-checks `Entry::expires_at` for
+        // every hint it visits and prunes the ones that no longer hold. The
+        // authority on expiry is the entry itself, and readers enforce it
+        // lazily, so a hint that is briefly stale can at worst delay a
+        // proactive reap by one pass — it can never make a live key read as
+        // missing.
         if has_ttl {
             self.ttl_keys.insert(key.clone());
         } else {
@@ -763,11 +811,56 @@ impl Store {
         // AFTER the insert so a woken waiter always reads the new value.
         // One Acquire load when nothing is watched (the common case).
         let watch = self.watch_slot_if_any(&key);
-        self.data.insert(key, entry);
+        // The atomic replace. `insert` swaps the value under the shard write
+        // lock, so the key is continuously present to concurrent readers, and
+        // returns the entry it displaced so its bytes can be reclaimed.
+        let previous = self.data.insert(key, entry);
+        // Reconcile from what was ACTUALLY replaced, not from `old_size`.
+        // Add before subtract: the transient error is then an over-count,
+        // which only makes the budget momentarily stricter, rather than an
+        // under-count that could let the store overshoot its limit.
+        self.mem_add(new_size);
+        if let Some(old) = previous {
+            self.mem_sub(old.mem_size);
+        }
         if let Some(slot) = watch {
             slot.bump();
         }
         true
+    }
+
+    /// Report a write refused by the memory budget: `warn!` for the first one
+    /// in the process, `debug!` for every one after.
+    ///
+    /// It has to be loud at least once, because nothing else says so. The
+    /// RESP `SET` handler discards [`Store::set`]'s boolean and answers `+OK`
+    /// regardless, so a client is never told its write was refused; under
+    /// `noeviction` this line is the only signal that the store is parked at
+    /// its limit and silently dropping writes.
+    ///
+    /// It also has to go quiet, for the same reason
+    /// [`Store::warn_hash_not_replicated`] does: a store sitting at the limit
+    /// refuses *every* write, and a `warn!` per write would bury the log in a
+    /// message whose content never changes.
+    fn log_write_rejected(&self, key: &str, new_size: usize) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mem_used = self.mem_used();
+        let limit = self.config.memory_limit;
+        if WARNED.swap(true, Ordering::Relaxed) {
+            debug!(key, new_size, mem_used, limit, "write refused: over the memory limit");
+            return;
+        }
+        tracing::warn!(
+            key,
+            new_size,
+            mem_used,
+            limit,
+            policy = ?self.config.eviction_policy,
+            "write refused: the KV store is over its memory limit and could not free enough space. \
+             The existing value at this key is left intact, and the RESP client was still answered \
+             +OK. Raise `[kv] memory_limit` or choose an eviction policy. Further refusals are \
+             logged at DEBUG."
+        );
     }
 
     /// Atomically set a key only if it doesn't already exist (`SETNX`).
@@ -2572,6 +2665,184 @@ mod tests {
         s.set("key".into(), vec![0u8; 10], None);
         let mem3 = s.mem_used();
         assert!(mem3 < mem2, "memory should decrease with smaller value");
+    }
+
+    // ── Atomic overwrite (#452) ─────────────────────────────────────
+    //
+    // `set_local` used to `remove` the old entry to reclaim its bytes and only
+    // then check the budget and insert. Two defects fell out of that ordering,
+    // and there is one test below for each:
+    //
+    //   * the key did not exist between the remove and the insert, so a
+    //     concurrent reader got a miss on a key nobody had deleted; and
+    //   * a write the budget then REFUSED had already destroyed the value it
+    //     was failing to replace.
+    //
+    // The second is deterministic and single-threaded, which is why it leads.
+
+    #[test]
+    fn over_budget_overwrite_refuses_the_write_and_keeps_the_existing_value() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+
+        // BEFORE: the key is present with the original value. Asserted so the
+        // final assertion cannot pass merely because the write never happened.
+        assert!(s.set("k".into(), vec![b'a'; 64], None), "the setup write must fit");
+        assert_eq!(s.get("k").as_deref(), Some(&[b'a'; 64][..]));
+        let mem_before = s.mem_used();
+
+        // A replacement far too large for the limit. Refusing it is correct.
+        assert!(!s.set("k".into(), vec![b'b'; 2048], None), "an over-budget write must be refused");
+
+        // AFTER: refusing it must not have deleted what was already there.
+        // Against the remove-first ordering this is `None` — the rejected
+        // write ate the existing value.
+        assert_eq!(
+            s.get("k").as_deref(),
+            Some(&[b'a'; 64][..]),
+            "a refused write must leave the existing value intact"
+        );
+        assert_eq!(s.mem_used(), mem_before, "a refused write must not move the accounting");
+    }
+
+    #[test]
+    fn over_budget_overwrite_keeps_the_existing_ttl() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+
+        assert!(s.set("sess".into(), vec![b'a'; 64], Some(Duration::from_secs(600))));
+        let ttl_before = s.pttl("sess").expect("key must exist before the refused write");
+        assert!(ttl_before > 0, "the setup write must have set a TTL");
+
+        assert!(!s.set("sess".into(), vec![b'b'; 2048], Some(Duration::from_secs(600))));
+
+        // Both the value and its expiry survive: the old code removed the
+        // entry AND pruned its `ttl_keys` hint on the way out.
+        assert_eq!(s.get("sess").as_deref(), Some(&[b'a'; 64][..]));
+        assert!(s.pttl("sess").is_some_and(|ms| ms > 0), "the TTL must survive a refused write");
+        assert!(s.ttl_keys.contains("sess"), "the TTL hint must survive a refused write");
+    }
+
+    #[test]
+    fn repeated_overwrites_do_not_drift_memory_accounting() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+
+        s.set("k".into(), vec![0u8; 128], None);
+        let after_first = s.mem_used();
+
+        // The replacement is now charged as a delta and reconciled from the
+        // entry `insert` returned. Getting either half wrong shows up here as
+        // a monotonic leak (forgot the subtract) or a drain to zero (charged
+        // the peek twice).
+        for i in 0..500u32 {
+            #[allow(clippy::cast_possible_truncation)]
+            let fill = i as u8;
+            assert!(s.set("k".into(), vec![fill; 128], None));
+        }
+        assert_eq!(
+            s.mem_used(),
+            after_first,
+            "same-size overwrites must not leak or double-count bytes"
+        );
+
+        s.remove("k");
+        assert_eq!(s.mem_used(), 0, "accounting must return to zero once the key is gone");
+    }
+
+    /// A reader must observe the key **continuously present** while another
+    /// thread overwrites it.
+    ///
+    /// This one is probabilistic — the defect is a race, and closing it means
+    /// there is no longer a window to hit, so there is nothing deterministic
+    /// left to trigger. It is made tight rather than lucky: three reader
+    /// threads spin on `get` for the whole of 300k overwrites, so the writer's
+    /// hole is offered millions of chances to be observed. Against the
+    /// remove-first ordering it fails within the first few thousand writes on
+    /// every machine tried; a regression would have to re-open the window AND
+    /// have every one of those millions of reads miss it to sneak through.
+    ///
+    /// The TTL is not decoration: it puts the `ttl_keys.insert` (a `String`
+    /// allocation plus a `DashSet` shard lock) inside the window, which is the
+    /// shape a real session write has.
+    #[test]
+    fn concurrent_reader_never_sees_a_miss_while_a_key_is_overwritten() {
+        const WRITES: usize = 300_000;
+        const READERS: usize = 3;
+        let old = vec![b'a'; 64];
+        let new = vec![b'b'; 64];
+
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+
+        // BEFORE: the key is present, and stays present for the whole test —
+        // nothing below ever deletes it.
+        assert!(s.set("hot".into(), old.clone(), Some(Duration::from_secs(600))));
+        assert_eq!(s.get("hot").as_deref(), Some(&old[..]));
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let misses = AtomicUsize::new(0);
+        let torn = AtomicUsize::new(0);
+        let reads = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..READERS {
+                scope.spawn(|| {
+                    let mut local_reads = 0usize;
+                    while !done.load(Ordering::Relaxed) {
+                        match s.get("hot") {
+                            None => {
+                                misses.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Neither value is ever partially written, but
+                            // assert it: a "present" that is not one of the
+                            // two written values would mean something worse
+                            // than a miss.
+                            Some(v) if v != old && v != new => {
+                                torn.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(_) => {}
+                        }
+                        local_reads += 1;
+                    }
+                    reads.fetch_add(local_reads, Ordering::Relaxed);
+                });
+            }
+
+            for i in 0..WRITES {
+                let value = if i % 2 == 0 { new.clone() } else { old.clone() };
+                assert!(s.set("hot".into(), value, Some(Duration::from_secs(600))));
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+
+        let reads = reads.load(Ordering::Relaxed);
+        assert!(
+            reads > WRITES,
+            "the readers must have out-run the writer for this to mean anything (reads: {reads})"
+        );
+        assert_eq!(
+            misses.load(Ordering::Relaxed),
+            0,
+            "a key that is only ever overwritten must never read as absent ({reads} reads)"
+        );
+        assert_eq!(
+            torn.load(Ordering::Relaxed),
+            0,
+            "a read returned a value that was never written"
+        );
     }
 
     #[test]
