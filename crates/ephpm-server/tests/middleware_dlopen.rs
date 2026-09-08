@@ -329,6 +329,31 @@ fn dynamic_init_failure_aborts_startup() {
     assert!(err.contains("init returned -3"), "{err}");
 }
 
+/// A module that declares `CONFIG_KEYS` is strict on the **dlopen** lane too
+/// (issue #473). The check is compiled into the module by `declare!`, not
+/// performed by the host — the host cannot know a third-party module's schema
+/// — so this is the only place it can be proven: a real cdylib, loaded across
+/// the C boundary, refusing a mount whose `config` names a key it does not
+/// read. The `-3` is `declare!`'s "init returned an error" code, the same one
+/// a rejected config produces above.
+#[test]
+fn a_declared_key_set_is_enforced_across_the_c_abi() {
+    let lib = fixture("mw_probe_v1");
+    let config = serde_json::json!({ "tag": "fixture-alpha", "tagg": "typo" });
+    let err = match MiddlewareChain::load(&[mount_path(lib.path(), Some(config))]) {
+        Ok(_) => panic!("a declared key set must be enforced on the dlopen lane"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("mw_probe_v1"), "{err}");
+    assert!(err.contains("init returned -3"), "{err}");
+
+    // Control: the same config without the typo loads. Without this the test
+    // would pass for a fixture that had simply stopped loading at all.
+    let lib = fixture("mw_probe_v1");
+    let good = serde_json::json!({ "tag": "fixture-alpha" });
+    MiddlewareChain::load(&[mount_path(lib.path(), Some(good))]).expect("control mount loads");
+}
+
 // ── chain composition across both lanes ───────────────────────────────────
 
 /// A builtin (static registry) mount and a dlopened mount in one chain,

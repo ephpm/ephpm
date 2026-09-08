@@ -110,7 +110,7 @@ config  = { api_key = "..." }
 | `library` | yes | Built-in name or shared library to load — bare name or explicit path (see below). Must not be empty. |
 | `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every PHP-bound request. |
 | `order` | yes | Chain position. Lower runs first; equal orders keep declaration order. |
-| `config` | no | Arbitrary table, serialised to JSON and handed to the module's `init`. |
+| `config` | no | Table serialised to JSON and handed to the module's `init`. For the built-in modules a key the module does not read is a startup error — see [Unknown `config` keys](#unknown-config-keys). |
 
 Mounts are **global** — they apply to every vhost. A module that needs
 per-tenant behavior reads the request's canonical site key (`req.vhost_id()`,
@@ -122,6 +122,40 @@ Loading is **fail-fast**: a builtin whose `init` rejects its config, a
 library that can't be found, a missing ABI symbol, or a dynamic module
 whose `init` returns an error aborts server startup with a message naming
 the mount.
+
+### Unknown `config` keys
+
+**Every built-in module rejects a `config` key it does not read**, and the
+rejection aborts startup naming the mount, the key, the nearest accepted
+spelling, and the module's full key set:
+
+```
+middleware chain: builtin middleware "ratelimit" init failed:
+unknown config key `per_ip_rp` (did you mean `per_ip_rps`?);
+accepted keys: `per_ip_rps`, `burst`, `key_headers`
+```
+
+That mount used to start and run the **default** rate limit. Nothing
+was logged at any level, so the operator's explicit instruction became a no-op
+that every health check reported green — and for `ip-allowlist`, `api-key`,
+`jwt` and `ratelimit` a no-op is a *widening*: the rule you wrote down is not
+the rule being enforced. The same reasoning as [unknown keys elsewhere in
+`ephpm.toml`](/reference/config/#unknown-keys-are-a-startup-error), and the ten
+built-ins ship inside the binary that checks them, so there is no
+version-skew case to tolerate. If an upgrade fails startup naming a `config`
+key, **that key was already doing nothing**.
+
+Two things are deliberately *not* checked:
+
+- **Free-form maps whose keys are your data, not schema names** — `api-key`'s
+  `keys`, `redirect`'s `host_map`, `header-transform`'s `request.set` /
+  `response.set`. Any key is valid there by definition. Section names are
+  checked: `header-transform`'s `response = { sett = ... }` is an error.
+- **Third-party (`dlopen`ed) modules that do not declare a key set.** The host
+  cannot know a module's schema, so strictness there is the module's own
+  choice — see [Writing your own module](#writing-your-own-module-in-rust). A
+  module built against an older authoring kit keeps the old lenient behaviour;
+  its `config` typos are still silent.
 
 ### Library resolution
 
@@ -542,6 +576,13 @@ use ephpm_middleware::{declare, Middleware, Request, Response};
 struct MyAuth { api_key: String }
 
 impl Middleware for MyAuth {
+    // Optional, and recommended: the complete set of top-level `config` keys
+    // you read. A mount carrying anything else then fails startup naming the
+    // key, instead of running your defaults. Omit it and unknown keys stay
+    // silently ignored — the pre-#473 behaviour, kept as the default because
+    // the host cannot know your schema.
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["api_key"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let api_key = config.get("api_key")
             .and_then(|v| v.as_str())
@@ -561,10 +602,17 @@ declare!(MyAuth);
 ```
 
 `declare!(MyAuth)` generates the four C ABI exports, the ABI major-version
-check, config JSON parsing, response marshaling, and panic containment (a
-panicking `invoke` becomes a fail-closed 500). To add the optional response
-phase, implement `ResponseMiddleware` and write `declare!(MyAuth, response)` —
-see [Response phase](#response-phase-transforming-the-response).
+check, config JSON parsing, the `CONFIG_KEYS` check, response marshaling, and
+panic containment (a panicking `invoke` becomes a fail-closed 500). To add the
+optional response phase, implement `ResponseMiddleware` and write
+`declare!(MyAuth, response)` — see
+[Response phase](#response-phase-transforming-the-response).
+
+`CONFIG_KEYS` is enforced by the authoring kit compiled into *your* module, not
+by the host, so it needs no ABI support and works with any ePHPm that can load
+the module at all. It describes the **top level** only: if your config nests,
+call `ephpm_middleware::config::reject_unknown_keys(&section, "section", &[...])`
+from your own `init` for each section, and leave free-form maps unchecked.
 
 Inside `invoke`, `req.host()` exposes host services:
 

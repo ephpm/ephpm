@@ -44,6 +44,9 @@ impl Cors {
 }
 
 impl Middleware for Cors {
+    const CONFIG_KEYS: Option<&'static [&'static str]> =
+        Some(&["allow_origins", "allow_methods", "allow_headers", "allow_credentials", "max_age"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let origins = config
             .get("allow_origins")

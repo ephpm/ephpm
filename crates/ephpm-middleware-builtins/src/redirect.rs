@@ -178,6 +178,17 @@ impl Redirect {
 }
 
 impl Middleware for Redirect {
+    // `host_map` is a free-form map of hostname -> destination: its keys are
+    // operator data, not schema names, so nothing inside it is checkable.
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&[
+        "force_https",
+        "canonical_host",
+        "host_map",
+        "trailing_slash",
+        "status",
+        "forwarded_proto_header",
+    ]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let canonical_host = match config.get("canonical_host") {
             None | Some(serde_json::Value::Null) => None,

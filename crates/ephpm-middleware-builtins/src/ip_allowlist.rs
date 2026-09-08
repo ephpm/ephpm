@@ -98,6 +98,8 @@ impl IpAllowlist {
 }
 
 impl Middleware for IpAllowlist {
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["allow", "deny", "default"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let allow = parse_cidrs(config, "allow")?;
         let deny = parse_cidrs(config, "deny")?;
@@ -163,6 +165,49 @@ mod tests {
         // SAFETY: `ctx` outlives the view; host_table() is 'static.
         let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
         mw.invoke(&req)
+    }
+
+    /// The widening this middleware must never do silently (issue #473).
+    ///
+    /// `deny = [...]` misspelled as `denied` used to parse, mount, and run
+    /// with an empty deny list: every address the operator wrote down to
+    /// block was let through, with no log line at any level. The assertion
+    /// pairs the rejection with what the typo would otherwise have produced,
+    /// so it cannot pass for the wrong reason.
+    #[test]
+    fn a_misspelled_key_is_a_startup_error_not_a_wider_allowlist() {
+        let typo = serde_json::json!({
+            "allow": ["10.0.0.0/8"],
+            "denied": ["10.6.6.6/32"],
+            "default": "deny",
+        });
+        let err = ephpm_middleware::init_checked::<IpAllowlist>(&typo)
+            .map(|_| ())
+            .expect_err("an unknown key must refuse the mount");
+        assert!(err.contains("unknown config key `denied`"), "{err}");
+        // Too far from `deny` for a did-you-mean (three edits), so the message
+        // falls back to listing what this module does accept.
+        assert!(err.contains("accepted keys: `allow`, `deny`, `default`"), "{err}");
+        // A near miss does get the hint.
+        let err = ephpm_middleware::init_checked::<IpAllowlist>(&serde_json::json!({
+            "allow": ["10.0.0.0/8"],
+            "defualt": "allow",
+        }))
+        .map(|_| ())
+        .expect_err("an unknown key must refuse the mount");
+        assert!(err.contains("did you mean `default`"), "{err}");
+
+        // What the old behaviour did with that same payload: the blocked host
+        // is inside `allow`, so dropping `denied` let it straight through.
+        let lenient = build(serde_json::json!({ "allow": ["10.0.0.0/8"], "default": "deny" }));
+        assert_eq!(invoke(&lenient, "10.6.6.6").__action(), ACTION_CONTINUE);
+        // Spelled correctly, the rule is honoured — so the key is not inert.
+        let correct = build(serde_json::json!({
+            "allow": ["10.0.0.0/8"],
+            "deny": ["10.6.6.6/32"],
+            "default": "deny",
+        }));
+        assert_eq!(invoke(&correct, "10.6.6.6").__status(), 403);
     }
 
     #[test]

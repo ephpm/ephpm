@@ -976,6 +976,48 @@ mod tests {
         MiddlewareMount { library: library.to_string(), match_pattern: None, order, config: None }
     }
 
+    /// Every name the builtin registry answers to, one per module. Kept here
+    /// rather than derived so that adding a builtin without deciding what its
+    /// config strictness is fails the test below.
+    const BUILTIN_NAMES: &[&str] = &[
+        "jwt",
+        "cors",
+        "ratelimit",
+        "security-headers",
+        "api-key",
+        "ip-allowlist",
+        "maintenance-mode",
+        "redirect",
+        "request-id",
+        "header-transform",
+    ];
+
+    /// Issue #473, through the real mount path: an unrecognised `config` key
+    /// on any in-tree builtin refuses the mount and names both the mount and
+    /// the key. Before this, every one of the ten dropped it silently — no
+    /// `warn!`, no `debug!` — and ran its defaults.
+    #[test]
+    fn every_builtin_rejects_an_unknown_config_key() {
+        for name in BUILTIN_NAMES {
+            assert!(builtin(name).is_some(), "{name} is not in the builtin registry");
+            let mount = MiddlewareMount {
+                library: (*name).to_string(),
+                match_pattern: None,
+                order: 0,
+                config: Some(serde_json::json!({ "ephpm_not_a_real_key": 1 })),
+            };
+            let Err(err) = MiddlewareChain::load(std::slice::from_ref(&mount)) else {
+                panic!("{name} must refuse an unknown config key");
+            };
+            let err = err.to_string();
+            assert!(err.contains(&format!("\"{name}\"")), "the mount must be named: {err}");
+            assert!(
+                err.contains("unknown config key `ephpm_not_a_real_key`"),
+                "the key must be named: {err}"
+            );
+        }
+    }
+
     #[test]
     fn glob_prefix_wildcard() {
         assert!(path_matches("/api/*", "/api/x"));

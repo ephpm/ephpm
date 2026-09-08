@@ -140,6 +140,9 @@ fn numeric_date(v: &serde_json::Value) -> Option<u64> {
 }
 
 impl Middleware for Jwt {
+    const CONFIG_KEYS: Option<&'static [&'static str]> =
+        Some(&["secret", "issuer", "audience", "header", "claims_header"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let secret = config
             .get("secret")

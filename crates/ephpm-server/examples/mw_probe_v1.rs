@@ -24,6 +24,11 @@ pub struct Probe {
 }
 
 impl Middleware for Probe {
+    /// Declared so the dlopen lane's enforcement of `CONFIG_KEYS` is covered
+    /// by a real cdylib built through `declare!` — the check lives in the
+    /// authoring kit compiled into the module, not in the host.
+    const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["tag"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let tag = config
             .get("tag")

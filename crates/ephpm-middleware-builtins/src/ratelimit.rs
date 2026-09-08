@@ -69,6 +69,9 @@ impl RateLimit {
 }
 
 impl Middleware for RateLimit {
+    const CONFIG_KEYS: Option<&'static [&'static str]> =
+        Some(&["per_ip_rps", "burst", "key_headers"]);
+
     fn init(config: &serde_json::Value) -> Result<Self, String> {
         let per_ip_rps = config
             .get("per_ip_rps")
