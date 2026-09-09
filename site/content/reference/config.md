@@ -145,8 +145,29 @@ Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, exper
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `access` | string | `""` | Path to access log file. Empty = disabled. |
+| `access` | string | `""` | Path to the access log file. Empty = disabled. When set, one structured-JSON record is written per served request (see below). |
 | `level` | string | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error`. Overridden by `RUST_LOG`. |
+
+When `access` names a file, the server writes one JSON object per served
+request to it — for example:
+
+```json
+{"timestamp":"2026-09-08T12:00:00.123456Z","level":"INFO","method":"GET","path":"/wp-login.php","status":200,"duration_ms":12.4,"bytes":5321,"client_ip":"203.0.113.7","version":"HTTP/1.1","target":"access_log","message":"access"}
+```
+
+Fields: `method`, `path` (the request path only — **never** the query
+string), `status`, `duration_ms`, `bytes` (omitted for streaming responses of
+unknown size), `client_ip` (the effective client after trusted-proxy
+resolution — a spoofed `X-Forwarded-For` from an untrusted peer is ignored),
+and `version`.
+
+The access log deliberately carries **no** request headers
+(`Authorization`/`Cookie`), no query string, and no `$_SERVER` value
+(`DB_PASSWORD`, `DATABASE_URL`, `PHP_AUTH_PW`), so it cannot leak a
+credential. Records go only to this file — they are not echoed to stdout or
+the service log. JSON (rather than a combined/common text line) is chosen so
+that attacker-influenced fields (the request path, the forwarded client IP)
+are escaped and cannot inject forged log lines.
 
 ### `[server.metrics]`
 
