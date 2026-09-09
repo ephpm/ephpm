@@ -8,7 +8,12 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::resp::Frame;
-use crate::store::Store;
+use crate::store::{OOM_ERROR, SetNxOutcome, Store};
+
+/// Error frame for a write refused by the memory budget (Redis `-OOM`).
+fn oom() -> Frame {
+    Frame::error(OOM_ERROR)
+}
 
 /// Early-return an error frame if `argv` has fewer than `n` elements.
 macro_rules! check_args {
@@ -112,8 +117,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 _ => return Frame::error("ERR invalid expire time in 'setex' command"),
             };
             let val = argv[2].to_vec();
-            store.set(key, val, Some(Duration::from_secs(secs)));
-            Frame::ok()
+            if store.set(key, val, Some(Duration::from_secs(secs))) { Frame::ok() } else { oom() }
         }
         "MGET" => {
             if argv.is_empty() {
@@ -135,9 +139,15 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.len() < 2 || !argv.len().is_multiple_of(2) {
                 return Frame::error("ERR wrong number of arguments for 'mset' command");
             }
+            // Best-effort under memory pressure: a refused pair returns `-OOM`
+            // and stops, so earlier pairs may already be stored. Redis rejects
+            // the whole MSET up front; we do not pre-check total size, and this
+            // only bites under `noeviction` at the limit.
             for pair in argv.chunks(2) {
                 let key = str_from(pair[0]);
-                store.set(key, pair[1].to_vec(), None);
+                if !store.set(key, pair[1].to_vec(), None) {
+                    return oom();
+                }
             }
             Frame::ok()
         }
@@ -146,11 +156,12 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             let key = str_from(argv[0]);
             // Atomic check-and-set under the per-key shard lock — the
             // exists/set pair this used to do was racy under concurrent
-            // callers.
-            if store.set_nx(key, argv[1].to_vec(), None) {
-                Frame::integer(1)
-            } else {
-                Frame::integer(0)
+            // callers. The outcome distinguishes "key exists" (`:0`) from a
+            // memory refusal (`-OOM`) — the plain boolean conflated them (#477).
+            match store.set_nx_outcome(key, argv[1].to_vec(), None) {
+                SetNxOutcome::Inserted => Frame::integer(1),
+                SetNxOutcome::Exists => Frame::integer(0),
+                SetNxOutcome::OutOfMemory => oom(),
             }
         }
         "INCR" => {
@@ -196,8 +207,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "APPEND" => {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            let new_len = store.append(&key, argv[1]);
-            Frame::integer(i64::try_from(new_len).unwrap_or(i64::MAX))
+            match store.append(&key, argv[1]) {
+                Some(new_len) => Frame::integer(i64::try_from(new_len).unwrap_or(i64::MAX)),
+                None => oom(),
+            }
         }
         "STRLEN" => {
             check_args!(cmd, argv, 1);
@@ -211,7 +224,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
             let old = store.get(&key);
-            store.set(key, argv[1].to_vec(), None);
+            if !store.set(key, argv[1].to_vec(), None) {
+                return oom();
+            }
             match old {
                 Some(v) => Frame::bulk(v),
                 None => Frame::Null,
@@ -313,7 +328,11 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                     // Convert Bytes → Vec<u8> at the write boundary
                     // (Store::set still takes an owned Vec). RENAME is
                     // cold enough that this extra copy is fine.
-                    store.set(new_key, val.to_vec(), ttl);
+                    if !store.set(new_key, val.to_vec(), ttl) {
+                        // The old key is still intact — the set that would
+                        // replace it was refused, so leave RENAME a no-op.
+                        return oom();
+                    }
                     store.remove(&old_key);
                     Frame::ok()
                 }
@@ -490,20 +509,28 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     // is rarely used and the value fetched here is still consistent
     // with what's stored after the call.
     if nx {
-        let inserted = store.set_nx(key.clone(), val, ttl);
-        return if get {
-            if inserted {
-                Frame::Null
-            } else {
-                match store.get(&key) {
-                    Some(v) => Frame::bulk(v),
-                    None => Frame::Null,
+        return match store.set_nx_outcome(key.clone(), val, ttl) {
+            // A memory refusal is `-OOM`, distinct from the `nil` that means
+            // "the key already existed" (#477).
+            SetNxOutcome::OutOfMemory => oom(),
+            SetNxOutcome::Inserted => {
+                if get {
+                    // NX+GET on a successful insert: no prior value.
+                    Frame::Null
+                } else {
+                    Frame::ok()
                 }
             }
-        } else if inserted {
-            Frame::ok()
-        } else {
-            Frame::Null
+            SetNxOutcome::Exists => {
+                if get {
+                    match store.get(&key) {
+                        Some(v) => Frame::bulk(v),
+                        None => Frame::Null,
+                    }
+                } else {
+                    Frame::Null
+                }
+            }
         };
     }
 
@@ -514,7 +541,9 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         return Frame::Null;
     }
 
-    store.set(key, val, ttl);
+    if !store.set(key, val, ttl) {
+        return oom();
+    }
 
     if get {
         match old {
@@ -1057,5 +1086,110 @@ mod tests {
         assert_eq!(cmd(&s, &["set", "k", "v"]), Frame::ok());
         assert_eq!(bulk_str(&cmd(&s, &["get", "k"])), Some("v"));
         assert_eq!(cmd(&s, &["Set", "k2", "v2"]), Frame::ok());
+    }
+
+    // ── Out-of-memory refusal is surfaced on the wire (#477) ──────────────
+
+    /// A store with a tiny budget and `NoEviction`, so a large value cannot be
+    /// stored and small ones can. `memory_limit: 200` fits a `k=v`-sized entry
+    /// but not a kilobyte (same sizing the store's `noeviction_rejects_writes`
+    /// test relies on).
+    fn tiny_store() -> Arc<Store> {
+        Store::new(StoreConfig {
+            memory_limit: 200,
+            eviction_policy: crate::store::EvictionPolicy::NoEviction,
+            compression: crate::store::CompressionConfig::default(),
+        })
+    }
+
+    /// A value guaranteed not to fit `tiny_store`'s budget.
+    fn too_big() -> String {
+        "x".repeat(1024)
+    }
+
+    fn is_oom(f: &Frame) -> bool {
+        matches!(f, Frame::Error(m) if m.starts_with("OOM"))
+    }
+
+    #[test]
+    fn set_within_budget_still_succeeds() {
+        let s = tiny_store();
+        assert_eq!(cmd(&s, &["SET", "k", "v"]), Frame::ok());
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("v"));
+    }
+
+    #[test]
+    fn set_over_budget_returns_oom_not_ok() {
+        let s = tiny_store();
+        let big = too_big();
+        let f = cmd(&s, &["SET", "big", &big]);
+        assert!(is_oom(&f), "expected -OOM, got {f:?}");
+        // The refused write must not have been stored.
+        assert_eq!(cmd(&s, &["GET", "big"]), Frame::Null);
+    }
+
+    #[test]
+    fn set_nx_option_over_budget_returns_oom() {
+        let s = tiny_store();
+        let big = too_big();
+        assert!(is_oom(&cmd(&s, &["SET", "big", &big, "NX"])));
+    }
+
+    #[test]
+    fn setex_over_budget_returns_oom() {
+        let s = tiny_store();
+        let big = too_big();
+        assert!(is_oom(&cmd(&s, &["SETEX", "big", "60", &big])));
+    }
+
+    #[test]
+    fn setnx_over_budget_returns_oom_not_zero() {
+        let s = tiny_store();
+        let big = too_big();
+        // A fresh key that does not fit is `-OOM`, distinct from the `:0` that
+        // means "key already exists".
+        assert!(is_oom(&cmd(&s, &["SETNX", "big", &big])));
+    }
+
+    #[test]
+    fn setnx_existing_key_is_zero_not_oom() {
+        let s = tiny_store();
+        assert_eq!(cmd(&s, &["SETNX", "k", "v"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["SETNX", "k", "v2"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn append_create_over_budget_returns_oom() {
+        let s = tiny_store();
+        let big = too_big();
+        assert!(is_oom(&cmd(&s, &["APPEND", "big", &big])));
+    }
+
+    #[test]
+    fn getset_over_budget_returns_oom() {
+        let s = tiny_store();
+        let big = too_big();
+        assert!(is_oom(&cmd(&s, &["GETSET", "big", &big])));
+    }
+
+    #[test]
+    fn mset_over_budget_returns_oom() {
+        let s = tiny_store();
+        let big = too_big();
+        assert!(is_oom(&cmd(&s, &["MSET", "big", &big])));
+    }
+
+    #[test]
+    fn incr_create_over_budget_returns_oom() {
+        // A budget too small for any entry: the INCR create path reserves
+        // memory and must be refused with `-OOM` rather than creating a
+        // counter that does not fit.
+        let s = Store::new(StoreConfig {
+            memory_limit: 8,
+            eviction_policy: crate::store::EvictionPolicy::NoEviction,
+            compression: crate::store::CompressionConfig::default(),
+        });
+        let f = cmd(&s, &["INCR", "counter"]);
+        assert!(is_oom(&f), "expected -OOM, got {f:?}");
     }
 }
