@@ -14,7 +14,10 @@ name: Release (PHP beta, experimental)
 # It is workflow_dispatch ONLY. A human cuts the first beta build. It builds the
 # four OS/arch targets against the pinned pre-release SDK and uploads them as
 # workflow artifacts; with `publish=true` from a tag ref it additionally
-# publishes a GitHub PRE-RELEASE (never promoted to "Latest").
+# publishes a GitHub PRE-RELEASE under its OWN distinct tag, `v<ref>-php<beta>`
+# (e.g. v0.8.7-php8.6.0beta1 — a '-' separator, never '+', which url-encodes to
+# %2B in release/tag URLs). It never touches the stable `v<ref>` release. Marked
+# prerelease so it is never promoted to "Latest" (#441).
 #
 # Prerequisite: the beta SDK must already be published at
 # github.com/ephpm/php-sdk (tag `v<full>`, e.g. v8.6.0beta1) for every target
@@ -339,10 +342,19 @@ jobs:
 
   # -- Optional pre-release publish -------------------------------------------
   # Gathers whatever archives the (non-gating) build jobs produced and, only
-  # when dispatched from a v* tag with publish=true, attaches them to a GitHub
-  # PRE-RELEASE tagged v<ref>+php<beta>. Marked prerelease so it is never
-  # promoted to "Latest". Non-gating: `!cancelled()` + `always()`-style guard so
-  # a red OS leg still publishes the ones that succeeded.
+  # when dispatched from a v* tag with publish=true, publishes them as a GitHub
+  # PRE-RELEASE under its OWN distinct tag, v<ref>-php<beta> (e.g.
+  # v0.8.7-php8.6.0beta1). This tag is deliberately NOT the dispatch tag: keying
+  # off github.ref_name made action-gh-release EDIT the existing stable v<ref>
+  # release — attaching the beta tarballs to it, renaming it, and flipping it to
+  # prerelease, which demoted the stable release out of "Latest" (#441, observed
+  # on run 33520043117 from v0.8.7). The beta gets its own tag; the stable
+  # release is never touched. A guard refuses to publish if a release already
+  # exists at the computed tag with different provenance (i.e. not one this lane
+  # created), so a re-dispatch is idempotent but a name collision fails loudly.
+  # Marked prerelease so it is never promoted to "Latest". Non-gating:
+  # `!cancelled()` + `always()`-style guard so a red OS leg still publishes the
+  # ones that succeeded.
   publish:
     name: Publish pre-release (optional)
     needs: [build-linux, build-linux-arm64, build-macos, build-windows]
@@ -369,13 +381,72 @@ jobs:
           fi
           (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
           ls -lh release/
+      - name: Compute distinct beta pre-release tag
+        id: tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          # Archive names are ephpm-<ref>+php<full>-<os>-<arch>.tar.gz. Derive
+          # the beta PHP version from what was actually built and publish under
+          # a DISTINCT tag v<ref>-php<full> ('-', never '+' — '+' url-encodes to
+          # %2B in release/tag URLs). The beta full version (e.g. 8.6.0beta1)
+          # never contains a '-', so [^-] safely stops at the OS segment.
+          betas="$(ls release/*.tar.gz \
+            | sed -n 's/.*+php\([^-]*\)-.*/\1/p' \
+            | sort -u)"
+          count="$(printf '%s\n' "$betas" | grep -c . || true)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one beta PHP version across archives, found ${count}: $(echo $betas)"
+            exit 1
+          fi
+          echo "beta=${betas}" >> "$GITHUB_OUTPUT"
+          echo "tag=${REF_NAME}-php${betas}" >> "$GITHUB_OUTPUT"
+          echo "Beta pre-release tag: ${REF_NAME}-php${betas}"
+      - name: Guard against clobbering a non-beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          # The tag is now distinct from the stable v<ref>, so a collision here
+          # means either a prior beta dispatch of THIS tag (fine — idempotent
+          # re-publish) or an unrelated/hand-made release (never edit it). Only
+          # treat it as ours if it is a prerelease carrying this lane's marker.
+          if gh release view "$TAG" --json isPrerelease,body \
+               --jq '.isPrerelease' > is_pre.txt 2>/dev/null; then
+            is_pre="$(cat is_pre.txt)"
+            body="$(gh release view "$TAG" --json body --jq '.body' || true)"
+            case "$body" in
+              *release-php-beta.yml*) ours=1 ;;
+              *) ours=0 ;;
+            esac
+            if [ "$is_pre" != "true" ] || [ "$ours" -ne 1 ]; then
+              echo "::error::release ${TAG} already exists and was not created by release-php-beta.yml (isPrerelease=${is_pre}); refusing to edit it. Delete or rename it first."
+              exit 1
+            fi
+            echo "Existing beta pre-release ${TAG} found; will update it."
+          else
+            echo "No existing release at ${TAG}; will create it."
+          fi
       - name: Create GitHub pre-release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          tag_name: ${{ github.ref_name }}
-          name: "${{ github.ref_name }} (PHP beta, experimental)"
+          # DISTINCT tag, never github.ref_name — see the job header and #441.
+          # action-gh-release creates this tag from the dispatched commit if it
+          # does not yet exist.
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "${{ github.ref_name }} (PHP ${{ steps.tag.outputs.beta }} beta, experimental)"
           prerelease: true
+          # Never let it become "Latest" even transiently.
+          make_latest: false
           body: |
             EXPERIMENTAL ephpm build linked against an upstream PHP pre-release
-            SDK. Not for production. See release-php-beta.yml.
+            SDK (PHP ${{ steps.tag.outputs.beta }}). Not for production.
+
+            This is a standalone pre-release under its own tag
+            (`${{ steps.tag.outputs.tag }}`); it does not modify, replace, or
+            demote the stable `${{ github.ref_name }}` release.
+
+            See release-php-beta.yml.
