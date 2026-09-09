@@ -1,0 +1,249 @@
+# pdo_mysql through the [db.mysql] proxy, end to end (issue #433).
+#
+# Why this workflow exists
+# ------------------------
+# `e2e.yml` runs the PHP-linked binary but only ever against the embedded Turso
+# engine (`[db.sqlite]`). `db-integration.yml` runs the `[db.mysql]` proxy
+# against a real MySQL but drives it with `mysql_async`, not PHP's `pdo_mysql`.
+# Nothing put the two together, so a regression visible only to `pdo_mysql`'s
+# connection/protocol behaviour toward the proxy — the exact class #425 was
+# about — had no CI guard. This job boots a real MySQL, builds the PHP-linked
+# ephpm, and drives a `pdo_mysql` write/read round-trip through a `[db.mysql]`
+# proxy in front of it.
+#
+# Why a separate workflow
+# -----------------------
+# It is the union of the two expensive things neither sibling pays for: it boots
+# a database (which `e2e.yml` does not) AND it does a full `lto=fat`,
+# `codegen-units=1` release build with PHP statically linked (which
+# `db-integration.yml` does not — it only builds the `ephpm-db` test binaries).
+# Paying both on every PR would be a real cost to everyone's queue time, so this
+# is path-filtered on the code that can break it, with an unconditional daily
+# run of `main` as the belt-and-suspenders (same reasoning as
+# `db-integration.yml`; a path filter that misses a transitive break still gets
+# caught within a day).
+#
+# The MySQL provisioning below is lifted from `db-integration.yml` and the
+# ephemerd-fleet quirks it documents apply verbatim: publishing is a userspace
+# proxy on a containerd shim, so host ports must be explicit (an empty host port
+# is silently dropped), a successful TCP connect proves nothing about mysqld
+# (readiness is the handshake packet, which also must NOT authenticate — a
+# single root auth warms the caching_sha2 cache and hides the full-auth branch
+# the proxy has to handle), containers run with `-t` so `docker logs` does not
+# choke on the un-multiplexed stream, and the endpoint is probed both on the
+# published port and directly on the container IP.
+
+name: pdo_mysql proxy E2E
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/ephpm-db/**"
+      - "crates/ephpm-php/**"
+      - "crates/ephpm-server/**"
+      - "crates/ephpm-config/**"
+      - "crates/ephpm-e2e/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pdo-mysql-e2e.yml"
+  pull_request:
+    branches: [main, "feat/**"]
+    paths:
+      - "crates/ephpm-db/**"
+      - "crates/ephpm-php/**"
+      - "crates/ephpm-server/**"
+      - "crates/ephpm-config/**"
+      - "crates/ephpm-e2e/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pdo-mysql-e2e.yml"
+  # Unconditional daily coverage of main, so a break arriving through a path not
+  # listed above still surfaces within a day.
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# One PHP-linked release build is ~2.3 GB peak RSS; group by ref so a burst of
+# merges to main queues instead of piling onto the small self-hosted fleet.
+# PRs cancel superseded runs (only the head commit needs to be green); pushes to
+# main do not, so every commit keeps its own bisectable result. Mirrors
+# `e2e.yml`.
+concurrency:
+  group: pdo-mysql-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Credentials for a throwaway loopback container that lives for one job. Not a
+  # secret.
+  MYSQL_PW: ephpm-test
+  # PHP minor to build the linked binary against. One leg is enough for a
+  # protocol/connection round-trip — this is not a per-version matrix.
+  PHP_VERSION: "8.4"
+
+jobs:
+  pdo-mysql-e2e:
+    name: pdo_mysql through the [db.mysql] proxy
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        # Same resolver as ci.yml/e2e.yml: some fleet runners come up as root
+        # without `sudo`, so a bare `sudo apt-get` exits 127 and reds the job in
+        # seconds for reasons unrelated to the change under test.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config
+
+      - name: Resolve container runtime
+        run: |
+          set -eu
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            RUNTIME=docker
+          elif command -v podman >/dev/null 2>&1; then
+            RUNTIME=podman
+          else
+            echo "::error::neither docker nor podman is usable on this runner; cannot start a test database"
+            exit 1
+          fi
+          echo "RUNTIME=$RUNTIME" >> "$GITHUB_ENV"
+          echo "using $RUNTIME"
+          $RUNTIME --version
+
+      - name: Start MySQL
+        run: |
+          set -eu
+          SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "DB_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+
+          # Explicit host port derived from the run id so two concurrent runs on
+          # the same runner do not collide. NOT `-p 127.0.0.1::3306`: the
+          # ephemerd fleet's Docker API is a containerd shim whose port-forward
+          # installer silently drops any binding with an empty host port.
+          MYSQL_HOST_PORT=$(( 24000 + (GITHUB_RUN_ID % 20000) ))
+          echo "MYSQL_HOST_PORT=$MYSQL_HOST_PORT" >> "$GITHUB_ENV"
+
+          # MySQL 8 with DEFAULT authentication (caching_sha2_password) — the
+          # plugin the proxy must handle. Do NOT downgrade to
+          # mysql_native_password: that is precisely the workaround that hid
+          # #234.
+          $RUNTIME run -d -t --name "ephpm-mysql-$SUFFIX" \
+            -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
+            -e MYSQL_DATABASE=test \
+            -p "127.0.0.1:$MYSQL_HOST_PORT:3306" \
+            docker.io/library/mysql:8.0
+
+      # Toolchain setup overlaps MySQL's ~20-30s initdb.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve database endpoint
+        # On a normal dockerd 127.0.0.1:<published> is right; on the ephemerd
+        # fleet the runner shares the container's CNI bridge and can reach
+        # <container IP>:3306 directly. Probe both, use whichever answers.
+        run: |
+          set -eu
+
+          probe() { timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+          c="ephpm-mysql-$DB_SUFFIX"
+          ip="$($RUNTIME inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" 2>/dev/null | head -1)"
+          ep=""
+          for _ in $(seq 1 120); do
+            if probe 127.0.0.1 "$MYSQL_HOST_PORT"; then ep="127.0.0.1:$MYSQL_HOST_PORT"; break; fi
+            if [ -n "$ip" ] && probe "$ip" 3306; then ep="$ip:3306"; break; fi
+            sleep 2
+          done
+          if [ -z "$ep" ]; then
+            echo "::error::no reachable endpoint for $c (tried 127.0.0.1:$MYSQL_HOST_PORT and $ip:3306)"
+            $RUNTIME logs "$c" 2>&1 | tail -50 || true
+            exit 1
+          fi
+          echo "MYSQL_EP=$ep" >> "$GITHUB_ENV"
+          echo "resolved: mysql=$ep"
+
+      - name: Wait for MySQL to accept queries
+        # Readiness is "the server sent its handshake packet". It must NOT
+        # authenticate (a single root auth warms the caching_sha2 cache and
+        # hides the full-auth branch), and it cannot be a bare TCP connect (the
+        # publishing proxy accepts before dialling the container). The handshake
+        # is sent unprompted on connect and only the real server sends one —
+        # initdb's temporary server runs with networking disabled.
+        run: |
+          set -eu
+          host="${MYSQL_EP%%:*}" port="${MYSQL_EP##*:}"
+          for _ in $(seq 1 150); do
+            n=$(timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port; head -c 16 <&3" 2>/dev/null | wc -c)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "MySQL ready (handshake received; nothing authenticated)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::MySQL ($MYSQL_EP) never sent a handshake"
+          exit 1
+
+      - name: Build the PHP-linked ephpm binary
+        # The whole point of this job: a real PHP that can drive pdo_mysql.
+        run: cargo xtask release --php-version "$PHP_VERSION"
+
+      - name: Run the pdo_mysql proxy E2E suite
+        env:
+          # Flip a missing prerequisite from a skip into a panic — the guard
+          # that stops this job going green against no database (issue #238's
+          # failure mode, applied to #433). The suite reads
+          # EPHPM_MYSQL_PROXY_TEST_URL for the backend; `cargo xtask e2e` hands
+          # it EPHPM_BINARY for the freshly built release binary.
+          EPHPM_REQUIRE_DB_TESTS: "1"
+        run: |
+          set -eu
+          export EPHPM_MYSQL_PROXY_TEST_URL="mysql://root:${MYSQL_PW}@${MYSQL_EP}/test"
+          cargo xtask e2e --php-version "$PHP_VERSION" --tests pdo_mysql_proxy
+
+      - name: Verify the guard fails rather than skips
+        # The fail-not-skip guard is itself a thing that can silently stop
+        # working. Assert the negative permanently: with EPHPM_REQUIRE_DB_TESTS=1
+        # and NO backend URL, the suite must FAIL (panic), not self-skip green.
+        if: always()
+        env:
+          EPHPM_REQUIRE_DB_TESTS: "1"
+        run: |
+          set -eu
+          # Deliberately export no EPHPM_MYSQL_PROXY_TEST_URL.
+          if cargo xtask e2e --php-version "$PHP_VERSION" --tests pdo_mysql_proxy > /tmp/guard.log 2>&1; then
+            echo "::error::pdo_mysql_proxy PASSED with no backend URL under EPHPM_REQUIRE_DB_TESTS=1 — the fail-not-skip guard is broken (a missing database could report green, issue #433/#238)."
+            tail -50 /tmp/guard.log
+            exit 1
+          fi
+          if ! grep -qF "EPHPM_MYSQL_PROXY_TEST_URL must be set" /tmp/guard.log; then
+            echo "::error::pdo_mysql_proxy failed, but not for the expected reason (wanted the require-guard panic)."
+            tail -50 /tmp/guard.log
+            exit 1
+          fi
+          echo "ok: the require-guard fails rather than skips"
+
+      - name: MySQL logs
+        if: failure()
+        run: $RUNTIME logs "ephpm-mysql-$DB_SUFFIX" 2>&1 | tail -100 || true
+
+      - name: Tear down MySQL
+        if: always()
+        run: $RUNTIME rm -f "ephpm-mysql-$DB_SUFFIX" >/dev/null 2>&1 || true
