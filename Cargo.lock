@@ -1519,6 +1519,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "ephpm-middleware",
+ "ephpm-middleware-builtins",
  "getrandom 0.3.4",
  "hmac 0.12.1",
  "reqwest",

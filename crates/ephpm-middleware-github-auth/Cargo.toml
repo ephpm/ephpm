@@ -77,6 +77,12 @@ webpki-roots.workspace = true
 # `host` supplies the request context and callback table so tests can build a
 # real `Request` without a running server. A shipped module never enables it.
 ephpm-middleware = { workspace = true, features = ["host"] }
+# The hot-path verifier's crypto core, used ONLY in the apex-flow integration
+# test to prove end to end that a session this module mints is bound to the
+# target preview (verifies there, rejected on any other) — the #396 property
+# that makes the shared domain-scoped cookie safe. Test-only; never linked into
+# the shipped cdylib.
+ephpm-middleware-builtins = { path = "../ephpm-middleware-builtins" }
 
 [lints]
 workspace = true

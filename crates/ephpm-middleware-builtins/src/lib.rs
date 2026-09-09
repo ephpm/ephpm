@@ -10,8 +10,9 @@
 //! The modules, by phase:
 //!
 //! - **Request phase** ([`ephpm_middleware::Middleware`]): [`jwt`],
-//!   [`session_cookie`], [`cors`], [`ratelimit`], [`security_headers`],
-//!   [`api_key`], [`ip_allowlist`], [`maintenance_mode`], [`redirect`].
+//!   [`session_cookie`], [`preview_gate`], [`cors`], [`ratelimit`],
+//!   [`security_headers`], [`api_key`], [`ip_allowlist`], [`maintenance_mode`],
+//!   [`redirect`].
 //! - **Request + response phase** (also
 //!   [`ephpm_middleware::ResponseMiddleware`], registered in the server via
 //!   [`ephpm_middleware::builtin::BuiltinModule::init_response`]):
@@ -50,6 +51,7 @@ pub mod hs256;
 pub mod ip_allowlist;
 pub mod jwt;
 pub mod maintenance_mode;
+pub mod preview_gate;
 pub mod ratelimit;
 pub mod redirect;
 pub mod request_id;
@@ -80,7 +82,7 @@ mod config_strictness_tests {
         assert!(err.contains(&format!("`{typo}`")), "message must name the key: {err}");
     }
 
-    /// All ten in-tree builtins, each with a minimally valid config and a
+    /// Every in-tree builtin, each with a minimally valid config and a
     /// realistic misspelling of one of its own keys. A new builtin added
     /// without a `CONFIG_KEYS` declaration fails here as soon as it is listed,
     /// and the list is checked against the server's registry by
@@ -106,6 +108,10 @@ mod config_strictness_tests {
         strict::<crate::session_cookie::SessionCookie>(
             &json!({ "secret": "s3cret", "login_url": "https://login.example/start" }),
             "require_sites",
+        );
+        strict::<crate::preview_gate::PreviewGate>(
+            &json!({ "secret": "s3cret", "login_url": "/auth/github/login" }),
+            "share_parm",
         );
     }
 

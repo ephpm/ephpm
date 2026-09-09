@@ -139,6 +139,18 @@ pub(crate) const INTERNAL_PREFIX: &str = "/_ephpm/";
 pub(crate) const INTERNAL_ROUTES: &[&str] =
     &["/_ephpm/health", "/_ephpm/ready", "/_ephpm/primary", "/_ephpm/requests"];
 
+/// Sub-namespace of [`INTERNAL_PREFIX`] carved out to reach the **request-phase
+/// middleware chain** instead of the reserved-namespace 404, so a mounted
+/// `github-auth` issuer (and any auth module) can serve its login and
+/// OAuth-callback endpoints here — their defaults
+/// (`github-auth`'s `/_ephpm/auth/github/{login,callback}`) live under this
+/// prefix, and the whole preview access gate is pointless if the callback is
+/// unreachable (issue #487). Everything else under `/_ephpm/` stays reserved and
+/// still 404s. Auth is kept inside the reserved namespace deliberately: a
+/// non-`/_ephpm/` default (e.g. `/auth/...`) risks colliding with an app's own
+/// routes. See [`Router::handle_auth_namespace`].
+pub(crate) const AUTH_NAMESPACE_PREFIX: &str = "/_ephpm/auth/";
+
 /// A virtual host's two roots, which are **not** the same directory once an
 /// operator-supplied override declares a `document_root`
 /// (`[server] site_overrides_dir`, see [`crate::site_overrides`]).
@@ -212,6 +224,16 @@ pub(crate) struct SiteRoots {
     /// Enforced at the single gate in [`Router::handle`], so it covers the
     /// static, PHP and WebSocket paths at once.
     pub(crate) unusable: Option<&'static str>,
+    /// This vhost's preview **access gate**, built when its override declared a
+    /// valid `[preview_auth]` section (issue #487). Invoked in the request phase
+    /// on BOTH the static and PHP paths, ahead of serving, so an unauthenticated
+    /// request to a gated preview is redirected to login (or `403`) and the
+    /// content — a script *or* a file — is never served. Fail-closed.
+    ///
+    /// Built once per [`SITE_CONFIG_TTL`] and shared by `Arc`, so the
+    /// per-request clone of this struct is a refcount bump, not a rebuild.
+    /// `None` for the overwhelming majority of sites (no gate).
+    pub(crate) preview_gate: Option<std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
     /// Keys in this site's override file that ePHPm did not understand, sorted.
     ///
     /// **Diagnostic only** — nothing routes on it. It rides the resolution so
@@ -233,6 +255,7 @@ impl SiteRoots {
             document_root: root,
             auto_prepend_file: None,
             unusable: None,
+            preview_gate: None,
             unknown_keys: Vec::new(),
         }
     }
@@ -936,11 +959,35 @@ fn resolve_site_roots(
     prepend: crate::site_overrides::PrependSupport,
 ) -> SiteRoots {
     let over = crate::site_overrides::load(overrides_dir, site_key, &container, prepend);
+    // Build the per-site access gate from the resolved `[preview_auth]` config.
+    // `site_overrides` already validated the section (secret resolved, min
+    // length, login_url present), so a build failure here is a belt-and-braces
+    // path — and it is fail-closed: the site refuses to serve (503) rather than
+    // serve the preview ungated, exactly as a broken `document_root` does.
+    let (preview_gate, gate_unusable) = match &over.preview_gate {
+        Some(config) => match ephpm_middleware::builtin::BuiltinModule::init::<
+            ephpm_middleware_builtins::preview_gate::PreviewGate,
+        >(config)
+        {
+            Ok(module) => (Some(std::sync::Arc::new(module)), None),
+            Err(err) => {
+                tracing::error!(
+                    site = site_key,
+                    error = %err,
+                    "[preview_auth] resolved but the access gate refused to build — this site \
+                     will REFUSE TO SERVE (503) rather than serve the preview ungated"
+                );
+                (None, Some("preview access gate could not be built"))
+            }
+        },
+        None => (None, None),
+    };
     SiteRoots {
         document_root: over.document_root.unwrap_or_else(|| container.clone()),
         container,
         auto_prepend_file: over.auto_prepend_file,
-        unusable: over.unusable,
+        unusable: over.unusable.or(gate_unusable),
+        preview_gate,
         unknown_keys: over.unknown_keys,
     }
 }
@@ -2578,8 +2625,13 @@ impl Router {
         // The reserved `/_ephpm/` namespace. One pre-dispatch check, ahead of
         // every mode-specific path below, so the routing decision cannot
         // differ between fpm, pool and worker mode — see `INTERNAL_PREFIX`.
-        if uri_path.starts_with(INTERNAL_PREFIX)
-            || uri_path == INTERNAL_PREFIX.trim_end_matches('/')
+        // `/_ephpm/auth/…` is carved out (see `AUTH_NAMESPACE_PREFIX`): it must
+        // reach the request-phase middleware chain (the `github-auth` issuer),
+        // not the reserved-namespace 404. It is dispatched below, *after*
+        // `resolve_site`, so the issuer sees the request's canonical site key.
+        if (uri_path.starts_with(INTERNAL_PREFIX)
+            || uri_path == INTERNAL_PREFIX.trim_end_matches('/'))
+            && !uri_path.starts_with(AUTH_NAMESPACE_PREFIX)
         {
             return Ok(self.handle_internal(&uri_path, &method_ref));
         }
@@ -2762,10 +2814,36 @@ impl Router {
         // is consumed downstream: the static-path request phase (issue #395,
         // security half) and the response phase (the choke point below) both
         // build a `RequestCtx` from this. Only taken when a chain exists.
-        let mw_req_headers: Option<Vec<(String, String)>> = self
-            .middleware_chain
-            .as_ref()
-            .map(|_| extract_headers(req.headers(), &self.ingest_strip_headers));
+        // Taken when a global chain exists OR this site has a per-site access
+        // gate — both build a `RequestCtx` from it on the static path, and the
+        // gate needs the request's `Cookie` (its session/share credential lives
+        // there). Without the per-site condition a gated preview with no
+        // `[[middleware]]` mounted would hand the gate a header-less request and
+        // reject every valid credential.
+        let mw_req_headers: Option<Vec<(String, String)>> = (self.middleware_chain.is_some()
+            || site_roots.preview_gate.is_some())
+        .then(|| extract_headers(req.headers(), &self.ingest_strip_headers));
+
+        // Auth sub-namespace (`/_ephpm/auth/…`, issue #487). Dispatched HERE so
+        // the issuer sees the canonical site key (`resolve_site` has run) and is
+        // subject to the same host-validation gates as every other request, but
+        // BEFORE `resolve_fallback` — the issuer's endpoints have no file on
+        // disk, so they would otherwise 404. Runs the GLOBAL chain only, never
+        // the per-site preview gate: the login/callback endpoints MUST be
+        // reachable to an unauthenticated visitor, or the OAuth flow could never
+        // start. A chain that does not claim the path 404s.
+        if uri_path.starts_with(AUTH_NAMESPACE_PREFIX) {
+            return Ok(self.handle_auth_namespace(
+                mw_req_headers.as_deref(),
+                method,
+                &uri_path,
+                &query_string,
+                effective_addr,
+                site_key.as_deref(),
+                &host,
+                is_https,
+            ));
+        }
 
         // WebSocket upgrade. Positioned deliberately:
         //
@@ -2784,6 +2862,41 @@ impl Router {
         if let Some(ref runtime) = self.websocket
             && crate::websocket::is_upgrade_request(&req)
         {
+            // Preview access gate (#487) also guards the WS **upgrade**: a
+            // native WebSocket runs the same per-site PHP with the same per-site
+            // database and KV keyspace, so an ungated upgrade to a gated preview
+            // would stream that tenant's data (e.g. `wordpress-sample`'s
+            // per-site activity ticker) to an unauthenticated visitor. Enforced
+            // at the same request-phase point, fail-closed: a `Respond` verdict
+            // (redirect/`403`) refuses the upgrade with a non-101 response, so no
+            // socket is ever handed over. An authenticated upgrade (valid
+            // session/share credential in the `Cookie`) continues to the normal
+            // handshake below.
+            if let Some(gate) = site_roots.preview_gate.as_ref() {
+                let ctx = ephpm_middleware::host::RequestCtx::new(
+                    method,
+                    &uri_path,
+                    &query_string,
+                    &effective_addr.ip().to_string(),
+                    site_key.as_deref().unwrap_or(""),
+                    mw_req_headers.as_deref().unwrap_or(&[]),
+                )
+                .with_scheme(is_https)
+                .with_host(&normalize_host_key(&host));
+                let verdict = {
+                    let _kv_scope = ephpm_middleware::host::enter_site_kv(
+                        self.middleware_kv_store(site_key.as_deref()),
+                    );
+                    gate.invoke(&ctx)
+                };
+                if let ephpm_middleware::builtin::Verdict::Respond { status, body, headers } =
+                    verdict
+                {
+                    let mut resp = middleware_response(status, body, &headers);
+                    self.apply_response_headers(&mut resp);
+                    return Ok((resp, "websocket"));
+                }
+            }
             let mut resp = self
                 .handle_websocket_upgrade(
                     req,
@@ -2912,6 +3025,7 @@ impl Router {
                         site_key.as_deref(),
                         &host,
                         is_https,
+                        site_roots.preview_gate.as_ref(),
                     ) {
                         StaticGate::Respond(resp) => (resp, "middleware"),
                         StaticGate::Continue(extra_headers) => {
@@ -3329,6 +3443,7 @@ impl Router {
             document_root,
             container: site_container,
             auto_prepend_file,
+            preview_gate,
             // Both diagnostic; `unusable` was already turned into a 503 at the
             // single gate in `handle`, so a request that reaches PHP has an
             // override that was fully honoured.
@@ -3438,6 +3553,34 @@ impl Router {
         // this request ultimately produces (PHP output or an error page). The
         // `request_body` accessor exposes up to `middleware_body_limit` bytes of
         // the buffered body (empty when buffering is off).
+        // Per-site access gate (#487): runs BEFORE the global chain and BEFORE
+        // PHP, fail-closed. It denies an unauthenticated request to a gated
+        // preview (redirect to login / 403) exactly as `static_request_phase`
+        // denies a static asset, so a gated preview's PHP is as unreachable as
+        // its files. Only a `Respond` matters — the gate admits (`Continue`) or
+        // denies (`Respond`); it never rewrites the request.
+        if let Some(gate) = preview_gate.as_ref() {
+            let ctx = ephpm_middleware::host::RequestCtx::new(
+                &method,
+                &path,
+                &query_string,
+                &remote_addr.ip().to_string(),
+                site_key.as_deref().unwrap_or(""),
+                &headers,
+            )
+            .with_scheme(is_https)
+            .with_host(&normalize_host_key(&server_name));
+            let verdict = {
+                let _kv_scope = ephpm_middleware::host::enter_site_kv(
+                    self.middleware_kv_store(site_key.as_deref()),
+                );
+                gate.invoke(&ctx)
+            };
+            if let ephpm_middleware::builtin::Verdict::Respond { status, body, headers } = verdict {
+                return middleware_response(status, body, &headers);
+            }
+        }
+
         let mut mw_response_headers: Vec<(String, String)> = Vec::new();
         if let Some(ref chain) = self.middleware_chain {
             let body_view: &[u8] = prebuffered.as_deref().map_or(&[], |b| {
@@ -4673,6 +4816,64 @@ impl Router {
     /// overrides are ignored on this branch (the file is already resolved and
     /// no PHP runs); only its appended response headers are carried through.
     #[allow(clippy::too_many_arguments)]
+    /// Serve a request in the [`AUTH_NAMESPACE_PREFIX`] (`/_ephpm/auth/…`)
+    /// sub-namespace by running the **global** request-phase middleware chain
+    /// and returning its verdict (issue #487).
+    ///
+    /// This is how the `github-auth` issuer's login and OAuth-callback endpoints
+    /// become reachable: those paths have no file on disk, so without this they
+    /// would 404 at `resolve_fallback`. The chain's `RESPOND` (a GitHub redirect
+    /// at login, a `Set-Cookie` + redirect at callback) is returned to the
+    /// client; a `CONTINUE` (no mounted module claimed the path) is a `404` —
+    /// the namespace is reserved, nothing else serves here.
+    ///
+    /// The **per-site preview gate is deliberately NOT run here.** The issuer's
+    /// own endpoints must answer an unauthenticated visitor (that is what starts
+    /// the login), so gating them would be a redirect loop. The gate protects
+    /// everything else (static, PHP, WebSocket) — the paths that carry content.
+    fn handle_auth_namespace(
+        &self,
+        req_headers: Option<&[(String, String)]>,
+        method: &str,
+        path: &str,
+        query: &str,
+        remote_addr: SocketAddr,
+        site_key: Option<&str>,
+        server_name: &str,
+        is_https: bool,
+    ) -> (Response<ServerBody>, &'static str) {
+        let Some(chain) = self.middleware_chain.as_ref() else {
+            // No middleware at all → nothing can serve auth → 404 (reserved).
+            return (error_response(StatusCode::NOT_FOUND, "404 Not Found"), "auth");
+        };
+        let ctx = ephpm_middleware::host::RequestCtx::new(
+            method,
+            path,
+            query,
+            &remote_addr.ip().to_string(),
+            site_key.unwrap_or(""),
+            req_headers.unwrap_or(&[]),
+        )
+        .with_scheme(is_https)
+        .with_host(&normalize_host_key(server_name));
+        // Per-vhost KV scope, exactly as the static/PHP request phases use — an
+        // auth module may read this tenant's keyspace. Synchronous, so the guard
+        // never spans an await.
+        let verdict = {
+            let _kv_scope =
+                ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
+            chain.evaluate(&ctx, path)
+        };
+        match verdict {
+            crate::middleware::ChainVerdict::Respond { status, body, headers } => {
+                (middleware_response(status, body, &headers), "auth")
+            }
+            crate::middleware::ChainVerdict::Continue { .. } => {
+                (error_response(StatusCode::NOT_FOUND, "404 Not Found"), "auth")
+            }
+        }
+    }
+
     fn static_request_phase(
         &self,
         req_headers: Option<&[(String, String)]>,
@@ -4683,10 +4884,13 @@ impl Router {
         site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
+        preview_gate: Option<&std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
     ) -> StaticGate {
-        let Some(chain) = self.middleware_chain.as_ref() else {
+        // Nothing to run: no global chain AND no per-site gate. (The gate is
+        // per-site, so a node with no `[[middleware]]` can still gate a preview.)
+        if self.middleware_chain.is_none() && preview_gate.is_none() {
             return StaticGate::Continue(Vec::new());
-        };
+        }
         // Static requests carry no buffered body, but scheme/host are still
         // authoritative from the connection (a `force_https` gate on static
         // assets needs the real scheme). The vhost identity is the canonical
@@ -4702,8 +4906,26 @@ impl Router {
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
         // Per-vhost KV scope, exactly as on the PHP path (issue #376). This
-        // method is synchronous throughout, so the guard never spans an await.
+        // method is synchronous throughout, so the guard never spans an await —
+        // and it wraps BOTH the gate (whose share-token revocation reads this
+        // vhost's KV) and the global chain.
         let _kv_scope = ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
+
+        // The per-site access gate runs FIRST and fail-closed: a `Respond`
+        // (redirect to login / 403) short-circuits before the file is read, so
+        // an unauthenticated request to a gated preview never leaks a static
+        // asset's bytes off disk (issue #487). The gate only ever CONTINUEs
+        // (admit) or RESPONDs; it does not rewrite.
+        if let Some(gate) = preview_gate
+            && let ephpm_middleware::builtin::Verdict::Respond { status, body, headers } =
+                gate.invoke(&ctx)
+        {
+            return StaticGate::Respond(middleware_response(status, body, &headers));
+        }
+
+        let Some(chain) = self.middleware_chain.as_ref() else {
+            return StaticGate::Continue(Vec::new());
+        };
         match chain.evaluate(&ctx, path) {
             crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                 StaticGate::Respond(middleware_response(status, body, &headers))
@@ -7611,6 +7833,18 @@ mod tests {
             assert!(body.contains("no such ePHPm endpoint"), "{path}: {body}");
         }
 
+        // The `/_ephpm/auth/…` carve-out (#487) reaches the middleware chain, but
+        // with no auth module mounted (these routers have none) it must still NOT
+        // fall through to the application — a `404`, never the worker/PHP
+        // catch-all (which the control request proves reaches PHP as a `504`
+        // here). The #444 reservation holds for the carve-out too.
+        let (status, _) = probe(router, "GET", "/_ephpm/auth/github/callback").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "/_ephpm/auth/* with no auth module mounted must 404, never reach the application"
+        );
+
         // A health checker using HEAD/OPTIONS (HAProxy's `option httpchk`
         // default) gets the server's 405, never a verdict computed by the app.
         for method in ["HEAD", "POST", "OPTIONS"] {
@@ -7628,6 +7862,46 @@ mod tests {
                 "{method} /_ephpm/health must advertise the allowed method"
             );
         }
+    }
+
+    /// Issue #487: the `/_ephpm/auth/…` carve-out delivers the request to the
+    /// **request-phase middleware chain**, so the `github-auth` issuer's login
+    /// and OAuth-callback endpoints (which default to this prefix) are
+    /// reachable. Proven with a mounted builtin (`jwt`) standing in for the
+    /// issuer: a tokenless `GET` to the callback path is answered by the
+    /// middleware (`401 "missing bearer token"`), not the reserved-namespace
+    /// `404`. Without the carve-out this path 404s before any middleware runs.
+    /// (`github-auth`'s own callback handling is tested in its crate.)
+    #[tokio::test]
+    async fn auth_namespace_reaches_the_middleware_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwt = MiddlewareMount {
+            library: "jwt".to_string(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({ "secret": "s3cret" })),
+        };
+        let router = test_router(dir.path()).with_middleware_chain(Some(chain_with(vec![jwt])));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_ephpm/auth/github/callback?code=abc&state=xyz")
+            .header("host", "example.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the OAuth callback path must reach the middleware chain, not the reserved 404"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            b"missing bearer token",
+            "the answer is the middleware's, not the router's"
+        );
     }
 
     /// **Worker mode** — the mode issue #444 was reported against. The
@@ -10245,6 +10519,210 @@ echo "post response";
         }
     }
 
+    /// Issue #487, end to end through the real router: a `[preview_auth]`
+    /// override gates a preview on BOTH the static-file path and the PHP path,
+    /// fail-closed, and a credential is bound to its own site.
+    ///
+    /// The **static** assertion is the one the whole design turns on: before
+    /// #395 the request phase never ran on static files, so a preview's
+    /// `wp-content/uploads/*` was world-readable to anyone who guessed the host.
+    /// Here an unauthenticated `GET /secret.png` on a gated site is redirected
+    /// to login and the file's bytes never leave disk. On pre-change code (no
+    /// `preview_gate` wired into `static_request_phase`) the file is served and
+    /// this fails.
+    ///
+    /// The credential used is a share capability token (`mint_share_token`, the
+    /// public reference minter) — a valid site-bound credential that exercises
+    /// the same `Hs256Policy` + `site` binding an OAuth session cookie does. The
+    /// session-vs-share distinction, expiry and revocation are unit-tested in
+    /// `ephpm_middleware_builtins::preview_gate`.
+    #[tokio::test]
+    async fn preview_auth_gates_static_and_php_fail_closed() {
+        use ephpm_middleware_builtins::preview_gate::mint_share_token;
+
+        // 32-byte literal secret (min length). A real deployment uses
+        // `env:`/`file:` so the secret is not in the override file.
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let token =
+            |site: &str| mint_share_token(SECRET.as_bytes(), site, "jti-1", now, now + 3600);
+
+        let f = fleet();
+        // Gated preview: a static asset and a PHP entrypoint.
+        let gated = f.site("pr-1.preview.test", &[]);
+        fs::write(gated.join("secret.png"), b"SENSITIVE-BYTES").unwrap();
+        fs::write(gated.join("index.php"), b"<?php echo 'php-ran';").unwrap();
+        f.override_for(
+            "pr-1.preview.test",
+            &format!(
+                "[preview_auth]\nsession_secret = \"{SECRET}\"\nlogin_url = \"/auth/github/login\"\n"
+            ),
+        );
+        // Ungated preview, same asset name — the control.
+        let open = f.site("open.preview.test", &[]);
+        fs::write(open.join("secret.png"), b"PUBLIC-BYTES").unwrap();
+
+        let router = f.router();
+        // Loopback client so `require_https` (default on) does not itself 403 an
+        // http test — the redirect we assert is the gate's auth verdict.
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let get = |host: &str, uri: &str, cookie: Option<&str>| {
+            let mut b = Request::builder().method("GET").uri(uri).header("host", host);
+            if let Some(c) = cookie {
+                b = b.header("cookie", format!("ephpm_session={c}"));
+            }
+            b.body(Empty::<Bytes>::new()).unwrap()
+        };
+
+        // 1. STATIC, no credential → redirect to login; bytes never served.
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "unauthenticated static must redirect");
+        assert!(resp.headers().get("location").is_some(), "a login redirect target");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"SENSITIVE-BYTES", "the gated file's bytes must never leave disk");
+
+        // 2. PHP, no credential → redirect BEFORE the engine runs (so this holds
+        // even in stub mode: the gate short-circuits ahead of PHP dispatch).
+        let resp =
+            router.handle(get("pr-1.preview.test", "/index.php", None), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "unauthenticated PHP must redirect");
+
+        // 3. STATIC, valid credential for THIS site → served.
+        let tok = token("pr-1.preview.test");
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", Some(&tok)), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a valid credential must be admitted");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"SENSITIVE-BYTES");
+
+        // 4. STATIC, credential minted for ANOTHER preview → rejected (#396
+        // cross-tenant binding, end to end through the router).
+        let wrong = token("some-other-preview");
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", Some(&wrong)), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "a credential for another preview must not open this one"
+        );
+
+        // 5. Ungated preview → served with no credential at all.
+        let resp = router
+            .handle(get("open.preview.test", "/secret.png", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "an ungated site must serve normally");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"PUBLIC-BYTES");
+    }
+
+    /// Issue #487, WebSocket half: the preview gate guards the WS **upgrade**
+    /// too. A native WebSocket runs the same per-site PHP against the same
+    /// per-site database/KV, so an ungated upgrade to a gated preview would leak
+    /// that tenant's data (the `wordpress-sample` activity ticker queries its
+    /// own DB). An unauthenticated upgrade is refused (non-101); an
+    /// authenticated one passes the gate (and then 404s here only because this
+    /// site ships no websocket entrypoint — proving the gate let it through).
+    #[tokio::test]
+    async fn preview_auth_gates_the_websocket_upgrade() {
+        use ephpm_middleware_builtins::preview_gate::mint_share_token;
+
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let tok =
+            mint_share_token(SECRET.as_bytes(), "pr-9.preview.test", "jti-ws", now, now + 3600);
+
+        let f = fleet();
+        f.site("pr-9.preview.test", &[]); // no websocket entrypoint on disk
+        f.override_for(
+            "pr-9.preview.test",
+            &format!(
+                "[preview_auth]\nsession_secret = \"{SECRET}\"\n\
+                 login_url = \"/_ephpm/auth/github/login\"\n"
+            ),
+        );
+
+        let ws = crate::websocket::WsRuntime::new(&ephpm_config::WebSocketConfig {
+            enabled: true,
+            ..ephpm_config::WebSocketConfig::default()
+        })
+        .map(std::sync::Arc::new);
+        assert!(ws.is_some(), "websocket must be enabled for this test");
+        let router = f.router().with_websocket(ws);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let upgrade = |cookie: Option<&str>| {
+            let mut b = Request::builder()
+                .method("GET")
+                .uri("/ws")
+                .header("host", "pr-9.preview.test")
+                .header("connection", "keep-alive, Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+            if let Some(c) = cookie {
+                b = b.header("cookie", format!("ephpm_session={c}"));
+            }
+            b.body(Empty::<Bytes>::new()).unwrap()
+        };
+
+        // Unauthenticated upgrade → refused by the gate (302), never a 101.
+        let resp = router.handle(upgrade(None), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "an unauthenticated WS upgrade to a gated preview must be refused, not upgraded"
+        );
+
+        // Authenticated upgrade → gate passes; the WS handler then 404s because
+        // this site has no `websocket_files` entrypoint. A 404 (not 302) proves
+        // the gate admitted it and handed off to the upgrade handler.
+        let resp = router.handle(upgrade(Some(&tok)), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "an authenticated upgrade passes the gate (then 404s: no websocket entrypoint here)"
+        );
+    }
+
+    /// A broken `[preview_auth]` takes the one preview out of service (503) —
+    /// fail-closed — rather than serving it ungated. Uses an unresolvable
+    /// `env:` secret; the site's static asset must not be served.
+    #[tokio::test]
+    async fn a_broken_preview_auth_returns_503_not_the_content() {
+        let f = fleet();
+        let gated = f.site("pr-2.preview.test", &[]);
+        fs::write(gated.join("secret.png"), b"SENSITIVE-BYTES").unwrap();
+        f.override_for(
+            "pr-2.preview.test",
+            "[preview_auth]\n\
+             session_secret = \"env:EPHPM_TEST_UNSET_GATE_SECRET\"\n\
+             login_url = \"/auth/github/login\"\n",
+        );
+        let router = f.router();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/secret.png")
+            .header("host", "pr-2.preview.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a broken gate must 503");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"SENSITIVE-BYTES");
+    }
+
     /// A site whose override declares `document_root = "web"` serves from it —
     /// and its container is still the vhost directory.
     #[test]
@@ -11906,7 +12384,9 @@ echo "post response";
 
             let addr: SocketAddr = "198.51.100.20:5000".parse().unwrap();
             let gate = |site: Option<&str>| {
-                router.static_request_phase(None, "GET", "/a.css", "", addr, site, "ignored", false)
+                router.static_request_phase(
+                    None, "GET", "/a.css", "", addr, site, "ignored", false, None,
+                )
             };
             assert!(matches!(gate(Some("shop")), StaticGate::Continue(_)));
             assert!(matches!(gate(Some("blog")), StaticGate::Continue(_)));

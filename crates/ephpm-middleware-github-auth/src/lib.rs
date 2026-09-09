@@ -279,11 +279,51 @@ impl GithubAuth {
     }
 
     /// Build the `redirect_uri` for this request.
+    ///
+    /// With an explicit `redirect_uri` configured (the single-OAuth-App apex
+    /// flow — one fixed callback host for the whole `*.preview` fleet), that
+    /// value is used verbatim and `vhost` is ignored. Otherwise it is derived
+    /// per-vhost. Both `authorize` and the code exchange call this with the same
+    /// argument (the target), so the two `redirect_uri`s byte-match as OAuth
+    /// requires.
     fn redirect_uri(&self, vhost: &str) -> String {
         self.config
             .redirect_uri
             .clone()
             .unwrap_or_else(|| format!("https://{vhost}{}", self.config.callback_path))
+    }
+
+    /// Whether a state-declared `target` host may complete a login on this
+    /// callback host — the same-fleet / open-redirect guard for the apex flow.
+    ///
+    /// Allowed: the target IS the callback host (per-vhost, and the apex serving
+    /// itself); or, with a fleet `cookie_domain` configured, both the target and
+    /// the callback host are under it. Without a `cookie_domain` only the
+    /// callback's own host is allowed — the strict per-vhost state binding this
+    /// replaced. Since a legitimate `target` is the host the user actually
+    /// started login on (and the state is signed), this bounds where a
+    /// successful login's absolute redirect and domain-scoped cookie can land.
+    fn target_is_allowed(&self, target: &str, callback_host: &str) -> bool {
+        if target.eq_ignore_ascii_case(callback_host) {
+            return true;
+        }
+        self.config.cookie_attrs.domain.as_deref().is_some_and(|domain| {
+            crate::cookie::host_in_domain(target, domain)
+                && crate::cookie::host_in_domain(callback_host, domain)
+        })
+    }
+
+    /// The final redirect `Location` after a successful login. When the callback
+    /// ran on a different host than the target (the apex flow), an absolute URL
+    /// to the target so the browser lands on the right preview; otherwise the
+    /// relative return path. `return_to` is already sanitized to a same-origin
+    /// absolute path and `target` is fleet-validated, so the join is safe.
+    fn return_location(&self, target: &str, callback_host: &str, return_to: &str) -> String {
+        if target.eq_ignore_ascii_case(callback_host) {
+            return_to.to_owned()
+        } else {
+            format!("https://{target}{return_to}")
+        }
     }
 
     /// 302 to GitHub's authorize endpoint, with a fresh signed `state`.
@@ -401,10 +441,30 @@ impl GithubAuth {
             return deny(400, "This login link is not valid here. Start again.")
                 .header("Set-Cookie", clear_state);
         }
-        // The state is bound to the vhost it was issued on, so a state minted
-        // for one tenant cannot complete a login on another.
-        if state_claims.get("v").and_then(serde_json::Value::as_str) != Some(vhost) {
-            log(req, LOG_WARN, "github-auth: OAuth state was issued for a different host");
+        // The **target** preview is whatever host the login was started on,
+        // carried (signed) in the state's `v` — NOT the host this callback
+        // landed on. They are the same in a single-host deployment; in the
+        // single-OAuth-App apex flow the callback always lands on the apex vhost
+        // while the target is a `*.preview` subdomain. The target is
+        // authoritative from here: the access check, the session's `site` claim,
+        // and the redirect all key off it.
+        let target = state_claims.get("v").and_then(serde_json::Value::as_str).unwrap_or_default();
+        // `v` was set by us to a router-validated site key, and the state is
+        // signed — but re-validate (defense in depth: it becomes an outbound
+        // `redirect_uri` and an absolute redirect Location) and confirm it is a
+        // host this callback may complete for: itself, or — with a fleet
+        // `cookie_domain` — any host under it. Without a `cookie_domain` only
+        // the callback's own host is allowed, which is the strict per-vhost
+        // binding this replaced (a state minted for another tenant is refused).
+        if target.is_empty()
+            || config::validate_vhost(target).is_err()
+            || !self.target_is_allowed(target, vhost)
+        {
+            log(
+                req,
+                LOG_WARN,
+                "github-auth: OAuth state target host is missing, invalid, or outside the fleet",
+            );
             return deny(400, "This login link is not valid here. Start again.")
                 .header("Set-Cookie", clear_state);
         }
@@ -416,7 +476,7 @@ impl GithubAuth {
             &self.config.reserved_paths(),
         );
 
-        let Some(check) = self.config.check_for(vhost) else {
+        let Some(check) = self.config.check_for(target) else {
             return deny(403, "This preview is not configured for GitHub access control.")
                 .header("Set-Cookie", clear_state);
         };
@@ -428,8 +488,11 @@ impl GithubAuth {
         };
 
         // ── The only network calls in the module ─────────────────────────
+        // The exchange's `redirect_uri` must byte-match the one sent at
+        // `authorize` (which used `redirect_uri(target)`); with a fixed apex
+        // `redirect_uri` configured, both are the apex regardless of argument.
         let outcome =
-            self.github.exchange_code(&code, &self.redirect_uri(vhost)).and_then(|access| {
+            self.github.exchange_code(&code, &self.redirect_uri(target)).and_then(|access| {
                 let user = self.github.current_user(&access)?;
                 let allowed = self.github.check_access(&access, check, &user)?;
                 Ok((user, allowed))
@@ -451,7 +514,7 @@ impl GithubAuth {
                 req,
                 LOG_INFO,
                 &format!(
-                    "github-auth: denied {} on vhost {vhost:?} — no access to {}",
+                    "github-auth: denied {} on target vhost {target:?} — no access to {}",
                     user.login,
                     check.describe()
                 ),
@@ -460,16 +523,21 @@ impl GithubAuth {
                 .header("Set-Cookie", clear_state);
         }
 
+        // Mint the session for the TARGET (its `site` claim), and redirect the
+        // browser back to the target — absolute when the callback ran on a
+        // different host (the apex flow), so it lands on the right preview. The
+        // domain-scoped session cookie `issue` sets travels with it.
+        let final_return = self.return_location(target, vhost, &return_to);
         self.issue(
             req,
-            vhost,
+            target,
             &user.login,
             "github",
             Some(user.id),
             Some(check),
             now,
             self.config.session_ttl_secs,
-            &return_to,
+            &final_return,
         )
         .header("Set-Cookie", clear_state)
     }
@@ -1152,5 +1220,103 @@ mod tests {
     #[test]
     fn describe_names_the_pairing_requirement() {
         assert!(GithubAuth::describe().contains("session verifier"));
+    }
+
+    // ── apex flow: one OAuth App across a wildcard fleet (fleet mode) ─────
+
+    /// A gate configured for the apex flow: a fixed apex `redirect_uri` and a
+    /// fleet `cookie_domain`.
+    fn fleet_gate() -> GithubAuth {
+        gate(serde_json::json!({
+            "cookie_domain": ".preview.test",
+            "redirect_uri": "https://preview.test/_ephpm/auth/github/callback",
+        }))
+    }
+
+    /// The same-fleet / open-redirect guard. Without a `cookie_domain` only the
+    /// callback's own host is allowed (the strict per-vhost binding this
+    /// replaced); with one, any host under it — but nothing outside it.
+    #[test]
+    fn target_is_allowed_matrix() {
+        let per_vhost = gate(serde_json::json!({}));
+        assert!(per_vhost.target_is_allowed("pr-1.preview.test", "pr-1.preview.test"));
+        assert!(
+            !per_vhost.target_is_allowed("pr-2.preview.test", "pr-1.preview.test"),
+            "with no cookie_domain, a state for another host must not complete here"
+        );
+
+        let fleet = fleet_gate();
+        assert!(fleet.target_is_allowed("pr-1.preview.test", "preview.test"), "in-fleet from apex");
+        assert!(fleet.target_is_allowed("preview.test", "preview.test"), "the apex serving itself");
+        assert!(
+            !fleet.target_is_allowed("evil.example.com", "preview.test"),
+            "an out-of-fleet target must be refused"
+        );
+        assert!(
+            !fleet.target_is_allowed("pr-1.preview.test", "random.other.com"),
+            "the callback host must itself be in-fleet for the cross-host branch"
+        );
+    }
+
+    /// The final redirect is relative on the same host and absolute (to the
+    /// target) across hosts — the apex-flow bounce back to the preview.
+    #[test]
+    fn return_location_is_absolute_only_across_hosts() {
+        let mw = fleet_gate();
+        assert_eq!(
+            mw.return_location("pr-1.preview.test", "pr-1.preview.test", "/wp-admin/"),
+            "/wp-admin/"
+        );
+        assert_eq!(
+            mw.return_location("pr-1.preview.test", "preview.test", "/wp-admin/"),
+            "https://pr-1.preview.test/wp-admin/"
+        );
+    }
+
+    /// A signed state whose target host is outside the fleet `cookie_domain` is
+    /// refused at the apex callback — before any network call. Guards the
+    /// cross-host redirect and the domain-scoped cookie against an out-of-fleet
+    /// destination.
+    #[test]
+    fn apex_callback_refuses_a_target_outside_the_fleet() {
+        let mw = fleet_gate();
+        let state = token::mint(
+            mw.config.state_secret.expose(),
+            &serde_json::json!({
+                "n": "nonce-value", "rt": "/", "v": "evil.example.com", "exp": unix_now() + 300,
+            }),
+        )
+        .expect("mint");
+        let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state}"))];
+        // The callback lands on the apex.
+        let ctx = RequestCtx::new(
+            "GET",
+            "/_ephpm/auth/github/callback",
+            "code=abc&state=nonce-value",
+            "203.0.113.9",
+            "preview.test",
+            &headers,
+        );
+        // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(
+            mw.invoke(&req).__status(),
+            400,
+            "a target host outside cookie_domain must be refused before any GitHub call"
+        );
+    }
+
+    /// In fleet mode the state cookie is domain-scoped, so it survives the
+    /// browser's trip from the target subdomain (where login starts) to the apex
+    /// (where the callback lands).
+    #[test]
+    fn the_state_cookie_is_domain_scoped_in_fleet_mode() {
+        let mw = fleet_gate();
+        let ctx = RequestCtx::new("GET", "/", "", "203.0.113.9", "pr-1.preview.test", &[]);
+        // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        let resp = mw.invoke(&req);
+        let set = header(&resp, "Set-Cookie").expect("state cookie");
+        assert!(set.contains("Domain=.preview.test"), "state cookie must be domain-scoped: {set}");
     }
 }
