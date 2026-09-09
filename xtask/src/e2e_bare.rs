@@ -269,11 +269,21 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// `ok`) *and* broken (it derived its docroot from `CARGO_MANIFEST_DIR`, which
 /// is xtask's under this harness). `EPHPM_DOCROOT` below fixes the second half.
 ///
+/// `pdo_mysql_proxy` is here because it needs a `[db.mysql]` node in front of a
+/// **real MySQL/MariaDB** — a backend nothing in the bare-process rig
+/// provisions — so it spawns its own `MysqlProxyFixture` and reads the backend
+/// URL from `EPHPM_MYSQL_PROXY_TEST_URL`. On the ordinary bare-process lane that
+/// variable is unset and the suite self-skips; it does real work only in the
+/// CI job that boots a database (`.github/workflows/pdo-mysql-e2e.yml`), which
+/// also sets `EPHPM_REQUIRE_DB_TESTS=1` so a missing backend fails rather than
+/// skips there (issue #433). Its config is `[db.mysql]`, which must NOT live on
+/// any shared or `[db.sqlite]` node (#288/#295), hence self-managed.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
 /// fixtures, and a suite that gets it starts spawning real processes.
-const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc", "bare_process_smoke"];
+const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy"];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///

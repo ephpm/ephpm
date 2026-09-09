@@ -125,6 +125,111 @@ impl Drop for SingleNodeFixture {
     }
 }
 
+/// A single ephpm process whose database is a **`[db.mysql]` proxy** pointed at
+/// a real MySQL/MariaDB backend.
+///
+/// This is deliberately distinct from [`SingleNodeFixture`], whose node runs
+/// the embedded Turso engine behind litewire (`[db.sqlite]`). The MySQL proxy
+/// (`crates/ephpm-db`) is a different code path entirely: it speaks the MySQL
+/// wire protocol on both sides and forwards to an external server through a
+/// connection pool. Nothing in the bare-process E2E rig provisions a real MySQL,
+/// so before this fixture existed the only PHP-through-`pdo_mysql` coverage ran
+/// against the *embedded* engine — the proxy's own connection/protocol
+/// behaviour toward `pdo_mysql` had no end-to-end guard (issue #433).
+///
+/// Requires a reachable backend URL (`mysql://user:pass@host:port/db`); the
+/// caller supplies it (the e2e suite reads `EPHPM_MYSQL_PROXY_TEST_URL`, set by
+/// the CI job that boots the database). Dropping the fixture SIGTERMs (then
+/// SIGKILLs) the child.
+pub struct MysqlProxyFixture {
+    child: Option<Child>,
+    base_url: String,
+    _tempdir: TempDir,
+}
+
+impl MysqlProxyFixture {
+    /// Spawn an ephpm on a free loopback port with a `[db.mysql]` proxy in
+    /// front of `backend_url`, serving `docroot`, and wait for its health
+    /// endpoint.
+    ///
+    /// The proxy's own listener gets a second reserved loopback port (not the
+    /// default 3306), so this fixture can coexist with any other node on the
+    /// host. `inject_env = true`, so the served PHP sees `DB_HOST`/`DB_PORT`
+    /// pointing at that listener.
+    ///
+    /// # Errors
+    ///
+    /// Fails if ports cannot be reserved, the config/scratch files cannot be
+    /// written, the child cannot be spawned, or it never reports healthy.
+    pub async fn start(ephpm_binary: &Path, docroot: &Path, backend_url: &str) -> Result<Self> {
+        let mut reserver = PortReserver::new();
+        let lease = reserver.lease(&[PortKind::Tcp, PortKind::Tcp])?;
+        let (http_port, proxy_port) = (lease.port(0), lease.port(1));
+
+        let tmp = tempfile::Builder::new()
+            .prefix("ephpm-e2e-mysqlproxy-")
+            .tempdir()
+            .context("create tempdir")?;
+
+        let config = MYSQL_PROXY_TEMPLATE
+            .replace("{HTTP_PORT}", &http_port.to_string())
+            .replace("{PROXY_PORT}", &proxy_port.to_string())
+            .replace("{DOCROOT}", &escape_toml(docroot))
+            // The backend URL carries operator-supplied credentials that may
+            // contain characters TOML treats specially (a backslash, a quote);
+            // escape it exactly like a path.
+            .replace("{BACKEND_URL}", &escape_toml_str(backend_url));
+
+        let config_path = tmp.path().join("ephpm.toml");
+        fs::write(&config_path, config).context("write config")?;
+
+        let stdout = fs::File::create(tmp.path().join("stdout.log")).context("open stdout log")?;
+        let stderr = fs::File::create(tmp.path().join("stderr.log")).context("open stderr log")?;
+
+        // Hand the ports off: release the probes and spawn in the same breath.
+        lease.release();
+        let mut child = Command::new(ephpm_binary)
+            .args(["serve", "--config"])
+            .arg(&config_path)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .with_context(|| format!("spawn ephpm ({})", ephpm_binary.display()))?;
+
+        // The MySQL proxy connects to its backend lazily (deferred), so the
+        // node reports healthy well before the pool warms; 30s is ample for a
+        // cold ~120 MB binary to page in and PHP to init.
+        wait_for_health(&mut child, http_port, Duration::from_secs(30)).await.with_context(
+            || {
+                format!(
+                    "ephpm on 127.0.0.1:{http_port} never healthy — check {}",
+                    tmp.path().join("stderr.log").display()
+                )
+            },
+        )?;
+
+        Ok(Self {
+            child: Some(child),
+            base_url: format!("http://127.0.0.1:{http_port}"),
+            _tempdir: tmp,
+        })
+    }
+
+    /// Base URL (`http://127.0.0.1:<port>`) for HTTP clients.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for MysqlProxyFixture {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            terminate(child);
+        }
+    }
+}
+
 /// How long each cluster node gets to answer `/_ephpm/health`.
 ///
 /// Sized against measured cold-start, not guessed: two ephpm processes
@@ -667,6 +772,35 @@ path = "{DATA_DIR}/ephpm-fixture.db"
 
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:{MYSQL_PORT}"
+"#;
+
+/// Config for [`MysqlProxyFixture`]. Placeholders: `{HTTP_PORT}`,
+/// `{PROXY_PORT}` (the `[db.mysql]` listener PHP's `pdo_mysql` connects to),
+/// `{DOCROOT}`, `{BACKEND_URL}` (the real MySQL/MariaDB the proxy forwards to).
+///
+/// This is `[db.mysql]`, NOT `[db.sqlite]`: it exercises the wire-protocol
+/// forwarding proxy in `crates/ephpm-db`, not the embedded engine. `inject_env`
+/// is left at its default (`true`) so the served PHP finds the proxy listener
+/// via `DB_HOST`/`DB_PORT` — the same auto-detection production PHP relies on.
+const MYSQL_PROXY_TEMPLATE: &str = r#"# Auto-generated by ephpm-e2e MysqlProxyFixture — do not edit.
+[server]
+listen = "127.0.0.1:{HTTP_PORT}"
+document_root = "{DOCROOT}"
+index_files = ["index.php", "index.html"]
+
+[server.request]
+trusted_hosts = ["localhost", "127.0.0.1", "127.0.0.1:{HTTP_PORT}"]
+
+[server.metrics]
+enabled = true
+
+[php]
+max_execution_time = 30
+memory_limit = "128M"
+
+[db.mysql]
+url = "{BACKEND_URL}"
+listen = "127.0.0.1:{PROXY_PORT}"
 "#;
 
 const CLUSTER_NODE_TEMPLATE: &str = r#"# Auto-generated by ephpm-e2e ClusterFixture — do not edit.
