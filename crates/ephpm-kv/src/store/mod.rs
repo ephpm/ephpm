@@ -52,6 +52,37 @@ impl EvictionPolicy {
     }
 }
 
+/// Redis-compatible out-of-memory error message, surfaced on the wire as
+/// `-OOM …`.
+///
+/// Returned when a write is refused under the [`EvictionPolicy::NoEviction`]
+/// policy with the store already over its `memory_limit`. Matching Redis'
+/// wording verbatim means client libraries that special-case `-OOM` (Predis,
+/// phpredis, and the PSR cache wrappers built on them) behave against ePHPm's
+/// KV exactly as they do against Redis — the write is reported as failed
+/// rather than silently answered `+OK` (#477).
+pub const OOM_ERROR: &str = "OOM command not allowed when used memory > 'maxmemory'";
+
+/// Outcome of a memory-guarded conditional write (`SET … NX` / `SETNX`).
+///
+/// The plain write path ([`Store::set`]) needs no such type: it returns
+/// `false` for exactly one reason — an out-of-memory refusal — so a caller can
+/// map `false` straight to [`OOM_ERROR`]. A conditional write has *two*
+/// distinct not-stored outcomes, and the RESP layer must tell them apart: a
+/// failed `NX` precondition is a normal `nil`/`:0` reply, whereas an
+/// out-of-memory refusal is `-OOM`. Collapsing them into one `bool` is what let
+/// a memory-refused `SETNX` answer as if the key merely already existed (#477).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetNxOutcome {
+    /// The value was inserted (the key was absent or held an expired entry).
+    Inserted,
+    /// A live entry already exists at this key; nothing was written.
+    Exists,
+    /// Refused: the `NoEviction` policy is active and the store is over its
+    /// `memory_limit`. Surfaced on the wire as [`OOM_ERROR`].
+    OutOfMemory,
+}
+
 /// Compression algorithm for stored values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionAlgo {
@@ -453,10 +484,19 @@ impl Store {
     pub fn get(&self, key: &str) -> Option<Bytes> {
         let entry = self.data.get(key)?;
         if entry.is_expired() {
+            let observed = entry.expires_at;
             drop(entry);
             // Lazy-expiry cleanup: local only. Replicas expire the key on
             // their own timelines; no need to broadcast the reap.
-            self.remove_local(key);
+            //
+            // Compare-and-remove, not an unconditional reap: only drop the
+            // entry we actually observed expire. A `set` that landed in the
+            // gap after we dropped the read guard carries a different
+            // `expires_at` and must survive — otherwise the reader destroys a
+            // fresh value the writer just stored (#478).
+            if let Some(exp) = observed {
+                self.reap_if_expired(key, exp);
+            }
             return None;
         }
         entry.touch(self.now_nanos());
@@ -474,9 +514,14 @@ impl Store {
         // Check string keys.
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired() {
+                let observed = entry.expires_at;
                 drop(entry);
-                // Lazy-expiry cleanup: local only.
-                self.remove_local(key);
+                // Lazy-expiry cleanup: local only, compare-and-remove so a
+                // value written after we observed the expiry is not reaped by
+                // this reader (#478).
+                if let Some(exp) = observed {
+                    self.reap_if_expired(key, exp);
+                }
             } else {
                 return true;
             }
@@ -492,9 +537,13 @@ impl Store {
     pub fn pttl(&self, key: &str) -> Option<i64> {
         let entry = self.data.get(key)?;
         if entry.is_expired() {
+            let observed = entry.expires_at;
             drop(entry);
-            // Lazy-expiry cleanup: local only.
-            self.remove_local(key);
+            // Lazy-expiry cleanup: local only, compare-and-remove so a value
+            // written after we observed the expiry is not reaped here (#478).
+            if let Some(exp) = observed {
+                self.reap_if_expired(key, exp);
+            }
             return Some(-2);
         }
         match entry.expires_at {
@@ -832,11 +881,12 @@ impl Store {
     /// Report a write refused by the memory budget: `warn!` for the first one
     /// in the process, `debug!` for every one after.
     ///
-    /// It has to be loud at least once, because nothing else says so. The
-    /// RESP `SET` handler discards [`Store::set`]'s boolean and answers `+OK`
-    /// regardless, so a client is never told its write was refused; under
-    /// `noeviction` this line is the only signal that the store is parked at
-    /// its limit and silently dropping writes.
+    /// The RESP layer now surfaces a refusal to the client as Redis `-OOM`
+    /// (#477), so a network client is no longer left in the dark. This line
+    /// stays because not every caller reads the return value — the in-process
+    /// `ephpm_kv_*` bridge hands PHP a `0`/`false` a caller may ignore, and an
+    /// operator watching the log still wants one clear signal that the store is
+    /// parked at its limit under `noeviction`.
     ///
     /// It also has to go quiet, for the same reason
     /// [`Store::warn_hash_not_replicated`] does: a store sitting at the limit
@@ -877,7 +927,31 @@ impl Store {
     ///
     /// Returns `false` if the `NoEviction` policy refuses the write
     /// because of memory pressure (same as `set()`).
+    ///
+    /// This is a thin wrapper over [`set_nx_outcome`](Self::set_nx_outcome),
+    /// which distinguishes the "key already exists" refusal from an
+    /// out-of-memory refusal — a distinction the RESP layer needs but this
+    /// boolean cannot carry. Callers that only need "did it store?" (the
+    /// distributed-lock / idempotency-key use cases) keep this signature.
     pub fn set_nx(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        matches!(self.set_nx_outcome(key, value, ttl), SetNxOutcome::Inserted)
+    }
+
+    /// Atomically set a key only if it doesn't already exist, reporting *why*
+    /// the write was or was not stored.
+    ///
+    /// Same atomicity and memory semantics as [`set_nx`](Self::set_nx) — the
+    /// existence check and the insert happen under the same per-key write lock
+    /// — but returns a [`SetNxOutcome`] so the RESP layer can answer a normal
+    /// `nil`/`:0` when the key already exists and Redis' `-OOM` when the write
+    /// was refused for memory. The two used to be indistinguishable, so a
+    /// memory-refused `SETNX` looked identical to "key already present" (#477).
+    pub fn set_nx_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> SetNxOutcome {
         // Fast path: peek without taking the per-key write lock. If the
         // key is already present and live we can bail before triggering
         // any eviction work. The TOCTOU window between this peek and the
@@ -887,7 +961,7 @@ impl Store {
         if let Some(existing) = self.data.get(&key)
             && !existing.is_expired()
         {
-            return false;
+            return SetNxOutcome::Exists;
         }
 
         // Keep the *logical* bytes for the publish below, before compression
@@ -922,21 +996,21 @@ impl Store {
         // including this one) and would deadlock if called under the
         // entry guard. The `set()` method makes the same trade-off.
         if !self.ensure_memory(new_size) {
-            return false;
+            return SetNxOutcome::OutOfMemory;
         }
 
         let published_expiry = new_entry.expires_at;
         let has_ttl = new_entry.expires_at.is_some();
         // Atomic check-and-insert. The shard write lock held by `entry()`
         // serialises concurrent set_nx calls for this key.
-        let (inserted, key_ref) = match self.data.entry(key) {
+        let key_ref = match self.data.entry(key) {
             dashmap::Entry::Occupied(mut occ) => {
                 if !occ.get().is_expired() {
                     // Lost the race; another writer landed first. We
                     // already ran `ensure_memory` which may have evicted
                     // unrelated keys — that's wasted work but not a
                     // correctness bug.
-                    return false;
+                    return SetNxOutcome::Exists;
                 }
                 // The existing entry has expired; reclaim its bytes and
                 // replace it.
@@ -944,32 +1018,30 @@ impl Store {
                 self.mem_add(new_size);
                 let k = occ.key().clone();
                 occ.insert(new_entry);
-                (true, k)
+                k
             }
             dashmap::Entry::Vacant(vac) => {
                 self.mem_add(new_size);
                 let k = vac.key().clone();
                 vac.insert(new_entry);
-                (true, k)
+                k
             }
         };
-        if inserted {
-            if has_ttl {
-                self.ttl_keys.insert(key_ref.clone());
-            } else {
-                self.ttl_keys.remove(&key_ref);
-            }
-            // Wake any waiters — the insert is visible at this point.
-            self.notify_write(&key_ref);
-            // Broadcast the winning value. This path already *has* the exact
-            // bytes and TTL it inserted (they are the caller's arguments), so
-            // there is nothing to re-read. Per-node atomic, cluster-wide
-            // last-arrival-wins — see `replicate_published_value`.
-            if let Some(value) = published_value {
-                self.replicate_published_value(&key_ref, value, published_expiry);
-            }
+        if has_ttl {
+            self.ttl_keys.insert(key_ref.clone());
+        } else {
+            self.ttl_keys.remove(&key_ref);
         }
-        inserted
+        // Wake any waiters — the insert is visible at this point.
+        self.notify_write(&key_ref);
+        // Broadcast the winning value. This path already *has* the exact
+        // bytes and TTL it inserted (they are the caller's arguments), so
+        // there is nothing to re-read. Per-node atomic, cluster-wide
+        // last-arrival-wins — see `replicate_published_value`.
+        if let Some(value) = published_value {
+            self.replicate_published_value(&key_ref, value, published_expiry);
+        }
+        SetNxOutcome::Inserted
     }
 
     /// Remove a key, returning `true` if it existed. Removes from both
@@ -1007,6 +1079,51 @@ impl Store {
             self.notify_write(key);
         }
         removed
+    }
+
+    /// Compare-and-remove an entry that a read path just observed expired.
+    ///
+    /// The lazy-expiry reap on `get`/`exists`/`pttl` used to call
+    /// [`remove_local`](Self::remove_local) unconditionally after dropping the
+    /// read guard. A `set` that landed in the gap between the observation and
+    /// the removal was then destroyed by the *reader* — the writer's success
+    /// silently undone. That is the stampede-refresh pattern exactly (write a
+    /// fresh value as the old one expires), so the window is aimed at, not
+    /// incidental (#478).
+    ///
+    /// The removal is now conditional on the entry still carrying the exact
+    /// `expires_at` the caller observed. Every TTL'd write builds a *fresh*
+    /// [`Instant`] (`Instant::now() + ttl`), and a TTL-less write stores
+    /// `None`, so a value written after the observation never compares equal —
+    /// it is preserved. A wholly new entry likewise does not match. The
+    /// observed instant is therefore a stable identity for "the entry I saw
+    /// expire", and equality alone suffices: it was already in the past when
+    /// observed, so a matching entry is still expired.
+    ///
+    /// Returns `true` if this call removed the entry.
+    ///
+    /// # Locking
+    ///
+    /// [`DashMap::remove_if`] evaluates the predicate under the shard write
+    /// lock and hands back the displaced entry with the lock already released.
+    /// The predicate touches no other lock, and the reconciliation
+    /// (`mem_sub` / `ttl_keys` / `notify_write`) runs after the guard is
+    /// dropped. So — unlike the eviction path — this never holds a shard guard
+    /// across [`ensure_memory`](Self::ensure_memory); the #476 deadlock
+    /// constraint does not apply here and is not reintroduced.
+    fn reap_if_expired(&self, key: &str, observed: Instant) -> bool {
+        let removed = self.data.remove_if(key, |_, entry| entry.expires_at == Some(observed));
+        if let Some((_, old)) = removed {
+            self.mem_sub(old.mem_size);
+            // Keep the TTL hint set consistent, same as remove_local.
+            self.ttl_keys.remove(key);
+            // A reap is a state change (the key becomes absent) — wake waiters,
+            // matching remove_local's contract.
+            self.notify_write(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Set an expiry on an existing key. Returns `false` if the key doesn't exist.
@@ -1136,7 +1253,9 @@ impl Store {
                 Entry::new(Bytes::from(delta.to_string().into_bytes()), key.len(), false, 0)
                     .mem_size;
             if !self.ensure_memory(create_size) {
-                return Err("ERR out of memory".to_string());
+                // Redis-compatible `-OOM` so INCR fails the same way SET does
+                // when the store is parked at its limit (#477).
+                return Err(OOM_ERROR.to_string());
             }
         }
 
@@ -1250,8 +1369,14 @@ impl Store {
     }
 
     /// Append `value` to the existing value at `key`, or create it.
-    /// Returns the new length of the value.
-    pub fn append(&self, key: &str, value: &[u8]) -> usize {
+    ///
+    /// Returns `Some(new_length)` on success. Returns `None` only when the key
+    /// was **absent** and the create was refused by the memory budget
+    /// (`NoEviction` over `memory_limit`) — the RESP layer maps that to Redis
+    /// `-OOM` instead of falsely answering with a length (#477). Growing an
+    /// *existing* value is done in place and is not memory-guarded, so it never
+    /// returns `None`.
+    pub fn append(&self, key: &str, value: &[u8]) -> Option<usize> {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
@@ -1312,13 +1437,18 @@ impl Store {
                 if let Some(value) = published_value {
                     self.replicate_published_value(key, value, published_expiry);
                 }
-                return final_len;
+                return Some(final_len);
             }
         }
 
         let len = value.len();
-        self.set(key.to_string(), value.to_vec(), None);
-        len
+        if self.set(key.to_string(), value.to_vec(), None) {
+            Some(len)
+        } else {
+            // Create refused for memory — report it rather than claiming a
+            // length for a value that was never stored.
+            None
+        }
     }
 
     // ── Hash operations ──────────────────────────────────────────
@@ -2203,7 +2333,7 @@ mod tests {
     #[test]
     fn append_new_key() {
         let s = test_store();
-        assert_eq!(s.append("k", b"hello"), 5);
+        assert_eq!(s.append("k", b"hello"), Some(5));
         assert_eq!(s.get("k").as_deref(), Some(&b"hello"[..]));
     }
 
@@ -2211,7 +2341,7 @@ mod tests {
     fn append_existing() {
         let s = test_store();
         s.set("k".into(), b"hello".to_vec(), None);
-        assert_eq!(s.append("k", b" world"), 11);
+        assert_eq!(s.append("k", b" world"), Some(11));
         assert_eq!(s.get("k").as_deref(), Some(&b"hello world"[..]));
     }
 
@@ -2277,6 +2407,76 @@ mod tests {
         assert!(s.set("k".into(), b"v".to_vec(), None));
         // Fill up memory with a large value.
         assert!(!s.set("big".into(), vec![0u8; 1024], None));
+    }
+
+    #[test]
+    fn set_nx_outcome_distinguishes_exists_from_oom() {
+        // #477: the boolean `set_nx` conflated "already exists" with an
+        // out-of-memory refusal. The outcome variant must tell them apart.
+        let s = Store::new(StoreConfig {
+            memory_limit: 200,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        assert_eq!(s.set_nx_outcome("k".into(), b"v".to_vec(), None), SetNxOutcome::Inserted);
+        // Live key present → Exists, NOT OutOfMemory.
+        assert_eq!(s.set_nx_outcome("k".into(), b"v2".to_vec(), None), SetNxOutcome::Exists);
+        // A fresh key too large for the budget → OutOfMemory, NOT Exists.
+        assert_eq!(
+            s.set_nx_outcome("big".into(), vec![0u8; 1024], None),
+            SetNxOutcome::OutOfMemory
+        );
+
+        // The boolean wrapper still means exactly "was it inserted?".
+        let s2 = test_store();
+        assert!(s2.set_nx("fresh".into(), b"x".to_vec(), None));
+        assert!(!s2.set_nx("fresh".into(), b"y".to_vec(), None));
+    }
+
+    #[test]
+    fn expired_key_is_still_lazily_reaped_on_get() {
+        // The compare-and-remove must still reap in the ordinary case: an
+        // expired key with no concurrent writer is removed on read.
+        let s = test_store();
+        let past = Instant::now() - Duration::from_secs(60);
+        s.data.insert("k".into(), Entry::with_expiry(Bytes::from_static(b"v"), 1, false, past, 0));
+        s.ttl_keys.insert("k".into());
+
+        assert_eq!(s.get("k"), None);
+        assert!(!s.data.contains_key("k"), "expired entry should be reaped");
+        assert!(!s.ttl_keys.contains("k"), "TTL hint should be cleared");
+    }
+
+    #[test]
+    fn refresh_at_expiry_survives_concurrent_reader_reap() {
+        // #478: a reader observes a key expired and, before it reaps, a writer
+        // stores a fresh value. The reader's compare-and-remove must not
+        // delete that fresh write.
+        let s = test_store();
+
+        // Plant an already-expired entry directly so we know the exact
+        // `expires_at` a reader would observe — fully deterministic, no sleep.
+        let observed = Instant::now() - Duration::from_secs(60);
+        s.data.insert(
+            "k".into(),
+            Entry::with_expiry(Bytes::from_static(b"old"), 1, false, observed, 0),
+        );
+
+        // The writer lands in the gap after the reader observed expiry,
+        // replacing the entry with a fresh, non-expiring value.
+        assert!(s.set("k".into(), b"new".to_vec(), None));
+
+        // The stale reader now runs its reap with the expiry it observed. The
+        // live entry carries a different `expires_at` (None), so the reap is a
+        // no-op and the fresh value survives.
+        assert!(!s.reap_if_expired("k", observed), "reap must not remove the refreshed value");
+        assert_eq!(s.get("k").as_deref(), Some(&b"new"[..]));
+
+        // Documents the pre-fix hazard on the same setup: the old
+        // unconditional reap (`remove_local`) destroys the fresh write.
+        assert!(s.set("k".into(), b"new2".to_vec(), None));
+        s.remove_local("k"); // what get()/exists()/pttl() used to call
+        assert_eq!(s.get("k"), None, "unconditional reap loses the refresh — the #478 bug");
     }
 
     #[test]
@@ -2365,8 +2565,8 @@ mod tests {
             eviction_policy: EvictionPolicy::AllKeysLru,
             compression: CompressionConfig { algo: CompressionAlgo::Zstd, level: 6, min_size: 1 },
         });
-        assert_eq!(s.append("key", b"hello"), 5);
-        assert_eq!(s.append("key", b" world"), 11);
+        assert_eq!(s.append("key", b"hello"), Some(5));
+        assert_eq!(s.append("key", b" world"), Some(11));
         let retrieved = s.get("key");
         assert_eq!(retrieved.as_deref(), Some(&b"hello world"[..]));
     }
