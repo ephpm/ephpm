@@ -39,28 +39,34 @@ Concretely, per preview:
 | A sticky PR comment | One comment, updated in place on every push, rewritten on close |
 
 What you do **not** get, and should plan around: no shelling out at request
-time, no `dl()`, no `queue:work` worker, and no authentication in front of the
-preview URL (see [Private repositories](#private-repositories) below).
+time, no `dl()`, and no `queue:work` worker. A per-preview access gate
+(GitHub-OAuth login, for private repositories) is landing — see
+[Private repositories](#private-repositories) below for what is implemented and
+what is not yet enabled on the `ephpm` org cluster.
 
 ## The GitHub App
 
-There is **no public marketplace App to install.** The App that comments on
-`ephpm/*` pull requests as `ephpm[bot]` is a *private* GitHub App — visit
-[github.com/apps/ephpm](https://github.com/apps/ephpm) and GitHub says so
-plainly. A private App can only be installed on the account that owns it, so it
-cannot be installed on a repository outside the ePHPm organization.
+`ephpm` is a **public GitHub App** — [github.com/apps/ephpm](https://github.com/apps/ephpm).
+It can be installed on any account or repository, and comments on pull requests
+as `ephpm[bot]`.
 
-So there are two real situations:
+Installing the App points a repository's pull-request webhooks at a preview
+cluster. **Which repositories a cluster actually builds previews for is that
+cluster's decision**, set by its repository allowlist — the operator running the
+previews chooses whose pull requests it will serve, and a cluster with no
+allowlist configured refuses every delivery (it fails closed). The `ephpm`
+organization's own cluster serves the `ephpm/*` repositories.
 
-**Your repo is in the `ephpm` org.** The App is already installed. Add an
-`ephpm.yaml`, open a pull request, and the bot comments. Nothing else to do.
+So there are two situations:
 
-**Your repo is anywhere else.** You run the system yourself, and part of that is
-creating your own GitHub App — one App per preview deployment, pointed at your
-own webhook endpoint. The permissions, the webhook event to subscribe to, and
-the rest of the standing-up work are in
+**Your repo is in the `ephpm` org.** The App is installed and the org cluster
+serves it. Add an `ephpm.yaml`, open a pull request, and the bot comments.
+Nothing else to do.
+
+**You want to run previews yourself.** Install the App on your repositories and
+point it at a cluster you operate, then set that cluster's allowlist to the
+repositories you want to serve. The daemon, webhook, and allowlist setup is in
 [PR Preview Bot → Install it on your repo](/guides/preview-bot/#install-it-on-your-repo).
-Do not wait for a hosted service; there is not one today.
 
 ## What happens on a pull request
 
@@ -228,38 +234,39 @@ phpredis `pconnect` will not work regardless of which path you choose.
 
 ## Private repositories
 
-Be clear-eyed about this one: **preview deployments of private repositories are
-not supported today.** Two independent reasons, both verified in source rather
-than inferred.
+Support for previewing **private** repositories is **landing.** The two things
+that used to block it are both implemented now, and are rolling out rather than
+already live on the `ephpm` org cluster. Until this note says otherwise, treat a
+deployed preview as readable by anyone who reaches its URL, and don't seed a
+private preview with anything you would not publish.
 
-**The checkout is unauthenticated.** The daemon mints a GitHub App installation
-token, but it uses it only to post the comment and create the Deployment record.
-The `git fetch` of `refs/pull/<N>/head` runs as an ordinary `git` child process
-against the plain `https://github.com/<owner>/<repo>.git` clone URL, with no
-credential helper, no `http.extraheader`, and no token in the URL. A public repo
-fetches fine; a private one fails. (An operator could in principle give the
-daemon's OS user ambient git credentials — that is outside switchboard's
-contract, is not documented by it, and is not tested.)
+**Authenticated checkout — implemented.** The daemon authenticates the
+`git fetch` of `refs/pull/<N>/head` with the GitHub App installation token it
+already mints, injected as a transient `http.extraheader` credential scoped to
+that one fetch and kept out of logs and out of the persisted git config — so a
+private repository checks out. A public repo still fetches with no credential.
 
-**The preview URL has no gate.** Even with the checkout solved, a preview is
-served at a guessable public hostname with no authentication in front of it.
-Middleware to gate previews behind HTTP Basic, signed session cookies, or GitHub
-OAuth was proposed as ePHPm PRs
-[#387](https://github.com/ephpm/ephpm/pull/387),
-[#388](https://github.com/ephpm/ephpm/pull/388) and
-[#389](https://github.com/ephpm/ephpm/pull/389), and all three were **closed
-unmerged**. There is no such builtin. So a private repository's code and seeded
-data would be published to anyone who guesses the URL.
+**Per-preview access gate — implemented.** A request-phase gate can require a
+**GitHub OAuth login** in front of a preview — on the static, PHP *and*
+WebSocket paths, fail-closed — authorizing a viewer by their read access to the
+pull request's repository. It also mints short-lived, per-preview, **revocable
+shareable URLs** for people who need to view a preview without repo access. One
+GitHub OAuth App serves the whole `*.preview` wildcard fleet; a viewer's session
+is bound to the single preview it was issued for and is rejected on any other,
+enforced by the token verifier (the multi-tenant binding that a shared cookie
+would otherwise break). Revived from the earlier proposals
+([#388](https://github.com/ephpm/ephpm/pull/388),
+[#389](https://github.com/ephpm/ephpm/pull/389)) with the cross-tenant
+session-replay bug that had blocked them fixed.
 
-The related, separable fact — and the one that *is* about degrading gracefully —
-is that GitHub **reporting** is optional. Configure both `--app-id` and
-`--app-key` and previews are reported on the PR; configure neither and deploys
-still run, they just say nothing. Configuring exactly one is a startup error, so
-a half-configured App cannot silently never report.
+GitHub **reporting** stays optional and orthogonal: configure both `--app-id`
+and `--app-key` and previews are reported on the PR; configure neither and
+deploys still run, they just say nothing. Configuring exactly one is a startup
+error, so a half-configured App cannot silently never report.
 
-If you need previews of private code today, run the whole system on
+Until the gate is enabled on the cluster you use, run private previews on
 infrastructure you control and put your own authentication in front of the
-preview domain. Treat anything you seed into a preview as public.
+preview domain, and treat anything you seed into a preview as public.
 
 ## The worked example
 
