@@ -846,7 +846,10 @@ async fn bind_listeners(
         .with_db_health(db_health)
         .with_primary_view(primary_view)
         .with_websocket(websocket)
-        .with_request_log(request_log);
+        .with_request_log(request_log)
+        // Access logging is on whenever `[server.logging] access` names a
+        // file; the file layer that consumes the records is built in `main`.
+        .with_access_log(!config.server.logging.access.is_empty());
 
         let router = match per_site_db_wire {
             Some((auth, listen)) => router.with_per_site_db_wire(auth, listen),

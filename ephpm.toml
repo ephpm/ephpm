@@ -48,7 +48,8 @@ index_files = ["index.php", "index.html"]
 # allowed_php_paths = []   # PHP execution allowlist, e.g. ["/index.php", "/wp-admin/*.php"]
 
 # [server.logging]
-# access = ""              # access log file path (empty = disabled)
+# access = ""              # access log file (empty = disabled); one JSON record
+#                          # per request — no headers, query string, or secrets
 # level = "info"           # trace, debug, info, warn, error
 
 [php]

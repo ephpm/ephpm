@@ -1126,10 +1126,24 @@ fn run_with_config(
     // (Scoping also keeps a global info-level filter from disabling the
     // DEBUG-level request spans the OTLP layer needs; that layer carries
     // its own target filter.)
+    // Access records travel on their own tracing target (`access_log`, see
+    // `ephpm_server::router`) to the dedicated file layer below. Silence that
+    // target on the main fmt layer so an enabled access log is written only to
+    // its file and never *also* echoed to stdout / the service log. Harmless
+    // when access logging is off — the router emits nothing on that target.
+    let env_filter = env_filter
+        .add_directive("access_log=off".parse().expect("static access_log directive parses"));
+
     let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
     layers.push(fmt_layer.with_filter(env_filter).boxed());
 
-    // Set up access log file writer if configured.
+    // Set up access log file writer if configured. One structured-JSON record
+    // per served request is emitted by the router on the `access_log` target;
+    // this layer is the only subscriber to it and writes to the configured
+    // file. JSON (rather than a combined/common text line) is deliberate: the
+    // record carries attacker-influenced fields (request path, client IP via
+    // X-Forwarded-For), and serde's escaping makes log-injection impossible,
+    // matching ePHPm's other structured diagnostics (`/_ephpm/requests`).
     let _access_guard = if config.server.logging.access.is_empty() {
         None
     } else {
@@ -1142,8 +1156,11 @@ fn run_with_config(
             tracing_appender::rolling::never(access_dir, access_file),
         );
         let access_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
             .with_writer(access_writer)
-            .with_target(true)
             .with_filter(EnvFilter::new("access_log=info"));
         layers.push(access_layer.boxed());
         Some(guard)

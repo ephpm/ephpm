@@ -34,7 +34,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # untrusted input, and TOML has no anchor/alias expansion to defend against.
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # OTLP trace export — only compiled behind the `otlp` cargo feature on
 # ephpm-server (forwarded by the ephpm binary's `otlp` feature). The
 # opentelemetry / tracing-opentelemetry pair must be bumped in lockstep:

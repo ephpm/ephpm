@@ -762,6 +762,12 @@ pub struct Router {
     /// Enabled by default in dev mode, opt-in via
     /// `[server.diagnostics] request_log` in serve mode.
     request_log: Option<Arc<crate::timeline::RequestLog>>,
+    /// Emit one access-log record per served request on the dedicated
+    /// `access_log` tracing target. `false` (the default) skips the capture
+    /// entirely — the shared serve-mode hot path allocates nothing. Enabled
+    /// when `[server.logging] access` names a file; the file layer that
+    /// consumes the target is wired up in the `ephpm` binary's `main`.
+    access_log_enabled: bool,
     /// Whether this node is currently the writable SQLite target, exposed at
     /// `/_ephpm/primary` so an external load balancer can route
     /// active-passive to the elected cluster primary.
@@ -1319,6 +1325,7 @@ impl Router {
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
             db_health: None,
             request_log: None,
+            access_log_enabled: false,
             // Default: this node is a writable SQLite target (standalone /
             // non-clustered). Clustered-SQLite mode replaces this with the
             // election's shared view via `with_primary_view`.
@@ -1586,6 +1593,15 @@ impl Router {
         request_log: Option<Arc<crate::timeline::RequestLog>>,
     ) -> Self {
         self.request_log = request_log;
+        self
+    }
+
+    /// Enable per-request access logging when `[server.logging] access` names
+    /// a file. Kept out of `new()`'s signature so existing call sites stay
+    /// unchanged; `false` (the default) leaves the capture off.
+    #[must_use]
+    pub(crate) fn with_access_log(mut self, enabled: bool) -> Self {
+        self.access_log_enabled = enabled;
         self
     }
 
@@ -2428,6 +2444,33 @@ impl Router {
             }
         });
 
+        // Access-log capture (`[server.logging] access`). The record is
+        // emitted once the response status is known, but the request fields
+        // have to be taken before `req` is consumed below. `None` — and zero
+        // allocation on the shared serve-mode hot path — when access logging
+        // is disabled.
+        //
+        // Deliberately NOT captured: request headers (`Authorization`,
+        // `Cookie`), the query string (`uri().path()` excludes it by
+        // construction, and it routinely carries tokens), and every `$_SERVER`
+        // value (`DB_PASSWORD`, `DATABASE_URL`, `PHP_AUTH_PW`). The access
+        // logger reads only this struct, so — unlike a logger that reaches
+        // into `PhpRequest`/`$_SERVER` — it cannot dump a credential. That is
+        // the same posture the `/_ephpm/requests` timeline holds (it logs no
+        // headers) and that #482's redacting `Debug` impls enforce for the
+        // request types.
+        let access_capture = if self.access_log_enabled {
+            let (client, _) = self.resolve_proxy_info(&req, remote_addr, is_tls);
+            Some(AccessLogCapture {
+                method: req.method().as_str().to_owned(),
+                path: req.uri().path().to_owned(),
+                version: http_version_label(req.version()),
+                client_ip: client.ip(),
+            })
+        } else {
+            None
+        };
+
         // Request span for OTLP export. DEBUG level under a dedicated target
         // (`crate::OTEL_TRACE_TARGET`) so the default info-level stack leaves
         // the callsite disabled — the span only materializes when a layer
@@ -2540,6 +2583,13 @@ impl Router {
                     php_ms: timings.and_then(|t| t.execute).map(|d| d.as_secs_f64() * 1000.0),
                     response_bytes,
                 });
+            }
+
+            // Access log (`[server.logging] access`): reuse `elapsed` and the
+            // response's own body-size hint — nothing is re-measured.
+            if let Some(cap) = access_capture {
+                let response_bytes = hyper::body::Body::size_hint(resp.body()).exact();
+                emit_access_log(&cap, resp.status().as_u16(), elapsed * 1000.0, response_bytes);
             }
         }
 
@@ -5414,6 +5464,70 @@ fn server_span_status_is_error(status: StatusCode) -> bool {
     status.is_server_error()
 }
 
+/// The tracing target the access log travels on. A file-only fmt layer in the
+/// `ephpm` binary's `main` subscribes to exactly this target, and the main
+/// (stdout / service-log) layer silences it, so an enabled access log is
+/// written only to `[server.logging] access` — never echoed to the console.
+const ACCESS_LOG_TARGET: &str = "access_log";
+
+/// Safe, owned request envelope captured before dispatch for the access log.
+///
+/// Carries only fields that cannot leak a credential: no request headers
+/// (`Authorization`/`Cookie`), no query string, no `$_SERVER` value. See the
+/// capture site in [`Router::handle`] for the full rationale.
+struct AccessLogCapture {
+    method: String,
+    /// Request path only — never the query string (it can carry tokens).
+    path: String,
+    version: &'static str,
+    client_ip: IpAddr,
+}
+
+/// Map an HTTP version to a stable `&'static str` for the access log.
+fn http_version_label(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "HTTP/0.9",
+        http::Version::HTTP_10 => "HTTP/1.0",
+        http::Version::HTTP_11 => "HTTP/1.1",
+        http::Version::HTTP_2 => "HTTP/2",
+        http::Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/?",
+    }
+}
+
+/// Emit one access-log record on the [`ACCESS_LOG_TARGET`] tracing target.
+///
+/// Only the safe request/response envelope in [`AccessLogCapture`] plus the
+/// response status, duration, and body size are logged — never a header,
+/// query string, or `$_SERVER` credential. `bytes` is `None` for a streaming
+/// response whose size is unknown at header time, in which case the field is
+/// simply omitted rather than logged as a misleading zero.
+fn emit_access_log(cap: &AccessLogCapture, status: u16, duration_ms: f64, bytes: Option<u64>) {
+    match bytes {
+        Some(bytes) => tracing::info!(
+            target: ACCESS_LOG_TARGET,
+            method = %cap.method,
+            path = %cap.path,
+            version = cap.version,
+            status,
+            duration_ms,
+            bytes,
+            client_ip = %cap.client_ip,
+            "access"
+        ),
+        None => tracing::info!(
+            target: ACCESS_LOG_TARGET,
+            method = %cap.method,
+            path = %cap.path,
+            version = cap.version,
+            status,
+            duration_ms,
+            client_ip = %cap.client_ip,
+            "access"
+        ),
+    }
+}
+
 /// Map an HTTP status code to a `&'static str` metrics label.
 ///
 /// The `metrics` macros require label values to be `'static`; returning a
@@ -7336,6 +7450,182 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(attrs.clone());
         let guard = tracing::subscriber::set_default(subscriber);
         (attrs, guard)
+    }
+
+    /// Test layer capturing the router's `access_log`-target **events** — the
+    /// per-request record the access logger emits. It sees exactly the fields
+    /// that reach the file layer in `main`, so the no-leak assertions below
+    /// are checking the real record, not a proxy for it.
+    #[derive(Clone, Default)]
+    struct AccessLogCollector(Arc<std::sync::Mutex<Vec<SpanAttrs>>>);
+
+    impl AccessLogCollector {
+        fn snapshot(&self) -> Vec<SpanAttrs> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// The single captured record, when a test drove exactly one request.
+        fn only(&self) -> SpanAttrs {
+            let events = self.snapshot();
+            assert_eq!(events.len(), 1, "expected exactly one access_log event: {events:?}");
+            events.into_iter().next().unwrap()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for AccessLogCollector
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != ACCESS_LOG_TARGET {
+                return;
+            }
+            let mut fields = SpanAttrs::new();
+            event.record(&mut AttrVisitor(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    /// Install an `AccessLogCollector` for the duration of a test.
+    fn collect_access_log() -> (AccessLogCollector, tracing::subscriber::DefaultGuard) {
+        enable_span_callsites();
+        let collector = AccessLogCollector::default();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        (collector, guard)
+    }
+
+    /// A served request emits exactly one access record with the safe
+    /// request/response envelope — method, request path, status, duration,
+    /// body size, client IP, and HTTP version.
+    #[tokio::test]
+    async fn access_log_records_a_served_request() {
+        let (log, _guard) = collect_access_log();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
+        let router = test_router(dir.path()).with_access_log(true);
+        let addr: SocketAddr = "203.0.113.7:52100".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/page.html").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rec = log.only();
+        assert_eq!(rec.get("method").map(String::as_str), Some("GET"), "{rec:?}");
+        assert_eq!(rec.get("path").map(String::as_str), Some("/page.html"), "{rec:?}");
+        assert_eq!(rec.get("status").map(String::as_str), Some("200"), "{rec:?}");
+        assert_eq!(rec.get("client_ip").map(String::as_str), Some("203.0.113.7"), "{rec:?}");
+        assert_eq!(rec.get("version").map(String::as_str), Some("HTTP/1.1"), "{rec:?}");
+        // A known-size static body records `bytes`; the value is the served
+        // length, not asserted exactly here (compression/headers may vary).
+        assert!(rec.contains_key("bytes"), "a fixed-size response records bytes: {rec:?}");
+        assert!(rec.contains_key("duration_ms"), "{rec:?}");
+    }
+
+    /// With access logging off (the default), a served request emits **no**
+    /// access record — the capture and the emit are both gated.
+    #[tokio::test]
+    async fn access_log_off_emits_nothing() {
+        let (log, _guard) = collect_access_log();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
+        let router = test_router(dir.path()); // no with_access_log
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/page.html").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(log.snapshot().is_empty(), "access logging is off: {:?}", log.snapshot());
+    }
+
+    /// The property the whole feature turns on: an access log must never leak
+    /// a credential. A request carrying a bearer token, a session cookie, and
+    /// secrets in the query string is served, and no field of the emitted
+    /// record contains any of them — the logger reads only the safe envelope
+    /// (method / path-without-query / status / timing / bytes / client IP),
+    /// never a header, the query string, or a `$_SERVER` value.
+    #[tokio::test]
+    async fn access_log_never_leaks_credentials() {
+        let (log, _guard) = collect_access_log();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
+        let router = test_router(dir.path()).with_access_log(true);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Secrets in three places an access logger is tempted to reach for:
+        // the query string (tokens), the `Authorization` header, and a cookie.
+        // `DB_PASSWORD=` in the query stands in for the `$_SERVER` credential
+        // family (#482) — a bulk field dump would surface it.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/page.html?token=SUPERSECRETTOKEN&DB_PASSWORD=leakedpw")
+            .header("authorization", "Bearer AUTHSECRETVALUE")
+            .header("cookie", "session=COOKIESECRETVALUE")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rec = log.only();
+        // The path is logged without its query string.
+        assert_eq!(rec.get("path").map(String::as_str), Some("/page.html"), "{rec:?}");
+
+        // No header/query fields are recorded at all.
+        for banned in ["authorization", "cookie", "query", "url.query", "headers"] {
+            assert!(!rec.contains_key(banned), "field `{banned}` must not be logged: {rec:?}");
+        }
+
+        // And no secret value appears in ANY field, however named.
+        for secret in
+            ["SUPERSECRETTOKEN", "leakedpw", "DB_PASSWORD", "AUTHSECRETVALUE", "COOKIESECRETVALUE"]
+        {
+            for (name, value) in &rec {
+                assert!(
+                    !value.contains(secret),
+                    "secret `{secret}` leaked into access field `{name}` = `{value}`: {rec:?}"
+                );
+            }
+        }
+    }
+
+    /// A spoofed `X-Forwarded-For` from an untrusted peer is ignored: with no
+    /// `[server] trusted_proxies`, the access record logs the real socket peer,
+    /// not the attacker-supplied header — so `client_ip` cannot be forged into
+    /// the log.
+    #[tokio::test]
+    async fn access_log_client_ip_ignores_untrusted_xff() {
+        let (log, _guard) = collect_access_log();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
+        let router = test_router(dir.path()).with_access_log(true);
+        let addr: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/page.html")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rec = log.only();
+        assert_eq!(
+            rec.get("client_ip").map(String::as_str),
+            Some("198.51.100.9"),
+            "untrusted XFF must not override the real peer: {rec:?}"
+        );
     }
 
     /// The OTel HTTP semconv span-status rule for a **server** span, pinned as

@@ -1448,6 +1448,18 @@ impl ServerConfig {
 pub struct LoggingConfig {
     /// Path to the access log file. Empty string disables access logging.
     ///
+    /// When set, the server writes one structured-JSON record per served
+    /// request to this file, with fields: `method`, `path` (request path
+    /// only — never the query string), `status`, `duration_ms`, `bytes`
+    /// (omitted for streaming responses of unknown size), `client_ip` (the
+    /// effective client after trusted-proxy resolution), and `version`.
+    ///
+    /// For safety the log deliberately carries **no** request headers
+    /// (`Authorization`/`Cookie`), no query string, and no `$_SERVER` value
+    /// (`DB_PASSWORD`, `DATABASE_URL`, `PHP_AUTH_PW`), so it cannot leak a
+    /// credential. Records are written only to this file, not echoed to
+    /// stdout or the service log.
+    ///
     /// Default: `""` (disabled).
     #[serde(default)]
     pub access: String,
