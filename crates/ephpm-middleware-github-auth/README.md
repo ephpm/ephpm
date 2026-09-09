@@ -21,6 +21,28 @@ config  = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
             session_secret = "env:EPHPM_SESSION_SECRET", repo = "acme/web" }
 ```
 
+## The OAuth App callback URL
+
+The module's default endpoints live under `/_ephpm/auth/`:
+
+- **Login:** `/_ephpm/auth/github/login`
+- **Callback:** `/_ephpm/auth/github/callback`
+
+The ePHPm router routes the reserved `/_ephpm/auth/` sub-namespace **to the
+middleware chain** (the rest of `/_ephpm/` is server-internal), so these are
+reachable without leaving the reserved namespace or colliding with an app
+route. Register this as the GitHub OAuth App's **Authorization callback URL**:
+
+```
+https://<host>/_ephpm/auth/github/callback
+```
+
+For a wildcard preview fleet, register
+`https://*.preview.<domain>/_ephpm/auth/github/callback` (or the specific hosts
+the App allows). Keep `login_path`/`callback_path` under `/_ephpm/auth/` — a
+non-`/_ephpm/` value leaves the carve-out and would need to avoid the app's own
+routes.
+
 ## Three things to know before reading the code
 
 1. **This is the cold path only.** It issues sessions; it never verifies one.

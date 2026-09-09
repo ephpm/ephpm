@@ -206,16 +206,16 @@ document_root = "public"
 
 [preview_auth]
 session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # HS256 key; env:/file:/literal
-login_url      = "/auth/github/login"                 # where unauthenticated browsers go
-exempt_paths   = ["/auth/github/login", "/auth/github/callback"]
+login_url      = "/_ephpm/auth/github/login"          # the github-auth issuer's login endpoint
 # optional: cookie, issuer, audience, require_https, require_site,
-#           share_param, share_epoch, share_revocation, return_to_param, site_param
+#           share_param, share_epoch, share_revocation, return_to_param, site_param,
+#           exempt_paths (not needed for the default /_ephpm/auth/ endpoints)
 ```
 
 - **`session_secret`** is the HS256 key ePHPm verifies sessions with — the *same* key the `github-auth` **issuer** (a global `[[middleware]]` mount) signs them with. Use an `env:NAME` or `file:/abs/path` **reference** so the secret is not a literal in this tenant-derived file and both halves name one source of truth. It must resolve to ≥ 32 bytes.
 - **Only the enforcement half lives here.** The OAuth issuer — and its GitHub App `client_id`/`client_secret` and per-repo access check — stays in the global mount, never in this file. Putting a client secret in a tenant-derived file would defeat the very trust boundary this directory exists for.
 - **Fail-closed.** A missing/short/unresolvable `session_secret`, or a missing `login_url`, takes the one preview **out of service (503)** rather than serving it ungated — the same narrowing rule `document_root` follows. Unknown keys inside the section are tolerated (reported), so a newer provisioning daemon can add one without a fleet outage.
-- **Reachability.** `github-auth`'s default `/_ephpm/…` login/callback paths are unreachable (that namespace is answered before middleware), so point `login_url` at a path **outside** `/_ephpm/` and list the login/callback paths in `exempt_paths`.
+- **Reachability.** The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so `github-auth`'s default endpoints work: login at `/_ephpm/auth/github/login`, callback at `/_ephpm/auth/github/callback` (the URL to register in the GitHub OAuth App). The gate never runs on `/_ephpm/auth/`, so no `exempt_paths` entry is needed for the defaults.
 - **Share links.** A `via:"share"` capability token (short `exp`, per-`jti` KV revocation, per-site epoch) admits a stakeholder who lacks repo access, as the cookie or `?ephpm_share=<token>`. It is a **bearer capability** — see the [roadmap page](/roadmap/preview-access-gate/) for the threat model, revocation, and the switchboard contract.
 
 ### Other per-site configuration

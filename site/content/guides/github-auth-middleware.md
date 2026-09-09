@@ -150,8 +150,8 @@ it is a secret in git.
 | `org` | — | organisation login, for `check = "org"` / `"team"` |
 | `team` | — | team slug, for `check = "team"` |
 | `sites` | unset | table mapping each vhost to its own `{ repo \| org \| team }` |
-| `login_path` | `/_ephpm/auth/github/login` | reserved: starts a login |
-| `callback_path` | `/_ephpm/auth/github/callback` | reserved: receives GitHub's redirect |
+| `login_path` | `/_ephpm/auth/github/login` | reserved: starts a login. The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so this default is reachable; keep custom values under `/_ephpm/auth/` |
+| `callback_path` | `/_ephpm/auth/github/callback` | reserved: receives GitHub's redirect. Register `https://<host>/_ephpm/auth/github/callback` as the GitHub OAuth App's Authorization callback URL |
 | `redirect_uri` | derived | full callback URL sent to GitHub. Defaults to `https://<vhost><callback_path>` |
 | `cookie_name` | `ephpm_session` | session cookie. Must match the verifier's |
 | `state_cookie_name` | `<cookie_name>_oauth` | short-lived OAuth `state` cookie |

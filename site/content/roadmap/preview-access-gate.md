@@ -86,9 +86,10 @@ document_root = "public"
 
 [preview_auth]                                    # turns the gate ON for this vhost
 session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # HS256 key, shared with the issuer
-login_url      = "/auth/github/login"                 # where unauthenticated browsers go
-exempt_paths   = ["/auth/github/login", "/auth/github/callback"]
-# cookie / issuer / audience / require_https / require_site / share_* are optional
+login_url      = "/_ephpm/auth/github/login"          # the issuer's login endpoint
+# cookie / issuer / audience / require_https / require_site / share_* are optional.
+# exempt_paths is NOT needed for the default `/_ephpm/auth/…` endpoints — the
+# router carve-out means the gate never sees them.
 ```
 
 ### Why activation lives here, and what stays out
@@ -130,16 +131,26 @@ matching the forward-compat rule the override file already follows for unknown
 top-level keys — a newer switchboard can add a key without taking a fleet
 down.)
 
-### The `/_ephpm/` reachability caveat (issuer-side, flagged)
+### The OAuth endpoints live under `/_ephpm/auth/` (reachable)
 
-`github-auth`'s default `login_path`/`callback_path` are under `/_ephpm/…`, but
-that namespace is **reserved and answered (404) before the middleware chain
-runs** — so the issuer cannot receive a callback there. The issuer, and this
-override's `login_url`, must therefore use paths **outside** `/_ephpm/` (e.g.
-`/auth/github/login`). The gate exempts its configured `login_url` path and any
-`exempt_paths`, so the OAuth round trip is never redirected back to login.
-(Routing `/_ephpm/auth/*` to the chain is possible future work; it is not
-required for enforcement and is out of scope for this stage.)
+The reserved `/_ephpm/` namespace is answered before the middleware chain — but
+the router **carves out `/_ephpm/auth/`** and routes it *to* the request-phase
+chain (`AUTH_NAMESPACE_PREFIX` / `Router::handle_auth_namespace`), specifically
+so a mounted `github-auth` issuer can serve its login and callback there. So the
+issuer's defaults work unchanged:
+
+- **Login:** `https://<preview-host>/_ephpm/auth/github/login`
+- **Callback (the URL to register in the GitHub OAuth App):**
+  `https://<preview-host>/_ephpm/auth/github/callback`
+
+Everything else under `/_ephpm/` (and the bare `/_ephpm`) still 404s, and the
+carve-out never reaches the application: with no auth module mounted a
+`/_ephpm/auth/…` request is a `404`, never the PHP/worker catch-all. The
+per-site gate is **not** run on `/_ephpm/auth/` (the issuer's own endpoints must
+answer an unauthenticated visitor), so no `exempt_paths` entry is needed for the
+default paths. Keep the issuer's `login_path`/`callback_path` under
+`/_ephpm/auth/` — a non-`/_ephpm/` path would leave the reserved namespace and
+risk colliding with an app route.
 
 ## Shipped: temporary shareable URLs (verification + revocation)
 
@@ -238,9 +249,12 @@ build against this, not against the ePHPm internals.
    `ephpm.toml` (`[[middleware]] library = "github-auth"`), with its
    `client_id`/`client_secret`, the per-repo/org access target (its own `sites`
    map or `default_check`), and `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`.
-   Its `login_path`/`callback_path` **must be outside `/_ephpm/`** (that
-   namespace 404s before middleware) — e.g. `/auth/github/login`,
-   `/auth/github/callback`.
+   Keep its `login_path`/`callback_path` at the defaults under `/_ephpm/auth/`
+   (the router routes that sub-namespace to the chain). The GitHub OAuth App's
+   **Authorization callback URL** is then
+   `https://<preview-host>/_ephpm/auth/github/callback` — for a wildcard preview
+   fleet, register `https://*.preview.<domain>/_ephpm/auth/github/callback` (or
+   the specific hosts your App allows).
 2. Set `EPHPM_PREVIEW_SESSION_SECRET` in the ePHPm process environment (≥ 32
    bytes). This is the one source of truth for the HS256 key; the issuer and
    every preview's gate reference it, never a literal.
@@ -253,11 +267,11 @@ build against this, not against the ePHPm internals.
    ```toml
    [preview_auth]
    session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # the SAME reference the issuer uses
-   login_url      = "/auth/github/login"                 # the issuer's login path
-   exempt_paths   = ["/auth/github/login", "/auth/github/callback"]
+   login_url      = "/_ephpm/auth/github/login"          # the issuer's login endpoint
    ```
    `cookie` must match the issuer's `cookie_name` (both default `ephpm_session`,
-   so usually omit it).
+   so usually omit it). No `exempt_paths` is needed for the default
+   `/_ephpm/auth/…` endpoints.
 4. **Rollout ordering:** only write `[preview_auth]` once an ePHPm that enforces
    it is deployed. An older ePHPm treats the unknown section leniently (ignored,
    reported) and would serve the preview **ungated** — so a fleet upgrades ePHPm
