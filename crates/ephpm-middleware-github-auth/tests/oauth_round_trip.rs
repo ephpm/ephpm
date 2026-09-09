@@ -197,7 +197,19 @@ fn gate(stub: &Stub, extra: serde_json::Value) -> GithubAuth {
 }
 
 fn call(mw: &GithubAuth, path: &str, query: &str, headers: &[(String, String)]) -> Response {
-    let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", VHOST, headers);
+    call_on(mw, VHOST, path, query, headers)
+}
+
+/// Like [`call`] but on a chosen vhost — the apex flow needs login on the
+/// target subdomain and the callback on the apex.
+fn call_on(
+    mw: &GithubAuth,
+    vhost: &str,
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+) -> Response {
+    let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", vhost, headers);
     // SAFETY: `ctx` outlives the borrow and `host_table()` is 'static — the
     // exact contract `Request::from_raw` documents.
     let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
@@ -463,6 +475,114 @@ fn github_being_unreachable_is_a_502_not_a_pass() {
     let resp = finish_login(&mw, &state, &cookie, GOOD_CODE);
     assert_eq!(resp.__status(), 502, "an unreachable identity provider must fail closed");
     assert!(!set_cookies(&resp).iter().any(|c| c.starts_with("ephpm_session=")));
+}
+
+/// The single-OAuth-App wildcard-fleet flow, end to end: login on a target
+/// subdomain, callback on the fixed **apex**, a session minted for the
+/// **target** (not the apex), a domain-scoped cookie, and a cross-host redirect
+/// back to the target. This is the design that lets ONE GitHub OAuth App — which
+/// allows only one callback host — serve every `*.preview` subdomain.
+#[test]
+fn apex_flow_one_app_serves_the_whole_wildcard_fleet() {
+    use ephpm_middleware_builtins::hs256::Hs256Policy;
+
+    let stub = Stub::start();
+    const APEX: &str = "preview.test";
+    // Distinct repos per host prove the callback gates on the TARGET, not the
+    // host it landed on: the target maps to a readable repo, the apex to a
+    // denied one. If the callback used its own (apex) vhost, this would 403.
+    let mw = gate(
+        &stub,
+        serde_json::json!({
+            "repo": null,
+            "sites": {
+                VHOST: { "repo": "acme/web" },      // target → readable
+                APEX:  { "repo": "acme/noread" },   // apex → read denied
+            },
+            "redirect_uri": format!("https://{APEX}/_ephpm/auth/github/callback"),
+            "cookie_domain": ".preview.test",
+        }),
+    );
+
+    // 1. Login on the TARGET subdomain. The authorize redirect carries the
+    //    fixed apex `redirect_uri`, and the state cookie is domain-scoped so it
+    //    survives the trip to the apex callback.
+    let login = call_on(&mw, VHOST, "/wp-admin/", "", &[]);
+    assert_eq!(login.__status(), 302);
+    let loc = header(&login, "Location").expect("Location");
+    let redirect_uri =
+        query_param(loc.split_once('?').expect("query").1, "redirect_uri").expect("redirect_uri");
+    assert_eq!(
+        redirect_uri,
+        format!("https://{APEX}/_ephpm/auth/github/callback"),
+        "authorize must send the ONE fixed apex redirect_uri for every target"
+    );
+    let state = query_param(loc.split_once('?').expect("query").1, "state").expect("state");
+    let state_cookie_raw = set_cookies(&login)
+        .into_iter()
+        .find(|c| c.starts_with("ephpm_session_oauth="))
+        .expect("state cookie");
+    assert!(
+        state_cookie_raw.contains("Domain=.preview.test"),
+        "the state cookie must be domain-scoped to survive the apex redirect: {state_cookie_raw}"
+    );
+    let state_cookie = state_cookie_raw.split(';').next().expect("pair").to_owned();
+
+    // 2. GitHub redirects to the APEX callback (a different host). The apex
+    //    reads the domain-scoped state cookie and mints for the TARGET.
+    let resp = call_on(
+        &mw,
+        APEX,
+        "/_ephpm/auth/github/callback",
+        &format!("code={GOOD_CODE}&state={state}"),
+        &[("Cookie".to_owned(), state_cookie)],
+    );
+    assert_eq!(resp.__status(), 302);
+
+    // 3. Cross-host redirect back to the target's own return path.
+    assert_eq!(
+        header(&resp, "Location").as_deref(),
+        Some("https://pr-1.preview.test/wp-admin/"),
+        "the browser must land back on the target preview"
+    );
+
+    // 4. The session cookie is domain-scoped so it reaches the target.
+    let raw = set_cookies(&resp)
+        .into_iter()
+        .find(|c| c.starts_with("ephpm_session="))
+        .expect("session cookie");
+    assert!(raw.contains("Domain=.preview.test"), "session cookie must reach the target: {raw}");
+
+    // The access check gated on the TARGET's repo (acme/web), never the apex's.
+    let seen = stub.seen();
+    assert!(seen.requests.iter().any(|r| r == "GET /repos/acme/web"), "must check the target repo");
+    assert!(
+        !seen.requests.iter().any(|r| r == "GET /repos/acme/noread"),
+        "must NOT check the apex's repo"
+    );
+    drop(seen);
+
+    // 5. The minted session's `site` is the TARGET, and — end to end through the
+    //    real verifier — it verifies on the target but is rejected on any other
+    //    preview and on the apex (#396). This is what makes the shared,
+    //    domain-scoped cookie safe: it travels fleet-wide, its authority does not.
+    let session = session_value(&resp);
+    let token = session.strip_prefix("ephpm_session=").expect("prefix");
+    let policy =
+        Hs256Policy::from_config(&serde_json::json!({ "secret": SESSION_SECRET })).expect("policy");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    assert!(policy.verify(token, now, Some(VHOST)).is_some(), "verifies on its target preview");
+    assert!(
+        policy.verify(token, now, Some("pr-2.preview.test")).is_none(),
+        "a domain-scoped session for pr-1 must be rejected on pr-2"
+    );
+    assert!(
+        policy.verify(token, now, Some(APEX)).is_none(),
+        "and it is not a session for the apex"
+    );
 }
 
 /// Minimal unpadded base64url decoder for asserting on the issued payload.

@@ -152,10 +152,11 @@ it is a secret in git.
 | `sites` | unset | table mapping each vhost to its own `{ repo \| org \| team }` |
 | `login_path` | `/_ephpm/auth/github/login` | reserved: starts a login. The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so this default is reachable; keep custom values under `/_ephpm/auth/` |
 | `callback_path` | `/_ephpm/auth/github/callback` | reserved: receives GitHub's redirect. Register `https://<host>/_ephpm/auth/github/callback` as the GitHub OAuth App's Authorization callback URL |
-| `redirect_uri` | derived | full callback URL sent to GitHub. Defaults to `https://<vhost><callback_path>` |
+| `redirect_uri` | derived | full callback URL sent to GitHub. Defaults to `https://<vhost><callback_path>`. **Set it to a fixed apex** for the wildcard-fleet flow (one App, one callback host) — see below |
 | `cookie_name` | `ephpm_session` | session cookie. Must match the verifier's |
 | `state_cookie_name` | `<cookie_name>_oauth` | short-lived OAuth `state` cookie |
 | `cookie_path` | `/` | `Path` attribute on both cookies |
+| `cookie_domain` | unset (host-only) | `Domain` on both cookies. Set to `.preview.<domain>` **only** for the wildcard-fleet apex flow, so a session minted at the apex reaches the target subdomain. Safe fleet-wide because the verifier honours the `site` binding (#396) — the cookie travels the fleet, its authority does not. Leave unset for a single host |
 | `cookie_secure` | `true` | emit `Secure`. Turn off only for a plaintext local preview |
 | `cookie_samesite` | `"Lax"` | `Lax`, `Strict` or `None` (`None` requires `cookie_secure`) |
 | `session_ttl_secs` | `28800` (8 h) | 60 – 604800 |
@@ -169,6 +170,31 @@ it is a secret in git.
 | `github_base` | `https://github.com` | authorize/token host (a GHES host works) |
 | `github_api_base` | `https://api.github.com` | REST base (`https://ghes/api/v3`) |
 | `http_timeout_secs` | `10` | 1 – 60, per outbound call |
+
+### One OAuth App for a `*.preview` wildcard fleet
+
+A GitHub OAuth App permits exactly **one** callback host — not a wildcard — so a
+`*.preview.<domain>` fleet cannot register one App per preview. Instead, funnel
+every callback through a fixed **apex** host and let the module carry the target
+preview in the signed OAuth `state`. Mount the issuer on the apex vhost with:
+
+```toml
+config = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
+           session_secret = "env:EPHPM_SESSION_SECRET",
+           redirect_uri  = "https://preview.example.com/_ephpm/auth/github/callback",
+           cookie_domain = ".preview.example.com",
+           sites = { "pr-1.preview.example.com" = { repo = "acme/web" } } }
+```
+
+Register **`https://preview.example.com/_ephpm/auth/github/callback`** as the
+App's Authorization callback URL. Login runs on the target subdomain; the
+callback lands on the apex, reads the signed `state`, runs the **target's** authz
+check, mints a session whose `site` claim is the **target**, sets it
+`Domain=.preview.example.com`, and redirects back to the target. The domain-wide
+cookie is safe because the verifier accepts a session only on the preview its
+`site` claim names (#396) — so `require_site` must stay on. The full flow, the
+open-redirect guard, and the definitive operator values are on the
+[Preview Access Gate roadmap page](/roadmap/preview-access-gate/#one-github-oauth-app-for-the-whole-preview-fleet-the-apex-flow).
 
 `github_base` / `github_api_base` must be `https://`, with one exception:
 `http://` is accepted for a **loopback** host, which is what lets the test

@@ -37,11 +37,35 @@ route. Register this as the GitHub OAuth App's **Authorization callback URL**:
 https://<host>/_ephpm/auth/github/callback
 ```
 
-For a wildcard preview fleet, register
-`https://*.preview.<domain>/_ephpm/auth/github/callback` (or the specific hosts
-the App allows). Keep `login_path`/`callback_path` under `/_ephpm/auth/` — a
-non-`/_ephpm/` value leaves the carve-out and would need to avoid the app's own
-routes.
+Keep `login_path`/`callback_path` under `/_ephpm/auth/` — a non-`/_ephpm/` value
+leaves the carve-out and would need to avoid the app's own routes.
+
+### One App across a `*.preview` wildcard fleet (the apex flow)
+
+A GitHub OAuth App allows exactly **one** callback host — **not** a wildcard. So
+a preview fleet does **not** register `*.preview.<domain>`; it funnels every
+callback through one fixed **apex** host and carries the target preview in the
+signed OAuth `state`. The issuer is a single global `[[middleware]]` mount (it
+runs on every vhost — login starts on the target subdomain, the callback lands
+on the apex, same mount). Configure it with:
+
+```toml
+config = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
+           session_secret = "env:EPHPM_SESSION_SECRET",
+           # apex flow: one fixed callback + a fleet-wide cookie
+           redirect_uri  = "https://preview.example.com/_ephpm/auth/github/callback",
+           cookie_domain = ".preview.example.com",
+           sites = { "pr-1.preview.example.com" = { repo = "acme/web" } } }
+```
+
+Register **`https://preview.example.com/_ephpm/auth/github/callback`** (the apex)
+as the App's Authorization callback URL. Login runs on the target subdomain; the
+callback lands on the apex, reads the signed `state`, runs the **target's** authz
+check, mints a session whose `site` claim is the **target**, sets it with
+`Domain=.preview.example.com`, and `302`s back to the target. A domain-wide
+cookie is safe here only because the session verifier honours the `site` binding
+(#396): the cookie travels the fleet, but verifies on exactly one preview. See
+`cookie.rs` for the full argument.
 
 ## Three things to know before reading the code
 

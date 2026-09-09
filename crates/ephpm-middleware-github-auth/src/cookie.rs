@@ -25,11 +25,22 @@
 //! * **`Max-Age`** — a real expiry, matching the `exp` inside the signed
 //!   token. The signature is what actually enforces it; `Max-Age` just stops
 //!   the browser from keeping a corpse around.
-//! * **no `Domain`** — deliberately absent, which makes the cookie
-//!   **host-only**. Adding `Domain=.preview.example.com` would send one
-//!   tenant's session to every other tenant on the wildcard, and in this
-//!   product the tenants are different customers' code. Host-only is the
-//!   isolation boundary, and it is not configurable for that reason.
+//! * **`Domain`** — **absent by default** (host-only), and configurable to a
+//!   fleet apex (`cookie_domain = ".preview.example.com"`) only for the
+//!   single-OAuth-App wildcard flow. A GitHub OAuth App permits exactly one
+//!   callback host, so a `*.preview` fleet must funnel every callback through
+//!   one apex vhost; the session it mints there has to reach the target
+//!   subdomain, which needs a domain-scoped cookie.
+//!
+//!   This *was* declared "not configurable — host-only is the isolation
+//!   boundary", and for a naive design it would be: a domain-wide cookie is
+//!   sent to every tenant on the wildcard. What makes it safe here is the
+//!   per-tenant **`site` claim binding** (issue #396): the session verifier
+//!   (`session-cookie` / `preview-gate`) accepts a token only on the vhost its
+//!   `site` claim names, so a domain-scoped session minted for `pr-1` is inert
+//!   on `pr-2` even though the browser sends it there. The cookie travels
+//!   fleet-wide; the *authority* does not. Leave `cookie_domain` unset for a
+//!   single-host deployment — host-only stays the default.
 
 use std::fmt::Write as _;
 
@@ -79,6 +90,12 @@ pub struct CookieAttrs {
     pub secure: bool,
     /// `SameSite` attribute.
     pub same_site: SameSite,
+    /// `Domain` attribute, when set — makes the cookie fleet-wide instead of
+    /// host-only, for the single-OAuth-App apex flow. `None` = host-only (the
+    /// default and the isolation-safe choice for a single-host deployment). See
+    /// the module docs for why a domain-scoped cookie is safe here (the `site`
+    /// claim binding, issue #396).
+    pub domain: Option<String>,
 }
 
 /// Build a `Set-Cookie` value.
@@ -91,6 +108,11 @@ pub fn set_cookie(name: &str, value: &str, max_age: i64, attrs: &CookieAttrs) ->
     // `name` and `value` are validated at init / produced by this crate, so
     // neither can contain a `;` or a control character.
     let _ = write!(out, "{name}={value}; Path={}; Max-Age={max_age}", attrs.path);
+    if let Some(domain) = &attrs.domain {
+        // Validated at init (`validate_cookie_domain`), so it cannot carry a
+        // `;` or a control character that would break out of the attribute.
+        let _ = write!(out, "; Domain={domain}");
+    }
     if max_age == 0 {
         out.push_str("; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
     }
@@ -138,12 +160,53 @@ pub fn validate_cookie_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a `cookie_domain` value for use in a `Set-Cookie` `Domain`
+/// attribute.
+///
+/// A leading dot is permitted (the conventional `.preview.example.com`
+/// spelling) and normalised away by the caller for comparisons. The value is
+/// interpolated into a header, so it must be a plain DNS name — ASCII letters,
+/// digits, `-` and `.`, at least one dot, no `..`, no leading/trailing dot on
+/// the *label* portion.
+///
+/// # Errors
+///
+/// Returns a message when the value is empty or contains anything outside the
+/// host character set.
+pub fn validate_cookie_domain(domain: &str) -> Result<(), String> {
+    let bare = domain.strip_prefix('.').unwrap_or(domain);
+    let ok = !bare.is_empty()
+        && bare.len() <= 253
+        && bare.contains('.')
+        && !bare.starts_with('.')
+        && !bare.ends_with('.')
+        && !bare.contains("..")
+        && bare.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "`cookie_domain` must be a DNS name like `.preview.example.com`, got {domain:?}"
+        ))
+    }
+}
+
+/// Whether `host` is within cookie `domain` — the open-redirect / same-fleet
+/// guard for the apex flow. `domain` may carry a leading dot; comparison is on
+/// the bare form. A host equal to the domain, or ending in `.<domain>`, is in.
+#[must_use]
+pub fn host_in_domain(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let bare = domain.strip_prefix('.').unwrap_or(domain).to_ascii_lowercase();
+    host == bare || host.ends_with(&format!(".{bare}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn attrs() -> CookieAttrs {
-        CookieAttrs { path: "/".into(), secure: true, same_site: SameSite::Lax }
+        CookieAttrs { path: "/".into(), secure: true, same_site: SameSite::Lax, domain: None }
     }
 
     #[test]
@@ -153,8 +216,45 @@ mod tests {
             c,
             "ephpm_session=abc.def.ghi; Path=/; Max-Age=28800; HttpOnly; Secure; SameSite=Lax"
         );
-        // The isolation-critical negative: never a Domain attribute.
-        assert!(!c.contains("Domain"), "cookies must stay host-only");
+        // Host-only by default: no Domain unless one is configured.
+        assert!(!c.contains("Domain"), "cookies stay host-only unless cookie_domain is set");
+    }
+
+    #[test]
+    fn a_configured_domain_makes_the_cookie_fleet_wide() {
+        let a = CookieAttrs { domain: Some(".preview.example.com".into()), ..attrs() };
+        let c = set_cookie("ephpm_session", "abc.def.ghi", 28_800, &a);
+        assert!(
+            c.contains("; Domain=.preview.example.com"),
+            "a configured cookie_domain must appear in Set-Cookie: {c}"
+        );
+        // Still carries the isolation-critical attributes.
+        assert!(c.contains("HttpOnly") && c.contains("Secure") && c.contains("SameSite=Lax"));
+    }
+
+    #[test]
+    fn cookie_domain_validation() {
+        for ok in [".preview.example.com", "preview.example.com", "a.b.c", ".ephpm.dev"] {
+            assert!(validate_cookie_domain(ok).is_ok(), "{ok:?} must be accepted");
+        }
+        for bad in
+            ["", ".", "no-dot", "has space.com", "a..b.com", "trailing.com.", "caf\u{e9}.com"]
+        {
+            assert!(validate_cookie_domain(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn host_in_domain_is_the_same_fleet_guard() {
+        assert!(host_in_domain("pr-1.preview.example.com", ".preview.example.com"));
+        assert!(host_in_domain("pr-1.preview.example.com", "preview.example.com"));
+        assert!(host_in_domain("preview.example.com", ".preview.example.com"), "apex itself is in");
+        // Case- and trailing-dot-insensitive.
+        assert!(host_in_domain("PR-1.Preview.Example.com.", ".preview.example.com"));
+        // Not in: a different domain, or a suffix-only string match.
+        assert!(!host_in_domain("pr-1.preview.evil.com", ".preview.example.com"));
+        assert!(!host_in_domain("evilpreview.example.com", ".preview.example.com"));
+        assert!(!host_in_domain("preview.example.com.attacker.com", ".preview.example.com"));
     }
 
     #[test]

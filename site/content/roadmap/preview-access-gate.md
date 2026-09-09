@@ -139,9 +139,13 @@ chain (`AUTH_NAMESPACE_PREFIX` / `Router::handle_auth_namespace`), specifically
 so a mounted `github-auth` issuer can serve its login and callback there. So the
 issuer's defaults work unchanged:
 
-- **Login:** `https://<preview-host>/_ephpm/auth/github/login`
-- **Callback (the URL to register in the GitHub OAuth App):**
-  `https://<preview-host>/_ephpm/auth/github/callback`
+- **Login:** `https://<host>/_ephpm/auth/github/login`
+- **Callback:** `https://<host>/_ephpm/auth/github/callback`
+
+For a single-host deployment `<host>` is that host. For a **wildcard fleet**
+`<host>` is the **fixed apex** (a GitHub OAuth App allows one callback host, not
+a wildcard) — see "One GitHub OAuth App for the whole fleet" below for the
+definitive callback URL and the two apex-flow config knobs.
 
 Everything else under `/_ephpm/` (and the bare `/_ephpm`) still 404s, and the
 carve-out never reaches the application: with no auth module mounted a
@@ -151,6 +155,60 @@ answer an unauthenticated visitor), so no `exempt_paths` entry is needed for the
 default paths. Keep the issuer's `login_path`/`callback_path` under
 `/_ephpm/auth/` — a non-`/_ephpm/` path would leave the reserved namespace and
 risk colliding with an app route.
+
+## One GitHub OAuth App for the whole `*.preview` fleet (the apex flow)
+
+A GitHub OAuth App allows exactly **one** Authorization callback host — no
+wildcard subdomains. A preview fleet has a new `<pr>.preview.<domain>` host per
+PR, so deriving `redirect_uri` per vhost would need one App per preview, which
+is unworkable. `github-auth` instead funnels every callback through **one fixed
+apex vhost** and carries the target in the signed OAuth `state`:
+
+1. **Fixed apex callback.** Set `redirect_uri` explicitly to one apex URL. Every
+   preview's login sends GitHub that same URL, so one App covers the fleet.
+2. **`state` carries the target.** Login runs on the target subdomain; the
+   signed `state` records the **target vhost** (`v`) and the return path (`rt`),
+   with a nonce bound to the `state` cookie (CSRF). The `state` cookie is set
+   **domain-scoped** (`cookie_domain`) so it survives the browser's trip to the
+   apex.
+3. **The apex mints for the target.** The callback lands on the apex, reads the
+   `state`, and uses the **target** from it — not its own (apex) vhost — for the
+   repo/org/team authz check (`check_for(<target>)`) and for the session's
+   `site` claim. (`Router::handle_auth_namespace` routes the apex's
+   `/_ephpm/auth/github/callback` to the chain; `github-auth`'s
+   `handle_callback` does the target-from-state minting.)
+4. **Domain-scoped cookie + cross-host redirect.** The session cookie is set
+   with `Domain=.preview.<domain>` so it reaches the target subdomain, and the
+   callback `302`s to `https://<target><return-path>`.
+5. **Why it is safe.** A domain-wide cookie is normally cross-tenant replay —
+   but the token's `site` binding plus the #396 verifier fix mean the session
+   **verifies only on the preview its `site` claim names**. The cookie travels
+   fleet-wide; its authority does not. This is exactly why `require_site` must
+   stay on — do not weaken it. An open-redirect guard confirms the state's
+   target host is within the configured `cookie_domain` before any cross-host
+   redirect or domain-scoped cookie is emitted (a target outside the fleet is
+   refused, before any GitHub call). Verified end to end in
+   `github-auth`'s `apex_flow_one_app_serves_the_whole_wildcard_fleet` (the
+   minted session verifies on the target and is rejected on another preview and
+   on the apex, through the real `Hs256Policy`).
+
+### Definitive operator values
+
+For a fleet at `*.preview.ephpm.dev` with the apex vhost `preview.ephpm.dev`:
+
+| Setting | Value | Where |
+|---|---|---|
+| **GitHub OAuth App → Authorization callback URL** | `https://preview.ephpm.dev/_ephpm/auth/github/callback` | one-time, in the GitHub App (the **single** allowed callback host) |
+| `github-auth` `redirect_uri` | `https://preview.ephpm.dev/_ephpm/auth/github/callback` | one-time, the global `[[middleware]]` mount |
+| `github-auth` `cookie_domain` | `.preview.ephpm.dev` | one-time (issuer mount only — the issuer sets the session cookie; the per-site gate only verifies it) |
+| `[preview_auth] login_url` | `/_ephpm/auth/github/login` | per-preview override |
+| Session secret | one `env:EPHPM_PREVIEW_SESSION_SECRET` reference | one-time (env) + referenced everywhere |
+
+`github-auth` is a single global `[[middleware]]` mount — it runs on every
+vhost, so the login it starts on `pr-1.preview.ephpm.dev` and the callback it
+handles on the apex are the same mount. The apex (`preview.ephpm.dev`) must
+itself be a served vhost (it is where callbacks land). Substitute your own domain
+throughout.
 
 ## Shipped: temporary shareable URLs (verification + revocation)
 
@@ -245,16 +303,24 @@ build against this, not against the ePHPm internals.
 
 **One-time, per fleet (operator config, not per preview):**
 
-1. Register one GitHub App and mount the `github-auth` **issuer** globally in
-   `ephpm.toml` (`[[middleware]] library = "github-auth"`), with its
-   `client_id`/`client_secret`, the per-repo/org access target (its own `sites`
-   map or `default_check`), and `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`.
-   Keep its `login_path`/`callback_path` at the defaults under `/_ephpm/auth/`
-   (the router routes that sub-namespace to the chain). The GitHub OAuth App's
-   **Authorization callback URL** is then
-   `https://<preview-host>/_ephpm/auth/github/callback` — for a wildcard preview
-   fleet, register `https://*.preview.<domain>/_ephpm/auth/github/callback` (or
-   the specific hosts your App allows).
+1. Register **one** GitHub OAuth App for the fleet and mount the `github-auth`
+   **issuer** globally in `ephpm.toml` (`[[middleware]] library = "github-auth"`
+   — one process config, so it runs on every vhost: login fires on the target
+   subdomain, the callback on the apex, from the same mount), with its
+   `client_id`/`client_secret`,
+   the per-repo/org access target (its own `sites` map or `default_check`), and
+   `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`. **For the wildcard
+   fleet, also set the two apex-flow knobs** (see "One GitHub OAuth App for the
+   whole fleet" above):
+   - `redirect_uri = "https://preview.<domain>/_ephpm/auth/github/callback"` — the
+     one fixed callback; a GitHub OAuth App allows a single callback host, **not**
+     a wildcard, so register exactly this URL in the App.
+   - `cookie_domain = ".preview.<domain>"` — so the session and state cookies
+     reach every subdomain.
+
+   Keep `login_path`/`callback_path` at the defaults under `/_ephpm/auth/` (the
+   router routes that sub-namespace to the chain). The apex host itself must be a
+   served vhost.
 2. Set `EPHPM_PREVIEW_SESSION_SECRET` in the ePHPm process environment (≥ 32
    bytes). This is the one source of truth for the HS256 key; the issuer and
    every preview's gate reference it, never a literal.

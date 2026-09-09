@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cookie::{CookieAttrs, SameSite, validate_cookie_name};
+use crate::cookie::{CookieAttrs, SameSite, validate_cookie_domain, validate_cookie_name};
 
 /// Default reserved path that receives GitHub's OAuth redirect.
 pub const DEFAULT_CALLBACK_PATH: &str = "/_ephpm/auth/github/callback";
@@ -419,6 +419,15 @@ impl Config {
         if same_site == SameSite::None && !secure {
             return Err("`cookie_samesite = \"None\"` requires `cookie_secure = true`".into());
         }
+        // `cookie_domain` makes the session + state cookies fleet-wide, for the
+        // single-OAuth-App apex flow (one callback host serving `*.preview`).
+        // Unset = host-only (the isolation-safe default). Safe fleet-wide only
+        // because of the per-tenant `site` claim binding — see the `cookie`
+        // module docs and issue #396.
+        let cookie_domain = opt_str(config, "cookie_domain")?;
+        if let Some(domain) = &cookie_domain {
+            validate_cookie_domain(domain)?;
+        }
 
         let session_ttl_secs = opt_u64(config, "session_ttl_secs", DEFAULT_SESSION_TTL)?;
         if !(60..=7 * 24 * 60 * 60).contains(&session_ttl_secs) {
@@ -504,7 +513,12 @@ impl Config {
             callback_path,
             cookie_name,
             state_cookie_name,
-            cookie_attrs: CookieAttrs { path: cookie_path, secure, same_site },
+            cookie_attrs: CookieAttrs {
+                path: cookie_path,
+                secure,
+                same_site,
+                domain: cookie_domain,
+            },
             session_ttl_secs,
             issuer: opt_str(config, "issuer")?.unwrap_or_else(|| DEFAULT_ISSUER.to_owned()),
             audience: opt_str(config, "audience")?,
