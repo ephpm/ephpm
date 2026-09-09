@@ -46,11 +46,24 @@ use tempfile::TempDir;
 const PDO_SCRIPT: &str = r#"<?php
 header('Content-Type: application/json');
 
-$host = getenv('DB_HOST') ?: '127.0.0.1';
-$port = getenv('DB_PORT') ?: '3306';
-$name = getenv('DB_NAME') ?: 'test';
-$user = getenv('DB_USER') ?: 'root';
-$pass = getenv('DB_PASSWORD') ?: '';
+// ePHPm injects DB_HOST/DB_PORT/... as $_SERVER entries (the SAPI registers
+// them as server variables), NOT into the process environment — so `getenv()`
+// does NOT see them and would fall back to 3306, where nothing listens (the
+// proxy binds a random loopback port). Read $_SERVER first; getenv/defaults
+// are only a fallback for running this script off ePHPm.
+function db_var($key, $default) {
+    if (isset($_SERVER[$key]) && $_SERVER[$key] !== '') {
+        return $_SERVER[$key];
+    }
+    $v = getenv($key);
+    return ($v !== false && $v !== '') ? $v : $default;
+}
+
+$host = db_var('DB_HOST', '127.0.0.1');
+$port = db_var('DB_PORT', '3306');
+$name = db_var('DB_NAME', 'test');
+$user = db_var('DB_USER', 'root');
+$pass = db_var('DB_PASSWORD', '');
 $action = $_GET['action'] ?? 'roundtrip';
 
 try {
@@ -180,11 +193,23 @@ async fn pdo_mysql_proxy_write_read_roundtrip() {
         .await
         .expect("start ephpm with a [db.mysql] proxy");
 
-    let resp = reqwest::get(format!("{}/pdo_mysql_test.php?action=roundtrip", fixture.base_url()))
-        .await
-        .expect("GET roundtrip");
-    let status = resp.status();
-    let body = resp.text().await.expect("read body");
+    // The proxy's listener binds immediately, but it *drains* (accepts then
+    // closes) connections until its backend pool has seeded — a brief window
+    // after the HTTP health endpoint already reports 200. A request that lands
+    // in it fails with a connection error, so poll the (idempotent — it
+    // DROP/CREATEs its own table) round-trip until the proxy is fully up.
+    let roundtrip_url = format!("{}/pdo_mysql_test.php?action=roundtrip", fixture.base_url());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (status, body) = loop {
+        let resp = reqwest::get(&roundtrip_url).await.expect("GET roundtrip");
+        let status = resp.status();
+        let body = resp.text().await.expect("read body");
+        if status == 200 || std::time::Instant::now() >= deadline {
+            break (status, body);
+        }
+        eprintln!("roundtrip not ready yet (HTTP {status}); retrying: {body}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
 
     assert_eq!(status, 200, "roundtrip should return 200, got {status}: {body}");
 
