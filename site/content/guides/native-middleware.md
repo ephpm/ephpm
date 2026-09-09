@@ -463,6 +463,54 @@ via `site_param`, and sets it as a `Secure; HttpOnly` cookie on the site's
 domain. There is no revocation: `exp` (kept short) is the only thing that ends
 a session early; rotating `secret` invalidates all sessions at once.
 
+### `preview-gate`
+
+The per-preview **access gate**: it verifies a GitHub-OAuth session cookie
+**and** accepts a time-limited, revocable **shareable-URL capability token**, at
+one enforcement point, fail-closed. It is the request-phase enforcer of the
+[Preview Access Gate](/roadmap/preview-access-gate/) (issue #487) and shares its
+verification core (`Hs256Policy`) with [`jwt`](#jwt) and `session-cookie` — there
+is deliberately **no second verifier**. In a preview fleet it is not mounted
+through `[[middleware]]`; it is activated per-vhost by the
+[`[preview_auth]`](/guides/virtual-hosts/#preview_auth-the-access-gate) override
+section, which ePHPm turns into a `preview-gate` instance and runs on **both**
+the static-file and PHP paths, ahead of serving.
+
+A request is admitted by **either** credential, both bound to this preview by a
+`site` claim (`vhost_id()`): an **OAuth session cookie** minted by the
+`github-auth` issuer, or a **share token** (`via:"share"`) presented as the
+cookie or as `?ephpm_share=<token>` (which the gate verifies, plants as the
+cookie, and strips from a `303` to the clean URL). Anything else redirects to
+`login_url` (`302`/`303`), so the content — a script *or* a static file — is
+never served to an unauthenticated visitor. Share tokens additionally clear a
+per-`jti` KV deny-list (`preview:share:revoked:<jti>`) and a per-site epoch
+(`preview:share:epoch`, or the static `share_epoch` floor); a plain session pays
+neither check. The reserved `exempt_paths` (the issuer's login/callback
+endpoints) bypass the gate so the OAuth round trip can complete.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `secret` (string) | **required** | HS256 shared secret — the same key the `github-auth` issuer signs sessions with |
+| `login_url` (string) | **required** | `https://`/`http://` URL or same-origin absolute path unauthenticated browsers are redirected to |
+| `cookie` (string) | `"ephpm_session"` | session cookie name (must match the issuer's `cookie_name`) |
+| `exempt_paths` (array) | `[]` | request paths that bypass the gate (the issuer's login/callback) |
+| `share_param` (string) | `"ephpm_share"` | query parameter carrying a share capability token |
+| `share_epoch` (integer) | `0` | static revoke-all floor: a share token with `iat` below this is refused |
+| `share_revocation` (bool) | `true` | consult the per-`jti` deny-list and per-site epoch for share tokens |
+| `return_to_param` / `site_param` (string) | unset | query parameters added to `login_url`, as in `session-cookie` |
+| `issuer` / `audience` (string) | unset | required `iss` / `aud` claim |
+| `require_https` (bool) | `true` | refuse a credential over cleartext (loopback exempt) |
+| `require_site` (bool) | `true` | require the token's `site` claim to equal this vhost (issue #396) |
+
+**Share links are a bearer capability** — anyone with the link is in until it
+expires or is revoked. That is weaker than the OAuth gate, on purpose (sharing
+with people who cannot authenticate); ePHPm bounds the blast radius (per-preview
+`site` binding, short `exp`, `jti` deny-list, per-site epoch) but cannot stop the
+holder forwarding it within its lifetime. Minting is the control plane's job —
+ePHPm ships the reference minter (`preview_gate::mint_share_token`) but no mint
+endpoint. See the [roadmap page](/roadmap/preview-access-gate/) for the full
+threat model and the switchboard contract.
+
 ### `ratelimit`
 
 Fixed-window per-client rate limiting backed by the embedded KV store.

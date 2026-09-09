@@ -56,14 +56,18 @@ use ephpm_middleware::{Middleware, Request, Response};
 use crate::hs256::{Hs256Policy, now_unix, opt_bool, opt_str};
 
 /// Default cookie name when the mount does not set one.
-const DEFAULT_COOKIE: &str = "ephpm_session";
+///
+/// `pub(crate)` so [`crate::preview_gate`] — which layers shareable-URL
+/// capability tokens over the same session-cookie verification — reuses the
+/// one default rather than growing a second, drifting copy.
+pub(crate) const DEFAULT_COOKIE: &str = "ephpm_session";
 
 /// Longest return-to target (path + query) we are willing to hand to the
 /// login service. Anything longer is dropped — the user still reaches the
 /// login page, just without a return-to. Well under the ~8 KB request-line
 /// limit typical proxies enforce, so the redirect can never build a URL the
 /// next hop refuses.
-const MAX_RETURN_TO: usize = 2048;
+pub(crate) const MAX_RETURN_TO: usize = 2048;
 
 /// Session-cookie gate policy, built once at `init`.
 pub struct SessionCookie {
@@ -253,7 +257,7 @@ impl Middleware for SessionCookie {
 ///
 /// A matched pair of surrounding double quotes is stripped (RFC 6265's
 /// `cookie-value` production permits them).
-fn cookie_values<'a>(header: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> {
+pub(crate) fn cookie_values<'a>(header: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> {
     header.split(';').filter_map(move |pair| {
         let (raw_name, raw_value) = pair.split_once('=')?;
         if raw_name.trim_matches([' ', '\t']) != name {
@@ -292,7 +296,7 @@ fn cookie_values<'a>(header: &'a str, name: &'a str) -> impl Iterator<Item = &'a
 /// slashes (`/%2F%2Fevil.example`) survive validation and are harmless: they
 /// stay a single-segment path when resolved, and a browser does not decode
 /// `%2F` before deciding a URL's origin.
-fn same_origin_return_to(path: &str, query: &str) -> Option<String> {
+pub(crate) fn same_origin_return_to(path: &str, query: &str) -> Option<String> {
     if !path.starts_with('/') || path.starts_with("//") || path.starts_with("/\\") {
         return None;
     }
@@ -313,7 +317,7 @@ fn same_origin_return_to(path: &str, query: &str) -> Option<String> {
 /// `=` and `#` included. Over-encoding is the point: whatever the login
 /// service's URL parser does, a value produced here cannot introduce a
 /// parameter, a fragment, or a second URL.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -334,7 +338,7 @@ fn percent_encode(value: &str) -> String {
 /// is loopback only for a client genuinely on this machine (or one a trusted
 /// proxy reported as such). An unparseable value is treated as not loopback —
 /// the fail-closed direction.
-fn is_loopback(remote_ip: &str) -> bool {
+pub(crate) fn is_loopback(remote_ip: &str) -> bool {
     remote_ip.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 

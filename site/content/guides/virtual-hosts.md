@@ -63,7 +63,7 @@ site_overrides_dir = "/var/lib/ephpm/site-overrides"   # NOT inside sites_dir
 document_root = "public"    # relative to the site container
 ```
 
-The file understands exactly two keys — `document_root` here, and [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
+The file understands `document_root` here, [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below, and the [`[preview_auth]`](#preview_auth-the-access-gate) section that turns the preview access gate on for one vhost. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
 
 ```
 /var/www/sites/alice-blog.com/     ← the site CONTAINER
@@ -196,11 +196,33 @@ Adding, changing or removing the key takes effect within the same 2-second windo
 
 **One reporting wrinkle.** After a site's prepend is *withdrawn*, `ini_get('auto_prepend_file')` inside that site can still return the old path for the life of the process, even though nothing is prepended any more. The value PHP executes from is cleared — the string `ini_get` reports lags behind it. It is confined to the site that had the prepend (another vhost reads empty, verified by driving both tenants through a single shared PHP thread), and it affects reporting only. Trust the behaviour, not `ini_get`, and check the boot log to see what is actually in effect.
 
+### `[preview_auth]`: the access gate
+
+A preview at `<label>.preview.example.com` resolves for anyone who knows the hostname. The `[preview_auth]` section turns the [Preview Access Gate](/roadmap/preview-access-gate/) on for one vhost, so an unauthenticated request is redirected to a GitHub-OAuth login and the content — a script **or** a static file — is never served. It is enforced in the request phase on **both** the static and PHP paths, fail-closed.
+
+```toml
+# <site_overrides_dir>/<site-key>.toml   (operator-owned, written by the provisioning daemon)
+document_root = "public"
+
+[preview_auth]
+session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # HS256 key; env:/file:/literal
+login_url      = "/auth/github/login"                 # where unauthenticated browsers go
+exempt_paths   = ["/auth/github/login", "/auth/github/callback"]
+# optional: cookie, issuer, audience, require_https, require_site,
+#           share_param, share_epoch, share_revocation, return_to_param, site_param
+```
+
+- **`session_secret`** is the HS256 key ePHPm verifies sessions with — the *same* key the `github-auth` **issuer** (a global `[[middleware]]` mount) signs them with. Use an `env:NAME` or `file:/abs/path` **reference** so the secret is not a literal in this tenant-derived file and both halves name one source of truth. It must resolve to ≥ 32 bytes.
+- **Only the enforcement half lives here.** The OAuth issuer — and its GitHub App `client_id`/`client_secret` and per-repo access check — stays in the global mount, never in this file. Putting a client secret in a tenant-derived file would defeat the very trust boundary this directory exists for.
+- **Fail-closed.** A missing/short/unresolvable `session_secret`, or a missing `login_url`, takes the one preview **out of service (503)** rather than serving it ungated — the same narrowing rule `document_root` follows. Unknown keys inside the section are tolerated (reported), so a newer provisioning daemon can add one without a fleet outage.
+- **Reachability.** `github-auth`'s default `/_ephpm/…` login/callback paths are unreachable (that namespace is answered before middleware), so point `login_url` at a path **outside** `/_ephpm/` and list the login/callback paths in `exempt_paths`.
+- **Share links.** A `via:"share"` capability token (short `exp`, per-`jti` KV revocation, per-site epoch) admits a stakeholder who lacks repo access, as the cookie or `?ephpm_share=<token>`. It is a **bearer capability** — see the [roadmap page](/roadmap/preview-access-gate/) for the threat model, revocation, and the switchboard contract.
+
 ### Other per-site configuration
 
-Beyond the document root and `auto_prepend_file`, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the site container plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
+Beyond the document root, `auto_prepend_file` and `[preview_auth]`, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the site container plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
 
-**The override file is deliberately not an `ini` channel.** It carries exactly two keys, and an arbitrary INI table is refused rather than unimplemented. In the deployment this mechanism exists for, the operator's daemon derives the file from a manifest committed *inside the tenant's repository* — so every value in it is transitively tenant-influenced. `open_basedir`, `include_path`, `sys_temp_dir`, `upload_tmp_dir`, `session.save_path` and `error_log` are precisely the directives ePHPm derives per vhost to keep tenants apart, and a file that could set them would hand that boundary to the thing it defends against. `auto_prepend_file` is safe under the opposite argument: it can only ever name a file *inside* the tenant's own container.
+**The override file is deliberately not an `ini` channel.** It carries a small set of named, typed keys, and an arbitrary INI table is refused rather than unimplemented. In the deployment this mechanism exists for, the operator's daemon derives the file from a manifest committed *inside the tenant's repository* — so every value in it is transitively tenant-influenced. `open_basedir`, `include_path`, `sys_temp_dir`, `upload_tmp_dir`, `session.save_path` and `error_log` are precisely the directives ePHPm derives per vhost to keep tenants apart, and a file that could set them would hand that boundary to the thing it defends against. `auto_prepend_file` is safe under the opposite argument: it can only ever name a file *inside* the tenant's own container.
 
 So if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop. A bounded set of named, individually-clamped per-site resource knobs may arrive later; a free-form `ini` table will not.
 

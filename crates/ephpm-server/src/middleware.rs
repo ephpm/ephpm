@@ -172,6 +172,9 @@ pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
         "session-cookie" | "ephpm-middleware-session-cookie" => {
             BuiltinModule::init::<ephpm_middleware_builtins::session_cookie::SessionCookie>
         }
+        "preview-gate" | "ephpm-middleware-preview-gate" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::preview_gate::PreviewGate>
+        }
         "api-key" | "ephpm-middleware-api-key" => {
             BuiltinModule::init::<ephpm_middleware_builtins::api_key::ApiKey>
         }
@@ -990,6 +993,7 @@ mod tests {
     const BUILTIN_NAMES: &[&str] = &[
         "jwt",
         "session-cookie",
+        "preview-gate",
         "cors",
         "ratelimit",
         "security-headers",
@@ -1150,6 +1154,10 @@ mod tests {
             "session_cookie",
             "ephpm-middleware-session-cookie",
             "ephpm_middleware_session_cookie",
+            "preview-gate",
+            "preview_gate",
+            "ephpm-middleware-preview-gate",
+            "ephpm_middleware_preview_gate",
             "api-key",
             "api_key",
             "ephpm-middleware-api-key",

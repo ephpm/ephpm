@@ -212,6 +212,16 @@ pub(crate) struct SiteRoots {
     /// Enforced at the single gate in [`Router::handle`], so it covers the
     /// static, PHP and WebSocket paths at once.
     pub(crate) unusable: Option<&'static str>,
+    /// This vhost's preview **access gate**, built when its override declared a
+    /// valid `[preview_auth]` section (issue #487). Invoked in the request phase
+    /// on BOTH the static and PHP paths, ahead of serving, so an unauthenticated
+    /// request to a gated preview is redirected to login (or `403`) and the
+    /// content — a script *or* a file — is never served. Fail-closed.
+    ///
+    /// Built once per [`SITE_CONFIG_TTL`] and shared by `Arc`, so the
+    /// per-request clone of this struct is a refcount bump, not a rebuild.
+    /// `None` for the overwhelming majority of sites (no gate).
+    pub(crate) preview_gate: Option<std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
     /// Keys in this site's override file that ePHPm did not understand, sorted.
     ///
     /// **Diagnostic only** — nothing routes on it. It rides the resolution so
@@ -233,6 +243,7 @@ impl SiteRoots {
             document_root: root,
             auto_prepend_file: None,
             unusable: None,
+            preview_gate: None,
             unknown_keys: Vec::new(),
         }
     }
@@ -936,11 +947,35 @@ fn resolve_site_roots(
     prepend: crate::site_overrides::PrependSupport,
 ) -> SiteRoots {
     let over = crate::site_overrides::load(overrides_dir, site_key, &container, prepend);
+    // Build the per-site access gate from the resolved `[preview_auth]` config.
+    // `site_overrides` already validated the section (secret resolved, min
+    // length, login_url present), so a build failure here is a belt-and-braces
+    // path — and it is fail-closed: the site refuses to serve (503) rather than
+    // serve the preview ungated, exactly as a broken `document_root` does.
+    let (preview_gate, gate_unusable) = match &over.preview_gate {
+        Some(config) => match ephpm_middleware::builtin::BuiltinModule::init::<
+            ephpm_middleware_builtins::preview_gate::PreviewGate,
+        >(config)
+        {
+            Ok(module) => (Some(std::sync::Arc::new(module)), None),
+            Err(err) => {
+                tracing::error!(
+                    site = site_key,
+                    error = %err,
+                    "[preview_auth] resolved but the access gate refused to build — this site \
+                     will REFUSE TO SERVE (503) rather than serve the preview ungated"
+                );
+                (None, Some("preview access gate could not be built"))
+            }
+        },
+        None => (None, None),
+    };
     SiteRoots {
         document_root: over.document_root.unwrap_or_else(|| container.clone()),
         container,
         auto_prepend_file: over.auto_prepend_file,
-        unusable: over.unusable,
+        unusable: over.unusable.or(gate_unusable),
+        preview_gate,
         unknown_keys: over.unknown_keys,
     }
 }
@@ -2762,10 +2797,15 @@ impl Router {
         // is consumed downstream: the static-path request phase (issue #395,
         // security half) and the response phase (the choke point below) both
         // build a `RequestCtx` from this. Only taken when a chain exists.
-        let mw_req_headers: Option<Vec<(String, String)>> = self
-            .middleware_chain
-            .as_ref()
-            .map(|_| extract_headers(req.headers(), &self.ingest_strip_headers));
+        // Taken when a global chain exists OR this site has a per-site access
+        // gate — both build a `RequestCtx` from it on the static path, and the
+        // gate needs the request's `Cookie` (its session/share credential lives
+        // there). Without the per-site condition a gated preview with no
+        // `[[middleware]]` mounted would hand the gate a header-less request and
+        // reject every valid credential.
+        let mw_req_headers: Option<Vec<(String, String)>> = (self.middleware_chain.is_some()
+            || site_roots.preview_gate.is_some())
+        .then(|| extract_headers(req.headers(), &self.ingest_strip_headers));
 
         // WebSocket upgrade. Positioned deliberately:
         //
@@ -2912,6 +2952,7 @@ impl Router {
                         site_key.as_deref(),
                         &host,
                         is_https,
+                        site_roots.preview_gate.as_ref(),
                     ) {
                         StaticGate::Respond(resp) => (resp, "middleware"),
                         StaticGate::Continue(extra_headers) => {
@@ -3329,6 +3370,7 @@ impl Router {
             document_root,
             container: site_container,
             auto_prepend_file,
+            preview_gate,
             // Both diagnostic; `unusable` was already turned into a 503 at the
             // single gate in `handle`, so a request that reaches PHP has an
             // override that was fully honoured.
@@ -3438,6 +3480,34 @@ impl Router {
         // this request ultimately produces (PHP output or an error page). The
         // `request_body` accessor exposes up to `middleware_body_limit` bytes of
         // the buffered body (empty when buffering is off).
+        // Per-site access gate (#487): runs BEFORE the global chain and BEFORE
+        // PHP, fail-closed. It denies an unauthenticated request to a gated
+        // preview (redirect to login / 403) exactly as `static_request_phase`
+        // denies a static asset, so a gated preview's PHP is as unreachable as
+        // its files. Only a `Respond` matters — the gate admits (`Continue`) or
+        // denies (`Respond`); it never rewrites the request.
+        if let Some(gate) = preview_gate.as_ref() {
+            let ctx = ephpm_middleware::host::RequestCtx::new(
+                &method,
+                &path,
+                &query_string,
+                &remote_addr.ip().to_string(),
+                site_key.as_deref().unwrap_or(""),
+                &headers,
+            )
+            .with_scheme(is_https)
+            .with_host(&normalize_host_key(&server_name));
+            let verdict = {
+                let _kv_scope = ephpm_middleware::host::enter_site_kv(
+                    self.middleware_kv_store(site_key.as_deref()),
+                );
+                gate.invoke(&ctx)
+            };
+            if let ephpm_middleware::builtin::Verdict::Respond { status, body, headers } = verdict {
+                return middleware_response(status, body, &headers);
+            }
+        }
+
         let mut mw_response_headers: Vec<(String, String)> = Vec::new();
         if let Some(ref chain) = self.middleware_chain {
             let body_view: &[u8] = prebuffered.as_deref().map_or(&[], |b| {
@@ -4683,10 +4753,13 @@ impl Router {
         site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
+        preview_gate: Option<&std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
     ) -> StaticGate {
-        let Some(chain) = self.middleware_chain.as_ref() else {
+        // Nothing to run: no global chain AND no per-site gate. (The gate is
+        // per-site, so a node with no `[[middleware]]` can still gate a preview.)
+        if self.middleware_chain.is_none() && preview_gate.is_none() {
             return StaticGate::Continue(Vec::new());
-        };
+        }
         // Static requests carry no buffered body, but scheme/host are still
         // authoritative from the connection (a `force_https` gate on static
         // assets needs the real scheme). The vhost identity is the canonical
@@ -4702,8 +4775,26 @@ impl Router {
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
         // Per-vhost KV scope, exactly as on the PHP path (issue #376). This
-        // method is synchronous throughout, so the guard never spans an await.
+        // method is synchronous throughout, so the guard never spans an await —
+        // and it wraps BOTH the gate (whose share-token revocation reads this
+        // vhost's KV) and the global chain.
         let _kv_scope = ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
+
+        // The per-site access gate runs FIRST and fail-closed: a `Respond`
+        // (redirect to login / 403) short-circuits before the file is read, so
+        // an unauthenticated request to a gated preview never leaks a static
+        // asset's bytes off disk (issue #487). The gate only ever CONTINUEs
+        // (admit) or RESPONDs; it does not rewrite.
+        if let Some(gate) = preview_gate
+            && let ephpm_middleware::builtin::Verdict::Respond { status, body, headers } =
+                gate.invoke(&ctx)
+        {
+            return StaticGate::Respond(middleware_response(status, body, &headers));
+        }
+
+        let Some(chain) = self.middleware_chain.as_ref() else {
+            return StaticGate::Continue(Vec::new());
+        };
         match chain.evaluate(&ctx, path) {
             crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                 StaticGate::Respond(middleware_response(status, body, &headers))
@@ -10245,6 +10336,140 @@ echo "post response";
         }
     }
 
+    /// Issue #487, end to end through the real router: a `[preview_auth]`
+    /// override gates a preview on BOTH the static-file path and the PHP path,
+    /// fail-closed, and a credential is bound to its own site.
+    ///
+    /// The **static** assertion is the one the whole design turns on: before
+    /// #395 the request phase never ran on static files, so a preview's
+    /// `wp-content/uploads/*` was world-readable to anyone who guessed the host.
+    /// Here an unauthenticated `GET /secret.png` on a gated site is redirected
+    /// to login and the file's bytes never leave disk. On pre-change code (no
+    /// `preview_gate` wired into `static_request_phase`) the file is served and
+    /// this fails.
+    ///
+    /// The credential used is a share capability token (`mint_share_token`, the
+    /// public reference minter) — a valid site-bound credential that exercises
+    /// the same `Hs256Policy` + `site` binding an OAuth session cookie does. The
+    /// session-vs-share distinction, expiry and revocation are unit-tested in
+    /// `ephpm_middleware_builtins::preview_gate`.
+    #[tokio::test]
+    async fn preview_auth_gates_static_and_php_fail_closed() {
+        use ephpm_middleware_builtins::preview_gate::mint_share_token;
+
+        // 32-byte literal secret (min length). A real deployment uses
+        // `env:`/`file:` so the secret is not in the override file.
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let token =
+            |site: &str| mint_share_token(SECRET.as_bytes(), site, "jti-1", now, now + 3600);
+
+        let f = fleet();
+        // Gated preview: a static asset and a PHP entrypoint.
+        let gated = f.site("pr-1.preview.test", &[]);
+        fs::write(gated.join("secret.png"), b"SENSITIVE-BYTES").unwrap();
+        fs::write(gated.join("index.php"), b"<?php echo 'php-ran';").unwrap();
+        f.override_for(
+            "pr-1.preview.test",
+            &format!(
+                "[preview_auth]\nsession_secret = \"{SECRET}\"\nlogin_url = \"/auth/github/login\"\n"
+            ),
+        );
+        // Ungated preview, same asset name — the control.
+        let open = f.site("open.preview.test", &[]);
+        fs::write(open.join("secret.png"), b"PUBLIC-BYTES").unwrap();
+
+        let router = f.router();
+        // Loopback client so `require_https` (default on) does not itself 403 an
+        // http test — the redirect we assert is the gate's auth verdict.
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let get = |host: &str, uri: &str, cookie: Option<&str>| {
+            let mut b = Request::builder().method("GET").uri(uri).header("host", host);
+            if let Some(c) = cookie {
+                b = b.header("cookie", format!("ephpm_session={c}"));
+            }
+            b.body(Empty::<Bytes>::new()).unwrap()
+        };
+
+        // 1. STATIC, no credential → redirect to login; bytes never served.
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "unauthenticated static must redirect");
+        assert!(resp.headers().get("location").is_some(), "a login redirect target");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"SENSITIVE-BYTES", "the gated file's bytes must never leave disk");
+
+        // 2. PHP, no credential → redirect BEFORE the engine runs (so this holds
+        // even in stub mode: the gate short-circuits ahead of PHP dispatch).
+        let resp =
+            router.handle(get("pr-1.preview.test", "/index.php", None), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "unauthenticated PHP must redirect");
+
+        // 3. STATIC, valid credential for THIS site → served.
+        let tok = token("pr-1.preview.test");
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", Some(&tok)), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a valid credential must be admitted");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"SENSITIVE-BYTES");
+
+        // 4. STATIC, credential minted for ANOTHER preview → rejected (#396
+        // cross-tenant binding, end to end through the router).
+        let wrong = token("some-other-preview");
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", Some(&wrong)), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "a credential for another preview must not open this one"
+        );
+
+        // 5. Ungated preview → served with no credential at all.
+        let resp = router
+            .handle(get("open.preview.test", "/secret.png", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "an ungated site must serve normally");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"PUBLIC-BYTES");
+    }
+
+    /// A broken `[preview_auth]` takes the one preview out of service (503) —
+    /// fail-closed — rather than serving it ungated. Uses an unresolvable
+    /// `env:` secret; the site's static asset must not be served.
+    #[tokio::test]
+    async fn a_broken_preview_auth_returns_503_not_the_content() {
+        let f = fleet();
+        let gated = f.site("pr-2.preview.test", &[]);
+        fs::write(gated.join("secret.png"), b"SENSITIVE-BYTES").unwrap();
+        f.override_for(
+            "pr-2.preview.test",
+            "[preview_auth]\n\
+             session_secret = \"env:EPHPM_TEST_UNSET_GATE_SECRET\"\n\
+             login_url = \"/auth/github/login\"\n",
+        );
+        let router = f.router();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/secret.png")
+            .header("host", "pr-2.preview.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a broken gate must 503");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"SENSITIVE-BYTES");
+    }
+
     /// A site whose override declares `document_root = "web"` serves from it —
     /// and its container is still the vhost directory.
     #[test]
@@ -11906,7 +12131,9 @@ echo "post response";
 
             let addr: SocketAddr = "198.51.100.20:5000".parse().unwrap();
             let gate = |site: Option<&str>| {
-                router.static_request_phase(None, "GET", "/a.css", "", addr, site, "ignored", false)
+                router.static_request_phase(
+                    None, "GET", "/a.css", "", addr, site, "ignored", false, None,
+                )
             };
             assert!(matches!(gate(Some("shop")), StaticGate::Continue(_)));
             assert!(matches!(gate(Some("blog")), StaticGate::Continue(_)));

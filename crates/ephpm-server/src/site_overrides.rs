@@ -102,7 +102,15 @@ use std::path::{Component, Path, PathBuf};
 /// Drives the "did you mean" hint on an unrecognized key, so it must stay in
 /// step with [`RawOverride`]'s fields — pinned by
 /// [`tests::known_keys_matches_the_parsed_schema`].
-const KNOWN_KEYS: &[&str] = &["document_root", "auto_prepend_file"];
+const KNOWN_KEYS: &[&str] = &["document_root", "auto_prepend_file", "preview_auth"];
+
+/// Shortest accepted preview-gate `session_secret`, in bytes.
+///
+/// 32 bytes is the HMAC-SHA256 block-security level and the same floor the
+/// `github-auth` issuer enforces on the key it signs sessions with — the two
+/// must agree, and a short key is what makes offline forgery of a self-contained
+/// token worth attempting.
+const MIN_SESSION_SECRET: usize = 32;
 
 /// Whether this server is able to honour a per-site `auto_prepend_file` at all.
 ///
@@ -121,7 +129,11 @@ pub(crate) enum PrependSupport {
 }
 
 /// The resolved override for one site.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: [`preview_gate`](Self::preview_gate) is a `serde_json::Value`,
+/// which is only `PartialEq` (it can hold a float). `PartialEq` is all the
+/// tests need.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SiteOverride {
     /// The document root the operator declared, already validated as a
     /// contained, existing directory under the site container.
@@ -145,6 +157,21 @@ pub(crate) struct SiteOverride {
     /// `None` under all the same failure modes as `document_root`, plus worker
     /// mode ([`PrependSupport::NoWorkerMode`]).
     pub(crate) auto_prepend_file: Option<PathBuf>,
+    /// A fully-resolved [`crate::preview-gate`](ephpm_middleware_builtins::preview_gate)
+    /// config for this site, as the JSON the builtin's `init` accepts — present
+    /// only when the operator declared a valid `[preview_auth]` section. `None`
+    /// means the site is **not** access-gated (the common case).
+    ///
+    /// The `session_secret` is already resolved to a literal here (following any
+    /// `env:`/`file:` indirection), so the caller can build the gate without
+    /// re-touching the environment or filesystem. It is the operator-owned
+    /// secret, never anything a tenant's PHP can write.
+    ///
+    /// A declared-but-broken `[preview_auth]` never lands here: it sets
+    /// [`unusable`](Self::unusable) instead, because a gate that cannot be built
+    /// must fail **closed** (503) rather than serve the preview ungated — the
+    /// same narrowing-instruction rule `document_root` follows.
+    pub(crate) preview_gate: Option<serde_json::Value>,
     /// Set when the override file **exists but cannot be honoured**: it is
     /// unreadable, it is not valid TOML, or a key this binary implements
     /// carries a value it had to reject. The value is a short, stable reason
@@ -183,6 +210,66 @@ struct RawOverride {
     document_root: Option<String>,
     #[serde(default)]
     auto_prepend_file: Option<String>,
+    #[serde(default)]
+    preview_auth: Option<RawPreviewAuth>,
+    #[serde(flatten)]
+    unknown: toml::Table,
+}
+
+/// The `[preview_auth]` section: it turns the GitHub-OAuth **preview access
+/// gate** on for this one vhost and carries what the request-phase enforcer
+/// needs. Written by the operator/switchboard, never by the tenant.
+///
+/// Only the enforcement half lives here. The OAuth *issuer* (`github-auth`, the
+/// cold-path login/callback round trip that holds the GitHub App's
+/// `client_id`/`client_secret`) stays a normal operator-owned `[[middleware]]`
+/// mount — deliberately **not** in this file, because this file is derived from
+/// a manifest inside the tenant's own repository, and an OAuth client secret is
+/// exactly the kind of value that must not travel a tenant-influenced channel.
+/// The two are coupled by the shared `session_secret` (typically an
+/// `env:NAME` reference both read) and the matching `cookie` name; see the
+/// preview-access-gate roadmap for the switchboard contract.
+#[derive(serde::Deserialize)]
+struct RawPreviewAuth {
+    /// HS256 session secret, or an indirection: `env:NAME` reads that
+    /// environment variable, `file:/abs/path` reads the file (trimmed). The
+    /// indirections keep the literal out of a file switchboard derives from
+    /// tenant input, and let this and the issuer name one source of truth.
+    session_secret: Option<String>,
+    /// Where unauthenticated browsers are redirected — the issuer's login path
+    /// (e.g. `/auth/github/login`). Required. Note the issuer's default
+    /// `/_ephpm/...` paths are unreachable through the router (that namespace is
+    /// reserved and 404s before middleware), so the issuer — and this — must use
+    /// a path outside `/_ephpm/`.
+    login_url: Option<String>,
+    /// Session cookie name (must match the issuer's `cookie_name`).
+    cookie: Option<String>,
+    /// Required `iss` claim.
+    issuer: Option<String>,
+    /// Required `aud` claim.
+    audience: Option<String>,
+    /// Refuse a credential over cleartext (loopback exempt). Defaults on.
+    require_https: Option<bool>,
+    /// Require the token's `site` claim to equal this vhost (issue #396).
+    /// Defaults on; a preview should never turn it off.
+    require_site: Option<bool>,
+    /// Query parameter carrying a shareable-URL capability token.
+    share_param: Option<String>,
+    /// Static revoke-all floor: a share token issued before this unix time is
+    /// refused.
+    share_epoch: Option<u64>,
+    /// Consult the KV deny-list / per-site epoch for share tokens. Defaults on.
+    share_revocation: Option<bool>,
+    /// Query parameter on `login_url` carrying the validated return path.
+    return_to_param: Option<String>,
+    /// Query parameter on `login_url` carrying this vhost's site key.
+    site_param: Option<String>,
+    /// Paths that bypass the gate entirely — the issuer's login/callback
+    /// endpoints, so the OAuth round trip is never redirected back to login.
+    exempt_paths: Option<Vec<String>>,
+    /// Unknown keys inside the section — tolerated (forward-compat with a newer
+    /// switchboard) and surfaced in the file's [`SiteOverride::unknown_keys`]
+    /// report, exactly as unknown top-level keys are.
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -319,6 +406,12 @@ pub(crate) fn load(
     };
 
     let mut unknown_keys: Vec<String> = raw.unknown.keys().cloned().collect();
+    // Unknown keys *inside* `[preview_auth]` are tolerated the same way (a newer
+    // switchboard adds one), reported with a `preview_auth.` prefix so the
+    // operator sees which section they belong to.
+    if let Some(pa) = &raw.preview_auth {
+        unknown_keys.extend(pa.unknown.keys().map(|k| format!("preview_auth.{k}")));
+    }
     unknown_keys.sort_unstable();
 
     let document_root = match raw.document_root.as_deref() {
@@ -361,7 +454,112 @@ pub(crate) fn load(
         None => None,
     };
 
-    SiteOverride { document_root, auto_prepend_file, unknown_keys, unusable: None }
+    // The access gate is a *narrowing* instruction, exactly like `document_root`:
+    // the operator declared `[preview_auth]` to stop serving this preview to
+    // anyone who guessed its hostname. So a section we understood and could not
+    // turn into a working gate must fail **closed** (`unusable` → 503), never
+    // fall back to serving the preview ungated.
+    let preview_gate = match &raw.preview_auth {
+        Some(pa) => match resolve_preview_auth(pa) {
+            Ok(config) => Some(config),
+            Err(reason) => return unusable(reason, &"[preview_auth]"),
+        },
+        None => None,
+    };
+
+    SiteOverride { document_root, auto_prepend_file, preview_gate, unknown_keys, unusable: None }
+}
+
+/// Turn a `[preview_auth]` section into the JSON config the
+/// [`preview-gate`](ephpm_middleware_builtins::preview_gate) builtin accepts,
+/// resolving the session secret indirection.
+///
+/// Every failure is a `&'static str` reason for [`SiteOverride::unusable`]: a
+/// broken gate takes the one preview out of service rather than serving it open.
+fn resolve_preview_auth(pa: &RawPreviewAuth) -> Result<serde_json::Value, &'static str> {
+    let login_url = pa
+        .login_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("[preview_auth] requires `login_url`")?;
+
+    let raw_secret = pa
+        .session_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("[preview_auth] requires `session_secret`")?;
+    let secret = resolve_secret(raw_secret)?;
+    if secret.len() < MIN_SESSION_SECRET {
+        return Err("[preview_auth] `session_secret` resolved to fewer than 32 bytes");
+    }
+
+    // Assemble the builtin's config. Only set keys the operator supplied, so the
+    // builtin applies its own documented defaults for the rest.
+    let mut config = serde_json::Map::new();
+    config.insert("secret".into(), secret.into());
+    config.insert("login_url".into(), login_url.into());
+    let mut set_str = |key: &str, v: &Option<String>| {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            config.insert(key.into(), s.into());
+        }
+    };
+    set_str("cookie", &pa.cookie);
+    set_str("issuer", &pa.issuer);
+    set_str("audience", &pa.audience);
+    set_str("share_param", &pa.share_param);
+    set_str("return_to_param", &pa.return_to_param);
+    set_str("site_param", &pa.site_param);
+    if let Some(b) = pa.require_https {
+        config.insert("require_https".into(), b.into());
+    }
+    if let Some(b) = pa.require_site {
+        config.insert("require_site".into(), b.into());
+    }
+    if let Some(b) = pa.share_revocation {
+        config.insert("share_revocation".into(), b.into());
+    }
+    if let Some(e) = pa.share_epoch {
+        config.insert("share_epoch".into(), e.into());
+    }
+    if let Some(paths) = &pa.exempt_paths {
+        config.insert("exempt_paths".into(), serde_json::Value::from(paths.clone()));
+    }
+    Ok(serde_json::Value::Object(config))
+}
+
+/// Resolve a `session_secret` value, following an `env:NAME` or
+/// `file:/abs/path` indirection. A literal is used as-is (discouraged: the
+/// override file is derived from tenant input, so a reference keeps the secret
+/// out of it). Every failure is a fail-closed `&'static str` reason.
+fn resolve_secret(raw: &str) -> Result<String, &'static str> {
+    if let Some(var) = raw.strip_prefix("env:") {
+        if var.is_empty() {
+            return Err("[preview_auth] `session_secret` is `env:` with no variable name");
+        }
+        let value = std::env::var(var).map_err(
+            |_| "[preview_auth] `session_secret` names an environment variable that is not set",
+        )?;
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err("[preview_auth] `session_secret` environment variable is empty");
+        }
+        Ok(value)
+    } else if let Some(path) = raw.strip_prefix("file:") {
+        if path.is_empty() {
+            return Err("[preview_auth] `session_secret` is `file:` with no path");
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| "[preview_auth] `session_secret` file could not be read")?;
+        let value = text.trim().to_owned();
+        if value.is_empty() {
+            return Err("[preview_auth] `session_secret` file is empty");
+        }
+        Ok(value)
+    } else {
+        Ok(raw.to_owned())
+    }
 }
 
 /// The "did you mean" clause for a set of unrecognized keys, or `None` when no
@@ -1219,9 +1417,16 @@ mod tests {
     #[test]
     fn known_keys_matches_the_parsed_schema() {
         // Each listed key must actually parse into a typed field rather than
-        // landing in the flattened `unknown` table.
+        // landing in the flattened `unknown` table. `preview_auth` is a section
+        // (a TOML table), so it takes table syntax; the scalar keys take a
+        // string. Either way, nothing must fall into `unknown`.
         for key in KNOWN_KEYS {
-            let raw: RawOverride = toml::from_str(&format!("{key} = \"x\"\n")).unwrap();
+            let toml = if *key == "preview_auth" {
+                format!("[{key}]\nsession_secret = \"x\"\n")
+            } else {
+                format!("{key} = \"x\"\n")
+            };
+            let raw: RawOverride = toml::from_str(&toml).unwrap();
             assert!(
                 raw.unknown.is_empty(),
                 "{key} is in KNOWN_KEYS but is not a typed field on RawOverride"
@@ -1230,6 +1435,134 @@ mod tests {
         // And nothing outside the list parses as typed.
         let raw: RawOverride = toml::from_str("some_future_key = \"x\"\n").unwrap();
         assert_eq!(raw.unknown.len(), 1);
+    }
+
+    // ── [preview_auth] — the access gate (issue #487) ─────────────────────
+
+    /// A 32-byte literal secret + a login URL is a valid gate: the section
+    /// resolves to a `preview_gate` config, the site is NOT unusable, and the
+    /// config is one the `preview-gate` builtin actually accepts — the check
+    /// that keeps this from being a silent no-op knob.
+    #[test]
+    fn valid_preview_auth_resolves_to_a_working_gate_config() {
+        let f = fixture();
+        f.write(
+            "[preview_auth]\n\
+             session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             login_url = \"/auth/github/login\"\n\
+             exempt_paths = [\"/auth/github/login\", \"/auth/github/callback\"]\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        let config = over.preview_gate.expect("a valid section must resolve to a gate config");
+        assert_eq!(config["secret"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(config["login_url"], "/auth/github/login");
+        // The produced config must be accepted by the builtin it feeds — if this
+        // fails, site_overrides and the gate have drifted and the knob is inert.
+        use ephpm_middleware::Middleware as _;
+        ephpm_middleware_builtins::preview_gate::PreviewGate::init(&config)
+            .expect("the gate must accept the config site_overrides produced");
+    }
+
+    /// `document_root` and `preview_auth` compose: a preview both narrows its
+    /// web root AND gates access from one file.
+    #[test]
+    fn document_root_and_preview_auth_apply_together() {
+        let f = fixture();
+        f.write(
+            "document_root = \"web\"\n\
+             [preview_auth]\n\
+             session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             login_url = \"/auth/github/login\"\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(over.document_root, Some(resolved(&f.container.join("web"))));
+        assert!(over.preview_gate.is_some());
+    }
+
+    /// A `file:` secret is read and trimmed. This is the recommended form for
+    /// keeping the literal out of the (tenant-derived) override file.
+    #[test]
+    fn preview_auth_reads_a_file_secret() {
+        let f = fixture();
+        let secret_file = f.container.parent().unwrap().join("gate.secret");
+        std::fs::write(&secret_file, "  0123456789abcdef0123456789abcdef\n  ").unwrap();
+        f.write(&format!(
+            "[preview_auth]\n\
+             session_secret = \"file:{}\"\n\
+             login_url = \"/auth/github/login\"\n",
+            secret_file.display().to_string().replace('\\', "\\\\"),
+        ));
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(over.preview_gate.expect("gate")["secret"], "0123456789abcdef0123456789abcdef");
+    }
+
+    /// Every broken `[preview_auth]` fails **closed** — the site refuses to
+    /// serve rather than serve the preview ungated. This is the property the
+    /// whole gate turns on: a half-written or misconfigured gate never opens
+    /// the preview to the internet.
+    #[test]
+    fn a_broken_preview_auth_fails_closed_never_ungated() {
+        for (label, section) in [
+            ("missing secret", "[preview_auth]\nlogin_url = \"/login\"\n"),
+            (
+                "missing login_url",
+                "[preview_auth]\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            ),
+            (
+                "short secret",
+                "[preview_auth]\nsession_secret = \"too-short\"\nlogin_url = \"/login\"\n",
+            ),
+            ("empty secret", "[preview_auth]\nsession_secret = \"\"\nlogin_url = \"/login\"\n"),
+            (
+                "env var unset",
+                "[preview_auth]\nsession_secret = \"env:EPHPM_TEST_DEFINITELY_UNSET_SECRET_VAR\"\nlogin_url = \"/login\"\n",
+            ),
+            (
+                "file unreadable",
+                "[preview_auth]\nsession_secret = \"file:/nonexistent/gate.secret\"\nlogin_url = \"/login\"\n",
+            ),
+        ] {
+            let f = fixture();
+            f.write(section);
+            let over = f.load();
+            assert!(
+                over.unusable.is_some(),
+                "{label}: a broken gate must fail closed (503), not serve ungated"
+            );
+            assert!(over.preview_gate.is_none(), "{label}: no gate config on a broken section");
+        }
+    }
+
+    /// An unknown key *inside* `[preview_auth]` is tolerated (forward-compat
+    /// with a newer switchboard), reported with the section prefix, and does
+    /// NOT take the gate down — the same leniency the file grants unknown
+    /// top-level keys.
+    #[test]
+    fn an_unknown_key_inside_preview_auth_is_tolerated_and_reported() {
+        let f = fixture();
+        f.write(
+            "[preview_auth]\n\
+             session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             login_url = \"/auth/github/login\"\n\
+             a_key_from_a_newer_switchboard = true\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None, "an unimplemented section key must not take the site down");
+        assert!(over.preview_gate.is_some());
+        assert_eq!(
+            over.unknown_keys,
+            vec!["preview_auth.a_key_from_a_newer_switchboard".to_string()]
+        );
+    }
+
+    /// `preview_auth` is a near-miss suggestion target like the scalar keys.
+    #[test]
+    fn preview_auth_typo_is_suggested() {
+        assert_eq!(nearest_known_key("preview_ath"), Some("preview_auth"));
+        assert!(understood_keys().contains("preview_auth"));
     }
 
     #[test]
