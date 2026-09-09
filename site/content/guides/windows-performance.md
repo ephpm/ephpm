@@ -216,6 +216,47 @@ handlers are unusable due to ASLR` — see the
 [config reference](/reference/config/#resource-aware-autotuning) for the
 mechanism.
 
+> **Caveat: don't turn on `opcache.file_cache` on Windows without also
+> pinning `opcache.cache_id`.** ePHPm never sets `opcache.file_cache` itself
+> — the OPcache defaults it emits are all in-memory (SHM). But if you enable
+> it yourself through `[php] ini_overrides`, the per-process `opcache.cache_id`
+> above quietly breaks it. On Windows PHP derives the file cache's
+> subdirectory from `opcache.cache_id` (the cache directory is
+> `<file_cache>\<md5(user ‖ cache_id)>\<system_id>\…`, in
+> `ext/opcache/zend_file_cache.c` and `ZendAccelerator.c`), so a
+> `cache_id` that changes every process — which `ephpm-<pid>` does — gives
+> each ePHPm process its *own* file-cache directory. Two consequences, both
+> permanent because these are on-disk directories (unlike the SHM sections,
+> which the kernel frees when the last handle closes at process exit):
+>
+> 1. **The file cache is cold on every restart.** A new PID means a new
+>    directory, so nothing a previous process compiled is ever reused —
+>    which defeats the entire point of `opcache.file_cache`.
+> 2. **Orphan directories accumulate.** Every restart leaves behind another
+>    `<file_cache>\<md5>\…` tree of compiled scripts that nothing prunes,
+>    so the directory grows without bound across restarts.
+>
+> If you want a persistent, reused file cache on Windows, pin your own stable
+> `opcache.cache_id` alongside `opcache.file_cache` in `ini_overrides`
+> (ePHPm emits its per-pid value *before* `ini_overrides`, so yours wins):
+>
+> ```toml
+> [php]
+> ini_overrides = [
+>   ["opcache.file_cache", "C:/apps/myapp/opcache"],
+>   ["opcache.cache_id", "myapp"],   # stable — reused across restarts
+> ]
+> ```
+>
+> Pinning `cache_id` re-opens the ASLR-collision risk the per-pid value
+> exists to avoid: two *different* ePHPm images (different install paths,
+> hence different ASLR bases) that share one `cache_id` and one
+> `opcache.memory_consumption` will collide, and the second to start dies
+> with `Opcode handlers are unusable due to ASLR`. Keep the `cache_id` unique
+> per image if you run more than one on the same box. (Note: `[server.file_cache]`
+> in `ephpm.toml` is ePHPm's own in-memory static-file cache — unrelated to
+> PHP's `opcache.file_cache`.)
+
 With `validate_timestamps` off, code changes go live via `ephpm deploy` /
 `ephpm cache reset`, which invalidate OPcache through the RESP listener
 (deploys-are-events). Note the coupling: if you disable the RESP listener
