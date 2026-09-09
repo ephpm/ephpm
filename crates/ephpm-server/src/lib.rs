@@ -2283,6 +2283,51 @@ pub(crate) fn is_per_site_clustered(config: &Config, cluster_enabled: bool) -> b
     })
 }
 
+/// The embedded-SQLite mode a loaded [`Config`] selects, classified for the
+/// `ephpm php --site` CLI (issue #471) so it can pick a DB-binding strategy
+/// without duplicating the private mode predicates.
+///
+/// This is the same taxonomy [`sqlite_mode_label`] reports; exposing it as an
+/// enum keeps the CLI's strategy picker in agreement with `serve()` about what
+/// a config means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedSqliteMode {
+    /// No `[db.sqlite]` — there is no embedded database to bind.
+    None,
+    /// One shared, non-clustered database (single-site).
+    SingleNode,
+    /// One shared clustered database.
+    Clustered,
+    /// Per-site single-node: one Turso file per virtual host, not replicated.
+    PerSite,
+    /// Per-site clustered: one replicated Turso database per virtual host.
+    PerSiteClustered,
+}
+
+/// Classify the embedded-SQLite mode of a loaded [`Config`] — see
+/// [`EmbeddedSqliteMode`].
+///
+/// `cluster_enabled` is taken from `[cluster] enabled`, matching how `serve()`
+/// derives it (a cluster handle exists iff clustering is enabled). Ordering
+/// mirrors [`sqlite_mode_label`]: the strictly-more-specific per-site-clustered
+/// case is tested before the single-DB clustered case.
+#[must_use]
+pub fn embedded_sqlite_mode(config: &Config) -> EmbeddedSqliteMode {
+    if config.db.sqlite.is_none() {
+        return EmbeddedSqliteMode::None;
+    }
+    let cluster_enabled = config.cluster.enabled;
+    if is_per_site_clustered(config, cluster_enabled) {
+        EmbeddedSqliteMode::PerSiteClustered
+    } else if config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, cluster_enabled)) {
+        EmbeddedSqliteMode::Clustered
+    } else if is_per_site_sqlite(config, cluster_enabled) {
+        EmbeddedSqliteMode::PerSite
+    } else {
+        EmbeddedSqliteMode::SingleNode
+    }
+}
+
 /// Build the per-site database registry and register it with the PHP bridge,
 /// when per-site mode is active. Returns whether it is active (for the router
 /// flag). The registry itself is kept alive by the resolver `Arc` handed to
@@ -2369,7 +2414,13 @@ fn wire_per_site_db(
     // Mint the per-site MySQL credentials over the SAME registry, so a site's
     // `pdo_mysql` connections and its `ephpm_db_*` bridge queries resolve to
     // one backend instance and one LRU entry — not two handles on one file.
-    let auth = site_wire_auth::SiteWireAuth::new(registry)?;
+    //
+    // When `[kv] secret` is set the credentials derive from it (stable across
+    // restarts), which is what lets a co-located `ephpm php --site` process
+    // authenticate to this listener (issue #471). Without it, a per-process
+    // random secret is used and the CLI wire path is unavailable — see
+    // `SiteWireAuth::with_route_and_secret`.
+    let auth = site_wire_auth::SiteWireAuth::new_with_secret(registry, config.kv.secret.clone())?;
 
     tracing::info!(
         max_open_dbs = sqlite.max_open_dbs,
@@ -2482,8 +2533,9 @@ fn wire_per_site_clustered_db(
     // registry instead (as it did before) made a non-owner's `pdo_mysql` write
     // commit to a local replica that nothing replicates and that is discarded
     // on the next re-bootstrap — silent divergence.
-    let auth = site_wire_auth::SiteWireAuth::with_route(
-        Arc::clone(&resolver) as Arc<dyn site_wire_auth::SiteWireRoute>
+    let auth = site_wire_auth::SiteWireAuth::with_route_and_secret(
+        Arc::clone(&resolver) as Arc<dyn site_wire_auth::SiteWireRoute>,
+        config.kv.secret.clone(),
     )?;
 
     tracing::info!(

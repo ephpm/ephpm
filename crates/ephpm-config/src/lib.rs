@@ -2876,6 +2876,17 @@ pub struct KvConfig {
     /// secret is not required; RESP AUTH is then a no-op unless a
     /// `[kv.redis_compat] password` is set.
     ///
+    /// **Also seeds the per-site MySQL wire-auth secret (#471).** When set, the
+    /// multi-tenant MySQL listener (`site_wire_auth.rs`) derives each vhost's
+    /// `pdo_mysql` password from *this* secret rather than a per-process random
+    /// one, so the per-site credentials are stable across restarts and a
+    /// co-located `ephpm php --site` / `ephpm exec` process can authenticate as
+    /// the site. Trade-off, stated plainly: with this set, **read access to the
+    /// config file grants the ability to impersonate any tenant's database
+    /// connection** (every password is `HMAC-SHA256(secret, site_key)` over a
+    /// public site name). Leave it unset to keep the random-per-restart wire
+    /// credentials — the CLI wire path is then unavailable (it fails closed).
+    ///
     /// Default: `None`.
     #[serde(default)]
     pub secret: Option<String>,

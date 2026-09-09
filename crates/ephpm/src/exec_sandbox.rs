@@ -22,15 +22,27 @@
 //! module carries **no PHP linkage**, so it compiles and is testable in stub
 //! mode with no PHP SDK.
 //!
+//! # Composing with `ephpm php --site` for database access (issue #471)
+//!
+//! `ephpm exec` deliberately does **not** host the `ephpm_db_*` bridge itself —
+//! it `execvp`s a child, so any bridge state set up here would not survive into
+//! that process. Instead the per-site DB binding lives in the child: the
+//! sandboxed way to run a database-touching PHP tool on Linux is to nest the
+//! two subcommands —
+//!
+//! ```text
+//! ephpm exec --site blog -- ephpm php --site blog --config /etc/ephpm/ephpm.toml -- wp db query "..."
+//! ```
+//!
+//! The outer `exec` establishes the Landlock + uid/gid containment; the inner
+//! `php --site` binds the bridge (via [`crate::site_db`]) — to the running
+//! server over the wire when one is up, or by opening the site's file directly
+//! for offline work — and picks the correct strategy for per-site *clustered*
+//! mode (refusing when it cannot reach the owner). See [`crate::site_db`] for
+//! the strategy picker; there is nothing further to wire in this module.
+//!
 //! # TODO — deliberately out of scope for this proof-of-concept
 //!
-//! - `TODO(#471)`: the per-site DB session bind (`db_bridge::set_resolver` +
-//!   `set_current_site`) so `ephpm exec --site … -- wp …` can reach the
-//!   tenant's Turso database. The containment property this PoC proves does not
-//!   depend on it.
-//! - `TODO`: per-site-clustered owner-refusal (`hrw_owner`) — an exec on a
-//!   non-owner must refuse rather than write to a replica whose writes never
-//!   replicate. Not needed to prove uid/Landlock containment.
 //! - `TODO`: `setrlimit` (`RLIMIT_AS`/`RLIMIT_CPU`) resource caps and a
 //!   transient cgroup. The wall-clock `--timeout` is implemented via `alarm(2)`;
 //!   memory/CPU ceilings are follow-up.

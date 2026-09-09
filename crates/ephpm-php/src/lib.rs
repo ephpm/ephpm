@@ -1526,6 +1526,41 @@ impl PhpRuntime {
         }
     }
 
+    /// Register a [`db_bridge::RemoteBackend`] backing the PHP native
+    /// `ephpm_db_*` functions — the `ephpm php --site` CLI wire path (issue
+    /// #471).
+    ///
+    /// Unlike [`Self::set_db_backend`] (a litewire backend the bridge wraps in a
+    /// translating `Session`), a remote backend forwards **raw** SQL to a
+    /// running server's wire listener, which does the single authoritative
+    /// translation. Used only by the CLI when it detects a live server; the
+    /// server itself never registers a remote backend. Mutually exclusive with
+    /// the other `set_db_*` registrations — first registration wins.
+    ///
+    /// In stub mode (no `php_linked`) the Rust-side registration still happens
+    /// but no PHP wiring occurs.
+    pub fn set_remote_db_backend(
+        remote: std::sync::Arc<dyn db_bridge::RemoteBackend>,
+        handle: tokio::runtime::Handle,
+    ) {
+        let registered = db_bridge::set_remote_backend(remote, handle);
+
+        #[cfg(php_linked)]
+        if registered {
+            // Safety: DB_OPS is a static with a stable address.
+            // ephpm_set_db_ops copies the struct into the C global — the
+            // pointer only needs to be valid for the duration of this call.
+            unsafe { ffi::ephpm_set_db_ops(&db_bridge::DB_OPS) };
+
+            tracing::info!("remote db wire backend wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        if registered {
+            tracing::debug!("remote db wire backend registered (stub mode, no PHP wiring)");
+        }
+    }
+
     /// Register the WebSocket connection registry backing the PHP native
     /// `ephpm_ws_*` functions.
     ///

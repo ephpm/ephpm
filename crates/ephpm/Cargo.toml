@@ -27,6 +27,17 @@ ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
 ephpm-server.workspace = true
+# litewire types (Value / SessionResult / SessionError / Turso) for the
+# `ephpm php --site` DB paths (issue #471): the direct-open path opens a Turso
+# file, and the remote wire path maps mysql_async results into litewire's
+# `SessionResult` for the `ephpm_db_*` bridge. Same pin/features as the rest of
+# the workspace.
+litewire.workspace = true
+# mysql_async: the wire CLIENT for `ephpm php --site` when a server is running —
+# it connects to the server's MySQL listener authenticating as the site and
+# forwards raw SQL (issue #471). `minimal-rust` (no TLS / no rsa) is fine: the
+# connection is loopback to a co-located server using mysql_native_password.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
 # mimalloc as the global allocator for the ephpm binary. Non-Windows only.
 #
 # Wins in workloads with many small, short-lived allocations (HTTP request

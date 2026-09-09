@@ -323,6 +323,41 @@ pub trait SiteBackendResolver: Send + Sync {
     fn resolve(&self, site_key: &str) -> Result<SharedBackend, String>;
 }
 
+/// Executes **raw, untranslated** SQL against a remote ePHPm server's wire
+/// listener (issue #471, the `ephpm php --site` CLI wire path).
+///
+/// This is the deliberate opposite of [`SiteBackendResolver`]: that yields a
+/// litewire [`Backend`](litewire::backend::Backend) the bridge wraps in a
+/// translating [`Session`], so the SQL is rewritten MySQL→SQLite *here* before
+/// it reaches the (SQLite) backend. A `RemoteBackend` instead forwards the
+/// statement **verbatim** over the MySQL wire to a running server, whose own
+/// frontend `Session` does the single, authoritative translation / metadata
+/// emulation / query-stats / owner-forwarding — exactly as a stock `pdo_mysql`
+/// connection would. Wrapping it in a second `Session` here would translate
+/// twice (e.g. re-parsing already-emitted SQL under the MySQL dialect), which
+/// is a correctness hazard, so [`run_on`] takes a dedicated branch for this
+/// source that never constructs a `Session` and never touches the per-thread
+/// [`HeldSession`] machinery.
+///
+/// `run` is `async` because the implementation drives `mysql_async`; the bridge
+/// calls it through the pinned [`Handle::block_on`](tokio::runtime::Handle),
+/// legal for the same reason the rest of the bridge's `block_on`s are (PHP FFI
+/// callbacks run on PHP execution OS threads, never async tasks — see the
+/// module docs, `Async boundary`).
+#[litewire::async_trait]
+pub trait RemoteBackend: Send + Sync {
+    /// Run `sql` with the bound `params` against the remote server and return
+    /// the result, mapping the server's real MySQL error code into
+    /// [`SessionError`] on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SessionError`] carrying the server's MySQL error code and
+    /// message when the statement fails or the connection cannot be
+    /// established.
+    async fn run(&self, sql: &str, params: &[Value]) -> Result<SessionResult, SessionError>;
+}
+
 /// Where the bridge gets the backend for a query.
 enum BackendSource {
     /// One process-global backend; the request's site is ignored.
@@ -330,6 +365,10 @@ enum BackendSource {
     /// Per-site registry; the backend is chosen by the current request's
     /// site key (fails closed when no key is set).
     PerSite(Arc<dyn SiteBackendResolver>),
+    /// Raw SQL forwarded to a remote ePHPm server's wire listener — the
+    /// `ephpm php --site` CLI wire path (issue #471). No local translation and
+    /// no [`HeldSession`]: [`run_on`] short-circuits to [`RemoteBackend::run`].
+    Remote(Arc<dyn RemoteBackend>),
 }
 
 /// Everything a thread needs to open and drive a session.
@@ -389,6 +428,25 @@ pub fn set_resolver(
         .is_ok();
     if registered {
         tracing::debug!("db backend registered for PHP native functions (per-site mode)");
+    }
+    registered
+}
+
+/// Register a [`RemoteBackend`] backing the PHP `ephpm_db_*` functions — the
+/// `ephpm php --site` CLI wire path (issue #471). SQL is forwarded raw to a
+/// running server; no local translation happens. First registration wins.
+///
+/// Returns `true` if this call performed the registration.
+pub fn set_remote_backend(remote: Arc<dyn RemoteBackend>, handle: tokio::runtime::Handle) -> bool {
+    let registered = DB_BRIDGE
+        .set(DbBridge {
+            source: BackendSource::Remote(remote),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        })
+        .is_ok();
+    if registered {
+        tracing::debug!("db backend registered for PHP native functions (remote wire mode)");
     }
     registered
 }
@@ -864,6 +922,15 @@ fn site_swap_target(
             };
             Ok(if held_site == Some(current) { None } else { Some(Box::from(current)) })
         })?,
+        // Unreachable: [`run_on`] short-circuits `Remote` before the per-thread
+        // session path. Fail closed (not `unreachable!`) so a future refactor
+        // that broke that invariant would surface a clean PHP exception rather
+        // than panic inside the bridge.
+        BackendSource::Remote(_) => Err(RunFailure::Error(infra_error(
+            ERR_UNAVAILABLE,
+            "internal error: remote wire backend must not use the per-thread session path"
+                .to_string(),
+        ))),
     }
 }
 
@@ -876,6 +943,11 @@ fn backend_for(source: &BackendSource, site: &str) -> Result<SharedBackend, Brid
         BackendSource::PerSite(resolver) => resolver.resolve(site).map_err(|msg| {
             infra_error(ERR_CONNECT, format!("failed to open the database for this site: {msg}"))
         }),
+        // Unreachable — see the matching note in [`site_swap_target`].
+        BackendSource::Remote(_) => Err(infra_error(
+            ERR_UNAVAILABLE,
+            "internal error: remote wire backend has no per-site backend to resolve".to_string(),
+        )),
     }
 }
 
@@ -944,6 +1016,22 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     if !is_live(&DB_ROWS) || !is_live(&DB_LAST) {
         return RunStatus::Gone;
     }
+
+    // Remote wire path (issue #471, `ephpm php --site` against a running
+    // server): forward the RAW MySQL SQL to the server's listener and let its
+    // frontend `Session` do the single, authoritative translation. No local
+    // `Session` (that would translate twice) and no per-thread [`HeldSession`]
+    // (the remote connection is authenticated as the site, so there is no
+    // site swap to perform). The defensive `screen_sql` above already ran; the
+    // server screens again. Staging is safe — the gate just proved both result
+    // cells are live on this (live) thread.
+    if let BackendSource::Remote(remote) = &bridge.source {
+        return match bridge.handle.block_on(remote.run(sql, &params)) {
+            Ok(result) => stage_result(result),
+            Err(e) => stage_error(BridgeError::from(e)),
+        };
+    }
+
     let Ok(outcome) = DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
 
@@ -1596,7 +1684,10 @@ fn available_on(bridge: Option<&DbBridge>) -> bool {
         return false;
     };
     match &bridge.source {
-        BackendSource::Single(_) => true,
+        // `Single` (one global backend) and `Remote` (a wire connection already
+        // authenticated as the site) both reach a database without needing a
+        // per-thread site key.
+        BackendSource::Single(_) | BackendSource::Remote(_) => true,
         // A destroyed key reports "not available" (issue #269) rather than
         // panicking. That is the truthful answer: a statement issued from a
         // retiring thread reports [`RunStatus::Gone`] and reaches no database,
@@ -3806,5 +3897,134 @@ mod ffi_tests {
         assert!(state.is_null(), "NULL sqlstate is the C side's `no error` signal");
 
         reset_staged();
+    }
+}
+
+// ── Remote wire-backend tests (issue #471) ──────────────────────────────────
+//
+// Drive `run_on` with a locally-constructed `DbBridge` whose source is a
+// `Remote` backend, proving the two properties the `ephpm php --site` wire path
+// depends on: SQL is forwarded **verbatim** (no CLI-side translating `Session`,
+// so a running server translates exactly once), and `screen_sql` still runs
+// CLI-side before anything is forwarded. No PHP runtime needed.
+#[cfg(test)]
+mod remote_tests {
+    use std::sync::Mutex;
+
+    use litewire::SessionOk;
+    use litewire::backend::ResultSet;
+
+    use super::tests::TEST_RT;
+    use super::*;
+
+    /// Records every SQL string it is handed and returns canned results.
+    struct RecordingRemote {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl RecordingRemote {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { seen: Mutex::new(Vec::new()) })
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[litewire::async_trait]
+    impl RemoteBackend for RecordingRemote {
+        async fn run(&self, sql: &str, _params: &[Value]) -> Result<SessionResult, SessionError> {
+            self.seen.lock().unwrap().push(sql.to_string());
+            if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+                Ok(SessionResult::Rows(ResultSet {
+                    columns: vec![Column { name: "id".into(), decltype: None }],
+                    rows: vec![vec![Value::Integer(7)]],
+                }))
+            } else {
+                Ok(SessionResult::Ok(SessionOk {
+                    affected_rows: 3,
+                    last_insert_id: 42,
+                    in_transaction: false,
+                    noop: false,
+                }))
+            }
+        }
+    }
+
+    fn remote_bridge(remote: Arc<RecordingRemote>) -> DbBridge {
+        let handle = TEST_RT
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+            })
+            .handle()
+            .clone();
+        DbBridge {
+            source: BackendSource::Remote(remote),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        }
+    }
+
+    /// The core wire-path property: the backend receives the SQL **byte-for-byte**
+    /// as PHP issued it — backticks and MySQL-isms intact — because the bridge
+    /// must NOT translate on this path (the server translates once).
+    #[test]
+    fn remote_forwards_sql_verbatim_without_translation() {
+        let remote = RecordingRemote::new();
+        let bridge = remote_bridge(Arc::clone(&remote));
+
+        let sql = "SELECT `id` FROM `wp_posts` LIMIT 1";
+        assert_eq!(run_on(Some(&bridge), sql.as_bytes()), RunStatus::Rows);
+        assert_eq!(
+            remote.seen().as_slice(),
+            &[sql.to_string()],
+            "the Remote path must forward SQL verbatim — a translating Session would rewrite it"
+        );
+        assert!(had_rowset());
+        assert_eq!(row_count(), 1);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(7))));
+        finish();
+    }
+
+    /// A non-rowset statement stages the server's OK counters.
+    #[test]
+    fn remote_ok_statement_stages_counters() {
+        let remote = RecordingRemote::new();
+        let bridge = remote_bridge(Arc::clone(&remote));
+
+        assert_eq!(run_on(Some(&bridge), b"UPDATE t SET v = 1"), RunStatus::Ok);
+        assert!(!had_rowset());
+        assert_eq!(ok_info(), (3, 42));
+        assert_eq!(remote.seen().as_slice(), &["UPDATE t SET v = 1".to_string()]);
+        reset_staged();
+    }
+
+    /// Defense in depth is preserved: a forbidden statement is screened
+    /// CLI-side and never reaches the wire.
+    #[test]
+    fn remote_still_screens_before_forwarding() {
+        let remote = RecordingRemote::new();
+        let bridge = remote_bridge(Arc::clone(&remote));
+
+        assert_eq!(run_on(Some(&bridge), b"ATTACH DATABASE 'other.db' AS o"), RunStatus::Err);
+        assert!(remote.seen().is_empty(), "a screened statement must not be forwarded");
+        with_error(|e| {
+            let (_, _, msg) = e.expect("error staged");
+            assert!(msg.to_ascii_lowercase().contains("attach"), "got: {msg}");
+        });
+        reset_staged();
+    }
+
+    /// `is_available` is true for a Remote backend without any per-thread site
+    /// key — the connection is already authenticated as the site.
+    #[test]
+    fn remote_is_always_available() {
+        let bridge = remote_bridge(RecordingRemote::new());
+        assert!(available_on(Some(&bridge)));
     }
 }
