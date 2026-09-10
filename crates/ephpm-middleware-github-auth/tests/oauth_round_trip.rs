@@ -585,6 +585,132 @@ fn apex_flow_one_app_serves_the_whole_wildcard_fleet() {
     );
 }
 
+// ── per-preview repo gate (issue #487) ─────────────────────────────────────
+
+/// A per-preview gate with **no** configured target — the repo arrives per
+/// request on the trusted router channel.
+fn per_preview_gate(stub: &Stub) -> GithubAuth {
+    let cfg = serde_json::json!({
+        "client_id": "Iv1.stub",
+        "client_secret": CLIENT_SECRET,
+        "session_secret": SESSION_SECRET,
+        "access": "per-preview",
+        "github_base": stub.base,
+        "github_api_base": stub.base,
+        "redirect_uri": format!("https://{VHOST}/_ephpm/auth/github/callback"),
+    });
+    GithubAuth::init(&cfg).expect("per-preview init needs no configured target")
+}
+
+/// Like [`call_on`] but with the trusted `request_gate_repo` channel set.
+fn call_repo(
+    mw: &GithubAuth,
+    vhost: &str,
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+    repo: Option<&str>,
+) -> Response {
+    let mut ctx = RequestCtx::new("GET", path, query, "203.0.113.9", vhost, headers);
+    if let Some(r) = repo {
+        ctx = ctx.with_gate_repo(r);
+    }
+    // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
+    let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+    mw.invoke(&req)
+}
+
+/// End to end (design §4/§10): per-preview login seals the trusted-channel repo
+/// into the state; the callback authorizes against the STATE's repo, not the
+/// channel it lands with — the apex callback host's channel could name a
+/// different repo, and the *signed* one must win. Proven by putting a hostile
+/// repo on the callback channel and asserting GitHub was queried for the
+/// state's repo only.
+#[test]
+fn per_preview_gates_on_the_signed_state_repo_not_the_callback_channel() {
+    let stub = Stub::start();
+    let mw = per_preview_gate(&stub);
+
+    let login = call_repo(&mw, VHOST, "/wp-admin/", "", &[], Some("acme/web"));
+    assert_eq!(login.__status(), 302);
+    assert_eq!(stub.requests(), 0, "starting a login must not touch GitHub");
+    let loc = header(&login, "Location").expect("Location");
+    let state = query_param(loc.split_once('?').expect("query").1, "state").expect("state");
+    let cookie = set_cookies(&login)
+        .into_iter()
+        .find(|c| c.starts_with("ephpm_session_oauth="))
+        .expect("state cookie")
+        .split(';')
+        .next()
+        .expect("pair")
+        .to_owned();
+
+    // The callback channel deliberately names a DIFFERENT repo. The state wins.
+    let resp = call_repo(
+        &mw,
+        VHOST,
+        "/_ephpm/auth/github/callback",
+        &format!("code={GOOD_CODE}&state={state}"),
+        &[("Cookie".to_owned(), cookie)],
+        Some("attacker/owns"),
+    );
+    assert_eq!(resp.__status(), 302, "a readable state repo issues a session");
+
+    let seen = stub.seen();
+    assert!(
+        seen.requests.iter().any(|r| r == "GET /repos/acme/web"),
+        "must authorize against the repo sealed into the state"
+    );
+    assert!(
+        !seen.requests.iter().any(|r| r == "GET /repos/attacker/owns"),
+        "the callback channel's repo must NOT be consulted — the signed state is authoritative"
+    );
+    drop(seen);
+
+    // The session binds to the site and never carries the repo (#396).
+    let session = session_value(&resp);
+    let payload =
+        session.strip_prefix("ephpm_session=").expect("prefix").split('.').nth(1).expect("payload");
+    let json: serde_json::Value =
+        serde_json::from_slice(&base64_url_decode(payload).expect("base64url")).expect("json");
+    assert_eq!(json["site"], VHOST);
+    assert!(json.get("repo").is_none(), "the session binds to the site, not the repo");
+    assert_eq!(json["check"], "repo acme/web");
+}
+
+/// Fail-closed matrix (design §11): in per-preview mode a user without read on
+/// the state's repo is denied — GitHub's "exists but not yours" 404 is a denial,
+/// and the flow completed (3 calls) rather than erroring.
+#[test]
+fn per_preview_denies_a_user_without_access_to_the_state_repo() {
+    let stub = Stub::start();
+    let mw = per_preview_gate(&stub);
+
+    let login = call_repo(&mw, VHOST, "/", "", &[], Some("acme/secret"));
+    let loc = header(&login, "Location").expect("Location");
+    let state = query_param(loc.split_once('?').expect("query").1, "state").expect("state");
+    let cookie = set_cookies(&login)
+        .into_iter()
+        .find(|c| c.starts_with("ephpm_session_oauth="))
+        .expect("state cookie")
+        .split(';')
+        .next()
+        .expect("pair")
+        .to_owned();
+
+    let resp = call_repo(
+        &mw,
+        VHOST,
+        "/_ephpm/auth/github/callback",
+        &format!("code={GOOD_CODE}&state={state}"),
+        &[("Cookie".to_owned(), cookie)],
+        Some("acme/secret"),
+    );
+    assert_eq!(resp.__status(), 403, "no read on the state's repo ⇒ deny");
+    assert!(!set_cookies(&resp).iter().any(|c| c.starts_with("ephpm_session=")));
+    assert_eq!(stub.seen().requests.len(), 3, "the flow completed and answered no");
+}
+
 /// Minimal unpadded base64url decoder for asserting on the issued payload.
 fn base64_url_decode(s: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

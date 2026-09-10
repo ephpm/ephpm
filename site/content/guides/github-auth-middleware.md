@@ -150,6 +150,7 @@ it is a secret in git.
 | `org` | — | organisation login, for `check = "org"` / `"team"` |
 | `team` | — | team slug, for `check = "team"` |
 | `sites` | unset | table mapping each vhost to its own `{ repo \| org \| team }` |
+| `access` | `"fixed"` | `"fixed"`: the configured target (`default_check`/`sites`) is authoritative — today's behaviour. `"per-preview"`: authorize each preview against the `owner/name` the router seals into the OAuth state from its `[preview_auth] repo` override; `default_check`/`sites` become optional and a request with no repo fails closed |
 | `login_path` | `/_ephpm/auth/github/login` | reserved: starts a login. The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so this default is reachable; keep custom values under `/_ephpm/auth/` |
 | `callback_path` | `/_ephpm/auth/github/callback` | reserved: receives GitHub's redirect. Register `https://<host>/_ephpm/auth/github/callback` as the GitHub OAuth App's Authorization callback URL |
 | `redirect_uri` | derived | full callback URL sent to GitHub. Defaults to `https://<vhost><callback_path>`. **Set it to a fixed apex** for the wildcard-fleet flow (one App, one callback host) — see below |
@@ -205,6 +206,23 @@ on the wire in clear.
 If `sites` is present it is **authoritative**: a vhost with no entry gets no
 access at all, even when a top-level `repo` is also configured. A hostname
 nobody mapped must not quietly inherit another tenant's rule.
+
+### Per-preview authorization (`access = "per-preview"`)
+
+A dynamic fleet mints a new `<pr>.preview.<domain>` host per PR, so a static
+`sites` map cannot name them and the only fleet-wide `default_check` is coarse
+(e.g. "any member of org `acme`"). `access = "per-preview"` authorizes each
+preview against **its own PR's base repo** instead. switchboard writes
+`repo = "owner/name"` into the preview's `[preview_auth]` override; the router
+carries it to this module on a trusted, non-spoofable channel (the middleware
+ABI's `request_gate_repo`, never a request header); `start_login` seals it into
+the signed OAuth `state` (login always runs on the target host, where the router
+knows the repo); and `handle_callback` — which lands on the apex host, where the
+router no longer does — rebuilds the `Check::Repo` from the signed state. In this
+mode `default_check`/`sites` are optional, and a login or callback with no repo
+fails **closed** (403). The session still binds only to the `site` (#396), never
+the repo. See the
+[Preview Access Gate roadmap page](/roadmap/preview-access-gate/#shipped-per-preview-repository-authorization-issue-487).
 
 ## Which GitHub calls are made
 

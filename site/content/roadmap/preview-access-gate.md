@@ -87,7 +87,10 @@ document_root = "public"
 [preview_auth]                                    # turns the gate ON for this vhost
 session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # HS256 key, shared with the issuer
 login_url      = "/_ephpm/auth/github/login"          # the issuer's login endpoint
+repo           = "acme/web"                           # per-preview authz target (see below)
 # cookie / issuer / audience / require_https / require_site / share_* are optional.
+# `repo` is optional too — omit it (and leave the issuer in `access = "fixed"`)
+# to authorize the whole fleet against one coarse org/repo check instead.
 # exempt_paths is NOT needed for the default `/_ephpm/auth/…` endpoints — the
 # router carve-out means the gate never sees them.
 ```
@@ -173,8 +176,10 @@ apex vhost** and carries the target in the signed OAuth `state`:
    apex.
 3. **The apex mints for the target.** The callback lands on the apex, reads the
    `state`, and uses the **target** from it — not its own (apex) vhost — for the
-   repo/org/team authz check (`check_for(<target>)`) and for the session's
-   `site` claim. (`Router::handle_auth_namespace` routes the apex's
+   session's `site` claim and for the access check: the repo/org/team
+   `check_for(<target>)` in `access = "fixed"` mode, or the signed `repo` claim
+   sealed at login in `access = "per-preview"` mode (see "per-preview repository
+   authorization"). (`Router::handle_auth_namespace` routes the apex's
    `/_ephpm/auth/github/callback` to the chain; `github-auth`'s
    `handle_callback` does the target-from-state minting.)
 4. **Domain-scoped cookie + cross-host redirect.** The session cookie is set
@@ -209,6 +214,71 @@ vhost, so the login it starts on `pr-1.preview.ephpm.dev` and the callback it
 handles on the apex are the same mount. The apex (`preview.ephpm.dev`) must
 itself be a served vhost (it is where callbacks land). Substitute your own domain
 throughout.
+
+## Shipped: per-preview repository authorization (issue #487)
+
+The apex flow above funnels every callback through one App, but on its own it
+still authorizes against a **single** target: the issuer's `check_for(<target>)`
+resolves either a `default_check` or a `sites` entry keyed by vhost. A dynamic
+fleet mints a new `<pr>.preview.<domain>` host per PR and cannot enumerate them
+in a static `sites` map, so the only enforceable coarse target was
+`default_check` — "any member of org `acme`", not "read access to *this PR's*
+base repo". Per-preview authorization closes that gap.
+
+The mechanism turns on the **crux** the apex flow created. The OAuth callback
+lands on the apex host, where the router no longer knows which repo the preview
+is for — so the repo cannot be looked up at callback. It is instead captured at
+**login**, which always runs on the target preview host, sealed into the signed
+OAuth `state`, and read back (re-validated) at the callback to build the access
+check:
+
+1. **switchboard writes `repo = "owner/name"`** into the preview's
+   `[preview_auth]` override (validated as `owner/name`, one more field on the
+   file it already writes). A malformed value fails that one preview **closed**
+   (503), exactly like a bad `document_root`.
+2. **The router carries it on a trusted channel.** ePHPm surfaces the value as
+   `SiteRoots::preview_gate_repo` and puts it on each request via the middleware
+   ABI's `request_gate_repo` accessor (ABI **minor 4**) — the same trusted,
+   router-populated channel as the canonical site key, **never** a request
+   header. It is deliberately **not** folded into the per-site verifier's config:
+   the verifier checks the session, and repo authorization is the issuer's job.
+3. **The issuer seals it into `state` at login.** With `access = "per-preview"`,
+   `github-auth`'s `start_login` reads `request_gate_repo` and adds a signed
+   `repo` claim to the OAuth `state` (alongside the existing target `v`, nonce
+   and return path). Both are minted together on the target host and signed
+   together.
+4. **The callback authorizes against the state's repo.** `handle_callback`
+   rebuilds `Check::Repo` from the state's `repo` (re-validated — a signature
+   attests origin, not shape) and runs the normal GitHub read-access check
+   against it. The **signed state wins over the callback host's own channel**, so
+   the apex callback authorizes each preview against its own PR's repo.
+
+### The `access` knob (issuer config, default `fixed`)
+
+```toml
+[[middleware]]
+library = "github-auth"
+config  = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
+            session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET",
+            redirect_uri = "https://preview.example.com/_ephpm/auth/github/callback",
+            cookie_domain = ".preview.example.com",
+            access = "per-preview" }   # authorize each preview against its own repo
+```
+
+- **`access = "fixed"` (default)** — today's behaviour, unchanged. `default_check`
+  or a `sites` table is **required**, the per-request repo channel is **ignored**,
+  and no `repo` claim is written. Nothing about an existing deployment changes.
+- **`access = "per-preview"`** — `default_check`/`sites` become **optional** (the
+  target arrives per request), and a login or callback that carries **no** repo
+  fails **closed** (403). This is the mode a multi-repo preview fleet uses.
+
+The session is unchanged: it still binds only to the **site** (`site` claim,
+#396), never to the repo. Repo authorization happens once, at login; the hot-path
+verifier is untouched and cross-preview replay is still a `site`-claim mismatch.
+Verified end to end in `github-auth`'s
+`per_preview_gates_on_the_signed_state_repo_not_the_callback_channel` (a hostile
+repo on the callback channel is ignored; the signed state's repo is what GitHub
+is queried for) and its fail-closed siblings.
 
 ## Shipped: temporary shareable URLs (verification + revocation)
 
@@ -307,11 +377,18 @@ build against this, not against the ePHPm internals.
    **issuer** globally in `ephpm.toml` (`[[middleware]] library = "github-auth"`
    — one process config, so it runs on every vhost: login fires on the target
    subdomain, the callback on the apex, from the same mount), with its
-   `client_id`/`client_secret`,
-   the per-repo/org access target (its own `sites` map or `default_check`), and
-   `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`. **For the wildcard
-   fleet, also set the two apex-flow knobs** (see "One GitHub OAuth App for the
-   whole fleet" above):
+   `client_id`/`client_secret` and
+   `session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"`. Choose the
+   authorization model:
+   - **Per-preview repo (recommended for a multi-repo fleet):** set
+     `access = "per-preview"` and write each preview's `repo` in its
+     `[preview_auth]` override (step 3). No fleet-wide `default_check`/`sites` is
+     needed — each preview authorizes against its own PR's base repo.
+   - **Fixed coarse target:** leave `access` at its default and set a per-repo/org
+     access target (`default_check`, or a `sites` map) on the mount.
+
+   **For the wildcard fleet, also set the two apex-flow knobs** (see "One GitHub
+   OAuth App for the whole fleet" above):
    - `redirect_uri = "https://preview.<domain>/_ephpm/auth/github/callback"` — the
      one fixed callback; a GitHub OAuth App allows a single callback host, **not**
      a wildcard, so register exactly this URL in the App.
@@ -334,10 +411,14 @@ build against this, not against the ePHPm internals.
    [preview_auth]
    session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET"   # the SAME reference the issuer uses
    login_url      = "/_ephpm/auth/github/login"          # the issuer's login endpoint
+   repo           = "owner/name"                         # the PR's base repo (per-preview mode)
    ```
    `cookie` must match the issuer's `cookie_name` (both default `ephpm_session`,
    so usually omit it). No `exempt_paths` is needed for the default
-   `/_ephpm/auth/…` endpoints.
+   `/_ephpm/auth/…` endpoints. Write `repo` only when the issuer is in
+   `access = "per-preview"` mode; a malformed value fails that one preview closed
+   (503), never open. In `access = "fixed"` mode `repo` is ignored (the mount's
+   `default_check`/`sites` decides), so omit it.
 4. **Rollout ordering:** only write `[preview_auth]` once an ePHPm that enforces
    it is deployed. An older ePHPm treats the unknown section leniently (ignored,
    reported) and would serve the preview **ungated** — so a fleet upgrades ePHPm

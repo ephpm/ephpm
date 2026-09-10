@@ -100,6 +100,47 @@ impl Check {
     }
 }
 
+/// Parse an `owner/name` repository spec into a [`Check::Repo`].
+///
+/// The one validation path for a repository string, whether it comes from the
+/// mount `config` (`repo = "owner/name"`), a `sites` entry, or — as of the
+/// per-preview gate — the trusted router `request_gate_repo` channel decoded
+/// back out of a signed OAuth `state`. Sharing it means the state-carried repo
+/// is held to exactly the same shape as a configured one: it becomes part of an
+/// outbound GitHub API path, so a smuggled `..`/`/`/query is refused here.
+///
+/// # Errors
+///
+/// Returns a message when `spec` is not exactly `owner/name` with both segments
+/// valid GitHub names.
+pub fn repo_from_spec(spec: &str, ctx: &str) -> Result<Check, String> {
+    let (owner, name) = spec
+        .split_once('/')
+        .ok_or_else(|| format!("{ctx}: `repo` must be `owner/name`, got {spec:?}"))?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(format!("{ctx}: `repo` must be exactly `owner/name`, got {spec:?}"));
+    }
+    validate_path_segment(owner, &format!("{ctx}: repo owner"))?;
+    validate_path_segment(name, &format!("{ctx}: repo name"))?;
+    Ok(Check::Repo { owner: owner.to_owned(), name: name.to_owned() })
+}
+
+/// How the gate decides *what* to authorize each preview against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Access {
+    /// The configured `default_check`/`sites` are authoritative — today's
+    /// behaviour, and the default. A per-request `request_gate_repo` is ignored.
+    #[default]
+    Fixed,
+    /// Each preview authorizes against the repository the router sealed into the
+    /// OAuth `state` at login (`request_gate_repo`, from the operator-owned
+    /// per-site override). `default_check`/`sites` become optional; a login or
+    /// callback with no repository fails **closed**. This is the mode a dynamic
+    /// multi-repo preview fleet uses, where the enforceable target is per-PR
+    /// base-repo read access rather than one coarse org/repo check.
+    PerPreview,
+}
+
 /// The gate's fully-resolved configuration.
 #[derive(Debug)]
 pub struct Config {
@@ -112,6 +153,9 @@ pub struct Config {
     /// Key for the OAuth `state` cookie, derived from `session_secret`.
     pub state_secret: Secret,
 
+    /// How each preview's authorization target is chosen — a fixed configured
+    /// check, or the per-preview repository the router sealed into the state.
+    pub access: Access,
     /// Access check applied when the request's vhost has no `sites` entry.
     pub default_check: Option<Check>,
     /// Per-vhost access checks (`request_vhost_id` → check).
@@ -248,15 +292,7 @@ fn parse_check(v: &serde_json::Value, ctx: &str) -> Result<Option<Check>, String
     match kind.as_str() {
         "repo" => {
             let spec = repo.ok_or_else(|| format!("{ctx}: `check = \"repo\"` needs `repo` set"))?;
-            let (owner, name) = spec
-                .split_once('/')
-                .ok_or_else(|| format!("{ctx}: `repo` must be `owner/name`, got {spec:?}"))?;
-            if owner.is_empty() || name.is_empty() || name.contains('/') {
-                return Err(format!("{ctx}: `repo` must be exactly `owner/name`, got {spec:?}"));
-            }
-            validate_path_segment(owner, &format!("{ctx}: repo owner"))?;
-            validate_path_segment(name, &format!("{ctx}: repo name"))?;
-            Ok(Some(Check::Repo { owner: owner.to_owned(), name: name.to_owned() }))
+            repo_from_spec(&spec, ctx).map(Some)
         }
         "org" => {
             let org = org.ok_or_else(|| format!("{ctx}: `check = \"org\"` needs `org` set"))?;
@@ -381,12 +417,30 @@ impl Config {
             }
             Some(other) => return Err(format!("`sites` must be a table, got {other}")),
         }
+        let access = match opt_str(config, "access")?.as_deref() {
+            None | Some("fixed") => Access::Fixed,
+            Some("per-preview") => Access::PerPreview,
+            Some(other) => {
+                return Err(format!(
+                    "`access` must be \"fixed\" or \"per-preview\", got {other:?}"
+                ));
+            }
+        };
+
         let default_check = parse_check(config, "config")?;
-        if default_check.is_none() && sites.is_empty() {
+        // In `fixed` mode a target is mandatory — a gate with nothing to check
+        // authenticates every GitHub user in the world. In `per-preview` mode
+        // the target arrives per request on the trusted `request_gate_repo`
+        // channel (sealed into the OAuth state at login), so `default_check` /
+        // `sites` are optional; a request that carries no repository fails
+        // closed at login/callback instead (see `GithubAuth::start_login` /
+        // `handle_callback`).
+        if access == Access::Fixed && default_check.is_none() && sites.is_empty() {
             return Err(
-                "no access target configured: set `repo` (or `org`/`team`), or a `sites` table \
-                 mapping each vhost to one. A gate with nothing to check would authenticate \
-                 every GitHub user in the world."
+                "no access target configured: set `repo` (or `org`/`team`), a `sites` table \
+                 mapping each vhost to one, or `access = \"per-preview\"` to authorize each \
+                 preview against the repository the router seals into the OAuth state. A gate \
+                 with nothing to check would authenticate every GitHub user in the world."
                     .into(),
             );
         }
@@ -507,6 +561,7 @@ impl Config {
             client_secret,
             session_secret,
             state_secret,
+            access,
             default_check,
             sites,
             login_path,
@@ -838,6 +893,54 @@ mod tests {
         assert!(validate_vhost("localhost:8080").is_ok());
         for bad in ["", "has space", "evil.test/path", "a@b", "caf\u{e9}.test", "x\r\ny"] {
             assert!(validate_vhost(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // ── access mode (issue #487, per-preview repo gate) ──────────────────
+
+    #[test]
+    fn access_defaults_to_fixed() {
+        assert_eq!(parse(base()).expect("parse").access, Access::Fixed);
+    }
+
+    /// `per-preview` mode makes a configured target OPTIONAL — the repo arrives
+    /// per request. A gate with no `repo`/`sites` must still start.
+    #[test]
+    fn per_preview_access_makes_the_target_optional() {
+        let mut v = base();
+        v.as_object_mut().expect("object").remove("repo");
+        v["access"] = serde_json::json!("per-preview");
+        let c = parse(v).expect("per-preview needs no configured target");
+        assert_eq!(c.access, Access::PerPreview);
+        assert!(c.default_check.is_none());
+        assert!(c.sites.is_empty());
+    }
+
+    /// `fixed` mode (the default) still requires a target — the "authenticate
+    /// every GitHub user in the world" guard is unchanged.
+    #[test]
+    fn fixed_access_still_requires_a_target() {
+        let mut v = base();
+        v.as_object_mut().expect("object").remove("repo");
+        let err = parse(v).expect_err("fixed mode with no target must not start");
+        assert!(err.contains("every GitHub user in the world"));
+    }
+
+    #[test]
+    fn an_unknown_access_value_is_refused() {
+        let mut v = base();
+        v["access"] = serde_json::json!("open");
+        assert!(parse(v).expect_err("bad access").contains("per-preview"));
+    }
+
+    #[test]
+    fn repo_from_spec_validates_owner_slash_name() {
+        assert_eq!(
+            repo_from_spec("acme/web", "x").expect("valid"),
+            Check::Repo { owner: "acme".into(), name: "web".into() }
+        );
+        for bad in ["acme", "acme/", "/web", "acme/web/x", "../../etc", "acme/we b", ".", ".."] {
+            assert!(repo_from_spec(bad, "x").is_err(), "{bad:?} must be refused");
         }
     }
 }

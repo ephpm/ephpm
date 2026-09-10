@@ -44,7 +44,7 @@ use std::os::raw::{c_char, c_int};
 /// Current ABI version (`0xMMmmmmmm`: major byte gates compatibility, the
 /// lower three bytes are an additive minor level).
 ///
-/// `0x0100_0003` = major **1**, minor **3**.
+/// `0x0100_0004` = major **1**, minor **4**.
 ///
 /// - Minor 1 added the optional response phase (the [`SYM_INVOKE_RESPONSE`]
 ///   symbol and the three appended `response_*` accessors on [`EphpmHostV1`]).
@@ -66,6 +66,11 @@ use std::os::raw::{c_char, c_int};
 ///   vhost, so it returns NULL on *every* request there, where it used to
 ///   return the `Host`. C modules must null-check it. See
 ///   [`ABI_MINOR_GLOBAL_KV`] for the migration note.
+/// - Minor 4 appends one request accessor, [`request_gate_repo`] — the
+///   preview access gate's `owner/name` repository, populated only from the
+///   operator-owned per-site override and NULL when unset. Purely additive,
+///   exactly like the minor-2 request accessors: an older module never reads
+///   the slot and a newer module minor-gates it on [`ABI_MINOR_GATE_REPO`].
 ///
 /// The major byte is unchanged across every minor, so **every** module built
 /// against major 1 still loads: growth is additive.
@@ -75,7 +80,8 @@ use std::os::raw::{c_char, c_int};
 /// [`request_host`]: EphpmHostV1::request_host
 /// [`request_body`]: EphpmHostV1::request_body
 /// [`request_vhost_id`]: EphpmHostV1::request_vhost_id
-pub const ABI_V1: u32 = 0x0100_0003;
+/// [`request_gate_repo`]: EphpmHostV1::request_gate_repo
+pub const ABI_V1: u32 = 0x0100_0004;
 
 /// Major version — the compatibility gate. A module refuses to init when the
 /// host's major (`host.abi_version >> 24`) is newer than its own.
@@ -88,7 +94,7 @@ pub const ABI_MAJOR: u32 = 1;
 /// those trailing fields, and reading past a shorter table is undefined
 /// behaviour. See [`ABI_MINOR_RESPONSE_PHASE`] and
 /// [`ABI_MINOR_REQUEST_ACCESSORS`].
-pub const ABI_MINOR: u32 = 3;
+pub const ABI_MINOR: u32 = 4;
 
 /// The minor version that introduced the response phase — the three
 /// `response_*` accessors on [`EphpmHostV1`] and the [`SYM_INVOKE_RESPONSE`]
@@ -150,6 +156,13 @@ pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
 /// This half genuinely *is* a no-op on a single-site node: there is one store,
 /// and both the scoped and global slots reach it.
 pub const ABI_MINOR_GLOBAL_KV: u32 = 3;
+
+/// The minor version that introduced the appended request accessor
+/// [`EphpmHostV1::request_gate_repo`]. A module needs
+/// `host.abi_version & 0x00FF_FFFF >=` this before calling it: on an older
+/// host the trailing table slot is absent and reading it is undefined
+/// behaviour. Purely additive — nothing pre-existing changed in minor 4.
+pub const ABI_MINOR_GATE_REPO: u32 = 4;
 
 /// Middleware verdicts for one request.
 pub const ACTION_CONTINUE: c_int = 0;
@@ -486,6 +499,31 @@ pub struct EphpmHostV1 {
         ttl_secs: i64,
         out: *mut i64,
     ) -> c_int,
+
+    // ── Preview access gate (minor 4) ─────────────────────────────────────
+    //
+    // Appended after `kv_incr_ttl_global`. A module that reads this must first
+    // confirm `abi_version & 0x00FF_FFFF >= ABI_MINOR_GATE_REPO`.
+    /// The preview access gate's target repository for this request, as an
+    /// `owner/name` string, or NULL when this vhost has no gate repository
+    /// configured.
+    ///
+    /// This is a **trusted, router-populated** channel, exactly like
+    /// [`request_vhost_id`](Self::request_vhost_id): its value comes only from
+    /// the operator-owned per-site override file (`[preview_auth] repo`), never
+    /// from anything a client can send. It exists so the OAuth issuer can seal
+    /// the repository a preview is *for* into the signed OAuth `state` at login
+    /// — login always runs on the target preview host, where the router knows
+    /// the site and its repo, whereas the callback lands on the apex host where
+    /// it does not. A module must not read a repository from any request header;
+    /// that would be client-controllable and defeats the gate.
+    ///
+    /// **NULL means "no gate repository", and a module must fail closed on it**
+    /// when it is operating in a per-preview mode that requires one — inventing
+    /// one would authorize against an attacker-chosen target. Rust modules get
+    /// `Option<&str>` from [`Request::gate_repo`](crate::Request::gate_repo),
+    /// which already null-checks and empty-checks.
+    pub request_gate_repo: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
 }
 
 /// Symbol names the loader looks up.

@@ -234,6 +234,18 @@ pub(crate) struct SiteRoots {
     /// per-request clone of this struct is a refcount bump, not a rebuild.
     /// `None` for the overwhelming majority of sites (no gate).
     pub(crate) preview_gate: Option<std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
+    /// This vhost's preview access-gate **repository** (`[preview_auth] repo`,
+    /// `owner/name`), when its override declared one (issue #487, per-preview
+    /// gate). Carried onto the request via `RequestCtx::with_gate_repo` so the
+    /// OAuth *issuer* (a global `[[middleware]]`) can seal it into the signed
+    /// OAuth state at login — the callback lands on the apex host, where the
+    /// router can no longer resolve it.
+    ///
+    /// Deliberately **separate** from [`preview_gate`](Self::preview_gate): the
+    /// per-site verifier that field builds must never see the repo. `None` for
+    /// the overwhelming majority of sites; travels on the trusted router channel
+    /// only, never a request header.
+    pub(crate) preview_gate_repo: Option<String>,
     /// Keys in this site's override file that ePHPm did not understand, sorted.
     ///
     /// **Diagnostic only** — nothing routes on it. It rides the resolution so
@@ -256,6 +268,7 @@ impl SiteRoots {
             auto_prepend_file: None,
             unusable: None,
             preview_gate: None,
+            preview_gate_repo: None,
             unknown_keys: Vec::new(),
         }
     }
@@ -994,6 +1007,7 @@ fn resolve_site_roots(
         auto_prepend_file: over.auto_prepend_file,
         unusable: over.unusable.or(gate_unusable),
         preview_gate,
+        preview_gate_repo: over.preview_gate_repo,
         unknown_keys: over.unknown_keys,
     }
 }
@@ -2892,6 +2906,7 @@ impl Router {
                 site_key.as_deref(),
                 &host,
                 is_https,
+                site_roots.preview_gate_repo.as_deref(),
             ));
         }
 
@@ -2932,7 +2947,10 @@ impl Router {
                     mw_req_headers.as_deref().unwrap_or(&[]),
                 )
                 .with_scheme(is_https)
-                .with_host(&normalize_host_key(&host));
+                .with_host(&normalize_host_key(&host))
+                // Harmless here (the WS gate is the per-site verifier, which does
+                // not read the repo), set for consistency with the other phases.
+                .with_gate_repo(site_roots.preview_gate_repo.as_deref().unwrap_or(""));
                 let verdict = {
                     let _kv_scope = ephpm_middleware::host::enter_site_kv(
                         self.middleware_kv_store(site_key.as_deref()),
@@ -3076,6 +3094,7 @@ impl Router {
                         &host,
                         is_https,
                         site_roots.preview_gate.as_ref(),
+                        site_roots.preview_gate_repo.as_deref(),
                     ) {
                         StaticGate::Respond(resp) => (resp, "middleware"),
                         StaticGate::Continue(extra_headers) => {
@@ -3160,6 +3179,7 @@ impl Router {
                     site_key.as_deref(),
                     &host,
                     is_https,
+                    site_roots.preview_gate_repo.as_deref(),
                 )
                 .await;
         }
@@ -3494,6 +3514,7 @@ impl Router {
             container: site_container,
             auto_prepend_file,
             preview_gate,
+            preview_gate_repo,
             // Both diagnostic; `unusable` was already turned into a 503 at the
             // single gate in `handle`, so a request that reaches PHP has an
             // override that was fully honoured.
@@ -3619,7 +3640,10 @@ impl Router {
                 &headers,
             )
             .with_scheme(is_https)
-            .with_host(&normalize_host_key(&server_name));
+            .with_host(&normalize_host_key(&server_name))
+            // Harmless here (this is the per-site verifier, not the issuer), set
+            // for consistency with the global-chain ctx below.
+            .with_gate_repo(preview_gate_repo.as_deref().unwrap_or(""));
             let verdict = {
                 let _kv_scope = ephpm_middleware::host::enter_site_kv(
                     self.middleware_kv_store(site_key.as_deref()),
@@ -3652,6 +3676,10 @@ impl Router {
             )
             .with_scheme(is_https)
             .with_host(&normalize_host_key(&server_name))
+            // Load-bearing: the OAuth issuer (github-auth) runs on this global
+            // chain, and its `start_login` seals this preview's repo into the
+            // signed OAuth state. Router-populated only — never a request header.
+            .with_gate_repo(preview_gate_repo.as_deref().unwrap_or(""))
             .with_body(body_view);
             // Scope the chain's KV callbacks to this request's vhost keyspace
             // (issue #376) — the same store PHP gets below. The guard is held
@@ -4891,6 +4919,7 @@ impl Router {
         site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
+        gate_repo: Option<&str>,
     ) -> (Response<ServerBody>, &'static str) {
         let Some(chain) = self.middleware_chain.as_ref() else {
             // No middleware at all → nothing can serve auth → 404 (reserved).
@@ -4905,7 +4934,11 @@ impl Router {
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
-        .with_host(&normalize_host_key(server_name));
+        .with_host(&normalize_host_key(server_name))
+        // Load-bearing on the apex-less flow: the login path
+        // (`/_ephpm/auth/github/login`) is dispatched here, and the issuer's
+        // `start_login` reads this to seal the preview's repo into the state.
+        .with_gate_repo(gate_repo.unwrap_or(""));
         // Per-vhost KV scope, exactly as the static/PHP request phases use — an
         // auth module may read this tenant's keyspace. Synchronous, so the guard
         // never spans an await.
@@ -4935,6 +4968,7 @@ impl Router {
         server_name: &str,
         is_https: bool,
         preview_gate: Option<&std::sync::Arc<ephpm_middleware::builtin::BuiltinModule>>,
+        gate_repo: Option<&str>,
     ) -> StaticGate {
         // Nothing to run: no global chain AND no per-site gate. (The gate is
         // per-site, so a node with no `[[middleware]]` can still gate a preview.)
@@ -4954,7 +4988,10 @@ impl Router {
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
-        .with_host(&normalize_host_key(server_name));
+        .with_host(&normalize_host_key(server_name))
+        // Set for consistency and for the global chain, which runs here too and
+        // could start a login from a static path (issue #487, per-preview gate).
+        .with_gate_repo(gate_repo.unwrap_or(""));
         // Per-vhost KV scope, exactly as on the PHP path (issue #376). This
         // method is synchronous throughout, so the guard never spans an await —
         // and it wraps BOTH the gate (whose share-token revocation reads this
@@ -5009,6 +5046,7 @@ impl Router {
         site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
+        gate_repo: Option<&str>,
     ) -> Response<ServerBody> {
         use hyper::body::Body as _;
 
@@ -5065,7 +5103,10 @@ impl Router {
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
-        .with_host(&normalize_host_key(server_name));
+        .with_host(&normalize_host_key(server_name))
+        // Harmless in the response phase (no issuer runs here), set for
+        // consistency with the request phases.
+        .with_gate_repo(gate_repo.unwrap_or(""));
         // Per-vhost KV scope for the response phase too (issue #376). Scoped
         // to the synchronous call: the body `.collect().await` above is
         // already done, and nothing awaits between here and the drop.
@@ -12675,7 +12716,7 @@ echo "post response";
             let addr: SocketAddr = "198.51.100.20:5000".parse().unwrap();
             let gate = |site: Option<&str>| {
                 router.static_request_phase(
-                    None, "GET", "/a.css", "", addr, site, "ignored", false, None,
+                    None, "GET", "/a.css", "", addr, site, "ignored", false, None, None,
                 )
             };
             assert!(matches!(gate(Some("shop")), StaticGate::Continue(_)));
