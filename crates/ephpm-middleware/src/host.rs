@@ -27,6 +27,12 @@ pub struct RequestCtx {
     /// Normalized request host (port/trailing-dot stripped, lowercased) — the
     /// `request_host` accessor. Empty when the request had no usable `Host`.
     host: CString,
+    /// The preview access gate's `owner/name` repository for this request — the
+    /// `request_gate_repo` accessor (ABI minor 4). Router-populated from the
+    /// operator-owned per-site override only, never a client header. Empty when
+    /// this vhost has no gate repository configured, which the accessor turns
+    /// into a NULL return so a module can fail closed on it.
+    gate_repo: CString,
     /// Whether the connection was secure (HTTPS/TLS) — drives `request_scheme`
     /// and `request_is_secure`. Authoritative from the connection.
     is_secure: bool,
@@ -76,6 +82,7 @@ impl RequestCtx {
             remote_ip: cstr(remote_ip),
             site_key: cstr(site_key),
             host: CString::default(),
+            gate_repo: CString::default(),
             is_secure: false,
             body: Vec::new(),
             headers: headers
@@ -98,6 +105,20 @@ impl RequestCtx {
     #[must_use]
     pub fn with_host(mut self, host: &str) -> Self {
         self.host = cstr(host);
+        self
+    }
+
+    /// Set the preview access gate's `owner/name` repository
+    /// (`request_gate_repo`, ABI minor 4). Pass the value the router resolved
+    /// from the operator-owned per-site override; the empty string (the
+    /// default) means "no gate repository" and the accessor returns NULL.
+    ///
+    /// Never pass anything a client can influence here — a module reads this as
+    /// a trusted authorization target (the same contract as
+    /// [`site_key`](Self::new)'s tenant identity).
+    #[must_use]
+    pub fn with_gate_repo(mut self, repo: &str) -> Self {
+        self.gate_repo = cstr(repo);
         self
     }
 
@@ -196,6 +217,16 @@ unsafe extern "C" fn request_is_secure(req: *const EphpmRequest) -> c_int {
 unsafe extern "C" fn request_host(req: *const EphpmRequest) -> *const c_char {
     // SAFETY: ABI contract.
     unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.host.as_ptr())
+}
+unsafe extern "C" fn request_gate_repo(req: *const EphpmRequest) -> *const c_char {
+    // NULL — not `""` — when no gate repository is configured, mirroring
+    // `request_vhost_id`: an empty C string is a repo-shaped answer a module
+    // would use as an authorization target, whereas NULL cannot be, so a
+    // per-preview gate can fail closed on it.
+    // SAFETY: ABI contract.
+    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| {
+        if c.gate_repo.is_empty() { std::ptr::null() } else { c.gate_repo.as_ptr() }
+    })
 }
 
 // ── Response context (response phase) ─────────────────────────────────────
@@ -790,6 +821,7 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_set_nx_global,
     kv_incr_global,
     kv_incr_ttl_global,
+    request_gate_repo,
 };
 
 /// Wire the process-global KV store into the host table. Call once at startup,
@@ -880,6 +912,38 @@ mod tests {
         let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
         assert_eq!(req.vhost_id(), Some("blog"));
         assert_eq!(req.http_host(), "blog.localhost");
+    }
+
+    /// The gate repo is a trusted authorization target (ABI minor 4), so —
+    /// exactly like `vhost_id` — "not configured" must be `None` (NULL over the
+    /// ABI), never `Some("")` which a per-preview gate would use as a repo.
+    #[test]
+    fn gate_repo_absent_reads_as_none_and_null() {
+        let unset = ctx();
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(unset.as_abi(), host_table()) };
+        assert_eq!(req.gate_repo(), None, "no gate repo must read as None, never Some(\"\")");
+        // SAFETY: the raw accessor is the C-ABI surface modules see; NULL is the
+        // contract for an unset repo.
+        assert!(unsafe { (host_table().request_gate_repo)(unset.as_abi()) }.is_null());
+
+        let set = ctx().with_gate_repo("acme/web");
+        // SAFETY: as above.
+        let req = unsafe { Request::from_raw(set.as_abi(), host_table()) };
+        assert_eq!(req.gate_repo(), Some("acme/web"));
+    }
+
+    /// A module built against minor 4 talking to an older host must NOT read the
+    /// appended `request_gate_repo` slot — it is past the end of that table. The
+    /// safe wrapper degrades to `None` instead.
+    #[test]
+    fn minor_gate_hides_gate_repo_on_an_older_host() {
+        let old = EphpmHostV1 { abi_version: 0x0100_0003, ..*host_table() };
+        assert!((old.abi_version & 0x00FF_FFFF) < abi::ABI_MINOR_GATE_REPO);
+        let ctx = ctx().with_gate_repo("acme/web");
+        // SAFETY: ctx and `old` outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), &old) };
+        assert_eq!(req.gate_repo(), None, "an older host has no gate-repo slot to read");
     }
 
     #[test]

@@ -163,7 +163,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ephpm_middleware::abi::{LOG_ERROR, LOG_INFO, LOG_WARN};
 use ephpm_middleware::{Middleware, Request, Response};
 
-use crate::config::{Check, Config, STATE_TTL_SECS};
+use crate::config::{Access, Check, Config, STATE_TTL_SECS};
 use crate::cookie::{read_cookie, set_cookie};
 use crate::github::{GhError, GitHub, encode_query};
 
@@ -326,27 +326,88 @@ impl GithubAuth {
         }
     }
 
+    /// The per-preview repository this request carries on the trusted router
+    /// channel (`request_gate_repo`), validated into a [`Check::Repo`].
+    ///
+    /// `None` when the channel is empty or the value fails re-validation. It is
+    /// only consulted in [`Access::PerPreview`] mode; the caller decides what an
+    /// absent repository means (a per-preview login/callback with none fails
+    /// closed). The value never comes from a client header — see the accessor.
+    fn gate_repo_check(&self, req: &Request<'_>) -> Option<Check> {
+        let spec = req.gate_repo()?;
+        match config::repo_from_spec(spec, "request_gate_repo") {
+            Ok(check) => Some(check),
+            Err(msg) => {
+                // The spec is operator-owned (not a secret), so naming it is safe
+                // and is the actionable part of a misconfigured override.
+                log(
+                    req,
+                    LOG_WARN,
+                    &format!("github-auth: ignoring invalid gate repository — {msg}"),
+                );
+                None
+            }
+        }
+    }
+
     /// 302 to GitHub's authorize endpoint, with a fresh signed `state`.
     fn start_login(&self, req: &Request<'_>, vhost: &str, return_to: &str, now: u64) -> Response {
-        let Some(check) = self.config.check_for(vhost) else {
-            log(
-                req,
-                LOG_WARN,
-                &format!(
-                    "github-auth: refusing login for vhost {vhost:?} — it has no `sites` entry and \
-                 no default target, so there is nothing to check access against"
-                ),
-            );
-            return deny(403, "This preview is not configured for GitHub access control.");
+        // What to authorize against — and, in per-preview mode, what to seal
+        // into the state so the apex callback (which cannot resolve the repo)
+        // can rebuild the exact `Check`. Each mode fails closed at *this* point
+        // when it has nothing, rather than starting a login the callback would
+        // later refuse.
+        let (check, per_preview_repo) = match self.config.access {
+            // Per-preview: the repository MUST arrive on the trusted router
+            // channel. No fallback to a configured target — that would seal no
+            // `repo` and the callback would deny late instead of here.
+            Access::PerPreview => {
+                let Some(repo) = self.gate_repo_check(req) else {
+                    log(
+                        req,
+                        LOG_WARN,
+                        &format!(
+                            "github-auth: refusing login for vhost {vhost:?} — access is \
+                             \"per-preview\" but no valid repository arrived on the trusted \
+                             channel (the site's `[preview_auth] repo`)"
+                        ),
+                    );
+                    return deny(403, "This preview is not configured for GitHub access control.");
+                };
+                (repo.clone(), Some(repo))
+            }
+            // Fixed: the configured target is authoritative and the channel is
+            // ignored — behaviour unchanged from before this feature.
+            Access::Fixed => {
+                let Some(check) = self.config.check_for(vhost).cloned() else {
+                    log(
+                        req,
+                        LOG_WARN,
+                        &format!(
+                            "github-auth: refusing login for vhost {vhost:?} — it has no `sites` \
+                             entry and no default target, so there is nothing to check access \
+                             against"
+                        ),
+                    );
+                    return deny(403, "This preview is not configured for GitHub access control.");
+                };
+                (check, None)
+            }
         };
 
         let nonce = token::random_nonce();
-        let state_claims = serde_json::json!({
+        let mut state_claims = serde_json::json!({
             "n": nonce,
             "rt": return_to,
             "v": vhost,
             "exp": now.saturating_add(STATE_TTL_SECS),
         });
+        // Seal the per-preview repository into the state so the apex callback can
+        // rebuild the exact `Check`. Only in per-preview mode; fixed mode never
+        // carries it, so its state is byte-for-byte what it was before.
+        if let Some(Check::Repo { owner, name }) = &per_preview_repo {
+            state_claims["repo"] = serde_json::Value::String(format!("{owner}/{name}"));
+        }
         let Some(state_cookie) = token::mint(self.config.state_secret.expose(), &state_claims)
         else {
             log(req, LOG_ERROR, "github-auth: could not mint the OAuth state token");
@@ -476,9 +537,44 @@ impl GithubAuth {
             &self.config.reserved_paths(),
         );
 
-        let Some(check) = self.config.check_for(target) else {
-            return deny(403, "This preview is not configured for GitHub access control.")
-                .header("Set-Cookie", clear_state);
+        // The access check to enforce. In per-preview mode the login sealed the
+        // repository into the state; the callback runs on the apex host where
+        // the router cannot resolve the target's repo, so the *signed* state is
+        // the only trustworthy source. Rebuild the `Check` from it, re-validated
+        // (the value became attacker-chosen input at the router before it was
+        // signed, and a signature attests origin, not shape). A per-preview
+        // state with no valid repository fails closed. Fixed mode keeps using
+        // the configured check exactly as before.
+        let check: Check = match self.config.access {
+            Access::PerPreview => {
+                let repo_claim = state_claims
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match config::repo_from_spec(repo_claim, "state repo") {
+                    Ok(c) => c,
+                    Err(_) => {
+                        log(
+                            req,
+                            LOG_WARN,
+                            "github-auth: per-preview callback state carries no valid repository \
+                             — rejected",
+                        );
+                        return deny(
+                            403,
+                            "This preview is not configured for GitHub access control.",
+                        )
+                        .header("Set-Cookie", clear_state);
+                    }
+                }
+            }
+            Access::Fixed => {
+                let Some(c) = self.config.check_for(target) else {
+                    return deny(403, "This preview is not configured for GitHub access control.")
+                        .header("Set-Cookie", clear_state);
+                };
+                c.clone()
+            }
         };
 
         let Some(code) = query_param(query, "code").filter(|c| is_plausible_code(c)) else {
@@ -494,7 +590,7 @@ impl GithubAuth {
         let outcome =
             self.github.exchange_code(&code, &self.redirect_uri(target)).and_then(|access| {
                 let user = self.github.current_user(&access)?;
-                let allowed = self.github.check_access(&access, check, &user)?;
+                let allowed = self.github.check_access(&access, &check, &user)?;
                 Ok((user, allowed))
             });
 
@@ -534,7 +630,7 @@ impl GithubAuth {
             &user.login,
             "github",
             Some(user.id),
-            Some(check),
+            Some(&check),
             now,
             self.config.session_ttl_secs,
             &final_return,
@@ -583,10 +679,15 @@ impl GithubAuth {
         if self.banner_done.swap(true, Ordering::Relaxed) {
             return;
         }
-        let target = self.config.default_check.as_ref().map_or_else(
-            || format!("{} vhost(s) mapped", self.config.sites.len()),
-            Check::describe,
-        );
+        let target = match self.config.access {
+            // The repository is per-preview and arrives at login on the trusted
+            // router channel, so there is no single configured target to name.
+            Access::PerPreview => "per-preview repository (from the OAuth state)".to_owned(),
+            Access::Fixed => self.config.default_check.as_ref().map_or_else(
+                || format!("{} vhost(s) mapped", self.config.sites.len()),
+                Check::describe,
+            ),
+        };
         log(
             req,
             LOG_INFO,
@@ -1318,5 +1419,205 @@ mod tests {
         let resp = mw.invoke(&req);
         let set = header(&resp, "Set-Cookie").expect("state cookie");
         assert!(set.contains("Domain=.preview.test"), "state cookie must be domain-scoped: {set}");
+    }
+
+    // ── per-preview repo gate (issue #487) ───────────────────────────────
+
+    /// A per-preview gate with NO configured target — the repo arrives per
+    /// request on the trusted `request_gate_repo` channel.
+    fn per_preview_gate() -> GithubAuth {
+        let cfg = serde_json::json!({
+            "client_id": "Iv1.test",
+            "client_secret": "client-secret",
+            "session_secret": SESSION_SECRET,
+            "access": "per-preview",
+            "github_base": "http://127.0.0.1:1",
+            "github_api_base": "http://127.0.0.1:1",
+        });
+        GithubAuth::init(&cfg).expect("per-preview init needs no default target")
+    }
+
+    /// Invoke with the trusted router repo channel set (or not).
+    fn invoke_repo(
+        mw: &GithubAuth,
+        path: &str,
+        query: &str,
+        headers: &[(String, String)],
+        site: &str,
+        repo: Option<&str>,
+    ) -> Response {
+        let mut ctx = RequestCtx::new("GET", path, query, "203.0.113.9", site, headers);
+        if let Some(r) = repo {
+            ctx = ctx.with_gate_repo(r);
+        }
+        // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        mw.invoke(&req)
+    }
+
+    /// Decode the `Set-Cookie` OAuth state a login emitted, into its claims.
+    fn state_claims_of(mw: &GithubAuth, resp: &Response) -> serde_json::Value {
+        let set = header(resp, "Set-Cookie").expect("state cookie");
+        let value = set.split(';').next().and_then(|p| p.split_once('=')).expect("cookie pair").1;
+        token::verify(mw.config.state_secret.expose(), value, unix_now()).expect("state verifies")
+    }
+
+    /// The crux (design §4): per-preview login seals the trusted-channel repo
+    /// into the signed state, keyed to the target host, so the apex callback can
+    /// rebuild the exact `Check`.
+    #[test]
+    fn per_preview_login_seals_the_repo_into_the_state() {
+        let mw = per_preview_gate();
+        let resp = invoke_repo(&mw, "/secret.php", "", &[], "pr-1.preview.test", Some("acme/web"));
+        assert_eq!(resp.__status(), 302);
+        let claims = state_claims_of(&mw, &resp);
+        assert_eq!(claims["repo"], "acme/web");
+        assert_eq!(claims["v"], "pr-1.preview.test");
+    }
+
+    /// Fail-closed (design §11): per-preview login with an EMPTY channel is
+    /// denied — and no request header can supply the repo (design §10: the
+    /// channel is not client-controllable).
+    #[test]
+    fn per_preview_login_without_a_repo_is_denied_and_headers_cannot_supply_it() {
+        let mw = per_preview_gate();
+        let spoof = vec![
+            ("x-gate-repo".to_owned(), "attacker/owns".to_owned()),
+            ("x-ephpm-gate-repo".to_owned(), "attacker/owns".to_owned()),
+            ("x-forwarded-repo".to_owned(), "attacker/owns".to_owned()),
+        ];
+        let resp = invoke_repo(&mw, "/", "", &spoof, "pr-1.preview.test", None);
+        assert_eq!(
+            resp.__status(),
+            403,
+            "no repo on the trusted channel ⇒ fail closed, and headers must not supply one"
+        );
+    }
+
+    /// A malformed repo on the channel is refused (fail closed), never gated
+    /// against a bad target.
+    #[test]
+    fn per_preview_login_with_a_malformed_repo_is_denied() {
+        let mw = per_preview_gate();
+        for bad in ["acme", "acme/", "/web", "acme/web/x", "../../etc", "acme/we b"] {
+            let resp = invoke_repo(&mw, "/", "", &[], "pr-1.preview.test", Some(bad));
+            assert_eq!(resp.__status(), 403, "repo {bad:?} must fail closed");
+        }
+    }
+
+    /// No silent behaviour change (design §7): `fixed` mode ignores the channel
+    /// entirely — its state is byte-for-byte what it was before this feature.
+    #[test]
+    fn fixed_mode_ignores_the_gate_repo_channel() {
+        let mw = gate(serde_json::json!({})); // fixed, default_check = repo acme/web
+        let resp = invoke_repo(&mw, "/", "", &[], "pr-1.preview.test", Some("evil/other"));
+        assert_eq!(resp.__status(), 302);
+        let claims = state_claims_of(&mw, &resp);
+        assert!(claims.get("repo").is_none(), "fixed mode must not seal a per-request repo");
+    }
+
+    /// The callback re-reads the sealed repo and builds `Check::Repo` from it:
+    /// a valid repo claim passes the local checks and reaches the exchange
+    /// (proving the repo was honoured) — the closed loopback port surfaces as
+    /// 502, not a 403 refusal.
+    #[test]
+    fn per_preview_callback_with_a_repo_claim_proceeds_to_the_exchange() {
+        let mw = per_preview_gate();
+        let state = token::mint(
+            mw.config.state_secret.expose(),
+            &serde_json::json!({
+                "n": "nonce-value", "rt": "/", "v": "pr-1.preview.test",
+                "repo": "acme/web", "exp": unix_now() + 300,
+            }),
+        )
+        .expect("mint");
+        let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state}"))];
+        let resp = invoke_repo(
+            &mw,
+            "/_ephpm/auth/github/callback",
+            "code=validcode123&state=nonce-value",
+            &headers,
+            "pr-1.preview.test",
+            Some("acme/web"),
+        );
+        assert_eq!(resp.__status(), 502, "a valid repo claim is honoured and reaches the exchange");
+    }
+
+    /// Fail-closed (design §11): a per-preview callback whose state carries NO
+    /// repo (e.g. a state minted by a fixed-mode login, replayed) is refused
+    /// BEFORE any network call — the closed port would be a 502, a 403 proves
+    /// the local refusal.
+    #[test]
+    fn per_preview_callback_without_a_repo_claim_is_denied_before_any_network() {
+        let mw = per_preview_gate();
+        let state = token::mint(
+            mw.config.state_secret.expose(),
+            &serde_json::json!({
+                "n": "nonce-value", "rt": "/", "v": "pr-1.preview.test", "exp": unix_now() + 300,
+            }),
+        )
+        .expect("mint");
+        let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state}"))];
+        let resp = invoke_repo(
+            &mw,
+            "/_ephpm/auth/github/callback",
+            "code=validcode123&state=nonce-value",
+            &headers,
+            "pr-1.preview.test",
+            None,
+        );
+        assert_eq!(resp.__status(), 403, "a per-preview state with no repo must fail closed");
+    }
+
+    /// Design §10: the session binds to the SITE (#396), and the repo is NOT in
+    /// it — so a session minted for preview A cannot be relabelled for another
+    /// repo, and cross-preview replay is a `site`-claim mismatch the verifier
+    /// rejects, independent of any repo.
+    #[test]
+    fn the_session_binds_to_the_site_and_never_carries_the_repo() {
+        let mw = per_preview_gate();
+        let claims = mw.session_claims(
+            "octocat",
+            "pr-1.preview.test",
+            "github",
+            Some(1),
+            Some(&Check::Repo { owner: "acme".into(), name: "web".into() }),
+            1_000,
+            3_600,
+        );
+        assert_eq!(claims["site"], "pr-1.preview.test");
+        assert!(
+            claims.get("repo").is_none(),
+            "the session binds to the site, never the repo (#396)"
+        );
+        // The repo shows only in the audit `check` string, not as an authz key.
+        assert_eq!(claims["check"], "repo acme/web");
+    }
+
+    /// Design §10: a state minted for preview A must not complete a login on
+    /// preview B — the per-vhost `target_is_allowed` binding refuses it before
+    /// any network call, regardless of the repo it carries.
+    #[test]
+    fn a_per_preview_state_for_another_host_is_refused() {
+        let mw = per_preview_gate();
+        let state = token::mint(
+            mw.config.state_secret.expose(),
+            &serde_json::json!({
+                "n": "nonce-value", "rt": "/", "v": "pr-A.preview.test",
+                "repo": "acme/web", "exp": unix_now() + 300,
+            }),
+        )
+        .expect("mint");
+        let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state}"))];
+        // The callback lands on preview B.
+        let resp = invoke_repo(
+            &mw,
+            "/_ephpm/auth/github/callback",
+            "code=validcode123&state=nonce-value",
+            &headers,
+            "pr-b.preview.test",
+            Some("acme/web"),
+        );
+        assert_eq!(resp.__status(), 400, "a state minted for host A must not complete on host B");
     }
 }

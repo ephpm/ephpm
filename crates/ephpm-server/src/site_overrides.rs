@@ -172,6 +172,20 @@ pub(crate) struct SiteOverride {
     /// must fail **closed** (503) rather than serve the preview ungated — the
     /// same narrowing-instruction rule `document_root` follows.
     pub(crate) preview_gate: Option<serde_json::Value>,
+    /// The preview access gate's target repository (`[preview_auth] repo`),
+    /// validated as `owner/name`. Present only when the operator declared it.
+    ///
+    /// Kept **separate** from [`preview_gate`](Self::preview_gate) on purpose:
+    /// the per-site verifier (the `preview-gate` builtin) must never see it — it
+    /// verifies the session, and repo authorization is the OAuth *issuer*'s job,
+    /// done once at login. The router carries this on the trusted
+    /// `request_gate_repo` ABI channel so the issuer can seal it into the signed
+    /// OAuth state; it never travels a request header.
+    ///
+    /// A present-but-invalid `repo` does **not** land here: it sets
+    /// [`unusable`](Self::unusable), failing the one site closed (503) rather
+    /// than gating it against a malformed target.
+    pub(crate) preview_gate_repo: Option<String>,
     /// Set when the override file **exists but cannot be honoured**: it is
     /// unreadable, it is not valid TOML, or a key this binary implements
     /// carries a value it had to reject. The value is a short, stable reason
@@ -236,12 +250,21 @@ struct RawPreviewAuth {
     /// indirections keep the literal out of a file switchboard derives from
     /// tenant input, and let this and the issuer name one source of truth.
     session_secret: Option<String>,
-    /// Where unauthenticated browsers are redirected — the issuer's login path
-    /// (e.g. `/auth/github/login`). Required. Note the issuer's default
-    /// `/_ephpm/...` paths are unreachable through the router (that namespace is
-    /// reserved and 404s before middleware), so the issuer — and this — must use
-    /// a path outside `/_ephpm/`.
+    /// Where unauthenticated browsers are redirected — the issuer's login path.
+    /// Required. The issuer's default `/_ephpm/auth/github/login` **is**
+    /// reachable: since #487 the router carves `/_ephpm/auth/` out of the
+    /// reserved-namespace 404 and dispatches it to the global middleware chain
+    /// (after site resolution), so the issuer's login/callback endpoints work at
+    /// their defaults. A path outside `/_ephpm/` is still fine if the operator
+    /// prefers one; it just must match the issuer's `login_path`.
     login_url: Option<String>,
+    /// The preview's target repository, `owner/name` (issue #487 per-preview
+    /// gate). Written by switchboard, validated here; surfaced separately on
+    /// [`SiteOverride::preview_gate_repo`] and carried to the OAuth issuer on
+    /// the trusted `request_gate_repo` ABI channel — **never** folded into the
+    /// gate config the verifier sees. A present-but-invalid value fails the site
+    /// closed (503), like any other value this binary understood and rejected.
+    repo: Option<String>,
     /// Session cookie name (must match the issuer's `cookie_name`).
     cookie: Option<String>,
     /// Required `iss` claim.
@@ -459,24 +482,36 @@ pub(crate) fn load(
     // anyone who guessed its hostname. So a section we understood and could not
     // turn into a working gate must fail **closed** (`unusable` → 503), never
     // fall back to serving the preview ungated.
-    let preview_gate = match &raw.preview_auth {
+    let (preview_gate, preview_gate_repo) = match &raw.preview_auth {
         Some(pa) => match resolve_preview_auth(pa) {
-            Ok(config) => Some(config),
+            Ok((config, repo)) => (Some(config), repo),
             Err(reason) => return unusable(reason, &"[preview_auth]"),
         },
-        None => None,
+        None => (None, None),
     };
 
-    SiteOverride { document_root, auto_prepend_file, preview_gate, unknown_keys, unusable: None }
+    SiteOverride {
+        document_root,
+        auto_prepend_file,
+        preview_gate,
+        preview_gate_repo,
+        unknown_keys,
+        unusable: None,
+    }
 }
 
 /// Turn a `[preview_auth]` section into the JSON config the
 /// [`preview-gate`](ephpm_middleware_builtins::preview_gate) builtin accepts,
 /// resolving the session secret indirection.
 ///
-/// Every failure is a `&'static str` reason for [`SiteOverride::unusable`]: a
-/// broken gate takes the one preview out of service rather than serving it open.
-fn resolve_preview_auth(pa: &RawPreviewAuth) -> Result<serde_json::Value, &'static str> {
+/// Returns the gate config **and** the validated per-preview repository (kept
+/// separate — the verifier must not see the repo). Every failure is a
+/// `&'static str` reason for [`SiteOverride::unusable`]: a broken gate, or a
+/// malformed repo, takes the one preview out of service rather than serving it
+/// open or gating it against a bad target.
+fn resolve_preview_auth(
+    pa: &RawPreviewAuth,
+) -> Result<(serde_json::Value, Option<String>), &'static str> {
     let login_url = pa
         .login_url
         .as_deref()
@@ -494,6 +529,16 @@ fn resolve_preview_auth(pa: &RawPreviewAuth) -> Result<serde_json::Value, &'stat
     if secret.len() < MIN_SESSION_SECRET {
         return Err("[preview_auth] `session_secret` resolved to fewer than 32 bytes");
     }
+
+    // The per-preview repository, if declared. Validated to `owner/name`; a
+    // present-but-invalid value fails the site closed, exactly like a broken
+    // `document_root`. It is deliberately NOT inserted into the gate `config`
+    // below — repo authorization is the OAuth issuer's job, and the per-site
+    // verifier this config feeds must never see it (issue #487).
+    let repo = match pa.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(spec) => Some(validate_owner_name(spec)?),
+        None => None,
+    };
 
     // Assemble the builtin's config. Only set keys the operator supplied, so the
     // builtin applies its own documented defaults for the rest.
@@ -526,7 +571,32 @@ fn resolve_preview_auth(pa: &RawPreviewAuth) -> Result<serde_json::Value, &'stat
     if let Some(paths) = &pa.exempt_paths {
         config.insert("exempt_paths".into(), serde_json::Value::from(paths.clone()));
     }
-    Ok(serde_json::Value::Object(config))
+    Ok((serde_json::Value::Object(config), repo))
+}
+
+/// Validate a `[preview_auth] repo` value as `owner/name`.
+///
+/// Mirrors the issuer's `config::repo_from_spec` shape check (both segments
+/// non-empty, no extra `/`, GitHub-name character set, not `.`/`..`) so a value
+/// accepted here is one the issuer accepts when it decodes it back out of the
+/// signed OAuth state. The duplication is forced: `ephpm-middleware-github-auth`
+/// is a `dlopen` module this crate does not link, the same reason `normalize_vhost`
+/// is duplicated there.
+fn validate_owner_name(spec: &str) -> Result<String, &'static str> {
+    let seg_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s != "."
+            && s != ".."
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let Some((owner, name)) = spec.split_once('/') else {
+        return Err("[preview_auth] `repo` must be `owner/name`");
+    };
+    if !seg_ok(owner) || name.contains('/') || !seg_ok(name) {
+        return Err("[preview_auth] `repo` must be exactly `owner/name` (GitHub names)");
+    }
+    Ok(format!("{owner}/{name}"))
 }
 
 /// Resolve a `session_secret` value, following an `env:NAME` or
@@ -1556,6 +1626,91 @@ mod tests {
             over.unknown_keys,
             vec!["preview_auth.a_key_from_a_newer_switchboard".to_string()]
         );
+    }
+
+    /// The per-preview gate (issue #487): a valid `repo` is surfaced on
+    /// `preview_gate_repo` and — the load-bearing property — is NOT folded into
+    /// the gate config the verifier sees. Repo authorization is the issuer's
+    /// job, done once at login; the verifier only checks the session.
+    #[test]
+    fn preview_auth_repo_is_surfaced_separately_never_in_the_gate_config() {
+        let f = fixture();
+        f.write(
+            "[preview_auth]\n\
+             session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             login_url = \"/auth/github/login\"\n\
+             repo = \"acme/web\"\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(over.preview_gate_repo.as_deref(), Some("acme/web"));
+        let config = over.preview_gate.expect("a valid section resolves to a gate config");
+        assert!(
+            config.get("repo").is_none(),
+            "the repo must never reach the verifier's config: {config}"
+        );
+        // And the config the verifier feeds still parses (repo omission is fine).
+        use ephpm_middleware::Middleware as _;
+        ephpm_middleware_builtins::preview_gate::PreviewGate::init(&config)
+            .expect("the gate must accept the config even with repo carried separately");
+    }
+
+    /// A `[preview_auth]` with no `repo` still resolves a working gate — the key
+    /// is optional (fixed-mode issuers do not need it).
+    #[test]
+    fn preview_auth_without_repo_still_resolves_a_gate() {
+        let f = fixture();
+        f.write(
+            "[preview_auth]\n\
+             session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+             login_url = \"/auth/github/login\"\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert!(over.preview_gate.is_some());
+        assert_eq!(over.preview_gate_repo, None);
+    }
+
+    /// A present-but-malformed `repo` fails the one site **closed** (503), like a
+    /// broken `document_root` — never gated against a malformed target, never
+    /// served ungated.
+    #[test]
+    fn a_malformed_preview_auth_repo_fails_closed() {
+        for bad in [
+            "acme",
+            "acme/",
+            "/web",
+            "acme/web/x",
+            "../../etc",
+            "acme/we b",
+            "a/b/c",
+            ".",
+            "..",
+            "acme/..",
+        ] {
+            let f = fixture();
+            f.write(&format!(
+                "[preview_auth]\n\
+                 session_secret = \"0123456789abcdef0123456789abcdef\"\n\
+                 login_url = \"/auth/github/login\"\n\
+                 repo = {bad:?}\n",
+            ));
+            let over = f.load();
+            assert!(over.unusable.is_some(), "repo {bad:?} must fail the site closed");
+            assert!(over.preview_gate.is_none(), "repo {bad:?}: no gate on a rejected section");
+            assert_eq!(over.preview_gate_repo, None, "repo {bad:?}: no repo surfaced");
+        }
+    }
+
+    /// `repo` is a **typed** field on the section, not swallowed into the
+    /// section's `unknown` bucket — otherwise it would be reported as an unknown
+    /// key and silently ignored, the exact silent-no-op class #429/#463 forbid.
+    #[test]
+    fn preview_auth_repo_is_a_typed_field_not_an_unknown_key() {
+        let raw: RawPreviewAuth =
+            toml::from_str("session_secret = \"x\"\nrepo = \"acme/web\"\n").unwrap();
+        assert!(raw.unknown.is_empty(), "repo must parse as a typed field, not land in `unknown`");
+        assert_eq!(raw.repo.as_deref(), Some("acme/web"));
     }
 
     /// `preview_auth` is a near-miss suggestion target like the scalar keys.

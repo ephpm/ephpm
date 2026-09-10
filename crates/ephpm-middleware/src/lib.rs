@@ -353,6 +353,31 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_host)(self.raw) })
     }
 
+    /// The preview access gate's `owner/name` repository for this request — the
+    /// repository the served preview is *for* — or `None` when this vhost has
+    /// no gate repository configured (ABI minor 4).
+    ///
+    /// This is a **trusted, router-populated** value drawn only from the
+    /// operator-owned per-site override, never from a request header, so an
+    /// authorization gate may treat it as authoritative — the same contract as
+    /// [`vhost_id`](Self::vhost_id). The OAuth issuer reads it at *login* (which
+    /// always runs on the target preview host) to seal the repository into the
+    /// signed OAuth `state`, because the callback lands on a different (apex)
+    /// host where the router can no longer resolve it.
+    ///
+    /// `None` on a host older than [`abi::ABI_MINOR_GATE_REPO`] (the accessor is
+    /// absent there), and a per-preview gate must fail closed on `None` rather
+    /// than invent a target.
+    #[must_use]
+    pub fn gate_repo(&self) -> Option<&str> {
+        if self.host_minor() < abi::ABI_MINOR_GATE_REPO {
+            return None;
+        }
+        // SAFETY: contract of `from_raw`; the minor gate above guarantees the
+        // `request_gate_repo` field is present on this host's table.
+        self.opt_str_of(unsafe { (self.host.request_gate_repo)(self.raw) })
+    }
+
     /// Bounded, read-only view of the buffered request body (borrowed; valid
     /// only inside `invoke`).
     ///
