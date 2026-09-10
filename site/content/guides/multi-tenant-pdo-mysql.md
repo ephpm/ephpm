@@ -50,12 +50,12 @@ too, populated per request.
    Symfony's `Env` repositories already read `$_SERVER`, so `env('DB_PASSWORD')`
    works; a bare `getenv('DB_PASSWORD')` returns `false`.
 
-2. **The password changes on every restart.** It is derived from a secret
-   generated in memory at startup and never written to disk. Do not paste it
-   into `wp-config.php` — read it from `$_SERVER` every request. This is a
-   deliberate trade: a stable password would have to be persisted somewhere,
-   and a per-tenant secret at rest is a much bigger surface than one that only
-   ever lives in memory.
+2. **Read the password from `$_SERVER` every request; don't hard-code it.**
+   Without `[kv] secret` it is derived from a random secret generated in memory
+   at startup, so it *changes on every restart*. With `[kv] secret` set (see
+   [Running wp-cli against a site](#running-wp-cli-artisan-against-a-site) below)
+   it is stable across restarts, but reading it from `$_SERVER` is still the
+   right habit — it works under both, and it is the only place ePHPm injects it.
 
 ## Configuration
 
@@ -136,9 +136,10 @@ Concretely, on a connection attempt:
 
 1. The username must normalize to a valid site key (`[a-z0-9._-]`) — this also
    bounds the filename that will be derived from it.
-2. `password = HMAC-SHA256(master_secret, site_key)`. The master secret is 32
-   random bytes drawn at startup; it never touches disk, never reaches PHP, and
-   cannot be recovered from any site's password.
+2. `password = HMAC-SHA256(master_secret, site_key)`. The master secret is
+   either the configured `[kv] secret` (when set — stable across restarts) or 32
+   random bytes drawn at startup (when unset); either way it never touches disk,
+   never reaches PHP, and cannot be recovered from any site's password.
 3. The client's challenge response is verified against that password in
    constant time.
 4. **Only then** is the site's backend resolved and bound to the connection,
@@ -297,6 +298,78 @@ attack surface on a hardened preview host. The per-site registry and the
 only the wire frontend is skipped. Startup logs that the listener is disabled.
 Leave it at the default `true` for any deployment where an app uses stock
 `pdo_mysql`.
+
+## Running wp-cli / artisan against a site
+
+`wp`, `artisan`, migrations, and seeders run through the PHP **CLI**, not an
+HTTP request — so there is no `Host` header to pick a tenant, and (for apps
+built on the [`db-*` packages](/guides/db-from-php/)) no `ephpm_db_*` backend
+bound. `ephpm php --site <key> --config <path>` supplies both:
+
+```bash
+# Offline (no server running) — opens the site's own database file directly:
+ephpm php --site shop --config /etc/ephpm/ephpm.toml -- wp --path=/srv/sites/shop db query "SELECT COUNT(*) FROM wp_posts"
+
+# Against a running server — forwards to it over the wire, so the single live
+# writer stays the server (safe even while it is serving the site):
+ephpm php --site shop --config /etc/ephpm/ephpm.toml -- vendor/bin/wp option get siteurl
+```
+
+`--config` and `--site` are ePHPm's own options and must come **before** the
+PHP program/args; everything after (including a `--` separator) is passed to PHP
+untouched. Without `--site`, `ephpm php` behaves exactly as before (no database
+bound).
+
+At startup it picks a strategy automatically:
+
+| Situation | What it does |
+|---|---|
+| A server answers on `[db.sqlite.proxy] mysql_listen` | Connects to it authenticating as the site and forwards **raw** SQL — the server does all translation, screening, query-stats, and (clustered) owner-forwarding, exactly as for an HTTP request |
+| No server, single-node / per-site-single | Opens the site's own `<key>.db` file directly (offline seeding) |
+| No server, per-site **clustered** | **Refuses** — a standalone CLI cannot reach the site's HRW owner, and opening the local file would write to a replica whose writes never replicate |
+
+Unknown or malformed `--site` keys fail closed (the same validation a request
+uses), and a config that is not multi-tenant per-site is rejected rather than
+silently binding a shared database.
+
+### The wire path needs `[kv] secret`
+
+To reach a **running** server, the CLI must present the site's MySQL password —
+which it can only derive if the server's per-site credentials come from a
+**stable, shared** secret rather than the per-process random one. Set `[kv]
+secret` (the CLI reads the same config, so it derives the identical password):
+
+```toml
+[kv]
+secret = "a-long-random-string-kept-in-a-0600-file-or-secret-mount"
+```
+
+Without it, the server still runs (random per-restart credentials) and the CLI's
+**offline** path still works, but the wire path fails closed with a message
+telling you to set `[kv] secret`.
+
+> **Security implication — state it out loud.** With `[kv] secret` set, every
+> tenant's database password is `HMAC-SHA256(secret, site_key)` over a *public*
+> site name. So **read access to the config file is enough to impersonate any
+> tenant's database connection.** That is the same trust boundary
+> [`ephpm exec`](/guides/multi-tenant-hardening/) already assumes ("whoever can
+> read this config can already impersonate any tenant"); keep the config
+> `0600` / in a secret mount, exactly as you would the secret itself. If you do
+> not need the CLI wire path, leave `[kv] secret` unset and the property never
+> applies.
+
+### Sandboxed on Linux: compose with `ephpm exec`
+
+On Linux, nest the two subcommands so the database-touching tool runs inside the
+tenant's Landlock + uid sandbox:
+
+```bash
+ephpm exec --site shop -- ephpm php --site shop --config /etc/ephpm/ephpm.toml -- wp core version
+```
+
+The outer `ephpm exec` establishes the filesystem/uid containment; the inner
+`ephpm php --site` binds the database. See
+[Multi-tenant hardening](/guides/multi-tenant-hardening/).
 
 ## See also
 

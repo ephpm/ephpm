@@ -19,6 +19,11 @@ ephpm php [options] [-f] <file> [--] [args...]
 ephpm php [options] -r <code> [--] [args...]
 ephpm php [options] -- [args...]        # program from stdin, with args
 echo '<?php ...' | ephpm php            # program from stdin
+
+# Bind a virtual host's database first, then run PHP (see "Binding a
+# virtual host's database" below). --site/--config are ePHPm's own options
+# and must come BEFORE the PHP program/args:
+ephpm php --site <key> --config <path> [PHP_ARGS...]
 ```
 
 ## Examples
@@ -47,6 +52,55 @@ printf 'a\nbb\n' | ephpm php -R 'echo strlen($argn), "\n";'
 # Print loaded modules
 ephpm php -m
 ```
+
+## Binding a virtual host's database (`--site`)
+
+In multi-tenant mode a request picks its tenant from the `Host` header; a CLI
+invocation has none. `--site <key>` (with `--config <path>`) binds the
+in-process [`ephpm_db_*` bridge](/guides/db-from-php/) to that vhost's database
+before PHP runs, so `wp`, `artisan`, migrations, and seeders built on the
+[`db-*` packages](/reference/php-packages/) reach the right tenant. Added in
+[#471](https://github.com/ephpm/ephpm/issues/471).
+
+| Option | Meaning |
+|--------|---------|
+| `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database. Validated fail-closed (an unknown or malformed key is rejected). |
+| `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. |
+
+Both are ePHPm's own options and must appear **before** the PHP program and its
+arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
+and everything after them — including a `--` separator and any `--site` a script
+itself wants — is passed to PHP untouched. Without `--site`, `ephpm php` runs
+with no database bound, exactly as before.
+
+```bash
+# Offline (no server) — opens the site's own .db file directly:
+ephpm php --site shop --config /etc/ephpm/ephpm.toml -- wp --path=/srv/sites/shop db check
+
+# Against a running server — forwards over its MySQL listener:
+ephpm php --site shop --config /etc/ephpm/ephpm.toml -- vendor/bin/wp option get siteurl
+```
+
+At startup a strategy is chosen automatically:
+
+- **A server is running** (its `[db.sqlite.proxy] mysql_listen` answers) → the
+  CLI connects to it authenticating **as the site** and forwards raw SQL. The
+  server does all translation, screening, query-stats, and (clustered)
+  owner-forwarding. This is the correct path while the server holds the database
+  file open. It requires `[kv] secret` to be set (so the CLI can derive the
+  site's password — see the [multi-tenant pdo_mysql
+  guide](/guides/multi-tenant-pdo-mysql/#the-wire-path-needs-kv-secret)); if it
+  is unset the wire path fails closed with a clear message.
+- **No server, single-node / per-site-single** → the CLI opens the site's own
+  `<key>.db` directly (offline seeding).
+- **No server, per-site clustered** → **refused**: a standalone CLI cannot reach
+  the site's owner, and opening the local file could write to a replica whose
+  writes never replicate.
+
+`--site` requires multi-tenant per-site mode (`[server] sites_dir` + `[db.sqlite]`);
+a single-shared-database config is rejected rather than bound. On Linux, wrap the
+whole thing in [`ephpm exec --site …`](/guides/multi-tenant-hardening/) to run it
+inside the tenant's filesystem/uid sandbox.
 
 ## Drop-in for the stock `php` CLI
 

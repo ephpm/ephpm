@@ -33,6 +33,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod exec_sandbox;
 mod fatal_signal;
 mod service;
+mod site_db;
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
@@ -93,8 +94,29 @@ enum Commands {
     },
 
     /// Run PHP CLI commands using the embedded PHP runtime
+    ///
+    /// With `--site` (and `--config`) the in-process `ephpm_db_*` bridge is
+    /// bound to a virtual host's database, so `wp`, `artisan`, migrations, and
+    /// seeders built on the `db-*` Composer packages reach that tenant's Turso
+    /// database — over the running server's wire listener when one is up, or by
+    /// opening the site's file directly for offline work (issue #471).
     #[command(disable_help_flag = true)]
     Php {
+        /// Path to the ephpm configuration file. Only read together with
+        /// `--site`; supplies `[server] sites_dir`, `[db.sqlite]`, and
+        /// `[kv] secret` so the CLI can locate and authenticate to the site's
+        /// database. `--long` only (never `-c`), to avoid colliding with
+        /// php-cli's own `-c <path>` ini flag in the passthrough args.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Bind `ephpm_db_*` to virtual host `<key>`'s database (requires
+        /// multi-tenant `[server] sites_dir` + `[db.sqlite]` and `--config`).
+        /// Without it, `ephpm php` runs with no embedded database bound, exactly
+        /// as before.
+        #[arg(long)]
+        site: Option<String>,
+
         /// Arguments to pass to the PHP interpreter
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -371,7 +393,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Php { args }) => run_php(&php_cli_args(&args)),
+        Some(Commands::Php { config, site, args }) => run_php(config, site, &php_cli_args(&args)),
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
             ensure_cli_tracing();
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
@@ -604,8 +626,13 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
 /// `… | php -- a b` reads the program from stdin and passes `a b` to it
 /// rather than running a script named `a`. clap consumes the first `--` it
 /// sees, so the parsed `Vec<String>` cannot express the difference. `ephpm`
-/// declares no global options before its subcommand, so argv[1] is always the
-/// `php` token and argv[2..] is exactly what the user typed after it.
+/// declares no global options before its subcommand, so argv[1] is the `php`
+/// token; argv[2..] is what the user typed after it, minus the ePHPm-owned
+/// `--config`/`--site` options clap consumes as a leading prefix (they are
+/// `--long`-only, chosen so they never collide with php-cli's own short flags
+/// in the passthrough). Those are stripped by [`strip_leading_site_opts`]
+/// before the `--` reconstruction so the comparison against clap's parsed args
+/// lines up.
 ///
 /// Falls back to clap's view for any argv shape that doesn't match that
 /// expectation (including non-UTF-8 arguments), so this can only ever restore
@@ -613,7 +640,29 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
 fn php_cli_args(parsed: &[String]) -> Vec<String> {
     let raw =
         std::env::args_os().skip(2).map(|a| a.into_string().ok()).collect::<Option<Vec<String>>>();
-    restore_php_separator(raw, parsed)
+    restore_php_separator(raw.map(strip_leading_site_opts), parsed)
+}
+
+/// Drop the leading run of ePHPm-owned `--config`/`--site` option tokens (and
+/// their values) from raw `php` argv, leaving exactly the PHP passthrough. Only
+/// a *leading* run is stripped — matching where clap consumes them (before the
+/// first positional / `--`), so a `--site` appearing *after* a PHP script name
+/// is left untouched for the script, exactly as clap routes it into `args`.
+fn strip_leading_site_opts(raw: Vec<String>) -> Vec<String> {
+    let mut i = 0;
+    while i < raw.len() {
+        let tok = raw[i].as_str();
+        if tok == "--config" || tok == "--site" {
+            // Option plus its value token (if present).
+            i += if i + 1 < raw.len() { 2 } else { 1 };
+        } else if tok.starts_with("--config=") || tok.starts_with("--site=") {
+            // `--opt=value` is a single token.
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    raw[i..].to_vec()
 }
 
 /// Pure half of [`php_cli_args`]: `raw` is argv[2..] when it was all valid
@@ -635,7 +684,56 @@ fn restore_php_separator(raw: Option<Vec<String>>, parsed: &[String]) -> Vec<Str
 /// by the CLI pre-scan in `ephpm_php::PhpRuntime::cli_main`, matching php-cli
 /// — the former "runtime `-d extension=` is ignored" warning is gone because
 /// the limitation is gone (issue #331).
-fn run_php(args: &[String]) -> anyhow::Result<ExitCode> {
+///
+/// With `--site`, the `ephpm_db_*` bridge is bound to that virtual host's
+/// database before PHP runs (issue #471, [`site_db::bind_site_db`]): a
+/// background tokio runtime drives the async backend work while PHP executes on
+/// this (main) thread, so the bridge's `Handle::block_on` is legal — this thread
+/// is never a runtime worker, the same invariant the server relies on.
+fn run_php(
+    config: Option<PathBuf>,
+    site: Option<String>,
+    args: &[String],
+) -> anyhow::Result<ExitCode> {
+    // Hold the runtime for the whole PHP execution when a --site backend is
+    // bound: the bridge captured its `Handle` and `block_on`s onto it from PHP.
+    let _db_runtime = match site {
+        Some(site_key) => {
+            ensure_cli_tracing();
+            let config_path = config.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`ephpm php --site {site_key}` requires `--config <path>` (it supplies \
+                     [server] sites_dir, [db.sqlite], and [kv] secret)"
+                )
+            })?;
+            if !config_path.exists() {
+                anyhow::bail!("configuration file not found: {}", config_path.display());
+            }
+            let cfg = ephpm_config::Config::load(&config_path)
+                .with_context(|| format!("loading configuration from {}", config_path.display()))?;
+            // A dedicated multi-thread runtime, NOT entered on this thread —
+            // PHP runs here, the runtime's own worker threads drive the backend.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("ephpm-php-db")
+                .build()
+                .context("failed to build the database runtime for `ephpm php --site`")?;
+            site_db::bind_site_db(&cfg, &site_key, runtime.handle())?;
+            Some(runtime)
+        }
+        None => {
+            // `--config` alone does nothing — it only locates a site's database.
+            // Say so rather than ignoring it silently.
+            if config.is_some() {
+                eprintln!(
+                    "warning: `ephpm php --config` has no effect without `--site`; ignoring it"
+                );
+            }
+            None
+        }
+    };
+
     let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
     Ok(exit_code_from(exit_code))
@@ -2143,6 +2241,80 @@ mod php_arg_tests {
         let parsed = v(&["-r", "echo 1;"]);
         assert_eq!(restore_php_separator(Some(v(&["something", "else"])), &parsed), parsed);
         assert_eq!(restore_php_separator(None, &parsed), parsed);
+    }
+
+    // ── --site / --config prefix stripping (issue #471) ─────────────────────
+
+    #[test]
+    fn strips_leading_config_and_site_options() {
+        // The ePHPm-owned options clap consumes are removed; the PHP args remain.
+        assert_eq!(
+            strip_leading_site_opts(v(&["--config", "e.toml", "--site", "shop", "-r", "echo 1;"])),
+            v(&["-r", "echo 1;"])
+        );
+        assert_eq!(strip_leading_site_opts(v(&["--site", "shop"])), v(&[] as &[&str]));
+    }
+
+    #[test]
+    fn strips_equals_form_options() {
+        assert_eq!(
+            strip_leading_site_opts(v(&["--site=shop", "--config=e.toml", "wp", "db", "query"])),
+            v(&["wp", "db", "query"])
+        );
+    }
+
+    #[test]
+    fn strip_stops_at_the_first_php_argument() {
+        // A `--site` appearing *after* a PHP token is the script's argument, not
+        // ePHPm's — clap routes it into `args`, and stripping must leave it be.
+        assert_eq!(
+            strip_leading_site_opts(v(&["script.php", "--site", "bar"])),
+            v(&["script.php", "--site", "bar"])
+        );
+        // No leading options at all → unchanged.
+        assert_eq!(strip_leading_site_opts(v(&["-r", "echo 1;"])), v(&["-r", "echo 1;"]));
+    }
+
+    #[test]
+    fn strip_then_restore_recovers_a_stdin_separator_after_site() {
+        // `ephpm php --site shop -- a b`: after stripping `--site shop`, the
+        // `--` clap swallowed is restored for php-cli's stdin semantics.
+        let raw = v(&["--site", "shop", "--", "a", "b"]);
+        let parsed = v(&["a", "b"]);
+        assert_eq!(
+            restore_php_separator(Some(strip_leading_site_opts(raw)), &parsed),
+            v(&["--", "a", "b"])
+        );
+    }
+
+    #[test]
+    fn clap_separates_site_from_passthrough_but_leaves_bare_php_alone() {
+        use clap::Parser;
+
+        // --site/--config before the passthrough are ePHPm's; the rest is PHP's.
+        let cli = Cli::try_parse_from(["ephpm", "php", "--site", "shop", "-r", "echo 1;"]).unwrap();
+        let Some(Commands::Php { config, site, args }) = cli.command else {
+            panic!("expected a php command");
+        };
+        assert_eq!(site.as_deref(), Some("shop"));
+        assert!(config.is_none());
+        assert_eq!(args, v(&["-r", "echo 1;"]));
+
+        // No --site → behaves exactly as before: everything is PHP's.
+        let cli = Cli::try_parse_from(["ephpm", "php", "-r", "echo 1;"]).unwrap();
+        let Some(Commands::Php { site, args, .. }) = cli.command else {
+            panic!("expected a php command");
+        };
+        assert!(site.is_none());
+        assert_eq!(args, v(&["-r", "echo 1;"]));
+
+        // A --site after a script name is the script's, captured into args.
+        let cli = Cli::try_parse_from(["ephpm", "php", "script.php", "--site", "x"]).unwrap();
+        let Some(Commands::Php { site, args, .. }) = cli.command else {
+            panic!("expected a php command");
+        };
+        assert!(site.is_none());
+        assert_eq!(args, v(&["script.php", "--site", "x"]));
     }
 }
 

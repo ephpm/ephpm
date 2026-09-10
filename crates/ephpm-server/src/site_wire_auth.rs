@@ -51,11 +51,26 @@
 //!
 //! `password = HMAC-SHA256(master_secret, site_key)`, hex-encoded — the same
 //! derivation, and the same function, the KV listener uses
-//! ([`ephpm_kv::auth::derive_site_password`]). The master secret is 32 random
-//! bytes generated at startup and never leaves the process: it is not written
-//! to disk, not exposed to PHP, and not derivable from any site's password
-//! (that is what makes HMAC the right primitive rather than a hash of
-//! secret+key).
+//! ([`ephpm_kv::auth::derive_site_password`]).
+//!
+//! The master secret comes from one of two sources (see
+//! [`SiteWireAuth::with_route_and_secret`]):
+//!
+//! * **Stable, config-sourced** — the `[kv] secret` value, shared with the KV
+//!   RESP listener. This is what lets a co-located `ephpm php --site` /
+//!   `ephpm exec` process (issue #471) reach a live server's per-site database:
+//!   reading the same config yields the same per-site password. The trade is a
+//!   real one — **config-read then grants tenant-impersonation**, because every
+//!   tenant's password is a pure function of the secret and the public site
+//!   name. That is the same boundary `ephpm exec` already documents.
+//! * **Per-process random** — 32 bytes of OS entropy generated at startup, used
+//!   when no `[kv] secret` is set. It never leaves the process (not on disk,
+//!   not exposed to PHP), so the CLI wire path is unavailable (it fails closed)
+//!   and, as before, **the credentials rotate on every restart**.
+//!
+//! Either way the secret itself is never sent to PHP and never logged — only
+//! per-site derivations of it are. HMAC (rather than a hash of secret+key) is
+//! what keeps the secret non-recoverable from any site's password.
 //!
 //! Each site's *own* password is injected into that site's requests as
 //! `$_SERVER['DB_PASSWORD']` by the router, which builds it per request from
@@ -63,11 +78,13 @@
 //! thread-local in ePHPm's SAPI, so site B's PHP never observes site A's
 //! credential.
 //!
-//! Consequence worth knowing: **the credentials rotate on every restart.** A
-//! tenant must read them from `$_SERVER`, not hard-code them in
-//! `wp-config.php`. That is a deliberate trade — a stable password would have
-//! to be persisted somewhere, and a per-tenant secret at rest is a much larger
-//! surface than one that lives only in memory.
+//! Consequence worth knowing: with the **random** secret (no `[kv] secret`),
+//! the credentials rotate on every restart, so a tenant must read them from
+//! `$_SERVER`, not hard-code them in `wp-config.php`. With a **stable** `[kv]
+//! secret` the derived password is constant across restarts (which is what the
+//! `ephpm php --site` CLI needs), at the cost of the config-read impersonation
+//! boundary noted above. Reading from `$_SERVER` is still the right habit — it
+//! works under both.
 //!
 //! # Which node serves the connection (clustered)
 //!
@@ -211,7 +228,28 @@ impl SiteWireAuth {
     /// secret makes every tenant's password derivable from its (public) site
     /// name, which is worse than not starting.
     pub fn new(backends: SiteBackends) -> anyhow::Result<Self> {
-        Self::with_route(Arc::new(backends))
+        Self::with_route_and_secret(Arc::new(backends), None)
+    }
+
+    /// Like [`Self::new`], but seed the master secret from a **stable,
+    /// config-sourced** value (`[kv] secret`) when one is present.
+    ///
+    /// This is how the `ephpm php --site` CLI wire path (issue #471) can
+    /// authenticate to a running server: a co-located process that reads the
+    /// same config derives the identical per-site password. When
+    /// `config_secret` is `None`/empty the behaviour is unchanged from
+    /// [`Self::new`] — a fresh per-process random secret, so the CLI wire path
+    /// is simply unavailable (it fails closed with a clear message).
+    ///
+    /// # Errors
+    ///
+    /// Fails if a random secret is needed and the OS entropy source is
+    /// unavailable — see [`Self::with_route_and_secret`].
+    pub fn new_with_secret(
+        backends: SiteBackends,
+        config_secret: Option<String>,
+    ) -> anyhow::Result<Self> {
+        Self::with_route_and_secret(Arc::new(backends), config_secret)
     }
 
     /// Generate a fresh master secret and resolve authenticated sites through
@@ -226,19 +264,60 @@ impl SiteWireAuth {
     ///
     /// Fails if the OS entropy source is unavailable — see [`Self::new`].
     pub fn with_route(route: Arc<dyn SiteWireRoute>) -> anyhow::Result<Self> {
-        let mut raw = [0u8; MASTER_SECRET_BYTES];
-        getrandom::fill(&mut raw).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to generate the per-site database master secret from OS entropy: {e}. \
-                 Refusing to start rather than derive tenant credentials from a predictable \
-                 secret."
-            )
-        })?;
-        let secret = raw.iter().fold(String::with_capacity(64), |mut s, b| {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-            s
-        });
+        Self::with_route_and_secret(route, None)
+    }
+
+    /// Resolve authenticated sites through `route`, deriving per-site passwords
+    /// from `config_secret` when it is `Some(non-empty)` and from a fresh
+    /// per-process random secret otherwise.
+    ///
+    /// # Security note (config-read ⇒ tenant impersonation)
+    ///
+    /// With a stable `[kv] secret`, every tenant's MySQL password is a pure
+    /// function of that secret and the (public) site name. So **anyone who can
+    /// read the config file can mint any tenant's credential** and connect as
+    /// that tenant. This is the same trust boundary `ephpm exec` already
+    /// documents ("whoever can read this config can already impersonate any
+    /// tenant"), and it is the deliberate trade for a CLI that can reach a live
+    /// server's per-site database. The random fallback keeps that property off
+    /// unless an operator opts in by setting `[kv] secret`. The secret is still
+    /// never sent to PHP and never logged; only per-site derivations are
+    /// injected into `$_SERVER`.
+    ///
+    /// # Errors
+    ///
+    /// Fails only when a random secret is required (no config secret) and the
+    /// OS entropy source is unavailable — deliberately fatal rather than
+    /// falling back to a predictable secret.
+    pub fn with_route_and_secret(
+        route: Arc<dyn SiteWireRoute>,
+        config_secret: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let secret = match config_secret {
+            Some(s) if !s.is_empty() => {
+                tracing::info!(
+                    "per-site MySQL wire credentials derive from the stable [kv] secret; a \
+                     co-located `ephpm php --site` / `ephpm exec` process that can read this \
+                     config can authenticate as any tenant (config-read ⇒ tenant impersonation)"
+                );
+                s
+            }
+            _ => {
+                let mut raw = [0u8; MASTER_SECRET_BYTES];
+                getrandom::fill(&mut raw).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to generate the per-site database master secret from OS entropy: \
+                         {e}. Refusing to start rather than derive tenant credentials from a \
+                         predictable secret."
+                    )
+                })?;
+                raw.iter().fold(String::with_capacity(64), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                })
+            }
+        };
         Ok(Self { inner: Arc::new(Inner { secret, route }) })
     }
 
