@@ -222,6 +222,47 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-${{ matrix.arch.sdk }}
           path: ${{ steps.pkg.outputs.archive }}
 
+      # -- github-auth middleware module (built once per arch) -----------------
+      # The OAuth preview gate is a dlopen'd cdylib; the preview nodes have no
+      # Rust toolchain to build it, so it ships as a release artifact. It does
+      # NOT depend on the PHP SDK or the PHP version -- it is a pure middleware
+      # cdylib -- so it is built ONCE per Linux arch (the first matrix leg,
+      # job-index 0), NOT once per PHP minor. Built in the SAME ephpm-ci
+      # container as the ephpm binary above (glibc 2.28 floor -> libc- and
+      # C-ABI-matched to the release) and against the SAME bind-mounted
+      # /w/target dir (the default CARGO_TARGET_DIR -- no separate cache), with
+      # the same LTO setting the binary used so shared deps (rustls, aws-lc-rs,
+      # hyper, ...) already compiled for the binary are reused rather than
+      # rebuilt. Output: target/<triple>/release/libgithub_auth.so.
+      - name: Build the github-auth middleware module
+        if: strategy.job-index == 0
+        run: |
+          set -eu
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_PROFILE_RELEASE_LTO="${{ matrix.arch.lto }}" \
+            -e CARGO_TERM_COLOR=always \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            sh -euc '
+              # aws-lc-rs (rustls provider) needs a C compiler if it is not
+              # already warm in target/. Best-effort, same as the binary step.
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; aws-lc-rs may fail to compile from cold"
+              cargo build -p ephpm-middleware-github-auth --release \
+                --target ${{ matrix.arch.triple }}
+            '
+          mkdir -p dist
+          cp "target/${{ matrix.arch.triple }}/release/libgithub_auth.so" \
+             "dist/libgithub_auth-${{ matrix.arch.sdk }}.so"
+
+      - name: Upload the github-auth module
+        if: strategy.job-index == 0
+        uses: actions/upload-artifact@v4
+        with:
+          # Prefix `ephpm-${ref}` so collect_release_artifacts.sh picks it up.
+          name: ephpm-${{ github.ref_name }}-libgithub_auth-${{ matrix.arch.sdk }}
+          path: dist/libgithub_auth-${{ matrix.arch.sdk }}.so
+
   # -- Linux arm64 binaries ----------------------------------------------------
   build-linux-arm64:
     name: Build (PHP ${{ matrix.php.full }}, linux-aarch64)
@@ -293,6 +334,38 @@ jobs:
         with:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-aarch64
           path: ${{ steps.pkg.outputs.archive }}
+
+      # -- github-auth middleware module (built once per arch) -----------------
+      # See build-linux for the full rationale. Built once (job-index 0), in
+      # ephpm-ci:latest-arm64 (glibc 2.28 floor), against the same warm
+      # /w/target dir, with LTO off to match the arm64 binary build so shared
+      # deps are reused. Output: target/aarch64-unknown-linux-gnu/release/
+      # libgithub_auth.so.
+      - name: Build the github-auth middleware module
+        if: strategy.job-index == 0
+        run: |
+          set -eu
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_PROFILE_RELEASE_LTO="off" \
+            -e CARGO_TERM_COLOR=always \
+            ephpm/ephpm-ci:latest-arm64 \
+            sh -euc '
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; aws-lc-rs may fail to compile from cold"
+              cargo build -p ephpm-middleware-github-auth --release \
+                --target aarch64-unknown-linux-gnu
+            '
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/libgithub_auth.so \
+             dist/libgithub_auth-linux-aarch64.so
+
+      - name: Upload the github-auth module
+        if: strategy.job-index == 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-${{ github.ref_name }}-libgithub_auth-linux-aarch64
+          path: dist/libgithub_auth-linux-aarch64.so
 
   # -- macOS binaries ---------------------------------------------------------
   build-macos:
@@ -987,11 +1060,22 @@ jobs:
         run: |
           set -eu
           mkdir -p release
-          # The collect step above extracted every archive flat under
+          # The collect step above extracted every artifact flat under
           # artifacts/; gather them so SHA256SUMS lives next to what it sums.
-          find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
-          (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
-          echo "Collected $(ls release/*.tar.gz | wc -l) archives:"
+          # Besides the per-platform *.tar.gz binary archives, the release also
+          # ships the github-auth middleware as a bare per-arch *.so (built by
+          # the build-linux / build-linux-arm64 jobs). nullglob keeps the *.so
+          # pattern from erroring on the republish path, where an older run's
+          # artifacts predate the module and only *.tar.gz is present.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.so' \) \
+            -exec cp {} release/ \;
+          (
+            cd release
+            shopt -s nullglob
+            assets=( *.tar.gz *.so )
+            sha256sum "${assets[@]}" | sort > SHA256SUMS
+          )
+          echo "Collected release assets:"
           ls -lh release/
 
       - name: Create GitHub release

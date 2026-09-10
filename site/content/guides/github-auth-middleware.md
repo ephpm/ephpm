@@ -123,6 +123,14 @@ builtin instead.
 
 ## Build and mount
 
+The Linux module ships with every ePHPm release, so you normally do not build
+it yourself. Each tagged release attaches a per-arch, glibc-dynamic
+`libgithub_auth-linux-x86_64.so` / `libgithub_auth-linux-aarch64.so` alongside
+the binary archives (covered by `SHA256SUMS`). It is built in the same
+glibc-floor container as the release binary, so it is libc- and C-ABI-matched
+to it — download it and point `library` at it. macOS and Windows are not
+shipped; build those yourself:
+
 ```bash
 cargo build --release -p ephpm-middleware-github-auth
 # target/release/libgithub_auth.so    (Linux)
