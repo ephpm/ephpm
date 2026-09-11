@@ -38,7 +38,8 @@ pub struct AnalyzerStatus {
 /// Everything one `ephpm analyze` run produced.
 #[derive(Debug, Clone)]
 pub struct AnalysisReport {
-    /// All findings across all analyzers, sorted most severe first.
+    /// The findings that gate: post scope-filter, operator suppressions,
+    /// and baseline — sorted most severe first.
     pub findings: Vec<Finding>,
     /// Per-analyzer outcome, in execution order.
     pub statuses: Vec<AnalyzerStatus>,
@@ -48,6 +49,13 @@ pub struct AnalysisReport {
     pub score: u32,
     /// Why the verdict is what it is — one line per policy layer that fired.
     pub reasons: Vec<String>,
+    /// Findings dropped because their path was outside the diff-aware scope
+    /// (`since:` / `--since`). `0` on a full run.
+    pub out_of_scope: usize,
+    /// Findings waived by operator `suppress:` rules.
+    pub waived: usize,
+    /// Findings suppressed by the configured baseline file.
+    pub baseline_suppressed: usize,
 }
 
 impl AnalysisReport {

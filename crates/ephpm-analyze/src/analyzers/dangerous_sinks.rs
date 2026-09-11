@@ -20,8 +20,9 @@
 
 use std::path::Path;
 
+use super::php_files::scan_php_tree;
 use crate::analyzer::{AnalysisCtx, Analyzer, AnalyzerError};
-use crate::finding::{Category, Finding, Severity};
+use crate::finding::{Category, Confidence, Finding, Severity};
 
 /// See the module docs.
 pub struct DangerousSinks;
@@ -29,19 +30,8 @@ pub struct DangerousSinks;
 /// The analyzer's stable id.
 pub const ID: &str = "dangerous-sinks";
 
-/// Files larger than this are skipped (a minified/vendored blob would drown
-/// the report; the YARA analyzer is the right tool for opaque payloads).
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-
 const SINKS: &[(&str, Severity)] =
     &[("eval", Severity::High), ("system", Severity::High), ("assert", Severity::Medium)];
-
-fn is_php_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some(ext) if ext.eq_ignore_ascii_case("php") || ext.eq_ignore_ascii_case("phtml")
-    )
-}
 
 /// `true` when the byte before a candidate token rules it out as a direct
 /// function call: part of a longer identifier (`subsystem(`), a variable
@@ -83,36 +73,15 @@ fn scan_text(text: &str, rel_path: &Path) -> Vec<Finding> {
                     path: Some(rel_path.to_path_buf()),
                     line: Some(line_idx as u64 + 1),
                     message: format!("call to {sink}() — dangerous sink"),
+                    // A naive token pass with known false positives (matches
+                    // inside comments/strings) is a hotspot, not proof — the
+                    // Phase-2 opcode analyzer will confirm.
+                    confidence: Confidence::Suspected,
                 });
             }
         }
     }
     findings
-}
-
-/// Recursively walk `dir`, scanning PHP files. Does not follow directory
-/// symlinks; skips `.git`.
-fn walk(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<(), AnalyzerError> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            if entry.file_name() == ".git" {
-                continue;
-            }
-            walk(root, &path, findings)?;
-        } else if file_type.is_file() && is_php_file(&path) {
-            if entry.metadata()?.len() > MAX_FILE_BYTES {
-                continue;
-            }
-            let bytes = std::fs::read(&path)?;
-            let text = String::from_utf8_lossy(&bytes);
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            findings.extend(scan_text(&text, rel));
-        }
-    }
-    Ok(())
 }
 
 impl Analyzer for DangerousSinks {
@@ -125,9 +94,7 @@ impl Analyzer for DangerousSinks {
     }
 
     fn run(&self, ctx: &AnalysisCtx) -> Result<Vec<Finding>, AnalyzerError> {
-        let mut findings = Vec::new();
-        walk(ctx.root(), ctx.root(), &mut findings)?;
-        Ok(findings)
+        scan_php_tree(ctx, ID, &scan_text)
     }
 }
 
@@ -166,6 +133,8 @@ mod tests {
         assert_eq!(findings[0].rule_id, "dangerous-sinks/eval");
         assert_eq!(findings[0].line, Some(3));
         assert_eq!(findings[0].severity, Severity::High);
+        // A naive token pass is a hotspot, never confirmed evidence.
+        assert!(findings.iter().all(|f| f.confidence == Confidence::Suspected));
         assert_eq!(findings[1].rule_id, "dangerous-sinks/system");
         assert_eq!(findings[1].line, Some(4));
         assert_eq!(findings[2].rule_id, "dangerous-sinks/assert");

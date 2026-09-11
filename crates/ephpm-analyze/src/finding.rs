@@ -74,6 +74,41 @@ impl fmt::Display for Category {
     }
 }
 
+/// How sure the producing analyzer is that a finding is real — the axis that
+/// separates *hotspots* from confirmed problems.
+///
+/// The policy engine (`crate::policy`) treats the two very differently:
+/// `Confirmed` findings can drive a hard `Deny` (deny-hard match, critical
+/// severity, deny-score threshold), while `Suspected` findings are review
+/// signals — they contribute to the score and can floor the verdict at
+/// `Quarantine`, but never force `Deny` on their own. "Definitely malicious →
+/// deny" stays separate from "suspicious → quarantine for review".
+///
+/// The ordering (`Suspected < Confirmed`) is load-bearing for comparisons.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// A heuristic hit that may be a false positive — a hotspot worth human
+    /// review, not proof.
+    Suspected,
+    /// The analyzer is confident the finding is real (a known advisory
+    /// against a pinned lockfile, a malware-signature match, a fact about
+    /// the file's content). The default: absence of doubt is confirmed.
+    #[default]
+    Confirmed,
+}
+
+impl fmt::Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Suspected => "suspected",
+            Self::Confirmed => "confirmed",
+        })
+    }
+}
+
 /// One result produced by an analyzer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
@@ -94,4 +129,8 @@ pub struct Finding {
     pub line: Option<u64>,
     /// Human-readable description.
     pub message: String,
+    /// How sure the analyzer is — see [`Confidence`] for the policy
+    /// consequences. Defaults to `Confirmed` when absent in serialized form.
+    #[serde(default)]
+    pub confidence: Confidence,
 }

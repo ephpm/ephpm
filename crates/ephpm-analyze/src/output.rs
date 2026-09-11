@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::finding::{Finding, Severity};
+use crate::finding::{Confidence, Finding, Severity};
 use crate::report::{AnalysisReport, AnalyzerState};
 
 /// SARIF `level` for a severity.
@@ -17,6 +17,15 @@ fn sarif_level(severity: Severity) -> &'static str {
         Severity::Info | Severity::Low => "note",
         Severity::Medium => "warning",
         Severity::High | Severity::Critical => "error",
+    }
+}
+
+/// SARIF `rank` (0.0–100.0, "importance for triage") from confidence:
+/// confirmed findings outrank suspected hotspots at equal severity.
+fn sarif_rank(confidence: Confidence) -> f64 {
+    match confidence {
+        Confidence::Suspected => 40.0,
+        Confidence::Confirmed => 80.0,
     }
 }
 
@@ -77,6 +86,12 @@ struct SarifRunProperties {
     verdict: String,
     #[serde(rename = "ephpm/score")]
     score: u32,
+    #[serde(rename = "ephpm/outOfScope")]
+    out_of_scope: usize,
+    #[serde(rename = "ephpm/waived")]
+    waived: usize,
+    #[serde(rename = "ephpm/baselineSuppressed")]
+    baseline_suppressed: usize,
 }
 
 #[derive(Serialize)]
@@ -84,6 +99,8 @@ struct SarifResult {
     #[serde(rename = "ruleId")]
     rule_id: String,
     level: &'static str,
+    /// Triage importance derived from confidence — see [`sarif_rank`].
+    rank: f64,
     message: SarifMessage,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     locations: Vec<SarifLocation>,
@@ -96,6 +113,8 @@ struct SarifResultProperties {
     severity: String,
     #[serde(rename = "ephpm/category")]
     category: String,
+    #[serde(rename = "ephpm/confidence")]
+    confidence: String,
 }
 
 #[derive(Serialize)]
@@ -148,11 +167,13 @@ fn sarif_result(finding: &Finding) -> SarifResult {
     SarifResult {
         rule_id: finding.rule_id.clone(),
         level: sarif_level(finding.severity),
+        rank: sarif_rank(finding.confidence),
         message: SarifMessage { text: finding.message.clone() },
         locations,
         properties: SarifResultProperties {
             severity: finding.severity.to_string(),
             category: finding.category.to_string(),
+            confidence: finding.confidence.to_string(),
         },
     }
 }
@@ -210,6 +231,9 @@ pub fn to_sarif(report: &AnalysisReport) -> anyhow::Result<String> {
             properties: SarifRunProperties {
                 verdict: report.verdict.to_string(),
                 score: report.score,
+                out_of_scope: report.out_of_scope,
+                waived: report.waived,
+                baseline_suppressed: report.baseline_suppressed,
             },
         }],
     };
@@ -242,13 +266,29 @@ pub fn to_text(report: &AnalysisReport) -> String {
             (Some(path), None) => path.display().to_string(),
             _ => "-".to_owned(),
         };
+        // Suspected findings are hotspots (review signals); the marker keeps
+        // the common confirmed case visually quiet.
+        let suffix = match finding.confidence {
+            Confidence::Confirmed => "",
+            Confidence::Suspected => " [suspected]",
+        };
         let _ = writeln!(
             out,
-            "  [{:<8}] {:<32} {location}: {}",
+            "  [{:<8}] {:<32} {location}: {}{suffix}",
             finding.severity, finding.rule_id, finding.message
         );
     }
     let _ = writeln!(out);
+    if report.out_of_scope > 0 {
+        let _ = writeln!(out, "out of scope: {} finding(s) (diff-aware run)", report.out_of_scope);
+    }
+    if report.waived > 0 {
+        let _ = writeln!(out, "waived:  {} finding(s) by operator suppressions", report.waived);
+    }
+    if report.baseline_suppressed > 0 {
+        let _ =
+            writeln!(out, "baseline: {} known finding(s) suppressed", report.baseline_suppressed);
+    }
     let _ = writeln!(out, "score:   {}", report.score);
     let _ = writeln!(out, "verdict: {}", report.verdict);
     for reason in &report.reasons {
@@ -276,6 +316,7 @@ mod tests {
                     path: Some(PathBuf::from("src\\index.php")),
                     line: Some(12),
                     message: "eval() call".to_owned(),
+                    confidence: Confidence::Suspected,
                 },
                 Finding {
                     rule_id: "composer-audit/CVE-2024-1".to_owned(),
@@ -284,6 +325,7 @@ mod tests {
                     path: None,
                     line: None,
                     message: "vulnerable dependency".to_owned(),
+                    confidence: Confidence::Confirmed,
                 },
             ],
             statuses: vec![
@@ -303,6 +345,9 @@ mod tests {
             verdict: Verdict::Quarantine,
             score: 14,
             reasons: vec!["score 14 >= quarantine threshold 10".to_owned()],
+            out_of_scope: 3,
+            waived: 2,
+            baseline_suppressed: 1,
         }
     }
 
@@ -324,12 +369,21 @@ mod tests {
         // Pathless finding has no locations key at all.
         assert!(results[1].get("locations").is_none());
         assert_eq!(results[1]["level"], "warning");
+        // Confidence surfaces as rank + a property: suspected hotspots rank
+        // below confirmed findings.
+        assert_eq!(results[0]["rank"], 40.0);
+        assert_eq!(results[0]["properties"]["ephpm/confidence"], "suspected");
+        assert_eq!(results[1]["rank"], 80.0);
+        assert_eq!(results[1]["properties"]["ephpm/confidence"], "confirmed");
         // Rule index covers both rule ids.
         let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 2);
         // Verdict rides in run properties; failed analyzer flips
         // executionSuccessful and produces an error notification.
         assert_eq!(run["properties"]["ephpm/verdict"], "quarantine");
+        assert_eq!(run["properties"]["ephpm/outOfScope"], 3);
+        assert_eq!(run["properties"]["ephpm/waived"], 2);
+        assert_eq!(run["properties"]["ephpm/baselineSuppressed"], 1);
         let invocation = &run["invocations"][0];
         assert_eq!(invocation["executionSuccessful"], false);
         let notes = invocation["toolExecutionNotifications"].as_array().unwrap();
@@ -345,5 +399,24 @@ mod tests {
         assert!(text.contains("verdict: quarantine"));
         assert!(text.contains("score:   14"));
         assert!(text.contains("quarantine threshold"));
+        // Confidence marker only on the suspected finding.
+        assert!(text.contains("eval() call [suspected]"));
+        assert!(text.contains("vulnerable dependency\n"));
+        // Post-processing counters.
+        assert!(text.contains("out of scope: 3"));
+        assert!(text.contains("waived:  2"));
+        assert!(text.contains("baseline: 1 known finding(s)"));
+    }
+
+    #[test]
+    fn text_omits_zero_counters() {
+        let mut report = sample_report();
+        report.out_of_scope = 0;
+        report.waived = 0;
+        report.baseline_suppressed = 0;
+        let text = to_text(&report);
+        assert!(!text.contains("out of scope"));
+        assert!(!text.contains("waived"));
+        assert!(!text.contains("baseline:"));
     }
 }

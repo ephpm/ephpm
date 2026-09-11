@@ -8,7 +8,7 @@
 
 use super::tool::{run_tool, stderr_excerpt};
 use crate::analyzer::{AnalysisCtx, Analyzer, AnalyzerError};
-use crate::finding::{Category, Finding, Severity};
+use crate::finding::{Category, Confidence, Finding, Severity};
 
 /// See the module docs.
 pub struct MalwareYara;
@@ -35,6 +35,10 @@ fn parse_matches(stdout: &str, root: &std::path::Path) -> Vec<Finding> {
                 path: Some(rel.to_path_buf()),
                 line: None,
                 message: format!("YARA rule {rule} matched"),
+                // A signature match from an operator-curated ruleset is
+                // treated as confirmed — pair with `deny_hard: [malware-yara]`
+                // for an instant deny.
+                confidence: Confidence::Confirmed,
             })
         })
         .collect()

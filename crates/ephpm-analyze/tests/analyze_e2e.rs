@@ -10,10 +10,11 @@
 //! already. `assert(` is one of the analyzer's sinks and is AV-benign.
 
 use std::fs;
+use std::path::Path;
 
 use ephpm_analyze::{
-    AnalysisCtx, AnalyzeConfig, Analyzer, AnalyzerError, AnalyzerState, Category, Finding,
-    Severity, Verdict, analyze, analyzers, output, run_analyzers,
+    AnalysisCtx, AnalyzeConfig, Analyzer, AnalyzerError, AnalyzerState, Baseline, Category,
+    Finding, Severity, Verdict, analyze, analyzers, output, run_analyzers,
 };
 
 /// Build a small PHP project fixture with one `assert($cond)` sink call.
@@ -128,6 +129,80 @@ fn failing_external_analyzer_fails_closed_alongside_native_findings() {
     );
     assert!(report.verdict >= Verdict::Quarantine);
     assert!(report.reasons.iter().any(|r| r.contains("fail-closed")));
+}
+
+#[test]
+fn baseline_roundtrip_suppresses_known_findings_end_to_end() {
+    // First run finds the assert() sink and quarantines; a baseline written
+    // from that report makes the second run pass — gate only on NEW
+    // findings. Cache disabled for hermeticity.
+    let dir = fixture();
+    let config = AnalyzeConfig::from_yaml(
+        "analyzers:\n  enable: [dangerous-sinks]\npolicy:\n  quarantine_score: 4\ncache:\n  enabled: false",
+    )
+    .unwrap();
+    let report = analyze(dir.path(), config.clone()).expect("first run");
+    assert_eq!(report.verdict, Verdict::Quarantine);
+
+    let baseline_path = dir.path().join("baseline.json");
+    Baseline::from_findings(&report.findings).save(&baseline_path).unwrap();
+
+    let mut config = config;
+    config.baseline = Some(baseline_path);
+    let report = analyze(dir.path(), config.clone()).expect("baselined run");
+    assert_eq!(report.baseline_suppressed, 1);
+    assert!(report.findings.is_empty());
+    assert_eq!(report.verdict, Verdict::Allow);
+
+    // A NEW finding still gates through the baseline.
+    fs::write(dir.path().join("src/new.php"), "<?php\nassert($x);\n").unwrap();
+    let report = analyze(dir.path(), config).expect("run with new finding");
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.verdict, Verdict::Quarantine);
+}
+
+fn git(root: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn diff_aware_run_scans_only_changed_files() {
+    // A real git repo: the committed sink is out of scope, the newly added
+    // one gates. Skips silently when git is unavailable on the host.
+    let dir = fixture();
+    if !git(dir.path(), &["init", "-q"]) {
+        eprintln!("git unavailable — skipping diff-aware e2e");
+        return;
+    }
+    assert!(git(dir.path(), &["add", "."]));
+    assert!(git(dir.path(), &["-c", "commit.gpgsign=false", "commit", "-qm", "base"]));
+
+    // An untracked new file with a sink: must be in scope (diff alone would
+    // miss it — the untracked union is load-bearing here).
+    fs::write(dir.path().join("src/new.php"), "<?php\nassert($x);\n").unwrap();
+
+    let config = AnalyzeConfig::from_yaml(
+        "since: HEAD\nanalyzers:\n  enable: [dangerous-sinks]\npolicy:\n  quarantine_score: 4\ncache:\n  enabled: false",
+    )
+    .unwrap();
+    let report = analyze(dir.path(), config).expect("diff-aware run");
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    let path = report.findings[0].path.as_ref().unwrap().to_string_lossy().replace('\\', "/");
+    assert_eq!(path, "src/new.php");
+    // The committed upload.php sink never surfaced at all: native analyzers
+    // skip out-of-scope files up front, so nothing needed dropping post-hoc
+    // (the out_of_scope counter tracks only post-filtered findings, e.g.
+    // from external tools that scanned the whole tree).
+    assert_eq!(report.out_of_scope, 0);
+    assert_eq!(report.verdict, Verdict::Quarantine);
 }
 
 #[test]

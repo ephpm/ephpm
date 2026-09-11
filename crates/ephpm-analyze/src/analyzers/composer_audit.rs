@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::tool::{run_tool, stderr_excerpt};
 use crate::analyzer::{AnalysisCtx, Analyzer, AnalyzerError};
-use crate::finding::{Category, Finding, Severity};
+use crate::finding::{Category, Confidence, Finding, Severity};
 
 /// See the module docs.
 pub struct ComposerAudit;
@@ -43,6 +43,9 @@ fn advisory_finding(package: &str, advisory: &Value) -> Finding {
         path: Some("composer.lock".into()),
         line: None,
         message: format!("{package}: {title}"),
+        // A published advisory matched against a pinned lockfile version is
+        // definite, not a heuristic.
+        confidence: Confidence::Confirmed,
     }
 }
 
@@ -78,6 +81,7 @@ fn parse_audit_json(json: &Value) -> Vec<Finding> {
                 path: Some("composer.lock".into()),
                 line: None,
                 message: format!("{package} is abandoned{suggestion}"),
+                confidence: Confidence::Confirmed,
             });
         }
     }
