@@ -3166,10 +3166,14 @@ typedef struct {
     long long (*pttl)(const char *key);
     int  (*flush_all)(void);
     /* Blocking versioned wait. Returns 0 = timeout, 1 = changed with a
-     * value (in the get_result buffer), 2 = changed but key absent.
-     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+     * value (in the get_result buffer), 2 = changed but key absent. */
     int  (*wait)(const char *key, long long last_version, long long timeout_ms,
                  long long *new_version);
+    /* Compare-and-delete: delete key only while its value equals the
+     * token/token_len bytes. Returns 1 if deleted, 0 otherwise. The
+     * safe-release primitive for KV locks (delete-side companion to set_nx).
+     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+    int  (*del_if_eq)(const char *key, const char *token, size_t token_len);
 } EphpmKvOps;
 
 static EphpmKvOps g_kv_ops = {0};
@@ -3238,6 +3242,25 @@ PHP_FUNCTION(ephpm_kv_del)
 
     if (!g_kv_ops.del) { RETURN_LONG(0); }
     RETURN_LONG(g_kv_ops.del(key));
+}
+
+PHP_FUNCTION(ephpm_kv_del_if_eq)
+{
+    char *key; size_t key_len;
+    char *token; size_t token_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(token, token_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.del_if_eq) { RETURN_FALSE; }
+    /* Deletes key only while its stored value still equals `token`; returns
+     * true if this call removed it, false otherwise (mismatch, absent, or
+     * expired). The compare-and-delete is atomic under the KV store's per-key
+     * shard lock — this is the safe-release primitive a lock library pairs
+     * with ephpm_kv_setnx(): a holder that overran its TTL can no longer
+     * delete the new holder's lock. */
+    RETURN_BOOL(g_kv_ops.del_if_eq(key, token, token_len));
 }
 
 PHP_FUNCTION(ephpm_kv_exists)
@@ -3420,6 +3443,11 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_del, 0, 0, 1)
     ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_del_if_eq, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, token)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_exists, 0, 0, 1)
@@ -4696,6 +4724,7 @@ ZEND_END_ARG_INFO()
     PHP_FE(ephpm_kv_set,       arginfo_ephpm_kv_set) \
     PHP_FE(ephpm_kv_setnx,     arginfo_ephpm_kv_setnx) \
     PHP_FE(ephpm_kv_del,       arginfo_ephpm_kv_del) \
+    PHP_FE(ephpm_kv_del_if_eq, arginfo_ephpm_kv_del_if_eq) \
     PHP_FE(ephpm_kv_exists,    arginfo_ephpm_kv_exists) \
     PHP_FE(ephpm_kv_incr,      arginfo_ephpm_kv_incr) \
     PHP_FE(ephpm_kv_decr,      arginfo_ephpm_kv_decr) \

@@ -188,6 +188,24 @@ pub struct EphpmKvOps {
             new_version: *mut std::os::raw::c_longlong,
         ) -> std::os::raw::c_int,
     >,
+
+    /// Atomically delete `key` only if its current value equals the
+    /// `token`/`token_len` bytes (compare-and-delete). Returns 1 if the key
+    /// was deleted by this call, 0 otherwise (value mismatch, absent, expired,
+    /// or no store registered). The compare and delete happen under the same
+    /// per-key shard lock, so a concurrent overwrite makes this a no-op rather
+    /// than deleting a value it never observed — this is the safe-release
+    /// primitive for KV locks (the delete-side companion to `set_nx`).
+    ///
+    /// Must stay LAST-appended: the layout mirrors `ephpm_wrapper.c`'s
+    /// `EphpmKvOps`.
+    pub del_if_eq: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            token: *const std::os::raw::c_char,
+            token_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -317,6 +335,27 @@ unsafe extern "C" fn kv_del(key: *const std::os::raw::c_char) -> std::os::raw::c
     };
 
     std::os::raw::c_long::from(store.remove(&key_str))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_del_if_eq(
+    key: *const std::os::raw::c_char,
+    token: *const std::os::raw::c_char,
+    token_len: usize,
+) -> std::os::raw::c_int {
+    // Safety: `key` is a null-terminated C string from PHP. `token` is a
+    // pointer to `token_len` bytes from PHP's (binary-safe) string parameter.
+    let key_str = unsafe { CStr::from_ptr(key) };
+    let Ok(key_str) = key_str.to_str() else {
+        return 0;
+    };
+    let Some(store) = effective_store() else {
+        return 0;
+    };
+    // Safety: `token` points to `token_len` bytes of valid memory from PHP.
+    let token_bytes = unsafe { std::slice::from_raw_parts(token.cast::<u8>(), token_len) };
+
+    i32::from(store.del_if_eq(key_str, token_bytes))
 }
 
 #[cfg(php_linked)]
@@ -475,6 +514,7 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     pttl: Some(kv_pttl),
     flush_all: Some(kv_flush_all),
     wait: Some(kv_wait),
+    del_if_eq: Some(kv_del_if_eq),
 };
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -655,6 +695,58 @@ mod tests {
         // Safety: key is a valid C string.
         let removed = unsafe { kv_del(key.as_ptr()) };
         assert_eq!(removed, 0);
+    }
+
+    // ── kv_del_if_eq (compare-and-delete) ───────────────────────────────
+
+    #[test]
+    #[serial]
+    fn del_if_eq_matching_token_deletes() {
+        let store = init_store();
+        store.set("bridge_cad_match".into(), b"tok".to_vec(), None);
+        let key = cstr("bridge_cad_match");
+        let token = b"tok";
+        // Safety: key is a valid C string; token is valid for token.len() bytes.
+        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        assert_eq!(rc, 1, "a matching token must delete");
+        assert_eq!(store.get("bridge_cad_match"), None);
+    }
+
+    #[test]
+    #[serial]
+    fn del_if_eq_mismatched_token_is_noop() {
+        let store = init_store();
+        store.set("bridge_cad_mismatch".into(), b"tok".to_vec(), None);
+        let key = cstr("bridge_cad_mismatch");
+        let token = b"other";
+        // Safety: key is a valid C string; token is valid for token.len() bytes.
+        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        assert_eq!(rc, 0, "a different token must not delete");
+        assert_eq!(store.get("bridge_cad_mismatch").as_deref(), Some(&b"tok"[..]));
+    }
+
+    #[test]
+    #[serial]
+    fn del_if_eq_absent_key_is_noop() {
+        init_store();
+        let key = cstr("bridge_cad_absent");
+        let token = b"tok";
+        // Safety: key is a valid C string; token is valid for token.len() bytes.
+        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn del_if_eq_matches_binary_token() {
+        let store = init_store();
+        let token: &[u8] = &[0x00, 0x01, 0xFF, 0xFE];
+        store.set("bridge_cad_bin".into(), token.to_vec(), None);
+        let key = cstr("bridge_cad_bin");
+        // Safety: key is a valid C string; token is valid for token.len() bytes.
+        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        assert_eq!(rc, 1, "a binary token must compare byte-exactly and delete");
+        assert_eq!(store.get("bridge_cad_bin"), None);
     }
 
     // ── kv_exists ───────────────────────────────────────────────────────

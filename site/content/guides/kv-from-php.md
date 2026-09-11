@@ -25,7 +25,12 @@ ephpm_kv_exists("greeting");                   // false
 
 // setnx is the atomic check-and-set the PHP lock libraries build on
 // (Laravel Cache::lock, Symfony LockFactory)
-ephpm_kv_setnx("lock:job", "owner-1");         // true if it did not exist
+ephpm_kv_setnx("lock:job", "owner-1", 30);     // true if it did not exist (30s TTL)
+
+// del_if_eq is the atomic compare-and-delete that makes the *release* safe:
+// it deletes the key only while its value is still your token, so a holder
+// that overran its TTL cannot delete the new holder's lock.
+ephpm_kv_del_if_eq("lock:job", "owner-1");     // true only if still "owner-1"
 
 // Counters — ephpm_kv_incr takes exactly one argument and always adds 1;
 // use ephpm_kv_incr_by for arbitrary deltas
@@ -44,9 +49,51 @@ ephpm_kv_flush_all();                          // empties the store
 ```
 
 The full set of SAPI functions: `ephpm_kv_get`, `ephpm_kv_set`,
-`ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr`,
-`ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`,
-`ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`.
+`ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_del_if_eq`, `ephpm_kv_exists`,
+`ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`,
+`ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`.
+
+### Safe lock release — `ephpm_kv_del_if_eq()`
+
+```php
+ephpm_kv_del_if_eq(string $key, string $token): bool
+```
+
+Atomically deletes `$key` **only while** its stored value equals `$token`
+(a compare-and-delete), returning `true` if this call removed it and
+`false` otherwise. The compare and the delete happen under the same
+per-key shard lock, so a value written by someone else between your read
+and your delete is never destroyed.
+
+This is the delete-side companion to `ephpm_kv_setnx()` and the primitive
+for **correct lock release**. Acquire with a unique token and a TTL, then
+release with the same token:
+
+```php
+$token = bin2hex(random_bytes(16));
+if (ephpm_kv_setnx("lock:job", $token, 30)) {   // 30s TTL guards a crash
+    try {
+        // ... critical section ...
+    } finally {
+        ephpm_kv_del_if_eq("lock:job", $token);  // releases only if still ours
+    }
+}
+```
+
+Because the release fires only while the value is still *your* token, a
+holder that overran the TTL — and whose lock was therefore taken over by
+another request — can no longer delete the **new** holder's lock. A plain
+`ephpm_kv_del()` release cannot make that distinction and will happily
+unlock a lock it no longer owns.
+
+Return values, precisely: `true` when the key was present, matched, and
+was deleted; `false` when the token differs, the key is absent, or the key
+has expired (an expired entry is treated as absent). Tokens are compared
+byte-exactly and may be binary.
+
+Like `ephpm_kv_setnx()`, the compare-and-delete is atomic **per node**;
+across a cluster it is last-arrival-wins, so do not build cross-node mutual
+exclusion on it without an external fence.
 
 ### Blocking waits — `ephpm_kv_wait()`
 
@@ -66,10 +113,11 @@ Semantics you can rely on:
   always start the protocol with `$last_version = 0`: that first call
   registers the watch and returns the current value + version
   immediately (a race-free snapshot), without blocking.
-- **What bumps the version:** `set`, `setnx` (on insert), `del`, `incr`
-  / `decr` / `incr_by`, `append` (via RESP), expiry reaping, and
-  `flush_all`. TTL-only changes (`expire`) and hash-field ops (RESP
-  `HSET`/`HDEL`) do **not**.
+- **What bumps the version:** `set`, `setnx` (on insert), `del`,
+  `del_if_eq` (only when it actually deletes), `incr` / `decr` /
+  `incr_by`, `append` (via RESP), expiry reaping, and `flush_all`.
+  TTL-only changes (`expire`) and hash-field ops (RESP `HSET`/`HDEL`)
+  do **not**.
 - **Negative arguments clamp to 0**; `$timeout_ms = 0` is a
   non-blocking poll.
 - **Cost when unused: zero.** Writes pay a single atomic load until the
@@ -135,9 +183,11 @@ $count = $redis->incr('page:views');
 | Group | Commands |
 |-------|----------|
 | Strings | `GET`, `SET`, `SETEX`, `MGET`, `MSET`, `SETNX`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `GETSET` |
-| Keys | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `PTTL`, `TYPE`, `KEYS`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `RENAME` |
+| Keys | `DEL`, `DELIFEQ`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `PTTL`, `TYPE`, `KEYS`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `RENAME` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS` |
 | Connection | `PING`, `ECHO`, `SELECT`, `QUIT`, `COMMAND`, `INFO`, `AUTH` |
+
+`DELIFEQ key token` is an ePHPm-specific compare-and-delete (not a standard Redis command): it deletes `key` only while its value equals `token`, returning `:1`/`:0`. It is the safe lock-release primitive — reach it over RESP with a raw command (e.g. Predis `$redis->executeRaw(['DELIFEQ', $key, $token])`), or, from in-process PHP, just call `ephpm_kv_del_if_eq()` above. It is a dedicated command rather than a `DEL key IFEQ token` variant because `DEL` is variadic over keys, where a positional marker would be ambiguous with a key named `IFEQ`.
 
 Not implemented: lists, sets, transactions, `SCAN`, pub/sub. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis.
 
