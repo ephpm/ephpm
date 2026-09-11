@@ -93,6 +93,38 @@ enum Commands {
         verbose: u8,
     },
 
+    /// Statically analyze a PHP application and gate on the verdict
+    ///
+    /// Runs the configured analyzers (external tools wrapped as
+    /// subprocesses, plus native passes) over PATH, merges their findings,
+    /// and applies the fail-closed policy: allow / quarantine / deny. The
+    /// exit code reflects the verdict per `fail_on`, so this works directly
+    /// as a CI or deploy-gate step. Configured by `.ephpm-analyze.yml` in
+    /// the analyzed directory (or `--config`).
+    Analyze {
+        /// Directory to analyze (defaults to the current directory)
+        path: Option<PathBuf>,
+
+        /// Path to the analysis configuration file. Defaults to
+        /// `<PATH>/.ephpm-analyze.yml` when present, else built-in defaults.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Output format: text | sarif (overrides the config file)
+        #[arg(long)]
+        format: Option<String>,
+
+        /// Profile preset: security | none (overrides the config file)
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Least severe verdict that fails the exit code:
+        /// allow (report-only) | quarantine | deny (overrides the config
+        /// file)
+        #[arg(long)]
+        fail_on: Option<String>,
+    },
+
     /// Run PHP CLI commands using the embedded PHP runtime
     ///
     /// With `--site` (and `--config`) the in-process `ephpm_db_*` bridge is
@@ -393,6 +425,9 @@ fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Analyze { path, config, format, profile, fail_on }) => {
+            run_analyze(path, config, format, profile, fail_on)
+        }
         Some(Commands::Php { config, site, args }) => run_php(config, site, &php_cli_args(&args)),
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
             ensure_cli_tracing();
@@ -447,6 +482,75 @@ fn run() -> anyhow::Result<ExitCode> {
         None => run_dev(None, None, 8080, None, 0),
         other @ Some(Commands::Serve { .. }) => run_serve_sync(other),
     }
+}
+
+/// `ephpm analyze` — load the config, run the aggregator, print the report,
+/// and map the verdict to the exit code.
+///
+/// Exit codes: `0` when the verdict passes the `fail_on` gate, `2` when a
+/// `quarantine` verdict fails it, `3` when a `deny` verdict fails it, `1`
+/// for internal errors (bad config, unreadable target).
+fn run_analyze(
+    path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    format: Option<String>,
+    profile: Option<String>,
+    fail_on: Option<String>,
+) -> anyhow::Result<ExitCode> {
+    use ephpm_analyze::{AnalyzeConfig, FailOn, OutputFormat, Verdict, output};
+
+    ensure_cli_tracing();
+    let root = match path {
+        Some(path) => path,
+        None => std::env::current_dir().context("failed to read current directory")?,
+    };
+
+    let mut config = match config_path {
+        // An explicit --config that doesn't exist is an error (fail-closed),
+        // never silently "defaults".
+        Some(path) => AnalyzeConfig::load(&path)?,
+        None => {
+            let found = [".ephpm-analyze.yml", ".ephpm-analyze.yaml"]
+                .iter()
+                .map(|name| root.join(name))
+                .find(|candidate| candidate.is_file());
+            match found {
+                Some(path) => AnalyzeConfig::load(&path)?,
+                None => AnalyzeConfig::default(),
+            }
+        }
+    };
+
+    // CLI flags override the config file.
+    if let Some(profile) = profile {
+        config.profile = profile.parse()?;
+    }
+    if let Some(fail_on) = fail_on {
+        config.fail_on = fail_on.parse()?;
+    }
+    if let Some(format) = format {
+        config.output = format.parse()?;
+    }
+    let output_format = config.output;
+    let gate = config.fail_on;
+
+    let report = ephpm_analyze::analyze(&root, config)?;
+
+    match output_format {
+        OutputFormat::Sarif => println!("{}", output::to_sarif(&report)?),
+        OutputFormat::Text => print!("{}", output::to_text(&report)),
+    }
+
+    let gated = match gate {
+        FailOn::Allow => false,
+        FailOn::Quarantine => report.verdict >= Verdict::Quarantine,
+        FailOn::Deny => report.verdict >= Verdict::Deny,
+    };
+    Ok(if gated {
+        if report.verdict == Verdict::Deny { ExitCode::from(3) } else { ExitCode::from(2) }
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// Initialise a small tracing subscriber for service-management commands so
@@ -2315,6 +2419,45 @@ mod php_arg_tests {
         };
         assert!(site.is_none());
         assert_eq!(args, v(&["script.php", "--site", "x"]));
+    }
+
+    #[test]
+    fn analyze_parses_path_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "ephpm",
+            "analyze",
+            "/srv/app",
+            "--config",
+            "gate.yml",
+            "--format",
+            "sarif",
+            "--profile",
+            "security",
+            "--fail-on",
+            "deny",
+        ])
+        .unwrap();
+        let Some(Commands::Analyze { path, config, format, profile, fail_on }) = cli.command else {
+            panic!("expected an analyze command");
+        };
+        assert_eq!(path.as_deref(), Some(std::path::Path::new("/srv/app")));
+        assert_eq!(config.as_deref(), Some(std::path::Path::new("gate.yml")));
+        assert_eq!(format.as_deref(), Some("sarif"));
+        assert_eq!(profile.as_deref(), Some("security"));
+        assert_eq!(fail_on.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn analyze_defaults_to_cwd_and_no_overrides() {
+        let cli = Cli::try_parse_from(["ephpm", "analyze"]).unwrap();
+        let Some(Commands::Analyze { path, config, format, profile, fail_on }) = cli.command else {
+            panic!("expected an analyze command");
+        };
+        assert!(path.is_none());
+        assert!(config.is_none());
+        assert!(format.is_none());
+        assert!(profile.is_none());
+        assert!(fail_on.is_none());
     }
 }
 

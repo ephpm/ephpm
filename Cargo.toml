@@ -191,7 +191,14 @@ yamux = "0.14"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
+# YAML parser for `.ephpm-analyze.yml` (crates/ephpm-analyze). serde_yaml_ng is
+# the maintained continuation of dtolnay's archived serde_yaml — same API, same
+# unsafe-libyaml backend, no new transitive weight. Chosen over the archived
+# serde_yaml so `cargo deny check advisories` stays clean without an ignore.
+serde_yaml_ng = "0.10"
+
 # Internal crates
+ephpm-analyze = { path = "crates/ephpm-analyze" }
 ephpm-cluster = { path = "crates/ephpm-cluster" }
 ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }
