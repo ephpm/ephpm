@@ -12,6 +12,10 @@ anyhow.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+# Baseline fingerprints and cache keys hash tenant-controlled adversarial
+# input — a collision-resistant hash is load-bearing there (see the module
+# docs of `baseline` and `cache`), so no fast non-cryptographic hash.
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -123,6 +123,33 @@ enum Commands {
         /// file)
         #[arg(long)]
         fail_on: Option<String>,
+
+        /// Strictness level 0..=3 (overrides the config file): 0 gates only
+        /// on hard denies, 1 is the weighted-score default, 2 quarantines
+        /// any high finding, 3 quarantines any medium finding
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3))]
+        level: Option<u8>,
+
+        /// Write a baseline of the current findings to FILE and exit 0.
+        /// Later runs with `baseline: FILE` in the config suppress those
+        /// findings and gate only on new ones
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
+
+        /// Diff-aware scan: analyze only files changed versus this git ref
+        /// (plus untracked files). Fails closed if git errors (overrides the
+        /// config file)
+        #[arg(long, value_name = "GIT_REF")]
+        since: Option<String>,
+
+        /// Directory for the incremental result cache (overrides the config
+        /// file; default: ephpm-analyze-cache under the system temp dir)
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+
+        /// Disable the incremental result cache for this run
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Run PHP CLI commands using the embedded PHP runtime
@@ -425,8 +452,29 @@ fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Analyze { path, config, format, profile, fail_on }) => {
-            run_analyze(path, config, format, profile, fail_on)
+        Some(Commands::Analyze {
+            path,
+            config,
+            format,
+            profile,
+            fail_on,
+            level,
+            baseline,
+            since,
+            cache_dir,
+            no_cache,
+        }) => {
+            let overrides = AnalyzeOverrides {
+                format,
+                profile,
+                fail_on,
+                level,
+                baseline,
+                since,
+                cache_dir,
+                no_cache,
+            };
+            run_analyze(path, config, overrides)
         }
         Some(Commands::Php { config, site, args }) => run_php(config, site, &php_cli_args(&args)),
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
@@ -484,20 +532,41 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
+/// CLI overrides for `ephpm analyze` — each `Some` wins over the config
+/// file (env-var-style precedence).
+#[derive(Default)]
+struct AnalyzeOverrides {
+    format: Option<String>,
+    profile: Option<String>,
+    fail_on: Option<String>,
+    level: Option<u8>,
+    /// Baseline **write** mode: run, write the findings to this file, exit 0.
+    baseline: Option<PathBuf>,
+    since: Option<String>,
+    cache_dir: Option<PathBuf>,
+    no_cache: bool,
+}
+
 /// `ephpm analyze` — load the config, run the aggregator, print the report,
 /// and map the verdict to the exit code.
 ///
 /// Exit codes: `0` when the verdict passes the `fail_on` gate, `2` when a
 /// `quarantine` verdict fails it, `3` when a `deny` verdict fails it, `1`
-/// for internal errors (bad config, unreadable target).
+/// for internal errors (bad config, unreadable target, git failure on a
+/// `--since` run, missing configured baseline).
+///
+/// With `--baseline FILE` the run instead *writes* a baseline of the
+/// current findings to FILE and exits 0 (the generation half of the PHPStan
+/// model; `baseline:` in the config is the consumption half). Operator
+/// suppressions still apply first — permanently waived findings don't
+/// belong in a baseline — while a configured `baseline:` is ignored for the
+/// generating run so the written file is complete.
 fn run_analyze(
     path: Option<PathBuf>,
     config_path: Option<PathBuf>,
-    format: Option<String>,
-    profile: Option<String>,
-    fail_on: Option<String>,
+    overrides: AnalyzeOverrides,
 ) -> anyhow::Result<ExitCode> {
-    use ephpm_analyze::{AnalyzeConfig, FailOn, OutputFormat, Verdict, output};
+    use ephpm_analyze::{AnalyzeConfig, Baseline, FailOn, OutputFormat, Verdict, output};
 
     ensure_cli_tracing();
     let root = match path {
@@ -522,19 +591,46 @@ fn run_analyze(
     };
 
     // CLI flags override the config file.
-    if let Some(profile) = profile {
+    if let Some(profile) = overrides.profile {
         config.profile = profile.parse()?;
     }
-    if let Some(fail_on) = fail_on {
+    if let Some(fail_on) = overrides.fail_on {
         config.fail_on = fail_on.parse()?;
     }
-    if let Some(format) = format {
+    if let Some(format) = overrides.format {
         config.output = format.parse()?;
+    }
+    if let Some(level) = overrides.level {
+        config.level = level;
+    }
+    if let Some(since) = overrides.since {
+        config.since = Some(since);
+    }
+    if let Some(cache_dir) = overrides.cache_dir {
+        config.cache.dir = Some(cache_dir);
+    }
+    if overrides.no_cache {
+        config.cache.enabled = false;
+    }
+    if overrides.baseline.is_some() {
+        // Generating a baseline must see every finding, including the ones a
+        // previously configured baseline would suppress.
+        config.baseline = None;
     }
     let output_format = config.output;
     let gate = config.fail_on;
 
     let report = ephpm_analyze::analyze(&root, config)?;
+
+    if let Some(baseline_path) = overrides.baseline {
+        Baseline::from_findings(&report.findings).save(&baseline_path)?;
+        println!(
+            "baseline written: {} ({} finding(s) recorded)",
+            baseline_path.display(),
+            report.findings.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
 
     match output_format {
         OutputFormat::Sarif => println!("{}", output::to_sarif(&report)?),
@@ -2435,9 +2531,30 @@ mod php_arg_tests {
             "security",
             "--fail-on",
             "deny",
+            "--level",
+            "2",
+            "--baseline",
+            "base.json",
+            "--since",
+            "origin/main",
+            "--cache-dir",
+            "/var/cache/analyze",
+            "--no-cache",
         ])
         .unwrap();
-        let Some(Commands::Analyze { path, config, format, profile, fail_on }) = cli.command else {
+        let Some(Commands::Analyze {
+            path,
+            config,
+            format,
+            profile,
+            fail_on,
+            level,
+            baseline,
+            since,
+            cache_dir,
+            no_cache,
+        }) = cli.command
+        else {
             panic!("expected an analyze command");
         };
         assert_eq!(path.as_deref(), Some(std::path::Path::new("/srv/app")));
@@ -2445,12 +2562,34 @@ mod php_arg_tests {
         assert_eq!(format.as_deref(), Some("sarif"));
         assert_eq!(profile.as_deref(), Some("security"));
         assert_eq!(fail_on.as_deref(), Some("deny"));
+        assert_eq!(level, Some(2));
+        assert_eq!(baseline.as_deref(), Some(std::path::Path::new("base.json")));
+        assert_eq!(since.as_deref(), Some("origin/main"));
+        assert_eq!(cache_dir.as_deref(), Some(std::path::Path::new("/var/cache/analyze")));
+        assert!(no_cache);
+    }
+
+    #[test]
+    fn analyze_rejects_out_of_range_level() {
+        assert!(Cli::try_parse_from(["ephpm", "analyze", "--level", "4"]).is_err());
     }
 
     #[test]
     fn analyze_defaults_to_cwd_and_no_overrides() {
         let cli = Cli::try_parse_from(["ephpm", "analyze"]).unwrap();
-        let Some(Commands::Analyze { path, config, format, profile, fail_on }) = cli.command else {
+        let Some(Commands::Analyze {
+            path,
+            config,
+            format,
+            profile,
+            fail_on,
+            level,
+            baseline,
+            since,
+            cache_dir,
+            no_cache,
+        }) = cli.command
+        else {
             panic!("expected an analyze command");
         };
         assert!(path.is_none());
@@ -2458,6 +2597,11 @@ mod php_arg_tests {
         assert!(format.is_none());
         assert!(profile.is_none());
         assert!(fail_on.is_none());
+        assert!(level.is_none());
+        assert!(baseline.is_none());
+        assert!(since.is_none());
+        assert!(cache_dir.is_none());
+        assert!(!no_cache);
     }
 }
 

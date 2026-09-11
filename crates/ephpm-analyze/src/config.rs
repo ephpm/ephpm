@@ -6,15 +6,22 @@
 //! set must never be a no-op). Unlike `ephpm.toml` there is no environment
 //! layer feeding this file, so the **root** is strict too.
 //!
+//! Every struct here also derives `Serialize`: the incremental cache
+//! (`crate::cache`) keys entries on a hash of the *effective* configuration,
+//! so any config change — file or CLI override — invalidates cached results.
+//!
 //! ```yaml
 //! profile: security          # security | none
+//! level: 1                   # 0..3 strictness (see crate::policy)
 //! fail_on: quarantine        # allow | quarantine | deny
 //! output: text               # text | sarif
+//! baseline: .ephpm-analyze-baseline.json   # suppress known findings
+//! since: origin/main         # diff-aware: only files changed vs this ref
 //! engine:                    # Phase 4 — parsed but inert today
 //!   detonate: false
 //!   timeout_ms: 30000
 //! analyzers:
-//!   enable: [composer-audit, semgrep-php, malware-yara, dangerous-sinks]
+//!   enable: [composer-audit, semgrep-php, malware-yara, dangerous-sinks, suppression-scan]
 //!   required: [composer-audit]
 //!   deny_hard: [dangerous-sinks/eval]
 //!   yara_rules: rules/malware.yar
@@ -23,6 +30,13 @@
 //! policy:
 //!   quarantine_score: 10
 //!   deny_score: 50
+//! cache:
+//!   enabled: true
+//!   dir: /var/cache/ephpm-analyze
+//! suppress:
+//!   - rule: dangerous-sinks/assert
+//!     path: legacy/compat.php
+//!     reason: vetted 2026-09 — assert() behind a debug flag, not reachable
 //! ```
 
 use std::fmt;
@@ -30,15 +44,15 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A named preset that supplies the default analyzer set when
 /// `analyzers.enable` is not given explicitly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
-    /// The Phase-1 security set: `composer-audit`, `semgrep-php`,
-    /// `malware-yara`, `dangerous-sinks`. The default.
+    /// The default security set: `composer-audit`, `semgrep-php`,
+    /// `malware-yara`, `dangerous-sinks`, `suppression-scan`.
     #[default]
     Security,
     /// No analyzers unless `analyzers.enable` lists them explicitly.
@@ -56,6 +70,7 @@ impl Profile {
                 "semgrep-php".to_owned(),
                 "malware-yara".to_owned(),
                 "dangerous-sinks".to_owned(),
+                "suppression-scan".to_owned(),
             ],
             Self::None => Vec::new(),
         }
@@ -94,7 +109,7 @@ impl fmt::Display for Profile {
 /// `allow` is deliberately "the gate allows everything" (report-only) rather
 /// than the literal "fail at allow-or-worse", which would fail every run and
 /// mean nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FailOn {
     /// Report-only — never fail the exit code on the verdict.
@@ -122,7 +137,7 @@ impl FromStr for FailOn {
 }
 
 /// Output format for the analysis report.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// Concise human-readable text. The default.
@@ -149,7 +164,7 @@ impl FromStr for OutputFormat {
 /// **Planned: not yet implemented — parsed but not acted upon.** Both knobs
 /// exist so Phase-4 configs are shaped now; setting either produces a startup
 /// `tracing::warn!` (the workspace's no-silent-no-op rule).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     /// Planned: not yet implemented — parsed but not acted upon. Will opt
@@ -181,7 +196,7 @@ fn default_tool_timeout_ms() -> u64 {
 }
 
 /// `analyzers:` — which analyzers run and how strictly.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzersConfig {
     /// Analyzer ids to run. When omitted, the `profile` supplies the set.
@@ -242,7 +257,7 @@ fn default_deny_score() -> u32 {
 /// See `crate::policy` for the full model. Weights per finding severity:
 /// info 0, low 1, medium 4, high 10, critical 40 (critical also hard-denies
 /// on its own, so its weight only matters for reporting).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Total score at or above which the verdict is at least `Quarantine`.
@@ -260,19 +275,102 @@ impl Default for PolicyConfig {
     }
 }
 
+fn default_cache_enabled() -> bool {
+    true
+}
+
+/// `cache:` — the incremental content-hash result cache.
+///
+/// Only the **native per-file analyzers** (`dangerous-sinks`,
+/// `suppression-scan`) consult the cache; external-tool analyzers are never
+/// cached because their results depend on state outside the analyzed tree
+/// (advisory databases, registry rule packs, ruleset files) — a cache hit
+/// there could hide a newly published advisory. See `crate::cache` for the
+/// key model and the trust boundary of the cache directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Whether the cache is consulted at all. Default `true` — the key
+    /// includes the file content hash, the analyzer id, the effective config
+    /// hash, and the crate version, so a hit is always current.
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Cache directory. Default: `ephpm-analyze-cache` under the system temp
+    /// directory. On shared hosts point this at a path only the operator can
+    /// write — the cache is trusted state.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self { enabled: default_cache_enabled(), dir: None }
+    }
+}
+
+/// One operator-side suppression: waive findings matching `rule` (and
+/// optionally `path`) with a documented `reason`.
+///
+/// Suppressions come **only** from this config — never from comments inside
+/// the analyzed code. Tenant-authored suppression-shaped comments are
+/// themselves flagged by the `suppression-scan` analyzer. `reason` is
+/// mandatory and must be non-empty: a waiver without a recorded why is a
+/// config error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressRule {
+    /// Rule id to waive — exact, or a `/`-prefix (`dangerous-sinks` waives
+    /// every `dangerous-sinks/<rule>`), same matching as
+    /// `analyzers.deny_hard`.
+    pub rule: String,
+    /// When set, only findings at exactly this tree-relative path are waived
+    /// (compared with normalized `/` separators). When unset, the rule
+    /// applies at any path.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Why this finding class is acceptable — recorded for the audit trail,
+    /// required non-empty.
+    pub reason: String,
+}
+
+fn default_level() -> u8 {
+    1
+}
+
+/// The highest valid `level:` value — see `crate::policy` for the mapping.
+pub const MAX_LEVEL: u8 = 3;
+
 /// The root of `.ephpm-analyze.yml`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeConfig {
     /// Named preset supplying the default analyzer set. Default `security`.
     #[serde(default)]
     pub profile: Profile,
+    /// Strictness level `0..=3` scaling which findings gate — see
+    /// `crate::policy` for the exact mapping. Default `1` (the weighted-score
+    /// model). Composes with `profile`: the profile picks *which* analyzers
+    /// run, the level picks *how strictly* their findings gate.
+    #[serde(default = "default_level")]
+    pub level: u8,
     /// Which verdicts fail the exit code. Default `quarantine`.
     #[serde(default)]
     pub fail_on: FailOn,
     /// Report format. Default `text`.
     #[serde(default)]
     pub output: OutputFormat,
+    /// Baseline file to read: findings whose fingerprint appears in it are
+    /// suppressed, so only *new* findings gate (the PHPStan model). Relative
+    /// paths resolve against the analyzed root. A configured-but-missing
+    /// baseline is a hard error (fail-closed), never a silent full scan.
+    /// Generate the file with `ephpm analyze --baseline <file>`.
+    #[serde(default)]
+    pub baseline: Option<PathBuf>,
+    /// Diff-aware scanning: restrict findings to files changed versus this
+    /// git ref (`git diff --name-only <ref>` plus untracked files). A git
+    /// failure is a hard error (fail-closed), never a silent full pass.
+    #[serde(default)]
+    pub since: Option<String>,
     /// Phase-4 engine section (parsed but inert — see [`EngineConfig`]).
     #[serde(default)]
     pub engine: EngineConfig,
@@ -282,6 +380,32 @@ pub struct AnalyzeConfig {
     /// Scoring thresholds.
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Incremental result cache — see [`CacheConfig`].
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// Operator-side finding waivers — see [`SuppressRule`]. The **only**
+    /// suppression mechanism: inline comments in the analyzed code are never
+    /// honored (and are flagged by `suppression-scan`).
+    #[serde(default)]
+    pub suppress: Vec<SuppressRule>,
+}
+
+impl Default for AnalyzeConfig {
+    fn default() -> Self {
+        Self {
+            profile: Profile::default(),
+            level: default_level(),
+            fail_on: FailOn::default(),
+            output: OutputFormat::default(),
+            baseline: None,
+            since: None,
+            engine: EngineConfig::default(),
+            analyzers: AnalyzersConfig::default(),
+            policy: PolicyConfig::default(),
+            cache: CacheConfig::default(),
+            suppress: Vec::new(),
+        }
+    }
 }
 
 impl AnalyzeConfig {
@@ -289,9 +413,38 @@ impl AnalyzeConfig {
     ///
     /// # Errors
     ///
-    /// On invalid YAML or any unknown key (all sections are strict).
+    /// On invalid YAML, any unknown key (all sections are strict), a `level`
+    /// outside `0..=3`, or a `suppress` entry with an empty `rule` or
+    /// `reason`.
     pub fn from_yaml(yaml: &str) -> anyhow::Result<Self> {
-        serde_yaml_ng::from_str(yaml).context("invalid .ephpm-analyze.yml")
+        let config: Self = serde_yaml_ng::from_str(yaml).context("invalid .ephpm-analyze.yml")?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Semantic checks past what serde can express.
+    ///
+    /// # Errors
+    ///
+    /// On an out-of-range `level` or an undocumented/empty suppression.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.level <= MAX_LEVEL,
+            "level {} is out of range (expected 0..={MAX_LEVEL})",
+            self.level
+        );
+        for (idx, rule) in self.suppress.iter().enumerate() {
+            anyhow::ensure!(
+                !rule.rule.trim().is_empty(),
+                "suppress[{idx}] has an empty rule — name the rule id (or prefix) to waive"
+            );
+            anyhow::ensure!(
+                !rule.reason.trim().is_empty(),
+                "suppress[{idx}] ({}) has an empty reason — a waiver must document why",
+                rule.rule
+            );
+        }
+        Ok(())
     }
 
     /// Load from a file.
@@ -321,15 +474,38 @@ mod tests {
     fn empty_document_gets_all_defaults() {
         let cfg = AnalyzeConfig::from_yaml("{}").unwrap();
         assert_eq!(cfg.profile, Profile::Security);
+        assert_eq!(cfg.level, 1);
         assert_eq!(cfg.fail_on, FailOn::Quarantine);
         assert_eq!(cfg.output, OutputFormat::Text);
+        assert_eq!(cfg.baseline, None);
+        assert_eq!(cfg.since, None);
         assert!(!cfg.engine.detonate);
         assert_eq!(cfg.policy.quarantine_score, 10);
         assert_eq!(cfg.policy.deny_score, 50);
+        assert!(cfg.cache.enabled);
+        assert_eq!(cfg.cache.dir, None);
+        assert!(cfg.suppress.is_empty());
         assert_eq!(
             cfg.enabled_analyzers(),
-            vec!["composer-audit", "semgrep-php", "malware-yara", "dangerous-sinks"]
+            vec![
+                "composer-audit",
+                "semgrep-php",
+                "malware-yara",
+                "dangerous-sinks",
+                "suppression-scan"
+            ]
         );
+    }
+
+    #[test]
+    fn parsed_and_derived_defaults_agree() {
+        // `AnalyzeConfig::default()` is used when no config file exists;
+        // parsing `{}` must produce the same effective configuration (this
+        // is where a derived `Default` silently diverging from a serde
+        // default would surface — e.g. `level` defaulting to 0 vs 1).
+        let parsed = AnalyzeConfig::from_yaml("{}").unwrap();
+        let derived = AnalyzeConfig::default();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), serde_json::to_value(&derived).unwrap());
     }
 
     #[test]
@@ -337,8 +513,11 @@ mod tests {
         let cfg = AnalyzeConfig::from_yaml(
             r"
 profile: none
+level: 2
 fail_on: deny
 output: sarif
+baseline: .ephpm-analyze-baseline.json
+since: origin/main
 engine:
   detonate: true
   timeout_ms: 30000
@@ -352,11 +531,31 @@ analyzers:
 policy:
   quarantine_score: 5
   deny_score: 20
+cache:
+  enabled: false
+  dir: /var/cache/ephpm-analyze
+suppress:
+  - rule: dangerous-sinks/assert
+    path: legacy/compat.php
+    reason: vetted
 ",
         )
         .unwrap();
         assert_eq!(cfg.profile, Profile::None);
+        assert_eq!(cfg.level, 2);
         assert_eq!(cfg.fail_on, FailOn::Deny);
+        assert_eq!(cfg.baseline.as_deref(), Some(Path::new(".ephpm-analyze-baseline.json")));
+        assert_eq!(cfg.since.as_deref(), Some("origin/main"));
+        assert!(!cfg.cache.enabled);
+        assert_eq!(cfg.cache.dir.as_deref(), Some(Path::new("/var/cache/ephpm-analyze")));
+        assert_eq!(
+            cfg.suppress,
+            vec![SuppressRule {
+                rule: "dangerous-sinks/assert".to_owned(),
+                path: Some("legacy/compat.php".to_owned()),
+                reason: "vetted".to_owned(),
+            }]
+        );
         assert_eq!(cfg.output, OutputFormat::Sarif);
         assert!(cfg.engine.detonate);
         assert_eq!(cfg.engine.timeout_ms, Some(30_000));
@@ -379,6 +578,8 @@ policy:
             ("engine", "engine:\n  detonate_all: true"),
             ("analyzers", "analyzers:\n  enabled: [x]"), // common typo of `enable`
             ("policy", "policy:\n  deny_treshold: 1"),
+            ("cache", "cache:\n  directory: /tmp"), // common typo of `dir`
+            ("suppress", "suppress:\n  - rule: a/b\n    reason: r\n    line: 3"),
         ];
         for (section, yaml) in cases {
             let err = AnalyzeConfig::from_yaml(yaml)
@@ -386,6 +587,27 @@ policy:
             let msg = format!("{err:#}");
             assert!(msg.contains("unknown field"), "{section}: {msg}");
         }
+    }
+
+    #[test]
+    fn level_out_of_range_is_rejected() {
+        let err = AnalyzeConfig::from_yaml("level: 4").unwrap_err();
+        assert!(format!("{err:#}").contains("out of range"));
+        for level in 0..=3u8 {
+            let cfg = AnalyzeConfig::from_yaml(&format!("level: {level}")).unwrap();
+            assert_eq!(cfg.level, level);
+        }
+    }
+
+    #[test]
+    fn suppress_without_reason_is_rejected() {
+        // A waiver must document why — an empty (or whitespace) reason is a
+        // config error, not a silently accepted suppression.
+        let err = AnalyzeConfig::from_yaml("suppress:\n  - rule: a/b\n    reason: ''").unwrap_err();
+        assert!(format!("{err:#}").contains("empty reason"));
+        let err =
+            AnalyzeConfig::from_yaml("suppress:\n  - rule: ' '\n    reason: why").unwrap_err();
+        assert!(format!("{err:#}").contains("empty rule"));
     }
 
     #[test]

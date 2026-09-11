@@ -1,19 +1,22 @@
 //! ephpm-analyze — static-analysis aggregator and fail-closed deploy gate
 //! for PHP applications (`ephpm analyze`).
 //!
-//! # Architecture (Phase 1)
+//! # Architecture
 //!
 //! ```text
 //!   .ephpm-analyze.yml ──► AnalyzeConfig ──► AnalysisCtx
+//!                             (+ scope, cache, baseline)
 //!                                               │
 //!                     ┌─────────────────────────┼──────────────┐
 //!                     ▼                         ▼              ▼
 //!             external-tool analyzers    native analyzers   (planned:
 //!             composer-audit             dangerous-sinks     opcode/L1,
-//!             semgrep-php                                    engine/L2)
+//!             semgrep-php                suppression-scan    engine/L2)
 //!             malware-yara
 //!                     │                         │
 //!                     └────────► Findings ◄─────┘
+//!                                   │
+//!               scope filter ─► operator suppress ─► baseline
 //!                                   │
 //!                            policy::decide ──► Verdict ──► exit code
 //!                                   │
@@ -21,13 +24,18 @@
 //! ```
 //!
 //! The aggregator runs every enabled [`Analyzer`], merges their
-//! [`Finding`]s, and hands the lot to the policy engine, which produces a
-//! [`Verdict`] (`Allow` / `Quarantine` / `Deny`). The whole pipeline is
-//! **fail-closed**: an analyzer that errors, times out, panics, or is
-//! `required` but cannot run floors the verdict at `Quarantine` — only a run
-//! where everything that should have spoken actually spoke can `Allow`. An
-//! *optional* analyzer whose external tool is simply not installed is
-//! reported as skipped and does not gate (see [`analyzer::AnalyzerError`]).
+//! [`Finding`]s, post-processes them (diff-aware scope filter, operator-only
+//! suppressions, baseline — in that order), and hands the survivors to the
+//! policy engine, which produces a [`Verdict`] (`Allow` / `Quarantine` /
+//! `Deny`). The whole pipeline is **fail-closed**: an analyzer that errors,
+//! times out, panics, or is `required` but cannot run floors the verdict at
+//! `Quarantine` — only a run where everything that should have spoken
+//! actually spoke can `Allow`. An *optional* analyzer whose external tool is
+//! simply not installed is reported as skipped and does not gate (see
+//! [`analyzer::AnalyzerError`]). The same discipline runs through the
+//! supporting features: a `since` git failure, a missing configured
+//! baseline, and an invalid config are all hard errors, never silent
+//! degradations.
 //!
 //! Later phases (opcode-level analysis of compiled PHP, engine-in-the-loop
 //! detonation) slot in as more [`Analyzer`] implementations reading richer
@@ -36,19 +44,24 @@
 
 pub mod analyzer;
 pub mod analyzers;
+pub mod baseline;
+pub mod cache;
 pub mod config;
 pub mod finding;
 pub mod output;
 pub mod policy;
 pub mod report;
+pub mod scope;
+pub mod suppress;
 
 use std::path::Path;
 
 use anyhow::Context as _;
 
 pub use crate::analyzer::{AnalysisCtx, Analyzer, AnalyzerError};
+pub use crate::baseline::Baseline;
 pub use crate::config::{AnalyzeConfig, FailOn, OutputFormat, Profile};
-pub use crate::finding::{Category, Finding, Severity};
+pub use crate::finding::{Category, Confidence, Finding, Severity};
 pub use crate::policy::Verdict;
 pub use crate::report::{AnalysisReport, AnalyzerState, AnalyzerStatus};
 
@@ -102,6 +115,31 @@ pub fn run_analyzers(ctx: &AnalysisCtx, analyzers: &[Box<dyn Analyzer>]) -> Anal
         statuses.push(AnalyzerStatus { id, state });
     }
 
+    // Post-processing, in a deliberate order:
+    //
+    // 1. Diff-aware scope: on a `since` run, drop findings anchored at a
+    //    path outside the changed set. Pathless findings are always kept —
+    //    an unattributable finding must not be droppable by scoping.
+    let mut out_of_scope = 0;
+    if let Some(scope) = ctx.scope() {
+        let before = findings.len();
+        findings.retain(|f| f.path.as_deref().is_none_or(|p| scope.contains(p)));
+        out_of_scope = before - findings.len();
+    }
+
+    // 2. Operator suppressions — the only waiver mechanism (crate::suppress).
+    let (mut findings, waived) = suppress::apply(findings, &ctx.config().suppress);
+
+    // 3. Baseline: drop findings whose stable fingerprint is remembered, so
+    //    only new findings gate.
+    let mut baseline_suppressed = 0;
+    if let Some(baseline) = ctx.baseline() {
+        let known = baseline.fingerprints();
+        let before = findings.len();
+        findings.retain(|f| !known.contains(baseline::fingerprint(f).as_str()));
+        baseline_suppressed = before - findings.len();
+    }
+
     // Most severe first, then stable by rule id for deterministic output.
     findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.rule_id.cmp(&b.rule_id)));
 
@@ -112,10 +150,13 @@ pub fn run_analyzers(ctx: &AnalysisCtx, analyzers: &[Box<dyn Analyzer>]) -> Anal
         .collect();
     let decision = policy::decide(
         &findings,
-        &ctx.config().analyzers.deny_hard,
-        &failed,
-        ctx.config().policy.quarantine_score,
-        ctx.config().policy.deny_score,
+        &policy::PolicyParams {
+            deny_hard: &ctx.config().analyzers.deny_hard,
+            failed_analyzers: &failed,
+            quarantine_score: ctx.config().policy.quarantine_score,
+            deny_score: ctx.config().policy.deny_score,
+            level: ctx.config().level,
+        },
     );
 
     AnalysisReport {
@@ -124,6 +165,9 @@ pub fn run_analyzers(ctx: &AnalysisCtx, analyzers: &[Box<dyn Analyzer>]) -> Anal
         verdict: decision.verdict,
         score: decision.score,
         reasons: decision.reasons,
+        out_of_scope,
+        waived,
+        baseline_suppressed,
     }
 }
 
@@ -136,11 +180,14 @@ pub fn run_analyzers(ctx: &AnalysisCtx, analyzers: &[Box<dyn Analyzer>]) -> Anal
 ///
 /// # Errors
 ///
-/// On a missing/non-directory `root`, an unknown analyzer id, or a
-/// `required` entry that is not enabled. Individual analyzer failures do
-/// **not** error — they are folded into the report fail-closed.
+/// On a missing/non-directory `root`, an invalid configuration (unknown
+/// analyzer id, `required` entry that is not enabled, out-of-range `level`),
+/// a git failure on a `since` run, or a configured-but-missing baseline —
+/// all fail-closed. Individual analyzer failures do **not** error — they are
+/// folded into the report fail-closed.
 pub fn analyze(root: &Path, config: AnalyzeConfig) -> anyhow::Result<AnalysisReport> {
     anyhow::ensure!(root.is_dir(), "analysis target {} is not a directory", root.display());
+    config.validate()?;
 
     if config.engine.any_set() {
         tracing::warn!(
@@ -175,7 +222,54 @@ pub fn analyze(root: &Path, config: AnalyzeConfig) -> anyhow::Result<AnalysisRep
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
-    let ctx = AnalysisCtx::new(root, config);
+
+    // Diff-aware scope: any git failure is a hard error (fail-closed).
+    let scope = match &config.since {
+        Some(since_ref) => {
+            let scope = scope::changed_files(&root, since_ref)?;
+            tracing::info!(since = %since_ref, changed_files = scope.len(), "diff-aware scan");
+            Some(scope)
+        }
+        None => None,
+    };
+
+    // Baseline: a configured-but-missing file is a hard error — an operator
+    // asked for baseline gating, so silently gating without one (or with a
+    // stale corrupt one) would be a no-op knob.
+    let baseline = match &config.baseline {
+        Some(path) => {
+            let path = if path.is_absolute() { path.clone() } else { root.join(path) };
+            Some(Baseline::load(&path)?)
+        }
+        None => None,
+    };
+
+    // Cache open failures degrade to an uncached run (warn) — the cache is
+    // an optimization; only its *contents* are correctness-relevant, and
+    // those are keyed safely (see crate::cache).
+    let cache = if config.cache.enabled {
+        let dir = config.cache.dir.clone().unwrap_or_else(cache::default_dir);
+        match cache::FileCache::open(dir, &config) {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                tracing::warn!(error = %e, "analysis cache unavailable — running uncached");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut ctx = AnalysisCtx::new(root, config);
+    if let Some(scope) = scope {
+        ctx = ctx.with_scope(scope);
+    }
+    if let Some(baseline) = baseline {
+        ctx = ctx.with_baseline(baseline);
+    }
+    if let Some(cache) = cache {
+        ctx = ctx.with_cache(cache);
+    }
     Ok(run_analyzers(&ctx, &selected))
 }
 
@@ -202,6 +296,37 @@ mod tests {
 
     fn ctx_with(config: AnalyzeConfig) -> AnalysisCtx {
         AnalysisCtx::new(std::env::temp_dir(), config)
+    }
+
+    fn test_finding(rule_id: &str, severity: Severity, path: Option<&str>) -> Finding {
+        Finding {
+            rule_id: rule_id.to_owned(),
+            severity,
+            category: Category::Security,
+            path: path.map(std::path::PathBuf::from),
+            line: Some(1),
+            message: format!("finding {rule_id}"),
+            confidence: Confidence::Confirmed,
+        }
+    }
+
+    /// A boxed analyzer emitting a fixed finding set (built per call so the
+    /// `fn()`-pointer shape of `FakeAnalyzer` is not a constraint here).
+    struct EmitAnalyzer(Vec<Finding>);
+
+    impl Analyzer for EmitAnalyzer {
+        // The trait fixes the signature; the literal cannot be
+        // `&'static str` here without diverging from it.
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "emit"
+        }
+        fn category(&self) -> Category {
+            Category::Security
+        }
+        fn run(&self, _ctx: &AnalysisCtx) -> Result<Vec<Finding>, AnalyzerError> {
+            Ok(self.0.clone())
+        }
     }
 
     #[test]
@@ -253,22 +378,8 @@ mod tests {
             id: "multi",
             result: || {
                 Ok(vec![
-                    Finding {
-                        rule_id: "multi/low".to_owned(),
-                        severity: Severity::Low,
-                        category: Category::Quality,
-                        path: None,
-                        line: None,
-                        message: "l".to_owned(),
-                    },
-                    Finding {
-                        rule_id: "multi/high".to_owned(),
-                        severity: Severity::High,
-                        category: Category::Security,
-                        path: None,
-                        line: None,
-                        message: "h".to_owned(),
-                    },
+                    test_finding("multi/low", Severity::Low, Some("a.php")),
+                    test_finding("multi/high", Severity::High, Some("a.php")),
                 ])
             },
         })];
@@ -298,5 +409,119 @@ mod tests {
         let err =
             analyze(Path::new("Z:/definitely/not/here"), AnalyzeConfig::default()).unwrap_err();
         assert!(format!("{err:#}").contains("not a directory"));
+    }
+
+    #[test]
+    fn scope_filter_drops_out_of_scope_findings_but_keeps_pathless() {
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![Box::new(EmitAnalyzer(vec![
+            test_finding("e/changed", Severity::High, Some("changed.php")),
+            test_finding("e/unchanged", Severity::High, Some("unchanged.php")),
+            test_finding("e/pathless", Severity::High, None),
+        ]))];
+        let ctx = ctx_with(AnalyzeConfig::default())
+            .with_scope(scope::Scope::from_paths(vec!["changed.php".to_owned()]));
+        let report = run_analyzers(&ctx, &analyzers);
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(report.out_of_scope, 1);
+        assert!(ids.contains(&"e/changed"));
+        assert!(!ids.contains(&"e/unchanged"));
+        // Pathless findings can never be dropped by scoping (fail-safe).
+        assert!(ids.contains(&"e/pathless"));
+    }
+
+    #[test]
+    fn operator_suppression_waives_and_is_counted() {
+        let mut config = AnalyzeConfig::default();
+        config.suppress = vec![config::SuppressRule {
+            rule: "e/known".to_owned(),
+            path: Some("legacy.php".to_owned()),
+            reason: "vetted".to_owned(),
+        }];
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![Box::new(EmitAnalyzer(vec![
+            test_finding("e/known", Severity::High, Some("legacy.php")),
+            test_finding("e/other", Severity::Low, Some("legacy.php")),
+        ]))];
+        let report = run_analyzers(&ctx_with(config), &analyzers);
+        assert_eq!(report.waived, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule_id, "e/other");
+        assert_eq!(report.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn baseline_suppresses_known_findings_and_gates_only_new_ones() {
+        // The baseline remembers e/known at line 5; the current run sees it
+        // at line 50 (reformatted) — still suppressed. e/new gates.
+        let mut known = test_finding("e/known", Severity::High, Some("a.php"));
+        known.line = Some(5);
+        let baseline = Baseline::from_findings(std::slice::from_ref(&known));
+        let mut moved = known.clone();
+        moved.line = Some(50);
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![Box::new(EmitAnalyzer(vec![
+            moved,
+            test_finding("e/new", Severity::High, Some("a.php")),
+        ]))];
+        let ctx = ctx_with(AnalyzeConfig::default()).with_baseline(baseline);
+        let report = run_analyzers(&ctx, &analyzers);
+        assert_eq!(report.baseline_suppressed, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule_id, "e/new");
+    }
+
+    #[test]
+    fn analyze_fails_closed_on_missing_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AnalyzeConfig {
+            baseline: Some(std::path::PathBuf::from("no-such-baseline.json")),
+            ..AnalyzeConfig::default()
+        };
+        let err = analyze(dir.path(), config).unwrap_err();
+        assert!(format!("{err:#}").contains("baseline"));
+    }
+
+    #[test]
+    fn analyze_fails_closed_when_since_git_fails() {
+        // A tempdir is not a git repository — the diff-aware run must error,
+        // never silently degrade to an empty (or full) scan.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config =
+            AnalyzeConfig { since: Some("HEAD".to_owned()), ..AnalyzeConfig::default() };
+        config.cache.enabled = false;
+        assert!(analyze(dir.path(), config).is_err());
+    }
+
+    #[test]
+    fn tenant_suppression_marker_is_flagged_and_never_honored() {
+        // The two halves of operator-only suppression, end to end on a real
+        // tree: (a) a tenant comment shaped like a suppression directive
+        // does NOT waive the finding it sits next to; (b) the comment itself
+        // becomes a finding. Then: (c) an operator suppress rule — the only
+        // honored mechanism — waives the sink finding, while the
+        // tenant-suppression-attempt finding still stands.
+        let dir = tempfile::tempdir().unwrap();
+        // The assert() sink with an inline "ignore" marker (assembled here,
+        // never a webshell-shaped byte sequence — see dangerous_sinks docs).
+        std::fs::write(dir.path().join("t.php"), "<?php\nassert($cond); // ephpm-analyze-ignore\n")
+            .unwrap();
+        let mut config =
+            AnalyzeConfig::from_yaml("analyzers:\n  enable: [dangerous-sinks, suppression-scan]")
+                .unwrap();
+        config.cache.enabled = false;
+
+        let report = analyze(dir.path(), config.clone()).unwrap();
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"dangerous-sinks/assert"), "marker must not waive: {ids:?}");
+        assert!(ids.contains(&"suppression-scan/tenant-suppression-attempt"), "{ids:?}");
+
+        config.suppress = vec![config::SuppressRule {
+            rule: "dangerous-sinks/assert".to_owned(),
+            path: Some("t.php".to_owned()),
+            reason: "vetted".to_owned(),
+        }];
+        let report = analyze(dir.path(), config).unwrap();
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(!ids.contains(&"dangerous-sinks/assert"), "operator suppress waives: {ids:?}");
+        assert!(ids.contains(&"suppression-scan/tenant-suppression-attempt"), "{ids:?}");
+        assert_eq!(report.waived, 1);
     }
 }

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::tool::{run_tool, stderr_excerpt};
 use crate::analyzer::{AnalysisCtx, Analyzer, AnalyzerError};
-use crate::finding::{Category, Finding, Severity};
+use crate::finding::{Category, Confidence, Finding, Severity};
 
 /// See the module docs.
 pub struct SemgrepPhp;
@@ -59,6 +59,9 @@ fn parse_sarif(doc: &Value) -> Result<Vec<Finding>, AnalyzerError> {
                 path,
                 line,
                 message,
+                // Pattern matches carry false positives by nature — review
+                // signals (hotspots), not confirmed evidence.
+                confidence: Confidence::Suspected,
             });
         }
     }
@@ -77,9 +80,22 @@ impl Analyzer for SemgrepPhp {
     fn run(&self, ctx: &AnalysisCtx) -> Result<Vec<Finding>, AnalyzerError> {
         let config = &ctx.config().analyzers.semgrep_config;
         let timeout = ctx.config().analyzers.tool_timeout_ms;
+        // `--disable-nosem`: Semgrep honors inline `// nosemgrep` comments
+        // by default — a tenant-controlled mute. Suppressions must come only
+        // from operator config (see `crate::suppress`), and the
+        // `suppression-scan` analyzer flags the comment itself; honoring it
+        // here would hollow both out.
         let run = run_tool(
             "semgrep",
-            &["--config", config, "--sarif", "--quiet", "--disable-version-check", "."],
+            &[
+                "--config",
+                config,
+                "--sarif",
+                "--quiet",
+                "--disable-version-check",
+                "--disable-nosem",
+                ".",
+            ],
             ctx.root(),
             timeout,
         )?;

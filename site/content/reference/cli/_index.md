@@ -176,7 +176,7 @@ $ ephpm kv del counter temp
 
 ## `ephpm analyze`
 
-Statically analyze a PHP application and gate on the result — external security tools (composer audit, semgrep, yara) wrapped as subprocesses plus native passes, merged under a fail-closed allow/quarantine/deny policy. The exit code reflects the verdict, so it works directly as a CI or deploy-gate step. See the [full `analyze` reference](analyze/).
+Statically analyze a PHP application and gate on the result — external security tools (composer audit, semgrep, yara) wrapped as subprocesses plus native passes, merged under a fail-closed allow/quarantine/deny policy. Supports baselines (gate only on new findings), diff-aware scans (`--since <git-ref>`), strictness levels (`--level 0..3`), an incremental result cache, and operator-only suppressions (inline suppression comments in the scanned code are never honored — they are flagged instead). The exit code reflects the verdict, so it works directly as a CI or deploy-gate step. See the [full `analyze` reference](analyze/).
 
 ```bash
 # Gate the current directory (security profile, fail on quarantine)
@@ -184,6 +184,9 @@ ephpm analyze
 
 # Report-only over a checkout, as SARIF
 ephpm analyze /srv/app --fail-on allow --format sarif
+
+# Fast per-push gate: only files changed vs main
+ephpm analyze /srv/app --since origin/main
 ```
 
 ---
@@ -250,7 +253,8 @@ ephpm serve          Start the production server (--config/--listen/--document-r
 ephpm dev            Development server (--port/--document-root/--sites)
 ephpm php            Run the embedded PHP CLI (pure passthrough)
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
-ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on)
+ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on/
+                     --level/--since/--baseline/--cache-dir/--no-cache)
 
 ephpm install        Install + start the system service
 ephpm uninstall      Remove the system service (--keep-data)

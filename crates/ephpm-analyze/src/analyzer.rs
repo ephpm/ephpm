@@ -3,15 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::baseline::Baseline;
+use crate::cache::FileCache;
 use crate::config::AnalyzeConfig;
 use crate::finding::{Category, Finding};
+use crate::scope::Scope;
 
 /// Everything an analyzer may read about the target under analysis.
 ///
-/// Phase 1 carries the checkout root and the effective configuration. The
-/// fields are private on purpose — analyzers go through accessors — so later
-/// phases can add **lazily populated shared state** without touching any
-/// analyzer's signature:
+/// Carries the checkout root, the effective configuration, and the optional
+/// run-scoped state resolved by [`crate::analyze`]: the diff-aware changed-file
+/// [`Scope`], the incremental [`FileCache`], and the loaded [`Baseline`].
+/// The fields are private on purpose — analyzers go through accessors — so
+/// later phases can add **lazily populated shared state** without touching
+/// any analyzer's signature:
 ///
 /// - *Planned — not yet implemented (Phase 2, opcode analyzers):* a
 ///   `compiled()` accessor returning a lazily built compiled representation
@@ -27,14 +32,38 @@ use crate::finding::{Category, Finding};
 pub struct AnalysisCtx {
     root: PathBuf,
     config: AnalyzeConfig,
+    scope: Option<Scope>,
+    cache: Option<FileCache>,
+    baseline: Option<Baseline>,
 }
 
 impl AnalysisCtx {
     /// Build a context for the checkout at `root` with the given effective
-    /// configuration.
+    /// configuration (no scope, cache, or baseline attached).
     #[must_use]
     pub fn new(root: PathBuf, config: AnalyzeConfig) -> Self {
-        Self { root, config }
+        Self { root, config, scope: None, cache: None, baseline: None }
+    }
+
+    /// Attach a diff-aware changed-file scope (`since:` / `--since`).
+    #[must_use]
+    pub fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// Attach an incremental result cache.
+    #[must_use]
+    pub fn with_cache(mut self, cache: FileCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Attach a loaded baseline whose fingerprints suppress known findings.
+    #[must_use]
+    pub fn with_baseline(mut self, baseline: Baseline) -> Self {
+        self.baseline = Some(baseline);
+        self
     }
 
     /// The directory being analyzed.
@@ -47,6 +76,36 @@ impl AnalysisCtx {
     #[must_use]
     pub fn config(&self) -> &AnalyzeConfig {
         &self.config
+    }
+
+    /// The diff-aware changed-file scope, when this is a `since` run.
+    #[must_use]
+    pub fn scope(&self) -> Option<&Scope> {
+        self.scope.as_ref()
+    }
+
+    /// Whether the tree-relative `rel_path` should be analyzed: always true
+    /// on a full run; on a diff-aware run, true only for changed files.
+    /// Per-file analyzers use this to skip unchanged files early — the
+    /// aggregator additionally enforces the same scope on every
+    /// path-anchored finding after the fact.
+    #[must_use]
+    pub fn is_in_scope(&self, rel_path: &Path) -> bool {
+        self.scope.as_ref().is_none_or(|scope| scope.contains(rel_path))
+    }
+
+    /// The incremental result cache, when enabled. Only meaningful for
+    /// per-file analyzers whose result depends solely on the file content
+    /// and the configuration — see `crate::cache` for the contract.
+    #[must_use]
+    pub fn cache(&self) -> Option<&FileCache> {
+        self.cache.as_ref()
+    }
+
+    /// The loaded baseline, when configured.
+    #[must_use]
+    pub fn baseline(&self) -> Option<&Baseline> {
+        self.baseline.as_ref()
     }
 }
 
