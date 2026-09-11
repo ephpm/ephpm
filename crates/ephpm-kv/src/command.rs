@@ -246,6 +246,18 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 .unwrap_or(i64::MAX);
             Frame::integer(removed)
         }
+        "DELIFEQ" => {
+            // Compare-and-delete: `DELIFEQ key token` deletes `key` only while
+            // its current value equals `token`, returning :1 if it did and :0
+            // otherwise. This is the atomic release primitive for KV locks —
+            // the delete-side companion to SETNX. It is deliberately its own
+            // command rather than a `DEL key IFEQ token` variant, because DEL
+            // is variadic over keys and a positional `IFEQ` marker would be
+            // ambiguous with a key literally named "IFEQ".
+            check_args!(cmd, argv, 2);
+            let key = str_from(argv[0]);
+            Frame::integer(i64::from(store.del_if_eq(&key, argv[1])))
+        }
         "EXISTS" => {
             if argv.is_empty() {
                 return Frame::error("ERR wrong number of arguments for 'exists' command");
@@ -789,6 +801,34 @@ mod tests {
         let s = store();
         cmd(&s, &["MSET", "a", "1", "b", "2"]);
         assert_eq!(cmd(&s, &["DEL", "a", "b", "missing"]), Frame::integer(2));
+    }
+
+    // ── DELIFEQ (compare-and-delete) ────────────────────────────────────
+
+    #[test]
+    fn delifeq_deletes_on_matching_token() {
+        let s = store();
+        cmd(&s, &["SET", "lock", "tok"]);
+        assert_eq!(cmd(&s, &["DELIFEQ", "lock", "tok"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["GET", "lock"]), Frame::Null);
+    }
+
+    #[test]
+    fn delifeq_is_noop_on_mismatch() {
+        let s = store();
+        cmd(&s, &["SET", "lock", "tok"]);
+        assert_eq!(cmd(&s, &["DELIFEQ", "lock", "other"]), Frame::integer(0));
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "lock"])), Some("tok"), "value must survive");
+    }
+
+    #[test]
+    fn delifeq_is_noop_on_absent_key() {
+        assert_eq!(cmd(&store(), &["DELIFEQ", "missing", "tok"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn delifeq_missing_token_is_error() {
+        assert!(matches!(cmd(&store(), &["DELIFEQ", "lock"]), Frame::Error(_)));
     }
 
     #[test]

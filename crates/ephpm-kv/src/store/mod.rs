@@ -225,6 +225,37 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
     /// would silently reintroduce the write-back in every new implementation.
     fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>);
 
+    /// **Publish only** — broadcast a delete that has *already* been applied to
+    /// the local map, dropping the key on every peer.
+    ///
+    /// Called by [`Store::del_if_eq`] after its compare-and-delete has fired
+    /// under the key's shard lock. It is the delete-side mirror of
+    /// [`replicate_published`](Self::replicate_published): the local copy is
+    /// **already gone**, so an implementation MUST NOT call
+    /// [`Store::remove_local`] (or any other local removal) from here.
+    ///
+    /// # Why the local re-removal is forbidden
+    ///
+    /// [`replicate_remove`](Self::replicate_remove) exists to service a plain
+    /// `DEL`, whose contract is "make this key not exist" — so it *does* drop
+    /// the local copy before fanning out. A conditional delete is different:
+    /// its contract is "delete this key **only while it still equals my
+    /// token**". After `del_if_eq` has removed the matching entry, a concurrent
+    /// writer may immediately recreate the key with a *different* value (a fresh
+    /// lock acquisition, say). Re-removing locally here would destroy that new
+    /// value — reintroducing the exact delete-after-recreate race the primitive
+    /// exists to close. Broadcasting a tombstone without touching the local map
+    /// preserves the recreated value locally while letting peers converge by the
+    /// same last-arrival-wins rule as every other write in this tier.
+    ///
+    /// Required rather than defaulted on purpose, for the same reason
+    /// [`replicate_published`](Self::replicate_published) is: a default that
+    /// delegated to `replicate_remove` would silently reintroduce that
+    /// local-re-removal in every new implementation, and a no-op default would
+    /// silently drop the tombstone — leaving a released lock alive on every peer
+    /// until its TTL, an invisible divergence.
+    fn replicate_remove_published(&self, key: String);
+
     /// Handle a public [`Store::set_broadcast`]: put this value on **every**
     /// node, whatever its size.
     ///
@@ -1042,6 +1073,94 @@ impl Store {
             self.replicate_published_value(&key_ref, value, published_expiry);
         }
         SetNxOutcome::Inserted
+    }
+
+    /// Atomically delete a key **only if** its current value equals `token`
+    /// (compare-and-delete). Returns `true` if the key was deleted by this
+    /// call, `false` otherwise.
+    ///
+    /// This is the delete-side companion to [`set_nx`](Self::set_nx): together
+    /// they make a KV lock *safe to release*. A holder acquires the lock with
+    /// `set_nx(key, my_token, ttl)` and releases it with `del_if_eq(key,
+    /// my_token)`. Because the release only fires while the stored value is
+    /// still the holder's own token, a holder that overran its TTL — and whose
+    /// lock was therefore taken over by someone else — can no longer delete the
+    /// **new** owner's lock. A plain [`remove`](Self::remove) release cannot
+    /// make that distinction and will happily unlock a lock it no longer owns.
+    ///
+    /// # Return semantics (precise)
+    ///
+    /// * key present and its value equals `token` → the entry is removed;
+    ///   returns `true`.
+    /// * key present but its value differs from `token` → **no-op**; returns
+    ///   `false` (someone else holds it now).
+    /// * key absent, or present but expired → **no-op**; returns `false` (an
+    ///   expired entry is treated as absent and is left for the normal
+    ///   lazy/proactive reap, exactly as [`get`](Self::get) treats it).
+    ///
+    /// The comparison is byte-exact against the **logical** (post-decompression)
+    /// value, so it is agnostic to whether the entry happens to be stored
+    /// compressed.
+    ///
+    /// # Atomicity
+    ///
+    /// The compare and the delete happen under the **same** per-key shard write
+    /// lock via [`DashMap::remove_if`], whose predicate is evaluated while the
+    /// shard is exclusively locked. A concurrent [`set`](Self::set) /
+    /// [`set_nx`](Self::set_nx) on this key is serialised against it: it either
+    /// lands *before* (the predicate then sees the new value and declines) or
+    /// *after* (we have already removed). There is no window in which a value
+    /// this call did not observe gets deleted — the property `remove` cannot
+    /// offer.
+    ///
+    /// # Clustering
+    ///
+    /// Like [`set_nx`](Self::set_nx), the compare-and-delete is **per-node
+    /// atomic**; cluster-wide it is last-arrival-wins. When a [`Replicator`] is
+    /// installed the deletion is fanned out to peers via
+    /// [`Replicator::replicate_remove_published`] — a *publish-only* tombstone
+    /// that does **not** re-remove the local copy, so a value recreated on this
+    /// node between the removal and the broadcast survives locally. Do not build
+    /// cross-node mutual exclusion on this without an external fence, for the
+    /// same reason spelled out on [`replicate_published_value`](Self::replicate_published_value).
+    pub fn del_if_eq(&self, key: &str, token: &[u8]) -> bool {
+        // Atomic compare-and-delete on the LOCAL map. `remove_if` evaluates the
+        // predicate under the shard write lock and only removes when it returns
+        // true, so the compare and the delete are one indivisible step.
+        let removed = self.data.remove_if(key, |_, entry| {
+            // An expired entry is logically absent: decline, and leave it for
+            // the normal reap rather than counting it as a match.
+            if entry.is_expired() {
+                return false;
+            }
+            if entry.compressed {
+                // Compare against the decompressed logical value. A decode
+                // failure (corrupt/foreign payload) is treated as "does not
+                // match" — never delete on an ambiguous compare.
+                decompress_value(&entry.data, self.config.compression.algo)
+                    .is_some_and(|plain| plain.as_ref() == token)
+            } else {
+                entry.data.as_ref() == token
+            }
+        });
+        let Some((_, old)) = removed else {
+            return false;
+        };
+        // Reconcile the same bookkeeping `remove_local` maintains: memory
+        // accounting, the TTL side index, and watch wakeups (the key is now
+        // absent, so a `wait_for_change` observer must be woken).
+        self.mem_sub(old.mem_size);
+        self.ttl_keys.remove(key);
+        self.notify_write(key);
+        // Clustered: broadcast a publish-only tombstone. The compare already
+        // happened locally under the shard lock; peers drop the key by
+        // last-arrival-wins. Crucially this must NOT re-remove locally (see
+        // `Replicator::replicate_remove_published`) — a value recreated here
+        // between the removal above and this call has to survive on this node.
+        if let Some(rep) = self.active_replicator() {
+            rep.replicate_remove_published(key.to_string());
+        }
+        true
     }
 
     /// Remove a key, returning `true` if it existed. Removes from both
@@ -2257,6 +2376,167 @@ mod tests {
         assert!(s.get("contested").is_some());
     }
 
+    // ── del_if_eq (compare-and-delete) ──────────────────────────────
+
+    #[test]
+    fn del_if_eq_deletes_on_exact_match() {
+        let s = test_store();
+        s.set("lock".into(), b"token-A".to_vec(), None);
+        assert!(s.del_if_eq("lock", b"token-A"), "matching token must delete");
+        assert_eq!(s.get("lock"), None, "key must be gone after a matching delete");
+    }
+
+    #[test]
+    fn del_if_eq_is_noop_on_mismatch() {
+        let s = test_store();
+        s.set("lock".into(), b"token-A".to_vec(), None);
+        assert!(!s.del_if_eq("lock", b"token-B"), "a different token must not delete");
+        assert_eq!(
+            s.get("lock").as_deref(),
+            Some(&b"token-A"[..]),
+            "the value must be untouched on a mismatch"
+        );
+    }
+
+    #[test]
+    fn del_if_eq_is_noop_on_absent_key() {
+        let s = test_store();
+        assert!(!s.del_if_eq("missing", b"whatever"), "an absent key must return false");
+    }
+
+    #[test]
+    fn del_if_eq_treats_expired_as_absent() {
+        let s = test_store();
+        // Insert an already-expired entry directly, then try to CAD it: the
+        // value bytes match, but an expired entry is logically absent, so this
+        // must be a no-op (and must NOT report a delete).
+        let entry = Entry::with_expiry(
+            Bytes::from_static(b"tok"),
+            3,
+            false,
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            0,
+        );
+        s.data.insert("lock".into(), entry);
+        assert!(!s.del_if_eq("lock", b"tok"), "expired entry must be treated as absent");
+    }
+
+    #[test]
+    fn del_if_eq_release_after_takeover_cannot_unlock_new_owner() {
+        // The motivating safety property. Holder A took the lock, overran its
+        // TTL, and holder B has since acquired it (value now B's token). A's
+        // release must NOT delete B's lock — this is exactly what a plain
+        // `remove()` release gets wrong.
+        let s = test_store();
+        s.set("lock".into(), b"holder-A".to_vec(), None); // A holds it
+        s.set("lock".into(), b"holder-B".to_vec(), None); // TTL lapsed → B took over
+        assert!(!s.del_if_eq("lock", b"holder-A"), "A must not unlock B's lock");
+        assert_eq!(
+            s.get("lock").as_deref(),
+            Some(&b"holder-B"[..]),
+            "B's lock must survive A's stale release"
+        );
+        // B releasing with its own token works.
+        assert!(s.del_if_eq("lock", b"holder-B"));
+        assert_eq!(s.get("lock"), None);
+    }
+
+    #[test]
+    fn del_if_eq_updates_memory_accounting() {
+        let s = test_store();
+        let baseline = s.mem_used();
+        s.set("lock".into(), b"token".to_vec(), None);
+        assert!(s.mem_used() > baseline, "storing a value must charge memory");
+        assert!(s.del_if_eq("lock", b"token"));
+        assert_eq!(s.mem_used(), baseline, "a matching delete must reclaim its bytes");
+    }
+
+    #[test]
+    fn del_if_eq_matches_logical_value_when_compressed() {
+        // With compression on and a low threshold, a large value is stored
+        // compressed. The compare must be against the decompressed logical
+        // bytes, so a matching token still deletes and a mismatch does not.
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig { algo: CompressionAlgo::Zstd, level: 6, min_size: 1 },
+        });
+        let token = vec![b'z'; 4096]; // very compressible, well over min_size
+        s.set("lock".into(), token.clone(), None);
+        assert!(!s.del_if_eq("lock", b"z"), "a prefix must not match the logical value");
+        assert!(s.del_if_eq("lock", &token), "the exact logical value must match and delete");
+        assert_eq!(s.get("lock"), None);
+    }
+
+    #[test]
+    fn del_if_eq_wakes_watchers() {
+        // A CAD that fires is a state change (key becomes absent), so a
+        // `wait_for_change` observer must be woken — same contract as remove.
+        let s = test_store();
+        s.set("lock".into(), b"token".to_vec(), None);
+        // Register + snapshot to learn the current version.
+        let (ver, _) = s.wait_for_change("lock", 0, Duration::from_millis(0)).unwrap();
+        assert!(s.del_if_eq("lock", b"token"));
+        let (new_ver, val) =
+            s.wait_for_change("lock", ver, Duration::from_millis(0)).expect("version must advance");
+        assert!(new_ver > ver, "delete must bump the watch version");
+        assert_eq!(val, None, "the woken observer must see the key as absent");
+    }
+
+    #[test]
+    fn del_if_eq_only_one_racing_releaser_wins() {
+        // 32 threads race to release the same lock with the same token; exactly
+        // one CAD may observe true. This is the mirror of the set_nx one-winner
+        // property, and it is what makes double-release harmless.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let s = test_store();
+        s.set("lock".into(), b"tok".to_vec(), None);
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let s = Arc::clone(&s);
+            let winners = Arc::clone(&winners);
+            handles.push(thread::spawn(move || {
+                if s.del_if_eq("lock", b"tok") {
+                    winners.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::Relaxed), 1, "exactly one releaser may win");
+        assert_eq!(s.get("lock"), None);
+    }
+
+    #[test]
+    fn del_if_eq_broadcasts_publish_only_tombstone_when_replicated() {
+        // In clustered mode a fired CAD must fan a tombstone to peers via the
+        // publish-only hook — and must NOT go through `replicate_remove` (which
+        // re-removes locally). A mismatch must broadcast nothing.
+        let s = test_store();
+        s.set_local("lock".into(), b"tok".to_vec(), None);
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        // Mismatch: no delete, no broadcast.
+        assert!(!s.del_if_eq("lock", b"other"));
+        assert!(rep.removes_published.lock().unwrap().is_empty(), "mismatch must not broadcast");
+
+        // Match: exactly one publish-only tombstone, and never the plain
+        // remove hook (that path would re-remove locally and reopen the
+        // delete-after-recreate race).
+        assert!(s.del_if_eq("lock", b"tok"));
+        assert_eq!(rep.removes_published.lock().unwrap().as_slice(), &["lock".to_string()]);
+        assert!(
+            rep.removes.lock().unwrap().is_empty(),
+            "CAD must use the publish-only tombstone, not replicate_remove"
+        );
+    }
+
     #[test]
     fn ttl_expiry() {
         let s = test_store();
@@ -3329,6 +3609,7 @@ mod tests {
         removes: std::sync::Mutex<Vec<String>>,
         expires: std::sync::Mutex<Vec<RecordedExpire>>,
         publishes: std::sync::Mutex<Vec<RecordedSet>>,
+        removes_published: std::sync::Mutex<Vec<String>>,
     }
 
     impl Replicator for RecordingReplicator {
@@ -3346,6 +3627,9 @@ mod tests {
         }
         fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) {
             self.publishes.lock().unwrap().push((key, value, ttl));
+        }
+        fn replicate_remove_published(&self, key: String) {
+            self.removes_published.lock().unwrap().push(key);
         }
     }
 

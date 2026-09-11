@@ -354,6 +354,9 @@ mod tests {
             fn replicate_published(&self, key: String, _v: Vec<u8>, _t: Option<Duration>) {
                 self.sets.lock().unwrap().push(format!("{}:{key}", self.site));
             }
+            fn replicate_remove_published(&self, key: String) {
+                self.sets.lock().unwrap().push(format!("{}:{key}", self.site));
+            }
         }
 
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -411,6 +414,9 @@ mod tests {
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
+            fn replicate_remove_published(&self, _key: String) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let _ = Mutex::new(());
 
@@ -465,6 +471,7 @@ mod tests {
                 true
             }
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
+            fn replicate_remove_published(&self, _key: String) {}
         }
 
         let done = Arc::new(AtomicBool::new(false));
@@ -528,6 +535,7 @@ mod tests {
                 true
             }
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
+            fn replicate_remove_published(&self, _key: String) {}
         }
 
         let (tx, rx) = mpsc::channel();

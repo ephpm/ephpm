@@ -497,6 +497,16 @@ impl ClusteredStore {
         gossip_deleted || local_deleted
     }
 
+    /// Per-site publish-only tombstone — the multi-tenant mirror of
+    /// [`gossip_tombstone`](Self::gossip_tombstone). Gossips the
+    /// site-namespaced delete without removing the site store's local copy, so
+    /// a value recreated between `del_if_eq`'s removal and this broadcast
+    /// survives on this node.
+    pub async fn gossip_tombstone_for_site(&self, site: &str, key: &str) -> bool {
+        let transport = crate::site_namespace::encode(site, key);
+        self.cluster.gossip_del(&transport).await
+    }
+
     /// Re-broadcast a per-site key's current value with a new TTL, so peers
     /// pick up the new expiry by the same last-arrival-wins rule the global
     /// path uses. Small-key tier only, matching the global `replicate_expire`.
@@ -739,6 +749,27 @@ impl ClusteredStore {
         }
 
         gossip_deleted || local_deleted
+    }
+
+    /// Broadcast a delete **tombstone only** — fan the removal out on the
+    /// gossip tier without touching this node's local materialized copy.
+    ///
+    /// This is the transport for
+    /// [`ephpm_kv::store::Replicator::replicate_remove_published`], emitted by
+    /// [`Store::del_if_eq`](ephpm_kv::store::Store::del_if_eq) after its
+    /// compare-and-delete has already removed the matching entry locally under
+    /// the key's shard lock. Unlike [`remove`](Self::remove) it must NOT call
+    /// `remove_local`: a concurrent writer may have recreated the key with a
+    /// different value in the gap between that local removal and this call, and
+    /// re-removing here would destroy it — reopening the delete-after-recreate
+    /// race the compare-and-delete exists to close. Peers converge by the
+    /// gossip tier's usual last-arrival-wins rule.
+    pub async fn gossip_tombstone(&self, key: &str) -> bool {
+        let deleted = self.cluster.gossip_del(key).await;
+        if self.config.hot_key_cache {
+            evict_hot_entry(&self.hot_cache, &self.hot_cache_mem, hash_key(key));
+        }
+        deleted
     }
 
     /// Check if a key exists in any tier.
@@ -1157,6 +1188,21 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         });
     }
 
+    fn replicate_remove_published(&self, key: String) {
+        // PUBLISH ONLY — no local removal. `Store::del_if_eq` already removed
+        // the matching entry under its shard lock; a re-removal here (whether
+        // synchronous or via `inner.remove`, which also drops the local copy)
+        // would destroy a value recreated between that removal and this
+        // broadcast. Record our own `write_ms` first so a slow gossip echo of
+        // THIS tombstone cannot clobber a follow-up SET we later accept
+        // locally, then fan the tombstone out on the gossip tier only.
+        self.applied.insert(key.clone(), current_write_ms());
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            inner.gossip_tombstone(&key).await;
+        });
+    }
+
     fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
         // Update the local copy synchronously so this node's readers see
         // the new expiry immediately, then re-broadcast the (unchanged)
@@ -1336,6 +1382,19 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
                     "per-site KV: clustered publish returned false — the value did not reach peers"
                 );
             }
+        });
+    }
+
+    fn replicate_remove_published(&self, key: String) {
+        // PUBLISH ONLY — mirrors the global replicator: no local removal, so a
+        // value recreated on this node between `del_if_eq`'s removal and this
+        // broadcast survives. Record `write_ms` keyed by the TRANSPORT key,
+        // then gossip the per-site tombstone only.
+        self.applied.insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+        let inner = Arc::clone(&self.inner);
+        let site = Arc::clone(&self.site);
+        self.handle.spawn(async move {
+            inner.gossip_tombstone_for_site(&site, &key).await;
         });
     }
 
