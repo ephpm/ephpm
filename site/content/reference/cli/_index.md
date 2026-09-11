@@ -174,6 +174,20 @@ $ ephpm kv del counter temp
 
 ---
 
+## `ephpm analyze`
+
+Statically analyze a PHP application and gate on the result — external security tools (composer audit, semgrep, yara) wrapped as subprocesses plus native passes, merged under a fail-closed allow/quarantine/deny policy. The exit code reflects the verdict, so it works directly as a CI or deploy-gate step. See the [full `analyze` reference](analyze/).
+
+```bash
+# Gate the current directory (security profile, fail on quarantine)
+ephpm analyze
+
+# Report-only over a checkout, as SARIF
+ephpm analyze /srv/app --fail-on allow --format sarif
+```
+
+---
+
 ## Service Lifecycle
 
 Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows.
@@ -236,6 +250,7 @@ ephpm serve          Start the production server (--config/--listen/--document-r
 ephpm dev            Development server (--port/--document-root/--sites)
 ephpm php            Run the embedded PHP CLI (pure passthrough)
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
+ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on)
 
 ephpm install        Install + start the system service
 ephpm uninstall      Remove the system service (--keep-data)
