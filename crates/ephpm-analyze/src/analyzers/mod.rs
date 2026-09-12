@@ -2,10 +2,10 @@
 //!
 //! Ten wrap external tools as subprocesses and degrade gracefully when the
 //! tool is absent (`composer-audit`, `semgrep-php`, `malware-yara`, `clamav`,
-//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); two are
-//! native with zero external dependencies (`dangerous-sinks`,
-//! `suppression-scan`), sharing the per-file walker in `php_files` —
-//! diff-aware scope skipping and the incremental cache included.
+//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); three
+//! are native with zero external dependencies (`dangerous-sinks`,
+//! `suppression-scan`, `obfuscation-scan`), sharing the per-file walker in
+//! `php_files` — diff-aware scope skipping and the incremental cache included.
 //! `opcode-scan` and `php-lint` are native too but engine-backed:
 //! `opcode-scan` compiles each file with the embedded Zend compiler (no
 //! execution) and detects sinks in the opcode stream; `php-lint` compiles each
@@ -17,14 +17,15 @@
 //! error), the WordPress analogue of `composer-audit`.
 //!
 //! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
-//! `rector`, `opcode-scan`, `php-lint`, and `wp-vuln` are registered but
-//! **not** in the default `security` profile
+//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, and `obfuscation-scan` are
+//! registered but **not** in the default `security` profile
 //! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
 //! `analyzers.enable`.
 
 mod clamav;
 mod composer_audit;
 mod dangerous_sinks;
+mod obfuscation_scan;
 mod opcode_scan;
 mod php_files;
 mod php_lint;
@@ -43,6 +44,7 @@ mod yara_scan;
 pub use clamav::Clamav;
 pub use composer_audit::ComposerAudit;
 pub use dangerous_sinks::DangerousSinks;
+pub use obfuscation_scan::ObfuscationScan;
 pub use opcode_scan::OpcodeScan;
 pub use php_lint::PhpLint;
 pub use phpcs::Phpcs;
@@ -77,6 +79,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(PhpLint),
         Box::new(WpVuln),
         Box::new(SuppressionScan),
+        Box::new(ObfuscationScan),
     ]
 }
 
@@ -91,7 +94,8 @@ mod tests {
         // default `security` profile (so the out-of-the-box gate is unchanged).
         let ids: Vec<String> = built_in().iter().map(|a| a.id().to_owned()).collect();
         let profile = Profile::Security.default_analyzers();
-        for id in ["clamav", "phpcs", "phpmd", "rector", "php-lint", "wp-vuln"] {
+        for id in ["clamav", "phpcs", "phpmd", "rector", "php-lint", "wp-vuln", "obfuscation-scan"]
+        {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");
         }
