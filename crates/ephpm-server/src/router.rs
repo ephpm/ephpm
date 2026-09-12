@@ -10956,6 +10956,226 @@ echo "post response";
         assert_eq!(&body[..], b"PUBLIC-BYTES");
     }
 
+    /// The composition regression guard for the preview-access-gate fleet — the
+    /// incident that motivated `endpoints_only` (PR #504).
+    ///
+    /// The intended MIXED public/private preview fleet mounts the `github-auth`
+    /// **issuer** ONCE, globally, as `access = "per-preview"` +
+    /// `endpoints_only = true`: a *passive* issuer that serves only its own
+    /// `/_ephpm/auth/*` endpoints and passes content through. Each **private**
+    /// preview additionally carries a per-site `[preview_auth]` override, which
+    /// the router turns into a per-site `preview-gate` verifier that redirects
+    /// unauthenticated requests to the passive issuer's login. A **public**
+    /// preview has no override → no verifier → the passive issuer lets it
+    /// through, so it stays open.
+    ///
+    /// The incident: the gate was deployed with the issuer mounted globally but
+    /// WITHOUT `endpoints_only` and with no per-site overrides — so the one
+    /// global, *content-gating* issuer 403'd/redirected EVERY preview (nothing
+    /// carried a session yet), a full preview outage. It was rolled back. No
+    /// test asserted the **composed** behaviour, so nothing caught it.
+    ///
+    /// This drives the REAL composition end to end through [`Router::handle`]:
+    /// the actual `github-auth` cdylib, `dlopen`ed as the global chain exactly
+    /// as a release does, in `endpoints_only` + `per-preview` mode, together
+    /// with the router's per-site verifier injection from `[preview_auth]`. It
+    /// is not a re-test of `route()` in isolation (PR #504 unit-tests that): the
+    /// property here is that the passive global issuer and the per-site verifier
+    /// **coexist** — public open, private gated — on one router.
+    ///
+    /// Like the dlopen suite (`tests/middleware_dlopen.rs`) this NEVER skips: an
+    /// absent cdylib is a build-wiring regression, so it hard-fails with the
+    /// build command rather than passing silently.
+    #[tokio::test]
+    async fn passive_issuer_and_per_site_verifier_compose_public_open_private_gated() {
+        use ephpm_middleware_builtins::preview_gate::mint_share_token;
+
+        // Coupled by design: the issuer signs sessions with `session_secret` and
+        // the per-site verifier checks them with the SAME key (32-byte floor).
+        const SECRET: &str = "0123456789abcdef0123456789abcdef";
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        // Locate the built `github-auth` cdylib in the profile dir, derived from
+        // this test binary's own path (`<target>/<profile>/deps/<name>` →
+        // `<target>/<profile>/<lib>`), so it is correct under a custom target
+        // dir, `--release`, and `--target <triple>` alike.
+        let dll = format!(
+            "{}github_auth.{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_EXTENSION
+        );
+        let exe = std::env::current_exe().expect("test binary has a path");
+        let profile_dir = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("test binary lives at <target>/<profile>/deps/<name>");
+        let built = profile_dir.join(&dll);
+        assert!(
+            built.is_file(),
+            "github-auth cdylib `{dll}` is missing at {} — this composition test dlopens the \
+             real issuer. Build it first with `cargo build -p ephpm-middleware-github-auth --lib` \
+             (CI's pre-test step, `cargo build --workspace --lib --examples`, already does).",
+            built.display()
+        );
+        // Stage a private copy: `declare!` keeps a module's config/host table in
+        // `OnceLock`s keyed by (device, inode), and staging keeps this load from
+        // aliasing any other test's — and, on Windows, from locking the shared
+        // artifact. Must outlive the chain (which holds the library open).
+        let stage = tempfile::tempdir().expect("stage dir for the cdylib");
+        let staged = stage.path().join(&dll);
+        fs::copy(&built, &staged).expect("copy cdylib into staging dir");
+
+        // The passive global issuer: `per-preview` + `endpoints_only`, with the
+        // minimal valid apex-flow config (single OAuth App, one callback host).
+        // `github_base` is loopback so nothing here can reach the network.
+        let issuer = ephpm_config::MiddlewareMount {
+            library: staged.to_string_lossy().into_owned(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({
+                "client_id": "Iv1.testclient",
+                "client_secret": "test-client-secret",
+                "session_secret": SECRET,
+                "access": "per-preview",
+                "endpoints_only": true,
+                "github_base": "http://127.0.0.1:1",
+                "github_api_base": "http://127.0.0.1:1",
+                "redirect_uri": "https://apex.preview.test/_ephpm/auth/github/callback",
+                "cookie_domain": "preview.test",
+            })),
+        };
+        let chain = crate::middleware::MiddlewareChain::load(&[issuer]).expect(
+            "the github-auth issuer must load as the global chain in per-preview/endpoints_only \
+             mode",
+        );
+
+        let f = fleet();
+        // PRIVATE preview: a per-site `[preview_auth]` override → gated. Its
+        // `login_url` is the passive issuer's login path, and the issuer's own
+        // endpoints are exempt from the per-site gate so the OAuth round trip is
+        // never redirected back to login.
+        let priv_site = f.site("pr-1.preview.test", &[]);
+        fs::write(priv_site.join("secret.png"), b"PRIVATE-BYTES").unwrap();
+        fs::write(priv_site.join("index.php"), b"<?php echo 'php-ran';").unwrap();
+        f.override_for(
+            "pr-1.preview.test",
+            &format!(
+                "[preview_auth]\n\
+                 session_secret = \"{SECRET}\"\n\
+                 repo = \"acme/web\"\n\
+                 login_url = \"/_ephpm/auth/github/login\"\n\
+                 exempt_paths = [\"/_ephpm/auth/github/login\", \"/_ephpm/auth/github/callback\"]\n"
+            ),
+        );
+        // PUBLIC preview: NO override → nothing gates it. This is the exact
+        // shape whose absence caused the outage.
+        let open_site = f.site("open.preview.test", &[]);
+        fs::write(open_site.join("hello.txt"), b"PUBLIC-BYTES").unwrap();
+
+        let router = f.router().with_middleware_chain(Some(Arc::new(chain)));
+        // Loopback client so the per-site gate's default `require_https` does not
+        // itself 403 an http test — the verdict we assert is the gate's auth
+        // decision, not a transport rejection.
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let get = |host: &str, uri: &str, cookie: Option<&str>| {
+            let mut b = Request::builder().method("GET").uri(uri).header("host", host);
+            if let Some(c) = cookie {
+                b = b.header("cookie", format!("ephpm_session={c}"));
+            }
+            b.body(Empty::<Bytes>::new()).unwrap()
+        };
+
+        // ── Property 1: PUBLIC preview PASSES THROUGH. ───────────────────────
+        // The incident property. With `endpoints_only` the passive issuer lets
+        // unauthenticated content through, so the public site's static file is
+        // served. WITHOUT `endpoints_only` this request would 302 to GitHub
+        // login (the outage) — this assertion is what would have caught it.
+        let resp =
+            router.handle(get("open.preview.test", "/hello.txt", None), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a PUBLIC preview (no [preview_auth]) must pass through the passive issuer, not be \
+             gated — the exact property whose absence caused the outage"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"PUBLIC-BYTES", "the public preview's content must be served");
+
+        // ── Property 2: PRIVATE preview is GATED by its per-site verifier. ───
+        // Unauthenticated static → redirect to login; bytes never served.
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "a PRIVATE preview must be gated by its per-site verifier even though the global \
+             issuer is passive"
+        );
+        assert!(resp.headers().get("location").is_some(), "a login redirect target");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"PRIVATE-BYTES", "the gated file's bytes must never leave disk");
+
+        // Unauthenticated PHP entrypoint → redirect BEFORE the engine runs (so
+        // this holds in stub mode too: the gate short-circuits ahead of PHP).
+        let resp =
+            router.handle(get("pr-1.preview.test", "/index.php", None), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "unauthenticated PHP on a gated preview redirects"
+        );
+
+        // A valid session credential for THIS site → admitted. Minted with the
+        // shared secret via the public reference minter, exactly as the existing
+        // per-site gate tests do.
+        let tok =
+            mint_share_token(SECRET.as_bytes(), "pr-1.preview.test", "jti-comp", now, now + 3600);
+        let resp = router
+            .handle(get("pr-1.preview.test", "/secret.png", Some(&tok)), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid session credential for this preview must be admitted through the gate"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"PRIVATE-BYTES");
+
+        // ── Property 3: `endpoints_only` is endpoint-SELECTIVE. ──────────────
+        // The passive issuer's own login endpoint still starts the OAuth flow
+        // (it does not pass through). On the private vhost it is reached via the
+        // auth namespace, which runs the global chain but not the per-site gate,
+        // and the router carries the site's `repo` on the trusted channel so the
+        // per-preview issuer can start the login rather than fail closed.
+        let resp = router
+            .handle(get("pr-1.preview.test", "/_ephpm/auth/github/login", None), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "the issuer's own login endpoint must start the OAuth flow, not pass content through"
+        );
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .expect("login must carry a Location");
+        assert!(
+            location.contains("/login/oauth/authorize"),
+            "login must 302 to the GitHub authorize endpoint, got {location:?}"
+        );
+
+        // `stage` must outlive the loaded library; drop after the router.
+        drop(router);
+        drop(stage);
+    }
+
     /// Issue #487, WebSocket half: the preview gate guards the WS **upgrade**
     /// too. A native WebSocket runs the same per-site PHP against the same
     /// per-site database/KV, so an ungated upgrade to a gated preview would leak
