@@ -175,6 +175,20 @@ pub struct Config {
     /// Session lifetime, seconds.
     pub session_ttl_secs: u64,
 
+    /// Serve only the gate's own endpoints and never gate content.
+    ///
+    /// When `true`, an unauthenticated content request passes through
+    /// (`CONTINUE`) instead of being redirected to login. `login_path`,
+    /// `callback_path`, a request already carrying a session cookie, and a
+    /// valid bypass token still behave exactly as they do in the default
+    /// (content-gating) mode — so the login flow still runs and still needs an
+    /// access target. This is the passive-issuer mode that lets one global
+    /// mount coexist with per-site `preview-gate` verifiers: a public preview
+    /// (no verifier) stays open, while a private one's verifier redirects
+    /// unauthenticated requests to the login this issuer serves. Defaults to
+    /// `false`, which preserves the original content-gating behaviour.
+    pub endpoints_only: bool,
+
     /// `iss` claim written into issued tokens.
     pub issuer: String,
     /// `aud` claim written into issued tokens, when configured.
@@ -492,6 +506,10 @@ impl Config {
             );
         }
 
+        // Passive-issuer mode: serve the OAuth endpoints, gate nothing. Off by
+        // default so existing content-gating mounts are unchanged.
+        let endpoints_only = opt_bool(config, "endpoints_only", false)?;
+
         let bypass_token = secret(config, "bypass_token", env)?;
         if let Some(t) = &bypass_token
             && t.expose().len() < MIN_SESSION_SECRET
@@ -575,6 +593,7 @@ impl Config {
                 domain: cookie_domain,
             },
             session_ttl_secs,
+            endpoints_only,
             issuer: opt_str(config, "issuer")?.unwrap_or_else(|| DEFAULT_ISSUER.to_owned()),
             audience: opt_str(config, "audience")?,
             bypass_token,
@@ -692,6 +711,28 @@ mod tests {
         assert!(c.scopes.is_empty(), "empty scopes is correct for a GitHub App");
         assert_eq!(c.http_timeout_secs, 10);
         assert_eq!(c.default_check, Some(Check::Repo { owner: "acme".into(), name: "web".into() }));
+        assert!(!c.endpoints_only, "endpoints_only defaults to false (content-gating)");
+    }
+
+    #[test]
+    fn endpoints_only_parses_and_still_requires_a_target() {
+        let mut v = base();
+        v["endpoints_only"] = serde_json::json!(true);
+        assert!(parse(v).expect("parse").endpoints_only);
+
+        // Passive mode still runs the login flow, so a target is still required.
+        let mut v = base();
+        v.as_object_mut().expect("object").remove("repo");
+        v["endpoints_only"] = serde_json::json!(true);
+        assert!(
+            parse(v).expect_err("no target").contains("every GitHub user in the world"),
+            "endpoints_only must not waive the access-target requirement"
+        );
+
+        // And it is a boolean.
+        let mut v = base();
+        v["endpoints_only"] = serde_json::json!("yes");
+        assert!(parse(v).is_err(), "a non-boolean endpoints_only must be refused");
     }
 
     #[test]
