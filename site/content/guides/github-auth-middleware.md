@@ -158,6 +158,7 @@ it is a secret in git.
 | `org` | — | organisation login, for `check = "org"` / `"team"` |
 | `team` | — | team slug, for `check = "team"` |
 | `sites` | unset | table mapping each vhost to its own `{ repo \| org \| team }` |
+| `endpoints_only` | `false` | passive-issuer mode: serve only login/callback and let unauthenticated **content** through (`CONTINUE`) instead of redirecting it to login. A session cookie, the bypass, and the two reserved paths behave exactly as in the default mode, so the login flow still runs and a target is still required. Use it for one global issuer alongside per-site verifiers (see [Passive issuer for public-open, private-gated fleets](#passive-issuer-for-public-open-private-gated-fleets)) |
 | `access` | `"fixed"` | `"fixed"`: the configured target (`default_check`/`sites`) is authoritative — today's behaviour. `"per-preview"`: authorize each preview against the `owner/name` the router seals into the OAuth state from its `[preview_auth] repo` override; `default_check`/`sites` become optional and a request with no repo fails closed |
 | `login_path` | `/_ephpm/auth/github/login` | reserved: starts a login. The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so this default is reachable; keep custom values under `/_ephpm/auth/` |
 | `callback_path` | `/_ephpm/auth/github/callback` | reserved: receives GitHub's redirect. Register `https://<host>/_ephpm/auth/github/callback` as the GitHub OAuth App's Authorization callback URL |
@@ -231,6 +232,35 @@ mode `default_check`/`sites` are optional, and a login or callback with no repo
 fails **closed** (403). The session still binds only to the `site` (#396), never
 the repo. See the
 [Preview Access Gate roadmap page](/roadmap/preview-access-gate/#shipped-per-preview-repository-authorization-issue-487).
+
+### Passive issuer for public-open, private-gated fleets
+
+By default the issuer gates content itself: an unauthenticated request that is
+not a login, callback, session, or bypass is redirected to GitHub. That is
+correct when every vhost the mount serves is private. On a mixed fleet — some
+previews public, some private — it is too much: a **single global issuer holds
+the OAuth client secret and must serve login on every subdomain and the callback
+on the apex**, so it necessarily runs on public previews too, where redirecting
+every visitor to login is wrong.
+
+`endpoints_only = true` makes the issuer **passive**. It still serves its own
+endpoints — login starts, the callback is handled, a session cookie hands off to
+the verifier, a bypass token still mints — but an unauthenticated **content**
+request is passed straight through (`CONTINUE`) instead of being redirected. The
+gating decision then belongs entirely to a **per-site verifier**
+([`preview-gate`](/guides/native-middleware/#preview-gate), activated per preview
+by a `[preview_auth]` override):
+
+- a **private** preview has a verifier, which redirects its unauthenticated
+  requests to this issuer's `login_url` — the passive issuer serves that login
+  and mints the session;
+- a **public** preview has no verifier, so the passive issuer lets its content
+  through and the preview is open.
+
+A target is still required in this mode (the login flow runs when someone hits
+the login path), so the "no access target" startup error is unchanged. Pair it
+with the apex-flow knobs above for a wildcard fleet. The full topology is on the
+[Preview Access Gate roadmap page](/roadmap/preview-access-gate/#public-open-private-gated-one-passive-global-issuer).
 
 ## Which GitHub calls are made
 

@@ -185,6 +185,11 @@ pub enum Route {
     Bypass,
     /// A session cookie is present: hand off to the verifier. No network.
     HasSession,
+    /// Endpoints-only mode: an unauthenticated content request is passed
+    /// through untouched instead of being redirected to login, so a passive
+    /// global issuer serves only its own endpoints and leaves content
+    /// enforcement to a per-site verifier. No network.
+    Passthrough,
 }
 
 /// The gate.
@@ -231,6 +236,13 @@ impl GithubAuth {
             )
         {
             return Route::Bypass;
+        }
+        // An unauthenticated content request. In endpoints-only mode the issuer
+        // is passive — it serves login/callback and lets content through, so a
+        // single global mount can coexist with per-site verifiers that gate
+        // only the previews that opt in. Otherwise it gates content itself.
+        if self.config.endpoints_only {
+            return Route::Passthrough;
         }
         Route::StartLogin { return_to: redirect::sanitize_return_to(&here(path, query), &reserved) }
     }
@@ -747,7 +759,7 @@ impl Middleware for GithubAuth {
         let now = unix_now();
 
         match self.route(req.path(), req.query(), cookies, bypass.as_deref()) {
-            Route::HasSession => Response::cont(),
+            Route::HasSession | Route::Passthrough => Response::cont(),
             Route::StartLogin { return_to } => self.start_login(req, vhost, &return_to, now),
             Route::Callback => self.handle_callback(req, vhost, now),
             Route::Bypass => {
@@ -1001,6 +1013,68 @@ mod tests {
                 "{hostile} must not survive"
             );
         }
+    }
+
+    // ── endpoints-only (passive issuer) mode ────────────────────────────
+
+    #[test]
+    fn endpoints_only_passes_unauthenticated_content_through() {
+        // A passive global issuer serves its own endpoints and lets content
+        // through, so a per-site verifier — not the issuer — decides whether a
+        // given preview is gated. An unauthenticated content request that would
+        // normally 302 to GitHub instead routes to Passthrough…
+        let mw = gate(serde_json::json!({ "endpoints_only": true }));
+        for (path, query) in [("/", ""), ("/index.php", "a=b"), ("/wp-admin/edit.php", "post=7")] {
+            assert_eq!(
+                mw.route(path, query, "", None),
+                Route::Passthrough,
+                "{path} must pass through in endpoints-only mode"
+            );
+        }
+        // …and invoke() turns that into a CONTINUE, not a 302/403.
+        let resp = invoke(&mw, "/", "", &[]);
+        assert_eq!(resp.__action(), ACTION_CONTINUE, "content must be let through, not redirected");
+        assert!(resp.__headers().is_empty(), "a pass-through adds no headers");
+    }
+
+    #[test]
+    fn endpoints_only_still_serves_its_own_endpoints() {
+        // The passive issuer is passive about *content* only — its own
+        // endpoints, an existing session, and the bypass all behave exactly as
+        // they do in the default mode.
+        let mw = gate(serde_json::json!({ "endpoints_only": true }));
+        assert_eq!(
+            mw.route("/_ephpm/auth/github/login", "", "", None),
+            Route::StartLogin { return_to: "/".into() },
+            "login must still start"
+        );
+        assert_eq!(
+            mw.route("/_ephpm/auth/github/callback", "code=x&state=y", "", None),
+            Route::Callback,
+            "the callback must still be handled"
+        );
+        assert_eq!(
+            mw.route("/", "", "ephpm_session=tok", None),
+            Route::HasSession,
+            "a session cookie must still hand off to the verifier"
+        );
+        // And a real login started at the login endpoint still 302s to GitHub.
+        let resp = invoke(&mw, "/_ephpm/auth/github/login", "", &[]);
+        assert_eq!(resp.__action(), ACTION_RESPOND);
+        assert_eq!(resp.__status(), 302);
+    }
+
+    #[test]
+    fn endpoints_only_defaults_off_and_gates_content_as_before() {
+        // Regression: with the knob omitted (the default) an unauthenticated
+        // content request is gated exactly as it always was.
+        let mw = gate(serde_json::json!({}));
+        assert!(!mw.config.endpoints_only, "the default must be false");
+        assert_eq!(
+            mw.route("/wp-admin/edit.php", "post=7", "", None),
+            Route::StartLogin { return_to: "/wp-admin/edit.php?post=7".into() },
+            "default mode still redirects unauthenticated content to login"
+        );
     }
 
     // ── the 302 to GitHub ───────────────────────────────────────────────

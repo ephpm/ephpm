@@ -215,6 +215,59 @@ handles on the apex are the same mount. The apex (`preview.ephpm.dev`) must
 itself be a served vhost (it is where callbacks land). Substitute your own domain
 throughout.
 
+Note the wording above assumes the issuer also **content-gates** — the mode it
+ships in by default, where an unauthenticated content request on any vhost is
+redirected to login. That is correct only when every vhost the mount serves is
+private. To run a fleet where some previews are public and some private, set the
+issuer's `endpoints_only = true` and let per-site verifiers do all content
+enforcement — see the next section.
+
+## Public open, private gated: one passive global issuer
+
+The single-global-issuer requirement above is in tension with a fleet that
+serves **public** previews next to private ones. The issuer must be global (it
+holds the OAuth client secret and serves login on every subdomain plus the
+callback on the apex), but a global content-gating issuer redirects *every*
+visitor to login — including on a public preview that was never meant to be
+gated. `[preview_auth]` cannot rescue this: it activates the per-site *verifier*,
+which only ever runs where it is written, whereas the issuer's own final "no
+session → redirect to login" fires on every vhost regardless.
+
+`endpoints_only = true` on the issuer resolves it. The issuer becomes **passive**
+— it still serves login, the callback, honours an existing session, and mints on
+a bypass token, but an unauthenticated **content** request passes through
+(`CONTINUE`) instead of being redirected. Content enforcement moves entirely to
+the per-site verifier:
+
+| Preview | `[preview_auth]` verifier? | Unauth content request | Result |
+|---|---|---|---|
+| **private** | yes | verifier redirects it to the issuer's `login_url`; the passive issuer serves login and mints the session | gated |
+| **public** | no | no verifier runs; the passive issuer passes it through | open |
+
+The two halves still couple exactly as before — the shared `session_secret`, the
+matching cookie name, and the per-tenant `site` claim binding (#396) — so a
+session minted at login verifies only on the preview it was for. `endpoints_only`
+changes **only** what the issuer does with an unauthenticated content request; it
+does not waive the access-target requirement (login still runs, so a `repo` /
+`org` / `team` / `sites` target — or `access = "per-preview"` — is still
+mandatory) and it does not touch the verifier's fail-closed behaviour. Combine it
+with the apex-flow knobs (`redirect_uri`, `cookie_domain`) for a wildcard fleet.
+
+```toml
+# ephpm.toml — one global, passive issuer for the whole fleet
+[[middleware]]
+library = "github-auth"
+config  = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
+            session_secret = "env:EPHPM_PREVIEW_SESSION_SECRET",
+            redirect_uri  = "https://preview.ephpm.dev/_ephpm/auth/github/callback",
+            cookie_domain = ".preview.ephpm.dev",
+            org = "acme",                           # target still required — login runs here
+            endpoints_only = true }                 # passive: gate nothing, serve endpoints
+```
+
+Only the private previews then get a `[preview_auth]` override; the public ones
+get none and stay open.
+
 ## Shipped: per-preview repository authorization (issue #487)
 
 The apex flow above funnels every callback through one App, but on its own it
