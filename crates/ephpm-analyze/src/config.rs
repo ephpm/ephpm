@@ -29,6 +29,7 @@
 //!   phpstan_config: phpstan.neon   # optional; PHPStan auto-discovers otherwise
 //!   phpstan_level: 6               # optional; else from the target's config
 //!   psalm_config: psalm.xml    # optional; Psalm auto-discovers otherwise
+//!   progpilot_config: progpilot.yml   # optional custom sources/sinks/rules
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -249,6 +250,14 @@ pub struct AnalyzersConfig {
     /// gates (fail-closed), never a silent clean run.
     #[serde(default)]
     pub psalm_config: Option<PathBuf>,
+    /// Optional progpilot configuration file passed to
+    /// `progpilot --configuration <path>` (custom sources/sinks/rules).
+    /// Relative paths resolve against the analyzed root (the tool's cwd).
+    /// A configured-but-missing file is a hard error (fail-closed), never a
+    /// skip. The `progpilot` analyzer consumes progpilot's default JSON
+    /// output, so the referenced config must not switch progpilot to SARIF.
+    #[serde(default)]
+    pub progpilot_config: Option<PathBuf>,
     /// Wall-clock budget per external tool invocation, in milliseconds. A
     /// tool exceeding it is killed and the analyzer fails (fail-closed).
     /// Default 300000 (5 minutes).
@@ -267,6 +276,7 @@ impl Default for AnalyzersConfig {
             phpstan_config: None,
             phpstan_level: None,
             psalm_config: None,
+            progpilot_config: None,
             tool_timeout_ms: default_tool_timeout_ms(),
         }
     }
@@ -558,6 +568,7 @@ analyzers:
   phpstan_config: phpstan.neon
   phpstan_level: 8
   psalm_config: psalm.xml.dist
+  progpilot_config: progpilot.yml
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -598,6 +609,7 @@ suppress:
         assert_eq!(cfg.analyzers.phpstan_config.as_deref(), Some(Path::new("phpstan.neon")));
         assert_eq!(cfg.analyzers.phpstan_level, Some(8));
         assert_eq!(cfg.analyzers.psalm_config.as_deref(), Some(Path::new("psalm.xml.dist")));
+        assert_eq!(cfg.analyzers.progpilot_config.as_deref(), Some(Path::new("progpilot.yml")));
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);
