@@ -35,6 +35,7 @@
 //!   phpcs_standard: PSR12          # optional; else PHPCS's own default/config
 //!   phpmd_ruleset: cleancode,codesize   # optional; else a built-in set
 //!   rector_config: rector.php      # optional; else auto-discover rector.php
+//!   wp_vuln_feed: wordfence-feed.json   # downloaded WP vuln feed for wp-vuln
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -293,6 +294,15 @@ pub struct AnalyzersConfig {
     /// Default 300000 (5 minutes).
     #[serde(default = "default_tool_timeout_ms")]
     pub tool_timeout_ms: u64,
+    /// Path to a downloaded WordPress vulnerability feed (Wordfence
+    /// Intelligence JSON) for the opt-in `wp-vuln` analyzer. Relative paths
+    /// resolve against the analyzed root, like `yara_rules`. When unset (the
+    /// default), `wp-vuln` is skipped with a diagnostic — no feed ships with
+    /// ePHPm and there are no network calls at scan time, so the operator
+    /// refreshes it out of band. A *configured but missing / unparseable*
+    /// feed is an error (fail-closed), not a skip.
+    #[serde(default)]
+    pub wp_vuln_feed: Option<PathBuf>,
 }
 
 impl Default for AnalyzersConfig {
@@ -311,6 +321,7 @@ impl Default for AnalyzersConfig {
             phpmd_ruleset: None,
             rector_config: None,
             tool_timeout_ms: default_tool_timeout_ms(),
+            wp_vuln_feed: None,
         }
     }
 }
@@ -605,6 +616,7 @@ analyzers:
   phpcs_standard: PSR12
   phpmd_ruleset: cleancode,codesize
   rector_config: rector.php
+  wp_vuln_feed: wordfence-feed.json
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -649,6 +661,7 @@ suppress:
         assert_eq!(cfg.analyzers.phpcs_standard.as_deref(), Some("PSR12"));
         assert_eq!(cfg.analyzers.phpmd_ruleset.as_deref(), Some("cleancode,codesize"));
         assert_eq!(cfg.analyzers.rector_config.as_deref(), Some(Path::new("rector.php")));
+        assert_eq!(cfg.analyzers.wp_vuln_feed.as_deref(), Some(Path::new("wordfence-feed.json")));
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);
