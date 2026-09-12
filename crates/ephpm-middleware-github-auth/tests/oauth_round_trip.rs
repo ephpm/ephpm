@@ -216,6 +216,27 @@ fn call_on(
     mw.invoke(&req)
 }
 
+/// Like [`call_on`] but sets the canonical **site key** and the normalized
+/// **full request host** independently — the exact split a `sites_domain_suffix`
+/// deployment produces, where `vhost_id()` is the suffix-stripped key (`pr-1`)
+/// while `http_host()` is the real host (`pr-1.preview.test`). `call_on` passes
+/// one string as both, which is only faithful to a deployment with no suffix.
+fn call_on_full(
+    mw: &GithubAuth,
+    site_key: &str,
+    full_host: &str,
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+) -> Response {
+    let ctx =
+        RequestCtx::new("GET", path, query, "203.0.113.9", site_key, headers).with_host(full_host);
+    // SAFETY: `ctx` outlives the borrow and `host_table()` is 'static — the
+    // exact contract `Request::from_raw` documents.
+    let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+    mw.invoke(&req)
+}
+
 fn header(resp: &Response, name: &str) -> Option<String> {
     resp.__headers().iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
 }
@@ -583,6 +604,123 @@ fn apex_flow_one_app_serves_the_whole_wildcard_fleet() {
         policy.verify(token, now, Some(APEX)).is_none(),
         "and it is not a session for the apex"
     );
+}
+
+/// The apex flow **with `sites_domain_suffix` configured** — the real
+/// production preview config, and the one CI never exercised. When the router
+/// strips a `sites_domain_suffix`, `req.vhost_id()` is the bare **site key**
+/// (`pr-1`), NOT the full host (`pr-1.preview.test`); `req.http_host()` carries
+/// the full host. The bug: `handle_callback` sealed the site key into the state
+/// as the target and then treated that bare label as a host — checking
+/// `host_in_domain("pr-1", ".preview.test")` (false) and, had it passed,
+/// redirecting to the unreachable `https://pr-1/…`. Every login 400'd with
+/// "This login link is not valid here."
+///
+/// The fix seals the full host separately (`vh`) and uses it for the fleet
+/// check, the outbound `redirect_uri` and the absolute bounce, while `v` stays
+/// the site key that binds the session (#396). This drives the end-to-end apex
+/// flow with the site-key/full-host split and asserts the login completes: the
+/// callback is NOT a 400, the session's `site` claim is the SITE KEY (not the
+/// full host, so the hot-path verifier still matches it), and the redirect
+/// lands on the full host.
+///
+/// Falsification: revert the fix (`git stash` the `src/` change) and this test
+/// fails at the callback with `400` instead of `302`.
+#[test]
+fn apex_flow_with_a_sites_domain_suffix_stripped_site_key() {
+    // The suffix-stripped site keys (what `req.vhost_id()` returns in prod), and
+    // the full hosts (what `req.http_host()` returns). The `sites` map is keyed
+    // by SITE KEY — the same value `check_for` has always looked up.
+    const TARGET_KEY: &str = "pr-1";
+    const TARGET_HOST: &str = "pr-1.preview.test";
+    const APEX_KEY: &str = "preview.test"; // suffix `.preview.test` does not strip the apex
+    const APEX_HOST: &str = "preview.test";
+
+    let stub = Stub::start();
+    // Distinct repos per site key prove the callback gates on the TARGET site
+    // key, not the apex it landed on: the target maps to a readable repo, the
+    // apex to a denied one.
+    let mw = gate(
+        &stub,
+        serde_json::json!({
+            "repo": null,
+            "sites": {
+                TARGET_KEY: { "repo": "acme/web" },     // target → readable
+                APEX_KEY:   { "repo": "acme/noread" },  // apex → read denied
+            },
+            "redirect_uri": format!("https://{APEX_HOST}/_ephpm/auth/github/callback"),
+            "cookie_domain": ".preview.test",
+        }),
+    );
+
+    // 1. Login on the TARGET: site key `pr-1`, full host `pr-1.preview.test`.
+    let login = call_on_full(&mw, TARGET_KEY, TARGET_HOST, "/wp-admin/", "", &[]);
+    assert_eq!(login.__status(), 302);
+    let loc = header(&login, "Location").expect("Location");
+    let qs = loc.split_once('?').expect("query").1;
+    assert_eq!(
+        query_param(qs, "redirect_uri").expect("redirect_uri"),
+        format!("https://{APEX_HOST}/_ephpm/auth/github/callback"),
+        "authorize must send the ONE fixed apex redirect_uri"
+    );
+    let state = query_param(qs, "state").expect("state");
+    let state_cookie = set_cookies(&login)
+        .into_iter()
+        .find(|c| c.starts_with("ephpm_session_oauth="))
+        .expect("state cookie")
+        .split(';')
+        .next()
+        .expect("pair")
+        .to_owned();
+
+    // 2. GitHub redirects to the APEX callback (a different host, site key
+    //    `preview.test`). On the buggy code the bare `pr-1` target failed the
+    //    fleet check here → 400. The fix reads the sealed full host instead.
+    let resp = call_on_full(
+        &mw,
+        APEX_KEY,
+        APEX_HOST,
+        "/_ephpm/auth/github/callback",
+        &format!("code={GOOD_CODE}&state={state}"),
+        &[("Cookie".to_owned(), state_cookie)],
+    );
+    assert_ne!(
+        resp.__status(),
+        400,
+        "the suffix-stripped site key must not read as an out-of-fleet host — this is the bug"
+    );
+    assert_eq!(resp.__status(), 302, "the apex callback completes the login");
+
+    // 3. The redirect lands on the TARGET's FULL HOST, not the bare site key.
+    assert_eq!(
+        header(&resp, "Location").as_deref(),
+        Some("https://pr-1.preview.test/wp-admin/"),
+        "the browser must bounce back to the full host, never the unreachable bare `pr-1`"
+    );
+
+    // 4. The access check gated on the TARGET site key's repo (acme/web).
+    let seen = stub.seen();
+    assert!(seen.requests.iter().any(|r| r == "GET /repos/acme/web"), "must check the target repo");
+    assert!(
+        !seen.requests.iter().any(|r| r == "GET /repos/acme/noread"),
+        "must NOT check the apex's repo"
+    );
+    drop(seen);
+
+    // 5. The minted session's `site` claim is the SITE KEY `pr-1` — NOT the full
+    //    host. The hot-path verifier compares `site` to `req.vhost_id()` (the
+    //    site key) per #396; a full host there would break every request.
+    let session = session_value(&resp);
+    let payload =
+        session.strip_prefix("ephpm_session=").expect("prefix").split('.').nth(1).expect("payload");
+    let json: serde_json::Value =
+        serde_json::from_slice(&base64_url_decode(payload).expect("base64url")).expect("json");
+    assert_eq!(
+        json["site"], TARGET_KEY,
+        "the session must bind to the site key (#396), not the full host {TARGET_HOST}"
+    );
+    assert_eq!(json["via"], "github");
+    assert_eq!(json["check"], "repo acme/web");
 }
 
 // ── per-preview repo gate (issue #487) ─────────────────────────────────────
