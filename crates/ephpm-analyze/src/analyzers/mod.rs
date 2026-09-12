@@ -2,9 +2,10 @@
 //!
 //! Ten wrap external tools as subprocesses and degrade gracefully when the
 //! tool is absent (`composer-audit`, `semgrep-php`, `malware-yara`, `clamav`,
-//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); three
+//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); four
 //! are native with zero external dependencies (`dangerous-sinks`,
-//! `suppression-scan`, `obfuscation-scan`), sharing the per-file walker in
+//! `suppression-scan`, `obfuscation-scan`, `secrets-scan`), sharing the
+//! per-file walker in
 //! `php_files` — diff-aware scope skipping and the incremental cache included.
 //! `opcode-scan` and `php-lint` are native too but engine-backed:
 //! `opcode-scan` compiles each file with the embedded Zend compiler (no
@@ -17,7 +18,8 @@
 //! error), the WordPress analogue of `composer-audit`.
 //!
 //! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
-//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, and `obfuscation-scan` are
+//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `obfuscation-scan`, and
+//! `secrets-scan` are
 //! registered but **not** in the default `security` profile
 //! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
 //! `analyzers.enable`.
@@ -35,6 +37,7 @@ mod phpstan;
 mod progpilot;
 mod psalm_taint;
 mod rector;
+mod secrets_scan;
 mod semgrep;
 mod suppression_scan;
 mod tool;
@@ -53,6 +56,7 @@ pub use phpstan::PhpStan;
 pub use progpilot::Progpilot;
 pub use psalm_taint::PsalmTaint;
 pub use rector::Rector;
+pub use secrets_scan::SecretsScan;
 pub use semgrep::SemgrepPhp;
 pub use suppression_scan::SuppressionScan;
 pub use wp_vuln::WpVuln;
@@ -80,6 +84,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(WpVuln),
         Box::new(SuppressionScan),
         Box::new(ObfuscationScan),
+        Box::new(SecretsScan),
     ]
 }
 
@@ -94,8 +99,16 @@ mod tests {
         // default `security` profile (so the out-of-the-box gate is unchanged).
         let ids: Vec<String> = built_in().iter().map(|a| a.id().to_owned()).collect();
         let profile = Profile::Security.default_analyzers();
-        for id in ["clamav", "phpcs", "phpmd", "rector", "php-lint", "wp-vuln", "obfuscation-scan"]
-        {
+        for id in [
+            "clamav",
+            "phpcs",
+            "phpmd",
+            "rector",
+            "php-lint",
+            "wp-vuln",
+            "obfuscation-scan",
+            "secrets-scan",
+        ] {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");
         }
