@@ -6,19 +6,22 @@
 //! native with zero external dependencies (`dangerous-sinks`,
 //! `suppression-scan`), sharing the per-file walker in `php_files` —
 //! diff-aware scope skipping and the incremental cache included.
-//! `opcode-scan` is native too but engine-backed: it compiles each file with
-//! the embedded Zend compiler (no execution) and detects sinks in the opcode
-//! stream, degrading to a skip on builds without a linked libphp.
+//! `opcode-scan` and `php-lint` are native too but engine-backed:
+//! `opcode-scan` compiles each file with the embedded Zend compiler (no
+//! execution) and detects sinks in the opcode stream; `php-lint` compiles each
+//! file for syntax validity alone (`php -l`, in-process). Both degrade to a
+//! skip on builds without a linked libphp.
 //!
-//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`, and
-//! `opcode-scan` are registered but **not** in the default `security` profile
-//! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
-//! `analyzers.enable`.
+//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`,
+//! `opcode-scan`, and `php-lint` are registered but **not** in the default
+//! `security` profile ([`crate::config::Profile::default_analyzers`]) — they
+//! are opt-in via `analyzers.enable`.
 
 mod composer_audit;
 mod dangerous_sinks;
 mod opcode_scan;
 mod php_files;
+mod php_lint;
 mod phpcs;
 mod phpmd;
 mod phpstan;
@@ -33,6 +36,7 @@ mod yara_scan;
 pub use composer_audit::ComposerAudit;
 pub use dangerous_sinks::DangerousSinks;
 pub use opcode_scan::OpcodeScan;
+pub use php_lint::PhpLint;
 pub use phpcs::Phpcs;
 pub use phpmd::Phpmd;
 pub use phpstan::PhpStan;
@@ -60,6 +64,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(Rector),
         Box::new(DangerousSinks),
         Box::new(OpcodeScan),
+        Box::new(PhpLint),
         Box::new(SuppressionScan),
     ]
 }
@@ -75,7 +80,7 @@ mod tests {
         // default `security` profile (so the out-of-the-box gate is unchanged).
         let ids: Vec<String> = built_in().iter().map(|a| a.id().to_owned()).collect();
         let profile = Profile::Security.default_analyzers();
-        for id in ["phpcs", "phpmd", "rector"] {
+        for id in ["phpcs", "phpmd", "rector", "php-lint"] {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");
         }
