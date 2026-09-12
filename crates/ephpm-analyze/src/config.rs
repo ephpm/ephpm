@@ -26,6 +26,8 @@
 //!   deny_hard: [dangerous-sinks/eval]
 //!   yara_rules: rules/malware.yar
 //!   semgrep_config: p/php
+//!   phpstan_config: phpstan.neon   # optional; PHPStan auto-discovers otherwise
+//!   phpstan_level: 6               # optional; else from the target's config
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -224,6 +226,19 @@ pub struct AnalyzersConfig {
     /// Semgrep config/registry ref passed to `--config`. Default `p/php`.
     #[serde(default = "default_semgrep_config")]
     pub semgrep_config: String,
+    /// PHPStan configuration file passed to `phpstan analyse -c <path>`.
+    /// Relative paths resolve against the analyzed root (the tool's cwd).
+    /// When unset (the default), PHPStan auto-discovers `phpstan.neon` /
+    /// `phpstan.neon.dist` in the target — the common case, so no knob needed.
+    #[serde(default)]
+    pub phpstan_config: Option<PathBuf>,
+    /// PHPStan rule level passed to `phpstan analyse --level <n>` (0 is
+    /// loosest, `max` is expressed as `9`). When unset (the default), the
+    /// level comes from the target's PHPStan config; PHPStan itself errors if
+    /// neither this nor a config supplies one, which surfaces as a gating
+    /// analyzer failure (fail-closed), never a silent clean run.
+    #[serde(default)]
+    pub phpstan_level: Option<u8>,
     /// Wall-clock budget per external tool invocation, in milliseconds. A
     /// tool exceeding it is killed and the analyzer fails (fail-closed).
     /// Default 300000 (5 minutes).
@@ -239,6 +254,8 @@ impl Default for AnalyzersConfig {
             deny_hard: Vec::new(),
             yara_rules: None,
             semgrep_config: default_semgrep_config(),
+            phpstan_config: None,
+            phpstan_level: None,
             tool_timeout_ms: default_tool_timeout_ms(),
         }
     }
@@ -527,6 +544,8 @@ analyzers:
   deny_hard: [dangerous-sinks/eval]
   yara_rules: rules/malware.yar
   semgrep_config: p/security-audit
+  phpstan_config: phpstan.neon
+  phpstan_level: 8
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -564,6 +583,8 @@ suppress:
         assert_eq!(cfg.analyzers.deny_hard, vec!["dangerous-sinks/eval"]);
         assert_eq!(cfg.analyzers.yara_rules.as_deref(), Some(Path::new("rules/malware.yar")));
         assert_eq!(cfg.analyzers.semgrep_config, "p/security-audit");
+        assert_eq!(cfg.analyzers.phpstan_config.as_deref(), Some(Path::new("phpstan.neon")));
+        assert_eq!(cfg.analyzers.phpstan_level, Some(8));
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);

@@ -40,6 +40,8 @@ ephpm analyze [PATH] [--config FILE] [--format FORMAT] [--profile NAME] [--fail-
 
 External tools are **not bundled** — ePHPm shells out to them. An analyzer whose tool (or required input) is absent is reported as *skipped* and does not gate, unless listed in `analyzers.required` (see below). Each finding carries a **confidence**: `confirmed` (the analyzer is sure) or `suspected` (a hotspot worth review) — see [Hotspots vs findings](#hotspots-vs-findings-confidence).
 
+The `security` profile enables the first five analyzers below (`composer-audit`, `semgrep-php`, `malware-yara`, `dangerous-sinks`, `suppression-scan`). `phpstan` is registered but **opt-in** — it runs only when named explicitly in `analyzers.enable`, so the default gate behaviour is unchanged.
+
 | Analyzer | Kind | Category | Confidence | Needs | What it does |
 |----------|------|----------|------------|-------|--------------|
 | `composer-audit` | external | supply-chain | confirmed | `composer` on `PATH`, `composer.json` + `composer.lock` in the target | Runs `composer audit --no-scripts --format=json`; each advisory becomes a finding (severity from the advisory, `critical` hard-denies), abandoned packages become `info` findings. |
@@ -47,6 +49,7 @@ External tools are **not bundled** — ePHPm shells out to them. An analyzer who
 | `malware-yara` | external | malware | confirmed | `yara` on `PATH` **and** a ruleset at `analyzers.yara_rules` (none ships with ePHPm — unset means skipped) | Runs `yara -r -w <rules> <target>`; each rule match is a `high` finding. A *configured but missing* ruleset path is an error (fail-closed), not a skip. |
 | `dangerous-sinks` | native | security | suspected | nothing | A naive line/token pass over `*.php` / `*.phtml` flagging direct calls to the `eval` and `system` sinks (high) and `assert` (medium). Deliberately simple — matches inside comments/strings are false positives (hence *suspected*); dynamic calls are missed. It will be superseded by the opcode-level analyzer (planned). |
 | `suppression-scan` | native | security | confirmed | nothing | Flags tenant-authored suppression-shaped comments (`ephpm-analyze-ignore`, `@phpstan-ignore*`, `@psalm-suppress`, `phpcs:ignore`/`phpcs:disable`, `nosemgrep`, `noqa`, `NOSONAR`, `@codingStandardsIgnore`) as `suppression-scan/tenant-suppression-attempt` (medium) — see [Operator-only suppressions](#operator-only-suppressions-suppress). One finding per (file, marker), anchored at the first occurrence. |
+| `phpstan` | external, **opt-in** | quality | confirmed | `phpstan` on `PATH` **or** a vendored `vendor/bin/phpstan`; a rule level (from `analyzers.phpstan_level` or a `phpstan.neon`/`phpstan.neon.dist` in the target) | Runs `phpstan analyse --error-format=json --no-progress --no-interaction`; each per-file message becomes a `medium` **quality** finding (`rule_id` = `phpstan/<identifier>` when PHPStan emits one, else `phpstan/analyse`). A non-empty top-level `errors` array (bad config, internal error) is a broken run and **gates** (fail-closed), never a clean result. Not in the `security` profile — enable it with `analyzers.enable: [phpstan]`. |
 
 ## The verdict model
 
@@ -166,6 +169,11 @@ analyzers:
   yara_rules: null         # YARA ruleset path for malware-yara (relative
                            # paths resolve against the analyzed directory)
   semgrep_config: p/php    # semgrep --config value
+  phpstan_config: null     # phpstan `analyse -c <path>` (relative to the
+                           # target). null = PHPStan auto-discovers
+                           # phpstan.neon / phpstan.neon.dist
+  phpstan_level: null      # phpstan `analyse --level <n>` (0..=9). null =
+                           # level comes from the target's PHPStan config
   tool_timeout_ms: 300000  # wall-clock budget per external tool; exceeding
                            # it kills the tool and gates (fail-closed)
 
@@ -227,4 +235,4 @@ ephpm analyze /srv/app
 
 ## Scope
 
-Shipped: the aggregator, the fail-closed policy engine (strictness levels, confidence model), the config/gating surface, baselines, diff-aware scanning, the incremental cache, operator-only suppressions with tenant-suppression detection, both output formats, and the five analyzers above. Planned — not yet implemented: opcode-level analysis of compiled PHP (which replaces the naive `dangerous-sinks` pass), engine-in-the-loop detonation of suspicious inputs (the `engine:` section), and ePHPm-specific rules. The `Analyzer` trait, finding shape, policy engine, and output formats are designed to be stable across those additions.
+Shipped: the aggregator, the fail-closed policy engine (strictness levels, confidence model), the config/gating surface, baselines, diff-aware scanning, the incremental cache, operator-only suppressions with tenant-suppression detection, both output formats, the five default-profile analyzers above, and the opt-in `phpstan` analyzer. Planned — not yet implemented: opcode-level analysis of compiled PHP (which replaces the naive `dangerous-sinks` pass), engine-in-the-loop detonation of suspicious inputs (the `engine:` section), and ePHPm-specific rules. The `Analyzer` trait, finding shape, policy engine, and output formats are designed to be stable across those additions.
