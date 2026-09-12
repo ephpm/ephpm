@@ -1,7 +1,7 @@
 //! The built-in analyzers.
 //!
-//! Nine wrap external tools as subprocesses and degrade gracefully when the
-//! tool is absent (`composer-audit`, `semgrep-php`, `malware-yara`,
+//! Ten wrap external tools as subprocesses and degrade gracefully when the
+//! tool is absent (`composer-audit`, `semgrep-php`, `malware-yara`, `clamav`,
 //! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); two are
 //! native with zero external dependencies (`dangerous-sinks`,
 //! `suppression-scan`), sharing the per-file walker in `php_files` —
@@ -16,11 +16,13 @@
 //! Intelligence vulnerability feed (unset → skip; configured-but-missing →
 //! error), the WordPress analogue of `composer-audit`.
 //!
-//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`,
-//! `opcode-scan`, `php-lint`, and `wp-vuln` are registered but **not** in the
-//! default `security` profile ([`crate::config::Profile::default_analyzers`])
-//! — they are opt-in via `analyzers.enable`.
+//! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
+//! `rector`, `opcode-scan`, `php-lint`, and `wp-vuln` are registered but
+//! **not** in the default `security` profile
+//! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
+//! `analyzers.enable`.
 
+mod clamav;
 mod composer_audit;
 mod dangerous_sinks;
 mod opcode_scan;
@@ -38,6 +40,7 @@ mod tool;
 mod wp_vuln;
 mod yara_scan;
 
+pub use clamav::Clamav;
 pub use composer_audit::ComposerAudit;
 pub use dangerous_sinks::DangerousSinks;
 pub use opcode_scan::OpcodeScan;
@@ -62,6 +65,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(ComposerAudit),
         Box::new(SemgrepPhp),
         Box::new(MalwareYara),
+        Box::new(Clamav),
         Box::new(PhpStan),
         Box::new(PsalmTaint),
         Box::new(Progpilot),
@@ -87,7 +91,7 @@ mod tests {
         // default `security` profile (so the out-of-the-box gate is unchanged).
         let ids: Vec<String> = built_in().iter().map(|a| a.id().to_owned()).collect();
         let profile = Profile::Security.default_analyzers();
-        for id in ["phpcs", "phpmd", "rector", "php-lint", "wp-vuln"] {
+        for id in ["clamav", "phpcs", "phpmd", "rector", "php-lint", "wp-vuln"] {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");
         }

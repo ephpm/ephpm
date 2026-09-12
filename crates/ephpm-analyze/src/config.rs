@@ -27,6 +27,7 @@
 //!   required: [composer-audit]
 //!   deny_hard: [dangerous-sinks/eval]
 //!   yara_rules: rules/malware.yar
+//!   clamav_db: sigs/webshells.hdb   # optional alternate ClamAV DB for clamav
 //!   semgrep_config: p/php
 //!   phpstan_config: phpstan.neon   # optional; PHPStan auto-discovers otherwise
 //!   phpstan_level: 6               # optional; else from the target's config
@@ -231,6 +232,15 @@ pub struct AnalyzersConfig {
     /// `malware-yara` is skipped with a diagnostic.
     #[serde(default)]
     pub yara_rules: Option<PathBuf>,
+    /// Optional alternate signature database (file or directory) for the
+    /// opt-in `clamav` analyzer, passed as `clamscan -d <path>` — the mechanism
+    /// for a curated webshell/PHP-malware feed, analogous to `yara_rules`.
+    /// Relative paths resolve against the analyzed root. When unset (the
+    /// default), ClamAV uses its system database (kept fresh out of band by
+    /// `freshclam`). A configured-but-missing path is a hard error
+    /// (fail-closed), not a skip.
+    #[serde(default)]
+    pub clamav_db: Option<PathBuf>,
     /// Semgrep config/registry ref passed to `--config`. Default `p/php`.
     #[serde(default = "default_semgrep_config")]
     pub semgrep_config: String,
@@ -312,6 +322,7 @@ impl Default for AnalyzersConfig {
             required: Vec::new(),
             deny_hard: Vec::new(),
             yara_rules: None,
+            clamav_db: None,
             semgrep_config: default_semgrep_config(),
             phpstan_config: None,
             phpstan_level: None,
