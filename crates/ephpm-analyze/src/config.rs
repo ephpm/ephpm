@@ -28,6 +28,7 @@
 //!   semgrep_config: p/php
 //!   phpstan_config: phpstan.neon   # optional; PHPStan auto-discovers otherwise
 //!   phpstan_level: 6               # optional; else from the target's config
+//!   psalm_config: psalm.xml    # optional; Psalm auto-discovers otherwise
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -239,6 +240,15 @@ pub struct AnalyzersConfig {
     /// analyzer failure (fail-closed), never a silent clean run.
     #[serde(default)]
     pub phpstan_level: Option<u8>,
+    /// Psalm configuration file passed to `psalm --config <path>` for the
+    /// opt-in `psalm-taint` analyzer. Relative paths resolve against the
+    /// analyzed root (the tool's cwd). When unset (the default), `psalm-taint`
+    /// auto-discovers `psalm.xml` / `psalm.xml.dist` in the target and skips
+    /// (does not gate) when neither is present — Psalm cannot run without a
+    /// config. A set-but-missing path is left to Psalm, which fails loudly and
+    /// gates (fail-closed), never a silent clean run.
+    #[serde(default)]
+    pub psalm_config: Option<PathBuf>,
     /// Wall-clock budget per external tool invocation, in milliseconds. A
     /// tool exceeding it is killed and the analyzer fails (fail-closed).
     /// Default 300000 (5 minutes).
@@ -256,6 +266,7 @@ impl Default for AnalyzersConfig {
             semgrep_config: default_semgrep_config(),
             phpstan_config: None,
             phpstan_level: None,
+            psalm_config: None,
             tool_timeout_ms: default_tool_timeout_ms(),
         }
     }
@@ -546,6 +557,7 @@ analyzers:
   semgrep_config: p/security-audit
   phpstan_config: phpstan.neon
   phpstan_level: 8
+  psalm_config: psalm.xml.dist
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -585,6 +597,7 @@ suppress:
         assert_eq!(cfg.analyzers.semgrep_config, "p/security-audit");
         assert_eq!(cfg.analyzers.phpstan_config.as_deref(), Some(Path::new("phpstan.neon")));
         assert_eq!(cfg.analyzers.phpstan_level, Some(8));
+        assert_eq!(cfg.analyzers.psalm_config.as_deref(), Some(Path::new("psalm.xml.dist")));
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);
