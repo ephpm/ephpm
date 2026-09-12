@@ -18,10 +18,13 @@ use crate::scope::Scope;
 /// later phases can add **lazily populated shared state** without touching
 /// any analyzer's signature:
 ///
-/// - *Planned — not yet implemented (Phase 2, opcode analyzers):* a
-///   `compiled()` accessor returning a lazily built compiled representation
-///   of the tree's PHP files (op_array-level), built at most once and shared
-///   by every opcode analyzer.
+/// - *Planned — not yet implemented (shared compile state):* a `compiled()`
+///   accessor returning a lazily built compiled representation of the
+///   tree's PHP files (op_array-level), built at most once and shared by
+///   every opcode analyzer. The first opcode analyzer (`opcode-scan`)
+///   ships without it — it compiles per file through
+///   `ephpm_php::opcode::scan_file` directly; this accessor becomes worth
+///   building once a *second* opcode-level pass exists to share the work.
 /// - *Planned — not yet implemented (Phase 4, engine-in-the-loop):* an
 ///   `engine()` accessor exposing a sandboxed embedded-PHP evaluation handle,
 ///   gated by `engine.detonate` / `engine.timeout_ms` (parsed today, inert).

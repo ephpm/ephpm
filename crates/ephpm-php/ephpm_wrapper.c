@@ -6755,3 +6755,382 @@ int ephpm_cli_main(int argc, char **argv)
 
     return result;
 }
+
+/* ===================================================================
+ * Opcode scanning — compile-only static analysis (`ephpm analyze`,
+ * the `opcode-scan` analyzer)
+ *
+ * Compile one PHP file with the SAME compiler that would execute it
+ * (zend_compile_file — OPcache's hook when loaded), walk the resulting
+ * op_array(s), and report dangerous call sites at the opcode level.
+ * NOTHING is executed: no zend_execute, no zend_execute_scripts, no
+ * php_execute_script. This is the `opcache_compile_file()` model —
+ * ZEND_COMPILE_WITHOUT_EXECUTION is set for the duration of the compile,
+ * exactly as ext/opcache does, so the compiler does not early-bind
+ * declarations on the assumption the code is about to run.
+ *
+ * Why opcodes instead of a text scan: the compiler has already discarded
+ * comments, resolved string literals into constants, and lowered the
+ * backtick operator into a shell_exec call — so a match here is a real
+ * call site (Confidence::Confirmed on the Rust side), not a token that
+ * happened to appear in a comment.
+ *
+ * What is walked, and why it is complete for one file:
+ *   1. the top-level op_array returned by zend_compile_file;
+ *   2. its dynamic_func_defs, recursively — PHP 8.1+ keeps closures,
+ *      arrow functions, and any function whose declaration was not
+ *      early-bound (conditional declarations, and everything under
+ *      ZEND_COMPILE_WITHOUT_EXECUTION) nested in the declaring op_array;
+ *   3. whatever the compile still registered into EG(function_table) /
+ *      EG(class_table) (classes land in the class table under their
+ *      runtime-definition keys even when not early-bound), found by
+ *      diffing nNumUsed before/after — the same capture technique
+ *      opcache's persistent compiler uses. Methods are walked only when
+ *      declared by the class itself (common.scope == ce) so inherited
+ *      aliases of a parent's op_array are not double-reported.
+ *
+ * Everything the compile registered is deleted from the tables again
+ * before returning (reverse insertion order), so scanning file B is
+ * independent of file A — two files unconditionally declaring the same
+ * function must not turn into a "cannot redeclare" fatal for B.
+ *
+ * setjmp/longjmp: the whole compile+walk runs inside zend_try. A fatal
+ * compile error (E_COMPILE_ERROR bailout) is caught here and reported as
+ * a return code — it never unwinds into Rust. A parse error is not a
+ * bailout: zend_compile_file returns NULL with a ParseError pending in
+ * EG(exception); its message/line are copied out and the exception is
+ * cleared so it cannot resurface later.
+ * =================================================================== */
+
+/* Callback into Rust: one dangerous call site. `sink` points at one of the
+ * caller-supplied sink strings (stable for the duration of the call);
+ * `lineno` is the 1-based source line recorded on the opcode. The callback
+ * MUST NOT call back into PHP (it runs inside the zend_try region). */
+typedef void (*ephpm_opcode_hit_cb)(void *ctx, const char *sink, uint32_t lineno);
+
+/* Return codes for ephpm_opcode_scan_file(). Must match the match arms in
+ * crates/ephpm-php/src/opcode.rs::scan_file. */
+#define EPHPM_OPSCAN_OK           0
+#define EPHPM_OPSCAN_COMPILE_ERR (-1)
+#define EPHPM_OPSCAN_BAILOUT     (-2)
+#define EPHPM_OPSCAN_NO_ENGINE   (-3)
+
+/* Case-insensitive match of a candidate function name against the sink
+ * list. Returns the matched caller-owned sink pointer (so the callback can
+ * hand Rust back its own string), or NULL. A leading backslash is stripped
+ * defensively: fully-qualified names normally resolve to ZEND_INIT_FCALL
+ * with an unqualified lowercased literal, but BY_NAME literals keep the
+ * source spelling. */
+static const char *ephpm_opcode_match_sink(const char *name, size_t name_len,
+                                           const char *const *sinks, size_t sink_count)
+{
+    size_t i;
+    if (name_len > 0 && name[0] == '\\') {
+        name++;
+        name_len--;
+    }
+    for (i = 0; i < sink_count; i++) {
+        size_t sink_len = strlen(sinks[i]);
+        if (sink_len == name_len
+            && zend_binary_strcasecmp(name, name_len, sinks[i], sink_len) == 0) {
+            return sinks[i];
+        }
+    }
+    return NULL;
+}
+
+/* Walk one op_array (and its nested dynamic function definitions) for
+ * dangerous call sites. Read-only over engine state; no PHP calls. */
+static void ephpm_opcode_walk_op_array(const zend_op_array *ops,
+                                       const char *const *sinks, size_t sink_count,
+                                       ephpm_opcode_hit_cb cb, void *cb_ctx)
+{
+    uint32_t i;
+    for (i = 0; i < ops->last; i++) {
+        const zend_op *opline = &ops->opcodes[i];
+        const zval *name_zv;
+        const char *matched;
+
+        switch (opline->opcode) {
+        case ZEND_INCLUDE_OR_EVAL:
+            /* Only the eval variant — include/require are a different
+             * (path-traversal-shaped) concern for a later rule. */
+            if (opline->extended_value == ZEND_EVAL) {
+                matched = ephpm_opcode_match_sink("eval", 4, sinks, sink_count);
+                if (matched) {
+                    cb(cb_ctx, matched, opline->lineno);
+                }
+            }
+            break;
+
+        case ZEND_INIT_FCALL:
+        case ZEND_INIT_FCALL_BY_NAME:
+        case ZEND_INIT_NS_FCALL_BY_NAME:
+            /* A statically-named call. op2 is IS_CONST; the literal layout
+             * differs per opcode (zend_compile.c):
+             *   INIT_FCALL            [lowercased resolved name]
+             *   INIT_FCALL_BY_NAME    [original, lowercased]
+             *   INIT_NS_FCALL_BY_NAME [original, lc namespaced, lc global
+             *                          fallback]
+             * We match the name the engine would use for GLOBAL resolution
+             * — for the NS case that is the fallback literal, i.e. exactly
+             * the internal function the call can reach at runtime when the
+             * namespace does not shadow it. RT_CONSTANT is valid here:
+             * zend_compile_file runs pass_two before returning, and
+             * literals are contiguous zvals, so +1/+2 index the siblings.
+             * Every INIT_FCALL* is paired with a ZEND_DO_FCALL/DO_ICALL by
+             * construction, so matching the INIT is matching the call. */
+            if (opline->op2_type != IS_CONST) {
+                break;
+            }
+            name_zv = RT_CONSTANT(opline, opline->op2);
+            if (opline->opcode == ZEND_INIT_FCALL_BY_NAME) {
+                name_zv += 1;
+            } else if (opline->opcode == ZEND_INIT_NS_FCALL_BY_NAME) {
+                name_zv += 2;
+            }
+            if (Z_TYPE_P(name_zv) != IS_STRING) {
+                break;
+            }
+            matched = ephpm_opcode_match_sink(Z_STRVAL_P(name_zv), Z_STRLEN_P(name_zv),
+                                              sinks, sink_count);
+            if (matched) {
+                cb(cb_ctx, matched, opline->lineno);
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    /* Closures, arrow functions, and non-early-bound function declarations
+     * nest here (PHP 8.1+), each a full op_array of its own. */
+    for (i = 0; i < ops->num_dynamic_func_defs; i++) {
+        ephpm_opcode_walk_op_array(ops->dynamic_func_defs[i], sinks, sink_count, cb, cb_ctx);
+    }
+}
+
+/* Walk the user functions the compile appended to EG(function_table)
+ * (bucket indexes [before, nNumUsed) — deletion never compacts a zend
+ * HashTable mid-request, so pre-existing entries keep their slots). */
+static void ephpm_opcode_walk_new_functions(uint32_t before,
+                                            const char *const *sinks, size_t sink_count,
+                                            ephpm_opcode_hit_cb cb, void *cb_ctx)
+{
+    HashTable *ft = EG(function_table);
+    uint32_t i;
+    for (i = before; i < ft->nNumUsed; i++) {
+        Bucket *p = ft->arData + i;
+        zend_function *fn;
+        if (Z_TYPE(p->val) == IS_UNDEF) {
+            continue;
+        }
+        fn = (zend_function *)Z_PTR(p->val);
+        if (fn->type == ZEND_USER_FUNCTION) {
+            ephpm_opcode_walk_op_array(&fn->op_array, sinks, sink_count, cb, cb_ctx);
+        }
+    }
+}
+
+/* Walk the methods of the user classes the compile appended to
+ * EG(class_table). Only methods DECLARED by the class (common.scope == ce)
+ * are walked — inherited entries alias the parent's op_array and would
+ * double-report. */
+static void ephpm_opcode_walk_new_classes(uint32_t before,
+                                          const char *const *sinks, size_t sink_count,
+                                          ephpm_opcode_hit_cb cb, void *cb_ctx)
+{
+    HashTable *ct = EG(class_table);
+    uint32_t i;
+    for (i = before; i < ct->nNumUsed; i++) {
+        Bucket *p = ct->arData + i;
+        zend_class_entry *ce;
+        zend_function *method;
+        if (Z_TYPE(p->val) == IS_UNDEF) {
+            continue;
+        }
+        ce = (zend_class_entry *)Z_PTR(p->val);
+        if (ce->type != ZEND_USER_CLASS) {
+            continue;
+        }
+        ZEND_HASH_MAP_FOREACH_PTR(&ce->function_table, method) {
+            if (method->type == ZEND_USER_FUNCTION && method->common.scope == ce) {
+                ephpm_opcode_walk_op_array(&method->op_array, sinks, sink_count, cb, cb_ctx);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* Delete every entry the compile appended to `table` (indexes
+ * [before, nNumUsed)), in reverse insertion order so intra-file
+ * dependencies (a class extending an earlier one) are torn down child
+ * first. zend_hash_del runs the table's destructor — the same
+ * zend_function_dtor / class dtor request shutdown uses, so refcounted and
+ * immutable (OPcache SHM) entries are handled correctly. Deletion leaves
+ * IS_UNDEF holes and never reallocates, so raw index iteration is safe. */
+static void ephpm_opcode_prune_table(HashTable *table, uint32_t before)
+{
+    uint32_t i = table->nNumUsed;
+    while (i > before) {
+        Bucket *p;
+        i--;
+        p = table->arData + i;
+        if (Z_TYPE(p->val) == IS_UNDEF || p->key == NULL) {
+            continue;
+        }
+        zend_hash_del(table, p->key);
+    }
+}
+
+/* Copy the pending ParseError's message + line into err_buf and clear the
+ * exception (so it cannot surface inside a later request phase). Reading
+ * the declared `message`/`line` properties of an Error object invokes no
+ * userland code. */
+static void ephpm_opcode_copy_exception(char *err_buf, size_t err_buf_len)
+{
+    zend_object *ex = EG(exception);
+    if (ex != NULL) {
+        if (err_buf && err_buf_len) {
+            zval rv_msg, rv_line;
+            zval *msg, *line;
+            ZVAL_UNDEF(&rv_msg);
+            ZVAL_UNDEF(&rv_line);
+            msg = zend_read_property_ex(zend_get_exception_base(ex), ex,
+                                        ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv_msg);
+            line = zend_read_property_ex(zend_get_exception_base(ex), ex,
+                                         ZSTR_KNOWN(ZEND_STR_LINE), 1, &rv_line);
+            if (msg && Z_TYPE_P(msg) == IS_STRING && line && Z_TYPE_P(line) == IS_LONG) {
+                snprintf(err_buf, err_buf_len, "%s on line " ZEND_LONG_FMT,
+                         Z_STRVAL_P(msg), Z_LVAL_P(line));
+            } else if (msg && Z_TYPE_P(msg) == IS_STRING) {
+                snprintf(err_buf, err_buf_len, "%s", Z_STRVAL_P(msg));
+            } else {
+                snprintf(err_buf, err_buf_len, "compile error (unreadable exception)");
+            }
+            /* rv_* were only written for dynamic properties; dtor on UNDEF
+             * is a no-op, so this is safe either way. */
+            zval_ptr_dtor(&rv_msg);
+            zval_ptr_dtor(&rv_line);
+        }
+        zend_clear_exception();
+    } else if (err_buf && err_buf_len) {
+        /* ZEND_INCLUDE + unopenable file: NULL op_array, no exception. */
+        snprintf(err_buf, err_buf_len, "could not open or compile file");
+    }
+}
+
+/* Copy the last fatal error (set by zend_error before it bailed out) into
+ * err_buf. Used on the zend_catch path only. */
+static void ephpm_opcode_copy_last_error(char *err_buf, size_t err_buf_len)
+{
+    if (!err_buf || !err_buf_len) {
+        return;
+    }
+    if (PG(last_error_message)) {
+        snprintf(err_buf, err_buf_len, "%s on line %d",
+                 ZSTR_VAL(PG(last_error_message)), PG(last_error_lineno));
+    } else {
+        snprintf(err_buf, err_buf_len, "fatal error during compilation (bailout)");
+    }
+}
+
+/*
+ * Compile `path` to opcodes — WITHOUT executing anything — and invoke `cb`
+ * once per dangerous call site found (see the section comment above for the
+ * full model). `sinks` is the list of function names to flag; the special
+ * name "eval" additionally matches the eval language construct
+ * (ZEND_INCLUDE_OR_EVAL with extended_value ZEND_EVAL, which is not a
+ * function call and has no INIT_FCALL).
+ *
+ * EG(assertions) is forced to 1 for the duration of the compile: with
+ * zend.assertions=-1 the compiler drops assert() calls entirely
+ * (zero-cost production mode), which would make detection depend on the
+ * scanning process's ini instead of on the scanned code.
+ *
+ * Must be called on a thread with an active PHP request context (the
+ * php_embed_init thread, or one that ran ephpm_thread_init) — verified via
+ * the TSRM cache and EG(active) rather than trusted.
+ *
+ * Returns EPHPM_OPSCAN_OK, or a negative code with a human-readable reason
+ * in err_buf (always NUL-terminated when err_buf_len > 0).
+ */
+int ephpm_opcode_scan_file(const char *path,
+                           const char *const *sinks, size_t sink_count,
+                           ephpm_opcode_hit_cb cb, void *cb_ctx,
+                           char *err_buf, size_t err_buf_len)
+{
+    volatile int rc = EPHPM_OPSCAN_OK;
+    uint32_t fn_before, cl_before;
+    zend_long orig_assertions;
+    uint32_t orig_compiler_options;
+
+    if (err_buf && err_buf_len) {
+        err_buf[0] = '\0';
+    }
+    if (!path || !cb || (sink_count > 0 && !sinks)) {
+        return EPHPM_OPSCAN_NO_ENGINE;
+    }
+#ifdef ZTS
+    /* An unregistered thread has no TSRM cache; touching EG() would crash. */
+    if (!tsrm_get_ls_cache()) {
+        return EPHPM_OPSCAN_NO_ENGINE;
+    }
+#endif
+    /* No active request context: the Zend memory manager and executor
+     * globals the compiler allocates from are not set up. */
+    if (!EG(active)) {
+        return EPHPM_OPSCAN_NO_ENGINE;
+    }
+
+    fn_before = EG(function_table)->nNumUsed;
+    cl_before = EG(class_table)->nNumUsed;
+    orig_assertions = EG(assertions);
+    orig_compiler_options = CG(compiler_options);
+    EG(assertions) = 1;
+    CG(compiler_options) |= ZEND_COMPILE_WITHOUT_EXECUTION;
+
+    zend_try {
+        zend_file_handle fh;
+        zend_op_array *op_array;
+
+        /* ZEND_INCLUDE, not ZEND_REQUIRE: an unopenable file is then a
+         * warning + NULL return instead of an E_COMPILE_ERROR bailout, so
+         * the common failure keeps the cheap non-longjmp path. */
+        zend_stream_init_filename(&fh, path);
+        op_array = zend_compile_file(&fh, ZEND_INCLUDE);
+        zend_destroy_file_handle(&fh);
+
+        if (!op_array) {
+            ephpm_opcode_copy_exception(err_buf, err_buf_len);
+            rc = EPHPM_OPSCAN_COMPILE_ERR;
+        } else {
+            ephpm_opcode_walk_op_array(op_array, sinks, sink_count, cb, cb_ctx);
+            ephpm_opcode_walk_new_functions(fn_before, sinks, sink_count, cb, cb_ctx);
+            ephpm_opcode_walk_new_classes(cl_before, sinks, sink_count, cb, cb_ctx);
+            /* Same teardown as opcache_compile_file: no static vars were
+             * ever bound (nothing executed), destroy_op_array handles the
+             * OPcache-SHM refcounted case. */
+            destroy_op_array(op_array);
+            efree_size(op_array, sizeof(zend_op_array));
+        }
+    } zend_catch {
+        /* Fatal compile error (redeclare within the file, resource limit).
+         * The compiler may have left partial state; the caller treats this
+         * as terminal for the scan run, so we do not prune the tables here
+         * (they may be mid-mutation). */
+        ephpm_opcode_copy_last_error(err_buf, err_buf_len);
+        rc = EPHPM_OPSCAN_BAILOUT;
+    } zend_end_try();
+
+    if (rc != EPHPM_OPSCAN_BAILOUT) {
+        /* Even a ParseError may have registered symbols that preceded the
+         * bad line — prune on the compile-error path too. */
+        ephpm_opcode_prune_table(EG(class_table), cl_before);
+        ephpm_opcode_prune_table(EG(function_table), fn_before);
+    }
+
+    CG(compiler_options) = orig_compiler_options;
+    EG(assertions) = orig_assertions;
+    return rc;
+}

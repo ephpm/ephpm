@@ -6,6 +6,7 @@ pub mod crash_guard;
 pub mod db_bridge;
 pub mod jit_metrics;
 pub mod kv_bridge;
+pub mod opcode;
 pub mod request;
 pub mod response;
 pub mod sapi;
@@ -274,6 +275,31 @@ mod ffi {
             buffer_size: *mut ::std::os::raw::c_ulonglong,
             buffer_free: *mut ::std::os::raw::c_ulonglong,
         ) -> ::std::os::raw::c_long;
+
+        // ── Opcode scanning (`ephpm analyze` opcode-scan, phase L1) ───
+
+        /// Compile one PHP file to opcodes — WITHOUT executing anything —
+        /// and invoke `cb` once per dangerous call site (a statically-named
+        /// call to one of `sinks`, or the `eval` construct when `"eval"` is
+        /// listed). The whole compile+walk runs inside `zend_try` in the C
+        /// wrapper, so a fatal compile error is returned as a code, never a
+        /// longjmp into Rust. Must be called on a thread with an active PHP
+        /// request context (verified by the wrapper, which returns `-3`
+        /// otherwise). Returns `0` ok, `-1` compile error (message in
+        /// `err_buf`), `-2` fatal/bailout, `-3` no engine context.
+        pub fn ephpm_opcode_scan_file(
+            path: *const ::std::os::raw::c_char,
+            sinks: *const *const ::std::os::raw::c_char,
+            sink_count: usize,
+            cb: unsafe extern "C" fn(
+                ctx: *mut ::std::os::raw::c_void,
+                sink: *const ::std::os::raw::c_char,
+                lineno: u32,
+            ),
+            cb_ctx: *mut ::std::os::raw::c_void,
+            err_buf: *mut ::std::os::raw::c_char,
+            err_buf_len: usize,
+        ) -> ::std::os::raw::c_int;
     }
 }
 

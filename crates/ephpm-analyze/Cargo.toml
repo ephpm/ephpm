@@ -7,8 +7,19 @@ license.workspace = true
 repository.workspace = true
 description = "Static analysis aggregator and fail-closed deploy gate for PHP applications"
 
+[features]
+# Enables the `opcode-scan` analyzer's engine path via ephpm-php. Off by
+# default so a standalone `cargo build -p ephpm-analyze` stays PHP-free (no
+# ephpm-php in the dependency graph at all). The `ephpm` binary enables it;
+# whether the engine is actually PRESENT is then ephpm-php's build-time
+# concern (`php_linked` — stub builds compile the dependency but
+# `ephpm_php::opcode::available()` reports false, and the analyzer degrades
+# to a skip). This crate itself never uses the `php_linked` cfg.
+php = ["dep:ephpm-php"]
+
 [dependencies]
 anyhow.workspace = true
+ephpm-php = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

@@ -22,7 +22,11 @@ otlp = ["ephpm-server/otlp"]
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
-ephpm-analyze.workspace = true
+# `php` feature: compiles the opt-in `opcode-scan` analyzer's engine path
+# (ephpm-php is already in this binary's graph for the server/CLI, so this
+# adds no weight; a standalone stub `cargo build -p ephpm-analyze` stays
+# PHP-free by leaving the feature off).
+ephpm-analyze = { workspace = true, features = ["php"] }
 ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true

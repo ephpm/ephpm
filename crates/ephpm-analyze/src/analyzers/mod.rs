@@ -5,14 +5,18 @@
 //! `phpstan`, `psalm-taint`, `progpilot`); two are native with zero external
 //! dependencies (`dangerous-sinks`, `suppression-scan`), sharing the per-file
 //! walker in `php_files` — diff-aware scope skipping and the incremental cache
-//! included — the same path a future opcode analyzer will use.
+//! included. `opcode-scan` is native too but engine-backed: it compiles each
+//! file with the embedded Zend compiler (no execution) and detects sinks in
+//! the opcode stream, degrading to a skip on builds without a linked libphp.
 //!
-//! `phpstan`, `psalm-taint`, and `progpilot` are registered but **not** in the
-//! default `security` profile ([`crate::config::Profile::default_analyzers`]) —
-//! they are opt-in via `analyzers.enable`.
+//! `phpstan`, `psalm-taint`, `progpilot`, and `opcode-scan` are registered but
+//! **not** in the default `security` profile
+//! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
+//! `analyzers.enable`.
 
 mod composer_audit;
 mod dangerous_sinks;
+mod opcode_scan;
 mod php_files;
 mod phpstan;
 mod progpilot;
@@ -24,6 +28,7 @@ mod yara_scan;
 
 pub use composer_audit::ComposerAudit;
 pub use dangerous_sinks::DangerousSinks;
+pub use opcode_scan::OpcodeScan;
 pub use phpstan::PhpStan;
 pub use progpilot::Progpilot;
 pub use psalm_taint::PsalmTaint;
@@ -44,6 +49,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(PsalmTaint),
         Box::new(Progpilot),
         Box::new(DangerousSinks),
+        Box::new(OpcodeScan),
         Box::new(SuppressionScan),
     ]
 }

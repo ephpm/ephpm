@@ -13,10 +13,12 @@ use crate::finding::Finding;
 
 /// Files larger than this are skipped (a minified/vendored blob would drown
 /// the report; the YARA analyzer is the right tool for opaque payloads).
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Shared with `opcode_scan`, which applies the same cutoff.
+pub(crate) const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Whether `path` names a PHP source file this walker scans.
-fn is_php_file(path: &Path) -> bool {
+/// Whether `path` names a PHP source file this walker scans. Shared with
+/// `opcode_scan` so every native pass agrees on what counts as PHP.
+pub(crate) fn is_php_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some(ext) if ext.eq_ignore_ascii_case("php") || ext.eq_ignore_ascii_case("phtml")

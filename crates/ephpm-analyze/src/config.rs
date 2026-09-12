@@ -21,6 +21,8 @@
 //!   detonate: false
 //!   timeout_ms: 30000
 //! analyzers:
+//!   # opt-in extras: phpstan (external tool), opcode-scan (requires a
+//!   # PHP-linked ephpm build — skipped on stub builds)
 //!   enable: [composer-audit, semgrep-php, malware-yara, dangerous-sinks, suppression-scan]
 //!   required: [composer-audit]
 //!   deny_hard: [dangerous-sinks/eval]
