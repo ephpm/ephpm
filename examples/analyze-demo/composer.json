@@ -1,0 +1,12 @@
+{
+    "name": "acme/portal-demo",
+    "description": "Deliberately-insecure sample app for demonstrating `ephpm analyze`.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "classmap": ["src/"]
+    }
+}

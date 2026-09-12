@@ -1,0 +1,20 @@
+# ephpm analyze — configuration for the acme-portal demo.
+# Any key ephpm does not recognize fails startup (deny_unknown_fields), so a
+# typo can never silently disable a check.
+
+profile: security          # runs: composer-audit, semgrep-php, malware-yara,
+                           #       dangerous-sinks, suppression-scan
+
+fail_on: quarantine        # deploy gate: a "quarantine" verdict (or worse)
+                           # makes `ephpm analyze` exit non-zero. Use "deny"
+                           # to gate only on the most severe verdict, or
+                           # "allow" for report-only.
+
+level: 1                   # 0 = gate only on hard denies
+                           # 1 = weighted-score default (this demo)
+                           # 2 = quarantine any High finding
+                           # 3 = quarantine any Medium finding
+
+analyzers:
+  # A malware-yara hit is always fatal, regardless of the weighted score.
+  deny_hard: [malware-yara]
