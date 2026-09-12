@@ -32,6 +32,9 @@
 //!   phpstan_level: 6               # optional; else from the target's config
 //!   psalm_config: psalm.xml    # optional; Psalm auto-discovers otherwise
 //!   progpilot_config: progpilot.yml   # optional custom sources/sinks/rules
+//!   phpcs_standard: PSR12          # optional; else PHPCS's own default/config
+//!   phpmd_ruleset: cleancode,codesize   # optional; else a built-in set
+//!   rector_config: rector.php      # optional; else auto-discover rector.php
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -260,6 +263,31 @@ pub struct AnalyzersConfig {
     /// output, so the referenced config must not switch progpilot to SARIF.
     #[serde(default)]
     pub progpilot_config: Option<PathBuf>,
+    /// Coding standard passed to the opt-in `phpcs` analyzer as
+    /// `phpcs --standard=<value>` (a built-in standard name like `PSR12`, or a
+    /// path to a `phpcs.xml` ruleset). When unset (the default), PHPCS uses its
+    /// own configured/default standard (auto-discovering `phpcs.xml` /
+    /// `phpcs.xml.dist` in the target). PHPCS errors loudly on an unknown
+    /// standard, which surfaces as a gating analyzer failure, never a silent
+    /// clean run.
+    #[serde(default)]
+    pub phpcs_standard: Option<String>,
+    /// Ruleset(s) passed to the opt-in `phpmd` analyzer as its positional
+    /// ruleset argument — a comma-separated list of built-in ruleset names
+    /// (`cleancode`, `codesize`, `controversial`, `design`, `naming`,
+    /// `unusedcode`) and/or paths to custom ruleset XML files. When unset (the
+    /// default), a sensible built-in set is used
+    /// (`cleancode,codesize,controversial,design,naming,unusedcode`).
+    #[serde(default)]
+    pub phpmd_ruleset: Option<String>,
+    /// Rector configuration file passed to the opt-in `rector` analyzer as
+    /// `rector process --config <path>`. Relative paths resolve against the
+    /// analyzed root (the tool's cwd). When unset (the default), `rector`
+    /// auto-discovers `rector.php` in the target and *skips* (does not gate)
+    /// when it is absent — Rector cannot run without a config. A set-but-missing
+    /// path is left to Rector, which fails loudly and gates (fail-closed).
+    #[serde(default)]
+    pub rector_config: Option<PathBuf>,
     /// Wall-clock budget per external tool invocation, in milliseconds. A
     /// tool exceeding it is killed and the analyzer fails (fail-closed).
     /// Default 300000 (5 minutes).
@@ -279,6 +307,9 @@ impl Default for AnalyzersConfig {
             phpstan_level: None,
             psalm_config: None,
             progpilot_config: None,
+            phpcs_standard: None,
+            phpmd_ruleset: None,
+            rector_config: None,
             tool_timeout_ms: default_tool_timeout_ms(),
         }
     }
@@ -571,6 +602,9 @@ analyzers:
   phpstan_level: 8
   psalm_config: psalm.xml.dist
   progpilot_config: progpilot.yml
+  phpcs_standard: PSR12
+  phpmd_ruleset: cleancode,codesize
+  rector_config: rector.php
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -612,6 +646,9 @@ suppress:
         assert_eq!(cfg.analyzers.phpstan_level, Some(8));
         assert_eq!(cfg.analyzers.psalm_config.as_deref(), Some(Path::new("psalm.xml.dist")));
         assert_eq!(cfg.analyzers.progpilot_config.as_deref(), Some(Path::new("progpilot.yml")));
+        assert_eq!(cfg.analyzers.phpcs_standard.as_deref(), Some("PSR12"));
+        assert_eq!(cfg.analyzers.phpmd_ruleset.as_deref(), Some("cleancode,codesize"));
+        assert_eq!(cfg.analyzers.rector_config.as_deref(), Some(Path::new("rector.php")));
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);
