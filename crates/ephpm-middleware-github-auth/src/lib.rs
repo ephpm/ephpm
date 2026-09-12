@@ -407,11 +407,29 @@ impl GithubAuth {
             }
         };
 
+        // The full request host this login is running on. `vhost` is the
+        // canonical *site key*, which with `sites_domain_suffix` set is
+        // suffix-stripped (host `pr-1.preview.example.com` → key `pr-1`) — a bare
+        // label the apex callback cannot use for its fleet-membership check, an
+        // outbound `redirect_uri`, or the absolute bounce-back. `http_host()` is
+        // the real host, normalized (port/dot stripped, lowercased). We seal both
+        // into the state: `v` stays the site key (the session's `site` claim and
+        // the per-tenant binding of issue #396), and `vh` carries the full host
+        // for everything host-shaped. On a host too old to expose `http_host`
+        // (`""`) fall back to the site key — where a suffix could not have been
+        // stripped either (that normalization arrived in the same ABI minor), so
+        // the two are identical anyway.
+        let full_host = {
+            let h = req.http_host();
+            if h.is_empty() { vhost } else { h }
+        };
+
         let nonce = token::random_nonce();
         let mut state_claims = serde_json::json!({
             "n": nonce,
             "rt": return_to,
             "v": vhost,
+            "vh": full_host,
             "exp": now.saturating_add(STATE_TTL_SECS),
         });
         // Seal the per-preview repository into the state so the apex callback can
@@ -426,11 +444,17 @@ impl GithubAuth {
             return deny(500, "Login could not be started.");
         };
 
+        // The `redirect_uri` must key off the full host, not the site key: with a
+        // fixed apex `redirect_uri` configured (the apex flow) the argument is
+        // ignored, but a per-vhost-derived `redirect_uri` under a
+        // `sites_domain_suffix` would otherwise build the unreachable
+        // `https://pr-1/callback`. The code exchange re-derives it from `vh`
+        // below, so the two byte-match as OAuth requires.
         let mut url = format!(
             "{}/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&response_type=code",
             self.config.github_base,
             encode_query(&self.config.client_id),
-            encode_query(&self.redirect_uri(vhost)),
+            encode_query(&self.redirect_uri(full_host)),
             encode_query(&nonce),
         );
         if !self.config.scopes.is_empty() {
@@ -515,23 +539,49 @@ impl GithubAuth {
                 .header("Set-Cookie", clear_state);
         }
         // The **target** preview is whatever host the login was started on,
-        // carried (signed) in the state's `v` — NOT the host this callback
-        // landed on. They are the same in a single-host deployment; in the
-        // single-OAuth-App apex flow the callback always lands on the apex vhost
-        // while the target is a `*.preview` subdomain. The target is
-        // authoritative from here: the access check, the session's `site` claim,
-        // and the redirect all key off it.
-        let target = state_claims.get("v").and_then(serde_json::Value::as_str).unwrap_or_default();
-        // `v` was set by us to a router-validated site key, and the state is
-        // signed — but re-validate (defense in depth: it becomes an outbound
-        // `redirect_uri` and an absolute redirect Location) and confirm it is a
-        // host this callback may complete for: itself, or — with a fleet
-        // `cookie_domain` — any host under it. Without a `cookie_domain` only
-        // the callback's own host is allowed, which is the strict per-vhost
-        // binding this replaced (a state minted for another tenant is refused).
-        if target.is_empty()
-            || config::validate_vhost(target).is_err()
-            || !self.target_is_allowed(target, vhost)
+        // carried (signed) in the state — NOT the host this callback landed on.
+        // They are the same in a single-host deployment; in the single-OAuth-App
+        // apex flow the callback always lands on the apex vhost while the target
+        // is a `*.preview` subdomain. The state carries two facets of the target,
+        // which must not be conflated:
+        //
+        //   * `target_site` (`v`) — the canonical **site key**. Under a
+        //     `sites_domain_suffix` this is suffix-stripped (`pr-1`), so it is a
+        //     tenant identity, not a host. It is authoritative for the access
+        //     check, the session's `site` claim (the per-tenant binding of issue
+        //     #396 — the verifier compares that claim to `req.vhost_id()`), and
+        //     the `sites` lookup.
+        //   * `target_host` (`vh`) — the **full host** login ran on. It is
+        //     authoritative for everything host-shaped: fleet-membership, the
+        //     outbound `redirect_uri`, and the absolute bounce-back `Location`.
+        //     Fall back to `v` for a state minted before `vh` existed and for a
+        //     no-suffix deployment, where the two are identical by construction.
+        let target_site =
+            state_claims.get("v").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let target_host = state_claims
+            .get("vh")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(target_site);
+        // The host this callback actually landed on — the apex in the fleet flow.
+        // Fleet membership and the absolute bounce are host comparisons, so use
+        // the full request host, not the (possibly suffix-stripped) site key
+        // `vhost`; fall back to `vhost` on a host too old to expose `http_host`.
+        let callback_host = {
+            let h = req.http_host();
+            if h.is_empty() { vhost } else { h }
+        };
+        // Both facets were set by us and the state is signed — but re-validate
+        // the full host (defense in depth: it becomes an outbound `redirect_uri`
+        // and an absolute redirect Location) and confirm it is a host this
+        // callback may complete for: itself, or — with a fleet `cookie_domain` —
+        // any host under it. Without a `cookie_domain` only the callback's own
+        // host is allowed, which is the strict per-vhost binding this replaced (a
+        // state minted for another tenant is refused). `target_site` must also be
+        // present, since it becomes the session's `site` claim.
+        if target_site.is_empty()
+            || config::validate_vhost(target_host).is_err()
+            || !self.target_is_allowed(target_host, callback_host)
         {
             log(
                 req,
@@ -581,7 +631,7 @@ impl GithubAuth {
                 }
             }
             Access::Fixed => {
-                let Some(c) = self.config.check_for(target) else {
+                let Some(c) = self.config.check_for(target_site) else {
                     return deny(403, "This preview is not configured for GitHub access control.")
                         .header("Set-Cookie", clear_state);
                 };
@@ -597,10 +647,11 @@ impl GithubAuth {
 
         // ── The only network calls in the module ─────────────────────────
         // The exchange's `redirect_uri` must byte-match the one sent at
-        // `authorize` (which used `redirect_uri(target)`); with a fixed apex
-        // `redirect_uri` configured, both are the apex regardless of argument.
+        // `authorize` (which used `redirect_uri(full_host)`, i.e. `vh` =
+        // `target_host`); with a fixed apex `redirect_uri` configured, both are
+        // the apex regardless of argument.
         let outcome =
-            self.github.exchange_code(&code, &self.redirect_uri(target)).and_then(|access| {
+            self.github.exchange_code(&code, &self.redirect_uri(target_host)).and_then(|access| {
                 let user = self.github.current_user(&access)?;
                 let allowed = self.github.check_access(&access, &check, &user)?;
                 Ok((user, allowed))
@@ -622,7 +673,7 @@ impl GithubAuth {
                 req,
                 LOG_INFO,
                 &format!(
-                    "github-auth: denied {} on target vhost {target:?} — no access to {}",
+                    "github-auth: denied {} on target vhost {target_site:?} — no access to {}",
                     user.login,
                     check.describe()
                 ),
@@ -631,14 +682,15 @@ impl GithubAuth {
                 .header("Set-Cookie", clear_state);
         }
 
-        // Mint the session for the TARGET (its `site` claim), and redirect the
-        // browser back to the target — absolute when the callback ran on a
-        // different host (the apex flow), so it lands on the right preview. The
-        // domain-scoped session cookie `issue` sets travels with it.
-        let final_return = self.return_location(target, vhost, &return_to);
+        // Mint the session bound to the TARGET SITE KEY (its `site` claim — the
+        // per-tenant binding of issue #396), and redirect the browser back to the
+        // target's FULL HOST — absolute when the callback ran on a different host
+        // (the apex flow), so it lands on the right preview. The domain-scoped
+        // session cookie `issue` sets travels with it.
+        let final_return = self.return_location(target_host, callback_host, &return_to);
         self.issue(
             req,
-            target,
+            target_site,
             &user.login,
             "github",
             Some(user.id),
