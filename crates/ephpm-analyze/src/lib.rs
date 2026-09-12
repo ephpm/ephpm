@@ -9,12 +9,12 @@
 //!                                               │
 //!                     ┌─────────────────────────┼──────────────┐
 //!                     ▼                         ▼              ▼
-//!             external-tool analyzers    native analyzers   (planned:
-//!             composer-audit             dangerous-sinks     opcode/L1,
-//!             semgrep-php                suppression-scan    engine/L2)
-//!             malware-yara
-//!                     │                         │
-//!                     └────────► Findings ◄─────┘
+//!             external-tool analyzers    native analyzers   engine-backed
+//!             composer-audit             dangerous-sinks    opcode-scan (L1,
+//!             semgrep-php                suppression-scan   opt-in; planned:
+//!             malware-yara                                  taint, L2)
+//!                     │                         │              │
+//!                     └────────► Findings ◄─────┴──────────────┘
 //!                                   │
 //!               scope filter ─► operator suppress ─► baseline
 //!                                   │
@@ -37,10 +37,14 @@
 //! baseline, and an invalid config are all hard errors, never silent
 //! degradations.
 //!
-//! Later phases (opcode-level analysis of compiled PHP, engine-in-the-loop
-//! detonation) slot in as more [`Analyzer`] implementations reading richer
-//! state off [`AnalysisCtx`] — the trait, the finding shape, the policy
-//! engine, and both output formats are already final for them.
+//! The opt-in `opcode-scan` analyzer is the first engine-backed pass: it
+//! compiles each PHP file with the embedded Zend compiler (never executing
+//! it) and detects dangerous call sites in the opcode stream — on builds
+//! without a linked libphp it degrades to a skip. Later phases (superglobal
+//! taint tracking, engine-in-the-loop detonation) slot in as more
+//! [`Analyzer`] implementations reading richer state off [`AnalysisCtx`] —
+//! the trait, the finding shape, the policy engine, and both output formats
+//! are already final for them.
 
 pub mod analyzer;
 pub mod analyzers;

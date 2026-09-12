@@ -4,9 +4,11 @@
 //! token pass over `*.php` / `*.phtml` files looking for calls to the
 //! `eval`, `system`, and `assert` sinks. It exists so the *native*-analyzer
 //! path of the framework (no external tool, no subprocess) is exercised end
-//! to end from day one; it will be superseded by the opcode-level analyzer
-//! (Phase 2), which sees through string tricks (a name built by
-//! concatenation), comments, and heredocs that this pass cannot.
+//! to end from day one; it will eventually be superseded by the opcode-level
+//! `opcode-scan` analyzer (shipped, opt-in — see `opcode_scan`), which sees
+//! through comments and string literals this pass cannot. Both coexist for
+//! now: this one needs no PHP-linked build and stays in the default
+//! `security` profile.
 //!
 //! Known false positives (accepted for a placeholder): matches inside
 //! comments and string literals. Known false negatives: dynamic calls,

@@ -268,6 +268,14 @@ fn link_windows_static_deps(lib_dir: &Path) {
             println!("cargo::rustc-link-lib=static={stem}");
         }
     }
+
+    // THIS crate's test binaries link php8embed directly, without the ephpm
+    // binary crate's build.rs in the loop — so they need the same
+    // /FORCE:MULTIPLE the binary crate passes for the one known duplicate
+    // (`locale_charset`, byte-identical libcharset copies bundled by both
+    // whole-archived GNU libs above; see the whole_archive comment).
+    // `rustc-link-arg-tests` scopes it to test targets only.
+    println!("cargo::rustc-link-arg-tests=/FORCE:MULTIPLE");
 }
 
 fn link_system_libs(target_os: &str) {
