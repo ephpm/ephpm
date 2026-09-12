@@ -375,7 +375,8 @@ fn default_cache_enabled() -> bool {
 /// `cache:` — the incremental content-hash result cache.
 ///
 /// Only the **native per-file analyzers** (`dangerous-sinks`,
-/// `suppression-scan`) consult the cache; external-tool analyzers are never
+/// `suppression-scan`, `obfuscation-scan`) consult the cache; external-tool
+/// analyzers are never
 /// cached because their results depend on state outside the analyzed tree
 /// (advisory databases, registry rule packs, ruleset files) — a cache hit
 /// there could hide a newly published advisory. See `crate::cache` for the
