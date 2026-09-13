@@ -11,12 +11,17 @@
 //! `opcode-scan` compiles each file with the embedded Zend compiler (no
 //! execution) and detects sinks in the opcode stream; `php-lint` compiles each
 //! file for syntax validity alone (`php -l`, in-process). Both degrade to a
-//! skip on builds without a linked libphp. `wp-vuln` is native and offline
-//! too, but data-driven rather than per-file: it matches installed WordPress
+//! skip on builds without a linked libphp. `wp-vuln` and `composer-scripts`
+//! are native and offline too, but data-driven rather than per-file: `wp-vuln`
+//! matches installed WordPress
 //! plugin/theme/core versions against an operator-supplied Wordfence
 //! Intelligence vulnerability feed (unset → skip; configured-but-missing →
-//! error), the WordPress analogue of `composer-audit`. `writable-exec` is
-//! native and offline too and likewise path-driven rather than
+//! error), the WordPress analogue of `composer-audit`; `composer-scripts`
+//! parses the root `composer.json`'s `scripts` block and flags dangerous
+//! install-time commands (pipe-to-shell, remote fetch, inline eval, raw shell)
+//! that a dependency-CVE scan like `composer-audit` never sees (absent
+//! `composer.json` yields no findings; unparseable is an error). `writable-exec`
+//! is native and offline too and likewise path-driven rather than
 //! content-scanning: it flags executable PHP (`*.php`/`*.phtml`/`*.php5`/
 //! `*.phar`) living where only uploaded data belongs — confirmed under
 //! `wp-content/uploads/`, suspected under operator-listed
@@ -24,14 +29,15 @@
 //! complementing the content scanners.
 //!
 //! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
-//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `obfuscation-scan`,
-//! `secrets-scan`, and `writable-exec` are
+//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `composer-scripts`,
+//! `obfuscation-scan`, `secrets-scan`, and `writable-exec` are
 //! registered but **not** in the default `security` profile
 //! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
 //! `analyzers.enable`.
 
 mod clamav;
 mod composer_audit;
+mod composer_scripts;
 mod dangerous_sinks;
 mod obfuscation_scan;
 mod opcode_scan;
@@ -53,6 +59,7 @@ mod yara_scan;
 
 pub use clamav::Clamav;
 pub use composer_audit::ComposerAudit;
+pub use composer_scripts::ComposerScripts;
 pub use dangerous_sinks::DangerousSinks;
 pub use obfuscation_scan::ObfuscationScan;
 pub use opcode_scan::OpcodeScan;
@@ -77,6 +84,7 @@ use crate::analyzer::Analyzer;
 pub fn built_in() -> Vec<Box<dyn Analyzer>> {
     vec![
         Box::new(ComposerAudit),
+        Box::new(ComposerScripts),
         Box::new(SemgrepPhp),
         Box::new(MalwareYara),
         Box::new(Clamav),
@@ -115,6 +123,7 @@ mod tests {
             "rector",
             "php-lint",
             "wp-vuln",
+            "composer-scripts",
             "obfuscation-scan",
             "secrets-scan",
             "writable-exec",
