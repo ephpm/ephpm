@@ -2,10 +2,10 @@
 //!
 //! Ten wrap external tools as subprocesses and degrade gracefully when the
 //! tool is absent (`composer-audit`, `semgrep-php`, `malware-yara`, `clamav`,
-//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); four
+//! `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`, `rector`); five
 //! are native with zero external dependencies (`dangerous-sinks`,
-//! `suppression-scan`, `obfuscation-scan`, `secrets-scan`), sharing the
-//! per-file walker in
+//! `suppression-scan`, `obfuscation-scan`, `secrets-scan`, `weak-crypto`),
+//! sharing the per-file walker in
 //! `php_files` — diff-aware scope skipping and the incremental cache included.
 //! `opcode-scan` and `php-lint` are native too but engine-backed:
 //! `opcode-scan` compiles each file with the embedded Zend compiler (no
@@ -30,7 +30,7 @@
 //!
 //! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
 //! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `composer-scripts`,
-//! `obfuscation-scan`, `secrets-scan`, and `writable-exec` are
+//! `obfuscation-scan`, `secrets-scan`, `writable-exec`, and `weak-crypto` are
 //! registered but **not** in the default `security` profile
 //! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
 //! `analyzers.enable`.
@@ -53,6 +53,7 @@ mod secrets_scan;
 mod semgrep;
 mod suppression_scan;
 mod tool;
+mod weak_crypto;
 mod wp_vuln;
 mod writable_exec;
 mod yara_scan;
@@ -73,6 +74,7 @@ pub use rector::Rector;
 pub use secrets_scan::SecretsScan;
 pub use semgrep::SemgrepPhp;
 pub use suppression_scan::SuppressionScan;
+pub use weak_crypto::WeakCrypto;
 pub use wp_vuln::WpVuln;
 pub use writable_exec::WritableExec;
 pub use yara_scan::MalwareYara;
@@ -102,6 +104,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(ObfuscationScan),
         Box::new(SecretsScan),
         Box::new(WritableExec),
+        Box::new(WeakCrypto),
     ]
 }
 
@@ -127,6 +130,7 @@ mod tests {
             "obfuscation-scan",
             "secrets-scan",
             "writable-exec",
+            "weak-crypto",
         ] {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");

@@ -389,7 +389,8 @@ fn default_cache_enabled() -> bool {
 /// `cache:` — the incremental content-hash result cache.
 ///
 /// Only the **native per-file analyzers** (`dangerous-sinks`,
-/// `suppression-scan`, `obfuscation-scan`, `secrets-scan`) consult the cache;
+/// `suppression-scan`, `obfuscation-scan`, `secrets-scan`, `weak-crypto`)
+/// consult the cache;
 /// external-tool analyzers are never
 /// cached because their results depend on state outside the analyzed tree
 /// (advisory databases, registry rule packs, ruleset files) — a cache hit
