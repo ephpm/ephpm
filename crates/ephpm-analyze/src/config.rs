@@ -37,6 +37,7 @@
 //!   phpmd_ruleset: cleancode,codesize   # optional; else a built-in set
 //!   rector_config: rector.php      # optional; else auto-discover rector.php
 //!   wp_vuln_feed: wordfence-feed.json   # downloaded WP vuln feed for wp-vuln
+//!   writable_exec_dirs: [wp-content/cache]  # extra data dirs for writable-exec
 //!   tool_timeout_ms: 300000
 //! policy:
 //!   quarantine_score: 10
@@ -313,6 +314,18 @@ pub struct AnalyzersConfig {
     /// feed is an error (fail-closed), not a skip.
     #[serde(default)]
     pub wp_vuln_feed: Option<PathBuf>,
+    /// Additional directories the opt-in `writable-exec` analyzer treats as
+    /// data-only: executable PHP (`*.php`/`*.phtml`/`*.php5`/`*.phar`) found
+    /// under any of them becomes a *suspected* `writable-exec/writable-dir-php`
+    /// finding. Relative paths resolve against the analyzed root, like
+    /// `yara_rules`. When unset (the default), `writable-exec` runs **only** its
+    /// confirmed `wp-content/uploads/` rule — keeping the defaults high-signal,
+    /// since some frameworks legitimately write `.php` into data dirs (Laravel's
+    /// `storage/framework/views/`, WordPress page-cache under
+    /// `wp-content/cache/`), which is why those are opt-in rather than flagged
+    /// by default.
+    #[serde(default)]
+    pub writable_exec_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Default for AnalyzersConfig {
@@ -333,6 +346,7 @@ impl Default for AnalyzersConfig {
             rector_config: None,
             tool_timeout_ms: default_tool_timeout_ms(),
             wp_vuln_feed: None,
+            writable_exec_dirs: None,
         }
     }
 }
@@ -629,6 +643,7 @@ analyzers:
   phpmd_ruleset: cleancode,codesize
   rector_config: rector.php
   wp_vuln_feed: wordfence-feed.json
+  writable_exec_dirs: [wp-content/cache, storage/framework/views]
   tool_timeout_ms: 60000
 policy:
   quarantine_score: 5
@@ -674,6 +689,10 @@ suppress:
         assert_eq!(cfg.analyzers.phpmd_ruleset.as_deref(), Some("cleancode,codesize"));
         assert_eq!(cfg.analyzers.rector_config.as_deref(), Some(Path::new("rector.php")));
         assert_eq!(cfg.analyzers.wp_vuln_feed.as_deref(), Some(Path::new("wordfence-feed.json")));
+        assert_eq!(
+            cfg.analyzers.writable_exec_dirs,
+            Some(vec![PathBuf::from("wp-content/cache"), PathBuf::from("storage/framework/views")])
+        );
         assert_eq!(cfg.analyzers.tool_timeout_ms, 60_000);
         assert_eq!(cfg.policy.quarantine_score, 5);
         assert_eq!(cfg.policy.deny_score, 20);
