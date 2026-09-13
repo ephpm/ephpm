@@ -15,11 +15,17 @@
 //! too, but data-driven rather than per-file: it matches installed WordPress
 //! plugin/theme/core versions against an operator-supplied Wordfence
 //! Intelligence vulnerability feed (unset → skip; configured-but-missing →
-//! error), the WordPress analogue of `composer-audit`.
+//! error), the WordPress analogue of `composer-audit`. `writable-exec` is
+//! native and offline too and likewise path-driven rather than
+//! content-scanning: it flags executable PHP (`*.php`/`*.phtml`/`*.php5`/
+//! `*.phar`) living where only uploaded data belongs — confirmed under
+//! `wp-content/uploads/`, suspected under operator-listed
+//! `analyzers.writable_exec_dirs` — catching a dropped webshell by *location*,
+//! complementing the content scanners.
 //!
 //! `clamav`, `phpstan`, `psalm-taint`, `progpilot`, `phpcs`, `phpmd`,
-//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `obfuscation-scan`, and
-//! `secrets-scan` are
+//! `rector`, `opcode-scan`, `php-lint`, `wp-vuln`, `obfuscation-scan`,
+//! `secrets-scan`, and `writable-exec` are
 //! registered but **not** in the default `security` profile
 //! ([`crate::config::Profile::default_analyzers`]) — they are opt-in via
 //! `analyzers.enable`.
@@ -42,6 +48,7 @@ mod semgrep;
 mod suppression_scan;
 mod tool;
 mod wp_vuln;
+mod writable_exec;
 mod yara_scan;
 
 pub use clamav::Clamav;
@@ -60,6 +67,7 @@ pub use secrets_scan::SecretsScan;
 pub use semgrep::SemgrepPhp;
 pub use suppression_scan::SuppressionScan;
 pub use wp_vuln::WpVuln;
+pub use writable_exec::WritableExec;
 pub use yara_scan::MalwareYara;
 
 use crate::analyzer::Analyzer;
@@ -85,6 +93,7 @@ pub fn built_in() -> Vec<Box<dyn Analyzer>> {
         Box::new(SuppressionScan),
         Box::new(ObfuscationScan),
         Box::new(SecretsScan),
+        Box::new(WritableExec),
     ]
 }
 
@@ -108,6 +117,7 @@ mod tests {
             "wp-vuln",
             "obfuscation-scan",
             "secrets-scan",
+            "writable-exec",
         ] {
             assert!(ids.contains(&id.to_owned()), "{id} must be registered: {ids:?}");
             assert!(!profile.contains(&id.to_owned()), "{id} must be opt-in, not in the profile");
