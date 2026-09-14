@@ -649,8 +649,15 @@ fn run_analyze(
     })
 }
 
-/// Initialise a small tracing subscriber for service-management commands so
-/// `tracing::info!` calls in the `service` module show up on the console.
+/// Initialise a small tracing subscriber for CLI commands so `tracing::info!`
+/// calls (service management, and the `analyze` pipeline) show up on the
+/// console.
+///
+/// Logs are written to **stderr**, never stdout: `ephpm analyze --format sarif`
+/// (and `--format text`) emit a machine-read report on stdout, and any log line
+/// prepended there corrupts it — a consumer parsing the SARIF (e.g. the
+/// switchboard preview gate) would choke on the leading ANSI/log bytes and see
+/// zero findings. stdout is for the report; stderr is for diagnostics.
 fn ensure_cli_tracing() {
     use std::sync::Once;
 
@@ -658,7 +665,7 @@ fn ensure_cli_tracing() {
     INIT.call_once(|| {
         let _ = tracing_subscriber::registry()
             .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(tracing_subscriber::fmt::layer().with_target(false).with_writer(std::io::stderr))
             .try_init();
     });
 }
