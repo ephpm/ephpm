@@ -71,6 +71,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+# vivacity: the embedded pure-Rust Composer installer that backs the
+# `ephpm composer` subcommand. `main.rs` forwards argv to `vivacity::run` and
+# exits with its returned code — no PHP needed, so this works in stub mode.
+vivacity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

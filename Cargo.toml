@@ -423,6 +423,15 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e2ea25b45ce7"
 # (re-exported by litewire) is the same turso::Connection.
 turso = { version = "=0.7.2", default-features = false }
 
+# vivacity: the pure-Rust Composer installer that backs `ephpm composer`. It
+# resolves and installs Composer dependencies with byte-parity to PHP Composer
+# and needs no PHP at runtime (it only shells out to a real `composer` for the
+# source-package fallback), so the subcommand works in stub mode too. Pinned to
+# the exact published version whose `vivacity::run()` embed entry point was
+# verified (argv[0] = program name; returns the process exit code as `i32`).
+# MIT-licensed. Published on crates.io, so a plain version pin — no git rev.
+vivacity = "=0.7.0"
+
 # Release-profile tuning for v0.4.2 perf release.
 #
 # `lto = "fat"` and `codegen-units = 1` widen the optimizer's view across

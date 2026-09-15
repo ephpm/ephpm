@@ -122,6 +122,30 @@ ephpm php -r "exit(42);"; echo $?   # → 42
 
 ---
 
+## `ephpm composer`
+
+Run Composer through the embedded [vivacity](https://github.com/Adelagric/vivacity) installer — a pure-Rust, Composer-compatible dependency installer built into the binary. **No external PHP or `composer.phar` is needed**, so it works in every build (including stub mode) and on Windows. Every argument after `composer` is forwarded verbatim, and the process exits with Composer's own exit code. See the [full `composer` reference](composer/).
+
+```bash
+# Install locked dependencies (drop-in `composer install`)
+ephpm composer install --no-dev --optimize-autoloader
+
+# Add a package
+ephpm composer require monolog/monolog
+
+# Regenerate the autoloader
+ephpm composer dump-autoload -o
+
+# Version of the embedded installer
+ephpm composer --version   # → vivacity <x.y.z>
+```
+
+**Implementation notes:**
+- Pure-Rust: vivacity resolves and installs dependencies itself; it only shells out to a real `composer` for the source-package fallback. Nothing here links PHP, so the subcommand is available even in a stub build.
+- The subcommand disables clap's help flag and captures all trailing arguments verbatim (`trailing_var_arg` + `allow_hyphen_values`); a synthetic `composer` program-name element is prepended before dispatch to `vivacity::run`.
+
+---
+
 ## `ephpm kv`
 
 Inspect and manipulate the KV store on a running server. Connects directly to the embedded KV server over the RESP2 protocol (requires `[kv.redis_compat] enabled = true`). See the [full `kv` reference](kv/).
@@ -252,6 +276,7 @@ ephpm                Local dev server (same as `ephpm dev`)
 ephpm serve          Start the production server (--config/--listen/--document-root/-v)
 ephpm dev            Development server (--port/--document-root/--sites)
 ephpm php            Run the embedded PHP CLI (pure passthrough)
+ephpm composer       Run Composer via the embedded vivacity installer (pure passthrough)
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
 ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on/
                      --level/--since/--baseline/--cache-dir/--no-cache)
