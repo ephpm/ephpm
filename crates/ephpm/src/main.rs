@@ -981,6 +981,10 @@ fn run_php(
 fn run_composer(args: Vec<std::ffi::OsString>) -> anyhow::Result<ExitCode> {
     let forwarded =
         std::iter::once(std::ffi::OsString::from("composer")).chain(args).collect::<Vec<_>>();
+    // vivacity reqwest uses rustls-tls-no-provider, so it consults the process
+    // default CryptoProvider. The serve path installs it; the CLI does not, so
+    // install aws-lc-rs here before the first cold-cache HTTPS fetch (#523).
+    ephpm_server::tls::install_default_crypto_provider();
     let code = vivacity::run(forwarded);
     std::process::exit(code);
 }
