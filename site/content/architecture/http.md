@@ -61,6 +61,38 @@ Per-request sequence:
 
 An earlier design reused one long-lived embed request and manually rebuilt the superglobals (destroying `PG(http_globals)` and re-running `sapi_module.treat_data`). That manual rebuild was removed: once the per-request lifecycle called `php_request_startup()` every request, it destroyed arrays startup had just created and caused a use-after-free SIGSEGV under load on tokio `spawn_blocking` threads. Superglobal construction is now owned entirely by `php_request_startup()`.
 
+### Execution Pool and Concurrency
+
+PHP never runs on the tokio runtime. It runs on an **owned pool of dedicated OS threads** (`std::thread`) that ePHPm spawns, sizes, and drains itself. There are two pools, selected by `[php] mode`, and they share one scheduling design: the per-request pool (`[php] mode = "per_request"`, the default) lives in `crates/ephpm-server/src/fpm_pool.rs`, and the persistent worker pool (`mode = "worker"`) in `crates/ephpm-server/src/worker_pool.rs`. Both are bounded by the same knobs — `[php] concurrency`, `queue_depth`, `admission`, `overload`, and `shed_after_ms` — which is why those knobs live on `[php]` rather than in a per-mode subsection.
+
+A pool thread's loop is deliberately dull: pull one job off a bounded dispatch queue, run exactly one PHP request under the bailout crash guard, reply on a `oneshot`, repeat. In per-request mode that one request is a full `php_request_startup()`/`php_request_shutdown()` cycle (the lifecycle above); in worker mode the framework is booted once per thread and the loop replays requests against it. Either way the concurrency ceiling is the thread count, not the arrival rate.
+
+#### Why an owned pool, not tokio `spawn_blocking`
+
+The obvious way to run blocking C from async Rust is `tokio::task::spawn_blocking`, and that is what ePHPm did before v0.9.0. It was the wrong tool here for two structural reasons, both a consequence of that pool being **shared and unbounded**:
+
+- **It is shared.** tokio's blocking pool also serves static-file I/O and every other blocking task in the process. Running PHP on it means a burst of slow PHP requests occupies the same threads that read files off disk, so PHP latency becomes static-file latency. A dedicated pool bounds PHP concurrency to its *own* thread count without touching the shared resource — capping PHP can never cap static-file serving (see [`concurrency`](/reference/config/#php) in the config reference).
+- **It grows without bound.** `spawn_blocking`'s pool expands on demand (up to a large default ceiling), so under a flood it spawns one blocking thread — and one full ZTS PHP context — per in-flight request. That is unbounded thread and memory growth exactly when the server is already under pressure. The owned pool has a fixed thread count and a bounded queue in front of it, so overload turns into backpressure or a shed 503, never runaway allocation.
+
+v0.9.0 removed the `spawn_blocking` execution engine outright — the `fpm_engine` knob is gone and the dedicated pool is the only per-request engine (see [Migration from the pre-v0.9.0 `[php]` keys](/reference/config/#migration-from-the-pre-v090-php-keys)). Owning the threads is also what makes `[php] crash_containment` possible: a poisoned Zend context can only be quarantined by retiring the thread that holds it, which requires the thread to be ours to retire.
+
+The flip was measured, not asserted. In the v0.9.0 A/B (PR #460), an open-loop CPU-bound flood against the unbounded `spawn_blocking` default spawned **486 threads at ~1.05 GiB RSS**; the pool default held at **65 threads and ~193 MiB** while serving *more* requests at a better P99. Those figures are from that specific overload A/B recorded in the PR — treat them as the shape of the win (bounded vs. unbounded), not a spec.
+
+#### Backpressure, shedding, and admission
+
+In front of every pool sits a bounded dispatch queue whose depth is `[php] queue_depth` (defaulting to `concurrency`). What happens when it fills is `[php] overload`:
+
+- `overload = "wait"` (the historical behaviour) applies **backpressure** — the dispatcher suspends until a slot frees. A queue that never frees becomes a **504** when the outer `[server.timeouts] request` deadline fires; there is no unbounded wait.
+- `overload = "shed"` refuses to queue behind a full backlog and answers **`503` + `Retry-After`** once a request has waited `shed_after_ms` (0 = shed immediately). Overload then costs one cheap error instead of a request that ties up a client until its own timeout (issue #301).
+
+Admission order is `[php] admission`. The default, `"fifo"`, admits waiters in strict arrival order through a fair semaphore. This is not cosmetic: the bounded channel's own `send().await` lets a fresh dispatcher barge past parked waiters and re-queues the lapped waiter at the back, producing a multi-lap starvation tail under saturation — removing it took worker-mode P99 from 280 ms to 58 ms at unchanged throughput (issue #442). `"barge"` restores the old racing admission as an operator escape hatch.
+
+#### Concurrency floor of two
+
+`[php] concurrency = 0` (the default) derives the pool size from the cgroup CPU quota when running under one, otherwise from host parallelism, clamped to `[2, 32]`. The floor is **2, never 1**: a one-thread pool deadlocks a PHP loopback subrequest — a script that HTTP-requests its own server holds the only thread while waiting for a response that itself needs that thread (WordPress Site Health checks, any blocking `wp_remote_get` to `127.0.0.1`), and the subrequest parks in the queue until the request timeout. An explicit `concurrency = 1` is honoured as written; only the *derived* value is floored (issue #461).
+
+The full knob table, defaults, and env-var forms are in the [configuration reference](/reference/config/#php).
+
 ### Superglobal Population
 
 All superglobals are built natively by PHP request startup, driven by the installed SAPI callbacks:
