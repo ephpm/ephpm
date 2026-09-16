@@ -429,8 +429,8 @@ turso = { version = "=0.7.2", default-features = false }
 # source-package fallback), so the subcommand works in stub mode too. Pinned to
 # the exact published version whose `vivacity::run()` embed entry point was
 # verified (argv[0] = program name; returns the process exit code as `i32`).
-# MIT-licensed. Published on crates.io, so a plain version pin — no git rev.
-vivacity = "=0.7.0"
+# MIT-licensed. Published on crates.io. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).
+vivacity = { version = "=0.10.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
