@@ -38,6 +38,14 @@ session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`)
 plus whatever you load through `[php] extensions`. See
 [the `ephpm php` reference](https://ephpm.dev/reference/cli/php/).
 
+You don't need a separate Composer either — `ephpm composer install` runs
+[vivacity](https://github.com/Adelagric/vivacity), a pure-Rust, byte-parity
+Composer installer compiled into the binary. There's no PHP runtime to link and
+no `composer.phar` to download, so it works in **every** build (including stub
+mode) and on **Windows**. Every argument is forwarded verbatim and the process
+exits with Composer's own code, so it drops straight into CI. See
+[the `ephpm composer` reference](https://ephpm.dev/reference/cli/composer/).
+
 When you are ready to scale to production, you can deploy high-availability clusters using the exact same code paths running seamlessly from your local development machine, through CI, and straight into production. Need to use an external database just configure the SQL proxy and point your app to localhost:3306 to gain performance boosts from connection pooling.
 
 ## Install
