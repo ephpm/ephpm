@@ -841,9 +841,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.67"
+version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
+checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1835,7 +1835,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc 0.2.189",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1910,9 +1910,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flate2"
@@ -2511,7 +2511,7 @@ dependencies = [
  "libc 0.2.189",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3212,9 +3212,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom"
@@ -3602,7 +3602,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3868,28 +3868,6 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
  "hmac 0.12.1",
-]
-
-[[package]]
-name = "pcre2"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
-dependencies = [
- "libc 0.2.189",
- "log",
- "pcre2-sys",
-]
-
-[[package]]
-name = "pcre2-sys"
-version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b9073c1a2549bd409bf4a32c94d903bb1a09bf845bc306ae148897fa0760a4"
-dependencies = [
- "cc",
- "libc 0.2.189",
- "pkg-config",
 ]
 
 [[package]]
@@ -4268,7 +4246,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4306,7 +4284,7 @@ dependencies = [
  "cfg_aliases",
  "libc 0.2.189",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -4784,7 +4762,7 @@ dependencies = [
  "errno",
  "libc 0.2.189",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4893,7 +4871,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5471,7 +5449,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6360,9 +6338,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivacity"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1a7b5b3ad4be82d2465457320723c1f3489750f9d8a3e02544dac09c3cf043e"
+checksum = "ba07389ae9c051f2d32058ab604ef295aa6e315f68c9a985ab9405d410e09f15"
 dependencies = [
  "anyhow",
  "clap",
@@ -6375,32 +6353,31 @@ dependencies = [
 
 [[package]]
 name = "vivacity-autoload"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e765692fa816c96b40819b63ba6598146573f9181f100432b318e7bf1ba2a4e5"
+checksum = "86cef3d5542756c2c8de314d420d1d179d47f94cc6f542b39c5bee5327eb5e9d"
 dependencies = [
  "md-5 0.10.6",
- "pcre2",
  "rayon",
  "serde_json",
  "sha1",
  "thiserror 2.0.20",
  "vivacity-core",
+ "vivacity-pcre2",
  "walkdir",
 ]
 
 [[package]]
 name = "vivacity-core"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88909554fe2c9da9959d2b07571e3785fdc65229a0e45cd4ea1f76c29c1adb9e"
+checksum = "577e2bf02030852ceafe2550f1aa4e00ad7484a234ea5dfa3a2c49df72c58005"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
  "hex",
  "libc 1.0.0-alpha.4",
  "md-5 0.10.6",
- "pcre2",
  "rayon",
  "reqwest",
  "serde",
@@ -6409,22 +6386,44 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "vivacity-pcre2",
  "zip",
 ]
 
 [[package]]
-name = "vivacity-resolver"
-version = "0.10.0"
+name = "vivacity-pcre2"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45fa4c1147b57f52852a9c739c7f03d53975840126af94125808fbe07a7f1f0d"
+checksum = "d600fe04a046ccd2f089d69c54683e7924c1300df6c1bf10e58ac07ab1a6f08b"
 dependencies = [
- "pcre2",
+ "libc 0.2.189",
+ "log",
+ "vivacity-pcre2-sys",
+]
+
+[[package]]
+name = "vivacity-pcre2-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d273121860f8cc802f9d4d4b2d10ebc3ad3da5a0118d3ae6df4be31492f2c0e"
+dependencies = [
+ "cc",
+ "libc 0.2.189",
+]
+
+[[package]]
+name = "vivacity-resolver"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c62a78da1c46a2303b9883093d71a4da6cdc056a1565a969d0fdf32f7799a55c"
+dependencies = [
  "serde",
  "serde_json",
  "sha1",
  "tempfile",
  "thiserror 2.0.20",
  "vivacity-core",
+ "vivacity-pcre2",
 ]
 
 [[package]]
@@ -6695,7 +6694,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
