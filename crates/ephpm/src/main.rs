@@ -181,6 +181,26 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Run Composer via the embedded vivacity installer (no external PHP)
+    ///
+    /// `ephpm composer <args...>` forwards every trailing argument verbatim to
+    /// the in-process [vivacity](https://github.com/Adelagric/vivacity)
+    /// installer — a pure-Rust reimplementation of Composer with byte-parity
+    /// dependency resolution. It needs no PHP runtime (it only shells out to a
+    /// real `composer` for the source-package fallback), so it works in every
+    /// build, including stub mode, and on Windows. The process exits with
+    /// Composer's own exit code.
+    ///
+    /// Examples: `ephpm composer install --no-dev --optimize-autoloader`,
+    /// `ephpm composer require monolog/monolog`, `ephpm composer --version`.
+    #[command(disable_help_flag = true)]
+    Composer {
+        /// Arguments passed through to Composer, untouched (a leading
+        /// `composer` program-name element is prepended before dispatch).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+
     /// Run a command inside a virtual host's tenant sandbox (Linux only).
     ///
     /// Resolves `--site <key>` to the vhost's filesystem boundary, scopes the
@@ -477,6 +497,7 @@ fn run() -> anyhow::Result<ExitCode> {
             run_analyze(path, config, overrides)
         }
         Some(Commands::Php { config, site, args }) => run_php(config, site, &php_cli_args(&args)),
+        Some(Commands::Composer { args }) => run_composer(args),
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
             ensure_cli_tracing();
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
@@ -944,6 +965,28 @@ fn run_php(
     let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
     Ok(exit_code_from(exit_code))
+}
+
+/// Run the `ephpm composer` subcommand — forward argv verbatim to the embedded
+/// vivacity Composer installer and propagate its exit code.
+///
+/// `vivacity::run` is built on clap and expects `argv[0]` to be the program
+/// name (as in `std::env::args()`), so a synthetic `"composer"` element is
+/// prepended before the user's trailing arguments. Nothing else is touched —
+/// the caller's `install`/`require`/`--version`/etc. pass through unchanged.
+///
+/// This exits the process directly with vivacity's `i32` status rather than
+/// returning through `main`, so the exact Composer exit code reaches CI and
+/// shells unmodified.
+fn run_composer(args: Vec<std::ffi::OsString>) -> anyhow::Result<ExitCode> {
+    let forwarded =
+        std::iter::once(std::ffi::OsString::from("composer")).chain(args).collect::<Vec<_>>();
+    // vivacity reqwest uses rustls-tls-no-provider, so it consults the process
+    // default CryptoProvider. The serve path installs it; the CLI does not, so
+    // install aws-lc-rs here before the first cold-cache HTTPS fetch (#523).
+    ephpm_server::tls::install_default_crypto_provider();
+    let code = vivacity::run(forwarded);
+    std::process::exit(code);
 }
 
 /// Startup diagnostics for `[php] max_execution_time`.

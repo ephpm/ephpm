@@ -423,6 +423,18 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e2ea25b45ce7"
 # (re-exported by litewire) is the same turso::Connection.
 turso = { version = "=0.7.2", default-features = false }
 
+# vivacity: the pure-Rust Composer installer that backs `ephpm composer`. It
+# resolves and installs Composer dependencies with byte-parity to PHP Composer
+# and needs no PHP at runtime (it only shells out to a real `composer` for the
+# source-package fallback), so the subcommand works in stub mode too. Pinned to
+# the exact published version whose `vivacity::run()` embed entry point was
+# verified (argv[0] = program name; returns the process exit code as `i32`).
+# MIT-licensed. Published on crates.io. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).
+# 0.11.1 also drops the C decompression libs (bzip2-sys/xz2/zstd-sys) from
+# `zip` in favor of pure-Rust backends, so this PHP-linked binary no longer
+# collides with libphp's bundled bzip2/xz/zstd at link time (ephpm/ephpm#523).
+vivacity = { version = "=0.11.1", default-features = false, features = ["rustls-tls-no-provider"] }
+
 # Release-profile tuning for v0.4.2 perf release.
 #
 # `lto = "fat"` and `codegen-units = 1` widen the optimizer's view across
