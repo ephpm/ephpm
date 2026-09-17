@@ -21,6 +21,16 @@ ignore = [
     # Compile-time-only (proc macro), no runtime exposure. Awaiting
     # upstream migration to manyhow / proc-macro2-diagnostics.
     "RUSTSEC-2026-0173",
+    # rustls TLS 1.3 handshake messages accepted at the wrong encryption
+    # level. Low severity: the handshake transcript stays authenticated, so a
+    # network attacker cannot alter or complete a handshake (upstream's own
+    # assessment) — the practical effect is that certain handshake messages
+    # could be sent in plaintext. The fix is rustls >= 0.23.45, which requires
+    # a Rust newer than our MSRV 1.88 (force-pinned by the litewire dep), so
+    # our own stack is capped at 0.23.43; opensrv-mysql's transitive 0.22.4
+    # cannot move either. Drop once litewire raises MSRV (letting us reach
+    # 0.23.45) and opensrv-mysql moves off rustls 0.22.
+    "RUSTSEC-2026-0285",
 ]
 
 [licenses]
@@ -35,6 +45,9 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    # libbz2-rs-sys (pure-Rust bzip2 backend, pulled by vivacity's zip). The
+    # bzip2/libbzip2 v1.0.6 license is a permissive BSD-style license.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 exceptions = [
