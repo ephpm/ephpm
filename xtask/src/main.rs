@@ -28,8 +28,12 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.33"), ("8.4", "8.4.23")
 ///   * are absent from the gating release matrices (`php_matrix` /
 ///     `docker_matrix`), so a beta SDK that is missing or fails to build can
 ///     never block a stable `v*` release;
-///   * are built only by the manually-dispatched `release-php-beta.yml` lane,
-///     which reads the `experimental_matrix` from `cargo xtask php-versions`.
+///   * are built by the non-gating `release-php-beta.yml` lane — automatically
+///     after every successful stable `v*` release (via `workflow_run`) and on
+///     manual dispatch — which reads the `experimental_matrix` /
+///     `experimental_tailcall_matrix` from `cargo xtask php-versions` and
+///     publishes them under a DISTINCT `v<ref>-php<beta>` pre-release tag that
+///     never touches the stable release.
 ///
 /// `resolve_php_version` accepts these minors so `cargo xtask release 8.6` and
 /// `cargo xtask php-sdk 8.6` resolve to the pinned beta once its SDK is
@@ -40,12 +44,20 @@ const EXPERIMENTAL_PHP_VERSIONS: &[(&str, &str)] = &[("8.6", "8.6.0beta1")];
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
 
-/// PHP minors that additionally get the experimental clang-cl / TAILCALL VM
-/// Windows build (`release.yml`'s `build-windows-tailcall` job, and the
-/// `tailcall_matrix` that `php-versions` derives for it). 8.5-only today: the
-/// TAILCALL VM does not exist in PHP 8.3/8.4. Single source of truth — both the
-/// matrix generator (`php_versions`) and any future pin tooling read this.
-const TAILCALL_MINORS: &[&str] = &["8.5"];
+/// PHP minors that get the clang-cl / TAILCALL VM Windows build. The TAILCALL
+/// VM (`[[clang::musttail]]` + `preserve_none`) exists in PHP 8.5+; 8.3/8.4 fall
+/// back to the slow `ZEND_VM_KIND_CALL` interpreter and are excluded.
+///
+/// Single source of truth, read by both the matrix generators in `php_versions`
+/// and `validate_variant`:
+///   * `tailcall_matrix` = `PHP_SDK_VERSIONS` ∩ this set — the GA TAILCALL legs
+///     of `release.yml`'s gating-adjacent `build-windows-tailcall` job (8.5).
+///   * `experimental_tailcall_matrix` = `EXPERIMENTAL_PHP_VERSIONS` ∩ this set —
+///     the non-gating beta TAILCALL leg of `release-php-beta.yml` (8.6 today).
+///
+/// 8.6 lives only in `EXPERIMENTAL_PHP_VERSIONS`, so listing it here does not add
+/// it to the gating `tailcall_matrix` (which filters `PHP_SDK_VERSIONS`).
+const TAILCALL_MINORS: &[&str] = &["8.5", "8.6"];
 
 /// Cargo features every *shipped* `ephpm` binary is built with.
 ///
@@ -197,12 +209,13 @@ fn parse_variant(args: &[String]) -> Option<&str> {
 /// Validate a `--variant` request against the SDK platform and PHP version.
 ///
 /// The only SDK build variant besides the default toolchain is `clang`: PHP
-/// built with clang-cl (MSVC-ABI-compatible) so the interpreter is PHP 8.5's
-/// TAILCALL VM (`[[clang::musttail]]` + `preserve_none`) instead of the slow
+/// built with clang-cl (MSVC-ABI-compatible) so the interpreter is the TAILCALL
+/// VM (`[[clang::musttail]]` + `preserve_none`) instead of the slow
 /// `ZEND_VM_KIND_CALL` interpreter every MSVC-built PHP falls back to. The
-/// artifact only exists for windows-x86_64 and PHP 8.5 — the TAILCALL VM does
-/// not exist in PHP 8.3/8.4, so those minors hard-error here with an
-/// explanation instead of a confusing 404 at download time (issue #329).
+/// artifact only exists for windows-x86_64 and TAILCALL-capable minors
+/// (`TAILCALL_MINORS`, 8.5+) — the TAILCALL VM does not exist in PHP 8.3/8.4, so
+/// those minors hard-error here with an explanation instead of a confusing 404
+/// at download time (issue #329).
 fn validate_variant(variant: &str, version: &str, os: &str, arch: &str) -> Result<(), ()> {
     if variant != "clang" {
         eprintln!("error: unsupported --variant '{variant}' (supported: clang)");
@@ -213,11 +226,18 @@ fn validate_variant(variant: &str, version: &str, os: &str, arch: &str) -> Resul
         eprintln!("error: --variant clang is only published for windows-x86_64");
         eprintln!("       only Windows's default SDK is the slow MSVC CALL VM, so only Windows");
         eprintln!("       needs a clang/TAILCALL variant. Linux builds with GCC (HYBRID VM);");
-        eprintln!("       macOS is already clang - 8.5 gets TAILCALL, but 8.3/8.4 fall to CALL.");
+        eprintln!("       macOS is already clang - 8.5+ gets TAILCALL, but 8.3/8.4 fall to CALL.");
         return Err(());
     }
-    if !version.starts_with("8.5.") {
-        eprintln!("error: --variant clang requires PHP 8.5 (got {version})");
+    // Minor = the "8.x" prefix of the (possibly pre-release) version string,
+    // e.g. "8.6.0beta1" -> "8.6". Compared against TAILCALL_MINORS so the gate
+    // tracks the same source of truth the matrices do.
+    let minor: String = version.split('.').take(2).collect::<Vec<_>>().join(".");
+    if !TAILCALL_MINORS.contains(&minor.as_str()) {
+        eprintln!(
+            "error: --variant clang requires a TAILCALL-capable PHP ({}) (got {version})",
+            TAILCALL_MINORS.join(", ")
+        );
         eprintln!("       The TAILCALL VM does not exist in PHP 8.3/8.4; those minors ship");
         eprintln!("       only the default MSVC (CALL VM) Windows build.");
         return Err(());

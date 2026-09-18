@@ -1,6 +1,6 @@
 name: Release (PHP beta, experimental)
 
-# EXPERIMENTAL, MANUAL-ONLY lane for building ephpm against an upstream PHP
+# EXPERIMENTAL, NON-GATING lane for building ephpm against an upstream PHP
 # PRE-RELEASE (beta/RC) SDK — today PHP 8.6.0beta1 (see xtask
 # EXPERIMENTAL_PHP_VERSIONS). This workflow is deliberately SEPARATE from
 # release.yml so that:
@@ -11,17 +11,38 @@ name: Release (PHP beta, experimental)
 #     SHA256SUMS (that collector sweeps every `ephpm-v*` artifact of a run — a
 #     beta job uploading into the same run would pollute the stable release).
 #
-# It is workflow_dispatch ONLY. A human cuts the first beta build. It builds the
-# four OS/arch targets against the pinned pre-release SDK and uploads them as
-# workflow artifacts; with `publish=true` from a tag ref it additionally
-# publishes a GitHub PRE-RELEASE under its OWN distinct tag, `v<ref>-php<beta>`
-# (e.g. v0.8.7-php8.6.0beta1 — a '-' separator, never '+', which url-encodes to
-# %2B in release/tag URLs). It never touches the stable `v<ref>` release. Marked
+# HOW IT RUNS
+#   * Automatically AFTER a stable release finishes: `workflow_run` fires when
+#     the "Release" workflow completes. The guard on `setup` only proceeds when
+#     that run was a TAG PUSH (`v*`) that SUCCEEDED — so every published stable
+#     release is followed by a matching beta build, and a release.yml
+#     workflow_dispatch republish (or a failed release) is ignored. Running
+#     strictly AFTER release.yml — not concurrently — is what keeps this lane
+#     from competing with the stable release for the self-hosted fleet: it can
+#     neither block `Create Release` (separate workflow) nor kill a stable leg
+#     by contending for the same Mac/arm node mid-build (it starts once those
+#     legs are done). The distinct concurrency group means a beta build in
+#     flight never delays the NEXT release either.
+#   * Manually via workflow_dispatch, for cutting a one-off beta build.
+#
+# It builds the OS/arch targets against the pinned pre-release SDK (linux
+# x64/arm64, macOS, windows-MSVC, and the experimental windows-clang/TAILCALL
+# leg) and uploads them as workflow artifacts. Every build job is
+# `continue-on-error` — a red OS leg (e.g. a beta Windows SDK that does not
+# exist yet) never fails the run. When triggered by a successful release (or a
+# workflow_dispatch with publish=true from a v* tag) it additionally publishes a
+# GitHub PRE-RELEASE under its OWN distinct tag, `v<ref>-php<beta>` (e.g.
+# v0.8.7-php8.6.0beta1 — a '-' separator, never '+', which url-encodes to %2B in
+# release/tag URLs). It never touches the stable `v<ref>` release. Marked
 # prerelease so it is never promoted to "Latest" (#441).
 #
 # Prerequisite: the beta SDK must already be published at
 # github.com/ephpm/php-sdk (tag `v<full>`, e.g. v8.6.0beta1) for every target
-# `cargo xtask release` downloads. See php-sdk build.yml's beta handling.
+# `cargo xtask release` downloads. The windows-x86_64 and windows-x86_64-clang
+# beta SDKs are built by a manual php-sdk build.yml dispatch with a `php_src_url`
+# pointing at the RM's beta tarball (spc cannot resolve a non-GA php-src); the
+# clang leg additionally needs an 8.6 entry in spc's static_extensions_win32
+# selector. Until those SDKs exist the two Windows beta legs go red (non-gating).
 
 on:
   workflow_dispatch:
@@ -30,10 +51,18 @@ on:
         description: "Publish a GitHub pre-release from the built archives (requires dispatching from a v* tag). Off = build + upload workflow artifacts only."
         type: boolean
         default: false
+  # Auto-run after every stable release. The `setup` guard filters to a
+  # successful `v*` tag-push run of release.yml (see that job's `if:`).
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
-# Never run two beta builds at once, and queue behind (do not cancel) a stable
-# release — both draw on the same self-hosted fleet. Distinct group from
-# ephpm-release so a beta build cannot cancel a real release, only serialize.
+# Never run two beta builds at once. Distinct group from `ephpm-release` so a
+# beta build cannot cancel OR delay a real release — the workflow_run trigger
+# already sequences it strictly after release.yml, and a separate group means a
+# still-building beta never sits in the release lane when the next `v*` tag
+# lands. cancel-in-progress: false so a superseding beta queues rather than
+# interrupting one mid-publish.
 concurrency:
   group: ephpm-release-php-beta
   cancel-in-progress: false
@@ -42,32 +71,72 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Derive the experimental (pre-release) matrix from the single source of
-  # truth, xtask::EXPERIMENTAL_PHP_VERSIONS. Empty table => empty matrix =>
-  # every build job self-skips (zero matrix runs).
+  # Resolve the release identity (tag / commit / whether to publish) for BOTH
+  # trigger paths, and derive the experimental (pre-release) matrices from the
+  # single source of truth, xtask::EXPERIMENTAL_PHP_VERSIONS. Empty tables =>
+  # empty matrices => every build job self-skips (zero matrix runs).
   setup:
-    name: Derive experimental PHP matrix
+    name: Resolve release + derive experimental PHP matrix
+    # Only proceed for a manual dispatch, or a workflow_run that was a
+    # SUCCESSFUL `v*` tag push of release.yml (ignore release.yml's
+    # workflow_dispatch republish path and failed releases).
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+          || (github.event.workflow_run.event == 'push'
+              && github.event.workflow_run.conclusion == 'success'
+              && startsWith(github.event.workflow_run.head_branch, 'v')) }}
     runs-on: [self-hosted, linux, x64]
     outputs:
       experimental_matrix: ${{ steps.matrix.outputs.experimental_matrix }}
-      # github.ref_name with `/` flattened to `-`. Artifact names reject
-      # slashes, so a branch dispatch (fix/php86-...) otherwise builds
-      # successfully and then dies at "Upload archive" — observed on run
-      # 33460847551. Use this, never ref_name, in artifact names.
-      safe_ref: ${{ steps.safe_ref.outputs.safe_ref }}
+      experimental_tailcall_matrix: ${{ steps.matrix.outputs.experimental_tailcall_matrix }}
+      # The release tag (e.g. v0.11.0) and its commit. On a workflow_run these
+      # come from the triggering release run's head; on a manual dispatch from
+      # this run's own ref. Downstream jobs check out `sha` and stamp `tag` into
+      # the binary + artifact names — NEVER github.ref_name, which on a
+      # workflow_run is the default branch, not the tag.
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      # tag with `/` flattened to `-`. Artifact names reject slashes, so a
+      # branch dispatch (fix/php86-...) otherwise builds successfully and then
+      # dies at "Upload archive" — observed on run 33460847551.
+      safe_ref: ${{ steps.resolve.outputs.safe_ref }}
+      # "true" when this run should publish the beta pre-release.
+      do_publish: ${{ steps.resolve.outputs.do_publish }}
     steps:
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISPATCH_REF: ${{ github.ref_name }}
+          DISPATCH_SHA: ${{ github.sha }}
+          DISPATCH_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -eu
+          if [ "$EVENT" = "workflow_run" ]; then
+            # A successful v* tag-push release just finished — always publish.
+            tag="$WR_BRANCH"; sha="$WR_SHA"; publish=true
+          else
+            tag="$DISPATCH_REF"; sha="$DISPATCH_SHA"; publish="${DISPATCH_PUBLISH:-false}"
+          fi
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "do_publish=$publish"
+            echo "safe_ref=${tag//\//-}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$tag sha=$sha publish=$publish"
+      # Build the matrices from the SAME commit the beta will be built from, so
+      # the pinned beta versions match the tag's tree.
       - uses: actions/checkout@v4
-      - name: Emit experimental matrix from xtask EXPERIMENTAL_PHP_VERSIONS
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+      - name: Emit experimental matrices from xtask EXPERIMENTAL_PHP_VERSIONS
         id: matrix
         run: |
           docker run --rm -v "$PWD":/w -w /w \
             ephpm/ephpm-ci:latest \
             cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
-      - name: Slash-safe ref name for artifact names
-        id: safe_ref
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: echo "safe_ref=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
 
   # -- Linux x86_64 (glibc 2.28 floor via ephpm-ci) ---------------------------
   build-linux:
@@ -82,11 +151,15 @@ jobs:
         php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
       - name: Build ephpm in the ephpm-ci container
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
         run: |
           set -eu
           docker run --rm -v "$PWD":/w -w /w \
-            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e EPHPM_RELEASE_VERSION="${TAG#v}" \
             -e CARGO_PROFILE_RELEASE_LTO="fat" \
             -e CARGO_TERM_COLOR=always \
             ephpm/ephpm-ci:latest \
@@ -99,7 +172,7 @@ jobs:
       - name: Package archive
         id: pkg
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.setup.outputs.tag }}
           PHP_FULL: ${{ matrix.php.full }}
         run: |
           set -eu
@@ -131,14 +204,16 @@ jobs:
         php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Compute release version
         env:
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ needs.setup.outputs.tag }}
         run: |
           set -eu
-          echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "EPHPM_RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - name: Pin libclang for bindgen
         run: |
           export PATH="/opt/homebrew/bin:$PATH"
@@ -154,7 +229,7 @@ jobs:
       - name: Package archive
         id: pkg
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.setup.outputs.tag }}
           PHP_FULL: ${{ matrix.php.full }}
         run: |
           set -eu
@@ -175,12 +250,10 @@ jobs:
   # -- Linux aarch64 (glibc, dedicated arm64 runner node) ---------------------
   build-linux-arm64:
     name: Beta (PHP ${{ matrix.php.full }}, linux-aarch64)
-    # arm64 runs on its own dedicated node now — it no longer shares the
-    # Apple Silicon host with build-macos, so no cross-job `needs:
-    # build-macos` serialization (that was copied from release.yml's old
-    # shared-Mac topology). max-parallel: 1 stays as a per-node guard on the
-    # arm64 box itself (disk/memory incidents under concurrent heavy links —
-    # see release.yml's build-linux-arm64).
+    # arm64 runs on its own dedicated node — no cross-job serialization with
+    # build-macos. max-parallel: 1 stays as a per-node guard on the arm64 box
+    # itself (disk/memory incidents under concurrent heavy links — see
+    # release.yml's build-linux-arm64).
     needs: setup
     if: needs.setup.outputs.experimental_matrix != '[]'
     runs-on: [self-hosted, linux, arm64]
@@ -192,11 +265,15 @@ jobs:
         php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
       - name: Build ephpm in the ephpm-ci container
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
         run: |
           set -eu
           docker run --rm -v "$PWD":/w -w /w \
-            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e EPHPM_RELEASE_VERSION="${TAG#v}" \
             -e CARGO_PROFILE_RELEASE_LTO="off" \
             -e CARGO_TERM_COLOR=always \
             ephpm/ephpm-ci:latest-arm64 \
@@ -209,7 +286,7 @@ jobs:
       - name: Package archive
         id: pkg
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.setup.outputs.tag }}
           PHP_FULL: ${{ matrix.php.full }}
         run: |
           set -eu
@@ -241,6 +318,8 @@ jobs:
         php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
       - name: Install Rust toolchain
         shell: powershell
         run: |
@@ -308,9 +387,9 @@ jobs:
       - name: Compute release version
         shell: powershell
         env:
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ needs.setup.outputs.tag }}
         run: |
-          $version = $env:REF_NAME -replace '^v',''
+          $version = $env:TAG -replace '^v',''
           "EPHPM_RELEASE_VERSION=$version" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
       - name: Build ephpm.exe
         shell: powershell
@@ -322,7 +401,7 @@ jobs:
         id: pkg
         shell: powershell
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.setup.outputs.tag }}
           PHP_FULL: ${{ matrix.php.full }}
         run: |
           $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64"
@@ -340,30 +419,177 @@ jobs:
           name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-windows-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # -- Optional pre-release publish -------------------------------------------
-  # Gathers whatever archives the (non-gating) build jobs produced and, only
-  # when dispatched from a v* tag with publish=true, publishes them as a GitHub
-  # PRE-RELEASE under its OWN distinct tag, v<ref>-php<beta> (e.g.
-  # v0.8.7-php8.6.0beta1). This tag is deliberately NOT the dispatch tag: keying
-  # off github.ref_name made action-gh-release EDIT the existing stable v<ref>
-  # release — attaching the beta tarballs to it, renaming it, and flipping it to
-  # prerelease, which demoted the stable release out of "Latest" (#441, observed
-  # on run 33520043117 from v0.8.7). The beta gets its own tag; the stable
-  # release is never touched. A guard refuses to publish if a release already
-  # exists at the computed tag with different provenance (i.e. not one this lane
-  # created), so a re-dispatch is idempotent but a name collision fails loudly.
-  # Marked prerelease so it is never promoted to "Latest". Non-gating:
-  # `!cancelled()` + `always()`-style guard so a red OS leg still publishes the
-  # ones that succeeded.
+  # -- Windows x86_64 TAILCALL (clang-cl, EXPERIMENTAL) -----------------------
+  # The beta counterpart of release.yml's build-windows-tailcall: PHP built with
+  # clang-cl so the interpreter is the TAILCALL VM. Matrix is the TAILCALL-capable
+  # subset of the experimental table (experimental_tailcall_matrix — 8.6 today;
+  # 8.5+ have the TAILCALL VM). Non-gating like every leg here: until the
+  # php-sdk-<full>-windows-x86_64-clang.tar.gz beta SDK exists (blocked on spc's
+  # static_extensions_win32 8.6 entry), this leg is red and nothing notices.
+  build-windows-tailcall:
+    name: Beta (PHP ${{ matrix.php.full }}, windows-x86_64, TAILCALL)
+    needs: setup
+    if: needs.setup.outputs.experimental_tailcall_matrix != '[]'
+    runs-on: [self-hosted, windows, x64]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        php: ${{ fromJSON(needs.setup.outputs.experimental_tailcall_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\rustup.exe")) {
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+          $cargoBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          & "$cargoBin\rustup.exe" show
+      - name: Install Visual Studio Build Tools
+        shell: powershell
+        run: |
+          $installPath = "C:\BuildTools"
+          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
+          if (Test-Path $msbuild) {
+            Write-Host "VS Build Tools already present at $installPath"
+          } else {
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
+            $proc = Start-Process -FilePath .\vs_buildtools.exe `
+              -ArgumentList @(
+                '--quiet', '--wait', '--norestart', '--nocache',
+                '--installPath', $installPath,
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+                '--includeRecommended'
+              ) -Wait -PassThru -NoNewWindow
+            Remove-Item vs_buildtools.exe
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
+              Start-Sleep -Seconds 30
+              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
+            }
+            if (-not (Test-Path $msbuild)) {
+              Write-Host "::error::VS install timed out - $msbuild never appeared"
+              exit 1
+            }
+          }
+      - name: Enter MSVC developer environment
+        shell: powershell
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Error "vcvars64.bat not found"; exit 1 }
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $cmdLine = 'call "' + $vcvars + '" >NUL & set'
+          $output = & cmd /c $cmdLine
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              if ($envBefore[$matches[1]] -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+              }
+            }
+          }
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+          }
+      - name: Compute release version
+        shell: powershell
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          $version = $env:TAG -replace '^v',''
+          "EPHPM_RELEASE_VERSION=$version" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+      - name: Build ephpm.exe (clang/TAILCALL SDK)
+        shell: powershell
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          RUST_MIN_STACK: "33554432"
+        # --variant clang downloads php-sdk-<ver>-windows-x86_64-clang.tar.gz and
+        # hard-gates on the SDK's VM kind (xtask disassembles zend_vm_kind() out
+        # of php8embed.lib and requires mov eax,5 / ZEND_VM_KIND_TAILCALL) before
+        # linking. A missing beta clang SDK fails the download here — non-gating.
+        run: cargo xtask release ${{ matrix.php.minor }} --target windows --variant clang
+      - name: Assert the produced binary is the TAILCALL build
+        shell: powershell
+        env:
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          $exe = "target\x86_64-pc-windows-msvc\release\ephpm.exe"
+          if (-not (Test-Path $exe)) { Write-Host "::error::$exe not found"; exit 1 }
+          $v = (& $exe php -v) -join "`n"
+          Write-Host $v
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::ephpm php -v exited $LASTEXITCODE"; exit 1 }
+          if ($v -notmatch [regex]::Escape("PHP $env:PHP_FULL")) {
+            Write-Host "::error::embedded PHP is not $env:PHP_FULL"; exit 1
+          }
+          if ($v -notmatch 'ZTS') { Write-Host "::error::embedded PHP is not a ZTS build"; exit 1 }
+          $clangLib = "php-sdk\$env:PHP_FULL-windows-x86_64-clang\lib\php8embed.lib"
+          if (-not (Test-Path $clangLib)) {
+            Write-Host "::error::clang SDK cache $clangLib missing -- wrong SDK linked?"; exit 1
+          }
+          Write-Host "==> TAILCALL build asserted: PHP $env:PHP_FULL ZTS, clang SDK cache present"
+      - name: Package archive
+        id: pkg
+        shell: powershell
+        env:
+          VERSION: ${{ needs.setup.outputs.tag }}
+          PHP_FULL: ${{ matrix.php.full }}
+        # The artifact name says what the binary IS (-tailcall: the TAILCALL VM),
+        # not how it is built (clang) -- consumers care about the former.
+        run: |
+          $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64-tailcall"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\ephpm.exe "$stage\ephpm.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          Copy-Item .github\release-readme.txt "$stage\README.txt"
+          tar -C dist -czf "dist\$name.tar.gz" $name
+          Remove-Item -Recurse -Force $stage
+          "archive=dist/$name.tar.gz" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-windows-x86_64-tailcall
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # -- Pre-release publish ----------------------------------------------------
+  # Gathers whatever archives the (non-gating) build jobs produced and, when
+  # do_publish is true and the resolved tag is a v* tag, publishes them as a
+  # GitHub PRE-RELEASE under its OWN distinct tag, v<ref>-php<beta> (e.g.
+  # v0.8.7-php8.6.0beta1). This tag is deliberately NOT the stable v<ref>: keying
+  # off the stable tag made action-gh-release EDIT the existing stable release —
+  # attaching the beta tarballs to it, renaming it, and flipping it to prerelease,
+  # which demoted the stable release out of "Latest" (#441, observed on run
+  # 33520043117 from v0.8.7). The beta gets its own tag; the stable release is
+  # never touched. A guard refuses to publish if a release already exists at the
+  # computed tag with different provenance (i.e. not one this lane created), so a
+  # re-run is idempotent but a name collision fails loudly. Marked prerelease so
+  # it is never promoted to "Latest". Non-gating: `!cancelled()` so a red OS leg
+  # still publishes the ones that succeeded.
   publish:
-    name: Publish pre-release (optional)
-    needs: [build-linux, build-linux-arm64, build-macos, build-windows]
-    if: ${{ !cancelled() && inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    name: Publish pre-release
+    needs: [setup, build-linux, build-linux-arm64, build-macos, build-windows, build-windows-tailcall]
+    if: ${{ !cancelled() && needs.setup.outputs.do_publish == 'true' && startsWith(needs.setup.outputs.tag, 'v') }}
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -384,12 +610,12 @@ jobs:
       - name: Compute distinct beta pre-release tag
         id: tag
         env:
-          REF_NAME: ${{ github.ref_name }}
+          REF_NAME: ${{ needs.setup.outputs.tag }}
         run: |
           set -eu
           # Archive names are ephpm-<ref>+php<full>-<os>-<arch>.tar.gz. Derive
-          # the beta PHP version from what was actually built and publish under
-          # a DISTINCT tag v<ref>-php<full> ('-', never '+' — '+' url-encodes to
+          # the beta PHP version from what was actually built and publish under a
+          # DISTINCT tag v<ref>-php<full> ('-', never '+' — '+' url-encodes to
           # %2B in release/tag URLs). The beta full version (e.g. 8.6.0beta1)
           # never contains a '-', so [^-] safely stops at the OS segment.
           betas="$(ls release/*.tar.gz \
@@ -410,7 +636,7 @@ jobs:
         run: |
           set -eu
           # The tag is now distinct from the stable v<ref>, so a collision here
-          # means either a prior beta dispatch of THIS tag (fine — idempotent
+          # means either a prior beta run of THIS tag (fine — idempotent
           # re-publish) or an unrelated/hand-made release (never edit it). Only
           # treat it as ours if it is a prerelease carrying this lane's marker.
           if gh release view "$TAG" --json isPrerelease,body \
@@ -433,11 +659,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          # DISTINCT tag, never github.ref_name — see the job header and #441.
-          # action-gh-release creates this tag from the dispatched commit if it
-          # does not yet exist.
+          # DISTINCT tag, never the stable tag — see the job header and #441.
+          # action-gh-release creates this tag from the checked-out commit (the
+          # release's own commit, checked out above) if it does not yet exist.
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: "${{ github.ref_name }} (PHP ${{ steps.tag.outputs.beta }} beta, experimental)"
+          name: "${{ needs.setup.outputs.tag }} (PHP ${{ steps.tag.outputs.beta }} beta, experimental)"
           prerelease: true
           # Never let it become "Latest" even transiently.
           make_latest: false
@@ -447,6 +673,6 @@ jobs:
 
             This is a standalone pre-release under its own tag
             (`${{ steps.tag.outputs.tag }}`); it does not modify, replace, or
-            demote the stable `${{ github.ref_name }}` release.
+            demote the stable `${{ needs.setup.outputs.tag }}` release.
 
             See release-php-beta.yml.
