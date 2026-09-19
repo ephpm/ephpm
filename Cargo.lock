@@ -1083,6 +1083,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
 name = "core-error"
 version = "0.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3322,9 +3328,9 @@ checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 
 [[package]]
 name = "memchr"
-version = "2.8.0"
+version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memoffset"
@@ -3849,6 +3855,16 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+]
 
 [[package]]
 name = "pear"
@@ -6318,9 +6334,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivacity"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aac31ab3e1a1fe3664d8032bead3d2347c578a5c80c277b6606dc7a61496b07c"
+checksum = "f33878b48fc40259f9afdc09888423157fc5aeac3cd9f819da4022eaedbefcfd"
 dependencies = [
  "anyhow",
  "clap",
@@ -6333,11 +6349,12 @@ dependencies = [
 
 [[package]]
 name = "vivacity-autoload"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25c78a053d3bf29ab986b0933994d2fcd8010e12f86e738f9ec855f0c7bb5e0d"
+checksum = "9249e7df762d4cab2dadf6dac5cf0a97497205449be756b1b77dd7b34929eaee"
 dependencies = [
  "md-5 0.10.6",
+ "memchr",
  "rayon",
  "serde_json",
  "sha1",
@@ -6349,9 +6366,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-core"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7229cf51447794e4defcc8cf83ae064e05fe649f0d1133af5ebf7abd7d238b7e"
+checksum = "fdf2915d52d879d5c4e3641349ef3b17c15d048f3592e48c9c778b621cdcca57"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6373,9 +6390,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60dde338dd98b8d54f94385867f32d4a96ef4d56ca0f1944a634640516e14b00"
+checksum = "9f3c7f5806153ad89379750fe75d2950d3f69100a818c98df2f0a06729364418"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6384,9 +6401,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2-sys"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ea610994802e5cfe9d9821ed3b5636d7eac3a97308502c2b374ed9b6249c3c4"
+checksum = "7ec91e3fa861379184697040a0870508e66b095432a01e5c9741ca6ff33a95ca"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6394,9 +6411,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-resolver"
-version = "0.11.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99567c50385385c2942c46ce006b725f81eaf1a7e816e6ba925766bdf72e69ca"
+checksum = "24e5e8093be68154f7611f16a15dea279d2b723fdeea5f0667f7e0e2c2b8fb36"
 dependencies = [
  "serde",
  "serde_json",
@@ -7192,6 +7209,20 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "zerotrie"
@@ -7234,18 +7265,25 @@ version = "2.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
 dependencies = [
+ "aes",
  "arbitrary",
  "bzip2",
+ "constant_time_eq",
  "crc32fast",
  "crossbeam-utils",
  "deflate64",
  "displaydoc",
  "flate2",
+ "getrandom 0.3.4",
+ "hmac 0.12.1",
  "indexmap",
  "lzma-rs",
  "memchr",
+ "pbkdf2",
+ "sha1",
  "thiserror 2.0.20",
  "time",
+ "zeroize",
  "zopfli",
 ]
 
