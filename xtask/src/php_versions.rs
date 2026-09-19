@@ -38,11 +38,12 @@ fn php_matrix_json() -> String {
     format!("[{}]", items.join(","))
 }
 
-/// JSON array of the TAILCALL minors' `{minor, full}` pairs.
+/// JSON array of the GA TAILCALL minors' `{minor, full}` pairs.
 ///
-/// The matrix for the experimental, non-gating `build-windows-tailcall` job.
-/// `TAILCALL_MINORS` is 8.5-only today — the TAILCALL VM does not exist in
-/// PHP 8.3/8.4.
+/// The matrix for `release.yml`'s non-gating `build-windows-tailcall` job — the
+/// GA (`PHP_SDK_VERSIONS`) minors that are TAILCALL-capable. 8.5-only today: the
+/// TAILCALL VM does not exist in PHP 8.3/8.4, and 8.6 is a beta (it lives in
+/// `EXPERIMENTAL_PHP_VERSIONS`, surfaced by `experimental_tailcall_matrix`).
 fn tailcall_matrix_json() -> String {
     let items: Vec<String> = PHP_SDK_VERSIONS
         .iter()
@@ -62,6 +63,23 @@ fn tailcall_matrix_json() -> String {
 fn experimental_matrix_json() -> String {
     let items: Vec<String> = EXPERIMENTAL_PHP_VERSIONS
         .iter()
+        .map(|(minor, full)| format!(r#"{{"minor":"{minor}","full":"{full}"}}"#))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// JSON array of the EXPERIMENTAL (pre-release) TAILCALL minors' `{minor, full}`
+/// pairs.
+///
+/// The matrix for `release-php-beta.yml`'s non-gating `build-windows-tailcall`
+/// (clang) job — the `EXPERIMENTAL_PHP_VERSIONS` minors that are TAILCALL-capable
+/// (`TAILCALL_MINORS`, 8.5+). 8.6.0beta1 today. Empty (`[]`) when no such beta is
+/// pinned, which expands to zero matrix runs — the leg self-skips. Kept separate
+/// from `tailcall_matrix` so a beta never enters the GA TAILCALL matrix.
+fn experimental_tailcall_matrix_json() -> String {
+    let items: Vec<String> = EXPERIMENTAL_PHP_VERSIONS
+        .iter()
+        .filter(|(minor, _)| TAILCALL_MINORS.contains(minor))
         .map(|(minor, full)| format!(r#"{{"minor":"{minor}","full":"{full}"}}"#))
         .collect();
     format!("[{}]", items.join(","))
@@ -91,7 +109,7 @@ fn docker_matrix_json() -> String {
 ///
 /// * `--github-matrix` prints the `key=value` lines the release workflows'
 ///   `setup` jobs append to `$GITHUB_OUTPUT` (`php_matrix`, `tailcall_matrix`,
-///   `experimental_matrix`, `docker_matrix`).
+///   `experimental_matrix`, `experimental_tailcall_matrix`, `docker_matrix`).
 /// * otherwise (or with `--json`) prints one combined JSON object — a
 ///   human/debug view and a stable contract for any other consumer.
 pub fn run(args: &[String]) -> ExitCode {
@@ -103,13 +121,15 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("php_matrix={}", php_matrix_json());
         println!("tailcall_matrix={}", tailcall_matrix_json());
         println!("experimental_matrix={}", experimental_matrix_json());
+        println!("experimental_tailcall_matrix={}", experimental_tailcall_matrix_json());
         println!("docker_matrix={}", docker_matrix_json());
     } else {
         println!(
-            r#"{{"php_matrix":{},"tailcall_matrix":{},"experimental_matrix":{},"docker_matrix":{}}}"#,
+            r#"{{"php_matrix":{},"tailcall_matrix":{},"experimental_matrix":{},"experimental_tailcall_matrix":{},"docker_matrix":{}}}"#,
             php_matrix_json(),
             tailcall_matrix_json(),
             experimental_matrix_json(),
+            experimental_tailcall_matrix_json(),
             docker_matrix_json()
         );
     }
@@ -140,8 +160,11 @@ mod tests {
         );
     }
 
-    /// `tailcall_matrix` is exactly the TAILCALL subset of the table — same
-    /// full versions the table pins, no more, no fewer.
+    /// `tailcall_matrix` is exactly the TAILCALL subset of the GA table — same
+    /// full versions the table pins, no more, no fewer. Its object count is the
+    /// intersection of `PHP_SDK_VERSIONS` and `TAILCALL_MINORS` (not
+    /// `TAILCALL_MINORS.len()`: that set also carries beta-only minors like 8.6,
+    /// which live in `EXPERIMENTAL_PHP_VERSIONS` and must not appear here).
     #[test]
     fn tailcall_matrix_is_the_tailcall_subset() {
         let json = tailcall_matrix_json();
@@ -153,7 +176,36 @@ mod tests {
                 "tailcall_matrix membership wrong for {minor}: {json}"
             );
         }
-        assert_eq!(json.matches(r#""minor""#).count(), TAILCALL_MINORS.len(), "{json}");
+        let ga_tailcall =
+            PHP_SDK_VERSIONS.iter().filter(|(m, _)| TAILCALL_MINORS.contains(m)).count();
+        assert_eq!(json.matches(r#""minor""#).count(), ga_tailcall, "{json}");
+    }
+
+    /// `experimental_tailcall_matrix` is exactly the TAILCALL subset of the
+    /// EXPERIMENTAL table, and none of its (pre-release) minors leak into either
+    /// gating matrix (`php_matrix`, `tailcall_matrix`) — that separation is what
+    /// keeps a beta clang leg from ever gating a stable release.
+    #[test]
+    fn experimental_tailcall_matrix_is_the_experimental_subset() {
+        let json = experimental_tailcall_matrix_json();
+        for (minor, full) in EXPERIMENTAL_PHP_VERSIONS {
+            let present = json.contains(&format!(r#"{{"minor":"{minor}","full":"{full}"}}"#));
+            assert_eq!(
+                present,
+                TAILCALL_MINORS.contains(minor),
+                "experimental_tailcall_matrix membership wrong for {minor}: {json}"
+            );
+        }
+        let exp_tailcall =
+            EXPERIMENTAL_PHP_VERSIONS.iter().filter(|(m, _)| TAILCALL_MINORS.contains(m)).count();
+        assert_eq!(json.matches(r#""minor""#).count(), exp_tailcall, "{json}");
+        let ga = tailcall_matrix_json();
+        for (minor, _) in EXPERIMENTAL_PHP_VERSIONS {
+            assert!(
+                !ga.contains(&format!(r#""minor":"{minor}""#)),
+                "experimental minor {minor} leaked into the GA tailcall_matrix: {ga}"
+            );
+        }
     }
 
     /// `experimental_matrix` is exactly `EXPERIMENTAL_PHP_VERSIONS`, and none of
