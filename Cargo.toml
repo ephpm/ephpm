@@ -430,10 +430,16 @@ turso = { version = "=0.7.2", default-features = false }
 # the exact published version whose `vivacity::run()` embed entry point was
 # verified (argv[0] = program name; returns the process exit code as `i32`).
 # MIT-licensed. Published on crates.io. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).
-# 0.11.1 also drops the C decompression libs (bzip2-sys/xz2/zstd-sys) from
-# `zip` in favor of pure-Rust backends, so this PHP-linked binary no longer
-# collides with libphp's bundled bzip2/xz/zstd at link time (ephpm/ephpm#523).
-vivacity = { version = "=0.11.1", default-features = false, features = ["rustls-tls-no-provider"] }
+# Like 0.11.1, 0.15.0 keeps the C decompression libs (bzip2-sys/xz2/zstd-sys)
+# out of `zip` in favor of pure-Rust backends, so this PHP-linked binary no
+# longer collides with libphp's bundled bzip2/xz/zstd at link time
+# (ephpm/ephpm#523). 0.12–0.15 are feature/perf releases on the same pure-Rust
+# dist-extraction + prefixed-PCRE2 linking surface as 0.11.1: 0.12 emulates
+# wikimedia/composer-merge-plugin, 0.13 adds `--run-scripts`, 0.14 makes
+# `install --no-plugins` native for any lock, and 0.15 is a perf release
+# (no-op install ~160→~50 ms, 2× faster autoloader dump, byte-identical output).
+# The only linking-side delta is memchr → 2.8.3 (pure Rust, no C symbols).
+vivacity = { version = "=0.15.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
