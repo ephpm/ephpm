@@ -18,6 +18,11 @@ It is a [dynamic (`dlopen`) middleware module](/guides/native-middleware/),
 not a builtin — it needs an HTTP client and a TLS stack, and none of that
 belongs in the `ephpm` binary.
 
+> **Where it lives.** This module is maintained in its own repository,
+> [`github.com/ephpm/middleware-github-auth`](https://github.com/ephpm/middleware-github-auth),
+> not in the ePHPm core workspace, and is released from there. See
+> [Build and mount](#build-and-mount) for how to obtain the `.so`.
+
 ## It is half of a pair
 
 Two jobs, deliberately in two modules:
@@ -123,24 +128,35 @@ builtin instead.
 
 ## Build and mount
 
-The Linux module ships with every ePHPm release, so you normally do not build
-it yourself. Each tagged release attaches a per-arch, glibc-dynamic
-`libgithub_auth-linux-x86_64.so` / `libgithub_auth-linux-aarch64.so` alongside
-the binary archives (covered by `SHA256SUMS`). It is built in the same
-glibc-floor container as the release binary, so it is libc- and C-ABI-matched
-to it — download it and point `library` at it. macOS and Windows are not
-shipped; build those yourself:
+This module lives in its **own repository**,
+[`github.com/ephpm/middleware-github-auth`](https://github.com/ephpm/middleware-github-auth),
+separate from ePHPm core — it is stable, preview-site infrastructure, and it
+carries an HTTP/TLS stack that has no place in the ePHPm binary. It is **no
+longer built or shipped by ePHPm releases**; get it from that repo's releases.
+
+Each tagged release there attaches a glibc-dynamic
+`github-auth.linux-x86_64.so` covered by `SHA256SUMS`, built against a pinned
+ePHPm ABI commit (major 1). Download it, verify it, and place it where the
+loader looks (or point `library` at it by path):
 
 ```bash
-cargo build --release -p ephpm-middleware-github-auth
-# target/release/libgithub_auth.so    (Linux)
-# target/release/libgithub_auth.dylib (macOS)
-# target/release/github_auth.dll      (Windows)
+sha256sum -c SHA256SUMS
+install -Dm755 github-auth.linux-x86_64.so \
+  /usr/local/lib/ephpm/middleware/github-auth.linux-x86_64.so
 ```
 
-`library` must be a **path** (something containing a separator or an
-extension). A bare name is resolved against the compiled-in builtin registry
-first, so it would not load this module.
+With the file installed under a searched directory you can mount it by the bare
+name `library = "github-auth"` (the loader tries `github-auth.<os>-<arch>.<ext>`
+first). To build it yourself — or for macOS/Windows/arm64, which the repo does
+not pre-build — clone that repo and run `cargo build --release` (the artifact is
+`target/release/libgithub_auth.{so,dylib}` / `github_auth.dll`); use a source
+revision whose pinned ABI **major** matches your ePHPm host.
+
+`library` may be a **path** (something containing a separator or an extension)
+or, once the file is installed under a searched directory, the bare name
+`github-auth`. A bare name is resolved against the compiled-in builtin registry
+first (which has no `github-auth` entry), then the platform-suffixed file
+`github-auth.<os>-<arch>.<ext>` in the search directories.
 
 ## Configuration
 
