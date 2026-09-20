@@ -30,11 +30,13 @@ compiler at all:
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
   box with the stock release binaries on every platform — see
-  [the dynamic lane](#the-dynamic-lane). A worked, shipped example lives in
-  the workspace: [the GitHub OAuth gate](/guides/github-auth-middleware/)
-  (`crates/ephpm-middleware-github-auth`), which authenticates a browser user
-  against GitHub and issues the stateless signed session that `session-cookie`
-  verifies.
+  [the dynamic lane](#the-dynamic-lane). A worked, shipped example is
+  [the GitHub OAuth gate](/guides/github-auth-middleware/), maintained in its
+  own repository
+  ([`github.com/ephpm/middleware-github-auth`](https://github.com/ephpm/middleware-github-auth),
+  which depends on the `ephpm-middleware` ABI crate by git rev), which
+  authenticates a browser user against GitHub and issues the stateless signed
+  session that the `preview-gate` verifier checks.
 
 ## Quick start
 

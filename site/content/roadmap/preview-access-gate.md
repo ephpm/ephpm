@@ -193,7 +193,7 @@ apex vhost** and carries the target in the signed OAuth `state`:
    target host is within the configured `cookie_domain` before any cross-host
    redirect or domain-scoped cookie is emitted (a target outside the fleet is
    refused, before any GitHub call). Verified end to end in
-   `github-auth`'s `apex_flow_one_app_serves_the_whole_wildcard_fleet` (the
+   the `github-auth` repo's `apex_flow_one_app_serves_the_whole_wildcard_fleet` (the
    minted session verifies on the target and is rejected on another preview and
    on the apex, through the real `Hs256Policy`).
 
@@ -328,7 +328,7 @@ config  = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
 The session is unchanged: it still binds only to the **site** (`site` claim,
 #396), never to the repo. Repo authorization happens once, at login; the hot-path
 verifier is untouched and cross-preview replay is still a `site`-claim mismatch.
-Verified end to end in `github-auth`'s
+Verified end to end in the `github-auth` repo's
 `per_preview_gates_on_the_signed_state_repo_not_the_callback_channel` (a hostile
 repo on the callback channel is ignored; the signed state's repo is what GitHub
 is queried for) and its fail-closed siblings.

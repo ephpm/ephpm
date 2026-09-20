@@ -10983,9 +10983,18 @@ echo "post response";
     /// property here is that the passive global issuer and the per-site verifier
     /// **coexist** — public open, private gated — on one router.
     ///
-    /// Like the dlopen suite (`tests/middleware_dlopen.rs`) this NEVER skips: an
-    /// absent cdylib is a build-wiring regression, so it hard-fails with the
-    /// build command rather than passing silently.
+    /// The `github-auth` issuer now lives in its own repository
+    /// (`github.com/ephpm/middleware-github-auth`) and is no longer built by
+    /// this workspace, so this test dlopens a **provided** cdylib rather than
+    /// one it can build itself. Point it at the module (the external repo's
+    /// `github-auth.linux-x86_64.so` release asset, or a local
+    /// `cargo build -p ephpm-middleware-github-auth --lib`) with the
+    /// `EPHPM_GITHUB_AUTH_CDYLIB` env var; the coordinated release/preview CI
+    /// sets it. When it is unset the test **skips loudly** — the ePHPm-side
+    /// composition it guards (passive global issuer + per-site verifier) can
+    /// only be exercised end to end with the real module present, and coupling
+    /// the default core build to fetching an out-of-tree repo is exactly what
+    /// the extraction avoids.
     #[tokio::test]
     async fn passive_issuer_and_per_site_verifier_compose_public_open_private_gated() {
         use ephpm_middleware_builtins::preview_gate::mint_share_token;
@@ -10996,26 +11005,27 @@ echo "post response";
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        // Locate the built `github-auth` cdylib in the profile dir, derived from
-        // this test binary's own path (`<target>/<profile>/deps/<name>` →
-        // `<target>/<profile>/<lib>`), so it is correct under a custom target
-        // dir, `--release`, and `--target <triple>` alike.
-        let dll = format!(
-            "{}github_auth.{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_EXTENSION
-        );
-        let exe = std::env::current_exe().expect("test binary has a path");
-        let profile_dir = exe
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("test binary lives at <target>/<profile>/deps/<name>");
-        let built = profile_dir.join(&dll);
+        // The github-auth cdylib is supplied out-of-band (see the doc comment):
+        // the crate moved to github.com/ephpm/middleware-github-auth and is not
+        // built by this workspace. `EPHPM_GITHUB_AUTH_CDYLIB` names the module
+        // file; absent → skip loudly (this composition needs the real issuer).
+        let Some(built) = std::env::var_os("EPHPM_GITHUB_AUTH_CDYLIB").map(PathBuf::from) else {
+            eprintln!(
+                "SKIP passive_issuer_and_per_site_verifier_compose_*: set \
+                 EPHPM_GITHUB_AUTH_CDYLIB to the github-auth module \
+                 (github.com/ephpm/middleware-github-auth release asset \
+                 `github-auth.linux-x86_64.so`, or a local \
+                 `cargo build -p ephpm-middleware-github-auth --lib`) to run it."
+            );
+            return;
+        };
+        let dll = built
+            .file_name()
+            .map_or_else(|| "github_auth".to_string(), |n| n.to_string_lossy().into_owned());
         assert!(
             built.is_file(),
-            "github-auth cdylib `{dll}` is missing at {} — this composition test dlopens the \
-             real issuer. Build it first with `cargo build -p ephpm-middleware-github-auth --lib` \
-             (CI's pre-test step, `cargo build --workspace --lib --examples`, already does).",
+            "EPHPM_GITHUB_AUTH_CDYLIB points at {} but no file is there — it must name the \
+             github-auth cdylib this composition test dlopens.",
             built.display()
         );
         // Stage a private copy: `declare!` keeps a module's config/host table in
