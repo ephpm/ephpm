@@ -198,10 +198,10 @@ engine:                    # Planned: not yet implemented — parsed but not
 
 analyzers:
   enable: null             # explicit analyzer list; null = use the profile.
-                           # Unknown ids are a hard error. Opt-in extras
-                           # (never enabled by a profile): phpstan,
-                           # obfuscation-scan, opcode-scan / php-lint (the last
-                           # two need a PHP-linked build).
+                           # Unknown ids are a hard error. The 15 opt-in
+                           # analyzers (never enabled by a profile) are listed
+                           # in the Analyzers table above; opcode-scan and
+                           # php-lint additionally need a PHP-linked build.
   required: []             # analyzers that MUST produce a result: a skip
                            # (tool absent) of a required analyzer gates like a
                            # failure. Must be a subset of the enabled set.
