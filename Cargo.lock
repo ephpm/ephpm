@@ -1893,6 +1893,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc 0.2.189",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1900,13 +1910,14 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flate2"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "libz-sys",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3426,9 +3437,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
@@ -5419,6 +5430,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc 0.2.189",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6317,12 +6338,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivacity"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f33878b48fc40259f9afdc09888423157fc5aeac3cd9f819da4022eaedbefcfd"
+checksum = "bdcf803dbe5b8e7f8d8b708d6c2d1f1eaee418833f211192d94fe839f5181e8e"
 dependencies = [
  "anyhow",
  "clap",
+ "md-5 0.10.6",
  "serde_json",
  "tokio",
  "vivacity-autoload",
@@ -6332,9 +6354,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-autoload"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9249e7df762d4cab2dadf6dac5cf0a97497205449be756b1b77dd7b34929eaee"
+checksum = "8374ae1cc0ffa6daf55b02ac672f82638d85200fa879dc0ca13ce55a68e7b698"
 dependencies = [
  "md-5 0.10.6",
  "memchr",
@@ -6349,13 +6371,14 @@ dependencies = [
 
 [[package]]
 name = "vivacity-core"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdf2915d52d879d5c4e3641349ef3b17c15d048f3592e48c9c778b621cdcca57"
+checksum = "7886297f62aa27aa0d56af8082bd669b1d2df0ba36da98b1e6b879b7d5a67d46"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
  "bzip2",
+ "flate2",
  "hex",
  "libc 1.0.0-alpha.4",
  "md-5 0.10.6",
@@ -6364,6 +6387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6373,9 +6397,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3c7f5806153ad89379750fe75d2950d3f69100a818c98df2f0a06729364418"
+checksum = "69e18faf698e1a0854cffab606ebe64ee30af4b59ed1bad61550304e6b0fba0b"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6384,9 +6408,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2-sys"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec91e3fa861379184697040a0870508e66b095432a01e5c9741ca6ff33a95ca"
+checksum = "f456f19c15a9e47c24280d3717cf3575fad898bb938fcf14f5ddd72bb4dcb783"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6394,9 +6418,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-resolver"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24e5e8093be68154f7611f16a15dea279d2b723fdeea5f0667f7e0e2c2b8fb36"
+checksum = "4ab628e9af4d00614c234c24fdbc9323cf7601cb4634edf8d11e0ab7da002ed7"
 dependencies = [
  "serde",
  "serde_json",
@@ -7269,6 +7293,12 @@ dependencies = [
  "zeroize",
  "zopfli",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
