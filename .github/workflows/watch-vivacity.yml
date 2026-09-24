@@ -1,0 +1,169 @@
+name: Vivacity Pin Watch
+
+# Opens a pin-bump PR when crates.io publishes a newer stable `vivacity` than
+# the exact pin in the workspace Cargo.toml. Auto-PR ONLY — review and merge
+# stay manual, on purpose (see the linking checklist in the PR body).
+#
+# Why a PR and not an issue (unlike turso-pin-watch.yml): vivacity is a direct
+# crates.io dependency ePHPm fully controls — a bump is a one-repo, one-line
+# change plus `cargo update`, so the job can prepare it. turso can't be bumped
+# unilaterally (litewire chooses it), which is why that watcher only files an
+# issue.
+#
+# Why review is never skipped: the pin is EXACT (`=X.Y.Z`) because vivacity is
+# linked into the PHP-embedded binary, where a new transitive C dependency
+# would collide with libphp's bundled bzip2/xz/zstd/zlib or PCRE2 at link time
+# (ephpm/ephpm#523), and a second rustls crypto provider would break the
+# single-aws-lc-rs invariant. The bot cannot vouch for those properties, so it
+# surfaces the `cargo update` crate delta in the PR body and hands the linking
+# checklist — and the hand-written pin comment — to a human.
+#
+# Idempotent by construction: one marker branch per target version
+# (`bump/vivacity-<ver>`). A run whose branch or open PR already exists is a
+# no-op. Same shape as sdk-bump.yml.
+#
+# Token note: the default GITHUB_TOKEN can push branches and open PRs here, but
+# PRs it opens do NOT trigger CI (GitHub's recursion guard). Close/reopen the
+# PR or push an empty commit to get a run — or set a PAT/App-token secret and
+# swap it in below.
+
+on:
+  schedule:
+    # Daily, 07:27 UTC — vivacity ships almost daily; offset well clear of
+    # sdk-bump (05:41) and the nightly job.
+    - cron: "27 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact vivacity version to bump to (e.g. 0.18.0). Empty = latest stable on crates.io."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: watch-vivacity
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump the vivacity pin when crates.io is ahead
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPLICIT_VERSION: ${{ inputs.version || '' }}
+          # crates.io rejects requests without a descriptive User-Agent.
+          UA: "ephpm-vivacity-pin-watch (+https://github.com/ephpm/ephpm)"
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ── 1. Target version: explicit input, or latest stable ──────────
+          if [ -n "$EXPLICIT_VERSION" ]; then
+            latest="$EXPLICIT_VERSION"
+          else
+            api=$(curl -fsSL --retry 3 --retry-delay 5 \
+                    -H "User-Agent: $UA" \
+                    https://crates.io/api/v1/crates/vivacity) \
+              || fail "crates.io query failed"
+            latest=$(jq -r '.crate.max_stable_version // empty' <<<"$api")
+          fi
+          [ -n "$latest" ] || fail "no target version resolved"
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$latest" \
+            || fail "target version is not a plain semver: '$latest'"
+
+          # ── 2. Current exact pin in the workspace Cargo.toml ─────────────
+          # Matches `vivacity = { version = "=X.Y.Z"` at line start, tolerating
+          # whitespace and the leading `=` of the exact pin.
+          current=$(sed -nE \
+            's/^[[:space:]]*vivacity[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*"=?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' \
+            Cargo.toml | head -1)
+          [ -n "$current" ] || fail "could not parse the vivacity pin from Cargo.toml"
+
+          echo "pinned=$current latest=$latest"
+
+          # ── 3. Newer? (`sort -V`: highest last; never downgrade) ─────────
+          if [ "$current" = "$latest" ] \
+             || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" != "$latest" ]; then
+            echo "vivacity pin $current is up to date (target: $latest)"
+            exit 0
+          fi
+          echo "::notice::vivacity $latest is newer than the pinned $current"
+
+          # ── 4. Marker-branch idempotency (one branch per version) ────────
+          branch="bump/vivacity-${latest}"
+          if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq length)" != "0" ]; then
+            echo "open PR from ${branch} already exists — nothing to do"; exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "branch ${branch} already exists on origin — nothing to do"; exit 0
+          fi
+
+          # ── 5. Bump the pin line + refresh the lock ──────────────────────
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch" origin/main
+
+          # Bump only the version inside the vivacity pin, keeping the exact-pin
+          # `=` prefix and every other field on the line untouched.
+          sed -i -E \
+            's/^([[:space:]]*vivacity[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*")=?[0-9]+\.[0-9]+\.[0-9]+(".*)/\1='"${latest}"'\2/' \
+            Cargo.toml
+          grep -q "\"=${latest}\"" Cargo.toml || fail "sed did not update the pin to =${latest}"
+
+          # Capture the crate delta — this is exactly what a human must vet for
+          # a new (transitive) C dependency before merging.
+          delta=$(cargo update -p vivacity 2>&1) || fail "cargo update -p vivacity failed"
+          echo "$delta"
+
+          git add Cargo.toml Cargo.lock
+          git commit -q -m "build(deps): bump vivacity ${current} -> ${latest}" \
+            || fail "nothing to commit — pin already at ${latest}?"
+          git push origin "$branch" || fail "pushing ${branch} failed"
+
+          # ── 6. Open the review PR ────────────────────────────────────────
+          body_file=$(mktemp)
+          {
+            echo "Automated pin bump: **vivacity \`${current}\` → \`${latest}\`**."
+            echo
+            echo "- Changelog: https://github.com/Adelagric/vivacity/compare/v${current}...v${latest}"
+            echo "- Release: https://github.com/Adelagric/vivacity/releases/tag/v${latest}"
+            echo
+            echo "\`cargo update -p vivacity\` crate delta (vet each **new** crate for a C dependency):"
+            echo '```'
+            echo "$delta"
+            echo '```'
+            echo
+            echo "### Linking review — required before merge"
+            echo "The pin is exact because vivacity links into the PHP-embedded binary."
+            echo "Confirm, against the delta above:"
+            echo "- [ ] No new \`*-sys\` / C-linking crate that would collide with libphp's"
+            echo "      bundled **bzip2 / xz / zstd / zlib** or **PCRE2** (a pure-Rust add"
+            echo "      such as \`zlib-rs\` is fine; \`libz-sys\`/\`libz-rs-sys\` is not)."
+            echo "- [ ] Still exactly one rustls crypto provider (aws-lc-rs via"
+            echo "      \`rustls-tls-no-provider\`) — no \`ring\` pulled in."
+            echo "- [ ] \`vivacity::run()\` embed entry point unchanged (no API break)."
+            echo "- [ ] The hand-written pin comment above the dependency in"
+            echo "      \`Cargo.toml\` updated to describe this version."
+            echo "- [ ] Full CI green (fmt / clippy / test / cargo-deny)."
+            echo
+            echo "<sub>Opened by \`.github/workflows/watch-vivacity.yml\`. Auto-PR only —"
+            echo "merge is manual. PRs opened with the default GITHUB_TOKEN do not trigger"
+            echo "CI; close/reopen or push to the branch to get a run.</sub>"
+          } > "$body_file"
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --title "build(deps): bump vivacity ${current} -> ${latest}" \
+            --body-file "$body_file" \
+            || fail "opening PR for ${branch} failed"
+          echo "::notice::opened bump PR for vivacity ${latest}"
