@@ -220,6 +220,15 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
+# litewire @ ee6fc12771a4 — SECURITY (RUSTSEC-2026-0285): litewire patches
+# opensrv-mysql at the aws-lc-rs fork on rustls >= 0.23.45 (litewire#42). Because
+# a [patch] does not propagate through a git dependency, ePHPm ALSO declares that
+# patch in its own root (see [patch.crates-io] at the end of this file) — the
+# litewire bump alone would not move opensrv-mysql off rustls 0.22 here. Also
+# drags in litewire#39 (docs) and litewire#40 (a TDS clippy fix); no dep or API
+# change beyond the opensrv patch. NOTE: this rev is the head of the (unmerged)
+# litewire fix branch — repin to the squash-merge commit once litewire#42 lands.
+#
 # litewire @ e2ea25b45ce7 — PERF: the MySQL command filter now hands
 # opensrv-mysql a whole command packet per `poll_read` (litewire#37, ePHPm #322).
 #
@@ -415,7 +424,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e2ea25b45ce7", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "ee6fc12771a4254e26c757a9486dbc6548091280", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.2)
@@ -491,3 +500,15 @@ unnecessary_cast = "allow"
 unused_async = "allow"
 unused_self = "allow"
 used_underscore_binding = "allow"
+
+# SECURITY (RUSTSEC-2026-0285): the litewire dependency (above) transitively
+# pulls opensrv-mysql 0.7.0 from crates.io, whose tokio-rustls 0.25 -> rustls
+# 0.22 is affected. litewire's own [patch] that redirects opensrv-mysql at the
+# ePHPm fork is NOT honoured here — cargo reads [patch] only from the workspace
+# root, never from a git dependency's manifest. So the same patch must be
+# declared here for ePHPm's own resolution. The fork's sole change is
+# tokio-rustls 0.25 -> 0.26 (rustls >= 0.23.45) pinned to aws-lc-rs (#241: never
+# `ring`); the tls/auth feature (#32) is byte-for-byte upstream 0.7.0. Retire
+# this when a fixed opensrv-mysql ships on crates.io.
+[patch.crates-io]
+opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
