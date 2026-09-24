@@ -433,13 +433,19 @@ turso = { version = "=0.7.2", default-features = false }
 # Like 0.11.1, 0.15.0 keeps the C decompression libs (bzip2-sys/xz2/zstd-sys)
 # out of `zip` in favor of pure-Rust backends, so this PHP-linked binary no
 # longer collides with libphp's bundled bzip2/xz/zstd at link time
-# (ephpm/ephpm#523). 0.12–0.15 are feature/perf releases on the same pure-Rust
-# dist-extraction + prefixed-PCRE2 linking surface as 0.11.1: 0.12 emulates
-# wikimedia/composer-merge-plugin, 0.13 adds `--run-scripts`, 0.14 makes
-# `install --no-plugins` native for any lock, and 0.15 is a perf release
-# (no-op install ~160→~50 ms, 2× faster autoloader dump, byte-identical output).
-# The only linking-side delta is memchr → 2.8.3 (pure Rust, no C symbols).
-vivacity = { version = "=0.15.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# (ephpm/ephpm#523). 0.12–0.17 are feature/perf/parity releases on the same
+# pure-Rust dist-extraction + prefixed-PCRE2 linking surface as 0.11.1: 0.12
+# emulates wikimedia/composer-merge-plugin, 0.13 adds `--run-scripts`, 0.14
+# makes `install --no-plugins` native for any lock, 0.15 is a perf release
+# (no-op install ~160→~50 ms, 2× faster autoloader dump), 0.16 makes the
+# class-map scan follow readdir order like Composer's Finder (ambiguous-class
+# winner + warning wording byte-match Composer), and 0.17 emulates more
+# Composer plugins (symfony/flex, composer-merge-plugin resolution, WordPress
+# core-installer, custom-directory installers) and hands `update`/`require`/
+# `remove` over to real Composer when an installed plugin changes resolution.
+# All keep byte-identical output. The only linking-side delta across the range
+# is memchr → 2.8.3 (pure Rust, no C symbols); no version adds a new C dep.
+vivacity = { version = "=0.17.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
