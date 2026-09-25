@@ -445,7 +445,7 @@ turso = { version = "=0.7.2", default-features = false }
 # `remove` over to real Composer when an installed plugin changes resolution.
 # All keep byte-identical output. The only linking-side delta across the range
 # is memchr → 2.8.3 (pure Rust, no C symbols); no version adds a new C dep.
-vivacity = { version = "=0.17.0", default-features = false, features = ["rustls-tls-no-provider"] }
+vivacity = { version = "=0.18.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
