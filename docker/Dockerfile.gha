@@ -112,24 +112,33 @@ RUN dnf config-manager --add-repo https://download.docker.com/linux/centos/docke
     && dnf install -y docker-ce-cli docker-compose-plugin docker-buildx-plugin \
     && dnf clean all
 
-# ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
+# ── Rust (pinned channel) + stable + nightly (for fmt only) ──────────────────
 #
-# The stable component set MUST be a superset of rust-toolchain.toml's
-# `components` (rustfmt, clippy, llvm-tools-preview). If any are missing,
-# rustup triggers a channel sync on first `cargo` invocation in the repo —
-# and that sync's atomic component rename fails EXDEV on the CI runner's
-# overlay (rustup tmp/ and toolchains/ land on different devices).
+# The image MUST already hold the exact channel rust-toolchain.toml names,
+# with a superset of its `components` (rustfmt, clippy, llvm-tools-preview).
+# If not, rustup triggers a channel sync on first `cargo` invocation in the
+# repo — and that sync's atomic component rename fails EXDEV on the CI
+# runner's overlay (rustup tmp/ and toolchains/ land on different devices).
+# So the channel is read from the repo's rust-toolchain.toml (ci-image.yml
+# rebuilds this image whenever that file changes). `stable` is installed too
+# so building an older tag whose toolchain file still says `stable` works.
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 
-# Releases target the host-default gnu triple, which ships with the stable
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+
+# Releases target the host-default gnu triple, which ships with every
 # toolchain — no `rustup target add` needed. This Dockerfile is built once
 # per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 -> :latest-arm64), each
 # natively on its own runner pulling the arch-matching almalinux:8 manifest.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal \
+RUN channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' /tmp/rust-toolchain.toml) \
+    && test -n "$channel" \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "$channel" --profile minimal \
+        --component rustfmt,clippy,llvm-tools-preview \
+    && rustup toolchain install stable --profile minimal \
         --component rustfmt,clippy,llvm-tools-preview \
     && rustup toolchain install nightly --component rustfmt \
     && cargo install cargo-nextest --locked \
