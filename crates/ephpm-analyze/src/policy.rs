@@ -254,7 +254,7 @@ mod tests {
         let d = decide(&[], &params(&[], &[]));
         assert_eq!(d.verdict, Verdict::Allow);
         assert_eq!(d.score, 0);
-        assert!(d.reasons.is_empty());
+        assert!(d.reasons.is_empty(), "{:?}", d.reasons);
     }
 
     #[test]

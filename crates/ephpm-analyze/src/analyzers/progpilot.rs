@@ -248,7 +248,8 @@ mod tests {
 
     #[test]
     fn empty_array_means_no_findings() {
-        assert!(parse_progpilot("[]", Path::new("/r")).unwrap().is_empty());
+        let found = parse_progpilot("[]", Path::new("/r")).unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

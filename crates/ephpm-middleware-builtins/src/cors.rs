@@ -177,7 +177,7 @@ mod tests {
         let mw = cors(serde_json::json!({ "allow_origins": ["*"] }));
         let resp = invoke(&mw, "GET", &[]);
         assert_eq!(resp.__action(), ACTION_CONTINUE);
-        assert!(resp.__response_headers().is_empty());
+        assert_eq!(resp.__response_headers(), []);
     }
 
     #[test]
@@ -185,7 +185,7 @@ mod tests {
         let mw = cors(serde_json::json!({ "allow_origins": ["https://good.test"] }));
         let resp = invoke(&mw, "GET", &[hdr("Origin", "https://evil.test")]);
         assert_eq!(resp.__action(), ACTION_CONTINUE);
-        assert!(resp.__response_headers().is_empty());
+        assert_eq!(resp.__response_headers(), []);
     }
 
     #[test]

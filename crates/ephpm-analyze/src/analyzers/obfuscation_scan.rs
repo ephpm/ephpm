@@ -564,7 +564,7 @@ mod tests {
         let src =
             format!("<?php\n{};\n", call(&eval_name(), &call("base64_decode", "$_POST['c']")));
         let findings = scan(&src);
-        assert!(!findings.is_empty());
+        assert!(!findings.is_empty(), "expected at least one finding");
         assert!(
             findings
                 .iter()

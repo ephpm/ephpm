@@ -1895,6 +1895,10 @@ impl Store {
         // (rejecting every write under NoEviction, eviction-spinning under LRU)
         // until restart. Flooring at 0 turns that catastrophe into a harmless,
         // self-correcting slight undercount.
+        #[allow(
+            deprecated,
+            reason = "`try_update` (the rename) postdates our MSRV 1.88; switch when MSRV allows"
+        )]
         let _ = self
             .mem_used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)));

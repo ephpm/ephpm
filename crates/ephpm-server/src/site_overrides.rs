@@ -1428,7 +1428,7 @@ mod tests {
     fn a_file_with_no_unknown_keys_reports_none() {
         let f = fixture();
         f.write("document_root = \"web\"\n");
-        assert!(f.load().unknown_keys.is_empty());
+        assert_eq!(f.load().unknown_keys, Vec::<String>::new());
     }
 
     #[test]

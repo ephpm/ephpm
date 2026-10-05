@@ -142,7 +142,7 @@ fn dynamic_module_loads_and_round_trips_request_context() {
     match chain.evaluate(&ctx, "/app/index.php") {
         ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
             assert!(rewrite_path.is_none());
-            assert!(header_overrides.is_empty());
+            assert_eq!(header_overrides, Vec::<(String, String)>::new());
             // Config reached the module's `init`.
             assert_eq!(find(&response_headers, "X-Probe-Tag"), Some("fixture-alpha"));
             // Every request accessor on the host table, across the boundary.
