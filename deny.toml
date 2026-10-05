@@ -5,32 +5,20 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rustls-pemfile unmaintained — transitive dep, awaiting upstream migration
     "RUSTSEC-2025-0134",
-    # rustls-webpki cert-verification vulns — after bumping our own TLS stack
-    # to rustls-webpki 0.103.13, these now match ONLY the old 0.102.8 still
-    # pulled via opensrv-mysql 0.7.0 (latest) -> tokio-rustls 0.25 ->
-    # rustls 0.22, a litewire transitive dep. opensrv-mysql uses rustls only
-    # for server-side MySQL TLS, which does not exercise the name-constraint /
-    # CRL verification paths these advisories concern. Drop once opensrv-mysql
-    # moves to rustls 0.23 (or litewire replaces it).
-    "RUSTSEC-2026-0049",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
     # proc-macro-error2 unmaintained — pulled transitively by
     # mysql-common-derive -> mysql_common -> mysql_async / opensrv-mysql.
     # Compile-time-only (proc macro), no runtime exposure. Awaiting
     # upstream migration to manyhow / proc-macro2-diagnostics.
     "RUSTSEC-2026-0173",
-    # rustls TLS 1.3 handshake messages accepted at the wrong encryption
-    # level. Low severity: the handshake transcript stays authenticated, so a
-    # network attacker cannot alter or complete a handshake (upstream's own
-    # assessment) — the practical effect is that certain handshake messages
-    # could be sent in plaintext. The fix is rustls >= 0.23.45, which requires
-    # a Rust newer than our MSRV 1.88 (force-pinned by the litewire dep), so
-    # our own stack is capped at 0.23.43; opensrv-mysql's transitive 0.22.4
-    # cannot move either. Drop once litewire raises MSRV (letting us reach
-    # 0.23.45) and opensrv-mysql moves off rustls 0.22.
-    "RUSTSEC-2026-0285",
+    # RESOLVED (do not re-add): RUSTSEC-2026-0285 (rustls TLS 1.3 handshake at
+    # the wrong encryption level) and the rustls-webpki advisories 0049 / 0098 /
+    # 0099 / 0104 are now fixed at the source, not ignored. opensrv-mysql is
+    # patched to the aws-lc-rs fork on rustls >= 0.23.45 ([patch.crates-io] in
+    # Cargo.toml), which removes rustls 0.22.4 and rustls-webpki 0.102.8 from the
+    # graph and moves our own rustls line to 0.23.45. (The earlier "0.23.45 needs
+    # a Rust newer than MSRV 1.88" note was wrong: rustls 0.23.45, tokio-rustls
+    # 0.26, aws-lc-rs 1.18 and rustls-webpki 0.103.15 all declare rust-version
+    # 1.71.) `cargo deny check advisories` matches none of these five.
 ]
 
 [licenses]
@@ -62,4 +50,9 @@ wildcards = "allow"
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/ephpm/litewire.git"]
+allow-git = [
+    "https://github.com/ephpm/litewire.git",
+    # ePHPm fork of opensrv-mysql 0.7.0 (RUSTSEC-2026-0285 fix; see
+    # [patch.crates-io] in Cargo.toml). Remove when it returns to a crates.io source.
+    "https://github.com/ephpm/opensrv-mysql.git",
+]
