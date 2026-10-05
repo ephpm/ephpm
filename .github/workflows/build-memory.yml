@@ -64,16 +64,32 @@ jobs:
     name: Peak memory (linux-aarch64)
     if: inputs.targets == 'both' || inputs.targets == 'linux-arm64'
     runs-on: [self-hosted, linux, arm64]
-    container: "ephpm/ephpm-ci:latest-arm64"
+    # De-containerized for node24: GitHub runs JS actions (checkout) on node24,
+    # which cannot start on the ephpm-ci image's glibc 2.28 (almalinux8); in a
+    # `container:` job they silently no-op (empty checkout). So checkout runs on
+    # the bare host and the measured build runs in ephpm-ci via `docker run` --
+    # which also keeps the cgroup memory.peak scoped to the build container.
+    # See release.yml's header for the full node24 rationale.
     steps:
       - uses: actions/checkout@v4
 
       - name: Build under measurement
-        env:
-          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.lto }}
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.codegen_units }}
-          PHP_MINOR: ${{ inputs.php_minor }}
+        # The measured build MUST run inside ephpm-ci -- that is what is being
+        # measured, and it holds the glibc 2.28 floor. The whole measurement
+        # script (cgroup memory.peak + `/usr/bin/time -v` around the cargo
+        # build) runs in ONE `docker run`, so the cgroup it reads is the build
+        # container's own. The former step `env:` values are passed as -e
+        # (EPHPM_RELEASE_VERSION is the workflow-level env). The script is fed on
+        # stdin via `bash -s` + a quoted heredoc because it contains
+        # single-quoted awk that a `sh -euc '...'` wrapper could not carry.
         run: |
+          docker run --rm -i -v "$PWD":/w -w /w \
+            -e CARGO_PROFILE_RELEASE_LTO="${{ inputs.lto }}" \
+            -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${{ inputs.codegen_units }}" \
+            -e PHP_MINOR="${{ inputs.php_minor }}" \
+            -e EPHPM_RELEASE_VERSION \
+            ephpm/ephpm-ci:latest-arm64 \
+            bash -euo pipefail -s <<'MEASURE'
           set -eu
 
           echo "=== configuration ==="
@@ -134,6 +150,7 @@ jobs:
               echo "max_single_proc_gib = $(awk -v k="${kb}" 'BEGIN{printf "%.2f", k/1048576}')"
             fi
           fi
+          MEASURE
 
   windows:
     name: Peak memory (windows-x86_64)
