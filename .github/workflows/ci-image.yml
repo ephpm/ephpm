@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - "docker/Dockerfile.gha"
+      # The image bakes in the channel this file pins (see Dockerfile.gha).
+      - "rust-toolchain.toml"
   workflow_dispatch:
 
 env:

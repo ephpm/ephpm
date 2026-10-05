@@ -110,8 +110,17 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 # The gnu target is the host default — no extra rustup target or cross
 # toolchain needed (the musl-era CC_*/LINKER plumbing is gone with it).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+#
+# Install exactly the channel + components rust-toolchain.toml pins: the
+# builder stage copies that file in with the source, and a mismatch makes
+# rustup sync a second toolchain mid-build (and fail EXDEV on overlay — see
+# Dockerfile.gha). Keep the component list in sync with that file.
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' /tmp/rust-toolchain.toml) \
+    && test -n "$channel" \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "$channel" --profile minimal \
+        --component rustfmt,clippy,llvm-tools-preview
 
 # ── Stage 2: deps — workspace manifests + stub sources + `cargo fetch` ───────
 #
