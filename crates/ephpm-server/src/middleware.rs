@@ -1284,7 +1284,7 @@ mod tests {
         match chain.evaluate(&ctx, "/index.php") {
             ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
                 assert!(rewrite_path.is_none());
-                assert!(header_overrides.is_empty());
+                assert_eq!(header_overrides, Vec::<(String, String)>::new());
                 assert_eq!(
                     find_header(&response_headers, "Content-Security-Policy"),
                     Some("default-src 'self'")
@@ -1336,7 +1336,7 @@ mod tests {
         match chain.evaluate(&ctx, "/api/x.php") {
             ChainVerdict::Respond { status, body, headers } => {
                 assert_eq!(status, 204);
-                assert!(body.is_empty());
+                assert_eq!(body, Vec::<u8>::new());
                 assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
                 assert_eq!(find_header(&headers, "Access-Control-Max-Age"), Some("600"));
             }
@@ -1425,8 +1425,8 @@ mod tests {
         match chain.evaluate(&ctx, "/x.php") {
             ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
                 assert!(rewrite_path.is_none());
-                assert!(header_overrides.is_empty());
-                assert!(response_headers.is_empty());
+                assert_eq!(header_overrides, Vec::<(String, String)>::new());
+                assert_eq!(response_headers, Vec::<(String, String)>::new());
             }
             ChainVerdict::Respond { status, .. } => {
                 panic!("a php: mount must not produce a native verdict (got {status})")
@@ -1635,7 +1635,7 @@ mod tests {
         match chain.evaluate(&ctx, "/index.php") {
             ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
                 assert!(rewrite_path.is_none());
-                assert!(header_overrides.is_empty());
+                assert_eq!(header_overrides, Vec::<(String, String)>::new());
                 let find = |name: &str| {
                     response_headers
                         .iter()
@@ -1690,7 +1690,7 @@ mod tests {
         match chain.evaluate(&ctx, "/api/x.php") {
             ChainVerdict::Respond { status, body, headers } => {
                 assert_eq!(status, 204);
-                assert!(body.is_empty());
+                assert_eq!(body, Vec::<u8>::new());
                 assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
                 assert_eq!(find_header(&headers, "Access-Control-Max-Age"), Some("600"));
             }

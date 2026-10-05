@@ -266,7 +266,8 @@ mod tests {
             r#"{"totals": {"errors": 0, "file_errors": 0}, "files": {}, "errors": []}"#,
         )
         .unwrap();
-        assert!(parse_phpstan_json(&doc).unwrap().is_empty());
+        let found = parse_phpstan_json(&doc).unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

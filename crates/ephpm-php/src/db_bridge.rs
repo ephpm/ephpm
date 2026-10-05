@@ -344,6 +344,10 @@ pub trait SiteBackendResolver: Send + Sync {
 /// legal for the same reason the rest of the bridge's `block_on`s are (PHP FFI
 /// callbacks run on PHP execution OS threads, never async tasks — see the
 /// module docs, `Async boundary`).
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[litewire::async_trait]
 pub trait RemoteBackend: Send + Sync {
     /// Run `sql` with the bound `params` against the remote server and return
@@ -2180,7 +2184,7 @@ mod tests {
             let (code, sqlstate, msg) = e.expect("error must be staged");
             assert_eq!(code, ER_PARSE_ERROR);
             assert_eq!(sqlstate, b"42000");
-            assert!(!msg.is_empty());
+            assert_ne!(msg, "");
         });
         finish();
     }

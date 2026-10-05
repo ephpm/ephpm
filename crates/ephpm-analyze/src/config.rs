@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(cfg.policy.deny_score, 50);
         assert!(cfg.cache.enabled);
         assert_eq!(cfg.cache.dir, None);
-        assert!(cfg.suppress.is_empty());
+        assert!(cfg.suppress.is_empty(), "{:?}", cfg.suppress);
         assert_eq!(
             cfg.enabled_analyzers(),
             vec![
@@ -743,7 +743,8 @@ suppress:
     #[test]
     fn none_profile_enables_nothing() {
         let cfg = AnalyzeConfig::from_yaml("profile: none").unwrap();
-        assert!(cfg.enabled_analyzers().is_empty());
+        let found = cfg.enabled_analyzers();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

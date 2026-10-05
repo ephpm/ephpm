@@ -250,7 +250,8 @@ mod tests {
             r#"{"totals": {"changed_files": 0, "errors": 0}, "file_diffs": []}"#,
         )
         .unwrap();
-        assert!(parse_rector_json(&doc, Path::new("/r")).unwrap().is_empty());
+        let found = parse_rector_json(&doc, Path::new("/r")).unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

@@ -153,6 +153,7 @@ mod tests {
 
     #[test]
     fn empty_output_means_no_matches() {
-        assert!(parse_matches("", std::path::Path::new("/r")).is_empty());
+        let found = parse_matches("", std::path::Path::new("/r"));
+        assert!(found.is_empty(), "{found:?}");
     }
 }

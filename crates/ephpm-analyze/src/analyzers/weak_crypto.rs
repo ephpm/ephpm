@@ -479,7 +479,7 @@ mod tests {
             "<?php\ncurl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);\n$h = md5($p);\n\
              $m = MCRYPT_MODE_ECB;\n$out = mcrypt_encrypt($a, $b, $c, $m);\n$n = rand();\n",
         );
-        assert!(!findings.is_empty());
+        assert!(!findings.is_empty(), "expected at least one finding");
         assert!(
             findings
                 .iter()
@@ -489,6 +489,7 @@ mod tests {
 
     #[test]
     fn empty_input_yields_nothing() {
-        assert!(scan("").is_empty());
+        let found = scan("");
+        assert!(found.is_empty(), "{found:?}");
     }
 }

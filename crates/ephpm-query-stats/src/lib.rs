@@ -655,7 +655,7 @@ mod tests {
         let id = digest::digest_id(&digest::normalize("SELECT * FROM users WHERE id = 42"));
         let entry = stats.entries.get(&id).unwrap();
         assert_eq!(entry.count, 50);
-        assert!(!entry.digest_label.is_empty());
+        assert_ne!(entry.digest_label, "");
     }
 
     #[test]

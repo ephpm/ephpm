@@ -193,6 +193,10 @@ struct Inner {
 /// [`ConnectionAuthenticator::authenticate`] runs on a tokio worker, so the
 /// bridge's synchronous `block_on` resolver would panic here. Implementations
 /// must be genuinely async.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[litewire::async_trait]
 pub trait SiteWireRoute: Send + Sync + 'static {
     /// The backend serving `site_key`, opening the site's database if this
@@ -640,7 +644,7 @@ mod tests {
             let pw = auth.password_for(user);
             assert!(auth.authenticate(&request(user, &client_response(&pw, SALT))).await.is_none());
         }
-        assert!(route.asked().is_empty());
+        assert_eq!(route.asked(), Vec::<String>::new());
     }
 
     /// A route failure fails the connection closed — never a fallback to some

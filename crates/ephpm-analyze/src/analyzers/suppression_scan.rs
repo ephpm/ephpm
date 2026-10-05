@@ -137,6 +137,7 @@ mod tests {
 
     #[test]
     fn clean_file_yields_nothing() {
-        assert!(scan("<?php\n// regular comment about ignoring nothing relevant\n").is_empty());
+        let found = scan("<?php\n// regular comment about ignoring nothing relevant\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 }

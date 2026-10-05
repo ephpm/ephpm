@@ -386,7 +386,8 @@ mod tests {
 
     #[test]
     fn no_scripts_block_yields_nothing() {
-        assert!(scan(r#"{"name": "acme/app", "require": {"php": "^8.3"}}"#).is_empty());
+        let found = scan(r#"{"name": "acme/app", "require": {"php": "^8.3"}}"#);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

@@ -244,7 +244,8 @@ mod tests {
     #[test]
     fn empty_files_means_no_findings() {
         let doc: Value = serde_json::from_str(r#"{"files": [], "errors": []}"#).unwrap();
-        assert!(parse_phpmd_json(&doc).unwrap().is_empty());
+        let found = parse_phpmd_json(&doc).unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn clean_tree_allows() {
     fs::write(dir.path().join("index.php"), "<?php\necho 'ok';\n").unwrap();
     let config = AnalyzeConfig::from_yaml("analyzers:\n  enable: [dangerous-sinks]").unwrap();
     let report = analyze(dir.path(), config).expect("analysis runs");
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings, Vec::<ephpm_analyze::Finding>::new());
     assert_eq!(report.verdict, Verdict::Allow);
 }
 
@@ -151,7 +151,7 @@ fn baseline_roundtrip_suppresses_known_findings_end_to_end() {
     config.baseline = Some(baseline_path);
     let report = analyze(dir.path(), config.clone()).expect("baselined run");
     assert_eq!(report.baseline_suppressed, 1);
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings, Vec::<ephpm_analyze::Finding>::new());
     assert_eq!(report.verdict, Verdict::Allow);
 
     // A NEW finding still gates through the baseline.
