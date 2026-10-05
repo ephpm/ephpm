@@ -884,7 +884,8 @@ mod tests {
             version: "1.2.4".to_owned(),
             path: Path::new("wp-content/plugins/example-plugin/example-plugin.php").to_path_buf(),
         }];
-        assert!(match_components(&components, &feed).is_empty());
+        let found = match_components(&components, &feed);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -896,7 +897,8 @@ mod tests {
             version: "1.0.0".to_owned(),
             path: Path::new("wp-content/plugins/some-other-plugin/x.php").to_path_buf(),
         }];
-        assert!(match_components(&components, &feed).is_empty());
+        let found = match_components(&components, &feed);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -909,7 +911,8 @@ mod tests {
             version: "1.2.0".to_owned(),
             path: Path::new("wp-content/themes/example-plugin/style.css").to_path_buf(),
         }];
-        assert!(match_components(&components, &feed).is_empty());
+        let found = match_components(&components, &feed);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     // ---- discovery / header parsing ----
@@ -1045,7 +1048,7 @@ mod tests {
         std::fs::write(dir.path().join("feed.json"), SAMPLE_FEED_JSON).unwrap();
         let ctx = AnalysisCtx::new(dir.path().to_path_buf(), config_with_feed(Some("feed.json")));
         let findings = WpVuln.run(&ctx).expect("non-WP tree is not an error");
-        assert!(findings.is_empty());
+        assert!(findings.is_empty(), "{:?}", findings);
     }
 
     #[test]

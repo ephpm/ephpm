@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(entry.size, 20);
         assert!(entry.content.is_some());
         assert_eq!(entry.mime, "text/css");
-        assert!(!entry.etag.is_empty());
+        assert_ne!(entry.etag, "");
     }
 
     #[test]

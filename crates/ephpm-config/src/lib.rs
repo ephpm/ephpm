@@ -7230,7 +7230,7 @@ idle_timeout_secs = 15
         // Single-node (clustering off) is never affected by the gate.
         let cfg = ClusterConfig::default();
         assert!(!cfg.enabled);
-        assert!(cfg.secret.is_empty());
+        assert_eq!(cfg.secret, "");
         assert!(cfg.ensure_secure().is_ok());
     }
 
@@ -8011,7 +8011,7 @@ extensions = ["redis", "/usr/lib/php/20240924/imagick.so"]
     #[test]
     fn test_php_extensions_default_empty() {
         let config = Config::default_config().unwrap();
-        assert!(config.php.extensions.is_empty());
+        assert_eq!(config.php.extensions, Vec::<String>::new());
         config.validate().expect("empty extension list should validate");
     }
 
@@ -8470,7 +8470,7 @@ path = "app.db"
             "the [db.sqlite.sqld] block is removed in v0.7.0 and absent by default"
         );
         assert_eq!(sqlite.replication.role, "auto");
-        assert!(sqlite.replication.primary_grpc_url.is_empty());
+        assert_eq!(sqlite.replication.primary_grpc_url, "");
         assert_eq!(sqlite.engine, "turso", "engine must default to \"turso\" (the only engine)");
         assert!(sqlite.dir.is_none(), "per-site `dir` must be absent by default (single-site)");
         assert_eq!(
@@ -9116,7 +9116,7 @@ multi_tenant_hardening = false
             "without preview, absent [server.limits] must resolve to all-off \
              (max_connections=0, per_ip*=0, per_site_rate=0, bursts 50/20)"
         );
-        assert!(config.server.preview_preset_applied().is_empty());
+        assert_eq!(config.server.preview_preset_applied(), Vec::<(&str, String)>::new());
 
         // The worst-case default check the knob checklist requires: the
         // no-preset resolution must not impose any limit.

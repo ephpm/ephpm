@@ -248,7 +248,8 @@ mod tests {
             r#"{"totals": {"errors": 0, "warnings": 0, "fixable": 0}, "files": {}}"#,
         )
         .unwrap();
-        assert!(parse_phpcs_json(&doc).is_empty());
+        let found = parse_phpcs_json(&doc);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

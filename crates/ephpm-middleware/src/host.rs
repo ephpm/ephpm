@@ -877,7 +877,7 @@ mod tests {
         assert_eq!(req.scheme(), "http");
         assert!(!req.is_secure());
         assert_eq!(req.http_host(), "");
-        assert!(req.body().is_empty());
+        assert_eq!(req.body(), b"");
     }
 
     /// Issue #390: the vhost accessor is a *tenant identity*, so "no tenant"

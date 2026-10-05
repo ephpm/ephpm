@@ -113,6 +113,10 @@ const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 /// the *same* `_acme-challenge.<domain>` name with different values, and both
 /// must be live simultaneously. `delete_txt` therefore takes the value so it
 /// can retract precisely the record it published.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[async_trait]
 pub trait DnsProvider: Send + Sync {
     /// Publish a `TXT` record at `fqdn` with the given `value`.

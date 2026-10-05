@@ -4095,7 +4095,7 @@ mod tests {
         assert_eq!(sites, vec!["blog.example.com".to_string(), "shop.example.com".to_string()]);
 
         // A missing directory yields an empty set, not an error.
-        assert!(scan_existing_sites(&dir.join("does-not-exist")).is_empty());
+        assert_eq!(scan_existing_sites(&dir.join("does-not-exist")), Vec::<String>::new());
     }
 
     #[test]

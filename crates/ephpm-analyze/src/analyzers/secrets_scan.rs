@@ -515,21 +515,26 @@ mod tests {
     fn generic_entropy_ignores_empty_and_placeholder() {
         // Empty string, short placeholder, and a non-secret-looking name must
         // not flag.
-        assert!(scan("<?php\n$password = '';\n").is_empty());
-        assert!(scan("<?php\n$apiKey = 'changeme';\n").is_empty());
-        assert!(scan("<?php\n$greeting = 'HelloThereFriend123!';\n").is_empty());
+        let found = scan("<?php\n$password = '';\n");
+        assert!(found.is_empty(), "{found:?}");
+        let found = scan("<?php\n$apiKey = 'changeme';\n");
+        assert!(found.is_empty(), "{found:?}");
+        let found = scan("<?php\n$greeting = 'HelloThereFriend123!';\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
     fn generic_entropy_ignores_low_entropy_long_value() {
         // ≥ 16 chars but repetitive → below the entropy floor.
-        assert!(scan("<?php\n$secret = 'aaaaaaaaaaaaaaaaaaaa';\n").is_empty());
+        let found = scan("<?php\n$secret = 'aaaaaaaaaaaaaaaaaaaa';\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
     fn generic_entropy_ignores_comparisons() {
         // `==` is a comparison, not an assignment of the literal.
-        assert!(scan("<?php\nif ($password == 'Xy7Kp2Lm9Qr4Vn8Bs3Wt6Zc') {}\n").is_empty());
+        let found = scan("<?php\nif ($password == 'Xy7Kp2Lm9Qr4Vn8Bs3Wt6Zc') {}\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -544,7 +549,9 @@ mod tests {
 
     #[test]
     fn empty_input_yields_nothing() {
-        assert!(scan("").is_empty());
-        assert!(scan("<?php\n$x = 1;\necho 'hello world, nothing secret here';\n").is_empty());
+        let found = scan("");
+        assert!(found.is_empty(), "{found:?}");
+        let found = scan("<?php\n$x = 1;\necho 'hello world, nothing secret here';\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 }

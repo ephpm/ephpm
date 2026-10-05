@@ -178,6 +178,7 @@ mod tests {
     #[test]
     fn clean_audit_yields_no_findings() {
         let json: Value = serde_json::from_str(r#"{"advisories": {}, "abandoned": {}}"#).unwrap();
-        assert!(parse_audit_json(&json).is_empty());
+        let found = parse_audit_json(&json);
+        assert!(found.is_empty(), "{found:?}");
     }
 }

@@ -325,7 +325,8 @@ mod tests {
     #[test]
     fn empty_tree_yields_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(run(dir.path(), AnalyzeConfig::default()).is_empty());
+        let found = run(dir.path(), AnalyzeConfig::default());
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

@@ -81,6 +81,10 @@ impl TokenBucket {
     /// empty. Concurrency-safe: refill is add-and-cap in one atomic update,
     /// and consumption is a compare-and-swap that refuses to wrap (see the
     /// comments inline — both were real bugs once).
+    #[allow(
+        deprecated,
+        reason = "`try_update` (the `fetch_update` rename) postdates our MSRV 1.88; switch when MSRV allows"
+    )]
     fn try_take(&self, now_ms: u64, rate: f64, burst_tokens: u64) -> bool {
         // Refill tokens based on elapsed time.
         let last_ms = self.last_refill_ms.load(Ordering::Relaxed);
