@@ -78,8 +78,8 @@ Edge cases worth knowing:
   an integer.
 - **Keys are C strings; values are binary-safe.** A key containing a NUL byte
   is truncated at the NUL (`"a\0b"` addresses the key `"a"`), and a key that
-  is not valid UTF-8 never matches anything: reads miss and writes return
-  `false`. Values may hold any bytes.
+  is not valid UTF-8 never matches anything: reads miss (`ttl`/`pttl` report
+  `-2`) and writes fail (`false`, or `0` from `del`). Values may hold any bytes.
 - **`ephpm_kv_flush_all()` is per-site in multi-tenant mode.** With
   `[server] sites_dir` set, it empties only the calling virtual host's
   keyspace, never another tenant's. In single-site mode it empties the whole

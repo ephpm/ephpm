@@ -829,7 +829,8 @@ This is the same approach FrankenPHP uses.
 > **Planned — not yet implemented.** The extension-suite model in this
 > section (`core` / `wordpress` / `laravel` / `full`, and the `-dev` variants
 > with Xdebug, PCOV and SPX compiled in) is a design, not what ships. Today's
-> releases are one archive per PHP minor and platform, named
+> releases are one archive per PHP minor and platform (plus an experimental
+> Windows TAILCALL build), named
 > `ephpm-vX.Y.Z+php<version>-<os>-<arch>.tar.gz` (see
 > `.github/workflows/release.yml`), all with the same statically linked
 > extension set. No build bundles Xdebug, PCOV or SPX; load them as shared

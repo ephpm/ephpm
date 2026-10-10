@@ -58,7 +58,7 @@ There is no `[session]` config block.
 
 ## Known issue: release the session explicitly {#known-issue}
 
-This applies to releases through v0.11.2.
+This applies to every current release (v0.11.2 and earlier). The fix is in progress ([#541](https://github.com/ephpm/ephpm/pull/541)) and has not shipped yet.
 
 In per-request mode (the default), releases up to and including v0.11.2
 write the session, and release its lock, during PHP's request teardown, and

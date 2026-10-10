@@ -149,8 +149,8 @@ In the order they appear in the generated file, so later lines win:
 5. `max_execution_time` — on builds with per-thread execution timers
    (not Windows).
 6. Every `[php] ini_overrides` line except `disable_functions`.
-7. `disable_functions` — the union of your list and ePHPm's multi-tenant
-   baseline (vhost mode only).
+7. `disable_functions` — your list, unioned with ePHPm's multi-tenant
+   baseline in vhost mode (in single-site mode your list is emitted alone).
 8. `mysqli.allow_persistent=0`, `pgsql.allow_persistent=0`,
    `odbc.allow_persistent=0` and, unless cluster OPcache invalidation is on,
    `opcache.restrict_api` — with the multi-tenant hardening preset only. See
@@ -182,6 +182,8 @@ ini_overrides = [
 ]
 ```
 
-The embed SAPI's other built-in values also apply unless you override them:
-`output_buffering=0`, `implicit_flush=1`, `register_argc_argv=1` and
-`max_input_time=-1`.
+The embed SAPI's other built-in values also apply: `output_buffering=0`,
+`implicit_flush=1`, `register_argc_argv=1` and `max_input_time=-1`. PHP
+applies these **after** the generated php.ini, so `ini_overrides` and
+`ini_file` cannot change them; `implicit_flush` can still be changed at
+runtime with `ini_set()`.

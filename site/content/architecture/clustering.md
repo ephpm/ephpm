@@ -1070,7 +1070,7 @@ fn session_lock(session_id: &str, timeout: Duration) -> bool {
 }
 ```
 
-With clustering, the lock key `session_lock:{id}` is small and rides the gossip tier (it is well under `small_key_threshold`), so it is replicated to every node — the `SETNX` and `DEL` operate on the local gossip-backed view. (In the shipped implementation the lock is node-local; see the [Sessions guide](/guides/sessions/) for the exact cross-node semantics.)
+With clustering, the lock key `session_lock:{id}` is a small string key, so its `SETNX` and `DEL` replicate over the gossip tier like any other write — but acquisition is decided against the local node's view, and a peer sees the key only after gossip converges. The lock therefore reliably serializes only requests on the same node; see the [Sessions guide](/guides/sessions/) for the cross-node semantics.
 
 #### Serialization
 
