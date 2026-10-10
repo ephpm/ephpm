@@ -42,7 +42,15 @@ Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releas
 sudo ./ephpm install
 ```
 
-`install` copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml`, registers a systemd service (Linux) or launchd plist (macOS), and starts it. By default the server listens on `http://localhost:8080`.
+`install` copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml` (only if that file doesn't exist yet, so re-running `install` keeps your config), creates `/var/lib/ephpm/` and `/var/log/ephpm/`, registers a systemd service (`/etc/systemd/system/ephpm.service`) or launchd daemon (`/Library/LaunchDaemons/dev.ephpm.plist`), and starts it. By default the server listens on `http://localhost:8080` and serves `/var/www/html`, which `install` does not create.
+
+By default the service runs as **root** with no sandboxing. To run it as a dedicated account instead, pass `--user` (and optionally `--group`, which defaults to the same name). The account must already exist:
+
+```bash
+sudo ephpm install --user ephpm-web
+```
+
+On Linux this adds `User=`/`Group=` and a hardening profile to the unit (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `CAP_NET_BIND_SERVICE` for ports 80/443, and write access to the data dir, log dir and `/var/www/html` only). On macOS it sets the plist's `UserName`/`GroupName`. The data and log directories are `chown`ed to the account. See [`ephpm install`](/reference/cli/#ephpm-install) for what the hardening means for paths outside those directories.
 
 ## Windows
 
@@ -52,7 +60,9 @@ Download the Windows `.tar.gz` archive from [Releases](https://github.com/ephpm/
 .\ephpm.exe install
 ```
 
-Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, registers a Windows service, and starts it.
+Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, writes a default config to `C:\ProgramData\ephpm\ephpm.toml` (only if none exists), creates `C:\ProgramData\ephpm\data\` and `C:\ProgramData\ephpm\logs\`, registers an auto-start Windows service named `ephpm` (running as `LocalSystem`), and starts it. The default config serves `C:\ProgramData\ephpm\www`. Edit `C:\ProgramData\ephpm\ephpm.toml` and run `ephpm restart` to change settings. The service log is `C:\ProgramData\ephpm\logs\ephpm.log`.
+
+`--user` / `--group` are not supported on Windows. Passing them is an error.
 
 > Single-node SQLite (the in-process Turso engine), the MySQL/Postgres proxy, and everything else work normally on Windows. Clustered SQLite (Turso CDC replication) is untested on Windows.
 
@@ -91,6 +101,8 @@ sudo ephpm logs           # tail the service log
 sudo ephpm logs --follow  # follow new log lines
 ```
 
+The server's own log output goes to `/var/log/ephpm/ephpm.log` (`C:\ProgramData\ephpm\logs\ephpm.log` on Windows). On Linux, `ephpm logs` shows the systemd journal (`journalctl -u ephpm.service`) instead. The unit sends the server's stdout/stderr to the log file, not the journal, so the journal mostly holds systemd's start/stop messages. For the server's output on Linux, read the file: `sudo tail -f /var/log/ephpm/ephpm.log`. See [Where things live](/reference/cli/#where-things-live) for every path per platform.
+
 To run the server in the foreground without registering a service (useful for debugging):
 
 ```bash
@@ -122,11 +134,13 @@ Details and caveats (including non-UTF-8 `TEXT`):
 sudo ephpm uninstall
 ```
 
-Stops the service, removes the binary, the service unit, and `/var/lib/ephpm/`. Pass `--keep-data` to preserve the config file and any SQLite databases:
+Stops the service and removes the binary and the service registration. **Without `--keep-data` it also deletes** the config file (`/etc/ephpm/ephpm.toml`), the whole data directory (`/var/lib/ephpm/`) and the whole log directory (`/var/log/ephpm/`). On Windows the equivalents under `C:\ProgramData\ephpm\` are deleted. Anything you stored in those directories, such as databases or ACME certificates, is gone. Pass `--keep-data` to leave the config, data and logs in place:
 
 ```bash
 sudo ephpm uninstall --keep-data
 ```
+
+Neither form touches your document root or `sites_dir`. A database is only inside the data directory if your config put it there. `[db.sqlite] path` defaults to `ephpm.db` relative to the service's working directory.
 
 ## Build from source
 

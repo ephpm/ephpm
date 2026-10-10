@@ -55,7 +55,7 @@ Queries exceeding `slow_query_threshold` log at `WARN` with the normalized SQL a
 WARN ephpm_query_stats: slow query digest=a3f9b2e1 elapsed_ms=731 sql="SELECT * FROM orders WHERE status = ?"
 ```
 
-Tail with `journalctl -u ephpm -f` (systemd) or whatever you point ePHPm at.
+Under the service that `ephpm install` registers, tail it with `sudo tail -f /var/log/ephpm/ephpm.log`. The generated systemd unit appends the server's output to that file, not to the journal. Otherwise read it wherever you send ePHPm's stdout.
 
 ## Useful PromQL
 

@@ -3,7 +3,7 @@ title = "ephpm serve"
 weight = 1
 +++
 
-Start the PHP application server. This is the command service backends invoke.
+Start the PHP application server. The systemd and launchd services that `ephpm install` registers run `ephpm serve --config <config>`. The Windows service instead runs a hidden `ephpm service-run` entry point, which reads the config path the service was registered with and then runs the same server.
 
 Note that `ephpm` with **no** subcommand is not `serve` — it starts the [development server](../#ephpm-dev) on port 8080. The subcommand is required for production use.
 
@@ -61,7 +61,7 @@ In one process:
 ## Exit codes
 
 - `0` — clean shutdown
-- non-zero — startup failure or fatal runtime error (logged via `tracing`)
+- non-zero — startup failure or fatal runtime error. Errors are logged via `tracing`, and a startup error is also printed as `error: ...` on stderr with exit `1`.
 
 ## See also
 

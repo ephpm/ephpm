@@ -161,7 +161,7 @@ authenticates with the same per-site derived password as `pdo_mysql`.
 ### 7. Two-uid process model + systemd sandbox
 
 > **Operator-supplied.** Unlike §1–§6, nothing in this section is produced by
-> ePHPm. `ephpm install` writes a single-uid systemd unit
+> ePHPm. [`ephpm install`](/reference/cli/#ephpm-install) writes a single-uid systemd unit
 > (`crates/ephpm/src/service/systemd.rs`): with `--user` it emits `User=`,
 > `Group=`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`,
 > a `CapabilityBoundingSet` of `CAP_NET_BIND_SERVICE`, and `ReadWritePaths`.
@@ -169,6 +169,10 @@ authenticates with the same per-site derived password as `pdo_mysql`.
 > there is no `ephpm-ctl` binary. The split below is a deployment pattern you
 > build on the host — the one the ePHPm preview fleet runs — described here so
 > it can be reproduced, not a default you inherit.
+
+To run a tenant's non-PHP commands (build or seed steps) under the tenant uid
+with a Landlock filesystem scope, use [`ephpm exec`](/reference/cli/exec/)
+(Linux only).
 
 Two OS users split the trust boundary:
 

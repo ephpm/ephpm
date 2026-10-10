@@ -82,11 +82,21 @@ ephpm dev --sites ./sites
 | `-l` | `--listen <ADDR>` | `127.0.0.1:<port>` | Override the listen address entirely |
 | `-v` | `--verbose` | off | Increase log verbosity (repeatable) |
 
+**Configuration in dev mode:** `ephpm dev` never reads an `ephpm.toml`, not even one in the current directory. It starts from the built-in defaults and **does** apply `EPHPM_*` environment overrides, and then the flags above override the listen address, document root, and sites directory. So a dev server can still turn features on through the environment, for example `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` to enable the RESP listener for [`ephpm kv`](kv/). For anything more, use `ephpm serve --config`.
+
+**Port selection:** without `--listen`, `dev` tries `--port` and then each following port, up to 50 in total (`8080`–`8129` by default). If all of them are busy it exits with `no free port in range ...`.
+
 ---
 
 ## `ephpm php`
 
-Run PHP CLI commands using the embedded PHP runtime. This is a **pure passthrough** — every argument after `php` goes straight to PHP's own argument parser, so all standard PHP CLI flags work. See the [full `php` reference](php/).
+Run PHP CLI commands using the embedded PHP runtime. Apart from two ePHPm options, every argument after `php` goes straight to PHP's own argument parser, so all standard PHP CLI flags work. See the [full `php` reference](php/).
+
+The two ePHPm options are `--site <key>` and `--config <path>`. When they come **first**, before the PHP program and its arguments, ePHPm consumes them and binds the [`ephpm_db_*` bridge](/guides/db-from-php/) to that virtual host's database (`--config` is required with `--site`). They are `--long`-only, so they never collide with php-cli's own `-c`. Anywhere after the program they pass through to PHP untouched. `--config` without `--site` has no effect: it prints a warning and is ignored. See [Binding a virtual host's database](php/#binding-a-virtual-hosts-database---site).
+
+```bash
+ephpm php --site shop --config /etc/ephpm/ephpm.toml -- vendor/bin/wp option get siteurl
+```
 
 ```bash
 # Version
@@ -151,12 +161,18 @@ ephpm composer --version   # → vivacity <x.y.z>
 Inspect and manipulate the KV store on a running server. Connects directly to the embedded KV server over the RESP2 protocol (requires `[kv.redis_compat] enabled = true`). See the [full `kv` reference](kv/).
 
 ```bash
-ephpm kv [--host <HOST>] [--port <PORT>] <COMMAND>
+ephpm kv [--host <HOST>] [--port <PORT>] [--password <PW>] [--user <NAME>] <COMMAND>
 
 Options:
-  --host <HOST>    KV server host [default: 127.0.0.1]
-  --port <PORT>    KV server port [default: 6379]
+  --host <HOST>      KV server IP address [default: 127.0.0.1]
+  --port <PORT>      KV server port [default: 6379]
+  --password <PW>    Sent as RESP AUTH before the first command
+                     [default: $EPHPM_KV_PASSWORD]
+  --user <NAME>      First argument of AUTH <user> <password> (per-site HMAC
+                     auth: the vhost hostname). Requires --password.
 ```
+
+These options belong to `ephpm kv` itself, so they go **before** the subcommand. Pass `--password` (or set `EPHPM_KV_PASSWORD`) whenever the server sets `[kv.redis_compat] password` or `[kv] secret`. Without it every command fails with `NOAUTH`. `--host` must be an IP literal (`10.0.1.5`, or `[::1]` for IPv6). A hostname such as `localhost` fails with `invalid address`. See [Authentication](kv/#authentication).
 
 | Command | Purpose |
 |---------|---------|
@@ -215,9 +231,76 @@ ephpm analyze /srv/app --since origin/main
 
 ---
 
+## `ephpm deploy`
+
+Invalidate the OPcache for one vhost (`--site`) or every vhost (`--all`) across a cluster. It writes `opcache:version:<vhost>` through the running server's RESP listener, and gossip replicates the write to every node. Needs `[kv.redis_compat] enabled = true` on the server. See the [full `deploy` reference](deploy/).
+
+```bash
+ephpm deploy --site blog --rev a8f13d2
+ephpm deploy --all
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--site <NAME>` | — | Vhost to invalidate. Mutually exclusive with `--all`. Neither flag means the default vhost. |
+| `--all` | off | Invalidate every vhost via the broadcast key |
+| `--rev <REV>` | — | Revision tag recorded at `opcache:revision:<vhost>` |
+| `--host <HOST>` | `127.0.0.1` | RESP server host (hostnames are resolved) |
+| `--port <PORT>` | `6379` | RESP server port |
+| `--password <PW>` | `$EPHPM_KV_PASSWORD` | Sent as RESP `AUTH` |
+
+---
+
+## `ephpm cache`
+
+Cache management. The only subcommand is `reset`, which performs the same OPcache invalidation as `deploy` without the `--rev` stamp. Same requirements as `deploy`. See the [full `cache` reference](cache/).
+
+```bash
+ephpm cache reset --site blog
+ephpm cache reset --all
+ephpm cache --host 10.0.1.5 --password "$PW" reset --all   # options go before `reset`
+```
+
+`--host` (default `127.0.0.1`), `--port` (default `6379`), and `--password` (default `$EPHPM_KV_PASSWORD`) are options of `ephpm cache`. `--site` / `--all` belong to `reset`.
+
+---
+
+## `ephpm exec`
+
+Run a command inside a virtual host's tenant sandbox: Landlock filesystem scope plus an irreversible drop to the tenant uid. **Linux only.** It must start as root, and it needs multi-tenant mode (`[server] sites_dir`). See the [full `exec` reference](exec/), including what the sandbox does and does not cover.
+
+```bash
+sudo ephpm exec --site shop -- composer install --no-dev
+sudo ephpm exec --site shop --timeout 600 -- bash -c './build.sh'
+```
+
+| Flag | Long | Default | Purpose |
+|------|------|---------|---------|
+| `-c` | `--config <FILE>` | `/etc/ephpm/ephpm.toml` | Config holding `[server] sites_dir` |
+| `-s` | `--site <KEY>` | (required) | Vhost directory name under `sites_dir` |
+| `-t` | `--timeout <SECS>` | `0` (none) | Wall-clock limit, enforced by `SIGALRM` |
+| | `--no-sandbox` | off | **Removes all containment**: no Landlock, no uid drop. The command runs with the caller's privileges |
+
+The command goes after `--`. `ephpm exec --help` does not print help, because the subcommand captures its arguments verbatim. Use `ephpm help exec`.
+
+---
+
 ## Service Lifecycle
 
-Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows.
+Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows. Every lifecycle command except `status` and `logs` needs root (`sudo`) or an Administrator shell. Without it, it exits `1` with `requires root privileges`.
+
+### Where things live
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Binary | `/usr/local/bin/ephpm` | `/usr/local/bin/ephpm` | `C:\Program Files\ephpm\ephpm.exe` |
+| Config | `/etc/ephpm/ephpm.toml` | `/etc/ephpm/ephpm.toml` | `C:\ProgramData\ephpm\ephpm.toml` |
+| Service | `/etc/systemd/system/ephpm.service` | `/Library/LaunchDaemons/dev.ephpm.plist` | Windows service `ephpm` |
+| Data dir | `/var/lib/ephpm/` | `/var/lib/ephpm/` | `C:\ProgramData\ephpm\data\` |
+| Log file | `/var/log/ephpm/ephpm.log` | `/var/log/ephpm/ephpm.log` | `C:\ProgramData\ephpm\logs\ephpm.log` |
+| Default document root (in the generated config) | `/var/www/html` | `/var/www/html` | `C:\ProgramData\ephpm\www` |
+
+The data dir is created by `install` and deleted by `uninstall`, but **the generated config does not point anything at it**. `[db.sqlite] path` defaults to `ephpm.db` and the ACME `cache_dir` defaults to `certs`. Both are relative to the service's working directory, which is not the data dir. To keep databases and certificates there, set absolute paths in the config (for example `path = "/var/lib/ephpm/app.db"`).
 
 ### `ephpm install`
 
@@ -225,18 +308,51 @@ Install ePHPm as a system service and start it.
 
 ```bash
 sudo ephpm install
+
+# Run the service as a dedicated non-root account (Linux/macOS)
+sudo ephpm install --user ephpm-web
+sudo ephpm install --user ephpm-web --group www-data
 ```
+
+What it does, in order:
+
+1. Copies the **running** binary to the install path. If you run the installed binary itself, the copy is skipped.
+2. Writes a default config **only if none exists**. Re-running `install`, for example with a newer binary, keeps your config, so re-running is the upgrade path. The generated config listens on `0.0.0.0:8080`, serves the platform's default document root, and uses `[php] mode = "per_request"`, `max_execution_time = 30`, `memory_limit = "128M"`.
+3. Creates the data and log directories.
+4. Registers the service: a systemd unit (enabled, `Restart=on-failure`, output appended to the log file), a launchd daemon (`RunAtLoad`, `KeepAlive`), or a Windows auto-start service running as `LocalSystem`. On Windows it also adds `C:\Program Files\ephpm` to the system `Path`. The Windows service runs the hidden `ephpm service-run` entry point, while systemd and launchd run `ephpm serve --config <config>`.
+5. Starts the service.
+
+`install` does not create the document root.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--user <USER>` | — (service runs as root / `LocalSystem`) | Run the service as this existing account. It also `chown -R`s the data and log directories to it. |
+| `--group <GROUP>` | same name as `--user` | Group to run the service as. Only valid together with `--user`. Without `--user` it is a usage error. |
+
+What `--user` changes per platform:
+
+- **Linux:** the unit gets `User=` / `Group=` plus a hardening profile: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (so the service can still bind ports 80/443), and `ReadWritePaths=` for the data dir, log dir, and default document root. Under `ProtectSystem=strict` everything else is read-only, so any other path the server must write to has to be added to `ReadWritePaths` in a drop-in. That covers a `sites_dir`, database, or ACME cache outside those three directories, and relative database/cache paths, which resolve against `/`.
+- **macOS:** the plist gets `UserName` / `GroupName`. No other hardening is added.
+- **Windows:** not supported. Passing `--user` is a hard error, because the SCM needs a stored account password that ePHPm has no secure way to collect. It does not quietly install as `LocalSystem`.
+
+Without `--user` the service runs as root (`LocalSystem` on Windows) with no sandboxing. That is the historical default.
+
+The account must already exist. `install` does not create users.
 
 ### `ephpm uninstall`
 
-Uninstall the system service.
+Stop and remove the system service.
 
 ```bash
 sudo ephpm uninstall
 
-# Keep the configuration file and data directory in place
+# Keep the configuration file, data directory, and logs in place
 sudo ephpm uninstall --keep-data
 ```
+
+> **Without `--keep-data`, `uninstall` deletes data.** It removes the config file (`/etc/ephpm/ephpm.toml`, or `C:\ProgramData\ephpm\ephpm.toml`), the **whole data directory** (`/var/lib/ephpm/` or `C:\ProgramData\ephpm\data\`) including any databases or certificates you put there, and the **whole log directory**. It then removes the config directory if it is empty. Back up anything you need first, or pass `--keep-data`.
+
+Either way it stops the service (if it can't, it logs a warning and carries on), deregisters it (and removes the install dir from the Windows `Path`), and deletes the installed binary. It never touches the document root or a `sites_dir`.
 
 ### `ephpm start` / `ephpm stop` / `ephpm restart`
 
@@ -256,9 +372,11 @@ Show service status (PID, uptime, listen address).
 ephpm status
 ```
 
+It prints the service state, PID, uptime, the `[server] listen` value read from the installed config file, and the config path. Uptime is reported on Linux only, as the systemd start timestamp. macOS and Windows show `-`. The listen address comes from the file only, so an `EPHPM_SERVER__LISTEN` override is not reflected.
+
 ### `ephpm logs`
 
-Tail the service log file.
+Show the service log.
 
 ```bash
 ephpm logs
@@ -266,6 +384,32 @@ ephpm logs
 # Follow the log (like tail -f)
 ephpm logs -f
 ```
+
+- **Linux:** runs `journalctl -u ephpm.service --no-pager -n 200` (or `-f` with `--follow`). It falls back to the log file only if `journalctl` is missing or fails. The generated unit appends the server's stdout/stderr to `/var/log/ephpm/ephpm.log` (`StandardOutput=append:`), not to the journal, so the journal mostly holds systemd's own start/stop messages. Read the file for the server's output: `sudo tail -f /var/log/ephpm/ephpm.log`.
+- **macOS / Windows:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation).
+
+The log file is at the path in [Where things live](#where-things-live). If it doesn't exist, `logs` exits `1`.
+
+---
+
+## Exit codes
+
+| Command | Exit code |
+|---------|-----------|
+| `serve`, `dev` | `0` on clean shutdown, non-zero on a startup or fatal error. See [`serve`](serve/#exit-codes). |
+| `php` | PHP's own exit status. See [`php`](php/#errors-and-exit-codes). |
+| `composer` | The exit code of the embedded installer. See [`composer`](composer/). |
+| `analyze` | `0` pass, `2` quarantine, `3` deny, `1` internal error. See [`analyze`](analyze/). |
+| `exec` | The command's own exit status once it has started, `1` if setup fails. See [`exec`](exec/#exit-status). |
+| `kv` | `0` on success. Server replies such as `(nil)`, `(empty)` or `key does not exist` count as success. `1` if the server answers with an error (`-ERR`, `-NOAUTH`, …), which is printed as `error: ...` on stderr. |
+| `deploy`, `cache reset` | `0` on success, `1` if the RESP listener is unreachable or returns an error |
+| `install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs` | `0` on success, `1` on any failure (`error: service command failed: ...` on stderr) |
+
+Any other failure, such as a connection error, an unreadable config, or an invalid argument value, prints `error: ...` on stderr and exits `1`. A clap usage error (unknown flag, missing required argument) exits `2`.
+
+## Logging for CLI commands
+
+`analyze`, `exec`, `php --site`, and the service lifecycle commands log diagnostics to **stderr**. stdout is reserved for the command's output (for example `analyze --format sarif`). The level comes from `RUST_LOG` and defaults to `info`. `serve` and `dev` use `RUST_LOG`, then `-v`, then `[server.logging] level`. See [Environment variables](/reference/environment-variables/).
 
 ---
 
@@ -280,14 +424,21 @@ ephpm composer       Run Composer via the embedded vivacity installer (pure pass
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
 ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on/
                      --level/--since/--baseline/--cache-dir/--no-cache)
+ephpm deploy         Cluster-wide OPcache invalidation (--site/--all/--rev)
+ephpm cache reset    OPcache reset for one vhost or all (--site/--all)
+ephpm exec           Run a command in a vhost's tenant sandbox (Linux only;
+                     --site/--config/--timeout/--no-sandbox)
 
-ephpm install        Install + start the system service
-ephpm uninstall      Remove the system service (--keep-data)
+ephpm install        Install + start the system service (--user/--group)
+ephpm uninstall      Remove the service AND delete config/data/logs (--keep-data keeps them)
 ephpm start          Start the installed service
 ephpm stop           Stop the installed service
 ephpm restart        Restart the installed service
 ephpm status         Service status (PID, uptime, listen address)
 ephpm logs           Tail the service log (-f to follow)
+ephpm help <cmd>     Help for a subcommand (the only way to get help for exec)
 ```
+
+Plain `ephpm php` / `ephpm composer` / `ephpm exec` don't accept `--help`. `ephpm php` passes `-h` to PHP, and `ephpm composer --help` goes to the embedded installer. Use `ephpm help <cmd>` for ePHPm's own help. On Windows there is also a hidden `ephpm service-run` subcommand. The Windows service manager invokes it to run the installed service, and it is not meant to be run by hand.
 
 `ephpm --version` prints the ePHPm version. For everything else — configuration, metrics, cluster state — see [Reference → Configuration](/reference/config/) and the `/metrics` endpoint.
