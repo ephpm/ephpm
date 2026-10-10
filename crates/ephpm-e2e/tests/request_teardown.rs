@@ -96,6 +96,120 @@ async fn ephpm_session_is_released_when_the_request_ends() {
     sequential_session_requests("ephpm").await;
 }
 
+const TENANT_A: &str = "teardown-a.test";
+const TENANT_B: &str = "teardown-b.test";
+
+/// Site A's page: a global object whose destructor writes a KV key.
+const DESTRUCT_KV_PHP: &str = r#"<?php
+final class TeardownKv
+{
+    public function __construct(private string $id) {}
+    public function __destruct()
+    {
+        ephpm_kv_set('teardown-scope:' . $this->id, 'written-by-a');
+    }
+}
+$keep = new TeardownKv($_GET['id'] ?? '');
+echo "ok\n";
+"#;
+
+/// Deployed in both sites: report whether the key exists in THIS site's KV
+/// namespace.
+const KV_READ_PHP: &str = r#"<?php
+echo var_export(ephpm_kv_get('teardown-scope:' . ($_GET['id'] ?? '')), true), "\n";
+"#;
+
+async fn get_with_host(client: &reqwest::Client, base_url: &str, host: &str, path: &str) -> String {
+    let resp = client
+        .get(format!("{base_url}{path}"))
+        .header(reqwest::header::HOST, host)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {path} (Host: {host}) failed: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "GET {path} (Host: {host}) returned {status}: {body:?}");
+    body.trim().to_owned()
+}
+
+/// A tenant's end-of-request work runs in ITS OWN site scope.
+///
+/// Before v0.11.3 the deferred teardown of tenant A's request ran at the top
+/// of the next request on the same PHP thread — after that request had already
+/// installed ITS site scope (KV keyspace, database, WebSocket scope). A's global
+/// destructor therefore wrote into whichever tenant reached the thread next.
+/// Here A's destructor writes a KV key; it must land in A's namespace and never
+/// in B's, however many of B's requests go through the pool afterwards.
+#[tokio::test]
+async fn global_destructor_writes_into_its_own_tenant_scope() {
+    let base_url = required_env("EPHPM_URL");
+    // Needs a multi-tenant node (the bare-process shared node is one). The
+    // k8s lane provides no writable sites dir, so skip there.
+    let Ok(sites) = std::env::var("EPHPM_SITES_DIR") else {
+        eprintln!("skipping: EPHPM_SITES_DIR not set (no multi-tenant node)");
+        return;
+    };
+    let sites = std::path::PathBuf::from(sites);
+    for (host, files) in [
+        (TENANT_A, &[("destruct_kv.php", DESTRUCT_KV_PHP), ("kv_read.php", KV_READ_PHP)][..]),
+        (TENANT_B, &[("kv_read.php", KV_READ_PHP)][..]),
+    ] {
+        let dir = sites.join(host);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create site dir");
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).expect("write site script");
+        }
+    }
+
+    let client = client();
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let read = format!("/kv_read.php?id={id}");
+
+    assert_eq!(
+        get_with_host(&client, &base_url, TENANT_A, &format!("/destruct_kv.php?id={id}")).await,
+        "ok"
+    );
+
+    // Push more of B's requests through the pool than it has threads (it is
+    // clamped to at most 32), so one of them is guaranteed to reach the thread
+    // that served A. Under the deferred teardown, A's destructor ran at the
+    // top of that request — in B's scope.
+    for n in 0..40 {
+        let in_b = get_with_host(&client, &base_url, TENANT_B, &read).await;
+        assert_eq!(
+            in_b, "NULL",
+            "tenant A's destructor wrote into tenant B's KV namespace (B request {n}) — \
+             A's request teardown ran under B's site scope"
+        );
+    }
+
+    // The teardown runs just after A's response; allow it a moment.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let in_a = loop {
+        let v = get_with_host(&client, &base_url, TENANT_A, &read).await;
+        if v != "NULL" || Instant::now() >= deadline {
+            break v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        in_a, "'written-by-a'",
+        "tenant A's destructor must write into A's own KV namespace"
+    );
+
+    for host in [TENANT_A, TENANT_B] {
+        let _ = std::fs::remove_dir_all(sites.join(host));
+    }
+}
+
 /// A global object's `__destruct` runs right after the response — with no
 /// follow-up request — observed over a loopback connection the destructor
 /// opens back to this test.
