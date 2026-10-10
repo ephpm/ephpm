@@ -1004,13 +1004,13 @@ fn run_composer(args: Vec<std::ffi::OsString>) -> anyhow::Result<ExitCode> {
 ///     syscall that never returns to the VM to observe the timer.
 ///
 /// The inner limit can only fire if it is strictly below the outer one, so warn
-/// when `max_execution_time >= request` (excluding `0`, which means "no PHP
-/// limit" — the request backstop is then the only ceiling, by design).
+/// when `max_execution_time >= request` — see [`php_timeout_preempted`] for the
+/// two `0` (disabled) cases that are exempt.
 #[cfg(php_max_exec_timers)]
 fn warn_max_execution_time(config: &ephpm_config::Config) {
     let inner = config.php.max_execution_time;
     let outer = config.server.timeouts.request;
-    if inner != 0 && u64::from(inner) >= outer {
+    if php_timeout_preempted(inner, outer) {
         tracing::warn!(
             max_execution_time = inner,
             request_timeout = outer,
@@ -1023,6 +1023,23 @@ fn warn_max_execution_time(config: &ephpm_config::Config) {
     }
 }
 
+/// Whether PHP's own `max_execution_time` (`inner`, seconds) can never fire
+/// because the outer `[server.timeouts] request` deadline (`outer`, seconds)
+/// always cuts the request off first.
+///
+/// `0` disables either limit, and a disabled limit never preempts or is
+/// preempted:
+/// - `inner == 0` — no PHP limit; the request deadline is the only ceiling,
+///   by design.
+/// - `outer == 0` — no request deadline at all (the router arms no timer), so
+///   PHP's own timeout is the ONLY ceiling and fires normally. Comparing
+///   `inner >= 0` here used to print "max_execution_time (30s) is >=
+///   [server.timeouts] request (0s)" — the exact opposite of the truth.
+#[cfg_attr(not(php_max_exec_timers), allow(dead_code))]
+fn php_timeout_preempted(inner: u32, outer: u64) -> bool {
+    inner != 0 && outer != 0 && u64::from(inner) >= outer
+}
+
 /// Fallback diagnostics when the linked libphp has no per-thread execution
 /// timers (macOS, Windows — its ZTS SDK lacks `ZEND_MAX_EXECUTION_TIMERS` —
 /// or a Linux SDK built without `--enable-zend-max-execution-timers`). PHP's only native mechanism there is
@@ -1033,13 +1050,18 @@ fn warn_max_execution_time(config: &ephpm_config::Config) {
 fn warn_max_execution_time(config: &ephpm_config::Config) {
     let php_defaults = ephpm_config::PhpConfig::default();
     if config.php.max_execution_time != php_defaults.max_execution_time {
+        let in_force = if config.server.timeouts.request == 0 {
+            "[server.timeouts] request is 0 (disabled), so no per-request deadline is in \
+             force at all."
+        } else {
+            "The per-request deadline actually in force is [server.timeouts] request."
+        };
         tracing::warn!(
             max_execution_time = config.php.max_execution_time,
             request_timeout = config.server.timeouts.request,
             "[php] max_execution_time is not natively enforced on this build \
              (the linked PHP has no per-thread execution timers; its process-wide \
-             SIGPROF timer is unsafe under tokio and stays disabled). The \
-             per-request deadline actually in force is [server.timeouts] request."
+             SIGPROF timer is unsafe under tokio and stays disabled). {in_force}"
         );
     }
 }
@@ -2768,6 +2790,32 @@ mod disable_functions_tests {
             ("disable_functions", "c"),
         ]));
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod exec_timeout_warning_tests {
+    use super::php_timeout_preempted;
+
+    #[test]
+    fn php_limit_at_or_above_the_request_deadline_is_preempted() {
+        assert!(php_timeout_preempted(30, 30));
+        assert!(php_timeout_preempted(60, 30));
+        assert!(!php_timeout_preempted(29, 30));
+    }
+
+    #[test]
+    fn disabled_request_deadline_never_preempts() {
+        // `[server.timeouts] request = 0` disables the deadline; PHP's own
+        // timeout is then the only ceiling and fires normally.
+        assert!(!php_timeout_preempted(30, 0));
+        assert!(!php_timeout_preempted(1, 0));
+    }
+
+    #[test]
+    fn disabled_php_limit_is_never_preempted() {
+        assert!(!php_timeout_preempted(0, 30));
+        assert!(!php_timeout_preempted(0, 0));
     }
 }
 
