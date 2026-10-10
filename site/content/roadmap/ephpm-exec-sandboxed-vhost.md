@@ -363,8 +363,21 @@ What shipped, all of it stub-mode-clean (no PHP SDK needed) and
 - `crates/ephpm/src/exec_sandbox.rs` — a `#[cfg(target_os = "linux")]` impl and a
   `#[cfg(not)]` refuse-stub, matching the `privdrop` shape. Layer order:
   resolve site → `PR_SET_NO_NEW_PRIVS` → Landlock (ABI v1, best-effort, refuse if
-  `NotEnforced`) → irreversible uid drop → `chdir` → `execvp`. `--timeout` arms
-  `alarm(2)` (survives `execve`; default `SIGALRM` terminates).
+  `NotEnforced`) → irreversible uid drop → `chdir` → exec with a **cleared
+  environment**. `--timeout` arms `alarm(2)` (survives `execve`; default
+  `SIGALRM` terminates).
+- **The command never inherits ePHPm's environment.** It is exec'd with an empty
+  environment plus a fixed allowlist: `PATH` (a fixed system default, not the
+  caller's), `HOME` = the tenant state root, `TMPDIR` = its `tmp/`, and the
+  caller's `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`. Everything else —
+  `EPHPM_*` overrides such as `EPHPM_KV__SECRET` (the master secret every
+  tenant password derives from), cloud credentials, tokens, `LD_PRELOAD`,
+  `SUDO_*` — is dropped, on the sandboxed and `--no-sandbox` paths alike. No
+  credentials are injected either (no `DB_*`, no KV password). To hand a
+  command a specific non-secret variable, set it inside the command:
+  `ephpm exec --site <key> -- env NODE_ENV=production npm run build`. Pinned
+  by `exec_sandbox::tests::sandbox_env_drops_secrets_and_keeps_only_the_allowlist`
+  and the `crates/ephpm/tests/exec_env.rs` end-to-end test.
 - `ephpm_server::router::resolve_sandbox_site(config, key)` — the site derivation
   reused verbatim from the request path (`resolve_site` → container +
   `vhost_state_root`), so the exec sandbox is not a *second*, divergent
