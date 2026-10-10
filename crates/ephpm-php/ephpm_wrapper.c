@@ -310,16 +310,25 @@ static EPHPM_TLS const char        *req_lazy_query_string = NULL;
  * it). Returns bytes written into buf (0 = EOF, negative = error). */
 static long ephpm_worker_body_read(char *buf, size_t cap);
 
-/* Server variables */
-
-#define MAX_SERVER_VARS 128
-
-static EPHPM_TLS struct {
-    const char *key;
-    const char *value;
-} server_vars[MAX_SERVER_VARS];
-
-static EPHPM_TLS int server_var_count = 0;
+/* Server variables ($_SERVER).
+ *
+ * Borrowed, caller-owned parallel arrays of NUL-terminated key/value
+ * pointers, registered whole by ephpm_request_set_server_vars(). There is
+ * deliberately NO fixed cap: this used to be a 128-slot copy that silently
+ * dropped the overflow, and because ePHPm's own per-site variables (DB_*,
+ * EPHPM_REDIS_*, EPHPM_NODE_ID, WS_*) are registered after the request
+ * headers, a request with ~100 headers (reachable over HTTP/2 and HTTP/3,
+ * which have no header-count limit) lost the tenant's DB credentials and
+ * WebSocket context. Borrowing the arrays costs no allocation here and has
+ * no limit to overflow. Lifetime: on the per-request lane, valid until the
+ * request is shut down (ephpm_finish_request(), or the next
+ * ephpm_begin_request()), because auto_globals_jit registers $_SERVER when a
+ * script that uses it is compiled, at any point in the request; on the worker
+ * lane, until the worker's send_response for this request — the same
+ * contract the old per-entry string pointers had. */
+static EPHPM_TLS size_t             server_var_count = 0;
+static EPHPM_TLS const char *const *server_var_keys  = NULL;
+static EPHPM_TLS const char *const *server_var_vals  = NULL;
 
 /* Per-request INI overrides (e.g. open_basedir for vhost isolation).
  *
@@ -357,7 +366,7 @@ static EPHPM_TLS int request_active = 0;
  * NOT go through php_execute_script().
  *
  * Pointers are borrowed from Rust and must stay valid until
- * ephpm_execute_request() returns — same contract as server_vars above. */
+ * ephpm_execute_request() returns — same contract as server_var_keys above. */
 #define MAX_REQUEST_MIDDLEWARE 16
 
 static EPHPM_TLS const char *req_middleware_paths[MAX_REQUEST_MIDDLEWARE];
@@ -534,15 +543,15 @@ static char *ephpm_sapi_read_cookies(void)
 /*
  * register_server_variables — Called by PHP during request startup
  * to populate $_SERVER. We iterate over the server variables that
- * Rust added via ephpm_request_add_server_var().
+ * Rust registered via ephpm_request_set_server_vars().
  */
 static void ephpm_sapi_register_server_variables(zval *track_vars_array)
 {
-    for (int i = 0; i < server_var_count; i++) {
+    for (size_t i = 0; i < server_var_count; i++) {
         php_register_variable_safe(
-            (char *)server_vars[i].key,
-            (char *)server_vars[i].value,
-            strlen(server_vars[i].value),
+            (char *)server_var_keys[i],
+            (char *)server_var_vals[i],
+            strlen(server_var_vals[i]),
             track_vars_array
         );
     }
@@ -1171,6 +1180,8 @@ void ephpm_request_clear(void)
     req_post_data_offset = 0;
     req_path_translated = NULL;
     server_var_count = 0;
+    server_var_keys = NULL;
+    server_var_vals = NULL;
     req_middleware_count = 0;
     req_middleware_active = -1;
     req_middleware_outcome = EPHPM_MW_CONTINUE;
@@ -1206,16 +1217,20 @@ void ephpm_request_set_info(
 }
 
 /*
- * Add a $_SERVER variable. Call before ephpm_execute_request().
- * Pointers must remain valid until ephpm_execute_request() returns.
+ * Register this request's whole $_SERVER set: `count` key/value pointer
+ * pairs. Call before ephpm_begin_request(). Both arrays, and every string
+ * they point to, are borrowed and must remain valid until the request is
+ * shut down (see server_var_keys above).
+ * Every entry is registered — there is no cap (see server_var_keys above).
  */
-void ephpm_request_add_server_var(const char *key, const char *value)
+void ephpm_request_set_server_vars(
+    size_t count,
+    const char *const *keys,
+    const char *const *vals)
 {
-    if (server_var_count < MAX_SERVER_VARS) {
-        server_vars[server_var_count].key = key;
-        server_vars[server_var_count].value = value;
-        server_var_count++;
-    }
+    server_var_count = count;
+    server_var_keys = keys;
+    server_var_vals = vals;
 }
 
 /*
@@ -2688,11 +2703,12 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * we let the registered SAPI callbacks repopulate $_SERVER/$_COOKIE/$_GET
      * via php_hash_environment(), which is safe at this quiescent point. */
     if (g_worker_populate_superglobals) {
-        /* Reset server-var registration to this request's set. */
-        server_var_count = 0;
-        for (size_t i = 0; i < req.server_var_count && i < MAX_SERVER_VARS; i++) {
-            ephpm_request_add_server_var(req.server_var_keys[i], req.server_var_vals[i]);
-        }
+        /* Point server-var registration at this request's whole set (no
+         * cap). The arrays borrow from CurrentRequest and stay valid until
+         * this request's send_response — the same lifetime the lazy
+         * Envelope accessors below rely on. */
+        ephpm_request_set_server_vars(
+            req.server_var_count, req.server_var_keys, req.server_var_vals);
         zend_try {
             php_hash_environment();
         } zend_catch {

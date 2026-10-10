@@ -106,7 +106,7 @@ would be shared by every tenant's threads.)
 | Variables | When |
 |---|---|
 | `REQUEST_METHOD`, `REQUEST_URI`, `SCRIPT_FILENAME`, `SCRIPT_NAME`, `PHP_SELF`, `DOCUMENT_ROOT`, `SERVER_NAME`, `SERVER_PORT`, `SERVER_PROTOCOL`, `QUERY_STRING`, `REMOTE_ADDR`, `REMOTE_PORT` | Every request. See [`$_SERVER` Variables](/architecture/http/#_server-variables). |
-| `SERVER_SOFTWARE` | Every request. Currently the fixed string `ePHPm/0.1.0`, whatever the release; do not use it to detect the version. |
+| `SERVER_SOFTWARE` | Every request. `ePHPm/<version>`, the same build version `ephpm --version` reports (the release tag on official builds, the crate version on local builds). |
 | `GATEWAY_INTERFACE` = `CGI/1.1`, `REDIRECT_STATUS` = `200` | Every request. |
 | `HTTPS` = `on` | Requests that arrived over TLS. |
 | `AUTH_TYPE`, `PHP_AUTH_USER`, `PHP_AUTH_PW`, `PHP_AUTH_DIGEST` | Derived from an `Authorization` header. See [HTTP Authentication Variables](/architecture/http/#http-authentication-variables). |
@@ -117,13 +117,11 @@ would be shared by every tenant's threads.)
 | `EPHPM_NODE_ID` | When this node has an identity: the running gossip node's id with `[cluster] enabled = true`, otherwise `[cluster] node_id` if it is set. Absent when neither applies. |
 | `WS_EVENT`, `WS_CONNECTION_ID`, `WS_OPCODE` | WebSocket events only. See [WebSockets](/guides/websockets/). |
 
-**Limit: 128 entries.** ePHPm registers at most 128 `$_SERVER` entries per
-request and drops the rest without an error. The fixed variables and the
-authentication variables are registered first, then one entry per request
-header, and the ePHPm-injected variables (`DB_*`, `DATABASE_URL`,
-`EPHPM_REDIS_*`, `EPHPM_NODE_ID`, `WS_*`) **last**. A request with roughly
-95 or more headers can therefore lose the injected variables, including a
-site's database credentials.
+**No entry limit.** Every variable is registered, however many request
+headers arrive. (Before this was fixed, ePHPm kept only the first 128
+entries; because the ePHPm-injected variables are registered after the
+request headers, a header-heavy request could lose a site's database
+credentials.)
 
 ## ini settings
 

@@ -101,11 +101,18 @@ mod ffi {
             path_translated: *const ::std::os::raw::c_char,
         );
 
-        /// Add a `$_SERVER` variable. Pointers must stay valid until
-        /// `ephpm_begin_request` returns.
-        pub fn ephpm_request_add_server_var(
-            key: *const ::std::os::raw::c_char,
-            value: *const ::std::os::raw::c_char,
+        /// Register the request's whole `$_SERVER` set: `count` parallel
+        /// key/value pointers. Every entry is registered (no cap). Both
+        /// arrays and every string they point to are borrowed, not copied,
+        /// and must stay valid until the request is shut down
+        /// (`ephpm_finish_request`, or the next `ephpm_begin_request`):
+        /// with `auto_globals_jit`, `$_SERVER` is registered when a script
+        /// that uses it is compiled, which can happen at any point in the
+        /// request, including destructors run by the shutdown.
+        pub fn ephpm_request_set_server_vars(
+            count: usize,
+            keys: *const *const ::std::os::raw::c_char,
+            vals: *const *const ::std::os::raw::c_char,
         );
 
         /// Queue one PHP middleware script for this request, in chain order.
@@ -1383,14 +1390,25 @@ impl PhpRuntime {
         // Build and pass server variables ($_SERVER). Built directly in
         // NUL-terminated form — the invariant entries are static C literals
         // and every dynamic one is allocated exactly once (issue #133).
+        // The wrapper borrows the whole set (no fixed cap — it used to keep
+        // only the first 128 and silently drop the rest, which lost the
+        // trailing per-site DB_*/WS_* vars on header-heavy requests).
         let c_server_vars = request.server_variables_c();
-        for (key, value) in &c_server_vars {
-            // Safety: the pointers stay valid until ephpm_begin_request
-            // returns — static literals live forever, owned CStrings live in
-            // `c_server_vars`, which outlives the call.
-            unsafe {
-                ffi::ephpm_request_add_server_var(key.as_ptr(), value.as_ptr());
-            }
+        let server_var_keys: Vec<*const std::os::raw::c_char> =
+            c_server_vars.iter().map(|(k, _)| k.as_ptr()).collect();
+        let server_var_vals: Vec<*const std::os::raw::c_char> =
+            c_server_vars.iter().map(|(_, v)| v.as_ptr()).collect();
+        // SAFETY: both pointer arrays hold `c_server_vars.len()` entries. The
+        // C side borrows the arrays themselves (not just the strings), so
+        // they move into IN_FLIGHT_REQUEST below together with
+        // `c_server_vars`, and stay alive until the request is shut down;
+        // moving a Vec does not move its heap buffer. The C side only reads.
+        unsafe {
+            ffi::ephpm_request_set_server_vars(
+                server_var_keys.len(),
+                server_var_keys.as_ptr(),
+                server_var_vals.as_ptr(),
+            );
         }
 
         // PHP middleware lane: queue the mounts the router matched for this
@@ -1443,6 +1461,8 @@ impl PhpRuntime {
         let in_flight: Box<dyn std::any::Any> = Box::new((
             [method, uri, query_string, content_type, cookie, script_filename],
             c_server_vars,
+            // The pointer arrays ephpm_request_set_server_vars borrowed.
+            (server_var_keys, server_var_vals),
             c_middleware,
             std::mem::take(&mut request.body),
         ));
