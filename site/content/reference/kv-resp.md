@@ -77,7 +77,7 @@ than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 | | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
-| | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. In a cluster these are **local to the node** (not replicated). |
+| | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
 | | `APPEND`, `STRLEN` | |
 | Keys | `DEL key...` | Removes the string and the hash of that name. |
 | | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`). |
@@ -128,7 +128,7 @@ What that means in practice:
 | Typical use | Works? |
 |---|---|
 | Key/value cache with TTLs (`GET`/`SET EX`/`SETEX`/`DEL`) | Yes |
-| Counters and fixed-window rate limits (`INCR` + `EXPIRE`) | Yes (per node when clustered) |
+| Counters and fixed-window rate limits (`INCR` + `EXPIRE`) | Yes (approximate cluster-wide when clustered: totals replicate last-writer-wins and can under-count) |
 | Session storage as a string key with a TTL | Yes |
 | Simple locks (`SET NX PX` + `DELIFEQ` to release) | Yes, but `DELIFEQ` is not a Redis command, so a client library's built-in lock release (usually a Lua `EVAL`) will not work |
 | Hash-per-object storage | Partly: `HSET`/`HGET`/`HGETALL` work, `HMGET`/`HINCRBY` do not |

@@ -55,7 +55,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `error` | Server-generated error responses: `400` path decoding, `403`/`404` from the security gates, `404`/`405` in `/_ephpm/`, fallback `=NNN` statuses, a `403` from `allowed_php_paths`, and a `stage="request"` timeout `504`. |
 | `health` | `/_ephpm/health`, `/_ephpm/ready` **and** `/_ephpm/primary`. |
 | `metrics` | Scrapes of the metrics path. |
-| `diagnostics` | `/_ephpm/requests`. |
+| `diagnostics` | `/_ephpm/requests`, including its `404` when the request timeline is off. |
 | `acme` | `/.well-known/acme-challenge/*`. |
 | `proxy` | `[[server.proxy]]` forwards. |
 | `websocket` | WebSocket upgrade requests (the `101` or the refusal). |

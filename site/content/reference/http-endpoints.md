@@ -67,7 +67,7 @@ which response headers it adds or changes.
 | `/_ephpm`, any other `/_ephpm/...` | `GET` | `404`, listing the four endpoints above. | `error` |
 | any `/_ephpm/...` above | not `GET` | `405` with `Allow: GET`. `HEAD` is refused too. | `error` |
 | `/_ephpm/auth/...` | any | **Not** answered by the server directly. Dispatched to the global `[[middleware]]` request-phase chain (the `github-auth` issuer's login and callback), *after* `trusted_hosts`, the malformed-Host gate, the hidden-file, manifest and blocked-path gates, and vhost resolution. `404` when no mounted module claims the path. The per-site preview gate does not run here. | `auth` |
-| `/.well-known/acme-challenge/<token>` | any | Always intercepted (after `trusted_hosts` and the malformed-Host gate). Serves the KV key `acme:challenge:<token>` if present, else `404`. Nothing in ePHPm writes those keys today: ACME uses TLS-ALPN-01, and HTTP-01 is not implemented. A side effect is that your application can never serve this path, so a certbot `--webroot` flow that writes files into the document root will not work against ePHPm. | `acme` |
+| `/.well-known/acme-challenge/<token>` | any | Always intercepted (after `trusted_hosts` and the malformed-Host gate). Serves the KV key `acme:challenge:<token>` if present, else `404`. Nothing in ePHPm writes those keys today: ACME uses TLS-ALPN-01 or DNS-01, and HTTP-01 is not implemented. A side effect is that your application can never serve this path, so a certbot `--webroot` flow that writes files into the document root will not work against ePHPm. | `acme` |
 
 The three probes all record `handler="health"`. Metrics scrapes and timeline
 polls record `handler="metrics"` and `handler="diagnostics"`, so a dashboard
@@ -171,7 +171,7 @@ backend); see [Reverse Proxy](/guides/reverse-proxy/).
 
 | Header | When |
 |---|---|
-| `Alt-Svc: h3=":<port>"; ma=<seconds>` | Every response on a TLS connection (including HTTP/3 itself) once the HTTP/3 socket has bound (`[server.http3] enabled = true`). `ma` is `[server.http3] alt_svc_max_age` (default `86400`); `0` suppresses the header. Never on plain HTTP. |
+| `Alt-Svc: h3=":<port>"; ma=<seconds>` | Every response on a TLS connection (including HTTP/3 itself), except the per-IP rate-limit `429`, once the HTTP/3 socket has bound (`[server.http3] enabled = true`). `ma` is `[server.http3] alt_svc_max_age` (default `86400`); `0` suppresses the header. Never on plain HTTP. |
 | `X-Ephpm-Preview: 1` | Every response the router produces when `[server] preview = true`, including errors, `429`s, `504`s and the internal endpoints. |
 | `Retry-After` | `1` on a shed `503` (`[php] overload = "shed"`); `2` on a site-override `503`; the bucket refill time on a per-site `429`. |
 | `Allow: GET` | `405` from `/_ephpm/*`. |
@@ -218,14 +218,15 @@ response, errors included.
   gzip-compressed when the type is compressible and the size is at least
   `[server.response] compression_min_size`. Files served from the open-file
   cache (`[server.file_cache]`, off by default) are offered **gzip only**,
-  never Brotli. Files
+  never Brotli — and with the cache on, that includes the first read of a file
+  up to 1 MiB, which is served from the entry it just created. Files
   larger than 1 MiB are streamed from disk uncompressed.
 - **`ETag`.** Weak in every case. Files up to 1 MiB read from disk get a
   content hash (`W/"<16 hex>"`). Files larger than 1 MiB, and anything served
   from the file cache, get `W/"<mtime-secs hex>-<size hex>"`.
-  `[server.static] etag = false` only turns off the first kind. Streamed files
-  and file-cache hits still send an `ETag` and still answer `If-None-Match`
-  with `304`.
+  `[server.static] etag = false` turns off the content-hash tag **and** all
+  `If-None-Match` handling. Streamed files and file-cache hits still send their
+  mtime+size `ETag`, but never answer `304`.
 - **No range requests and no `Last-Modified`.** There is no `Accept-Ranges`,
   no `206 Partial Content` and no `If-Modified-Since` handling, so interrupted
   downloads cannot resume and video seeking re-downloads from the start. Serve
