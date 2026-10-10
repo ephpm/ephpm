@@ -82,7 +82,7 @@ ephpm dev --sites ./sites
 | `-l` | `--listen <ADDR>` | `127.0.0.1:<port>` | Override the listen address entirely |
 | `-v` | `--verbose` | off | Increase log verbosity (repeatable) |
 
-**Configuration in dev mode:** `ephpm dev` never reads an `ephpm.toml`, not even one in the current directory. It starts from the built-in defaults and **does** apply `EPHPM_*` environment overrides, and then the flags above override the listen address, document root, and sites directory. So a dev server can still turn features on through the environment, for example `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` to enable the RESP listener for [`ephpm kv`](kv/). For anything more, use `ephpm serve --config`.
+**Configuration in dev mode:** `ephpm dev` never reads an `ephpm.toml`, not even one in the current directory. It starts from the built-in defaults and **does** apply `EPHPM_*` environment overrides, except for the listen address and document root, which `dev` always sets itself — from the flags above, or from their defaults — so `EPHPM_SERVER__LISTEN` and `EPHPM_SERVER__DOCUMENT_ROOT` have no effect. `--sites` likewise overrides the sites directory. So a dev server can still turn features on through the environment, for example `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` to enable the RESP listener for [`ephpm kv`](kv/). For anything more, use `ephpm serve --config`.
 
 **Port selection:** without `--listen`, `dev` tries `--port` and then each following port, up to 50 in total (`8080`–`8129` by default). If all of them are busy it exits with `no free port in range ...`.
 
@@ -331,7 +331,7 @@ What it does, in order:
 
 What `--user` changes per platform:
 
-- **Linux:** the unit gets `User=` / `Group=` plus a hardening profile: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (so the service can still bind ports 80/443), and `ReadWritePaths=` for the data dir, log dir, and default document root. Under `ProtectSystem=strict` everything else is read-only, so any other path the server must write to has to be added to `ReadWritePaths` in a drop-in. That covers a `sites_dir`, database, or ACME cache outside those three directories, and relative database/cache paths, which resolve against `/`.
+- **Linux:** the unit gets `User=` / `Group=` plus a hardening profile: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (so the service can still bind ports 80/443), and `ReadWritePaths=` for the data dir, log dir, and default document root. Under `ProtectSystem=strict` everything else is read-only, so any other path the server must write to has to be added to `ReadWritePaths` in a drop-in. That covers a `sites_dir`, database, or ACME cache outside those three directories, and relative database/cache paths, which resolve against `/`. It also covers the system temp directory: `ProtectSystem=strict` leaves `/tmp` read-only too, and that is where PHP writes uploads and file sessions by default and where multi-tenant mode keeps each site's private temp/session state (`/tmp/ephpm-vhosts/…`).
 - **macOS:** the plist gets `UserName` / `GroupName`. No other hardening is added.
 - **Windows:** not supported. Passing `--user` is a hard error, because the SCM needs a stored account password that ePHPm has no secure way to collect. It does not quietly install as `LocalSystem`.
 
@@ -388,7 +388,7 @@ ephpm logs -f
 - **Linux:** runs `journalctl -u ephpm.service --no-pager -n 200` (or `-f` with `--follow`). It falls back to the log file only if `journalctl` is missing or fails. The generated unit appends the server's stdout/stderr to `/var/log/ephpm/ephpm.log` (`StandardOutput=append:`), not to the journal, so the journal mostly holds systemd's own start/stop messages. Read the file for the server's output: `sudo tail -f /var/log/ephpm/ephpm.log`.
 - **macOS / Windows:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation).
 
-The log file is at the path in [Where things live](#where-things-live). If it doesn't exist, `logs` exits `1`.
+The log file is at the path in [Where things live](#where-things-live). On Linux `logs` reads the systemd journal first and falls back to that file only when `journalctl` fails; on macOS and Windows (or that Linux fallback), a missing log file makes `logs` exit `1`.
 
 ---
 

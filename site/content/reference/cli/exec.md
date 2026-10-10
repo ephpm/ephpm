@@ -134,7 +134,7 @@ clamped.
 
 `--no-sandbox` skips steps 2, 3, 4 and 6 above. The command runs with **the
 caller's full privileges** (root, under `sudo`): no Landlock scope, no uid
-drop, no `PR_SET_NO_NEW_PRIVS`. A warning is logged. It does not need root.
+drop, no `PR_SET_NO_NEW_PRIVS`. A warning is logged. It does not need root, but the tenant user (`run_as_user`, else `ephpm-web`) is still resolved first, so that account must exist.
 The config is still loaded, the site is still resolved, `--timeout` still
 applies, and the command still starts in the site's web root.
 
