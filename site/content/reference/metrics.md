@@ -148,13 +148,13 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests handled. `handler` is the route class; see the value table below. To keep series cardinality bounded, `method` is one of the standard verbs (`GET`, `POST`, ...) or `OTHER` for any non-standard verb, and `status` is the numeric code for the common statuses this server and typical apps emit or `other` for uncommon codes. Requests refused by the per-IP rate limit (`429`) are counted only in `ephpm_rate_limited_total`, not here. |
-| `ephpm_http_requests_in_flight` | gauge | — | Currently in-flight HTTP requests. **Drifts upward** when a client disconnects mid-request: the decrement runs after the handler returns, with no drop guard, so a request whose future is dropped never decrements. Treat the long-run level as unreliable; watch short-term changes. |
+| `ephpm_http_requests_in_flight` | gauge | — | Currently in-flight HTTP requests. Decremented however a request ends: a response, a timeout, or the client disconnecting mid-request. |
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | Request handling time, end-to-end (no `status` label). |
 | `ephpm_http_body_overflow_total` | counter | — | `413`s raised while **reading** a request body that turned out larger than `[server.request] max_body_size`: chunked or under-declared bodies, the middleware pre-buffer (`middleware_body_limit`), and worker-mode streamed bodies. A body whose declared `Content-Length` already exceeds the limit is refused before reading and is **not** counted. A body read error during the middleware pre-buffer is also answered `413` and counted here. |
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. `method` is bounded the same way as above (standard verb or `OTHER`). |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size before compression. Recorded on the PHP path only (`handler="php"`). |
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests answered `504` by `[server.timeouts] request`. Three values: `request` (the outer deadline around the whole request, in both modes), `fpm_pool` (per-request mode: the pool thread did not reply in time) and `worker` (worker mode: the worker did not reply in time). See the timeout note below: in practice most timeouts are recorded as `request`. |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests answered `504` because `[server.timeouts] request` expired. Each request has one deadline, measured from when it arrived. `stage` says what it was waiting on: `fpm_pool` (per-request mode, waiting on PHP), `worker` (worker mode, waiting on PHP), or `request` (anything else: routing, middleware, or a dispatch queue so full the request never got in). The `request` stage fires 50 ms after the deadline, so a request waiting on PHP is always counted under its PHP stage. When an `fpm_pool` or `worker` timeout's job had already **started** on a thread, that thread is also marked hung (`ephpm_fpm_pool_recycles_total` / `ephpm_worker_recycles_total` with `reason="hung"`). A job still in the queue at the deadline is overload, not a hung thread, and nothing is replaced. |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 | `ephpm_site_rate_limited_total` | counter | — | 429s from the per-site PHP rate limit (`[server.limits] per_site_rate`; on by default under `[server] preview`). |
 | `ephpm_site_override_unusable_total` | counter | — | 503s from a per-site override file that exists but cannot be honoured (`[server] site_overrides_dir`). Non-zero means a vhost is serving nothing rather than falling back to its whole container — see [Virtual Hosts → Failure modes](/guides/virtual-hosts/#failure-modes-a-broken-override-takes-the-site-out-of-service). |
@@ -181,23 +181,24 @@ Filtering out `handler="health"` still leaves Prometheus's own scrapes
 
 ### Timeouts and the `fpm_pool` / `worker` stages
 
-Two deadlines of the same length (`[server.timeouts] request`) are armed per
-PHP request. The outer one starts when the request arrives. The inner one
-starts only after routing, the body read and any dispatch-queue wait. Because
-the outer one starts first, it usually fires first and cancels the inner one.
-The `fpm_pool` and `worker` stages are recorded only when both deadlines expire
-on the same timer tick, which in practice means a request that got a thread
-within about a millisecond of arriving. Any request that queued for a thread
-times out as `stage="request"`.
+Each request has one deadline, `[server.timeouts] request` after it arrived.
+The wait for PHP's reply uses that same deadline, and the outer whole-request
+guard fires 50 ms later, so a request that is waiting on PHP when the deadline
+passes is always answered (`504`) and counted under `stage="fpm_pool"` or
+`stage="worker"`. `stage="request"` is left for requests stuck somewhere else:
+routing, middleware, or a dispatch queue so full the job never got in.
 
-The difference matters beyond the label. Only the `fpm_pool`/`worker` path
-marks the stuck thread as hung, replaces it, and increments
-`ephpm_fpm_pool_recycles_total{reason="hung"}` or
-`ephpm_worker_recycles_total{reason="hung"}`. A `stage="request"` timeout
-answers the client with `504` but leaves the thread running the request until
-PHP finishes it (or `max_execution_time` stops it, where enforced), and no
-replacement thread is started. So a `hung` recycle count of `0` does not mean
-no request outlived the timeout.
+A PHP-stage timeout replaces a thread only if the job had **started** on it:
+the thread is marked hung, a replacement is spawned, and
+`ephpm_fpm_pool_recycles_total{reason="hung"}` /
+`ephpm_worker_recycles_total{reason="hung"}` increments. A job still queued at
+the deadline is overload and replaces nothing. The hung thread keeps running
+until PHP finishes the request (or `max_execution_time` stops it, where
+enforced); when it answers, one surplus thread retires so the pool returns to
+its configured size. A request whose client disconnects while it waits on PHP
+is still watched until its deadline and counted hung the same way. On the
+worker-mode Xdebug debug lane, a timed-out request is only logged: its thread
+was never part of the serving pool.
 
 ## HTTP/3 (QUIC)
 
@@ -268,7 +269,7 @@ These appear in per-request mode (`[php] mode = "per_request"`, the default exec
 | `ephpm_fpm_pool_boot_failures_total` | counter | — | Pool threads that failed to start (thread spawn or TSRM registration failure). The pool respawns with exponential backoff. |
 | `ephpm_fpm_pool_panics_total` | counter | — | Rust panics escaping a PHP job. The request still gets a 500 and the thread is retired. A PHP bailout is *not* a panic and is not counted here. |
 | `ephpm_fpm_pool_contained_crashes_total` | counter | — | PHP C-stack overflows contained instead of aborting the process. Requires [`[php] crash_containment`](/reference/config/#php); always `0` without it. Any non-zero value means a request crashed PHP and a thread was poisoned. |
-| `ephpm_fpm_pool_recycles_total` | counter | `reason` | Pool threads retired and replaced. `reason` is `hung` (never responded within the request timeout; abandoned and replaced; only recorded on a `stage="fpm_pool"` timeout, see [the timeout note](#timeouts-and-the-fpm_pool--worker-stages)), `panic` (a Rust panic escaped the job), or `poisoned` (a crash was contained on it — abandoned **without** PHP teardown, since its Zend context is corrupt). |
+| `ephpm_fpm_pool_recycles_total` | counter | `reason` | Pool threads retired and replaced. `reason` is `hung` (was running a request that hit its deadline: abandoned and replaced, because a PHP thread cannot be killed safely; if it answers later, one surplus thread retires so the pool returns to its configured size), `panic` (a Rust panic escaped the job), or `poisoned` (a crash was contained on it — abandoned **without** PHP teardown, since its Zend context is corrupt). |
 
 ## Native middleware
 
@@ -293,14 +294,14 @@ These appear when `[php] mode = "worker"`.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_worker_pool_size` | gauge | — | Configured number of persistent worker threads, set at pool startup. |
-| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. **Drifts upward** after a `stage="request"` timeout or a client disconnect while a request is waiting on its worker: the decrement is skipped when the waiting future is dropped. Long-run levels are unreliable. |
+| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. Released when the wait ends for any reason, including a timeout or a client disconnect. |
 | `ephpm_worker_idle` | gauge | — | Workers parked in `take_request()` waiting for work (recorded inside the dispatch recv; only moves in PHP-linked builds). |
 | `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs sitting in the dispatch queue, sampled at each dispatch. |
 | `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to **enter** the dispatch queue (backpressure when the queue is full). Time spent inside the queue waiting for a free worker is not included. |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | Time from worker-thread start to the framework's first `take_request()` (i.e. framework boot time). |
 | `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `[php.worker] boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
-| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `[php.worker] max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced; only recorded on a `stage="worker"` timeout, see [the timeout note](#timeouts-and-the-fpm_pool--worker-stages)). |
+| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `[php.worker] max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (was running a request that hit its deadline: replaced; if it answers later, one surplus worker retires at its next `take_request()` so the pool returns to its configured size). |
 | `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than [`[server.timeouts] idle`](/reference/config/#servertimeouts-all-in-seconds) (default 60 s). Note that `idle` does double duty: it is both the connection idle timeout and the worker-mode streaming send timeout, so changing it moves this threshold too. |
 | `ephpm_worker_stream_aborts_total` | counter | — | Streamed responses whose worker died in a bailout after the headers were already sent. The body is deliberately ended with an error (no terminating chunk) so the client sees a failed transfer rather than a truncated 200. Any non-zero value is a PHP crash. |
 | `ephpm_xdebug_debug_requests_total` | counter | `outcome` | Worker-mode [Xdebug debug lane](/guides/xdebug/) requests (only present when the lane is armed — Xdebug loaded with step debugging on). Per request: `dispatched` (a debug thread was spawned), or a refusal instead — `rejected` (answered 503: `16 × debug_workers` requests were already waiting for a debug slot, or `2 × debug_workers` debug threads are alive) or `spawn_failed` (OS thread spawn failed; 503). `abandoned` counts dispatched requests whose HTTP side gave up first (request timeout or client disconnect) — the thread keeps running until the debugger releases it. Per debug thread, how it ended: `ok`, `no_response` (script finished without answering → 500), `script_exit`, `script_fatal`, `bailout`, `run_failed`, `startup_failed` (request startup failed → 500). |

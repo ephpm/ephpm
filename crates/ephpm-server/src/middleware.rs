@@ -202,6 +202,56 @@ pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
     })
 }
 
+/// Short names of the built-in modules, as [`builtin_short_name`] reports them.
+const BUILTIN_SHORT_NAMES: &[&str] = &[
+    "jwt",
+    "cors",
+    "ratelimit",
+    "security-headers",
+    "session-cookie",
+    "preview-gate",
+    "api-key",
+    "ip-allowlist",
+    "maintenance-mode",
+    "redirect",
+    "request-id",
+    "header-transform",
+];
+
+/// Which built-in module a `[[middleware]] library` value mounts, by its short
+/// name (`"ratelimit"`, `"jwt"`, ...), or `None` for anything else.
+///
+/// Recognises every spelling [`builtin`] resolves — short name, crate name,
+/// `-`/`_` interchangeable, `rate-limit` — and also a path to the shipped
+/// cdylib shell of the same module (`./libephpm_middleware_ratelimit.so`,
+/// `ephpm-middleware-ratelimit.linux-x86_64.so`), which runs the same code
+/// through `dlopen`. A path-like value must carry the `ephpm-middleware-`
+/// crate prefix to count: a third-party `./ratelimit.so` is somebody else's
+/// module. Startup checks that care about *which* module is mounted (the
+/// cluster rate-limit warning) go through here rather than comparing the raw
+/// `library` string.
+#[must_use]
+pub fn builtin_short_name(library: &str) -> Option<&'static str> {
+    let path_like = library.contains(['/', '\\', '.']);
+    // File name, then everything before the first `.` (extension and any
+    // `.<os>-<arch>` tag).
+    let file = library.rsplit(['/', '\\']).next().unwrap_or(library);
+    let stem = file.split('.').next().unwrap_or(file);
+    let canonical = stem.replace('_', "-");
+    let crate_form = if path_like {
+        canonical.strip_prefix("lib").unwrap_or(&canonical)
+    } else {
+        canonical.as_str()
+    };
+    let short = match crate_form.strip_prefix("ephpm-middleware-") {
+        Some(short) => short,
+        None if !path_like => crate_form,
+        None => return None,
+    };
+    let short = if short == "rate-limit" { "ratelimit" } else { short };
+    BUILTIN_SHORT_NAMES.iter().copied().find(|name| *name == short)
+}
+
 /// Outcome of evaluating the middleware chain for one request.
 pub enum ChainVerdict {
     /// Proceed to PHP dispatch, applying any accumulated rewrites.
@@ -398,6 +448,13 @@ impl MiddlewareChain {
     #[must_use]
     pub fn module_names(&self) -> Vec<&str> {
         self.modules.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    /// Whether any mount is the built-in module `short` (e.g. `"ratelimit"`),
+    /// however its `library` value spells it — see [`builtin_short_name`].
+    #[must_use]
+    pub fn mounts_builtin(&self, short: &str) -> bool {
+        self.modules.iter().any(|m| builtin_short_name(&m.name) == Some(short))
     }
 
     /// Evaluate the chain for one request.
@@ -1183,6 +1240,60 @@ mod tests {
         for name in ["", "jwtx", "my-auth", "jwt.so", "./jwt", "middleware/jwt", "JWT"] {
             assert!(builtin(name).is_none(), "\"{name}\" should NOT resolve as builtin");
         }
+    }
+
+    /// Every spelling the registry accepts names a short name, and that short
+    /// name is itself a registry entry — so a check keyed on the short name
+    /// (the cluster rate-limit warning) cannot miss an alias the registry
+    /// honours.
+    #[test]
+    fn builtin_short_name_covers_every_registry_spelling() {
+        for short in BUILTIN_SHORT_NAMES {
+            assert!(builtin(short).is_some(), "\"{short}\" must be a registry entry");
+            let long = format!("ephpm-middleware-{short}");
+            for spelling in [(*short).to_owned(), short.replace('-', "_"), long.clone()] {
+                assert_eq!(builtin_short_name(&spelling), Some(*short), "{spelling}");
+            }
+            assert_eq!(builtin_short_name(&long.replace('-', "_")), Some(*short));
+        }
+    }
+
+    /// The rate-limit warning bug (it matched only `"ratelimit"` exactly):
+    /// every alias, and the dlopened cdylib shell, is the same module.
+    #[test]
+    fn builtin_short_name_recognises_every_ratelimit_form() {
+        for spelling in [
+            "ratelimit",
+            "rate-limit",
+            "rate_limit",
+            "ephpm-middleware-ratelimit",
+            "ephpm_middleware_ratelimit",
+            "./libephpm_middleware_ratelimit.so",
+            "/usr/local/lib/ephpm/middleware/libephpm_middleware_ratelimit.dylib",
+            r"C:\ephpm\ephpm_middleware_ratelimit.dll",
+            "ephpm-middleware-ratelimit.linux-x86_64.so",
+        ] {
+            assert_eq!(builtin_short_name(spelling), Some("ratelimit"), "{spelling}");
+        }
+        // A third-party module that merely shares the short name, or
+        // anything else, is not the builtin.
+        for other in ["./ratelimit.so", "libratelimit.so", "my-ratelimit", "jwt", "php:limit.php"] {
+            assert_ne!(builtin_short_name(other), Some("ratelimit"), "{other}");
+        }
+    }
+
+    #[test]
+    fn mounts_builtin_matches_an_aliased_mount() {
+        wire_kv();
+        let mounts = vec![builtin_mount(
+            "ephpm_middleware_ratelimit",
+            None,
+            10,
+            serde_json::json!({ "per_ip_rps": 5 }),
+        )];
+        let chain = MiddlewareChain::load(&mounts).expect("aliased ratelimit loads");
+        assert!(chain.mounts_builtin("ratelimit"));
+        assert!(!chain.mounts_builtin("jwt"));
     }
 
     /// `session-cookie` mounted from the static registry: an unauthenticated

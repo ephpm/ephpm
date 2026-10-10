@@ -708,6 +708,13 @@ that bailed out.**
   metric surfaces the bad script. This matches how every persistent-PHP server
   (FrankenPHP, RoadRunner) handles a genuinely-wedged worker: replace, don't
   kill.
+  *As implemented* (`crates/ephpm-server/src/php_wait.rs`): the request has one
+  deadline, and the oneshot wait uses it while the outer guard fires 50 ms later,
+  so the worker-aware arm always answers. Only a job the worker had already
+  pulled marks it hung (a job still queued at the deadline is overload). The
+  abandoned worker is not excluded from the queue; if it comes back, one
+  surplus worker retires at its next `take_request()` so the pool returns to
+  `worker_count`.
 - **Dead worker (thread panicked / boot-failed).** `WorkerPool` holds
   `JoinHandle`s; a supervision task (`tokio::spawn` a monitor, or a
   `on_thread_stop`-style hook) notices a terminated worker and respawns to

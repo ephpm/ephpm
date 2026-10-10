@@ -236,9 +236,11 @@ response, errors included.
 - **`ETag`.** Weak in every case. Files up to 1 MiB read from disk get a
   content hash (`W/"<16 hex>"`). Files larger than 1 MiB, and anything served
   from the file cache, get `W/"<mtime-secs hex>-<size hex>"`.
-  `[server.static] etag = false` turns off the content-hash tag **and** all
-  `If-None-Match` handling. Streamed files and file-cache hits still send their
-  mtime+size `ETag`, but never answer `304`.
+  `If-None-Match` is evaluated on `GET`/`HEAD` with RFC 9110 weak comparison
+  (`W/"x"` matches `"x"`). `[server.static] etag = false` turns off the
+  `ETag` header **and** the `304` on every static path (small, streamed and
+  file-cache). It does not affect the PHP ETag cache, which has its own
+  switch (`[server.php_etag_cache] enabled`).
 - **No range requests and no `Last-Modified`.** There is no `Accept-Ranges`,
   no `206 Partial Content` and no `If-Modified-Since` handling, so interrupted
   downloads cannot resume and video seeking re-downloads from the start. Serve

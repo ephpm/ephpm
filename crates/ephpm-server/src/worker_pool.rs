@@ -16,10 +16,13 @@
 //! - **Crash recovery:** a fatal bailout unwinds past `send_response`; the
 //!   parked `oneshot::Sender` is still stashed, so the thread fulfils it with a
 //!   500 (the in-flight request never hangs) and the worker is recycled.
-//! - **Hung-worker replacement:** on an `oneshot` timeout the router calls
+//! - **Hung-worker replacement:** when a request the worker had already pulled
+//!   is still unanswered at the request deadline, the router calls
 //!   [`WorkerPool::note_hung`]; the pool spawns a replacement and abandons the
 //!   stuck thread (a wedged PHP thread cannot be killed without corrupting the
-//!   ZMM — replace, don't kill; matches RoadRunner / FrankenPHP).
+//!   ZMM — replace, don't kill; matches RoadRunner / FrankenPHP). If the stuck
+//!   worker answers after all, [`WorkerPool::note_recovered`] lets one surplus
+//!   worker retire at its next `take_request()` (see `crate::php_wait`).
 //! - **Graceful drain:** [`WorkerPool::drain`] closes the dispatch sender;
 //!   each worker's `take_request()` then returns null, the loop ends, and the
 //!   thread exits after any in-flight request completes.
@@ -141,6 +144,12 @@ struct PoolState {
     draining: AtomicBool,
     /// Monotonic id source for worker threads (metric label / logging).
     next_id: AtomicUsize,
+    /// Workers marked hung ([`WorkerPool::note_hung`]) that have not answered
+    /// yet: live, but not serving.
+    hung: AtomicUsize,
+    /// Surplus workers that have claimed retirement
+    /// ([`WorkerPool::claim_surplus`]) but not yet left `live`.
+    retiring: AtomicUsize,
 }
 
 impl WorkerPool {
@@ -167,6 +176,8 @@ impl WorkerPool {
             boot_failures: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             next_id: AtomicUsize::new(0),
+            hung: AtomicUsize::new(0),
+            retiring: AtomicUsize::new(0),
         });
 
         gauge!("ephpm_worker_pool_size").set(worker_count as f64);
@@ -225,6 +236,19 @@ impl WorkerPool {
         self.state.live.load(Ordering::Acquire)
     }
 
+    /// Play a worker in tests: pull the next queued job (as `take_request`
+    /// would — depth accounting and the `started` flag included) without
+    /// answering it.
+    #[cfg(test)]
+    pub(crate) fn pull_job_for_test(&self) -> Option<WorkerJob> {
+        let job = self.dispatch_rx.try_recv().ok()?;
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        if let Some(started) = &job.started {
+            started.store(true, Ordering::Release);
+        }
+        Some(job)
+    }
+
     /// Current dispatch-queue depth (jobs enqueued, not yet pulled by a
     /// worker). Test-only accessor for the counter-pair accounting.
     #[cfg(test)]
@@ -252,8 +276,23 @@ impl WorkerPool {
         &self,
         request: WorkerRequestOwned,
     ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
+        self.dispatch_tracked(request, None).await
+    }
+
+    /// [`WorkerPool::dispatch`], plus a flag the worker raises when it pulls
+    /// the job — how the router tells a request that was *running* at its
+    /// deadline (the worker may be hung) from one still queued (it is not).
+    ///
+    /// # Errors
+    ///
+    /// As [`WorkerPool::dispatch`].
+    pub(crate) async fn dispatch_tracked(
+        &self,
+        request: WorkerRequestOwned,
+        started: Option<Arc<AtomicBool>>,
+    ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
         if self.admission_policy == AdmissionPolicy::Barge {
-            return self.dispatch_barge(request).await;
+            return self.dispatch_barge(request, started).await;
         }
         // Wait for a queue slot in strict arrival order. Errors only when
         // `drain()` closed the semaphore.
@@ -261,7 +300,7 @@ impl WorkerPool {
             return Err(DispatchClosed);
         };
         let (tx, rx) = oneshot::channel();
-        let job = WorkerJob { request, respond_to: tx, admission: Some(permit) };
+        let job = WorkerJob { request, respond_to: tx, admission: Some(permit), started };
         // Holding a permit guarantees a free channel slot (capacity == permit
         // count, and every enqueued job holds one permit until a worker pulls
         // it), so this `try_send` cannot see `Full` — no await, no suspension,
@@ -300,9 +339,10 @@ impl WorkerPool {
     async fn dispatch_barge(
         &self,
         request: WorkerRequestOwned,
+        started: Option<Arc<AtomicBool>>,
     ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
         let (tx, rx) = oneshot::channel();
-        let job = WorkerJob { request, respond_to: tx, admission: None };
+        let job = WorkerJob { request, respond_to: tx, admission: None, started };
         // Account the enqueue before the (awaitable) send so a worker pulling
         // concurrently can only ever decrement a value we already added. The
         // rollback guard undoes it if the job never enters the queue — on the
@@ -321,10 +361,13 @@ impl WorkerPool {
         }
     }
 
-    /// Record that a worker appears hung (its `oneshot` timed out). The stuck
-    /// thread is abandoned and a replacement is spawned to keep the pool at
-    /// `worker_count` live pullers (design §5.4).
+    /// Record that a worker appears hung (its request was running at the
+    /// request deadline and had not answered). The stuck thread is abandoned
+    /// and a replacement is spawned to keep the pool at `worker_count` serving
+    /// workers (design §5.4). Pair every call with
+    /// [`WorkerPool::note_recovered`] once the worker answers.
     pub fn note_hung(self: &Arc<Self>) {
+        self.state.hung.fetch_add(1, Ordering::AcqRel);
         counter!("ephpm_worker_recycles_total", "reason" => "hung").increment(1);
         // The stuck thread still holds its dispatch-receiver clone and may
         // eventually finish; we simply add capacity. A brief over-provision is
@@ -333,6 +376,28 @@ impl WorkerPool {
             self.spawn_worker();
             tracing::warn!("worker appeared hung — spawned replacement, abandoned stuck thread");
         }
+    }
+
+    /// A worker passed to [`WorkerPool::note_hung`] answered (or dropped) its
+    /// request at last. If it is still serving, the pool is one worker over
+    /// target and the next worker to ask for a request retires
+    /// ([`WorkerPool::claim_surplus`]).
+    pub fn note_recovered(&self) {
+        crate::php_wait::release_hung(&self.state.hung);
+    }
+
+    /// Claim retirement for the calling worker if the pool is over target
+    /// (live workers, minus hung and already-retiring ones, exceed
+    /// `worker_count`). At most one worker claims each surplus slot. Called by
+    /// the worker bridge between requests.
+    fn claim_surplus(&self) -> bool {
+        !self.state.draining.load(Ordering::Acquire)
+            && crate::php_wait::claim_surplus(
+                &self.state.live,
+                &self.state.hung,
+                &self.state.retiring,
+                self.worker_count,
+            )
     }
 
     /// Begin graceful drain: stop accepting new jobs and let workers exit once
@@ -406,6 +471,12 @@ fn worker_main(
     ephpm_php::worker_bridge::set_dispatch_depth_counter(Arc::clone(&pool.queue_depth));
     ephpm_php::worker_bridge::set_max_requests(max_requests);
     ephpm_php::worker_bridge::set_stream_send_timeout(pool.stream_send_timeout);
+    // Between requests the bridge asks whether this worker is surplus (a hung
+    // worker's replacement still running after the hung one came back).
+    {
+        let pool = Arc::clone(pool);
+        ephpm_php::worker_bridge::set_retire_check(Box::new(move || pool.claim_surplus()));
+    }
 
     // TSRM register + start the one long-lived request the whole loop runs in.
     if let Err(e) = PhpRuntime::worker_thread_init() {
@@ -467,6 +538,7 @@ fn worker_main(
 
     // The worker is no longer serving (only if it ever was).
     let was_booted = booted.load(Ordering::Acquire);
+    let retired_surplus = ephpm_php::worker_bridge::retired_as_surplus();
     if was_booted {
         pool.state.ready.fetch_sub(1, Ordering::AcqRel);
     }
@@ -477,7 +549,14 @@ fn worker_main(
                 // Clean loop end: graceful drain or max_requests recycle.
                 let requests_served = ephpm_php::worker_bridge::requests_handled();
                 let uptime_secs = boot_start.elapsed().as_secs_f64();
-                if pool.state.draining.load(Ordering::Acquire) {
+                if retired_surplus {
+                    tracing::debug!(
+                        worker_id,
+                        requests_served,
+                        uptime_secs,
+                        "worker retired — pool back to target after a hung worker recovered",
+                    );
+                } else if pool.state.draining.load(Ordering::Acquire) {
                     tracing::debug!(
                         worker_id,
                         requests_served,
@@ -602,15 +681,20 @@ fn worker_main(
     PhpRuntime::worker_thread_shutdown();
 
     pool.state.live.fetch_sub(1, Ordering::AcqRel);
+    if retired_surplus {
+        pool.state.retiring.fetch_sub(1, Ordering::AcqRel);
+    }
     respawn_if_running(pool);
 }
 
 /// Spawn a replacement worker unless the pool is draining or already at target.
 ///
-/// Gating on `live < worker_count` is what makes hung-worker replacement
-/// self-balancing: `note_hung` spawns a replacement (live -> count+1) while the
-/// stuck thread is abandoned; when that stuck thread eventually exits it finds
-/// `live == count` and does NOT respawn, so the pool converges back to target.
+/// Gating on `live < worker_count` keeps hung-worker replacement from
+/// compounding: `note_hung` spawns a replacement (live -> count+1) while the
+/// stuck thread is abandoned. When that stuck thread eventually exits it finds
+/// `live == count` and does NOT respawn; when it instead goes back to serving,
+/// `note_recovered` + `claim_surplus` retire one worker at its next
+/// `take_request()`. Either way the pool converges back to target.
 fn respawn_if_running(pool: &Arc<WorkerPool>) {
     if pool.state.draining.load(Ordering::Acquire) {
         return;
