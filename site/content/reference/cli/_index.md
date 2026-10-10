@@ -129,12 +129,13 @@ ephpm php -r "exit(42);"; echo $?   # → 42
 - The `ephpm php` subcommand disables clap's help flag so `-h` passes through to PHP instead of being intercepted.
 - Backed by `ephpm_cli_main()` in `crates/ephpm-php/ephpm_wrapper.c`, which uses PHP's own `php_getopt` with a copy of the CLI SAPI's option table.
 - Output goes directly to stdout/stderr — same PHP version, same extensions, same INI overrides as the server.
+- `PHP_BINARY` is the `ephpm` executable, and `ephpm` answers as php-cli when a script re-invokes it (`PHP_BINARY script.php`, `-r`, `-d`, bare with stdin), or when it is installed under a php name (`ln -s ephpm php`). See [Re-invoking `PHP_BINARY`](php/#re-invoking-php_binary).
 
 ---
 
 ## `ephpm composer`
 
-Install dependencies with the embedded [vivacity](https://github.com/Adelagric/vivacity) installer (pinned to 0.17.0), a Rust reimplementation of Composer's `install`, `update`, `require`, `remove` and `dump-autoload` that is compiled into the binary. Every argument after `composer` is forwarded verbatim, and the process exits with vivacity's exit code. It is **not** full Composer. No other command exists. Scripts do not run unless you pass `--run-scripts`, which needs a real `composer`. Some common Composer flags (`--no-interaction`, `--prefer-dist`, `-q`) are usage errors on `install`/`update`. `update`/`require`/`remove` need a `php` executable on `PATH` for the platform probe. Locks it cannot install natively are handed to a real `composer` on `PATH`, and without one it exits `3`. Read the [full `composer` reference](composer/) before relying on it.
+Install dependencies with the embedded [vivacity](https://github.com/Adelagric/vivacity) installer (pinned to 0.17.0), a Rust reimplementation of Composer's `install`, `update`, `require`, `remove` and `dump-autoload` that is compiled into the binary. Every argument after `composer` is forwarded verbatim, and the process exits with vivacity's exit code. It is **not** full Composer. No other command exists. Scripts do not run unless you pass `--run-scripts`, which needs a real `composer`. Some common Composer flags (`--no-interaction`, `--prefer-dist`, `-q`) are usage errors on `install`/`update`. `update`/`require`/`remove` need a `php` executable for the platform probe: a PHP-linked `ephpm` uses itself, a stub build needs `php` on `PATH`. Locks it cannot install natively are handed to a real `composer` on `PATH`, and without one it exits `3`. Read the [full `composer` reference](composer/) before relying on it.
 
 ```bash
 # Install locked dependencies (drop-in `composer install`)
@@ -151,7 +152,7 @@ ephpm composer --version   # → vivacity <x.y.z>
 ```
 
 **Implementation notes:**
-- Nothing here links PHP, so the subcommand exists in every build, including stub mode and Windows. `install` and `dump-autoload` of an in-scope lock need neither PHP nor Composer. `update`/`require`/`remove` run an external `php` (`VIVACITY_PHP` or `php` on `PATH`, never the embedded one) to probe platform requirements. The out-of-scope fallback and `--run-scripts` shell out to a real `composer` on `PATH`.
+- Nothing here links PHP, so the subcommand exists in every build, including stub mode and Windows. `install` and `dump-autoload` of an in-scope lock need neither PHP nor Composer. `update`/`require`/`remove` run a `php` to probe platform requirements: `VIVACITY_PHP` if you set it, otherwise — in a PHP-linked build — `ephpm` sets it to its own executable (which answers as php-cli when re-invoked, see [`ephpm php`](php/#re-invoking-php_binary)), and in a stub build `php` on `PATH`. The out-of-scope fallback and `--run-scripts` shell out to a real `composer` on `PATH`.
 - The subcommand disables clap's help flag and captures all trailing arguments verbatim (`trailing_var_arg` + `allow_hyphen_values`); a synthetic `composer` program-name element is prepended before dispatch to `vivacity::run`.
 
 ---

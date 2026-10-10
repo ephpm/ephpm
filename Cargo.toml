@@ -451,7 +451,9 @@ turso = { version = "=0.7.2", default-features = false }
 # its upstream's stated target). It links no PHP, so the subcommand works in
 # stub mode too. At runtime it shells out to a real `composer` for the
 # out-of-scope fallback and `--run-scripts`, and `update`/`require`/`remove`
-# run an external `php` for the platform probe. User-facing docs, pinned to
+# run a `php` for the platform probe (`$VIVACITY_PHP`; a PHP-linked ephpm sets
+# it to its own executable, which answers as php-cli — see
+# crates/ephpm/src/php_personality.rs). User-facing docs, pinned to
 # this version: site/content/reference/cli/composer.md. Pinned to
 # the exact published version whose `vivacity::run()` embed entry point was
 # verified (argv[0] = program name; returns the process exit code as `i32`).

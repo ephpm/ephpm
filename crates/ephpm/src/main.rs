@@ -32,6 +32,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod exec_sandbox;
 mod fatal_signal;
+mod php_personality;
 mod service;
 mod site_db;
 
@@ -192,9 +193,11 @@ enum Commands {
     /// `--run-scripts`, and locks it cannot install natively are handed to a
     /// real `composer` on `PATH` (exit 3 without one). `install` and
     /// `dump-autoload` need no PHP, so they work in every build, including
-    /// stub mode, and on Windows. `update`, `require` and `remove` run an
-    /// external `php` (`VIVACITY_PHP` or `php` on `PATH`) to probe platform
-    /// requirements. The process exits with vivacity's exit code.
+    /// stub mode, and on Windows. `update`, `require` and `remove` run a `php`
+    /// to probe platform requirements: in a PHP-linked build that is this
+    /// `ephpm` binary itself (so no system PHP is needed), in a stub build
+    /// `VIVACITY_PHP` or `php` on `PATH`. The process exits with vivacity's
+    /// exit code.
     ///
     /// Examples: `ephpm composer install --no-dev --optimize-autoloader`,
     /// `ephpm composer dump-autoload -o`, `ephpm composer --version`.
@@ -474,6 +477,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> anyhow::Result<ExitCode> {
+    // Re-invoked as `php` (argv[0] `php`/`php8.x`, or `PHP_BINARY …` from a
+    // script under `ephpm php`/`ephpm composer`)? Then argv belongs to php-cli,
+    // not to clap. See `php_personality` for the exact rules.
+    if let Some(php_args) = php_personality::php_args(
+        &std::env::args_os().collect::<Vec<_>>(),
+        php_personality::marker_set(),
+        is_ephpm_subcommand,
+        |arg| std::path::Path::new(arg).is_file(),
+    )? {
+        return run_php(None, None, &php_args);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -853,6 +868,18 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
     anyhow::bail!("no free port in range {start_port}..={}", start_port.saturating_add(49))
 }
 
+/// Whether `name` is one of `ephpm`'s own subcommands (or an alias, or clap's
+/// implicit `help`) — the tokens that keep their ePHPm meaning even when the
+/// binary is re-invoked through `PHP_BINARY` (see `php_personality`).
+fn is_ephpm_subcommand(name: &str) -> bool {
+    use clap::CommandFactory;
+
+    name == "help"
+        || Cli::command()
+            .get_subcommands()
+            .any(|sub| sub.get_name() == name || sub.get_all_aliases().any(|a| a == name))
+}
+
 /// The verbatim argument list for `ephpm php`, including any `--` separator.
 ///
 /// `--` is *meaningful* to php-cli: it ends option parsing, so
@@ -928,6 +955,10 @@ fn run_php(
     site: Option<String>,
     args: &[String],
 ) -> anyhow::Result<ExitCode> {
+    // Before any thread exists: let `PHP_BINARY …` re-invocations from this
+    // script come back as php-cli rather than as `ephpm` (php_personality).
+    php_personality::export_for_children(false);
+
     // Hold the runtime for the whole PHP execution when a --site backend is
     // bound: the bridge captured its `Handle` and `block_on`s onto it from PHP.
     let _db_runtime = match site {
@@ -984,6 +1015,11 @@ fn run_php(
 /// returning through `main`, so the exact Composer exit code reaches CI and
 /// shells unmodified.
 fn run_composer(args: Vec<std::ffi::OsString>) -> anyhow::Result<ExitCode> {
+    // Point vivacity's platform probe (`$VIVACITY_PHP <probe.php>`) at this
+    // binary when it embeds PHP, so update/require/remove need no system php,
+    // and mark the environment so that re-invocation runs as php-cli. Must
+    // precede vivacity::run, which spawns threads.
+    php_personality::export_for_children(true);
     let forwarded =
         std::iter::once(std::ffi::OsString::from("composer")).chain(args).collect::<Vec<_>>();
     // vivacity reqwest uses rustls-tls-no-provider, so it consults the process
@@ -2554,6 +2590,20 @@ mod php_arg_tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn subcommand_names_come_from_the_real_cli() {
+        // The php-personality rules defer to these names, so they must track
+        // the actual clap tree — including hidden ones and clap's `help`.
+        for name in ["serve", "dev", "php", "composer", "kv", "cache", "help"] {
+            assert!(is_ephpm_subcommand(name), "{name} is an ephpm subcommand");
+        }
+        // Hidden, and only compiled into the Windows build.
+        assert_eq!(is_ephpm_subcommand("service-run"), cfg!(windows));
+        for name in ["script.php", "artisan", "-r", "", "vendor/bin/phpunit"] {
+            assert!(!is_ephpm_subcommand(name), "{name:?} is not an ephpm subcommand");
+        }
     }
 
     #[test]
