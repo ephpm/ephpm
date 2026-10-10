@@ -225,6 +225,13 @@ mod ffi {
         /// the full ZTS-aware rationale.
         pub fn ephpm_pre_init();
 
+        /// Outcome of the `sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0)` call
+        /// the C side makes during module startup: `0` = SQLite's
+        /// process-wide memory-statistics mutex is off, a positive SQLite
+        /// error code = the call was refused, `-1` = not run / no SQLite
+        /// linked. Read-only; safe at any time.
+        pub fn ephpm_sqlite_memstatus_result() -> ::std::os::raw::c_int;
+
         /// Set a custom php.ini file path. Must be called BEFORE
         /// `php_embed_init()` so the ini file is loaded during module startup.
         /// Also backs the CLI `-c <path>` flag.
@@ -837,6 +844,29 @@ impl PhpRuntime {
         Self::init_with_ini_file(None)
     }
 
+    /// Outcome of the SQLite tuning done during PHP module startup:
+    /// `sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0)`, which removes the
+    /// process-wide mutex SQLite otherwise takes on every allocation (see
+    /// `ephpm_tune_sqlite` in the C wrapper).
+    ///
+    /// `0` = memory statistics are off; a positive SQLite error code = the
+    /// call was refused (`21` = `SQLITE_MISUSE`: SQLite was initialized
+    /// before PHP module startup); `-1` = PHP is not initialized yet, or this
+    /// build links no SQLite (always `-1` in stub mode).
+    #[must_use]
+    pub fn sqlite_memstatus_result() -> i32 {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: reads a plain int the C side writes once during module
+            // startup. No PHP call, no longjmp, no pointer.
+            unsafe { ffi::ephpm_sqlite_memstatus_result() }
+        }
+        #[cfg(not(php_linked))]
+        {
+            -1
+        }
+    }
+
     /// Initialize the PHP runtime with a custom ini file.
     ///
     /// If `ini_file` is `Some`, that file will be loaded before any PHP
@@ -903,6 +933,17 @@ impl PhpRuntime {
             // Freeze the Xdebug trigger settings while we are still on the
             // php_embed_init() thread (ini values are per-thread under ZTS).
             xdebug::capture();
+
+            match Self::sqlite_memstatus_result() {
+                0 => tracing::debug!("SQLite memory statistics disabled for threaded PHP"),
+                -1 => {}
+                rc => tracing::warn!(
+                    rc,
+                    "could not disable SQLite memory statistics (SQLite was initialized \
+                     before PHP module startup); pdo_sqlite/sqlite3 will serialize on a \
+                     process-wide allocator mutex under concurrent requests"
+                ),
+            }
 
             tracing::info!("PHP runtime initialized (libphp linked)");
         }
