@@ -143,9 +143,10 @@ mod imp {
     /// On [`Guarded::Contained`], `work` was abandoned mid-flight by a
     /// `siglongjmp` out of the signal handler: any Rust value created **inside**
     /// `work` is leaked (its destructor does not run), which is acceptable for a
-    /// contained crash. Keep `work` minimal — in ePHPm it wraps only the single
-    /// `ephpm_execute_request` FFI call, so the leak is the abandoned Zend
-    /// request, not Rust state.
+    /// contained crash. Keep `work` minimal — in ePHPm it wraps exactly one
+    /// request-lifecycle FFI call (`ephpm_begin_request`, `ephpm_run_request`
+    /// or `ephpm_finish_request`), so the leak is the abandoned Zend request,
+    /// not Rust state.
     pub fn run_guarded<F: FnOnce()>(work: F) -> Guarded {
         // The closure is moved into an `Option` so the trampoline can take it by
         // value exactly once. A raw pointer to it crosses the C boundary.

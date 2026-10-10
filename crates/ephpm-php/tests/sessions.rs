@@ -113,7 +113,6 @@ const SESSION_INI: &str = r#"
 ini_set('session.save_handler', 'ephpm');
 ini_set('session.use_strict_mode', '1');
 ini_set('session.use_cookies', '0');
-ini_set('session.use_only_cookies', '0');
 ini_set('session.cache_limiter', '');
 ini_set('session.gc_maxlifetime', '600');
 "#;
