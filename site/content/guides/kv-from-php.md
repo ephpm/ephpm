@@ -258,18 +258,23 @@ ephpm_kv_expire("session:{$id}", 3600);         // 1 hour (seconds)
 
 ## Shutdown functions and destructors
 
-**Do not put KV calls in `register_shutdown_function()` callbacks or in
-`__destruct()`.** ePHPm keeps one long-lived SAPI request open per worker
-thread, so a shutdown function does not run at the end of *your* request —
-it runs when the worker thread itself retires, by which point that thread's
-per-request KV state is gone.
+**Per-request mode (the default):** both work. `register_shutdown_function()`
+callbacks run right after the script, before the response is captured;
+global objects' `__destruct()` runs in `php_request_shutdown()` right after
+the response is sent, on the same thread and still scoped to the request's
+own keyspace. (Before v0.11.3 that teardown waited for the thread's next
+request.) Output from a destructor is discarded.
 
-Calls made from there fail closed rather than crashing the server: a `get`
-reports a miss, a `set` returns `false`, and in multi-tenant mode nothing
-falls back to another site's keyspace. Do your KV work inside the request.
+**Worker mode:** a worker keeps one long-lived SAPI request open per thread,
+so shutdown functions and end-of-script destructors run when the worker
+thread itself retires, by which point that thread's per-request KV state is
+gone. Calls made from there fail closed rather than crashing the server: a
+`get` reports a miss, a `set` returns `false`, and in multi-tenant mode
+nothing falls back to another site's keyspace. Do your KV work inside the
+request.
 
-The same rule applies to [`ephpm_db_*`](/guides/db-from-php/), which throws
-a distinct exception in that situation.
+The same split applies to [`ephpm_db_*`](/guides/db-from-php/#shutdown-functions-and-destructors),
+which throws a distinct exception in the worker-mode case.
 
 ## Configuration
 
