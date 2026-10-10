@@ -48,6 +48,11 @@ pub struct ServerConfig {
     /// alongside a `MultiTenantStore`, clients must `AUTH <hostname>
     /// <derived_password>` and their connection is scoped to that site's
     /// store.
+    ///
+    /// Without a `MultiTenantStore` the secret cannot authenticate anyone:
+    /// AUTH is still demanded, and only `password` (when set) is accepted.
+    /// With neither a store nor a password, **every** AUTH is rejected (fail
+    /// closed) — the listener is unusable rather than open.
     pub secret: Option<String>,
 }
 
@@ -305,7 +310,24 @@ fn handle_auth(
             (Some(_), None) => {
                 (Frame::error("ERR wrong number of arguments for 'auth' command"), false, None)
             }
-            // No password configured — AUTH is a no-op, always succeeds.
+            // A `secret` with no multi-tenant store and no password: the
+            // listener demands AUTH (see `handle_connection`) but holds no
+            // credential any AUTH could be checked against — the secret only
+            // derives per-site passwords, which need a site store to scope
+            // to. Fail closed: reject every AUTH. Accepting it here (the old
+            // behavior) turned the NOAUTH gate into theatre — any password
+            // unlocked the whole store. `ephpm-server` refuses to start in
+            // this configuration; this guards every other embedder.
+            (None, _) if secret.is_some() => (
+                Frame::error(
+                    "ERR AUTH failed: no password is configured for this listener \
+                     (set [kv.redis_compat] password)",
+                ),
+                false,
+                None,
+            ),
+            // Nothing configured — AUTH is a no-op, always succeeds (Redis
+            // with no `requirepass` behaves the same way).
             (None, _) => (Frame::ok(), true, None),
         }
     }

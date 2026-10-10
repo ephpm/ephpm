@@ -1885,6 +1885,15 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
         );
     }
 
+    // Fail closed, single-site counterpart (also enforced by
+    // `Config::validate`): a secret with no per-site stores and no password
+    // leaves the listener demanding AUTH it has no credential to check.
+    if let Some(reason) =
+        config.kv.single_site_resp_secret_without_password(config.server.sites_dir.is_some())
+    {
+        anyhow::bail!("refusing to start the KV RESP listener: {reason}");
+    }
+
     // Hand the RESP listener the *same* multi-tenant handle the router gets,
     // so `AUTH <hostname> <derived>` resolves to the identical `Arc<Store>`
     // that PHP's `ephpm_kv_*` functions write through for that vhost. In
@@ -3451,6 +3460,29 @@ mod lib_tests {
         assert!(multi_tenant.is_none(), "no sites_dir → no per-vhost stores");
         let handle = handle.expect("RESP listener enabled → a listener task exists");
         handle.abort();
+    }
+
+    #[test]
+    fn start_kv_service_refuses_single_site_resp_with_secret_but_no_password() {
+        // Regression: a single-site listener with `[kv] secret` and no
+        // password demanded AUTH and then accepted any password. Defense in
+        // depth behind `Config::validate` — startup itself must refuse.
+        let config = kv_resp_config(None, Some("s3cret-value"));
+        let err = match start_kv_service(&config) {
+            Ok(_) => panic!("must refuse a single-site RESP listener with secret and no password"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[kv.redis_compat] password"), "should point at password: {msg}");
+    }
+
+    #[tokio::test]
+    async fn start_kv_service_single_site_resp_with_secret_and_password_starts() {
+        let mut config = kv_resp_config(None, Some("s3cret-value"));
+        config.kv.redis_compat.password = Some("pw".to_string());
+        let (_store, _mt, handle) =
+            start_kv_service(&config).expect("a configured password protects the listener");
+        handle.expect("RESP listener enabled → a listener task exists").abort();
     }
 
     // ── idle timeout ────────────────────────────────────────────────────────
