@@ -194,9 +194,9 @@ exists and routing is unchanged.
   per-request handling so ordinary exceptions don't cost you a re-boot.
 - **A worker script that fails to boot** (exits before its first
   `take_request()`) is respawned with exponential backoff and counted in
-  `ephpm_worker_boot_failures_total`. Its fatals appear in the engine log as
-  `[PHP]` lines — worker mode defaults `log_errors=On` (overridable) so boot
-  failures are never silent.
+  `ephpm_worker_boot_failures_total`. Its fatals appear in ePHPm's log on the
+  `php` target — ePHPm defaults `log_errors=On` in every mode (overridable via
+  `[php] ini_overrides`) so boot failures are never silent.
 - **Shebang lines are fine**: `#!/usr/bin/env php` at the top of a worker
   script (including Composer `vendor/bin` proxies) is skipped by the engine.
 - **Runaway recursion** is a normal error, not a crash. Every thread that runs

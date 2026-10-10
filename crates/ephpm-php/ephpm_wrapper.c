@@ -549,12 +549,41 @@ static void ephpm_sapi_register_server_variables(zval *track_vars_array)
 }
 
 /*
- * log_message — Called by PHP to log error messages.
- * Routes to stderr for now. Future: call back to Rust tracing.
+ * Rust log sink for PHP's error log (see ephpm_set_log_sink). NULL until the
+ * server installs it; the CLI never does.
+ */
+typedef void (*ephpm_log_sink_fn)(const char *message, size_t len);
+static ephpm_log_sink_fn g_log_sink = NULL;
+
+/* CLI identity flag — set by ephpm_enable_cli_mode() (documented below).
+ * Defined this early because ephpm_sapi_log_message reads it. */
+static int g_cli_mode = 0;
+
+/*
+ * Install the Rust-side sink that receives PHP's error-log lines (the
+ * `log_errors=On` path when no `error_log` file is configured). Must be
+ * called before php_embed_init() — it only stores a pointer.
+ */
+void ephpm_set_log_sink(ephpm_log_sink_fn sink)
+{
+    g_log_sink = sink;
+}
+
+/*
+ * log_message — Called by PHP to log error messages (php_log_err when
+ * `error_log` is unset). In the server this hands the line to Rust's tracing
+ * so it reaches ePHPm's own log (stdout, or the service log file on Windows).
+ * The sink only formats and emits a tracing event; it never calls back into
+ * PHP, so no longjmp can cross it. In `ephpm php` (CLI identity) the line goes
+ * to stderr, as php-cli does.
  */
 static void ephpm_sapi_log_message(const char *message, int syslog_type_int)
 {
     (void)syslog_type_int;
+    if (g_log_sink && !g_cli_mode && message) {
+        g_log_sink(message, strlen(message));
+        return;
+    }
     fprintf(stderr, "[PHP] %s\n", message);
 }
 
@@ -1080,7 +1109,7 @@ void __wrap_zend_unset_timeout(void)
  * this in the CLI process cannot affect the server (which never calls the
  * enabling function and keeps reporting "ephpm").
  */
-static int g_cli_mode = 0;
+/* g_cli_mode itself is defined above ephpm_sapi_log_message. */
 
 /*
  * Switch the SAPI into CLI identity. MUST be called before php_embed_init()

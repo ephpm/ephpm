@@ -1246,6 +1246,25 @@ const HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION: &[&str] = &[
 /// executing script's path and would block ePHPm's invalidator too.
 const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disabled";
 
+/// Mode-dependent PHP error display/logging defaults for the generated ini.
+///
+/// PHP's built-in default is `display_errors=1`, which renders every warning
+/// — including the script's absolute filesystem path — into the HTTP
+/// response. `ephpm serve` is the production entry point, so it turns display
+/// off (php.ini-production's stance) and turns logging on; with no
+/// `error_log` file configured, PHP's log lines reach ePHPm's own log through
+/// the SAPI `log_message` hook. `ephpm dev` keeps diagnostics on screen.
+///
+/// These are written *first* into the generated ini, so `[php] ini_file`,
+/// `[php] ini_overrides` and per-site overrides all win over them.
+fn error_display_ini_defaults(dev_mode: bool) -> [(&'static str, &'static str); 3] {
+    if dev_mode {
+        [("display_errors", "On"), ("display_startup_errors", "On"), ("log_errors", "On")]
+    } else {
+        [("display_errors", "Off"), ("display_startup_errors", "Off"), ("log_errors", "On")]
+    }
+}
+
 /// Split every operator `disable_functions` entry in `ini_overrides` into
 /// individual, trimmed function names. Multiple entries (or a comma list)
 /// are all collected so the composed union below preserves every one.
@@ -1637,10 +1656,10 @@ fn run_with_config(
     // builder and the startup log agree.
     let cluster_invalidation =
         config.opcache.effective_cluster_invalidation(config.cluster.enabled);
-    // Always generate the ini in worker mode: log_errors must default On there
-    // (see below) or a worker script that dies during boot leaves no
-    // diagnostic anywhere — display_errors output is captured into a buffer
-    // that is discarded when no request is in flight.
+    // Worker mode needs the generated ini for log_errors=On (seeded for every
+    // mode now, see `error_display_ini_defaults`): a worker script that dies
+    // during boot leaves no diagnostic otherwise — display_errors output is
+    // captured into a buffer that is discarded when no request is in flight.
     let worker_mode = config.php.is_worker_mode();
     // OPcache timestamp-validation default is mode-dependent (off under serve,
     // on under dev) and is always emitted into the generated ini, so ini
@@ -1675,10 +1694,15 @@ fn run_with_config(
             use std::fmt::Write as _;
 
             let mut content = String::new();
-            // Server-sane default, before ini_file/ini_overrides so either can
-            // override it: fatals must reach the engine log ([PHP] lines).
-            if worker_mode {
-                content.push_str("log_errors=On\n");
+            // Error display/logging defaults, first so `ini_file` and
+            // `ini_overrides` (and per-site overrides at request time) win.
+            // Serve never renders PHP diagnostics into the HTTP response —
+            // they carry absolute filesystem paths — and logs them to ePHPm's
+            // own log instead. Dev keeps them on screen. Worker mode also
+            // relies on log_errors: a worker script that dies during boot has
+            // no response to display into.
+            for (k, v) in error_display_ini_defaults(dev_mode) {
+                let _ = writeln!(content, "{k}={v}");
             }
             // Shared extensions ([php] extensions) go first, before
             // ini_file/ini_overrides, so any extension ini settings that
@@ -2798,6 +2822,30 @@ mod disable_functions_tests {
             ("disable_functions", "c"),
         ]));
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    fn ini_value(defaults: &[(&str, &str)], key: &str) -> Option<String> {
+        defaults.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_string())
+    }
+
+    #[test]
+    fn serve_hides_php_errors_from_responses_and_logs_them() {
+        // PHP's own default is display_errors=1: a warning would render the
+        // script's absolute path into the HTTP body. Serve must override it.
+        let serve = error_display_ini_defaults(false);
+        assert_eq!(ini_value(&serve, "display_errors").as_deref(), Some("Off"));
+        assert_eq!(ini_value(&serve, "display_startup_errors").as_deref(), Some("Off"));
+        assert_eq!(ini_value(&serve, "log_errors").as_deref(), Some("On"));
+        // No error_log file: the line must reach the SAPI log_message hook
+        // (ePHPm's log), not a file nobody reads.
+        assert!(ini_value(&serve, "error_log").is_none());
+    }
+
+    #[test]
+    fn dev_keeps_php_errors_visible() {
+        let dev = error_display_ini_defaults(true);
+        assert_eq!(ini_value(&dev, "display_errors").as_deref(), Some("On"));
+        assert_eq!(ini_value(&dev, "log_errors").as_deref(), Some("On"));
     }
 }
 

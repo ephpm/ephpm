@@ -11,7 +11,8 @@
 //! - **`register_server_variables`** — Populates `$_SERVER` with request
 //!   metadata (method, URI, headers, etc.).
 //! - **`send_headers`** — Captures response headers.
-//! - **`log_message`** — Routes PHP error messages to stderr.
+//! - **`log_message`** — Routes PHP error-log lines to ePHPm's tracing
+//!   output (target `php`) in the server; to stderr in `ephpm php`.
 //!
 //! The callbacks are installed by [`ephpm_install_sapi()`] (called once
 //! during runtime initialization) and invoked by PHP during request
