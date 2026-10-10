@@ -1236,9 +1236,14 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
         } else {
             cmd.arg("build");
         }
+        // `--target e2e`: the k8s suite needs the test docroot + test config,
+        // which live only in the `e2e` stage. The default (last) stage is the
+        // fixture-free image release.yml publishes.
         cmd.args(["-f"])
             .arg(&dockerfile)
             .args([
+                "--target",
+                "e2e",
                 "--build-arg",
                 &format!("PHP_SDK_VERSION={php_sdk_version}"),
                 "-t",
@@ -1958,6 +1963,89 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split a Dockerfile into `(stage name, parent, body lines)`, one entry per
+    /// `FROM`. Line continuations are not joined; the checks below only look at
+    /// `FROM` and `COPY`, which in docker/Dockerfile are single-line.
+    fn dockerfile_stages(text: &str) -> Vec<(String, String, Vec<String>)> {
+        let mut stages: Vec<(String, String, Vec<String>)> = Vec::new();
+        for line in text.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("FROM ") {
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                let parent = words.first().copied().unwrap_or_default().to_string();
+                let name = match words.as_slice() {
+                    [_, as_kw, name] if as_kw.eq_ignore_ascii_case("AS") => (*name).to_string(),
+                    _ => String::new(),
+                };
+                stages.push((name, parent, Vec::new()));
+            } else if let Some(stage) = stages.last_mut() {
+                stage.2.push(line.to_string());
+            }
+        }
+        stages
+    }
+
+    /// The published image (the Dockerfile's last stage, built by release.yml
+    /// with `--target runtime`) must contain no E2E fixtures. Releases through
+    /// v0.11.2 baked `tests/docroot/` (info.php, shell_test.php, ...) and
+    /// `tests/ephpm-test.toml` (display_errors On, Hrana on 0.0.0.0:8081) into
+    /// it. The fixtures now live only in the `e2e` stage that `k8s-e2e` builds.
+    #[test]
+    fn published_docker_image_has_no_test_fixtures() {
+        let root = workspace_root();
+        let dockerfile =
+            std::fs::read_to_string(root.join("docker/Dockerfile")).expect("read Dockerfile");
+        let stages = dockerfile_stages(&dockerfile);
+
+        let (last_name, ..) = stages.last().expect("Dockerfile has stages");
+        assert_eq!(last_name, "runtime", "the default (last) stage must be the published image");
+
+        // Walk `runtime` and every stage it is built FROM, up to the external base.
+        let mut chain = Vec::new();
+        let mut current = "runtime".to_string();
+        while let Some(stage) = stages.iter().find(|(name, ..)| *name == current) {
+            chain.push(stage);
+            current.clone_from(&stage.1);
+        }
+        let names: Vec<&str> = chain.iter().map(|(name, ..)| name.as_str()).collect();
+        assert_eq!(names, ["runtime", "runtime-base"]);
+        for (name, _, body) in &chain {
+            for line in body {
+                let upper = line.to_ascii_uppercase();
+                if upper.starts_with("COPY ") || upper.starts_with("ADD ") {
+                    assert!(
+                        !line.contains("tests/"),
+                        "published stage `{name}` copies a test fixture: {line}"
+                    );
+                }
+            }
+        }
+
+        // The E2E image still gets its fixtures.
+        let (_, e2e_parent, e2e_body) =
+            stages.iter().find(|(name, ..)| name == "e2e").expect("an `e2e` stage exists");
+        assert_eq!(e2e_parent, "runtime-base");
+        assert!(e2e_body.iter().any(|l| l == "COPY tests/docroot/ /var/www/html/"));
+        assert!(e2e_body.iter().any(|l| l == "COPY tests/ephpm-test.toml /etc/ephpm/ephpm.toml"));
+
+        // The placeholder docroot is exactly one inert page.
+        let www: Vec<String> = std::fs::read_dir(root.join("docker/default/www"))
+            .expect("docker/default/www exists")
+            .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(www, ["index.php"]);
+        let index = std::fs::read_to_string(root.join("docker/default/www/index.php"))
+            .expect("read placeholder");
+        for forbidden in ["phpinfo", "$_SERVER", "$_GET", "$_POST", "$_REQUEST", "getenv", "exec"] {
+            assert!(!index.contains(forbidden), "placeholder index.php uses `{forbidden}`");
+        }
+
+        // release.yml names the published stage explicitly rather than relying
+        // on stage order.
+        let release = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+            .expect("read release.yml");
+        assert!(release.contains("--target runtime"), "release.yml must build `--target runtime`");
+    }
 
     /// A canonicalized path handed to a spawned ephpm must not carry Windows'
     /// verbatim prefix — PHP's `open_basedir` rejects it and every script under

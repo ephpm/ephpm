@@ -35,6 +35,10 @@ If you'd rather not install anything:
 
     docker run -p 8080:8080 ephpm/ephpm:latest
 
+The image serves a placeholder page with a minimal config (HTTP on :8080
+only, PHP errors logged, not displayed). Mount your site at /var/www/html
+and your config at /etc/ephpm/ephpm.toml.
+
 Tag scheme:
   ephpm/ephpm:<release>-php<phpver>   pinned ePHPm release × pinned PHP patch
   ephpm/ephpm:<release>-php<minor>    pinned ePHPm release × rolling PHP minor

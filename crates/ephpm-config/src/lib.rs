@@ -8143,6 +8143,7 @@ listen = "0.0.0.0:8080"
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let shipped = [
             "ephpm.toml",
+            "docker/default/ephpm.toml",
             "examples/php-middleware/demo/ephpm.toml",
             "examples/rust-middleware/demo/ephpm.toml",
             "examples/wordpress-compose/ephpm.toml",
@@ -8161,6 +8162,41 @@ listen = "0.0.0.0:8080"
                 )
             });
         }
+    }
+
+    /// The config baked into the published `ephpm/ephpm` image must stay a
+    /// minimal production default. Releases up to v0.11.2 shipped the E2E test
+    /// config there instead: `display_errors = On` and the Hrana SQL endpoint
+    /// bound on `0.0.0.0:8081`, both live for anyone who ran the image without
+    /// mounting a config of their own.
+    #[test]
+    fn published_docker_config_is_minimal() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/default/ephpm.toml");
+        let config = Config::load(&path).expect("docker/default/ephpm.toml loads");
+
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.document_root, std::path::Path::new("/var/www/html"));
+
+        // No listener beyond the HTTP port.
+        assert!(config.db.sqlite.is_none(), "no embedded DB, so no MySQL/Hrana/PG/TDS listener");
+        assert!(
+            config.db.mysql.is_none() && config.db.postgres.is_none() && config.db.tds.is_none()
+        );
+        assert!(!config.kv.redis_compat.enabled, "no KV RESP listener");
+        assert!(!config.cluster.enabled, "no gossip listener");
+        assert!(!config.server.http3.enabled, "no QUIC listener");
+        assert!(config.server.tls.is_none());
+        assert!(!config.server.metrics.enabled, "no /metrics endpoint");
+        assert!(config.middleware.is_empty());
+
+        // PHP errors are logged, never rendered into the response body.
+        let ini = |key: &str| {
+            config.php.ini_overrides.iter().find(|[k, _]| k == key).map(|[_, v]| v.as_str())
+        };
+        assert_eq!(ini("display_errors"), Some("Off"));
+        assert_eq!(ini("display_startup_errors"), Some("Off"));
+        assert_eq!(ini("log_errors"), Some("On"));
     }
 
     #[test]
