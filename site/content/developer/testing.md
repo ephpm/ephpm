@@ -30,8 +30,8 @@ cargo nextest run -p ephpm-server test_routing   # single test
 
 **The middleware `dlopen` tests need their libraries built first.**
 `crates/ephpm-server/tests/middleware_dlopen.rs` and
-`middleware_response_phase.rs` load real cdylibs (the in-tree
-`ephpm-middleware-*` shells and the `ephpm-server` examples).
+`middleware_response_phase.rs` load real cdylib fixtures (the `ephpm-server` examples,
+`examples/mw_probe_*.rs` and `mw_response_gzip.rs`).
 `cargo test` / `cargo nextest run` do **not** build example artifacts, so on a
 clean checkout those tests fail on a missing library unless you first run the
 same step CI runs before its test step:

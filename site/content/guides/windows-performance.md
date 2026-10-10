@@ -328,7 +328,7 @@ startup WARN when the configuration touches it.
   SDK is ZTS but lacks per-thread execution timers
   (`ZEND_MAX_EXECUTION_TIMERS`). ePHPm treats a build without them as having
   no native PHP timeout, and startup warns when you set `max_execution_time`
-  on one. The
+  to a non-default value on one. The
   per-request ceiling actually in force is `[server.timeouts] request`
   (default 300 s), enforced at the HTTP layer as a 504. Keep it set to
   something sane — on Windows it is the *only* runaway-request backstop, and
