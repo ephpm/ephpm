@@ -3668,6 +3668,37 @@ pub struct WorkerConfig {
     /// Default: `1048576` (1 MiB).
     #[serde(default = "default_worker_stream_threshold")]
     pub stream_threshold: u64,
+
+    /// Cap on concurrent **Xdebug step-debugging requests** in worker mode
+    /// (the "debug lane"). `0` disables the lane.
+    ///
+    /// In worker mode a worker's whole life is one PHP request, so Xdebug —
+    /// which opens its debug session at request startup and closes it at
+    /// request shutdown — cannot debug individual HTTP requests on a warm
+    /// worker. When the xdebug extension is loaded with `xdebug.mode`
+    /// including `debug`, a request that Xdebug would start a session for
+    /// (an `XDEBUG_TRIGGER` / `XDEBUG_SESSION` query parameter, cookie or
+    /// urlencoded POST field matching `xdebug.trigger_value` if set, or
+    /// `XDEBUG_SESSION_START`) is instead run on a *fresh* worker thread
+    /// whose request startup sees that request: the framework boots inside
+    /// the debug session, the one request is served, and the thread retires —
+    /// ending the session cleanly. Untriggered requests keep using the warm
+    /// pool. Each debugged request pays one framework boot.
+    ///
+    /// The cap is separate from `[php] concurrency`. A triggered request
+    /// beyond it **waits** for a slot (bounded by `[server.timeouts]
+    /// request`; at most `16 × debug_workers` may wait, further ones get a
+    /// 503). A request that is abandoned (504 or client disconnect)
+    /// releases its slot at once; its thread stays paused in the debugger
+    /// until the IDE resumes it. At most `2 × debug_workers` debug threads
+    /// may be alive; past that a triggered request gets a 503.
+    ///
+    /// Inert unless Xdebug is loaded with step debugging on (the decision is
+    /// logged at startup). Linux only today — see the Xdebug guide.
+    ///
+    /// Default: `1`.
+    #[serde(default = "default_worker_debug_workers")]
+    pub debug_workers: usize,
 }
 
 impl Default for WorkerConfig {
@@ -3678,6 +3709,7 @@ impl Default for WorkerConfig {
             boot_timeout: default_worker_boot_timeout(),
             populate_superglobals: false,
             stream_threshold: default_worker_stream_threshold(),
+            debug_workers: default_worker_debug_workers(),
         }
     }
 }
@@ -3697,6 +3729,7 @@ impl WorkerConfig {
             || self.boot_timeout != default_worker_boot_timeout()
             || self.populate_superglobals
             || self.stream_threshold != default_worker_stream_threshold()
+            || self.debug_workers != default_worker_debug_workers()
     }
 }
 
@@ -6185,6 +6218,12 @@ fn default_worker_boot_timeout() -> u64 {
     30
 }
 
+fn default_worker_debug_workers() -> usize {
+    // One debugger at a time; a second triggered request queues behind it.
+    // Only in force when the xdebug extension is loaded.
+    1
+}
+
 fn default_cluster_bind() -> String {
     "0.0.0.0:7946".to_string()
 }
@@ -7913,6 +7952,9 @@ listen = "0.0.0.0:8080"
             ("[kv]", "[kv]\nbogus_key = 1\n", "bogus_key"),
             ("[kv.redis_compat]", "[kv.redis_compat]\nbogus_key = 1\n", "bogus_key"),
             ("[php]", "[php]\nmemory_limits = \"256M\"\n", "memory_limits"),
+            // A misspelt `debug_workers` must not silently leave the Xdebug
+            // debug lane at its default.
+            ("[php.worker]", "[php.worker]\ndebug_worker_cap = 2\n", "debug_worker_cap"),
             ("[cluster]", "[cluster]\nenabled_typo = true\n", "enabled_typo"),
             ("[cluster.channel]", "[cluster.channel]\nbogus_key = 1\n", "bogus_key"),
             ("[cluster.kv]", "[cluster.kv]\nbogus_key = 1\n", "bogus_key"),
@@ -10366,6 +10408,8 @@ opcache_revalidate_freq = 60
             WorkerConfig { populate_superglobals: true, ..WorkerConfig::default() }.is_customized()
         );
         assert!(WorkerConfig { stream_threshold: 1, ..WorkerConfig::default() }.is_customized());
+        assert!(WorkerConfig { debug_workers: 0, ..WorkerConfig::default() }.is_customized());
+        assert!(WorkerConfig { debug_workers: 4, ..WorkerConfig::default() }.is_customized());
     }
 
     #[test]
@@ -10394,6 +10438,7 @@ max_requests = 1000
 boot_timeout = 45
 populate_superglobals = true
 stream_threshold = 262144
+debug_workers = 3
 "#,
         )
         .unwrap();
@@ -10407,6 +10452,12 @@ stream_threshold = 262144
         assert_eq!(config.php.worker.boot_timeout, 45);
         assert!(config.php.worker.populate_superglobals);
         assert_eq!(config.php.worker.stream_threshold, 262_144);
+        assert_eq!(config.php.worker.debug_workers, 3);
+    }
+
+    #[test]
+    fn worker_debug_workers_defaults_to_one() {
+        assert_eq!(Config::default().php.worker.debug_workers, 1);
     }
 
     #[test]

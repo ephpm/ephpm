@@ -138,6 +138,26 @@ see the [config reference](/reference/config/) for authoritative details:
 | `[php] queue_depth` | `0` (= `concurrency`) | Dispatch-queue depth; a full queue applies HTTP backpressure. |
 | `[php.worker] boot_timeout` | `30` | Boots slower than this are logged as errors and counted (`ephpm_worker_boot_timeouts_total`). |
 | `[php.worker] stream_threshold` | `1 MiB` | Request bodies at/above this (or chunked bodies) stream into the worker instead of buffering. |
+| `[php.worker] debug_workers` | `1` | Concurrent Xdebug step-debugging requests (only when Xdebug is loaded — see below). |
+
+## Step debugging (Xdebug)
+
+A persistent worker is, to PHP, one long request — so Xdebug, which starts
+and ends a debug session at request startup/shutdown, cannot debug individual
+requests on a warm worker. When Xdebug is loaded with step debugging on,
+ePHPm instead runs each request that carries an Xdebug trigger
+(`XDEBUG_TRIGGER` / `XDEBUG_SESSION` query parameter, cookie or form field)
+on a **fresh one-request worker**: your worker script boots inside the debug
+session (breakpoints in boot code work), serves that one request through the
+normal `take_request()` loop, and exits — ending the session cleanly. Every
+other request keeps hitting the warm pool, even while a debugged request is
+paused on a breakpoint.
+
+Nothing changes in your worker script. Each debugged request pays one boot,
+and state is fresh for it (a bug that only shows up on a worker's N-th
+request will not reproduce there). Setup, IDE notes and limits:
+[Debugging with Xdebug](/guides/xdebug/). Without Xdebug loaded none of this
+exists and routing is unchanged.
 
 ## Failure behavior
 
@@ -181,4 +201,5 @@ see the [config reference](/reference/config/) for authoritative details:
 Worker metrics on `/metrics` (see the [metrics reference](/reference/metrics/)):
 pool size, busy/idle, boot duration/failures/timeouts, recycles by reason
 (`max_requests` | `script_exit` | `fatal` | `hung`), dispatch-queue depth and
-wait time.
+wait time, and — when Xdebug is loaded — debug-lane requests
+(`ephpm_xdebug_debug_requests_total`, `ephpm_xdebug_debug_workers`).

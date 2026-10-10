@@ -645,6 +645,12 @@ pub struct Router {
     /// per-request mode. When set, PHP requests are dispatched to the pool
     /// instead of the per-request execution pool.
     worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
+    /// Worker-mode Xdebug debug lane (`[php.worker] debug_workers > 0`, the
+    /// xdebug extension loaded with step debugging on). A request Xdebug
+    /// would start a session for is dispatched here — a fresh one-request
+    /// worker thread — instead of the warm pool, so it gets its own DBGp
+    /// session. `None` otherwise, which leaves routing untouched.
+    debug_lane: Option<Arc<crate::debug_lane::DebugLane>>,
     /// The dedicated per-request PHP execution pool (`mode = "per_request"`).
     /// `None` in worker mode. Its size ([`PhpConfig::effective_concurrency`])
     /// is the concurrency cap; capping it deliberately does NOT cap tokio's
@@ -1301,6 +1307,8 @@ impl Router {
                 if id.is_empty() { None } else { Some(id.to_string()) }
             },
             worker_pool,
+            // Wired by `serve()` via `with_debug_lane` (worker mode + xdebug).
+            debug_lane: None,
             fpm_pool,
             // Wired by `serve()` via `with_tenant_ebpf` only when
             // `[server.tenant_network] ebpf_policy = true` (Linux multi-tenant).
@@ -1836,6 +1844,13 @@ impl Router {
         self.fpm_pool.clone()
     }
 
+    /// The worker-mode Xdebug debug lane, when armed. `serve()` drains it on
+    /// shutdown alongside the worker pool.
+    #[must_use]
+    pub fn debug_lane(&self) -> Option<Arc<crate::debug_lane::DebugLane>> {
+        self.debug_lane.clone()
+    }
+
     /// Advertise an HTTP/3 endpoint via `Alt-Svc` on TLS responses.
     ///
     /// Called by `serve()` **after** the QUIC endpoint has actually bound, so
@@ -1926,6 +1941,14 @@ impl Router {
         tenant_ebpf: Option<Arc<crate::tenant_ebpf::TenantEbpf>>,
     ) -> Self {
         self.tenant_ebpf = tenant_ebpf;
+        self
+    }
+
+    /// Attach the worker-mode Xdebug debug lane. Only meaningful alongside a
+    /// worker pool; a `None` leaves triggered requests on the warm pool.
+    #[must_use]
+    pub fn with_debug_lane(mut self, lane: Option<Arc<crate::debug_lane::DebugLane>>) -> Self {
+        self.debug_lane = lane;
         self
     }
 
@@ -4402,6 +4425,25 @@ impl Router {
             headers,
         };
 
+        // Debug lane (worker mode + Xdebug loaded, see `debug_lane`): a
+        // request Xdebug would start a step-debugging session for runs on a
+        // fresh one-request worker thread whose request startup sees it.
+        // Decided here, on exactly the query string / cookie string / buffered
+        // body PHP will see. Without Xdebug the lane is `None` and this is a
+        // single branch.
+        let target = match &self.debug_lane {
+            Some(lane) if lane.routes(&owned) => {
+                // Path only: the query string can carry the
+                // xdebug.trigger_value secret.
+                tracing::info!(
+                    path = %path,
+                    "Xdebug trigger — running this request on a fresh debug worker"
+                );
+                crate::debug_lane::WorkerTarget::Debug(lane)
+            }
+            _ => crate::debug_lane::WorkerTarget::Pool(pool),
+        };
+
         // `worker.queue_wait` and `php.execute` spans, siblings under
         // `http.request`. Both open at dispatch time — the same instant the
         // existing timers start. queue_wait closes when the pool hands back
@@ -4414,7 +4456,7 @@ impl Router {
         let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let queue_wait_start = php_start;
-        let recv = pool.dispatch(owned).await;
+        let recv = target.dispatch(owned).await;
         let queue_wait = queue_wait_start.elapsed();
         drop(queue_span);
         #[allow(clippy::cast_precision_loss)]
@@ -4426,15 +4468,20 @@ impl Router {
         let queued_only =
             crate::timeline::PhpTimings { queue_wait: Some(queue_wait), execute: None };
 
-        // Dispatch channel closed (pool draining / all workers gone) — 503.
-        let Ok(rx) = recv else {
+        // Dispatch channel closed (pool draining / all workers gone; debug
+        // lane draining or full of abandoned sessions) — 503.
+        let Ok(mut dispatched) = recv else {
             return with_php_timings(
                 error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
                 queued_only,
             );
         };
 
-        gauge!("ephpm_worker_busy").increment(1.0);
+        // Held for the await below and released by Drop, so the gauge also
+        // comes back down when the OUTER request timeout (or a client
+        // disconnect) drops this future mid-await — which the debug lane
+        // makes routine, since its slot wait runs before this inner timer.
+        let busy = BusyGauge::enter();
         // Bound the wait so a wedged worker becomes a 504 AND signals the pool
         // to replace it (design §5.4). This inner timeout fires at or before
         // the outer request timeout.
@@ -4448,12 +4495,19 @@ impl Router {
         // the receiver directly so no inner timer is armed. `rx` awaited bare
         // yields `Result<_, RecvError>`; wrap it as `Ok(_)` to match the
         // `timeout` arm's `Result<Result<_, _>, Elapsed>` shape.
+        //
+        // `dispatched` lives until this function returns: on the debug lane
+        // it holds the request's debug slot, released when it drops —
+        // answered, timed out, or (handler future dropped) abandoned.
         let awaited = if self.request_timeout.is_zero() {
-            Ok(rx.await)
+            Ok((&mut dispatched.rx).await)
         } else {
-            tokio::time::timeout(self.request_timeout, rx).await
+            tokio::time::timeout(self.request_timeout, &mut dispatched.rx).await
         };
-        gauge!("ephpm_worker_busy").decrement(1.0);
+        if awaited.is_ok() {
+            dispatched.mark_answered();
+        }
+        drop(busy);
 
         let worker_resp = match awaited {
             Ok(Ok(resp)) => resp,
@@ -4474,7 +4528,7 @@ impl Router {
             }
             // Worker never responded in time — replace it, return 504.
             Err(_) => {
-                pool.note_hung();
+                target.note_hung();
                 counter!("ephpm_http_timeouts_total", "stage" => "worker").increment(1);
                 return with_php_timings(
                     error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),
@@ -5788,6 +5842,23 @@ fn json_response(status: StatusCode, body: &'static str) -> Response<ServerBody>
         .header("content-type", "application/json")
         .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static json response")
+}
+
+/// `ephpm_worker_busy` +1 for as long as it lives. Drop-based so the gauge
+/// is restored on every exit, including a future cancelled mid-await.
+struct BusyGauge;
+
+impl BusyGauge {
+    fn enter() -> Self {
+        gauge!("ephpm_worker_busy").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for BusyGauge {
+    fn drop(&mut self) {
+        gauge!("ephpm_worker_busy").decrement(1.0);
+    }
 }
 
 /// Stash PHP-path timings in the response extensions so `Router::handle`
@@ -7821,6 +7892,128 @@ mod tests {
         // Conditionally required by semconv when the status is Error; the
         // status code is its canonical value for an HTTP failure.
         assert_eq!(span.get("error.type").map(String::as_str), Some("504"), "{span:?}");
+    }
+
+    /// Worker-mode debug lane routing, end to end through `Router::handle`.
+    ///
+    /// The warm pool here has zero workers, so anything routed to it times out
+    /// (504); the lane runs a fake debug thread (no PHP in stub mode) that
+    /// answers 200 with the body it was handed. That makes the routing
+    /// decision observable per request:
+    /// - no lane (Xdebug not loaded) → a triggered request stays on the pool;
+    /// - with a lane → a triggered request (query, cookie, urlencoded POST
+    ///   field) runs on the lane and the application still receives the full,
+    ///   unconsumed body; an untriggered one stays on the pool.
+    #[tokio::test]
+    async fn worker_mode_routes_only_triggered_requests_to_the_debug_lane() {
+        use ephpm_php::worker_bridge::{WorkerBody, WorkerResponse};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = 1;
+        let zero_worker_pool = || {
+            crate::worker_pool::WorkerPool::spawn(
+                dir.path().join("worker.php"),
+                0, // nobody answers: the pool path is a 504
+                500,
+                4,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                ephpm_config::AdmissionPolicy::Fifo,
+            )
+        };
+        let policy =
+            crate::xdebug_trigger::TriggerPolicy::from_ini(&ephpm_php::xdebug::XdebugIni {
+                mode: "debug".into(),
+                start_with_request: "trigger".into(),
+                ..ephpm_php::xdebug::XdebugIni::default()
+            })
+            .unwrap();
+        // Fake debug thread: pull the one job, answer with its body.
+        let runner: crate::debug_lane::Runner = Arc::new(|_id, _seed, rx| {
+            let job = rx.recv_blocking().expect("job queued for the debug thread");
+            let body = match job.request.body {
+                WorkerBody::Buffered(bytes) => bytes,
+                WorkerBody::Streaming { .. } => b"streaming".to_vec(),
+            };
+            let mut out = b"debug-lane:".to_vec();
+            out.extend_from_slice(&body);
+            let _ = job.respond_to.send(WorkerResponse::Buffered {
+                status: 200,
+                headers: Vec::new(),
+                body: out,
+            });
+        });
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let get = |uri: &str, cookie: Option<&str>| {
+            let mut b = Request::builder().method("GET").uri(uri);
+            if let Some(c) = cookie {
+                b = b.header("cookie", c);
+            }
+            b.body(Full::new(Bytes::new())).unwrap()
+        };
+
+        // Xdebug not loaded: no lane, a trigger changes nothing.
+        let router =
+            Router::new(&config, test_store(), None, None, None, None, Some(zero_worker_pool()));
+        let resp = router.handle(get("/index.php?XDEBUG_TRIGGER=1", None), addr, false).await;
+        assert_eq!(resp.unwrap().status(), StatusCode::GATEWAY_TIMEOUT, "stays on the pool");
+
+        // Lane armed.
+        let lane = crate::debug_lane::DebugLane::with_runner(1, policy, runner);
+        let router =
+            Router::new(&config, test_store(), None, None, None, None, Some(zero_worker_pool()))
+                .with_debug_lane(Some(Arc::clone(&lane)));
+
+        let resp =
+            router.handle(get("/index.php?XDEBUG_TRIGGER=1", None), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query trigger → debug lane");
+
+        let resp = router
+            .handle(get("/index.php", Some("a=b; XDEBUG_SESSION=PHPSTORM")), addr, false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "cookie trigger → debug lane");
+
+        let form = b"name=x&XDEBUG_TRIGGER=1&tail=y".to_vec();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/index.php")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("content-length", form.len().to_string())
+            .body(Full::new(Bytes::from(form.clone())))
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "POST-body trigger → debug lane");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut expected = b"debug-lane:".to_vec();
+        expected.extend_from_slice(&form);
+        assert_eq!(body.as_ref(), expected.as_slice(), "the app still gets the whole body");
+
+        let resp = router.handle(get("/index.php?page=2", None), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "untriggered → warm pool");
+
+        // Every lane thread retires once it has answered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lane.live_count() != 0 {
+            assert!(std::time::Instant::now() < deadline, "debug threads never retired");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Issue #380: in multi-site mode the span carries the **resolved**

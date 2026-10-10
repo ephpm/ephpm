@@ -765,6 +765,112 @@ int ephpm_thread_init(void)
 }
 
 /*
+ * Worker-mode Xdebug debug lane: ephpm_thread_init() with SG(request_info)
+ * already describing the HTTP request this thread is about to serve.
+ *
+ * A persistent worker's whole life is ONE PHP request, and the request it
+ * starts in ephpm_thread_init() carries no HTTP data at all — so an extension
+ * whose RINIT inspects the request never sees anything. Xdebug is the one
+ * that matters: with xdebug.start_with_request=trigger it decides at RINIT,
+ * from $_GET/$_POST/$_COOKIE, whether to open a DBGp session, and it closes
+ * that session at request shutdown. Both events happen exactly once per
+ * worker thread, never per HTTP request.
+ *
+ * The debug lane turns that constraint into the mechanism: a thread that
+ * serves exactly one triggered request. Pre-seeding request_info here means
+ * php_request_startup() builds $_GET/$_COOKIE (and, see below, $_POST) from
+ * the real request before zend_activate_modules() runs Xdebug's RINIT, so the
+ * trigger is honoured natively — no Xdebug-specific code, no per-iteration
+ * reset of its state. The framework then boots INSIDE the session (boot-code
+ * breakpoints work), take_request() hands over the pre-queued request, and
+ * when the loop ends after that one request ephpm_thread_shutdown()'s
+ * php_request_shutdown() runs Xdebug's RSHUTDOWN, which ends the session
+ * with a clean `stopping`.
+ *
+ * POST bodies. sapi_activate() reads and parses the body only when
+ * SG(server_context) is non-NULL. When `post_data` is non-NULL (the Rust side
+ * passes a private COPY of a fully buffered application/x-www-form-urlencoded
+ * POST body, never a streaming one) the server-context marker is set for the
+ * duration of php_request_startup() only, so PHP builds $_POST from that copy
+ * through the ordinary read_post callback and a trigger in the body is
+ * visible at RINIT. The marker is cleared again right after startup so this
+ * thread then matches a pool worker exactly (NULL server context): in
+ * particular sapi_deactivate_module() at thread shutdown will never call
+ * read_post to "drain" a body. The job's own copy of the body is untouched —
+ * take_request() re-points the read_post buffers at it — so the application
+ * sees the full body. When `post_data` is NULL the server context stays NULL
+ * and nothing reads a body at startup.
+ *
+ * Every pointer must stay valid until ephpm_thread_shutdown() returns:
+ * sapi_deactivate() does not free them, but php_request_shutdown() may still
+ * read SG(request_info) (the Rust side keeps the backing strings in a
+ * thread-local that outlives the shutdown call).
+ *
+ * php_request_startup() runs its own zend_try/zend_catch internally (like
+ * ephpm_thread_init above), so a bailout during RINIT returns FAILURE here
+ * rather than longjmp-ing into the Rust caller.
+ *
+ * Returns 0 on success, -1 if php_request_startup() failed. Either way the
+ * thread is TSRM-registered and must be retired with ephpm_thread_shutdown().
+ */
+int ephpm_thread_init_preseeded(
+    const char *method,
+    const char *uri,
+    const char *query_string,
+    const char *content_type,
+    const char *cookie,
+    size_t content_length,
+    const char *path_translated,
+    const char *post_data,
+    size_t post_data_len)
+{
+    ts_resource(0);
+
+    /* Same thread-local mirrors the fpm path keeps, so the read_cookies /
+     * read_post SAPI callbacks serve this request during startup. take_request()
+     * re-points them at the dispatched job. */
+    req_method = method;
+    req_uri = uri;
+    req_query_string = query_string;
+    req_content_type = content_type;
+    req_cookie_data = cookie;
+    req_post_data = post_data;
+    req_post_data_len = post_data ? post_data_len : 0;
+    req_post_data_offset = 0;
+    req_body_streaming = 0;
+    req_path_translated = path_translated;
+
+    SG(request_info).request_method = (char *)method;
+    SG(request_info).request_uri = (char *)uri;
+    SG(request_info).query_string = (char *)query_string;
+    SG(request_info).content_type = content_type;
+    SG(request_info).cookie_data = (char *)cookie;
+    SG(request_info).content_length = (zend_long)content_length;
+    SG(request_info).path_translated = (char *)path_translated;
+
+    /* Only for a buffered urlencoded POST: let sapi_activate() parse $_POST. */
+    SG(server_context) = post_data ? (void *)&ephpm_server_context_marker : NULL;
+
+    int ret = php_request_startup();
+
+    /* Back to the pool-worker state (see above), success or not. */
+    SG(server_context) = NULL;
+    req_post_data = NULL;
+    req_post_data_len = 0;
+    req_post_data_offset = 0;
+
+    /* Mark the request active even when startup FAILED: a bailout inside
+     * php_request_startup() leaves a partially activated request (some
+     * RINITs run, a TSRM entry allocated). The caller still retires this
+     * thread through ephpm_thread_shutdown(), whose php_request_shutdown() is
+     * built to tear down partial state (it is what runs after any fatal) and
+     * whose ts_free_thread() releases the TSRM entry — instead of leaking it
+     * for module shutdown to trip over (#266). */
+    request_active = 1;
+    return ret == SUCCESS ? 0 : -1;
+}
+
+/*
  * Shut down PHP on the current thread.
  *
  * Performs request shutdown and unregisters the thread from TSRM,
@@ -804,9 +910,59 @@ void ephpm_thread_shutdown(void)
 #else /* !ZTS — NTS stubs */
 
 int ephpm_thread_init(void) { return 0; }
+int ephpm_thread_init_preseeded(
+    const char *method,
+    const char *uri,
+    const char *query_string,
+    const char *content_type,
+    const char *cookie,
+    size_t content_length,
+    const char *path_translated,
+    const char *post_data,
+    size_t post_data_len)
+{
+    /* NTS has no per-thread PHP context to pre-seed: fail so the debug lane
+     * answers 500 instead of running PHP on a thread that has no request. */
+    (void)method; (void)uri; (void)query_string; (void)content_type;
+    (void)cookie; (void)content_length; (void)path_translated;
+    (void)post_data; (void)post_data_len;
+    return -1;
+}
 void ephpm_thread_shutdown(void) {}
 
 #endif /* ZTS */
+
+/*
+ * Whether a PHP extension (module) is loaded, by its lower-case registry
+ * name ("xdebug", "opcache", ...). module_registry is a true process global
+ * (not per-TSRM-thread), populated during php_embed_init(); readable from any
+ * thread afterwards without a TSRM context. Mirrors extension_loaded().
+ */
+int ephpm_extension_loaded(const char *name)
+{
+    if (!name) {
+        return 0;
+    }
+    return zend_hash_str_exists(&module_registry, name, strlen(name)) ? 1 : 0;
+}
+
+/*
+ * Current value of a PHP ini directive on THIS thread, or NULL if no such
+ * directive is registered. Used once, on the thread that ran php_embed_init()
+ * (whose executor globals hold the startup ini values), to snapshot Xdebug's
+ * trigger settings for the debug lane's router-side trigger matching. The
+ * returned pointer borrows PHP-owned memory: copy it before any further PHP
+ * call. A plain hash lookup — cannot bail out.
+ */
+const char *ephpm_ini_string(const char *name)
+{
+    if (!name) {
+        return NULL;
+    }
+    bool exists = false;
+    const char *value = zend_ini_string_ex(name, strlen(name), 0, &exists);
+    return exists ? value : NULL;
+}
 
 /* ===================================================================
  * Signal handling overrides

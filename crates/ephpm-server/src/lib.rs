@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod body;
 pub mod db_health;
+pub mod debug_lane;
 pub mod dns01;
 pub mod dns01_digitalocean;
 pub mod dns01_google;
@@ -34,6 +35,7 @@ pub mod turso_cdc;
 pub mod turso_cdc_metrics;
 pub mod websocket;
 pub mod worker_pool;
+pub mod xdebug_trigger;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -730,7 +732,7 @@ async fn bind_listeners(
         );
 
         let pool = worker_pool::WorkerPool::spawn(
-            script,
+            script.clone(),
             concurrency,
             config.php.worker.max_requests,
             config.php.effective_queue_depth(),
@@ -741,7 +743,19 @@ async fn bind_listeners(
             Duration::from_secs(config.server.timeouts.idle),
             config.php.admission,
         );
-        Some(pool)
+
+        // Xdebug debug lane: fresh one-request worker threads for requests
+        // Xdebug would start a step-debugging session for. Armed only when
+        // the extension is loaded with step debugging on — otherwise `None`
+        // and worker routing is untouched.
+        let debug_lane = debug_lane::arm(
+            script,
+            config.php.worker.debug_workers,
+            ephpm_php::xdebug::settings(),
+            config.server.timeouts.request,
+            Duration::from_secs(config.server.timeouts.idle),
+        );
+        Some((pool, debug_lane))
     } else {
         // add-config-knob: `[php.worker]` is structurally scoped to worker
         // mode, but an operator who configured it still deserves one line
@@ -754,6 +768,10 @@ async fn bind_listeners(
             );
         }
         None
+    };
+    let (worker_pool, debug_lane) = match worker_pool {
+        Some((pool, lane)) => (Some(pool), lane),
+        None => (None, None),
     };
 
     // Native WebSockets (experimental). `None` when `[server.websocket]` is
@@ -835,6 +853,7 @@ async fn bind_listeners(
             file_cache.clone(),
             worker_pool.clone(),
         )
+        .with_debug_lane(debug_lane)
         .with_tenant_ebpf(tenant_ebpf)
         .with_middleware_chain(middleware_chain)
         // Expose the effective gossip node id to PHP (EPHPM_NODE_ID). When
@@ -1112,6 +1131,11 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     if let Some(pool) = &worker_pool {
         pool.drain();
     }
+    // The worker-mode debug lane: refuse queued/new debug requests (503).
+    let debug_lane = router.debug_lane();
+    if let Some(lane) = &debug_lane {
+        lane.drain();
+    }
 
     // Per-request execution pool: same contract — close the dispatch queue so
     // pool threads finish any in-flight request and exit. Mutually exclusive
@@ -1168,6 +1192,29 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                     live_workers = live,
                     "shutdown timeout reached with worker threads still live — \
                      PHP teardown may be unsafe if a worker is wedged mid-request"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // Debug lane: same #266 wait for its one-request threads. A session still
+    // paused in an IDE keeps its thread (and TSRM context) alive past the
+    // deadline; `PhpRuntime::shutdown()` then skips module teardown, which is
+    // the safe outcome.
+    if let Some(lane) = &debug_lane {
+        let deadline = tokio::time::Instant::now() + shutdown_timeout;
+        loop {
+            let live = lane.live_count();
+            if live == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    live_debug_workers = live,
+                    "shutdown timeout reached with debug-lane threads still live (an Xdebug \
+                     session paused in an IDE?) — PHP module teardown will be skipped"
                 );
                 break;
             }

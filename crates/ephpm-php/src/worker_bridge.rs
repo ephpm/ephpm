@@ -209,6 +209,239 @@ pub struct WorkerJob {
     pub admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+impl WorkerBody {
+    /// The length PHP should expect: the actual size of a buffered body, or
+    /// the declared `Content-Length` (possibly `0`) of a streaming one.
+    #[must_use]
+    pub fn declared_len(&self) -> usize {
+        match self {
+            Self::Buffered(data) => data.len(),
+            Self::Streaming { declared_len, .. } => *declared_len,
+        }
+    }
+}
+
+// ── Debug lane: pre-seeded request startup ───────────────────────────────
+
+/// The request a worker-mode **debug lane** thread pre-seeds into
+/// `SG(request_info)` (and its `$_SERVER` registration list) *before* its
+/// `php_request_startup()`, so request-startup consumers — Xdebug's
+/// step-debug trigger check, and its `discover_client_host` lookup of
+/// `REMOTE_ADDR` / forwarding headers — see the triggering HTTP request.
+/// Owned copies, taken from the [`WorkerRequestOwned`] before it is queued for
+/// `take_request()`: the job keeps its own copy of everything, including the
+/// body.
+#[derive(Clone)]
+pub struct DebugSeed {
+    /// HTTP method.
+    pub method: String,
+    /// `REQUEST_URI`.
+    pub uri: String,
+    /// Query string without the leading `?` (`XDEBUG_TRIGGER=1` lives here).
+    pub query_string: String,
+    /// Raw `Cookie` header (`XDEBUG_SESSION=...` lives here).
+    pub cookie_data: String,
+    /// `Content-Type`, if any.
+    pub content_type: Option<String>,
+    /// Declared body length (see [`WorkerBody::declared_len`]).
+    pub content_length: usize,
+    /// The request's `$_SERVER` variables, in FFI-ready form.
+    pub server_vars: Vec<CServerVar>,
+    /// A private copy of the request body for PHP to parse into `$_POST`
+    /// during request startup, so a trigger in a form body is visible to
+    /// Xdebug. Only ever set for a fully **buffered**
+    /// `application/x-www-form-urlencoded` `POST` (see
+    /// [`DebugSeed::from_request`]); `None` means no body is read at startup.
+    /// Freed as soon as request startup returns.
+    pub post_body: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for DebugSeed {
+    // Hand-written so `$_SERVER` values (which carry `PHP_AUTH_PW` since
+    // #386) and cookies never reach a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebugSeed")
+            .field("method", &self.method)
+            .field("content_type", &self.content_type)
+            .field("content_length", &self.content_length)
+            .field("server_vars", &self.server_vars.len())
+            .field("post_body", &self.post_body.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+impl DebugSeed {
+    /// Copy the seed out of `req`. The body is copied only when PHP itself
+    /// would parse it into `$_POST` *and* it is already in memory: a `POST`
+    /// whose content type is `application/x-www-form-urlencoded` (PHP's
+    /// matching: case-insensitive, parameters after `;` ignored) with a
+    /// [`WorkerBody::Buffered`] body. A streaming body is never touched —
+    /// reading it here would consume it before the application could.
+    #[must_use]
+    pub fn from_request(req: &WorkerRequestOwned) -> Self {
+        let post_body = match &req.body {
+            WorkerBody::Buffered(bytes)
+                if req.method == "POST"
+                    && req.content_type.as_deref().is_some_and(is_form_urlencoded) =>
+            {
+                Some(bytes.clone())
+            }
+            _ => None,
+        };
+        Self {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            query_string: req.query_string.clone(),
+            cookie_data: req.cookie_data.clone(),
+            content_type: req.content_type.clone(),
+            content_length: req.body.declared_len(),
+            server_vars: req.server_vars.clone(),
+            post_body,
+        }
+    }
+
+    /// `REQUEST_URI` without its query string — what the lane logs. The
+    /// query can carry the `xdebug.trigger_value` secret.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.uri.split('?').next().unwrap_or_default()
+    }
+}
+
+/// Whether a `Content-Type` selects PHP's `application/x-www-form-urlencoded`
+/// POST handler. Mirrors `sapi_read_post_data()`: the type is lower-cased and
+/// cut at the first `;`, `,` or space before the lookup.
+#[must_use]
+pub fn is_form_urlencoded(content_type: &str) -> bool {
+    let end = content_type.find([';', ',', ' ']).unwrap_or(content_type.len());
+    content_type[..end].eq_ignore_ascii_case("application/x-www-form-urlencoded")
+}
+
+/// Storage for the pointers a debug-lane thread lends to C at request
+/// startup. Lives in a thread-local for the whole life of the thread: the C
+/// side keeps the `SG(request_info)` pointers until `ephpm_thread_shutdown()`
+/// has run, and the thread retires through `worker_thread_shutdown()` as
+/// ordinary code — before TLS destructors — so the storage is still alive at
+/// that point. (Once `take_request()` has run, `SG(request_info)` points at
+/// the job instead.) The server vars stay registered for the request's
+/// lifetime because PHP builds `$_SERVER` lazily (`auto_globals_jit`); only
+/// the POST copy is released early — see [`thread_init_preseeded`].
+#[cfg(php_linked)]
+#[allow(dead_code)] // owns memory C borrows; never read from Rust after install
+struct PreseededStrings {
+    method: CString,
+    uri: CString,
+    query_string: CString,
+    cookie_data: CString,
+    content_type: Option<CString>,
+    path_translated: CString,
+    server_vars: Vec<CServerVar>,
+    post_body: Option<Vec<u8>>,
+}
+
+#[cfg(php_linked)]
+thread_local! {
+    /// The strings `SG(request_info)` borrows on a debug lane thread.
+    static PRESEEDED: RefCell<Option<PreseededStrings>> = const { RefCell::new(None) };
+}
+
+/// Raw views into [`PreseededStrings`], collected so the `RefCell` borrow is
+/// released before any FFI call.
+#[cfg(php_linked)]
+struct PreseededPtrs {
+    method: *const c_char,
+    uri: *const c_char,
+    query_string: *const c_char,
+    content_type: *const c_char,
+    cookie_data: *const c_char,
+    path_translated: *const c_char,
+    server_vars: Vec<(*const c_char, *const c_char)>,
+    post_data: *const c_char,
+    post_len: usize,
+}
+
+/// Register this thread with TSRM and start its long-lived request with
+/// `SG(request_info)` and `$_SERVER` pre-seeded from `seed`. Returns the C
+/// status (`0` ok).
+///
+/// Only [`crate::PhpRuntime::worker_thread_init_preseeded`] should call this —
+/// it owns the registration guard that pairs with `worker_thread_shutdown`.
+#[cfg(php_linked)]
+pub(crate) fn thread_init_preseeded(seed: DebugSeed, path_translated: &std::path::Path) -> c_int {
+    // Lossy on interior NULs, same policy as `build_current_request`.
+    let cstr = |s: String| CString::new(s).unwrap_or_default();
+    let content_length = seed.content_length;
+    let strings = PreseededStrings {
+        method: cstr(seed.method),
+        uri: cstr(seed.uri),
+        query_string: cstr(seed.query_string),
+        cookie_data: cstr(seed.cookie_data),
+        content_type: seed.content_type.map(cstr),
+        path_translated: cstr(path_translated.to_string_lossy().into_owned()),
+        server_vars: seed.server_vars,
+        post_body: seed.post_body,
+    };
+    // Install the storage, then take raw views with a short-lived shared
+    // borrow: no RefCell guard (or any other Rust value with a destructor)
+    // is live across the PHP calls below. The heap buffers the pointers refer
+    // to do not move when the struct is moved into the cell.
+    let ptrs = PRESEEDED.with(|cell| {
+        *cell.borrow_mut() = Some(strings);
+        let slot = cell.borrow();
+        let s = slot.as_ref().expect("PRESEEDED was set on the line above");
+        PreseededPtrs {
+            method: s.method.as_ptr(),
+            uri: s.uri.as_ptr(),
+            query_string: s.query_string.as_ptr(),
+            content_type: s.content_type.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            cookie_data: s.cookie_data.as_ptr(),
+            path_translated: s.path_translated.as_ptr(),
+            server_vars: s.server_vars.iter().map(|(k, v)| (k.as_ptr(), v.as_ptr())).collect(),
+            post_data: s.post_body.as_ref().map_or(std::ptr::null(), |b| b.as_ptr().cast()),
+            post_len: s.post_body.as_ref().map_or(0, Vec::len),
+        }
+    });
+    for (key, value) in &ptrs.server_vars {
+        // SAFETY: both pointers borrow NUL-terminated strings owned by this
+        // thread's PRESEEDED cell (see below for its lifetime). The C side
+        // only stores them in its thread-local registration list (no PHP
+        // call, cannot bail out); PHP reads them when it builds `$_SERVER`.
+        unsafe { crate::ffi::ephpm_request_add_server_var(*key, *value) };
+    }
+    // SAFETY: every pointer borrows from the `PreseededStrings` now owned by
+    // this thread's PRESEEDED cell, which is not written again until the POST
+    // copy is released below (after C has stopped using it) and otherwise
+    // lives until the thread exits — after `ephpm_thread_shutdown` has run
+    // (worker_thread_shutdown is called explicitly on the thread body, before
+    // TLS teardown). `post_data`/`post_len` describe the same Vec (or NULL/0).
+    // The C function registers the calling thread with TSRM and runs
+    // php_request_startup(), which wraps activation in PHP's own zend_try, so
+    // no longjmp escapes into this frame.
+    let status = unsafe {
+        crate::ffi::ephpm_thread_init_preseeded(
+            ptrs.method,
+            ptrs.uri,
+            ptrs.query_string,
+            ptrs.content_type,
+            ptrs.cookie_data,
+            content_length,
+            ptrs.path_translated,
+            ptrs.post_data,
+            ptrs.post_len,
+        )
+    };
+    // The C side drops its read_post pointers before returning and PHP keeps
+    // its own copy of the body (SG(request_info).request_body), so the POST
+    // copy is no longer borrowed: free it now rather than hold it for the
+    // thread's life (which, for a session parked in a debugger, is unbounded).
+    PRESEEDED.with(|cell| {
+        if let Some(s) = cell.borrow_mut().as_mut() {
+            s.post_body = None;
+        }
+    });
+    status
+}
+
 // ── C-compatible request view ────────────────────────────────────────────
 
 /// Borrowed view of the next request, filled by [`take_request`] and read by
