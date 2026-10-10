@@ -75,9 +75,11 @@ max_connections = 0               # 0 = unlimited; see "Noisy neighbours" below
 ```
 
 `dir` is required in multi-site mode — ePHPm refuses to start without it rather
-than share one database between tenants. Per-site isolation is **single-node
-only**; with `[cluster]` enabled the database is clustered and shared, and
-startup warns about it.
+than share one database between tenants. With `[cluster]` enabled, per-site
+isolation needs `[db.sqlite.replication] per_site = true` (experimental; see
+[Clustered mode](#clustered-mode) below).
+Without it, a clustered node shares **one** clustered database across every
+tenant, and startup warns about it.
 
 At startup you will see:
 

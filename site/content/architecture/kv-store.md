@@ -36,7 +36,7 @@ Why a built-in KV? PHP apps want a cache. The default answer is "run Redis." Tha
 └──────────────┘      └──────────────┘    └──────────────────────┘
 ```
 
-Hash entries are kept separate from string entries because Redis types are mutually exclusive — `WRONGTYPE` errors flow naturally from this split.
+Hash entries are kept in a separate map from string entries. Unlike Redis, the two are **not** mutually exclusive and there is no `WRONGTYPE` error: one key name can exist as a string and as a hash at the same time. `GET` on a hash-only key returns nil, `RENAME` only moves string values, and `TYPE` reports `hash` if a hash exists under the name. Avoid reusing a key name across the two types.
 
 ## Storage
 
@@ -86,15 +86,17 @@ Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `H
 
 In vhost mode (`[server] sites_dir = ...`), whether the RESP listener is isolated per tenant depends entirely on `[kv] secret`.
 
-**Without `[kv] secret`**, it is a sharp tool: every connection dispatches against the process-wide default store, so any client that can reach the listener sees *every* site's keys. The optional `[kv.redis_compat] password` gates access but does not scope it. Recommended posture is to leave `[kv.redis_compat] enabled = false` and let PHP use the SAPI functions, which are namespaced per host regardless of this listener.
+**Without `[kv] secret`**, ePHPm refuses to start the RESP listener in vhost mode: `[kv.redis_compat] enabled = true` with `sites_dir` set and no secret is a **hard startup error**, because the listener would otherwise serve one shared store to every tenant. Either set the secret or leave `[kv.redis_compat] enabled = false` (the default) and let PHP use the SAPI functions, which are namespaced per site regardless of this listener.
 
-**With `[kv] secret` set**, a connection must authenticate as a specific host and is then bound to that host's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
+**With `[kv] secret` set**, a connection must authenticate as a specific site (`AUTH <site> <password>`) and is then bound to that site's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
 
 ```
-password = HMAC-SHA256(secret, hostname)
+password = HMAC-SHA256(secret, site_key)
 ```
 
-The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is unset, nothing is auto-generated — multi-tenant HMAC AUTH is simply disabled.
+The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. `[kv.redis_compat] password` is ignored in this mode. The same secret also derives each site's MySQL wire password, so anyone who can read the config can impersonate any tenant — see [`[kv] secret`](/reference/config/#kv).
+
+**Single-site mode** (no `sites_dir`) has one shared store. There, only `[kv.redis_compat] password` authenticates the listener; setting `[kv] secret` alone makes the listener ask for `AUTH` but accepts any value.
 
 ## Clustered KV (when `[cluster] enabled = true`)
 
@@ -145,7 +147,9 @@ We could. But:
 - The SAPI path is ~100x faster than the network path. For hot counters and rate limiters, that matters.
 - The whole stack (HTTP, PHP, KV, DB proxy) shares one tokio runtime — no inter-process coordination, no extra socket budget, no separate config.
 
-If you outgrow it, the RESP listener means swapping back to standalone Redis is a one-line config change in your PHP app.
+If you outgrow it, the RESP listener means swapping back to standalone Redis is a one-line config change in your PHP app — for code that sticks to the commands the KV implements.
+
+**It is a cache, not a broker.** The KV deliberately implements strings, hashes, TTLs and counters only. There are no lists, sets, sorted sets, streams, pub/sub, `MULTI`/`EXEC` or `EVAL`. Job queues (Laravel queues, Symfony Messenger's Redis transport, Sidekiq-style workers) need those, so run a real Redis for queues and keep the ePHPm KV for caching, sessions and counters.
 
 ## See also
 

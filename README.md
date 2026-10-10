@@ -273,7 +273,7 @@ In a cluster, the KV store becomes a two-tier distributed store with no extra mo
 
 - **Small values** (< 512 bytes by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
 - **Large values** live on a **hashed data plane** — the owner is `hash(key)` modulo the sorted alive-node list (no consistent-hash ring), replicated to N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
-- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
+- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list and reads fall back to the surviving replicas. Replication is write-time only: existing keys are not moved or re-replicated when membership changes, so a large value survives at most `replication_factor - 1` node losses until it is rewritten. No primary, no election — every node can read and write.
 
 ```toml
 [cluster]
@@ -290,7 +290,7 @@ hot_key_max_memory = "64MB"
 
 ### Multi-tenant security
 
-When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint, ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
+When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint (when `[kv.redis_compat] enabled = true` and `[kv] secret` is set), ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, site_key)` and injects it into PHP `$_SERVER` (not the process environment) as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
 
 ### How it works under the hood
 

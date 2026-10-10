@@ -2,7 +2,9 @@
 
 This document covers the in-memory KV store, gossip-based clustering, `hash % nodes` key ownership, large-value replication, and all features that depend on the KV layer (ACME cert coordination, PHP response cache, session storage).
 
-> **Doc status:** this is a broad design document written ahead of implementation. Sections describing the KV store, gossip transport security, key ownership, and replication have been reconciled with the shipped code (`crates/ephpm-cluster/`). Some later sections (auto-instrumentation, admin UI wiring, and the illustrative session-handler C listing) still describe the intended design and may not match the code line-for-line — those spots are flagged inline.
+> **Doc status:** this is a broad design document written ahead of implementation. Sections describing the KV store, PHP access paths, sessions, gossip transport security, key ownership, and replication have been reconciled with the shipped code (`crates/ephpm-cluster/`, `crates/ephpm-kv/`). Code listings are illustrative sketches, not the shipped source. Features that do not exist yet (the PHP response cache, the Node API endpoints, RESP lists/sets) are labelled **Planned** inline.
+>
+> This page covers the **KV** side of clustering. For clustered **SQLite** (Turso CDC replication, primary election, and per-site clustered databases) see [Database → Clustered](/architecture/database/#clustered-turso-cdc--experimental) and [Clustering setup](/guides/clustering-setup/).
 
 ---
 
@@ -25,12 +27,12 @@ We evaluated embedding existing databases (Redis, Dragonfly, KeyDB, Garnet) and 
 | Requirement | What competitors offer | ePHPm goal |
 |-------------|------------------------|------------|
 | Single-node KV | RoadRunner: in-memory/BoltDB/Redis drivers. Swoole: `Swoole\Table`. | In-process concurrent hashmap, zero-overhead access from PHP via SAPI. |
-| Data structures | Redis-style: strings, hashes, lists, sets, sorted sets | MVP: strings + hashes only (covers 95% of PHP usage). Lists, sets, sorted sets added later if needed. |
+| Data structures | Redis-style: strings, hashes, lists, sets, sorted sets | Strings + hashes only — a cache, not a broker. No lists, sets, sorted sets or streams; workloads that need them (queues especially) should use a real Redis. |
 | TTL / expiry | Standard | Background sweeper + lazy expiry on access. |
 | Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, `hash % nodes` key ownership, cross-node routing with replication. |
 | PHP access | RoadRunner: Goridge RPC. Swoole: shared memory API. | SAPI function calls — zero serialization, zero network hop for local keys. |
 | Persistence | Optional | **Planned — not yet implemented.** Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
-| Redis protocol compat | Not required | Optional RESP listener so existing Redis clients/tools work. |
+| Redis protocol compat | Not required | Optional RESP listener (TCP) so existing Redis clients and tools work for cache-style commands. Not a full Redis: see the gaps under [Redis Protocol](#1-redis-protocol-resp--redis-compatible-for-caching-not-a-redis-replacement). |
 
 ---
 
@@ -141,278 +143,107 @@ eviction_policy = "allkeys-lru"  # noeviction, allkeys-lru, volatile-lru, allkey
 
 ## PHP Access
 
-Three ways for PHP to access the KV store, each serving different use cases. All three work transparently with clustering — local keys are fast-pathed, remote keys are routed automatically.
+PHP reaches the KV store three ways. The SAPI functions and the native session handler run in-process; the RESP listener is a TCP socket for existing Redis clients. All three see the same store, and with clustering on, writes are replicated by the cluster layer described below.
 
-### 1. Redis Protocol (RESP) — Zero Code Changes
+### 1. Redis Protocol (RESP) — Redis-compatible for caching, not a Redis replacement
 
-**Priority: implement first.** This gives instant compatibility with every PHP app that already uses Redis. WordPress, Laravel, Symfony, Drupal — they all have Redis session and cache drivers. No code changes, no new dependencies.
-
-ePHPm exposes a RESP (Redis Serialization Protocol) listener that PHP's existing Redis clients connect to as if it were a real Redis server. Two transport options:
-
-**TCP (default)** — drop-in replacement, zero config changes for most apps:
+ePHPm can expose a RESP2 listener that PHP's existing Redis clients (`phpredis`, `predis/predis`) connect to as if it were a Redis server. It is **off by default**:
 
 ```toml
 [kv.redis_compat]
 enabled = true
-listen = "127.0.0.1:6379"   # looks like Redis to PHP
+listen = "127.0.0.1:6379"   # TCP only
 ```
 
-**Unix socket** — eliminates TCP overhead (no handshake, no Nagle, no loopback routing). ~2-5x faster than TCP for high-frequency small operations like session reads. Requires a one-line config change in the PHP app:
+**What works.** Plain caching: strings with TTLs, counters, and hashes. That covers most object-cache and page-cache usage. The exact command list (`GET`/`SET` with `EX`/`PX`/`NX`/`XX`/`GET`, `MGET`/`MSET`, `INCR`/`DECR`, `EXPIRE`/`TTL`, `HSET`/`HGET`/`HGETALL` and the other basic hash commands, `KEYS`, `DBSIZE`, `FLUSHDB`, `DELIFEQ`, `AUTH`, `INFO`, …) is in [KV from PHP](/guides/kv-from-php/). Anything else returns `ERR unknown command`.
 
-```toml
-[kv.redis_compat]
-enabled = true
-socket = "/run/ephpm/redis.sock"   # unix socket path
-# listen = "127.0.0.1:6379"       # TCP and socket can run simultaneously
-```
+**What does not exist** — check this list before pointing a framework at the listener:
 
-Both can be enabled at the same time — TCP for backward compatibility and tooling (`redis-cli`), Unix socket for performance-sensitive paths.
+| Missing | What breaks |
+|---------|-------------|
+| Unix-socket listener | `[kv.redis_compat] socket` is parsed but **not implemented**; startup warns and the listener stays TCP-only. Connection strings that use `unix://` or a socket path will not connect. |
+| Lists (`LPUSH`, `BRPOP`, …) | **Laravel queues**, Symfony Messenger's Redis transport, and any other Redis-backed job queue. |
+| Sets and sorted sets | Laravel cache **tags**, leaderboards, rate limiters built on sorted sets. |
+| `MULTI`/`EXEC` | Transactions and pipelined-transaction helpers (e.g. Laravel's `RedisStore::putMany`). |
+| `EVAL`/`EVALSHA` | Lua scripts, including Laravel's atomic lock release. |
+| `SCAN`, `HMGET`, `HMSET`, `HINCRBY`, `UNLINK`, `EXPIREAT` | Clients and libraries that use them (e.g. `SCAN`-based cache clears). |
+| Pub/sub | Broadcasting, cache-invalidation channels. |
 
-#### Transport Comparison
+Two further traps:
 
-| Transport | Latency | Throughput | Config change needed |
-|-----------|---------|------------|---------------------|
-| **TCP localhost** | ~10-50us | Good | None — point at `127.0.0.1:6379` |
-| **Unix socket** | ~2-10us | Better (~2-5x) | Change host to socket path |
-| **SAPI (direct FFI)** | ~100-200ns | Best (~100x vs TCP) | Use `ephpm_kv_*()` functions |
+- **`INFO` reports `redis_version:7.0.0`** (a fixed string, with `tcp_port:6379` whatever the real port is). Clients that feature-detect on the version will assume a modern Redis and may send commands from the table above.
+- **One logical database.** `SELECT` accepts only `0`.
 
-Unix socket is the sweet spot for apps that want better performance without rewriting code. Just change the Redis connection string:
+**The KV is a cache, not a broker.** If you need queues, streams, pub/sub, or Lua, run a real Redis for that workload and keep ePHPm's KV for caching, sessions and counters. For Laravel that means `QUEUE_CONNECTION=redis` against a real Redis (or the `database`/`sqs` queue drivers), with the cache pointed at ePHPm.
 
-```php
-// Laravel — config/database.php
-'redis' => [
-    'default' => [
-        'scheme' => 'unix',
-        'path' => '/run/ephpm/redis.sock',
-        // or for phpredis: 'host' => '/run/ephpm/redis.sock'
-    ],
-],
+For framework integration, prefer the in-process packages over RESP. They skip the socket and avoid the command gaps above: `ephpm/cache-laravel`, `ephpm/cache-symfony`, `ephpm/cache-wordpress` and `ephpm/predis-connection` (a drop-in `Predis\Client` connection with no socket). See [PHP packages](/reference/php-packages/#cache-kv-and-session-packages).
 
-// WordPress — wp-config.php
-define('WP_REDIS_SCHEME', 'unix');
-define('WP_REDIS_PATH', '/run/ephpm/redis.sock');
+In multi-site mode (`[server] sites_dir`), the listener requires `[kv] secret` and each connection authenticates as one site — see [`[kv]`](/reference/config/#kv) and [KV Store → Multi-tenant isolation](/architecture/kv-store/#multi-tenant-isolation).
 
-// Symfony — config/packages/cache.yaml
-framework:
-    cache:
-        default_redis_provider: 'redis:///run/ephpm/redis.sock'
-```
+### 2. Native session handler — opt-in
 
-#### Supported PHP Clients
-
-Both major PHP Redis clients support TCP and Unix sockets out of the box:
-
-- **`phpredis`** — C extension, best performance for RESP path. Pre-compiled into many PHP distributions. Supports Unix sockets natively via `host` parameter.
-- **`predis/predis`** — Pure PHP, most popular Composer package. No extension required. Supports Unix sockets via `scheme: unix` parameter.
-
-#### Framework Integration (Zero Changes)
-
-**Laravel** — point the Redis connection at localhost:
-
-```php
-// config/database.php — the only change needed
-'redis' => [
-    'client' => env('REDIS_CLIENT', 'phpredis'), // or 'predis'
-    'default' => [
-        'host' => '127.0.0.1',
-        'port' => 6379,
-        'database' => 0,
-    ],
-],
-
-// Cache, sessions, queues — all work automatically
-Cache::put('key', 'value', 3600);
-// config/session.php: 'driver' => 'redis'
-```
-
-**WordPress** — with the [Redis Object Cache](https://wordpress.org/plugins/redis-cache/) plugin:
-
-```php
-// wp-config.php
-define('WP_REDIS_HOST', '127.0.0.1');
-define('WP_REDIS_PORT', 6379);
-// Plugin handles the rest — object cache, transients, etc.
-```
-
-**Symfony** — configure the cache adapter:
-
-```yaml
-# config/packages/cache.yaml
-framework:
-    cache:
-        default_redis_provider: 'redis://127.0.0.1:6379'
-        pools:
-            app.cache:
-                adapter: cache.adapter.redis
-```
-
-#### RESP Commands to Implement
-
-The RESP protocol is simple text-based. ~500-800 lines of Rust to implement the commands PHP clients actually use.
-
-**What PHP apps actually need:** WordPress, Laravel, and Symfony Redis usage is almost entirely strings and hashes — `GET`/`SET` for cache and sessions, `HGET`/`HSET` for WordPress object cache groups, `INCR`/`DECR` for rate limiting. This covers 95%+ of real-world usage. Lists, sets, and sorted sets are niche — anyone needing those probably has a real Redis anyway.
-
-##### MVP — Strings + Hashes (Phase 1)
-
-These commands cover cache, sessions, object cache, and rate limiting:
-
-| Command | Used by |
-|---------|---------|
-| `PING`, `ECHO`, `INFO`, `SELECT`, `AUTH` | Connection/handshake (required by all clients) |
-| `GET`, `SET`, `SETEX`, `SETNX`, `DEL`, `EXISTS` | All cache/session drivers |
-| `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, `PERSIST` | TTL management |
-| `MGET`, `MSET` | Batch cache reads/writes |
-| `INCR`, `DECR`, `INCRBY`, `DECRBY` | Rate limiting, counters |
-| `HGET`, `HSET`, `HDEL`, `HGETALL`, `HMSET`, `HMGET`, `HEXISTS`, `HLEN` | WordPress object cache groups, Laravel hash storage |
-| `KEYS`, `SCAN`, `FLUSHDB`, `DBSIZE`, `TYPE` | Admin/debug |
-
-This is enough for:
-- WordPress with Redis Object Cache plugin
-- Laravel cache, sessions, and rate limiting
-- Symfony cache adapter
-- Any app using Redis as a simple key-value cache
-
-##### Phase 2 — Lists (if needed)
-
-Lists are used primarily by **Laravel queues** (`LPUSH`/`BRPOP`). However, Laravel also supports database and SQS queue drivers, and we may want a native ephpm queue backed by the KV store instead of emulating Redis lists. Add lists only if there's real demand:
-
-| Command | Used by |
-|---------|---------|
-| `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX` | Laravel queues |
-| `BRPOP`, `BLPOP` | Blocking queue pops (requires async listener) |
-
-##### Phase 3 — Sets + Sorted Sets (low priority)
-
-Niche usage — unique tracking (`SADD`/`SISMEMBER`), leaderboards (`ZADD`/`ZRANGE`). Most apps that need these are using Redis as a primary data store, not just a cache, and should keep using a dedicated Redis instance:
-
-| Command | Used by |
-|---------|---------|
-| `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` | Unique tracking, tag sets |
-| `ZADD`, `ZRANGE`, `ZRANGEBYSCORE`, `ZRANK`, `ZREM`, `ZSCORE` | Leaderboards, priority queues |
-
-##### Not Implementing
-
-| Category | Why |
-|----------|-----|
-| `SUBSCRIBE`/`PUBLISH` | Pub/sub is a different architecture. If needed, build a native ephpm event system rather than emulating Redis pub/sub. |
-| `EVAL`/`EVALSHA` (Lua scripting) | Complex to implement, rarely used by PHP apps. |
-| `MULTI`/`EXEC` (transactions) | Atomic operations (`INCR`, `SETNX`) cover most transaction use cases. |
-| Persistence (`BGSAVE`, `RDB`, `AOF`) | ephpm is a cache, not a database. Optional snapshot/AOF may come later as a KV feature, not via RESP commands. |
-| Cluster (`CLUSTER *`) | ephpm clustering is transparent — the RESP listener always acts as a single-node interface. Key routing happens behind the scenes. |
-
-Unsupported commands return `-ERR unknown command` so clients handle them gracefully. This matches how Redis itself handles unknown commands — PHP clients and frameworks already have fallback paths.
-
-### 2. Session Handler — Automatic
-
-**Priority: implement second.** Register a custom PHP `session.save_handler` so `session_start()` uses the KV store with zero application changes. This uses the FFI path internally for maximum performance.
+ePHPm registers a native PHP session save handler named `ephpm` that stores sessions in the KV store. **It is not enabled automatically**: with no configuration, sessions use PHP's default `files` handler, which is node-local (and, in multi-site mode, a per-site directory). Behind a load balancer that means sessions are **not** shared across nodes until you opt in:
 
 ```toml
 [php]
 ini_overrides = [
     ["session.save_handler", "ephpm"],
-    ["session.save_path", ""],           # not needed, ephpm manages storage
 ]
 ```
 
-From PHP's perspective, sessions just work:
+What the handler does:
+
+| Callback | Behaviour |
+|----------|-----------|
+| `open()` | Nothing to connect to; always succeeds. |
+| `read($id)` | Takes a per-session lock (`session_lock:<id>`, see below), then reads `session:<id>`. |
+| `write($id, $data)` | Stores `session:<id>` with a TTL of `session.gc_maxlifetime`. |
+| `close()` | **Releases the session lock.** |
+| `destroy($id)` | Deletes `session:<id>`. |
+| `gc()` | No-op; the KV's TTL expiry removes old sessions. |
+
+The [`ephpm/session-handler`](/reference/php-packages/#cache-kv-and-session-packages) Composer package is a userland alternative. Both store sessions in the KV, so a session is subject to `[kv] memory_limit` and the eviction policy like any other key.
+
+### 3. Direct SAPI functions
+
+The `ephpm_kv_*` functions call the store directly from PHP, with no socket and no serialization:
 
 ```php
-session_start();                    // → ephpm_kv_get("session:<id>")
-$_SESSION['cart'] = ['item1'];
-// On request end:                  // → ephpm_kv_set("session:<id>", data, ttl: gc_maxlifetime)
-```
-
-The session handler implements PHP's `SessionHandlerInterface` at the C level:
-
-| Callback | KV Operation |
-|----------|-------------|
-| `open()` | No-op (KV store is always available) |
-| `close()` | No-op |
-| `read($id)` | `ephpm_kv_get("session:$id")` |
-| `write($id, $data)` | `ephpm_kv_set("session:$id", $data, ttl: gc_maxlifetime)` |
-| `destroy($id)` | `ephpm_kv_del("session:$id")` |
-| `gc($max_lifetime)` | No-op (TTL expiry handles this) |
-
-With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer. Ownership is a deterministic `hash(session_id) % alive_nodes`, so within a stable cluster reads-after-writes for a session hit the same owner (read-your-writes for free). Large session blobs are additionally replicated to `replication_factor` nodes, so a session survives owner loss.
-
-> **KV v1 caveats:** `session_destroy()` and lazy-write TTL refresh are not replicated cluster-wide — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/) and the sessions doc's clustered-mode caveats.
-
-### 3. Direct SAPI Functions — Maximum Performance
-
-**Priority: implement third.** For applications that want the absolute fastest KV access — 1,000-10,000x faster than RESP for local keys. Requires ephpm-specific PHP code.
-
-C-level functions exposed to PHP via the ePHPm SAPI:
-
-```php
-// String operations
-ephpm_kv_set("user:123:profile", $json, ttl: 3600);
+ephpm_kv_set("user:123:profile", $json, 3600);   // optional 3rd arg: TTL in seconds
 $json = ephpm_kv_get("user:123:profile");
 ephpm_kv_del("user:123:profile");
 
-// Atomic operations
-$count = ephpm_kv_incr("page:views");
+$count  = ephpm_kv_incr("page:views");
 $exists = ephpm_kv_exists("cache:key");
-
-// With clustering, this is transparent:
-// - If key is local → direct memory access, ~100ns
-// - If key is on another node → internal network hop, ~0.5-2ms
-// PHP code doesn't know or care which node owns the key
 ```
 
-#### Composer Package (`ephpm/ephpm`)
+With clustering on, the call is the same whether the key is local or owned by another node; remote keys cost a data-plane round trip. The full function list is in [KV from PHP](/guides/kv-from-php/).
 
-Ship a Composer package that wraps the SAPI functions in standard PHP interfaces, with a fallback to Redis for local development without ephpm:
+#### Composer packages
 
-```php
-// composer require ephpm/ephpm
-
-use Ephpm\Cache\KvStore;
-use Ephpm\Cache\KvCachePool;       // PSR-6 CacheItemPoolInterface
-use Ephpm\Cache\KvSimpleCache;     // PSR-16 CacheInterface
-
-// PSR-16 SimpleCache
-$cache = new KvSimpleCache();
-$cache->set('key', 'value', 3600);
-$value = $cache->get('key');
-
-// PSR-6 Cache Pool
-$pool = new KvCachePool();
-$item = $pool->getItem('key');
-
-// Laravel cache driver registration
-// In a ServiceProvider:
-Cache::extend('ephpm', function ($app, $config) {
-    return new EphpmCacheStore();
-});
-
-// config/cache.php
-'stores' => [
-    'ephpm' => ['driver' => 'ephpm'],
-],
-```
-
-The Composer package detects whether it's running inside ephpm (SAPI functions available) or standalone (falls back to Redis/Memcached). This means the same application code works in development with a local Redis and in production on ephpm with zero-overhead KV.
+The `ephpm/cache` package wraps the SAPI functions in PSR-16 (SimpleCache) and PSR-6 interfaces, and the framework packages (`ephpm/cache-laravel`, `ephpm/cache-symfony`, `ephpm/cache-wordpress`, `ephpm/predis-connection`) build on it. They are distributed from their GitHub repositories, not Packagist — see [PHP packages](/reference/php-packages/) for the repository setup and each package's README for its API.
 
 ### Access Path Comparison
 
-| Path | Latency (local) | Code changes | Best for |
-|------|-----------------|-------------|----------|
-| **RESP over TCP** | ~10-50us | None — existing Redis config | Drop-in migration, zero effort |
-| **RESP over Unix socket** | ~2-10us | Change Redis host to socket path | Existing apps wanting more speed |
-| **Session handler** | ~100-200ns | None — INI config only | PHP sessions (automatic) |
-| **SAPI functions** | ~100-200ns | ephpm-specific calls | New apps, performance-critical paths |
-| **Composer package** | ~100-200ns | PSR-6/PSR-16 interfaces | New apps that want portability + speed |
+The latency figures are rough design estimates, not benchmarks.
 
-The RESP paths have overhead from IPC + RESP serialization, but are still **100-1,000x faster than external Redis** since there's no network hop — just in-process communication. Unix sockets cut the RESP overhead roughly in half vs TCP by eliminating the TCP/IP stack.
+| Path | Latency (local key) | Code changes | Best for |
+|------|---------------------|-------------|----------|
+| **RESP over TCP** | ~10-50µs | Point the Redis client at the listener | Existing Redis cache code that uses only the supported commands |
+| **Native session handler** | in-process | One `ini_overrides` line | PHP sessions |
+| **SAPI functions** | ~100-200ns | ePHPm-specific calls | New code, hot paths |
+| **Composer cache packages** | in-process | Swap the cache driver | Framework caches without a socket |
 
 ### Performance Expectations
 
-| Operation | SAPI (local) | RESP Unix socket | RESP TCP | SAPI (remote) | External Redis |
-|-----------|-------------|-----------------|----------|---------------|----------------|
-| GET (string) | ~100-200ns | ~2-10us | ~10-50us | ~0.5-2ms | ~0.5-2ms |
-| SET (string) | ~200-400ns | ~2-10us | ~10-50us | ~0.5-2ms | ~0.5-2ms |
-| Serialization | None (shared memory) | RESP encode/decode | RESP encode/decode | Internal binary | Full RESP |
-| Connection | None (in-process FFI) | Unix socket | Localhost TCP | Persistent internal | TCP pool |
+Design estimates, not measured benchmarks:
+
+| Operation | SAPI (local) | RESP TCP | SAPI (remote) | External Redis |
+|-----------|-------------|----------|---------------|----------------|
+| GET (string) | ~100-200ns | ~10-50us | ~0.5-2ms | ~0.5-2ms |
+| SET (string) | ~200-400ns | ~10-50us | ~0.5-2ms | ~0.5-2ms |
+| Serialization | None (shared memory) | RESP encode/decode | Internal binary | Full RESP |
+| Connection | None (in-process FFI) | Localhost TCP | Persistent internal | TCP pool |
 
 ---
 
@@ -809,6 +640,8 @@ Phase 2 (clustered):                 AcmeConfig → KvCache (gossip-replicated K
 
 Intercept PHP-generated `ETag` headers and short-circuit repeat requests across all nodes without executing PHP. This is distinct from static file ETags (which are handled at the server level today).
 
+> **Status:** the **ETag-only** form ships, off by default, as [`[server.php_etag_cache]`](/reference/config/#serverphp_etag_cache): PHP-emitted ETags are cached in the KV and a matching `If-None-Match` gets a `304` without running PHP. Full-response (edge) caching, the purge header and the cache-group logic below are **Planned — not yet implemented**.
+
 #### Flow
 
 ```
@@ -840,314 +673,89 @@ Most WordPress page views are anonymous and return identical content. Skipping P
 
 ### Session Storage
 
-PHP sessions stored in the KV store instead of the filesystem. With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer (but note the KV v1 caveats: `session_destroy()` and lazy-write TTL refresh are not replicated — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/)).
+PHP sessions can be stored in the KV store instead of the filesystem, through the native `ephpm` save handler (see [Native session handler](#2-native-session-handler--opt-in) above). **This is opt-in.** Without `session.save_handler = ephpm`, sessions use PHP's `files` handler: node-local files that other nodes cannot see, so a load balancer without sticky sessions will log users out. Nothing in ePHPm switches the handler for you, whether or not `[kv]` or `[cluster]` is configured.
 
-#### How PHP Sessions Work
-
-PHP's session system is callback-driven. The engine calls a set of handler functions at specific points in the session lifecycle. By default, PHP uses the `files` handler (`/tmp/sess_<id>`). Redis and Memcached replace this with their own handlers. We do the same, implementing the callbacks in C (via `ephpm_wrapper.c`) backed by Rust's KV store.
-
-#### Request Lifecycle
-
-```
-PHP: session_start()
-       │
-       ▼
-  1. open(save_path, session_name)
-       → No-op. KV store is always available, no connection to establish.
-       │
-       ▼
-  2. read(session_id)
-       → C: ephpm_session_read(id)
-       → Rust: kv_store.get("session:{id}")
-       → Returns serialized $_SESSION data (or "" for new session)
-       │
-       ▼
-  3. PHP deserializes data into $_SESSION superglobal
-       │
-       ▼
-  4. Script runs, modifies $_SESSION freely
-       │
-       ▼
-  5. Request ends (or explicit session_write_close())
-       │
-       ▼
-  6. write(session_id, serialized_data)
-       → C: ephpm_session_write(id, data, gc_maxlifetime)
-       → Rust: kv_store.set("session:{id}", data, ttl: gc_maxlifetime)
-       │
-       ▼
-  7. close()
-       → Release session lock (see Locking below)
-```
-
-#### C Handler Implementation
-
-The session handler is registered during SAPI initialization via `php_session_register_module()`. All functions go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` bailout protection.
-
-> **TODO verify / does not match the shipped code:** the C listing below is the *original design sketch*. The actual implementation in `crates/ephpm-php/ephpm_wrapper.c` does not use the `ephpm_kv_session_lock(const char *id, size_t id_len)` / `ephpm_kv_session_unlock(...)` FFI signatures shown here. Locking is done inside the wrapper via a KV op table (`g_kv_ops.set_nx` / `g_kv_ops.del`) and internal `static` helpers `ephpm_session_lock_acquire(sid, sid_len)` / `ephpm_session_lock_release(void)`, with the acquired sid tracked in thread-local state (`session_lock:<sid>`, 30s TTL, spin-with-backoff). See [the Sessions feature doc](/features/sessions/) for the authoritative behaviour.
-
-```c
-// ephpm_wrapper.c
-
-#include "ext/session/php_session.h"
-
-// Forward declarations — these call into Rust via FFI
-extern int ephpm_kv_session_read(const char *id, size_t id_len,
-                                  char **data, size_t *data_len);
-extern int ephpm_kv_session_write(const char *id, size_t id_len,
-                                   const char *data, size_t data_len,
-                                   int gc_maxlifetime);
-extern int ephpm_kv_session_destroy(const char *id, size_t id_len);
-extern int ephpm_kv_session_lock(const char *id, size_t id_len);
-extern int ephpm_kv_session_unlock(const char *id, size_t id_len);
-
-PS_OPEN_FUNC(ephpm) {
-    // No-op — KV store is always available in-process
-    return SUCCESS;
-}
-
-PS_CLOSE_FUNC(ephpm) {
-    // Release session lock
-    ephpm_kv_session_unlock(/* current session id */);
-    return SUCCESS;
-}
-
-PS_READ_FUNC(ephpm) {
-    // Acquire session lock first (blocking)
-    int rc = ephpm_kv_session_lock(key->val, key->len);
-    if (rc != SUCCESS) {
-        php_error_docref(NULL, E_WARNING,
-            "ephpm: session lock timeout for %s, proceeding without lock",
-            key->val);
-    }
-
-    char *data = NULL;
-    size_t data_len = 0;
-    rc = ephpm_kv_session_read(key->val, key->len, &data, &data_len);
-    if (rc == SUCCESS && data != NULL) {
-        *val = zend_string_init(data, data_len, 0);
-        free(data);
-    } else {
-        *val = zend_string_init("", 0, 0);  // new session
-    }
-    return SUCCESS;
-}
-
-PS_WRITE_FUNC(ephpm) {
-    int maxlifetime = INI_INT("session.gc_maxlifetime");
-    return ephpm_kv_session_write(
-        key->val, key->len,
-        val->val, val->len,
-        maxlifetime
-    );
-}
-
-PS_DESTROY_FUNC(ephpm) {
-    return ephpm_kv_session_destroy(key->val, key->len);
-}
-
-PS_GC_FUNC(ephpm) {
-    // No-op — TTL-based expiry handles garbage collection automatically.
-    // PHP calls this probabilistically (session.gc_probability / session.gc_divisor),
-    // but we don't need it since every session key has a TTL.
-    *nrdels = 0;
-    return SUCCESS;
-}
-
-// Register the handler module
-ps_module ps_mod_ephpm = {
-    PS_MOD_UPDATE_TIMESTAMP(ephpm)
-};
-
-void ephpm_register_session_handler(void) {
-    php_session_register_module(&ps_mod_ephpm);
-}
-```
-
-#### Rust Side
-
-```rust
-// In ephpm-php/src/lib.rs (or a new session.rs module)
-
-/// Called from C: read session data from KV store.
-#[no_mangle]
-pub extern "C" fn ephpm_kv_session_read(
-    id: *const c_char, id_len: usize,
-    data: *mut *mut c_char, data_len: *mut usize,
-) -> c_int {
-    let id = unsafe { std::slice::from_raw_parts(id as *const u8, id_len) };
-    let key = format!("session:{}", std::str::from_utf8(id).unwrap_or(""));
-
-    let store = KV_STORE.get().expect("KV store not initialized");
-    match store.get(key.as_bytes()) {
-        Some(value) => {
-            let ptr = unsafe { libc::malloc(value.len()) as *mut c_char };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    value.as_ptr(), ptr as *mut u8, value.len()
-                );
-                *data = ptr;
-                *data_len = value.len();
-            }
-            0 // SUCCESS
-        }
-        None => {
-            unsafe {
-                *data = std::ptr::null_mut();
-                *data_len = 0;
-            }
-            0 // SUCCESS (empty session is not an error)
-        }
-    }
-}
-
-/// Called from C: write session data to KV store with TTL.
-#[no_mangle]
-pub extern "C" fn ephpm_kv_session_write(
-    id: *const c_char, id_len: usize,
-    data: *const c_char, data_len: usize,
-    gc_maxlifetime: c_int,
-) -> c_int {
-    let id = unsafe { std::slice::from_raw_parts(id as *const u8, id_len) };
-    let data = unsafe { std::slice::from_raw_parts(data as *const u8, data_len) };
-    let key = format!("session:{}", std::str::from_utf8(id).unwrap_or(""));
-    let ttl = Duration::from_secs(gc_maxlifetime as u64);
-
-    let store = KV_STORE.get().expect("KV store not initialized");
-    store.set(key.into_bytes(), data.to_vec(), Some(ttl));
-    0 // SUCCESS
-}
-```
-
-#### Session Locking
-
-This is the most important design decision. Without locking, concurrent requests sharing a session ID can clobber each other:
-
-```
-Request A: session_start() → reads $_SESSION = {cart: [item1]}
-Request B: session_start() → reads $_SESSION = {cart: [item1]}
-Request A: $_SESSION['cart'][] = 'item2'; session_write_close()
-           → writes {cart: [item1, item2]}
-Request B: $_SESSION['cart'][] = 'item3'; session_write_close()
-           → writes {cart: [item1, item3]}  ← item2 is LOST
-```
-
-**Current model (ZTS, concurrent PHP requests):** This is a real concern. Multiple threads can execute PHP concurrently, so concurrent session access from the same user (e.g. AJAX requests) can cause lost updates.
-
-**Future model (external PHP workers, multi-process):** Locking is essential.
-
-**Implementation:** Lock acquired during `read()`, released during `close()`. The lock is a KV key with TTL to prevent deadlocks:
-
-```
-KV key: "session_lock:{session_id}"
-Value:  "{request_id}"
-TTL:    30s (safety net if request crashes without releasing)
-```
-
-Lock acquisition strategy:
-- **Spin with backoff**: Try to acquire lock, sleep 10ms, retry up to `session.lock_wait_timeout` (default 10s). Same approach as the Redis session handler.
-- **If timeout exceeded**: Proceed without lock (same behavior as phpredis `redis.session.lock_retries` exhausted). Log a warning.
-
-```rust
-/// Acquire session lock with spin + backoff.
-fn session_lock(session_id: &str, timeout: Duration) -> bool {
-    let lock_key = format!("session_lock:{session_id}");
-    let lock_ttl = Duration::from_secs(30);
-    let deadline = Instant::now() + timeout;
-    let mut backoff = Duration::from_millis(10);
-
-    loop {
-        // SET NX — only succeeds if key doesn't exist
-        if store.set_nx(lock_key.as_bytes(), request_id, Some(lock_ttl)) {
-            return true;  // lock acquired
-        }
-        if Instant::now() >= deadline {
-            return false;  // timeout
-        }
-        std::thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_millis(200));
-    }
-}
-```
-
-With clustering, the lock key `session_lock:{id}` is small and rides the gossip tier (it is well under `small_key_threshold`), so it is replicated to every node — the `SETNX` and `DEL` operate on the local gossip-backed view. (In the shipped implementation the lock is node-local; see the [Sessions feature doc](/features/sessions/) for the exact cross-node semantics.)
-
-#### Serialization
-
-PHP has a built-in session serializer (`session.serialize_handler`). By default it uses `php` format, but `php_serialize` (standard `serialize()`) is also common. We don't touch serialization at all — PHP handles it before calling our `write()` and after our `read()`. The KV store just sees opaque bytes.
-
-#### Configuration
+#### Enabling it
 
 ```toml
 [php]
 ini_overrides = [
-    # Enable ephpm session handler (set automatically when [kv] is configured)
-    ["session.save_handler", "ephpm"],
+    ["session.save_handler", "ephpm"],      # required: opt in to the KV handler
 
     # Standard PHP session settings still apply
-    ["session.gc_maxlifetime", "1440"],   # TTL in seconds (default 24 min)
-    ["session.cookie_lifetime", "0"],      # browser session cookie
-    ["session.cookie_secure", "1"],        # HTTPS only
-    ["session.cookie_httponly", "1"],       # no JS access
-    ["session.cookie_samesite", "Lax"],    # CSRF protection
+    ["session.gc_maxlifetime", "1440"],     # session TTL in the KV, seconds
+    ["session.cookie_secure", "1"],
+    ["session.cookie_httponly", "1"],
+    ["session.cookie_samesite", "Lax"],
 ]
 ```
 
-When `[kv]` is configured in ephpm.toml, the session handler is registered automatically. If the user hasn't explicitly set `session.save_handler`, ephpm defaults to the KV handler. If they've set it to `files` or `redis` explicitly, we respect that.
+ePHPm generates the `php.ini` PHP reads, so a line in a system `php.ini` has no effect; use `ini_overrides` (or `ini_set()` before `session_start()`).
 
-#### Clustering Behavior
-
-With clustering, sessions work transparently across nodes:
+#### Request lifecycle
 
 ```
-Client → Load Balancer → Pod 0: session_start()
-  │                              → kv_store.get("session:abc123")
-  │                              → key hashes to Pod 2 (owner)
-  │                              → internal network hop to Pod 2
-  │                              → Pod 2 returns session data
-  │                              → PHP deserializes, script runs
-  │                              → session_write_close()
-  │                              → kv_store.set("session:abc123", data)
-  │                              → routed to Pod 2 (owner)
-  │                              → Pod 2 writes locally + replicates
-  │
-  ├── Next request → Pod 1: session_start()
-  │                          → same flow, key routes to Pod 2
-  │                          → session data available immediately
+session_start()
+  1. open()   — nothing to connect to; always succeeds
+  2. read(id) — acquire session_lock:<id>, then GET session:<id> ("" for a new session)
+  3. PHP unserializes into $_SESSION; the script runs
+session_write_close() / end of request
+  4. write(id, data) — SET session:<id> with TTL = session.gc_maxlifetime
+  5. close()  — release session_lock:<id>
 ```
 
-No sticky sessions needed at the load balancer. Any node can read/write any session. Ownership (`hash(session_id) % alive_nodes`) keeps a session on the same owner while membership is stable, so there's no replication-lag concern for read-your-writes within a single session.
+PHP does the (de)serialization (`session.serialize_handler`); the KV stores opaque bytes. `gc()` is a no-op because every session key carries a TTL. The handler is implemented in C in `crates/ephpm-php/ephpm_wrapper.c` on top of the same KV operations the `ephpm_kv_*` functions use.
 
-If the owner node (Pod 2) crashes, a surviving node recomputes ownership and reads the session from a replica (large blobs are replicated to `replication_factor` nodes; small blobs live on every node via gossip). The session survives up to `replication_factor - 1` simultaneous owner-side failures. Note the write-time-only caveat: there is no background re-replication, so after a crash the surviving copies are not automatically topped back up to `replication_factor` until the session is rewritten.
+#### Session locking
 
-#### Performance vs Other Session Handlers
+Without a lock, two concurrent requests on one session (typically AJAX) can each read the same `$_SESSION` and the second write silently drops the first one's change. PHP runs requests concurrently on ePHPm's threads, so this is a real risk.
 
-| Handler | Read latency | Write latency | Clustering | Lock support |
-|---------|-------------|---------------|------------|-------------|
-| `files` (default) | ~50-200us (disk) | ~50-200us (disk) | No — local filesystem only | flock() |
-| `redis` (external) | ~0.5-2ms (TCP) | ~0.5-2ms (TCP) | Yes (Redis Cluster) | Spin lock via SET NX |
-| `memcached` (external) | ~0.5-2ms (TCP) | ~0.5-2ms (TCP) | Yes (consistent hashing) | GET + CAS |
-| **`ephpm` (local key)** | **~100-200ns** | **~200-400ns** | **Yes (built-in)** | **KV SET NX** |
-| **`ephpm` (remote key)** | **~0.5-2ms** | **~0.5-2ms** | **Yes (built-in)** | **KV SET NX** |
+The handler takes a pessimistic per-session lock in `read()` and releases it in `close()`:
 
-For the common case (session key local to the node), ephpm is **1,000-10,000x faster** than Redis or Memcached. For the clustered case (key on another node), it's comparable — but with zero external infrastructure.
+- The lock key is `session_lock:<id>`, set with `SETNX` and a **30-second TTL**, so a crashed request cannot hold it forever.
+- A contending request retries with backoff (10 ms, doubling, capped at 100 ms) for up to **30 seconds** in total. If the lock is still held, it logs an `E_WARNING` and continues **without** the lock — a possible lost update rather than a stuck worker.
+- The lock is released with an unconditional delete. If a request holds the lock longer than its 30-second TTL, another request may take it, and the first request's `close()` then deletes the second one's lock.
+
+With clustering on, the lock is a small key and therefore rides the gossip tier, which is eventually consistent. Two requests for the same session on **different** nodes at the same moment can both acquire it, so the lock is only reliable for requests that land on the same node.
+
+#### Clustering behaviour
+
+Session data is ordinary KV data. Small sessions (under `[cluster.kv] small_key_threshold`, default 512 bytes) are replicated to every node over gossip; larger ones are owned by `hash(session_id) % alive_nodes` and replicated to `replication_factor` nodes over the data plane. Any node can therefore read a session written on another node, so sticky sessions are not required.
+
+Caveats, all from the clustered KV's design:
+
+- Replication is asynchronous by default and write-time only. A session written on one node is visible elsewhere only after gossip converges or the data-plane write completes, and there is no background re-replication after a node loss.
+- When membership changes, ownership of large sessions remaps and existing copies are not moved; reads fall back to surviving replicas.
+- `session_destroy()` and lazy-write TTL refreshes are not replicated cluster-wide in KV v1 — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/).
+- Sessions count against `[kv] memory_limit` and can be evicted under memory pressure like any other key.
 
 ### Distributed Locking
 
-General-purpose distributed locks for PHP applications, built on the atomic
-`ephpm_kv_setnx()` primitive plus a TTL:
+Locks for PHP applications, built on the atomic `ephpm_kv_setnx()` primitive
+with a TTL, and released with `ephpm_kv_del_if_eq()` so a request only ever
+deletes its own lock:
 
 ```php
-// setnx() returns true only if the key did not already exist.
-if (ephpm_kv_setnx("deploy:mutex", getmypid())) {
-    ephpm_kv_expire("deploy:mutex", 30);  // never hold it forever
+$token = bin2hex(random_bytes(16));
+
+// Set-if-absent with a 30-second TTL in one atomic call — never hold it forever,
+// and never leave a window where the key exists without a TTL.
+if (ephpm_kv_setnx("deploy:mutex", $token, 30)) {
     try {
         // critical section
     } finally {
-        ephpm_kv_del("deploy:mutex");
+        // Delete only if it is still ours: if we overran the TTL and another
+        // request took the lock, a plain ephpm_kv_del() would release theirs.
+        ephpm_kv_del_if_eq("deploy:mutex", $token);
     }
 }
 ```
+
+These are reliable on a single node. With clustering on, a small lock key is
+replicated over the eventually-consistent gossip tier, so two nodes can both
+acquire the same lock at the same moment; do not rely on it for cross-node
+mutual exclusion. See [KV from PHP](/guides/kv-from-php/) for the function
+reference.
 
 ePHPm uses the same KV + TTL pattern internally to elect a single ACME
 certificate requester across the cluster, but that coordination lives in Rust
@@ -1165,15 +773,15 @@ Request from 1.2.3.4:
   if count > limit: return 429
 ```
 
-With clustering, rate limits are cluster-wide — an attacker can't bypass limits by hitting different nodes.
+**Rate limits are per node, not cluster-wide.** `INCR` and the other read-modify-write operations are local-only in the clustered KV — they are not replicated — so each node counts its own requests. Behind a load balancer across N nodes, a client can get up to roughly N times the configured limit. The built-in `ratelimit` middleware has the same property. Owner-routed `INCR` is designed in the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/) but not implemented.
 
 ---
 
-## Node API Endpoints
+## Node API Endpoints — Planned, not yet implemented
 
-The Node API exposes KV and cluster state for monitoring and debugging:
+None of these endpoints exist; no `/api/kv/*` route is served. Today, KV and cluster state is visible through the Prometheus metrics on `/metrics` and the [`ephpm kv`](/reference/cli/kv/) CLI. The table records the intended design:
 
-| Endpoint | Method | Description |
+| Endpoint (planned) | Method | Description |
 |----------|--------|-------------|
 | `/api/kv/stats` | GET | Memory usage, key count, hit/miss rate, evictions |
 | `/api/kv/cluster` | GET | Cluster membership, ring state, replication status |
@@ -1190,7 +798,7 @@ The KV store and clustering should be built incrementally:
 | **2. RESP listener (MVP)** | Strings + hashes commands, connection handshake, admin commands | Phase 1 |
 | **3. PHP SAPI functions** | `ephpm_kv_get/set/del/hget/hset` via FFI | Phase 1 |
 | **4. Session handler** | Custom PHP session save handler using KV (SAPI path) | Phase 3 |
-| **5. Composer package** | `ephpm/ephpm` — PSR-6/PSR-16 adapters, Laravel/Symfony drivers, Redis fallback | Phase 3 |
+| **5. Composer packages** | `ephpm/cache` (PSR-6/PSR-16) plus `cache-laravel`, `cache-symfony`, `cache-wordpress`, `predis-connection`, `session-handler` — shipped as separate repos | Phase 3 |
 | **6. Gossip** | `chitchat` integration, peer discovery, health, symmetric encryption | Nothing — can start in parallel with Phase 1 |
 | **6b. Data plane PSK encryption** | ChaCha20-Poly1305 sealing of the TCP data plane with a key derived from `[cluster] secret` (symmetric PSK, not mTLS) | Phase 6 |
 | **7. Key ownership** | `hash % nodes` owner selection, local vs remote routing over the (optionally sealed) data plane | Phase 1 + Phase 6b |
@@ -1198,17 +806,15 @@ The KV store and clustering should be built incrementally:
 | **9. ACME on KV** | Swap `DirCache` for `KvCache` in rustls-acme | Phase 8 |
 | **10. PHP response cache** | ETag interception, 304 short-circuit | Phase 7 |
 | **11. Distributed locks** | TTL-based locks, leader election | Phase 7 |
-| **12. Rate limiting** | Cluster-wide counters with TTL windows | Phase 7 |
-| **13. RESP lists** | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`BRPOP` — only if Laravel queue demand warrants it | Phase 2 |
-| **14. RESP sets + sorted sets** | `SADD`/`ZADD` etc. — low priority, most apps needing these keep a dedicated Redis | Phase 2 |
+| **12. Rate limiting** | Counters with TTL windows (per node today; cluster-wide needs owner-routed `INCR`) | Phase 7 |
 
-Phases 1-5 (single-node) and Phase 6 (gossip) can be developed in parallel. Everything after Phase 7 depends on key ownership being operational. RESP data structure phases (13-14) can be added at any time after Phase 2.
+Phases 1-5 (single-node) and Phase 6 (gossip) can be developed in parallel. Everything after Phase 7 depends on key ownership being operational. RESP lists, sets and sorted sets are deliberately **not** on this list: the KV is a cache, not a broker, and queue-style workloads belong on a real Redis.
 
 ---
 
 ## Configuration Reference
 
-### Planned
+These keys exist today; the authoritative list, with defaults, is the [configuration reference](/reference/config/#kv).
 
 ```toml
 [kv]
@@ -1217,9 +823,7 @@ eviction_policy = "allkeys-lru"        # noeviction, allkeys-lru, volatile-lru, 
 
 [kv.redis_compat]
 enabled = false                        # RESP protocol listener
-listen = "127.0.0.1:6379"             # TCP listener (default, zero-config for existing apps)
-socket = "/run/ephpm/redis.sock"       # Unix socket (~2-5x faster than TCP)
-# Both can be enabled simultaneously — TCP for tooling, socket for performance
+listen = "127.0.0.1:6379"             # TCP only; `socket` is parsed but NOT implemented
 
 [cluster]
 enabled = false
