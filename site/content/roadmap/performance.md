@@ -130,7 +130,7 @@ per-request serving.
 
 | Item | Est. win | Notes |
 |---|---|---|
-| **`ephpm composer`** — an embedded, pure-Rust Composer-compatible installer ([vivacity](https://github.com/Adelagric/vivacity)) built into the binary, so dependency install needs no PHP runtime and works in stub mode and on Windows | **Planned — not yet released** (on a feature branch, not in v0.10.8). Any install-speed figure is **vivacity's own claim as an external project**, not measured on/by ePHPm; no ePHPm-side benchmark exists yet, so no number is stated here | when it ships, the number to publish is an ePHPm-measured install of a real app's `composer install`, against `composer.phar`, on a pinned runner — per the benchmarks discipline |
+| **`ephpm composer`**: an embedded Composer-compatible installer ([vivacity](https://github.com/Adelagric/vivacity)) built into the binary, so `install` from a lock needs no PHP runtime and works in stub mode and on Windows | **Shipped in v0.11.0** ([reference](/reference/cli/composer/)). The open item is the benchmark. Any install-speed figure is **vivacity's own claim as an external project**, not measured on or by ePHPm. No ePHPm-side benchmark exists yet, so no number is stated here | the number to publish is an ePHPm-measured install of a real app's `composer install`, against `composer.phar`, on a pinned runner, per the benchmarks discipline |
 
 ## Gated on external milestones
 

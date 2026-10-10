@@ -181,18 +181,23 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Run Composer via the embedded vivacity installer (no external PHP)
+    /// Composer install/update/require/remove/dump-autoload via the embedded
+    /// vivacity installer
     ///
     /// `ephpm composer <args...>` forwards every trailing argument verbatim to
     /// the in-process [vivacity](https://github.com/Adelagric/vivacity)
-    /// installer — a pure-Rust reimplementation of Composer with byte-parity
-    /// dependency resolution. It needs no PHP runtime (it only shells out to a
-    /// real `composer` for the source-package fallback), so it works in every
-    /// build, including stub mode, and on Windows. The process exits with
-    /// Composer's own exit code.
+    /// installer, a Rust reimplementation of five Composer commands (`install`,
+    /// `update`, `require`, `remove`, `dump-autoload`). It is not full
+    /// Composer: no other command exists, scripts are not run unless you pass
+    /// `--run-scripts`, and locks it cannot install natively are handed to a
+    /// real `composer` on `PATH` (exit 3 without one). `install` and
+    /// `dump-autoload` need no PHP, so they work in every build, including
+    /// stub mode, and on Windows. `update`, `require` and `remove` run an
+    /// external `php` (`VIVACITY_PHP` or `php` on `PATH`) to probe platform
+    /// requirements. The process exits with vivacity's exit code.
     ///
     /// Examples: `ephpm composer install --no-dev --optimize-autoloader`,
-    /// `ephpm composer require monolog/monolog`, `ephpm composer --version`.
+    /// `ephpm composer dump-autoload -o`, `ephpm composer --version`.
     #[command(disable_help_flag = true)]
     Composer {
         /// Arguments passed through to Composer, untouched (a leading
