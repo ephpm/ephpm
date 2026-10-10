@@ -48,25 +48,49 @@ cookie and redirecting instead of answering `401`:
 [[middleware]]
 library = "/opt/ephpm/modules/libgithub_auth.so"
 order   = 10                     # cold path — owns the reserved paths
-config  = { client_id = "Iv1.0123456789abcdef",
-            client_secret  = "env:GH_CLIENT_SECRET",
-            session_secret = "env:EPHPM_SESSION_SECRET",
-            repo = "acme/web" }
+[middleware.config]
+client_id      = "Iv1.0123456789abcdef"
+client_secret  = "env:GH_CLIENT_SECRET"   # this module resolves env:NAME itself
+# The literal session key — byte-for-byte the same string as the verifier's
+# `secret` below. Generate it once, e.g. `openssl rand -hex 32` (>= 32 bytes).
+session_secret = "REPLACE-ME-with-a-random-key-of-at-least-32-bytes"
+repo           = "acme/web"
 
 [[middleware]]
 library = "session-cookie"       # hot path — verifies, redirects to login
 order   = 20
-config  = { secret = "env:EPHPM_SESSION_SECRET",
-            cookie = "ephpm_session",
-            login_url = "/_ephpm/auth/github/login",
-            return_to_param = "next" }
+[middleware.config]
+# LITERAL. The session-cookie builtin does NOT expand env:/file: — see below.
+secret          = "REPLACE-ME-with-a-random-key-of-at-least-32-bytes"
+cookie          = "ephpm_session"
+login_url       = "/_ephpm/auth/github/login"
+return_to_param = "next"
 ```
+
+> **Do not write `secret = "env:…"` on the `session-cookie` side.** This
+> module resolves `env:NAME` in its own config, but the built-in
+> `session-cookie` (like `jwt` and `preview-gate` mounted through
+> `[[middleware]]`) uses `secret` **literally**. `secret =
+> "env:EPHPM_SESSION_SECRET"` there makes the HMAC key the public string
+> `env:EPHPM_SESSION_SECRET`: every real session this module mints is refused,
+> and anyone who has read these docs can forge a session that verifies.
+> Earlier versions of this page showed exactly that line — if you copied it,
+> replace it and rotate. The verifier's `secret` must be the same bytes as the
+> issuer's resolved `session_secret`; you may keep `session_secret =
+> "env:NAME"` on the issuer side as long as the variable holds exactly the
+> string you put in `secret` (the issuer does not trim it). Protect the
+> literal by rendering `ephpm.toml` from your secret store at deploy time and
+> making it readable only by the service user. On a `sites_dir` preview host
+> the per-site [`[preview_auth]`](/guides/virtual-hosts/#preview_auth-the-access-gate)
+> override is the one ePHPm-side verifier config that **does** accept
+> `env:`/`file:` references (and enforces ≥ 32 bytes). See
+> [Secrets in `config` are literal](/guides/native-middleware/#secrets-in-config-are-literal).
 
 Three things must line up, and only three:
 
 | this module | `session-cookie` | note |
 |---|---|---|
-| `session_secret` | `secret` | the same HMAC key — that is what makes the token verify |
+| `session_secret` | `secret` | the same HMAC key — that is what makes the token verify. `env:` works only on this module's side; `secret` is literal |
 | `cookie_name` (`ephpm_session`) | `cookie` (`ephpm_session`) | defaults already match |
 | `login_path` | `login_url` + `return_to_param = "next"` | this module reads the return-to from `?next=` and sanitizes it |
 
@@ -112,14 +136,18 @@ every repository the user can touch, handed to a preview host. A GitHub App's
 user-to-server token is bounded by the app's installation instead, and needs
 no scope for the repository check. That is why `scopes` defaults to empty.
 
-**The reserved paths must reach PHP routing.** ePHPm evaluates middleware on
-the PHP-bound path, so `login_path` and `callback_path` must resolve to a PHP
-script for the module to see them. With the default
-`fallback = ["$uri", "$uri/", "/index.php?$query_string"]` and a front
-controller at `index.php` — WordPress, Laravel, Symfony — that is automatic,
-and PHP still never runs because the chain short-circuits first. A site with
-no `index.php` and a `=404` fallback would 404 the callback before the module
-is consulted.
+**Keep the reserved paths under `/_ephpm/auth/`.** The router hands every
+request in the `/_ephpm/auth/` sub-namespace straight to the global
+middleware chain, before static-file or PHP resolution — so the default
+`login_path` and `callback_path` work on any site, with or without an
+`index.php` front controller or a `=404` fallback. If no mounted module
+answers such a path (or no middleware is mounted at all), the router returns
+`404`: the namespace is reserved and nothing else serves there. The per-site
+`preview-gate` verifier is deliberately not run on that namespace, so the
+login round trip is never redirected back to login. A custom `login_path` /
+`callback_path` **outside** `/_ephpm/auth/` gets no such routing: it is only
+seen by the chain if the request reaches the normal static/PHP path, and a
+per-site gate would then need it in `exempt_paths`.
 
 **`dlopen` must work.** The stock Linux release is glibc-dynamic and can load
 this. A custom fully static (musl) ePHPm **cannot `dlopen` at all** and
@@ -160,9 +188,13 @@ first (which has no `github-auth` entry), then the platform-suffixed file
 
 ## Configuration
 
-Secrets accept an **`env:NAME`** indirection, read once at startup. Prefer it:
-`ephpm.toml` is often templated or rendered into a ConfigMap, and a literal in
-it is a secret in git.
+This module's secrets (`client_secret`, `session_secret`, `bypass_token`)
+accept an **`env:NAME`** indirection, read once at startup (the value is used
+as-is — not trimmed; `file:` is not supported). Prefer it: `ephpm.toml` is
+often templated or rendered into a ConfigMap, and a literal in it is a secret
+in git. This is a feature **of this module's own config parser**, not of
+ePHPm: the built-in verifiers you pair it with take their `secret` literally —
+see the warning under [It is half of a pair](#it-is-half-of-a-pair).
 
 | key | default | meaning |
 |---|---|---|
@@ -205,12 +237,18 @@ every callback through a fixed **apex** host and let the module carry the target
 preview in the signed OAuth `state`. Mount the issuer on the apex vhost with:
 
 ```toml
-config = { client_id = "Iv1.…", client_secret = "env:GH_CLIENT_SECRET",
-           session_secret = "env:EPHPM_SESSION_SECRET",
-           redirect_uri  = "https://preview.example.com/_ephpm/auth/github/callback",
-           cookie_domain = ".preview.example.com",
-           sites = { "pr-1.preview.example.com" = { repo = "acme/web" } } }
+[middleware.config]
+client_id      = "Iv1.…"
+client_secret  = "env:GH_CLIENT_SECRET"
+session_secret = "env:EPHPM_SESSION_SECRET"   # issuer side: env: is resolved here
+redirect_uri   = "https://preview.example.com/_ephpm/auth/github/callback"
+cookie_domain  = ".preview.example.com"
+sites          = { "pr-1.preview.example.com" = { repo = "acme/web" } }
 ```
+
+(The verifier on each preview still needs the same key: literally in a
+`session-cookie`/`preview-gate` `[[middleware]]` mount, or by `env:`/`file:`
+reference in a per-site `[preview_auth]` override.)
 
 Register **`https://preview.example.com/_ephpm/auth/github/callback`** as the
 App's Authorization callback URL. Login runs on the target subdomain; the
@@ -314,7 +352,9 @@ to `alg` pinning and a mandatory `exp`.
 
 There is **no server-side session record**. Restarts do not log anyone out, a
 second node needs no replication, and the module never touches the middleware
-KV surface (which is process-global rather than per-site — issue #376).
+KV surface. (Were it to, that surface is per-site on a multi-tenant node since
+ABI minor 3 — issue #376 — see
+[KV scope](/guides/native-middleware/#kv-scope-per-tenant-by-default).)
 
 The cost, plainly: **an issued session cannot be revoked before it expires.**
 Rotating `session_secret` invalidates every session at once and is the only
@@ -329,9 +369,15 @@ plaintext hop), `SameSite=Lax` (`Strict` would bounce a user through GitHub
 every time they clicked a preview link from a PR comment or Slack; `Lax` sends
 the cookie on top-level GET navigations, which is that case *and* the OAuth
 callback), `Path` (the gate covers the whole site), a real `Max-Age` matching
-the token's `exp` — and **no `Domain`**, which makes the cookie host-only.
-`Domain=.preview.example.com` would send one tenant's session to every other
-tenant on the wildcard. That one is not configurable.
+the token's `exp` — and, by default, **no `Domain`**, which makes the cookie
+host-only. The one exception is `cookie_domain`, which exists for the
+[apex flow](#one-oauth-app-for-a-preview-wildcard-fleet): it sets
+`Domain=.preview.example.com` on both cookies so a session minted at the apex
+reaches the target preview. That does send every session to every preview on
+the wildcard; it is safe only because the verifier enforces the `site`
+binding (`require_site = true`), so a session travels the fleet but opens only
+the preview it was minted for. Leave `cookie_domain` unset on a single host,
+and never combine it with `require_site = false`.
 
 ## Automation bypass
 
@@ -420,10 +466,11 @@ used during the login and dropped. **Rotate `client_secret` and
 ## Limitations
 
 - **One callback host per app.** GitHub does not support wildcard callback
-  URLs. A fleet of per-PR hostnames needs a single auth origin and a
-  cross-host hand-off; that is **not implemented here**. Today, `redirect_uri`
-  is derived per request from the vhost, which works when each preview host is
-  registered (or when one host is used).
+  URLs. By default `redirect_uri` is derived per request from the vhost, which
+  works for one host (or when each preview host is registered). A fleet of
+  per-PR hostnames uses the apex hand-off instead — a fixed `redirect_uri`
+  plus `cookie_domain`, described in
+  [One OAuth App for a `*.preview` wildcard fleet](#one-oauth-app-for-a-preview-wildcard-fleet).
 - **No revocation before expiry.** See [The session](#the-session).
 - **The `state` cookie is replayable within its 10-minute window** by whoever
   holds it — i.e. by the user themselves. Reuse of an authorization *code* is
