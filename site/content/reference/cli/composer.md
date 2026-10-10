@@ -16,10 +16,13 @@ it hands the work to a real `composer` on `PATH` or stops with an error. The
 differences are listed [below](#differences-from-composer), and you need to
 read them before you put it in CI.
 
-> **Pinned to vivacity 0.17.0.** ePHPm pins vivacity to an exact version
-> (`vivacity = "=0.17.0"` in the workspace `Cargo.toml`). Flags and behavior can
-> change when that pin moves, so this page describes 0.17.0 only.
-> `ephpm composer --version` prints the version your binary embeds.
+> **Pinned to vivacity 0.20.0, from the ePHPm fork.** ePHPm pins vivacity to
+> an exact version (`vivacity = "=0.20.0"` in the workspace `Cargo.toml`) and
+> builds it from [ephpm/vivace](https://github.com/ephpm/vivace) (a
+> `[patch.crates-io]` entry): upstream v0.20.0 plus one change that accepts
+> Composer's global `-n`/`-q`/`-v`/`--no-ansi` on every command. Flags and
+> behavior can change when that pin moves, so this page describes that build
+> only. `ephpm composer --version` prints the version your binary embeds.
 
 ## What needs PHP or Composer
 
@@ -44,7 +47,7 @@ ePHPm actually runs. A **stub** build falls back to `php` on `PATH`, and there
 
 ```bash
 ephpm composer <COMMAND> [OPTIONS] [ARGS...]
-ephpm composer --version          # → vivacity 0.17.0
+ephpm composer --version          # → vivacity 0.20.0
 ephpm composer --help             # or: ephpm composer help <COMMAND>
 ephpm composer <COMMAND> --help
 ```
@@ -71,13 +74,15 @@ vivacity parses each command's options separately, and they are not the same
 across commands. **An option a command does not declare is a usage error that
 exits `2`**, even if Composer accepts it.
 
-> **CI warning: `--no-interaction`, `--no-progress`, `--prefer-dist`, `-q` and
-> `-v` are not accepted by `install`, `update` or `dump-autoload`.** A typical
-> deploy line such as `composer install --no-dev --no-interaction --prefer-dist
-> --optimize-autoloader` exits `2` under `ephpm composer`. Drop those flags:
-> vivacity never prompts, always installs from dist archives, and has no
-> progress bar. `require` and `remove` accept several of them as no-ops (see
-> the last table).
+Composer's global options `-n`/`--no-interaction`, `-q`/`--quiet`,
+`-v`/`--verbose` and `--no-ansi` are accepted by **all five** commands, and
+`install` accepts `--prefer-dist` and `--no-progress`, so a typical deploy line
+such as `composer install --no-dev --no-interaction --no-ansi --prefer-dist
+--optimize-autoloader` runs unchanged under `ephpm composer`. They are no-ops
+(see [Accepted but ignored](#accepted-but-ignored)): in particular `-q` does
+**not** silence vivacity's output. Still a usage error: `--ansi`, Composer's
+`-d` short form of `--working-dir`, `--no-progress` on `dump-autoload`, and
+the `--prefer-*` flags on `update`.
 
 ### Options by command
 
@@ -110,6 +115,8 @@ exits `2`**, even if Composer accepts it.
 | `-W`, `--with-all-dependencies`: also update dependencies, root requirements included | | ✓ | ✓ ³ | ✓ ³ | |
 | `--no-update-with-dependencies`: update only the listed packages | | | | ✓ | |
 | `--prefer-stable`, `--prefer-lowest` | | ✓ | ✓ | | |
+| `--with <REQ>`, and the `vendor/pkg:<constraint>` argument form: a temporary constraint for this run | | ✓ | | | |
+| `--prefer-dist`, `--prefer-source`, `--prefer-install <dist\|source\|auto>`: this run's `preferred-install` ⁵ | ✓ | | ✓ | | |
 | `--fixed`: write the exact version found instead of `^x.y` (`project`-type packages or `--dev` only) | | | ✓ | | |
 | `--sort-packages`: keep the section sorted (also `config.sort-packages`) | | | ✓ | | |
 | `--unused`: remove every locked package nothing requires | | | | ✓ | |
@@ -118,6 +125,7 @@ exits `2`**, even if Composer accepts it.
 ² `install --no-install` is accepted by the parser, then refused with Composer's message, exit `1`.
 ³ Spelled `--update-with-dependencies` / `--update-with-all-dependencies` (short `-w` / `-W`). `--with-dependencies` / `--with-all-dependencies` work as aliases, except that `remove` has no `--with-dependencies`.
 ⁴ `remove -w` / `--update-with-dependencies` only prints Composer's deprecation notice. Including dependencies is already the default.
+⁵ On `install` the flag sets the effective `preferred-install`, exactly as `config.preferred-install` would: `--prefer-dist` is what vivacity does anyway, while `--prefer-source` (or `--prefer-install source`/`auto` where it selects source) puts the affected packages [out of scope](#fallback-to-composer), so the install is handed to Composer. On `require` the three are parsed and ignored.
 
 ### Accepted but ignored
 
@@ -125,11 +133,13 @@ These are parsed so Composer command lines keep working, and they do nothing:
 
 | Option | Commands | Note |
 |---|---|---|
-| `--no-scripts` | install, update, require, remove | Scripts never run anyway. **Not** accepted by `dump-autoload` |
+| `--no-scripts` | all five | Scripts never run anyway. On `dump-autoload` it cannot be combined with `--run-scripts` (exit `2`) |
 | `--no-audit`, `--audit-format <FORMAT>` | `--no-audit`: update, require, remove. `--audit-format`: require, remove | vivacity has no audit |
-| `--prefer-source`, `--prefer-dist`, `--prefer-install <X>` | require | vivacity always installs dist archives |
-| `-n`, `--no-interaction` | require, remove | vivacity never prompts |
-| `--no-progress`, `-q`, `--quiet`, `-v`, `--verbose` | require, remove | They do not change the output |
+| `--prefer-source`, `--prefer-dist`, `--prefer-install <X>` | require | vivacity always installs dist archives (on `install` they are honored, see ⁵) |
+| `-n`, `--no-interaction` | all five | vivacity never prompts |
+| `-q`, `--quiet`, `-v`/`-vv`/`-vvv`, `--verbose` | all five | They do not change the output: `-q` does not silence it |
+| `--no-ansi` | all five | vivacity never writes ANSI escapes |
+| `--no-progress` | install, update, require, remove | vivacity has no progress bar |
 | `--no-suggest` | require | Prints Composer's deprecation notice |
 
 ### Refused
@@ -137,9 +147,9 @@ These are parsed so Composer command lines keep working, and they do nothing:
 These exit `1` with an error rather than doing something different from Composer:
 
 - `update lock`, `update nothing`, `update mirrors`: refreshing lock metadata is not supported.
-- Temporary constraints such as `update vendor/pkg:^1.2`, and `--with`.
 - `-m`, `--minimal-changes`, `COMPOSER_MINIMAL_CHANGES=1` and `config.update-with-minimal-changes: true` on `require` and `remove` (`update` has no `-m`, so it exits `2` there).
-- An alternate manifest via `COMPOSER=other.json` on `require` and `remove`.
+- An alternate manifest via `COMPOSER=other.json`, on every command.
+- A root `composer.json` that Composer itself refuses (an invalid root package name, a package that requires itself, an invalid link name), on every command and before anything is written, with Composer's message and exit code.
 - `require` with `config.lock: false`, unless you also pass `--no-install`.
 
 ## Differences from Composer
@@ -147,8 +157,9 @@ These exit `1` with an error rather than doing something different from Composer
 ### `install` and `dump-autoload` need a lock
 
 Composer's `install` without a `composer.lock` falls back to an update.
-vivacity's does not. It exits `1` with `no composer.lock in <dir> — vivacity
-does not resolve dependencies yet`. Commit your lock, or run `update` first.
+vivacity's does not. It exits `1` with `no composer.lock in <dir> — `install`
+needs one; run `vivacity update` to resolve and write it`. Commit your lock, or
+run `ephpm composer update` first.
 `dump-autoload` also needs a `composer.lock` and exits `1` without one, while
 Composer's works from `installed.json` alone.
 
@@ -365,7 +376,8 @@ support custom lists (`policy.<name>`).
 | Code | Meaning |
 |---|---|
 | `0` | Success. Also `--help`, `--version`, `--dry-run`, and `--check-scope` on an in-scope lock |
-| `1` | Runtime error: missing `composer.lock` on `install`, no `php` for `update`/`require`/`remove` (stub build), an unsupported repository type, a refused option, network or I/O failures |
+| `1` | Runtime error: missing `composer.lock` on `install`, no `php` for `update`/`require`/`remove` (stub build), an unsupported repository type, a refused option, local I/O failures |
+| `100` | A fetch failed (a dist or repository that answers an HTTP error, is unreachable, or a local dist path that is missing), after Composer's retry policy (up to three attempts). Composer exits `100` for the same failures |
 | `2` | Usage error (unknown command or option, or no command at all). Also Composer's code `2`: an unsolvable dependency set, a lock blocked by policy, or `remove` leaving the package installed |
 | `3` | Out of scope with no fallback possible (`--no-fallback`, `--check-scope`, or no `composer` on `PATH`), or `--run-scripts` without `composer` |
 | `4` | Platform requirements not met on `install`, or `composer.json` requires something the lock does not contain |

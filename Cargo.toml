@@ -473,7 +473,14 @@ turso = { version = "=0.7.2", default-features = false }
 # `remove` over to real Composer when an installed plugin changes resolution.
 # All keep byte-identical output. The only linking-side delta across the range
 # is memchr → 2.8.3 (pure Rust, no C symbols); no version adds a new C dep.
-vivacity = { version = "=0.17.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# 0.18–0.20: `update --with` / `a/b:^1` temporary constraints (0.18);
+# `install --prefer-dist/--prefer-source/--prefer-install` and `--no-progress`
+# accepted (0.19); transport failures exit 100 with Composer's retry policy,
+# hardened dist extraction (symlink-chain escape, decompressed-size limit,
+# Windows reserved names) (0.19.1/0.20). Linking surface re-checked for the
+# bump: no new `-sys` crate, same prefixed PCRE2. The patched fork below adds
+# Composer's global -n/-q/-v/--no-ansi on every command (see [patch.crates-io]).
+vivacity = { version = "=0.20.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
@@ -531,3 +538,13 @@ used_underscore_binding = "allow"
 # this when a fixed opensrv-mysql ships on crates.io.
 [patch.crates-io]
 opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
+# vivacity 0.20.0 from the ePHPm fork (github.com/ephpm/vivace): upstream
+# v0.20.0 plus one commit that accepts Composer's global options
+# (-n/--no-interaction, -q, -v, --no-ansi) on install/update/dump-autoload, so
+# the usual CI line `composer install --no-dev --no-interaction --prefer-dist -o`
+# runs instead of exiting 2 (ephpm/vivace#2). The fork's version is 0.20.0, so
+# the exact `=0.20.0` pin above still holds and Vivacity Pin Watch keeps
+# working: a bump PR to a newer crates.io version leaves this patch unused
+# (cargo warns), which is the cue to drop it if upstream has taken the change.
+# Retire when upstream vivacity ships the same flags.
+vivacity = { git = "https://github.com/ephpm/vivace.git", rev = "6882fc083100d599321633237a150feea630e4ac" }

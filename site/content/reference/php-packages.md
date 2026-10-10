@@ -36,7 +36,7 @@ transitively, so **every ePHPm package in the tree needs its own
 ```
 
 > **Resolve with a real Composer.** The embedded
-> [`ephpm composer`](/reference/cli/composer/) (vivacity 0.17.0) cannot read
+> [`ephpm composer`](/reference/cli/composer/) (vivacity 0.20.0) cannot read
 > `vcs` repositories. `ephpm composer update` / `require` on a manifest like
 > this exits `1` with `repository type "vcs" is not supported`, even when a
 > `composer` is on `PATH`. Run `composer update` (or

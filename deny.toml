@@ -66,4 +66,7 @@ allow-git = [
     # ePHPm fork of opensrv-mysql 0.7.0 (RUSTSEC-2026-0285 fix; see
     # [patch.crates-io] in Cargo.toml). Remove when it returns to a crates.io source.
     "https://github.com/ephpm/opensrv-mysql.git",
+    # ePHPm fork of vivacity 0.20.0 (Composer global flags; see
+    # [patch.crates-io] in Cargo.toml). Remove when upstream ships the change.
+    "https://github.com/ephpm/vivace.git",
 ]
