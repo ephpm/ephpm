@@ -77,8 +77,9 @@ serde.workspace = true
 serde_json.workspace = true
 # Read-only symbol inspection of shared objects (src/ext_ini.rs): a library
 # exporting `zend_extension_entry` must be loaded with `zend_extension=`, not
-# `extension=`. ELF (Linux) + Mach-O (macOS) only; no write support.
-object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "std"] }
+# `extension=`. ELF (Linux), Mach-O (macOS) and PE (Windows DLL exports); no
+# write support.
+object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "pe", "std"] }
 # tempfile is a runtime dependency, not just a test one: the generated
 # php.ini is materialised into a private mkdtemp directory (see
 # `run_with_config`), because a predictable path under a shared /tmp is
@@ -185,9 +186,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde_json = "1"
 tokio = { workspace = true, features = ["macros", "rt"] }
-# Writes the tiny fake ELF shared objects the Zend-extension detection tests
+# Writes the tiny fake ELF shared objects and PE DLLs the Zend-extension detection tests
 # inspect (src/ext_ini.rs) — test-only.
-object = { version = "0.37", default-features = false, features = ["write_std", "elf"] }
+object = { version = "0.37", default-features = false, features = ["write_std", "elf", "pe"] }
 
 [lints]
 workspace = true

@@ -184,6 +184,14 @@ cargo xtask release --target windows --variant clang
 
 This downloads the clang-cl-built SDK asset (`php-sdk-<ver>-windows-x86_64-clang.tar.gz`, cached at `php-sdk/<ver>-windows-x86_64-clang/` next to the default SDK) and verifies the SDK's interpreter is the TAILCALL VM before linking. `cargo xtask php-sdk 8.5 --target windows --variant clang` fetches the SDK alone.
 
+The static Windows build cannot load PHP extension DLLs (Xdebug, PECL `php_*.dll`). To get one that can, build the **shared-engine** variant (PHP 8.3 / 8.4 / 8.5):
+
+```powershell
+cargo xtask release --target windows --variant shared
+```
+
+It links the official windows.php.net ZTS engine from the `php-sdk-<ver>-windows-x86_64-shared.tar.gz` asset (cached at `php-sdk/<ver>-windows-x86_64-shared/`) and copies its runtime — `php8ts.dll`, its dependency DLLs, and `ext\` — next to `ephpm.exe`. Deploy that directory, not the exe alone. At startup ePHPm loads from `ext\` the extensions the static build compiles in (so both builds offer the same extension set), and `[php] extensions` / `ephpm dev --xdebug` can load extension DLLs built for the same PHP minor, ZTS, x64, and the VS toolset windows.php.net uses (`vs16` for 8.3, `vs17` for 8.4+). It uses the same MSVC CALL-VM interpreter as the default build. Opt-in and built from source only; release artifacts ship the static build.
+
 A binary built from source can also self-install:
 
 ```bash

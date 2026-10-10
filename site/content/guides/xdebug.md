@@ -35,7 +35,8 @@ the warm pool keeps serving everybody else; see
 |---|---|---|
 | Linux, glibc, x86_64 / aarch64 | Supported | Xdebug fetched from the ePHPm extension catalog (see below), or `--xdebug-path`. Verified with Xdebug 3.5.3 on PHP 8.5.7 and 8.5.11 (ZTS). |
 | macOS, arm64 | Supported (untested live) | `--xdebug` downloads `ephpm-ext-<php>-macos-aarch64.tar.gz` from the catalog (published for PHP 8.3, 8.4 and 8.5), or use `--xdebug-path`. Needs an ePHPm macOS binary newer than v0.11.3: earlier ones were linked without `-export_dynamic`, so `-dead_strip` removed PHP functions that ePHPm never calls but Xdebug imports, and loading fails with `symbol not found in flat namespace`. |
-| Windows | Not available with the release binaries | The Windows release binaries link PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs. Loading Xdebug needs a build against a shared `php8ts.dll`. Use ePHPm under WSL today. |
+| Windows x64, **shared-engine build** | Supported (built from source) | A `cargo xtask release --target windows --variant shared` build links the official `php8ts.dll` and loads `php_xdebug.dll` from the catalog's Windows entry (the official xdebug.org ZTS DLL for the PHP minor). See [Windows](#windows). |
+| Windows x64, default build | Not available | The default Windows binary links PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs; `--xdebug` refuses with that reason. Use the shared-engine build, or ePHPm under WSL. |
 
 Xdebug must be a **ZTS** build for the PHP minor your ePHPm binary embeds
 (`ephpm php -v` shows both). Distro and Sury packages are NTS and will not
@@ -83,7 +84,8 @@ What the flag does:
    makes the download trustworthy is HTTPS to GitHub: the catalog URLs must
    be `https://` (plain `http://` is accepted only for a loopback mirror).
 3. **Caches it** at `<user cache dir>/ephpm/ext/<api>-zts-<arch>/`
-   (`$XDG_CACHE_HOME` or `~/.cache` on Linux) with a small `xdebug.json`
+   (`$XDG_CACHE_HOME` or `~/.cache` on Linux, `%LOCALAPPDATA%` on Windows)
+   with a small `xdebug.json`
    record. Later runs re-verify the cached file's sha256 and use it with no
    network access at all, so `--xdebug` works offline after the first run.
    A cached build is kept even after a newer catalog release appears (any
@@ -176,6 +178,34 @@ container with the project bind-mounted elsewhere):
 ```
 
 PhpStorm: *Run → Start Listening for PHP Debug Connections* (port 9003).
+
+## Windows
+
+The default Windows `ephpm.exe` is one static file and cannot load any PHP
+extension DLL. For step debugging on Windows itself, build the
+**shared-engine** variant:
+
+```powershell
+cargo xtask release --target windows --variant shared
+```
+
+It links the official windows.php.net ZTS engine (`php8ts.dll`) from the
+php-sdk `php-sdk-<ver>-windows-x86_64-shared.tar.gz` asset and copies the
+runtime next to `ephpm.exe`: `php8ts.dll`, the DLLs it and the extensions
+need (OpenSSL, ICU, …), and `ext\`. Ship that whole directory — the exe does
+not start without `php8ts.dll`. At startup ePHPm loads, from that `ext\`
+directory, the extensions the static build compiles in but the official
+engine ships as DLLs (mbstring, openssl, curl, intl, `pdo_mysql`, …), so
+the extension set matches the default build.
+
+`ephpm dev --xdebug` then downloads `ephpm-ext-<php>-windows-x86_64.tar.gz`
+from the catalog (manifest `libc` = `msvc`), verifies it the same way, and
+caches `xdebug-<version>.dll` under `%LOCALAPPDATA%\ephpm\ext\`. With the IDE
+on the same Windows machine the defaults (`127.0.0.1:9003`, no
+`pathMappings`) work.
+
+Status: the shared-engine build is opt-in and built from source; release
+artifacts ship the default static build only.
 
 ## WSL
 

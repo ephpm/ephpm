@@ -1740,7 +1740,9 @@ fn run_with_config(
         || vhost_disable_shell
         || vhost_hardening
         || worker_mode
-        || cfg!(php_max_exec_timers);
+        || cfg!(php_max_exec_timers)
+        // The shared engine's extension preload rides the generated ini.
+        || ephpm_php::shared::SharedRuntime::is_shared_build();
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<tempfile::TempDir>) =
         if want_generated_ini {
@@ -1756,6 +1758,19 @@ fn run_with_config(
             // no response to display into.
             for (k, v) in error_display_ini_defaults(dev_mode) {
                 let _ = writeln!(content, "{k}={v}");
+            }
+            // Windows shared-engine build: extension_dir + the extensions the
+            // static build compiles in but the official php8ts.dll ships as
+            // DLLs (mbstring, openssl, intl, ...). First, so `[php]
+            // extensions` that depend on them load after them and every
+            // operator setting below can still override. No-op elsewhere.
+            if let Some(shared) = ephpm_php::shared::SharedRuntime::detect() {
+                for line in shared
+                    .ini_lines()
+                    .context("the shared PHP engine's runtime files are incomplete")?
+                {
+                    let _ = writeln!(content, "{line}");
+                }
             }
             // Shared extensions ([php] extensions) go first, before
             // ini_file/ini_overrides, so any extension ini settings that

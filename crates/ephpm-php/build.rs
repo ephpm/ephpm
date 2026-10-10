@@ -11,6 +11,11 @@ fn main() {
     // older SDKs) PHP falls back to the process-wide setitimer/SIGPROF timer,
     // which is unsafe on tokio worker threads, so the feature stays disabled.
     println!("cargo::rustc-check-cfg=cfg(php_max_exec_timers)");
+    // Set when the SDK is the Windows shared-engine variant
+    // (`php-sdk-<ver>-windows-x86_64-shared`): PHP lives in php8ts.dll next to
+    // the executable instead of being linked in, so extension DLLs (Xdebug)
+    // can load. See `link_php` and `src/shared.rs`.
+    println!("cargo::rustc-check-cfg=cfg(php_shared)");
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-changed=resolver_shim.c");
@@ -74,9 +79,15 @@ fn main() {
         println!("cargo::rustc-cfg=php_max_exec_timers");
     }
 
-    link_php(&lib_dir, &target_os);
-    compile_wrapper(&include_dir, &target_os, has_exec_timers);
-    generate_bindings(&include_dir, &target_os);
+    let shared = is_shared_sdk(&lib_dir, &target_os);
+    if shared {
+        println!("cargo::rustc-cfg=php_shared");
+        emit_shared_preload(&sdk_path);
+    }
+
+    link_php(&lib_dir, &target_os, shared);
+    compile_wrapper(&include_dir, &target_os, has_exec_timers, shared);
+    generate_bindings(&include_dir, &target_os, shared);
 
     // Note: --wrap flags for zend_signal_* are in the binary crate's
     // build.rs (crates/ephpm/build.rs). rustc-link-arg only works for
@@ -101,9 +112,88 @@ fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
     );
 }
 
+/// Whether the SDK is the Windows shared-engine variant.
+///
+/// Decided from the SDK's contents, never from an env var, so a build is
+/// always self-describing: only the shared variant ships `php8ts.lib` (the
+/// import library for `php8ts.dll`). The static variant's `php8embed.lib`
+/// carries the whole engine and there is no `php8ts.*` in it at all.
+fn is_shared_sdk(lib_dir: &Path, target_os: &str) -> bool {
+    let import_lib = lib_dir.join("php8ts.lib");
+    println!("cargo::rerun-if-changed={}", import_lib.display());
+    target_os == "windows" && import_lib.exists()
+}
+
+/// Bake the shared SDK's extension preload list into the crate as
+/// `EPHPM_PHP_PRELOAD`.
+///
+/// The official build compiles fewer extensions into `php8ts.dll` than the
+/// static SDK has (mbstring, openssl, curl, intl, pdo_mysql, ... are
+/// `ext\php_*.dll`). `ephpm-sdk.json`'s `preload` array lists them in a
+/// dependency-safe load order; ePHPm loads them at startup so a shared build
+/// has the same extension set as a static one (`src/shared.rs`). Encoded as
+/// `e:<file>` / `z:<file>` (extension / `zend_extension`) joined by `;` so
+/// the runtime side needs no JSON parser for a compile-time constant.
+///
+/// A shared SDK without the manifest fails the build: linking it anyway would
+/// produce a binary that silently lacks a dozen extensions.
+fn emit_shared_preload(sdk_path: &Path) {
+    let manifest = sdk_path.join("ephpm-sdk.json");
+    println!("cargo::rerun-if-changed={}", manifest.display());
+    let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
+        panic!(
+            "{} is a shared-engine Windows SDK (lib/php8ts.lib) but has no readable \
+             ephpm-sdk.json ({e}). Use the php-sdk `-windows-x86_64-shared` tarball \
+             (`cargo xtask php-sdk --target windows --variant shared`).",
+            sdk_path.display()
+        )
+    });
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{}: invalid JSON: {e}", manifest.display()));
+    assert_eq!(
+        json.get("linkage").and_then(serde_json::Value::as_str),
+        Some("shared"),
+        "{}: expected \"linkage\": \"shared\"",
+        manifest.display()
+    );
+    let preload = json
+        .get("preload")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{}: missing \"preload\" array", manifest.display()));
+    let mut encoded = Vec::with_capacity(preload.len());
+    for entry in preload {
+        let file = entry
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{}: preload entry without \"file\"", manifest.display()));
+        assert!(
+            !file.is_empty() && !file.contains(['/', '\\', ';', ':', '"']),
+            "{}: preload file {file:?} must be a plain file name",
+            manifest.display()
+        );
+        let zend =
+            entry.get("zend_extension").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        encoded.push(format!("{}:{file}", if zend { 'z' } else { 'e' }));
+    }
+    println!("cargo::rustc-env=EPHPM_PHP_PRELOAD={}", encoded.join(";"));
+}
+
 /// Link libphp and its platform-specific system library dependencies.
-fn link_php(lib_dir: &Path, target_os: &str) {
+fn link_php(lib_dir: &Path, target_os: &str, shared: bool) {
     println!("cargo::rustc-link-search=native={}", lib_dir.display());
+    if shared {
+        // Windows shared-engine SDK (official windows.php.net build). Its
+        // php8embed.lib is a small *static* lib holding only the embed SAPI;
+        // its objects import the engine from php8ts.dll through the
+        // php8ts.lib import library. The engine's own dependencies
+        // (OpenSSL, ICU, ...) are DLLs beside php8ts.dll, not link inputs,
+        // so there are no dependency archives to link. The runtime DLLs ship
+        // next to ephpm.exe (`cargo xtask release --variant shared`).
+        println!("cargo::rustc-link-lib=static=php8embed");
+        println!("cargo::rustc-link-lib=dylib=php8ts");
+        link_system_libs(target_os);
+        return;
+    }
     if target_os == "windows" {
         // The php-sdk Windows tarball ships a *static* `php8embed.lib`
         // (static-php-cli's `--build-embed` is a static build — a fat lib
@@ -374,7 +464,7 @@ fn php_config_has_max_exec_timers(include_dir: &Path) -> bool {
 }
 
 /// Compile the C wrapper that provides `zend_try`/`zend_catch` guards.
-fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
+fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool, shared: bool) {
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
     let include_tsrm = include_dir.join("TSRM");
@@ -439,8 +529,17 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
     // `tsrm_get_ls_cache()` call per access — same as the Unix build. Safe
     // on Windows because php8embed.lib is linked statically into the same
     // module (no cross-DLL __declspec(thread) import involved).
+    //
+    // The Windows shared-engine SDK is the exception: there the engine is in
+    // php8ts.dll, and a thread-local cannot be imported across a DLL
+    // boundary, so the wrapper must resolve the TSRM cache through the
+    // exported `tsrm_get_ls_cache()` instead (exactly what an extension DLL
+    // built without the static cache does). The cost is a function call per
+    // EG()/SG() access in the wrapper only; the engine keeps its own cache.
     build.define("ZTS", Some("1"));
-    build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
+    if !shared {
+        build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
+    }
     if target_os == "windows" {
         build.define("ZEND_WIN32", None);
         build.define("PHP_WIN32", None);
@@ -461,7 +560,7 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
 }
 
 /// Generate Rust FFI bindings from PHP headers via bindgen.
-fn generate_bindings(include_dir: &Path, target_os: &str) {
+fn generate_bindings(include_dir: &Path, target_os: &str, shared: bool) {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
@@ -505,7 +604,11 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     // Unix branches with no Unix headers present).
     // ZTS on every platform — the Windows SDK lib is ZTS too (see the
     // matching defines in compile_wrapper; issue #326).
-    builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+    // The shared-engine SDK drops the static TSRM cache (see compile_wrapper).
+    builder = builder.clang_arg("-DZTS=1");
+    if !shared {
+        builder = builder.clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+    }
     if target_os == "windows" {
         builder = builder
             .clang_arg("--target=x86_64-pc-windows-msvc")
