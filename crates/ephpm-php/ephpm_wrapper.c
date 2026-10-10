@@ -8,8 +8,8 @@
  *   1. Custom SAPI callbacks (ub_write, read_post, read_cookies, etc.) that
  *      capture PHP output and bridge HTTP request data into PHP.
  *
- *   2. Per-request lifecycle management (request_shutdown → set info →
- *      request_startup → execute → capture response).
+ *   2. Per-request lifecycle management (set info → request_startup →
+ *      execute → capture response → request_shutdown).
  *
  *   3. Safe script execution with zend_try/zend_catch bailout protection.
  *
@@ -17,7 +17,13 @@
  *   php_embed_init()          — module startup + initial request startup
  *   ephpm_install_sapi()      — override default callbacks with ours
  *   ephpm_finalize_init()     — mark initial request active (HTTP mode)
- *   ephpm_execute_request()×N — reuse request: update SAPI → execute → capture
+ *   per HTTP request, on the PHP thread that serves it:
+ *     ephpm_begin_request()   — close any still-open request, start a fresh one
+ *     ephpm_run_request()     — execute → shutdown functions → capture response
+ *     ephpm_finish_request()  — php_request_shutdown(): destructors, extension
+ *                               RSHUTDOWN (session write + lock release), INI
+ *                               restore. Called by the host right AFTER the
+ *                               response has been handed to the client.
  *   php_embed_shutdown()      — request shutdown + module shutdown
  */
 
@@ -323,7 +329,7 @@ static EPHPM_TLS int server_var_count = 0;
  * applied before the per-request shutdown/startup cycle is wiped before the
  * script runs. We buffer the key/value pairs here (owning copies, since the
  * caller frees its strings once ephpm_request_set_ini returns) and replay
- * them inside ephpm_execute_request once the fresh request is live. */
+ * them inside ephpm_begin_request once the fresh request is live. */
 #define MAX_REQUEST_INI 16
 
 static EPHPM_TLS char *request_ini_keys[MAX_REQUEST_INI];
@@ -695,7 +701,7 @@ static void capture_response_headers(void)
  * Finalize PHP embed initialization for HTTP serve mode.
  *
  * Mark the embed SAPI's initial request as active so
- * ephpm_execute_request() properly shuts it down before starting
+ * ephpm_begin_request() properly shuts it down before starting
  * its own request lifecycle on the first HTTP request.
  *
  * Must be called once after php_embed_init() and ephpm_install_sapi().
@@ -987,8 +993,11 @@ void ephpm_request_clear(void)
 }
 
 /*
- * Set core request info fields. Pointers must remain valid until
- * ephpm_execute_request() returns.
+ * Set core request info fields. Pointers must remain valid until the request
+ * is finished — ephpm_finish_request() returns (or the next
+ * ephpm_begin_request() closes it): SG(request_info) keeps pointing at these
+ * strings, and php_request_shutdown() drains any unread body through our
+ * read_post callback.
  */
 void ephpm_request_set_info(
     const char *method,
@@ -1079,10 +1088,12 @@ int ephpm_middleware_ran(void)
  * STAGE_ACTIVATE — the bucket PHP itself uses during request_startup —
  * skips the tightening check, which is the behavior we want here.
  *
- * Buffer the override rather than applying it now: ephpm_execute_request()
- * tears down the active request (php_request_shutdown -> zend_ini_deactivate)
- * before starting a fresh one, which would immediately undo an entry applied
- * here. The buffered entries are replayed once the new request is live.
+ * Buffer the override rather than applying it now: a request may still be
+ * open on this thread (the initial one ephpm_thread_init() starts), and
+ * ephpm_begin_request() tears that down (php_request_shutdown ->
+ * zend_ini_deactivate) before starting a fresh one, which would immediately
+ * undo an entry applied here. The buffered entries are replayed once the new
+ * request is live.
  *
  * Call before ephpm_execute_request().
  */
@@ -1317,46 +1328,74 @@ static int ephpm_run_middleware_chain(void)
 }
 
 /*
- * Execute a PHP request.
+ * Per-request lifecycle (php-fpm-style isolation).
  *
- * Reuses the active request started by php_embed_init() — we update the
- * SAPI request info fields and execute the script without a full
- * request shutdown/startup cycle. This is necessary because:
+ * Every HTTP request runs a full php_request_startup() → script →
+ * php_request_shutdown() cycle on its PHP thread, in three calls:
  *
- *   - php_request_startup() calls zend_signal_init() and other thread-
- *     sensitive functions that crash on tokio's spawn_blocking threads
- *   - The embed SAPI's initial request provides a valid execution
- *     context that we can reuse for all HTTP requests
+ *   ephpm_begin_request()  — start a fresh request (superglobals, per-request
+ *                            INI). The host may then run in-request
+ *                            maintenance (OPcache invalidation, JIT stats)
+ *                            that needs a live executor before the script.
+ *   ephpm_run_request()    — execute the script, run shutdown functions, flush
+ *                            output buffers, capture the response.
+ *   ephpm_finish_request() — php_request_shutdown(): object destructors,
+ *                            extension RSHUTDOWN, INI restore, ZMM reset.
+ *
+ * ephpm_execute_request() is begin + run, for callers with no maintenance to
+ * interleave.
+ *
+ * WHY finish is a separate, EAGER call (not deferred to the next request).
+ * Until v0.11.3 php_request_shutdown() ran lazily at the TOP of the next
+ * request on the same thread — a leftover from the single-request-reuse model
+ * this lifecycle replaced (PR #101/#104). Everything PHP does at request end
+ * then waited for that thread's next request, which may never come or may
+ * take arbitrarily long under a multi-thread pool:
+ *
+ *   - session write + lock release happen in session RSHUTDOWN, so a second
+ *     request sharing the session cookie landed on another thread and blocked
+ *     on the session lock (the files handler's flock, forever; the ephpm KV
+ *     handler's lock, up to its TTL) — sessions hung after the first request;
+ *   - global-object __destruct side effects, extension RSHUTDOWN, Xdebug's
+ *     DBGp "stopping" packet / socket close and its profiler output were all
+ *     delayed to an unrelated later request;
+ *   - and those deferred destructors ran inside the NEXT request's tenant
+ *     scope.
+ *
+ * The host calls ephpm_finish_request() right after handing the response to
+ * the client, so teardown never adds to response latency. The `request_active`
+ * check in ephpm_begin_request() stays as the fallback for a thread whose
+ * previous request was never finished (the request ephpm_thread_init() opens,
+ * or a caller that drives begin/run directly).
  *
  * With ZTS, each PHP execution thread has its own TSRM context and
- * __thread-local per-request state, so concurrent reuse is safe.
- *
- * Returns:
- *   EPHPM_EXEC_OK          (0)  the script ran to completion
- *   EPHPM_EXEC_STARTUP_FAIL(-1) php_request_startup failed (only on cold start)
- *   EPHPM_EXEC_SCRIPT_EXIT (-2) the script chose to stop (exit()/die()); the
- *                               captured response is complete and trustworthy
- *   EPHPM_EXEC_BAILOUT     (-3) a zend_bailout() unwound the script; the
- *                               captured response is TRUNCATED and must never
- *                               be completed as a success (see below)
+ * __thread-local per-request state, so concurrent requests are isolated.
  */
-int ephpm_execute_request(const char *filename)
+
+/*
+ * Start a fresh PHP request on this thread.
+ *
+ * Returns EPHPM_EXEC_OK, or EPHPM_EXEC_STARTUP_FAIL if php_request_startup()
+ * failed (in which case no request is active and ephpm_run_request() must not
+ * be called).
+ */
+int ephpm_begin_request(void)
 {
-    /* ---- Per-request lifecycle (php-fpm-style isolation) ----
-     * Tear down the previous request and start a fresh one. Without this,
-     * a single request was reused for the whole life of the thread, so
-     * user functions/classes/constants and the global symbol table leaked
-     * across requests — vanilla WordPress rendered only the first request
-     * per worker thread ($wp_did_header / WP_USE_THEMES persisted).
+    /* Close a request still open on this thread — normally only the initial
+     * one ephpm_thread_init() starts, since the host finishes every request
+     * eagerly via ephpm_finish_request(). Without a fresh request per HTTP
+     * request, user functions/classes/constants and the global symbol table
+     * leaked across requests — vanilla WordPress rendered only the first
+     * request per thread ($wp_did_header / WP_USE_THEMES persisted).
      *
      * php_request_shutdown() runs zend_deactivate() -> shutdown_executor(),
      * which destroys user symbols, constants, statics, and included_files;
      * php_request_startup() then provides a clean executor. The signal /
      * timeout / stack functions that made php_request_startup() crash on
-     * tokio spawn_blocking threads are already no-op'd via --wrap, so this
-     * is safe. OPcache's compiled bytecode lives in SHM and survives the
-     * cycle, so the opcode cache (and JIT buffer) are preserved — this is
-     * exactly the classic php-fpm + opcache model. */
+     * non-PHP-owned threads are already no-op'd via --wrap, so this is safe.
+     * OPcache's compiled bytecode lives in SHM and survives the cycle, so the
+     * opcode cache (and JIT buffer) are preserved — this is exactly the
+     * classic php-fpm + opcache model. */
     if (request_active) {
         php_request_shutdown(NULL);
         request_active = 0;
@@ -1395,6 +1434,19 @@ int ephpm_execute_request(const char *filename)
     SG(request_info).content_length = (long)req_post_data_len;
     SG(request_info).path_translated = (char *)req_path_translated;
     SG(request_info).proto_num = 1001; /* HTTP/1.1 */
+
+    /* An HTTP request has no argv (php-fpm/cgi leave it unset, so
+     * php_build_argv() derives $argv from the query string). On the thread
+     * that ran php_embed_init(), SG(request_info).argv still points at the
+     * argv array the host passed to it — a stack array that is long gone by
+     * now — and php_request_startup() -> php_hash_environment() ->
+     * php_build_argv() would dereference it. Only test harnesses execute
+     * requests on the init thread (the server's PHP threads are fresh TSRM
+     * threads with argv already NULL), but whether that read faults depends
+     * on whatever reused the old stack slot, so it is cleared for every
+     * request rather than left to luck. */
+    SG(request_info).argc = 0;
+    SG(request_info).argv = NULL;
 
     /* sapi_activate() (run inside php_request_startup) only reads and parses
      * the POST body into $_POST when SG(server_context) is non-NULL — that is
@@ -1439,12 +1491,33 @@ int ephpm_execute_request(const char *filename)
     /* Replay per-request INI overrides now that the fresh request is live.
      * Applied at STAGE_ACTIVATE (the bucket request_startup itself uses), so
      * open_basedir for vhost isolation takes effect for this request without
-     * tripping the runtime "can only tighten" check, and is restored by the
-     * next request's php_request_shutdown(). (The same set was already
-     * applied before startup for directives rfc1867/sapi_activate consume —
-     * see ephpm_request_ini_apply(); re-applying is idempotent.) */
+     * tripping the runtime "can only tighten" check, and is restored by this
+     * request's php_request_shutdown() in ephpm_finish_request(). (The same
+     * set was already applied before startup for directives
+     * rfc1867/sapi_activate consume — see ephpm_request_ini_apply();
+     * re-applying is idempotent.) */
     ephpm_request_ini_apply();
 
+    return EPHPM_EXEC_OK;
+}
+
+/*
+ * Execute the script in the request ephpm_begin_request() started.
+ *
+ * Returns:
+ *   EPHPM_EXEC_OK          (0)  the script ran to completion
+ *   EPHPM_EXEC_SCRIPT_EXIT (-2) the script chose to stop (exit()/die()); the
+ *                               captured response is complete and trustworthy
+ *   EPHPM_EXEC_BAILOUT     (-3) a zend_bailout() unwound the script; the
+ *                               captured response is TRUNCATED and must never
+ *                               be completed as a success (see below)
+ *   EPHPM_EXEC_TIMEOUT     (-4) max_execution_time fired (see below)
+ *
+ * The request is left ACTIVE: the host calls ephpm_finish_request() once the
+ * captured response has been read out and delivered.
+ */
+int ephpm_run_request(const char *filename)
+{
     /* Reset PHP's last-error tracking so we can tell whether THIS script
      * raised a fatal (vs. a value carried over from a prior request). */
     PG(last_error_type) = 0;
@@ -1521,10 +1594,11 @@ int ephpm_execute_request(const char *filename)
     EG(bailout) = __orig_bailout;
 
     /* Run user shutdown functions and flush every open output buffer
-     * BEFORE capturing the response. Request teardown is lazy (top of the
-     * NEXT ephpm_execute_request), so without this, content still sitting
-     * in userland ob_ buffers at script end — and anything printed by
-     * register_shutdown_function() — never reached the ub_write capture:
+     * BEFORE capturing the response. Request teardown (php_request_shutdown)
+     * runs only AFTER the response has been read out and delivered — in
+     * ephpm_finish_request() — so without this, content still sitting in
+     * userland ob_ buffers at script end — and anything printed by
+     * register_shutdown_function() — never reached the response capture:
      * `ob_start(); echo "hello";` returned content-length: 0, and
      * WordPress 7.0 (which finalizes its template-enhancement buffer on
      * the `shutdown` action) rendered EVERY page as 0 bytes. Mirrors the
@@ -1539,8 +1613,10 @@ int ephpm_execute_request(const char *filename)
      * worker mode.
      *
      * php_free_shutdown_functions() empties the list afterwards so the
-     * lazy php_request_shutdown() at the top of the next request cannot
-     * run the same shutdown functions a second time. */
+     * php_request_shutdown() in ephpm_finish_request() cannot run the same
+     * shutdown functions a second time. (Object destructors are NOT run
+     * here: php_request_shutdown() runs them after the response is out, in
+     * php-fpm's order — shutdown functions, then destructors.) */
     zend_try {
         php_call_shutdown_functions();
     } zend_catch {
@@ -1609,11 +1685,73 @@ int ephpm_execute_request(const char *filename)
     /* Release this request's buffered INI overrides; they have already been
      * applied to the live request above and must not leak into the next one
      * (which buffers its own set before calling back in). The request itself
-     * is torn down lazily at the top of the next ephpm_execute_request(), or
-     * by php_embed_shutdown() at process exit. */
+     * stays active until the host calls ephpm_finish_request() (or, if it
+     * never does, until the next ephpm_begin_request() / php_embed_shutdown()
+     * closes it). */
     ephpm_request_ini_reset();
 
     return result;
+}
+
+/*
+ * Begin + run in one call, for callers with nothing to interleave between
+ * request startup and the script. Leaves the request active, exactly like
+ * ephpm_run_request().
+ */
+int ephpm_execute_request(const char *filename)
+{
+    int rc = ephpm_begin_request();
+    if (rc != EPHPM_EXEC_OK) {
+        return rc;
+    }
+    return ephpm_run_request(filename);
+}
+
+/*
+ * End the active request on this thread: php_request_shutdown().
+ *
+ * This is where PHP's end-of-request machinery runs — end-of-script object
+ * destructors (zend_call_destructors), the final output flush, every
+ * extension's RSHUTDOWN (session write + session lock release, Xdebug's DBGp
+ * session end and profiler flush, ...), INI restore (zend_ini_deactivate —
+ * which is what unwinds the per-vhost open_basedir/temp/session directives)
+ * and the ZMM reset. Registered shutdown functions are NOT run again: they
+ * already ran in ephpm_run_request() before the response was captured.
+ *
+ * The host calls this right after the response has been handed to the
+ * client. Output produced here (a destructor's echo) is appended to the
+ * capture buffer that the host has already read, and is discarded at the
+ * next ephpm_begin_request() — the same thing php-fpm does with output
+ * emitted after fastcgi_finish_request().
+ *
+ * The request strings the host lent via ephpm_request_set_info() must still
+ * be alive when this runs: sapi_deactivate drains any unread request body
+ * through our read_post callback, and the request_info fields still point at
+ * them. The Rust side keeps them until this returns.
+ *
+ * Bailout safety: php_request_shutdown() guards each of its phases with its
+ * own zend_try, but a bailout that escaped them with no outer jump buffer
+ * would hit zend_bailout()'s "no bailout address" path and exit the process,
+ * so the call carries a guard of its own (as cli_shutdown_request() does).
+ *
+ * Returns 1 if a request was finished, 0 if none was active (idempotent).
+ */
+int ephpm_finish_request(void)
+{
+    if (!request_active) {
+        return 0;
+    }
+
+    zend_try {
+        php_request_shutdown(NULL);
+    } zend_catch {
+        /* A bailout escaped php_request_shutdown's internal phase guards; the
+         * request is as torn down as it will get. The next
+         * ephpm_begin_request() starts a fresh one either way. */
+    } zend_end_try();
+    request_active = 0;
+
+    return 1;
 }
 
 /*
@@ -1682,7 +1820,10 @@ int ephpm_get_response_header(size_t idx,
  * EG(function_table) and invoke them the same way a compiled call site would.
  *
  * Must be called on a TSRM-registered thread WITH an active PHP request
- * (i.e. at the start of ephpm_execute_request(), after php_request_startup).
+ * (i.e. between ephpm_begin_request() and ephpm_run_request() — the Rust side
+ * queues it with PhpRuntime::at_request_start). Between requests a per-request
+ * thread has NO active request (ephpm_finish_request() closed it), so a call
+ * there would reach zend_call_function() with the executor shut down.
  * Callers gate the invocation with a Rust-side per-vhost version comparison
  * so the actual invalidation runs only when a deploy has advanced the
  * cluster-wide version key, not on every request.
@@ -1872,9 +2013,10 @@ done:
  * disabled the call still succeeds and reports buffer_size = 0.
  *
  * Same calling contract as ephpm_opcache_invalidate_under: TSRM-registered
- * thread, inside the thread's active request context (the router calls it on
- * the PHP dispatch thread, and worker mode from the worker's own long-lived
- * request). opcache_get_status(false) excludes the per-script table, so a
+ * thread, inside the thread's active request context (per-request mode queues
+ * it via PhpRuntime::at_request_start so it runs right after
+ * ephpm_begin_request(); worker mode calls it from the worker's own
+ * long-lived request). opcache_get_status(false) excludes the per-script table, so a
  * call is cheap — callers additionally rate-limit (ephpm-php jit_metrics).
  */
 long ephpm_opcache_jit_stats(unsigned long long *buffer_size,
@@ -6125,7 +6267,8 @@ static int cli_process_stdin_lines(
  * Finally, the embed lifecycle expects one active request when
  * php_embed_shutdown() runs (it unconditionally calls php_request_shutdown),
  * so a fresh, empty request is started before returning — the same
- * shutdown→startup pairing ephpm_execute_request uses per HTTP request.
+ * shutdown→startup pairing ephpm_begin_request falls back to for a thread
+ * whose previous request was never finished.
  * $argv/$argc in SG(request_info) are cleared first so nothing in the
  * throwaway request (or its eventual teardown, which outlives the caller's
  * argv memory) ever reads the CLI argv pointers again. It runs no user code

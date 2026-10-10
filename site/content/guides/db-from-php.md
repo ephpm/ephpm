@@ -393,31 +393,34 @@ try {
 
 ## Shutdown functions and destructors
 
-How end-of-request code behaves depends on the PHP execution mode.
+**Per-request mode (the default).** PHP's end-of-request machinery runs in
+php-fpm's order, on the thread that served the request, with that request's
+site scope (its own database, KV keyspace, WebSocket scope) still in place:
 
-**Per-request mode (`[php] mode = "per_request"`, the default).**
-`register_shutdown_function()` callbacks run at the end of **every**
-request, after your script finishes (including after `exit()` or a fatal
-error) and before the response is sent, just as under php-fpm. They run
-inside the request, against the same site's database, so queries there work.
-WordPress and other frameworks that finish their work in a shutdown hook
-depend on this.
+1. `register_shutdown_function()` callbacks run right after the script and
+   **before** the response is captured, so their output is part of the
+   response.
+2. The response is sent to the client.
+3. `php_request_shutdown()` runs: global objects' `__destruct()`, then every
+   extension's request shutdown (the session module writes the session and
+   releases its lock here). Queries from a destructor reach the request's
+   own database, and a transaction left open there is rolled back afterwards
+   exactly like one the script left open. Output is discarded and nothing
+   here can change the response — the same as code after
+   `fastcgi_finish_request()` under php-fpm.
 
-Do not rely on `__destruct()` to issue queries. An object freed while the
-script runs (it goes out of scope, or you `unset()` it) is destructed at
-that moment, inside the request. Objects still alive when the script ends
-are torn down as part of request shutdown, and the database context there is
-not something to build on. Issue the query explicitly, or from a shutdown
-function.
+Before v0.11.3, step 3 ran only when the same thread served its *next*
+request — which also meant a session was not unlocked until then, so a
+second request on the same session could hang.
 
-**Worker mode (`[php] mode = "worker"`).** The worker script is one
-long-lived PHP request per worker thread, so a shutdown function registered
-there does **not** run after each request the loop handles. It runs when the
-worker thread itself retires (a recycle, or server shutdown), by which point
-that thread's per-request database state has already been released. A
-destructor that only runs at that point is in the same position.
+**Worker mode, and a retiring thread.** A [worker](/guides/worker-mode/)
+keeps one long-lived PHP request open per thread, so shutdown functions and
+end-of-script destructors registered there run when the worker thread
+itself retires (recycle, crash, or server shutdown) — not at the end of the
+request you are serving — by which point that thread's per-request database
+state may already have been released. Keep queries out of them there.
 
-A query issued from there is **refused, not executed**, and throws:
+A query issued after the state is gone is **refused, not executed**, and throws:
 
 ```
 Exception: ephpm_db: the database bridge is no longer available on this
@@ -436,15 +439,14 @@ returns an empty list, `ephpm_db_errno()` returns `0`,
 `ephpm_db_in_transaction()` and `ephpm_db_available()` return `false` — the
 same answers a thread that has run nothing reports.
 
-In worker mode, do your database work inside the loop iteration. If you
-need end-of-request cleanup, do it explicitly (a `finally` block, or your
+In worker mode, do your database work inside the request. If you need
+end-of-request cleanup there, do it explicitly (a `finally` block, or your
 framework's terminate hook, which runs while the request is still live)
 rather than relying on PHP's shutdown handlers.
 
-The same split applies to [`ephpm_kv_*`](/guides/kv-from-php/#shutdown-functions-and-destructors)
-(in the worker-retirement case reads miss and writes are refused).
-WebSockets are per-request-mode only; see
-[WebSockets](/guides/websockets/#limitations).
+The same applies to [`ephpm_kv_*`](/guides/kv-from-php/#shutdown-functions-and-destructors) (reads miss and
+writes are refused) and [`ephpm_ws_*`](/guides/websockets/) (the site scope
+is gone, so sends report no capability).
 
 ## The session model
 

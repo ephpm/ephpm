@@ -317,34 +317,23 @@ ephpm_kv_set("session:{$id}", json_encode($data), 3600);   // 1 hour (seconds)
 
 ## Shutdown functions and destructors
 
-How end-of-request code behaves depends on the PHP execution mode.
+**Per-request mode (the default):** both work. `register_shutdown_function()`
+callbacks run right after the script, before the response is captured;
+global objects' `__destruct()` runs in `php_request_shutdown()` right after
+the response is sent, on the same thread and still scoped to the request's
+own keyspace. (Before v0.11.3 that teardown waited for the thread's next
+request.) Output from a destructor is discarded.
 
-**Per-request mode (`[php] mode = "per_request"`, the default).**
-`register_shutdown_function()` callbacks run at the end of **every**
-request, after your script finishes (including after `exit()` or a fatal
-error) and before the response is sent, just as under php-fpm. They run
-inside the request, so `ephpm_kv_*` calls there reach the same site's
-keyspace as the rest of the request. Anything a shutdown function prints is
-part of the response.
-
-Do not rely on `__destruct()` for KV writes. An object freed while the
-script runs (it goes out of scope, or you `unset()` it) is destructed at
-that moment, inside the request. Objects that are still alive when the
-script ends are torn down as part of request shutdown, and the KV context
-there is not something to build on. Make the call explicitly, or from a
-shutdown function.
-
-**Worker mode (`[php] mode = "worker"`).** The worker script is one
-long-lived PHP request per worker thread, so a shutdown function registered
-there runs when the worker **thread** retires (a recycle, or server
-shutdown), not after each request it handles. By then the thread's
-per-request KV state is gone. Calls made from there fail closed rather than
-crashing the server: a `get` reports a miss, a `set` returns `false`, and in
-multi-tenant mode nothing falls back to another site's keyspace. Do
-per-request KV work inside the loop iteration.
+**Worker mode:** a worker keeps one long-lived SAPI request open per thread,
+so shutdown functions and end-of-script destructors run when the worker
+thread itself retires, by which point that thread's per-request KV state is
+gone. Calls made from there fail closed rather than crashing the server: a
+`get` reports a miss, a `set` returns `false`, and in multi-tenant mode
+nothing falls back to another site's keyspace. Do your KV work inside the
+request.
 
 The same split applies to [`ephpm_db_*`](/guides/db-from-php/#shutdown-functions-and-destructors),
-which throws a distinct exception in the worker-retirement case.
+which throws a distinct exception in the worker-mode case.
 
 ## Configuration
 

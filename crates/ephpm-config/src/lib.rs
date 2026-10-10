@@ -3726,6 +3726,43 @@ impl Config {
         Ok(config)
     }
 
+    /// Make `[server] document_root` and `[server] sites_dir` absolute by
+    /// joining a relative value onto `cwd` — the working directory the server
+    /// was started from, which is what every other relative path in the
+    /// config (`[db.sqlite] path`, TLS files, ...) is already resolved against
+    /// by the OS.
+    ///
+    /// These two are different because the paths built from them are handed
+    /// to PHP, which resolves a relative script path against its OWN
+    /// per-thread working directory (PHP moves it to each executed script's
+    /// directory), not the directory ePHPm was started from. A relative
+    /// `document_root = "app"` (or `"./app"`) therefore made every PHP request
+    /// 500 with "Failed opening required 'app/index.php'". Absolute roots also keep
+    /// `open_basedir`, `$_SERVER['DOCUMENT_ROOT']`/`SCRIPT_FILENAME` and the
+    /// worker-script containment check unambiguous.
+    ///
+    /// Lexical only: `.` components are dropped, nothing is canonicalized, so a
+    /// root that does not exist yet still resolves (and fails later, where it
+    /// always did). Call after CLI overrides are applied.
+    pub fn resolve_relative_roots(&mut self, cwd: &std::path::Path) {
+        fn absolutize(path: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
+            if path.is_absolute() {
+                return path.to_path_buf();
+            }
+            let mut out = cwd.to_path_buf();
+            for component in path.components() {
+                if component != std::path::Component::CurDir {
+                    out.push(component);
+                }
+            }
+            out
+        }
+        self.server.document_root = absolutize(&self.server.document_root, cwd);
+        if let Some(sites_dir) = &self.server.sites_dir {
+            self.server.sites_dir = Some(absolutize(sites_dir, cwd));
+        }
+    }
+
     /// Load configuration with defaults only (no file).
     ///
     /// # Errors
@@ -6483,6 +6520,40 @@ mod tests {
     // must install it with `EnvVars` — see `crate::test_env`; nothing else in
     // this module may touch `std::env` directly.
     use crate::test_env::EnvVars;
+
+    // ── relative [server] document_root / sites_dir ──────────────────
+    // (`load_toml` is the shared helper defined with the unknown-key tests.)
+
+    #[test]
+    fn relative_document_root_and_sites_dir_resolve_against_cwd() {
+        let cwd = std::env::temp_dir().join("ephpm-cwd");
+        let mut config = load_toml("[server]\ndocument_root = \"app\"\nsites_dir = \"./sites\"\n");
+        config.resolve_relative_roots(&cwd);
+        assert_eq!(config.server.document_root, cwd.join("app"));
+        assert_eq!(config.server.sites_dir, Some(cwd.join("sites")), "`./` is dropped");
+        assert!(config.server.document_root.is_absolute());
+    }
+
+    #[test]
+    fn default_document_root_resolves_to_cwd_itself() {
+        let cwd = std::env::temp_dir().join("ephpm-cwd");
+        let mut config = load_toml("");
+        assert_eq!(config.server.document_root, PathBuf::from("."), "the default is relative");
+        config.resolve_relative_roots(&cwd);
+        assert_eq!(config.server.document_root, cwd);
+        assert_eq!(config.server.sites_dir, None, "an unset sites_dir stays unset");
+    }
+
+    #[test]
+    fn absolute_roots_are_left_alone() {
+        let abs = std::env::temp_dir().join("www");
+        let mut config = Config::default_config().unwrap();
+        config.server.document_root.clone_from(&abs);
+        config.server.sites_dir = Some(abs.join("sites"));
+        config.resolve_relative_roots(&std::env::temp_dir().join("elsewhere"));
+        assert_eq!(config.server.document_root, abs);
+        assert_eq!(config.server.sites_dir, Some(abs.join("sites")));
+    }
 
     // ── [[middleware]] library = "php:<path>" ────────────────────────
 

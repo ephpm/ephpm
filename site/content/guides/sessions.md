@@ -56,9 +56,12 @@ echo $_SESSION['user_id']; // 42
 
 There is no `[session]` config block.
 
-## Known issue: release the session explicitly {#known-issue}
+## Known issue (before v0.11.3): release the session explicitly {#known-issue}
 
-This applies to every current release (v0.11.2 and earlier). The fix is in progress ([#541](https://github.com/ephpm/ephpm/pull/541)) and has not shipped yet.
+This applies to releases up to and including v0.11.2. It is fixed from
+v0.11.3 ([#541](https://github.com/ephpm/ephpm/pull/541)): PHP's request
+teardown, including the session write and lock release, now runs on the same
+thread right after each response is sent.
 
 In per-request mode (the default), releases up to and including v0.11.2
 write the session, and release its lock, during PHP's request teardown, and
@@ -69,7 +72,8 @@ follow-up request with the same session cookie that lands on another
 thread then waits for the lock (up to 30 seconds, see [Locking](#locking))
 and reads the session as it was **before** the previous request.
 
-The fix is to end the session yourself as soon as you are done with it:
+On those releases, the workaround is to end the session yourself as soon as
+you are done with it:
 
 ```php
 session_start();
@@ -133,7 +137,8 @@ cannot lose updates. Locking is always on; there is no config knob.
   acquired the lock releases it.
 - Hold the session only as long as you need it and call
   `session_write_close()` as soon as you have finished changing `$_SESSION`
-  (see the [known issue](#known-issue) above).
+  (on v0.11.2 and earlier this is required — see the
+  [known issue](#known-issue) above).
 
 Known limitation: if a request holds its session for longer than the
 30-second lock TTL, the lock expires and a competing request may take it.

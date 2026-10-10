@@ -723,13 +723,17 @@ Client ──HTTP──► hyper (tokio)
                         ├── send_header() → capture headers
                         ├── read_post() → provide POST data
                         └── read_cookies() → provide cookies
-                     5. php_request_shutdown()
-                     6. Return (status, headers, body)
+                     5. Return (status, headers, body)
                             │
                             ▼
                 Build hyper::Response
                             │
 Client ◄──HTTP──────────────┘
+
+             then, on the same PHP thread, after the reply:
+                     6. php_request_shutdown()
+                        (destructors, session write +
+                         unlock, extension RSHUTDOWN)
 ```
 
 PHP execution is lock-free and concurrent: PHP is compiled with ZTS, and each execution-pool thread registers with TSRM on first use to get its own isolated PHP context. A `Mutex` guards only the one-time `init()`/`shutdown()` — never request execution.
