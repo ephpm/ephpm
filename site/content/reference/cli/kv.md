@@ -24,7 +24,7 @@ The server must be configured with `[kv.redis_compat] enabled = true` for these 
 
 ## Authentication
 
-The RESP listener requires `AUTH` as soon as either `[kv.redis_compat] password` or `[kv] secret` is set — until a connection authenticates, every command except `AUTH` and `QUIT` is answered with `-NOAUTH Authentication required`. That gate is only as strong as what `AUTH` checks: on a **single-site** server with `[kv] secret` set and no `password`, any `AUTH` succeeds, so the secret alone protects nothing there. The full matrix is in [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication). There are two server-side modes that do check credentials:
+The RESP listener requires `AUTH` as soon as either `[kv.redis_compat] password` or `[kv] secret` is set — until a connection authenticates, every command except `AUTH` and `QUIT` is answered with `-NOAUTH Authentication required`. A **single-site** server with `[kv] secret` set and no `password` refuses to start, since the secret cannot authenticate anyone without `sites_dir`. The full matrix is in [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication). There are two server-side modes:
 
 **Single password** (`[kv.redis_compat] password`) — pass `--password`, or set `EPHPM_KV_PASSWORD` and leave the flag off. Do not add `--user` here: the server compares the first `AUTH` argument, so `AUTH <user> <password>` fails.
 
