@@ -1627,9 +1627,10 @@ fn run_with_config(
     // Resolve the full resource-aware autotuning profile once: it feeds both
     // the generated php.ini (opcache/memory/realpath/assertions lines) and the
     // startup autotune summary log below.
-    // The JIT default is shaped by tenancy: tracing in single-site serve,
-    // disable when `sites_dir` is set (per-vhost invalidation never reclaims
-    // JIT buffer) — so autotune needs to know whether this is a vhost run.
+    // The JIT defaults to `disable` in every mode, but the *reason* logged at
+    // startup depends on tenancy (`sites_dir` set: per-vhost invalidation
+    // never reclaims JIT buffer) — so autotune needs to know whether this is
+    // a vhost run.
     let autotune = config.php.autotune(dev_mode, config.server.sites_dir.is_some());
     let opcache_ini_lines = autotune.ini_lines();
     let validate_timestamps = autotune.validate_timestamps.value;

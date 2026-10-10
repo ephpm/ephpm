@@ -33,7 +33,7 @@ The separator between levels must be a **double** underscore. Underscores inside
 
 | Mistake | Becomes | Result |
 |---------|---------|--------|
-| `EPHPM_SERVER_LISTEN` (single `_` after the section) | top-level key `server_listen` | **Silently ignored.** No error, no warning — the server starts on its default address. |
+| `EPHPM_SERVER_LISTEN` (single `_` after the section) | top-level key `server_listen` | **Silently ignored.** No error, no warning — `listen` keeps its TOML or default value. |
 | `EPHPM_PHP_MODE=worker` | top-level key `php_mode` | **Silently ignored.** The server runs in the default `per_request` mode. |
 | `EPHPM_SERVER__REQUEST_MAX_BODY_SIZE` (single `_` at a deeper level) | `[server] request_max_body_size` | **Startup error** naming the unknown key. |
 
