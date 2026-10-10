@@ -14,6 +14,8 @@ The store is the same in both cases; only the path differs — by roughly **500�
 
 No external dependency. Available as native PHP functions whenever PHP is running inside ePHPm.
 
+**Not under `ephpm php`.** The CLI runs PHP without starting the server, so no KV store is attached: the functions exist but every call returns its failure value (`null` / `false` / `0` / `-2`) and the first call emits an `E_WARNING` saying so. To reach a running server's KV from a script, use its RESP listener (`[kv.redis_compat]`) with any Redis client.
+
 ```php
 ephpm_kv_set("greeting", "hello");
 $greeting = ephpm_kv_get("greeting");          // "hello"
@@ -55,7 +57,7 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 |---|---|---|
 | `ephpm_kv_get(string $key)` | `?string` | `null` on a miss. |
 | `ephpm_kv_set(string $key, string $value, int $ttl = 0)` | `bool` | `$ttl` in seconds; `0` or negative means no expiry. |
-| `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic per node). Same `$ttl` rules as `set`. |
+| `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic; in a cluster decided by the key's owner node, see [Locks in a cluster](#locks-in-a-cluster)). Same `$ttl` rules as `set`. |
 | `ephpm_kv_del(string $key)` | `int` | Number of keys deleted (`0` or `1`). |
 | `ephpm_kv_del_if_eq(string $key, string $token)` | `bool` | Compare-and-delete — see below. |
 | `ephpm_kv_exists(string $key)` | `bool` | |
@@ -140,9 +142,41 @@ was deleted; `false` when the token differs, the key is absent, or the key
 has expired (an expired entry is treated as absent). Tokens are compared
 byte-exactly and may be binary.
 
-Like `ephpm_kv_setnx()`, the compare-and-delete is atomic **per node**;
-across a cluster it is last-arrival-wins, so do not build cross-node mutual
-exclusion on it without an external fence.
+### Locks in a cluster
+
+With `[cluster]` enabled, `ephpm_kv_setnx()` and `ephpm_kv_del_if_eq()` (and
+their RESP forms `SETNX`, `SET … NX`, `DELIFEQ`) are **routed to the key's
+owner node** — `hash(key) % sorted alive nodes`, the same owner the
+large-value tier uses — and decided there under that node's shard lock. Every
+node's attempt on a key is therefore serialized by one lock on one node, and
+two nodes cannot both acquire it. (Before this, each node decided on its own
+copy and both could win.)
+
+The guarantee, stated precisely:
+
+- **It holds while membership is stable.** Each node computes the owner from
+  its own view of cluster membership. Across a membership change — a node
+  joining or leaving, or the seconds before gossip declares a dead node dead —
+  two nodes can briefly name different owners and both grant the same lock.
+- **A new owner learns about existing locks by replication.** If ownership
+  moves, the new owner knows about a lock its predecessor granted only once
+  that grant has replicated to it (gossip; typically well under a second).
+- **An unreachable owner fails closed.** If the owner does not answer within
+  2 seconds, nothing is written anywhere: `ephpm_kv_setnx()` returns `false`,
+  `ephpm_kv_del_if_eq()` returns `false`, and the RESP commands answer
+  `-CLUSTERDOWN …` (never `:0`/`nil`, which would claim the key exists or the
+  token did not match). Retry; a dead owner stops being the owner once gossip
+  declares it dead.
+- **The caller's own copy follows by replication.** A routed `setnx()` win is
+  visible to `ephpm_kv_get()` on the calling node once the owner's write has
+  replicated back, not synchronously.
+- **Rolling upgrades:** a node running a version without owner routing cannot
+  answer a routed request, so lock keys it owns are refused (fail closed) until
+  it is upgraded.
+
+This is single-arbiter routing, not consensus. If you need mutual exclusion
+that survives membership changes, fence the protected resource itself (for
+example with a monotonically increasing token checked by the database).
 
 ### Blocking waits — `ephpm_kv_wait()`
 

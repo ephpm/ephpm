@@ -109,6 +109,11 @@ fn body_str(resp: &PhpResponse) -> String {
 // The ini directives every test needs. Inlined into each script so the
 // ephpm save handler is selected regardless of how the embed SAPI's
 // default php.ini was configured.
+//
+// No `session.use_only_cookies` here: disabling it is deprecated since PHP 8.4,
+// and the deprecation notice is output — it "sends headers", after which every
+// later session ini_set() and session_start() fails. The scripts pass the id via
+// session_id() anyway, so the directive was never needed.
 const SESSION_INI: &str = r#"
 ini_set('session.save_handler', 'ephpm');
 ini_set('session.use_strict_mode', '1');
@@ -222,6 +227,57 @@ echo 'OK';
         pttl > 0 && pttl <= 120_000,
         "expected TTL in (0, 120_000] ms (gc_maxlifetime=120s); got {pttl}",
     );
+}
+
+/// The session lock is released with a compare-and-delete against a
+/// per-acquisition token, not a plain DEL. Simulates the TTL-overrun case: while
+/// the request holds the session, the lock key is taken over by "someone else"
+/// (what an expiry + re-acquire by a concurrent request leaves behind). The
+/// original holder's release must then leave the new holder's lock alone.
+#[test]
+#[serial]
+fn session_lock_release_cannot_delete_a_lock_it_no_longer_holds() {
+    let store = init_once();
+    let sid = "ephpmtestsid_lockcad_eeeeeeeeeeee";
+    let lock_key = format!("session_lock:{sid}");
+    store.set(format!("session:{sid}"), b"".to_vec(), None);
+
+    let script = write_script(
+        "session_lock_cad.php",
+        &format!(
+            r#"<?php
+{SESSION_INI}
+session_id('{sid}');
+session_start();
+$held = ephpm_kv_get('{lock_key}');
+ephpm_kv_set('{lock_key}', 'someone-else');
+session_write_close();
+echo $held, '|', var_export(ephpm_kv_get('{lock_key}'), true);
+"#,
+        ),
+    );
+    let body = body_str(&run(script, Some(sid)));
+    let (held, after) = body.split_once('|').expect("two fields");
+
+    assert_eq!(held.len(), 32, "lock value must be a per-acquisition token, got {held:?}");
+    assert!(held.bytes().all(|b| b.is_ascii_hexdigit()), "token must be hex, got {held:?}");
+    assert_eq!(after, "'someone-else'", "release must not delete a lock taken over by another");
+
+    // A normal acquire/release cycle still cleans up after itself.
+    store.remove(&lock_key);
+    let script = write_script(
+        "session_lock_cycle.php",
+        &format!(
+            r#"<?php
+{SESSION_INI}
+session_id('{sid}');
+session_start();
+session_write_close();
+echo var_export(ephpm_kv_get('{lock_key}'), true);
+"#,
+        ),
+    );
+    assert_eq!(body_str(&run(script, Some(sid))), "NULL", "own lock must be released");
 }
 
 #[test]

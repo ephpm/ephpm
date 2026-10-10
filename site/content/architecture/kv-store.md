@@ -112,6 +112,8 @@ Applies are **last-arrival-wins** by origin `write_ms`: each node keeps a per-ke
 
 **Hashes and `FLUSHDB` do not replicate.** The replication tier carries string keys only, so `HSET`/`HDEL` stay on the node that ran them even in a cluster (a `WARN` is logged once per process the first time it happens), and hash values cannot be given a TTL. `FLUSHDB`/`FLUSHALL` empty only the local node's store, deliberately: replicating a flush would let one node erase the whole cluster's data. Use string keys for anything that must be cluster-visible.
 
+**Conditional writes are owner-arbitrated, not last-arrival-wins.** `SETNX` / `SET … NX` and the compare-and-delete `DELIFEQ` (`ephpm_kv_setnx` / `ephpm_kv_del_if_eq` from PHP) cannot be decided on each node's own copy — two nodes would both see "absent" and both acquire a lock. They are routed over the KV data plane to the key's owner (`hash(key) % sorted alive nodes`, whichever tier the value lives in) and decided under that node's shard lock; the owner then replicates its decision like any other write. The guarantee holds while membership is stable: across a membership change two nodes can briefly name different owners, a new owner only knows about locks that have replicated to it, and an unreachable owner fails closed (`-CLUSTERDOWN` on RESP, `false` from PHP; 2s timeout). See [KV from PHP — Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster).
+
 This is where `kv:sqlite:primary` and other cluster-wide control state lives. Designed for small, frequently-read, eventually-consistent values.
 
 ### Tier 2 — TCP data plane (large values)

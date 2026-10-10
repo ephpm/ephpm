@@ -74,13 +74,13 @@ than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 | Strings | `GET key` | `nil` for a missing key, and also for a key that only exists as a hash. |
 | | `SET key value [EX s \| PX ms] [NX \| XX] [GET]` | `EXAT`/`PXAT`/`KEEPTTL` are `ERR syntax error`. An `EX`/`PX` value that is zero, negative or not a number is **silently ignored** and the key is stored with no TTL (Redis returns an error). `NX` with `XX` is an error. |
 | | `SETEX key seconds value` | `seconds` must be positive. |
-| | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. |
+| | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` and writes nothing. The same applies to `SET … NX`. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
 | | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
 | | `APPEND`, `STRLEN` | |
 | Keys | `DEL key...` | Removes the string and the hash of that name. |
-| | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`). |
+| | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`). Owner-decided in a cluster, like `SETNX`; an unreachable owner answers `-CLUSTERDOWN …`. |
 | | `EXISTS key...` | Counts strings and hashes. |
 | | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time`; Redis would delete the key. Options (`NX`/`XX`/`GT`/`LT`) are ignored. **String keys only:** on a hash it returns `0` and sets nothing. |
 | | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. String keys only: a hash reports `-2`. |

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use ephpm_config::ClusterKvConfig;
-use ephpm_kv::store::Store;
+use ephpm_kv::store::{Routed, SetNxOutcome, Store};
 
 use crate::ClusterHandle;
 use crate::node::NodeInfo;
@@ -34,6 +34,48 @@ use crate::secure_transport::ClusterCipher;
 
 /// Key prefix for hot-key version metadata in chitchat state.
 const HOT_PREFIX: &str = "hot:";
+
+/// How long a non-owner waits for the owner to decide a routed `SETNX` /
+/// compare-and-delete before treating it as unreachable (and writing nothing).
+///
+/// The call blocks a PHP worker or RESP connection, so it is kept well below
+/// any request timeout. An owner that is merely slow — not dead — is still
+/// answered "not acquired", which a lock caller retries; a dead owner stops
+/// being the owner once gossip declares it dead.
+pub const CONDITIONAL_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run `fut` to completion from a **synchronous** caller on `handle`'s runtime.
+///
+/// [`ephpm_kv::store::Replicator`]'s routing hooks are synchronous (RESP
+/// dispatch, the PHP bridge, middleware), but owner routing is a network round
+/// trip. Three caller shapes exist:
+///
+/// - a thread outside any runtime (the PHP execution pools): `block_on` the
+///   runtime handle directly;
+/// - a multi-thread runtime worker (RESP connections, ACME, middleware):
+///   `block_in_place` hands this worker's other tasks to a fresh worker while
+///   the round trip runs, so the runtime keeps making progress;
+/// - a current-thread runtime: blocking would deadlock the only worker, so
+///   this returns `None` and the caller fails closed. Production runs the
+///   multi-thread runtime; this case exists for tests.
+fn block_on_cluster<F: std::future::Future>(
+    handle: &tokio::runtime::Handle,
+    fut: F,
+) -> Option<F::Output> {
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => Some(handle.block_on(fut)),
+        Ok(current) if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            Some(tokio::task::block_in_place(|| handle.block_on(fut)))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                "KV conditional write called from a current-thread tokio runtime; cannot route \
+                 it to the key's owner without deadlocking, so it fails closed"
+            );
+            None
+        }
+    }
+}
 
 /// How large-value writes propagate to replica nodes.
 ///
@@ -775,6 +817,102 @@ impl ClusteredStore {
         deleted
     }
 
+    /// The node that arbitrates conditional writes (`SETNX`, compare-and-delete)
+    /// on `transport_key`, or `None` when this node is the arbiter.
+    ///
+    /// The arbiter is the key's **primary owner** — the same
+    /// `hash(key) % sorted alive nodes` choice the large-value tier uses — so
+    /// every node that agrees on membership names the same single node, and the
+    /// one shard lock on that node serialises every caller in the cluster.
+    /// `None` also covers a cluster of one.
+    pub async fn conditional_owner(&self, transport_key: &str) -> Option<NodeInfo> {
+        let primary = self.replica_nodes(transport_key).await.into_iter().next()?;
+        (primary.id != self.cluster.self_node().id).then_some(primary)
+    }
+
+    /// Route a `SETNX` on `transport_key` to its arbiter.
+    ///
+    /// Returns [`Routed::Local`] when this node is the arbiter (the caller then
+    /// decides on its own map), the owner's answer when it is another node, or
+    /// [`Routed::OwnerUnreachable`] when the owner did not answer within
+    /// [`CONDITIONAL_ROUTE_TIMEOUT`] — in which case nothing was written.
+    pub async fn route_set_nx(
+        &self,
+        transport_key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> Routed<SetNxOutcome> {
+        let Some(owner) = self.conditional_owner(transport_key).await else {
+            return Routed::Local;
+        };
+        let Some(addr) = node_data_addr(&owner, self.config.data_port) else {
+            tracing::warn!(key = transport_key, owner = %owner.id, "SETNX owner has no data address");
+            return Routed::OwnerUnreachable;
+        };
+        let call = crate::kv_data_plane::set_nx_remote(
+            addr,
+            transport_key,
+            value,
+            ttl,
+            self.cipher.as_deref(),
+        );
+        match tokio::time::timeout(CONDITIONAL_ROUTE_TIMEOUT, call).await {
+            Ok(Ok(outcome)) => {
+                tracing::trace!(key = transport_key, owner = %owner.id, ?outcome, "SETNX routed");
+                Routed::Owner(outcome)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr, %e,
+                    "SETNX owner unreachable; not acquired (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+            Err(_) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr,
+                    "SETNX owner timed out; not acquired (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+        }
+    }
+
+    /// Route a compare-and-delete on `transport_key` to the same arbiter
+    /// [`route_set_nx`](Self::route_set_nx) uses. Same contract.
+    pub async fn route_del_if_eq(&self, transport_key: &str, token: &[u8]) -> Routed<bool> {
+        let Some(owner) = self.conditional_owner(transport_key).await else {
+            return Routed::Local;
+        };
+        let Some(addr) = node_data_addr(&owner, self.config.data_port) else {
+            tracing::warn!(key = transport_key, owner = %owner.id, "DELIFEQ owner has no data address");
+            return Routed::OwnerUnreachable;
+        };
+        let call = crate::kv_data_plane::del_if_eq_remote(
+            addr,
+            transport_key,
+            token,
+            self.cipher.as_deref(),
+        );
+        match tokio::time::timeout(CONDITIONAL_ROUTE_TIMEOUT, call).await {
+            Ok(Ok(deleted)) => Routed::Owner(deleted),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr, %e,
+                    "DELIFEQ owner unreachable; nothing deleted (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+            Err(_) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr,
+                    "DELIFEQ owner timed out; nothing deleted (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+        }
+    }
+
     /// Check if a key exists in any tier.
     pub async fn exists(&self, key: &str) -> bool {
         self.cluster.gossip_exists(key).await || self.store.exists(key)
@@ -1149,6 +1287,17 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         Box::pin(async move { self.inner.get(key).await })
     }
 
+    fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
+        // The global keyspace's transport key IS the key.
+        block_on_cluster(&self.handle, self.inner.route_set_nx(key, value, ttl))
+            .unwrap_or(Routed::OwnerUnreachable)
+    }
+
+    fn route_del_if_eq(&self, key: &str, token: &[u8]) -> Routed<bool> {
+        block_on_cluster(&self.handle, self.inner.route_del_if_eq(key, token))
+            .unwrap_or(Routed::OwnerUnreachable)
+    }
+
     fn replicate_remove(&self, key: &str) -> bool {
         // Drop the local materialized copy synchronously (mirror of the
         // set path above), then propagate the removal via a gossip
@@ -1422,6 +1571,21 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
             inner.expire_for_site(&site, &key, value, ttl).await;
         });
         true
+    }
+
+    fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
+        // Route on the TRANSPORT key: it is both what picks the owner (so two
+        // sites' same-named locks are arbitrated independently) and what the
+        // owner's data plane decodes to land the decision in this site's store.
+        let transport = crate::site_namespace::encode(&self.site, key);
+        block_on_cluster(&self.handle, self.inner.route_set_nx(&transport, value, ttl))
+            .unwrap_or(Routed::OwnerUnreachable)
+    }
+
+    fn route_del_if_eq(&self, key: &str, token: &[u8]) -> Routed<bool> {
+        let transport = crate::site_namespace::encode(&self.site, key);
+        block_on_cluster(&self.handle, self.inner.route_del_if_eq(&transport, token))
+            .unwrap_or(Routed::OwnerUnreachable)
     }
 }
 

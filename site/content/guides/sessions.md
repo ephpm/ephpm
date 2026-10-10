@@ -123,9 +123,10 @@ PHP's `files` handler, so concurrent read-modify-write cycles on `$_SESSION`
 cannot lose updates. Locking is always on; there is no config knob.
 
 - On `read` (inside `session_start()`) the handler acquires
-  `session_lock:<sid>` with an atomic `SETNX` and a **30-second TTL**. The
-  TTL is a dead-man's switch: a crashed or wedged holder stops blocking the
-  session after at most 30 seconds.
+  `session_lock:<sid>` with an atomic `SETNX` and a **30-second TTL**,
+  storing a random 128-bit token unique to this acquisition as the lock's
+  value. The TTL is a dead-man's switch: a crashed or wedged holder stops
+  blocking the session after at most 30 seconds.
 - On contention it retries with exponential backoff (10 ms, doubling to a
   100 ms cap) for up to **30 seconds** in total. If the lock is still held,
   it raises an `E_WARNING` ("could not acquire session lock … proceeding
@@ -134,29 +135,48 @@ cannot lose updates. Locking is always on; there is no config knob.
 - The lock is released in `close`, which PHP calls on
   `session_write_close()` and at request teardown, and in `destroy`
   (`session_destroy()`, `session_regenerate_id(true)`). Only the thread that
-  acquired the lock releases it.
+  acquired the lock releases it, and the release is a **compare-and-delete**
+  (`del_if_eq`) against that acquisition's token, not a plain `DEL`.
 - Hold the session only as long as you need it and call
   `session_write_close()` as soon as you have finished changing `$_SESSION`
   (on v0.11.2 and earlier this is required — see the
   [known issue](#known-issue) above).
 
-Known limitation: if a request holds its session for longer than the
-30-second lock TTL, the lock expires and a competing request may take it.
-When the original holder closes, it releases the lock with an unconditional
-`DEL`, which removes the **new** holder's lock early. The KV store now has a
-compare-and-delete primitive (`ephpm_kv_del_if_eq`), but the handler does
-not use it yet. The window needs a session held for more than 30 seconds
-plus overlapping competitors, and the worst case is the lost-update race the
-lock otherwise prevents.
+TTL overrun: if a request holds its session for longer than the 30-second
+lock TTL, the lock expires and a competing request may take it. The
+overrunning request then runs unlocked for the rest of its life, which is
+inherent to any TTL lock. Its eventual release is harmless: the
+compare-and-delete sees the new holder's token, not its own, and deletes
+nothing. (Through v0.11.3 the release was an unconditional `DEL`, which
+removed the new holder's lock early and let a third request in.)
 
 In multi-tenant mode the lock key lives in the same per-site store as the
 session data, so tenants cannot contend with each other. Windows builds are
 ZTS like Linux and macOS, so the same locking applies there.
 
-The lock is **node-local**. In a cluster, concurrent requests for the same
-session that land on *different* nodes are not serialized against each
-other. Use session-affinity routing if overlapping requests for one session
-across nodes are a real pattern for your app.
+**In a cluster**, the lock's `SETNX` and its compare-and-delete release are
+routed to the lock key's **owner node** (`hash(key) % sorted alive nodes`,
+the same owner the large-value tier uses) over the KV data plane and decided
+under that one node's shard lock, so concurrent requests for one session on
+*different* nodes are serialized too. What that does and does not guarantee:
+
+- It holds while cluster membership is stable. Each node computes the owner
+  from its own membership view, so across a membership change (a node
+  joining or leaving, or the seconds before gossip declares a dead node
+  dead) two nodes can briefly name different owners and both grant the lock.
+- A node that becomes the owner only knows about a lock its predecessor
+  granted once that grant has replicated to it (gossip, typically well under
+  a second).
+- If the owner cannot be reached (2-second timeout), the acquire is refused
+  rather than falling back to a node-local lock. The handler treats that like
+  contention and, after its 30-second wait, proceeds without the lock with
+  the usual warning.
+- During a rolling upgrade from a version without owner routing, an owner
+  still on the old version cannot answer the routed request, so locks it
+  owns are refused (the same contention path) until it is upgraded.
+
+This is single-arbiter routing, not consensus. Use session-affinity routing
+if your app cannot tolerate the membership-change window.
 
 ## TTL and eviction
 

@@ -17,6 +17,24 @@
 //!
 //! **SET response:** `[status: u8]` where `0x00` = success, `0x01` = rejected (e.g., OOM).
 //!
+//! ### Owner-arbitrated conditional writes
+//!
+//! `SETNX` and compare-and-delete are decided by the key's owner node (see
+//! [`ClusteredStore`](crate::ClusteredStore)'s routing), so a non-owner ships
+//! them here and takes the owner's answer:
+//!
+//! - `op = 0x02` (SETNX): followed by `[value_len: u32 BE][value][ttl_ms: u64 BE]`
+//!   (`ttl_ms = 0` = no expiry). Response `[status: u8]`: `0x00` inserted,
+//!   `0x01` refused for memory, `0x02` key already exists, `0x03` this node
+//!   cannot route the key (a per-site key on a non-multi-tenant node).
+//! - `op = 0x03` (DEL-IF-EQ): followed by `[token_len: u32 BE][token]`.
+//!   Response `[status: u8]`: `0x00` deleted, `0x02` not deleted (absent,
+//!   expired, or the token differs), `0x03` cannot route the key.
+//!
+//! A node predating these ops drops the connection on the unknown op code
+//! without answering; the caller treats that, like any transport failure, as
+//! "owner unreachable" and writes nothing.
+//!
 //! The sentinel `u32::MAX` indicates the key was not found. This is
 //! unambiguous because real values are bounded by memory limits well
 //! below 4 GiB.
@@ -40,7 +58,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ephpm_kv::store::Store;
+use ephpm_kv::store::{SetNxOutcome, Store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -56,8 +74,9 @@ const MAX_KEY_LEN: u32 = 64 * 1024;
 const MAX_VALUE_LEN: u32 = 64 * 1024 * 1024;
 
 /// Maximum sealed frame length accepted in encrypted mode: the largest
-/// legal plaintext message (SET request) plus sealing overhead.
-const MAX_FRAME_LEN: u32 = 1 + 4 + MAX_KEY_LEN + 4 + MAX_VALUE_LEN + SEAL_OVERHEAD as u32;
+/// legal plaintext message (a SETNX request — a SET plus its 8-byte TTL) plus
+/// sealing overhead.
+const MAX_FRAME_LEN: u32 = 1 + 4 + MAX_KEY_LEN + 4 + MAX_VALUE_LEN + 8 + SEAL_OVERHEAD as u32;
 
 /// Op code for GET requests.
 const OP_GET: u8 = 0x00;
@@ -65,11 +84,29 @@ const OP_GET: u8 = 0x00;
 /// Op code for SET requests.
 const OP_SET: u8 = 0x01;
 
+/// Op code for an owner-arbitrated SETNX.
+const OP_SET_NX: u8 = 0x02;
+
+/// Op code for an owner-arbitrated compare-and-delete.
+const OP_DEL_IF_EQ: u8 = 0x03;
+
 /// SET response: success.
 const SET_OK: u8 = 0x00;
 
 /// SET response: rejected (e.g., memory limit with `NoEviction`).
 const SET_REJECTED: u8 = 0x01;
+
+/// SETNX / DEL-IF-EQ response: the condition did not hold (the key exists /
+/// the token did not match), so nothing changed.
+const COND_NOT_APPLIED: u8 = 0x02;
+
+/// SETNX / DEL-IF-EQ response: the receiving node cannot route the key.
+const COND_UNROUTABLE: u8 = 0x03;
+
+/// Whether `op` carries a value (or token) after the key.
+fn op_has_value(op: u8) -> bool {
+    matches!(op, OP_SET | OP_SET_NX | OP_DEL_IF_EQ)
+}
 
 /// Start the TCP KV data plane listener on all interfaces at `port`.
 ///
@@ -219,8 +256,10 @@ struct Request {
     op: u8,
     /// The key being fetched or stored.
     key: String,
-    /// The value for SET requests.
+    /// The value for SET / SETNX requests, or the token for DEL-IF-EQ.
     value: Option<Vec<u8>>,
+    /// SETNX only: TTL in milliseconds, `0` = no expiry.
+    ttl_ms: u64,
 }
 
 /// Handle a single TCP connection: read one request, write one response.
@@ -242,6 +281,7 @@ async fn handle_connection(
         );
         let response = match request.op {
             OP_GET => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
+            OP_SET_NX | OP_DEL_IF_EQ => vec![COND_UNROUTABLE],
             _ => vec![SET_REJECTED],
         };
         return write_message(&mut stream, &response, cipher).await;
@@ -268,6 +308,29 @@ async fn handle_connection(
             // our peers (infinite loop).
             let ok = store.set_local(key.to_string(), value, None);
             vec![if ok { SET_OK } else { SET_REJECTED }]
+        }
+        OP_SET_NX => {
+            let value = request.value.expect("SETNX request always carries a value");
+            let ttl =
+                (request.ttl_ms > 0).then(|| std::time::Duration::from_millis(request.ttl_ms));
+            // We are the key's owner, asked to arbitrate. Decide on OUR map and
+            // do not re-route: two nodes that briefly disagree about ownership
+            // would otherwise bounce the request between them. A win is
+            // published to the cluster by the store's own replicator.
+            let status = match store.set_nx_outcome_local(key.to_string(), value, ttl) {
+                SetNxOutcome::Inserted => SET_OK,
+                SetNxOutcome::Exists => COND_NOT_APPLIED,
+                SetNxOutcome::OutOfMemory => SET_REJECTED,
+                // Unreachable from the local path, but answer honestly.
+                SetNxOutcome::OwnerUnreachable => COND_UNROUTABLE,
+            };
+            vec![status]
+        }
+        OP_DEL_IF_EQ => {
+            let token = request.value.expect("DEL-IF-EQ request always carries a token");
+            // Same as SETNX: decide here, never re-route. The deletion is
+            // published as a tombstone by the store's replicator.
+            vec![if store.del_if_eq_local(key, &token) { SET_OK } else { COND_NOT_APPLIED }]
         }
         other => {
             anyhow::bail!("unknown op code: {other:#04x}");
@@ -301,7 +364,7 @@ async fn read_request(
     stream.read_exact(&mut key_buf).await?;
     let key = String::from_utf8(key_buf).map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
 
-    let value = if op == OP_SET {
+    let value = if op_has_value(op) {
         let value_len = stream.read_u32().await?;
         if value_len > MAX_VALUE_LEN {
             anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
@@ -313,8 +376,9 @@ async fn read_request(
     } else {
         None
     };
+    let ttl_ms = if op == OP_SET_NX { stream.read_u64().await? } else { 0 };
 
-    Ok(Request { op, key, value })
+    Ok(Request { op, key, value, ttl_ms })
 }
 
 /// Parse a plaintext request message from a decrypted frame.
@@ -328,7 +392,7 @@ fn parse_request(mut buf: &[u8]) -> anyhow::Result<Request> {
     let key = String::from_utf8(take_bytes(&mut buf, key_len as usize)?.to_vec())
         .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
 
-    let value = if op == OP_SET {
+    let value = if op_has_value(op) {
         let value_len = take_u32(&mut buf)?;
         if value_len > MAX_VALUE_LEN {
             anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
@@ -337,8 +401,15 @@ fn parse_request(mut buf: &[u8]) -> anyhow::Result<Request> {
     } else {
         None
     };
+    let ttl_ms = if op == OP_SET_NX {
+        let bytes: [u8; 8] =
+            take_bytes(&mut buf, 8)?.try_into().expect("take_bytes(8) returns exactly 8 bytes");
+        u64::from_be_bytes(bytes)
+    } else {
+        0
+    };
 
-    Ok(Request { op, key, value })
+    Ok(Request { op, key, value, ttl_ms })
 }
 
 /// Write one protocol message, sealing it into a frame when encrypted.
@@ -483,6 +554,90 @@ pub async fn store_remote(
         stream.read_u8().await?
     };
     Ok(status == SET_OK)
+}
+
+/// Ask the owner node at `addr` to perform `SETNX key value [ttl]` on its own
+/// map and return its decision.
+///
+/// The owner decides under its per-key shard lock and publishes a win to the
+/// cluster itself, so the caller must not apply the value anywhere.
+///
+/// # Errors
+///
+/// Returns an error on connection or I/O failure, a cipher mismatch, a peer
+/// that does not speak this op (an older node closes without answering), or a
+/// peer that cannot route the key. Every error means **nothing was written**.
+pub async fn set_nx_remote(
+    addr: SocketAddr,
+    key: &str,
+    value: &[u8],
+    ttl: Option<std::time::Duration>,
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<SetNxOutcome> {
+    let ttl_ms = ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1));
+    let status =
+        conditional_roundtrip(addr, &encode_set_nx_request(key, value, ttl_ms)?, cipher).await?;
+    match status {
+        SET_OK => Ok(SetNxOutcome::Inserted),
+        COND_NOT_APPLIED => Ok(SetNxOutcome::Exists),
+        SET_REJECTED => Ok(SetNxOutcome::OutOfMemory),
+        COND_UNROUTABLE => anyhow::bail!("owner {addr} cannot route key {key:?}"),
+        other => anyhow::bail!("owner {addr} answered SETNX with unknown status {other:#04x}"),
+    }
+}
+
+/// Ask the owner node at `addr` to delete `key` only while its value equals
+/// `token`, returning whether it did.
+///
+/// # Errors
+///
+/// As [`set_nx_remote`]: any error means nothing was deleted.
+pub async fn del_if_eq_remote(
+    addr: SocketAddr,
+    key: &str,
+    token: &[u8],
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<bool> {
+    let status =
+        conditional_roundtrip(addr, &encode_del_if_eq_request(key, token)?, cipher).await?;
+    match status {
+        SET_OK => Ok(true),
+        COND_NOT_APPLIED => Ok(false),
+        COND_UNROUTABLE => anyhow::bail!("owner {addr} cannot route key {key:?}"),
+        other => anyhow::bail!("owner {addr} answered DEL-IF-EQ with unknown status {other:#04x}"),
+    }
+}
+
+/// Send one conditional-write request and read its one-byte status.
+async fn conditional_roundtrip(
+    addr: SocketAddr,
+    message: &[u8],
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<u8> {
+    let mut stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+    write_message(&mut stream, message, cipher).await?;
+    if let Some(cipher) = cipher {
+        let frame = read_frame(&mut stream, cipher).await?;
+        return take_u8(&mut frame.as_slice());
+    }
+    Ok(stream.read_u8().await?)
+}
+
+/// Encode a plaintext SETNX request message.
+fn encode_set_nx_request(key: &str, value: &[u8], ttl_ms: u64) -> anyhow::Result<Vec<u8>> {
+    let mut message = encode_set_request(key, value)?;
+    message[0] = OP_SET_NX;
+    message.extend_from_slice(&ttl_ms.to_be_bytes());
+    Ok(message)
+}
+
+/// Encode a plaintext DEL-IF-EQ request message (the token rides where a SET
+/// carries its value).
+fn encode_del_if_eq_request(key: &str, token: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut message = encode_set_request(key, token)?;
+    message[0] = OP_DEL_IF_EQ;
+    Ok(message)
 }
 
 /// Encode a plaintext GET request message.
@@ -921,6 +1076,109 @@ mod tests {
             panic!("expected an oversized-length error, got a parsed request");
         };
         assert!(err.to_string().contains("exceeds maximum"), "got {err}");
+    }
+
+    // ── Owner-arbitrated conditional writes ───────────────────────────
+
+    /// The owner's map decides SETNX: first caller inserts, every later caller
+    /// sees `Exists`, and the stored value is the winner's.
+    #[tokio::test]
+    async fn set_nx_remote_is_decided_by_the_owner() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+
+        let first = set_nx_remote(addr, "lock", b"A", None, None).await.unwrap();
+        let second = set_nx_remote(addr, "lock", b"B", None, None).await.unwrap();
+        assert_eq!(first, SetNxOutcome::Inserted);
+        assert_eq!(second, SetNxOutcome::Exists);
+        assert_eq!(store.get("lock").as_deref(), Some(&b"A"[..]), "the first caller won");
+    }
+
+    /// The TTL crosses the wire: an expired grant is vacant again on the owner.
+    #[tokio::test]
+    async fn set_nx_remote_carries_the_ttl() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_multi_handler(Arc::clone(&store), Some(test_cipher("s"))).await;
+        let cipher = test_cipher("s");
+
+        let ttl = Some(std::time::Duration::from_millis(150));
+        assert_eq!(
+            set_nx_remote(addr, "lock", b"A", ttl, Some(&cipher)).await.unwrap(),
+            SetNxOutcome::Inserted
+        );
+        let pttl = store.pttl("lock").expect("owner holds the lock");
+        assert!((1..=150).contains(&pttl), "owner applied the TTL, got pttl {pttl}");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            set_nx_remote(addr, "lock", b"B", None, Some(&cipher)).await.unwrap(),
+            SetNxOutcome::Inserted,
+            "an expired grant must be vacant again"
+        );
+    }
+
+    /// Compare-and-delete is compared against the OWNER's value.
+    #[tokio::test]
+    async fn del_if_eq_remote_compares_on_the_owner() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+        store.set_local("lock".into(), b"new-holder".to_vec(), None);
+
+        assert!(!del_if_eq_remote(addr, "lock", b"old-holder", None).await.unwrap());
+        assert_eq!(store.get("lock").as_deref(), Some(&b"new-holder"[..]), "mismatch keeps it");
+        assert!(del_if_eq_remote(addr, "lock", b"new-holder", None).await.unwrap());
+        assert_eq!(store.get("lock"), None);
+    }
+
+    /// A per-site conditional write lands in that site's store on the owner.
+    #[tokio::test]
+    async fn per_site_set_nx_lands_in_that_sites_store() {
+        let (global, mt) = multi_tenant_fixture();
+        let addr =
+            spawn_router_handler(KvRouter::multi_tenant(Arc::clone(&global), mt.clone()), None)
+                .await;
+        let transport = crate::site_namespace::encode("alice.test", "lock");
+
+        assert_eq!(
+            set_nx_remote(addr, &transport, b"A", None, None).await.unwrap(),
+            SetNxOutcome::Inserted
+        );
+        assert_eq!(mt.get_site_store("alice.test").get("lock").as_deref(), Some(&b"A"[..]));
+        assert_eq!(global.get("lock"), None);
+        assert_eq!(mt.get_site_store("bob.test").get("lock"), None);
+        assert!(del_if_eq_remote(addr, &transport, b"A", None).await.unwrap());
+        assert_eq!(mt.get_site_store("alice.test").get("lock"), None);
+    }
+
+    /// A node that cannot route a per-site key answers "unroutable", which the
+    /// caller surfaces as an error (nothing written) — never as "exists".
+    #[tokio::test]
+    async fn conditional_write_to_an_unroutable_node_is_an_error() {
+        let global = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_router_handler(KvRouter::global(Arc::clone(&global)), None).await;
+        let transport = crate::site_namespace::encode("alice.test", "lock");
+
+        assert!(set_nx_remote(addr, &transport, b"A", None, None).await.is_err());
+        assert!(del_if_eq_remote(addr, &transport, b"A", None).await.is_err());
+        assert_eq!(global.get("lock"), None);
+    }
+
+    #[test]
+    fn parse_request_roundtrips_conditional_encoders() {
+        let nx = encode_set_nx_request("k", b"v", 1500).unwrap();
+        let parsed = parse_request(&nx).unwrap();
+        assert_eq!(parsed.op, OP_SET_NX);
+        assert_eq!(parsed.key, "k");
+        assert_eq!(parsed.value.as_deref(), Some(b"v".as_slice()));
+        assert_eq!(parsed.ttl_ms, 1500);
+
+        let del = encode_del_if_eq_request("k", b"tok").unwrap();
+        let parsed = parse_request(&del).unwrap();
+        assert_eq!(parsed.op, OP_DEL_IF_EQ);
+        assert_eq!(parsed.value.as_deref(), Some(b"tok".as_slice()));
+        assert_eq!(parsed.ttl_ms, 0);
+
+        // A SETNX missing its TTL trailer is truncated, not "no TTL".
+        assert!(parse_request(&nx[..nx.len() - 1]).is_err());
     }
 
     #[test]

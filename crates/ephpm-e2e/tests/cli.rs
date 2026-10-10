@@ -638,6 +638,29 @@ fn warning_is_reported_and_execution_continues() {
     assert_eq!(run.code, 0, "a warning must not change the exit status, got {}", run.code);
 }
 
+/// `ephpm php` runs PHP without the server, so there is no KV store behind
+/// the `ephpm_kv_*` functions. They used to return their failure values
+/// silently — a CLI script that "cached" a value or "took" a lock did nothing
+/// and never found out. Now the first call warns, once, and the return values
+/// are unchanged.
+#[test]
+fn kv_functions_warn_once_when_no_store_is_attached() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let code = "var_dump(ephpm_kv_set('k', 'v')); var_dump(ephpm_kv_get('k')); \
+                var_dump(ephpm_kv_setnx('lock', 't')); echo 'END';";
+    let run = run_php(&bin, &["-r", code], "");
+    let combined = run.output();
+    assert_eq!(
+        combined.matches("no ePHPm KV store is attached").count(),
+        1,
+        "expected exactly one KV-unavailable warning:\n{combined}"
+    );
+    assert!(combined.contains("bool(false)\nNULL\nbool(false)\nEND"), "return values:\n{combined}");
+    assert_eq!(run.code, 0, "a warning must not change the exit status, got {}", run.code);
+}
+
 // ── php-cli conformance cluster: #335 / #336 / #338 / #339 / #340 ───────────
 //
 // Each of these was found by the nightly CLI conformance harness

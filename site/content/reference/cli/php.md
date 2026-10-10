@@ -107,6 +107,18 @@ in `/etc/ephpm`. The sandbox denies that directory on purpose, so the inner
 [`ephpm exec` → Database access](../exec/#database-access). Run
 `ephpm php --site` as the operator instead.
 
+## No KV store under `ephpm php`
+
+`ephpm php` runs PHP without starting the server, so there is no KV store behind
+the [`ephpm_kv_*` functions](/guides/kv-from-php/) (`--site` binds the database
+bridge only). The functions are defined, but every call returns its failure
+value (`null` / `false` / `0` / `-2`) and the first call in the process emits an
+`E_WARNING` saying no KV store is attached. `session.save_handler = ephpm` is
+backed by the same store, so under `ephpm php` it starts every session empty and
+persists nothing (it does not emit that warning). To
+read or write a running server's KV from a script, connect to its RESP listener
+(`[kv.redis_compat]`) with a Redis client, or use [`ephpm kv`](../kv/).
+
 ## Drop-in for the stock `php` CLI
 
 `ephpm php` reports **`PHP_SAPI === "cli"`** (and `php_sapi_name()` returns

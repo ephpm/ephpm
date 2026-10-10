@@ -81,6 +81,59 @@ pub enum SetNxOutcome {
     /// Refused: the `NoEviction` policy is active and the store is over its
     /// `memory_limit`. Surfaced on the wire as [`OOM_ERROR`].
     OutOfMemory,
+    /// Clustered only: the node that arbitrates this key (its owner — see
+    /// [`Replicator::route_set_nx`]) could not be reached, so **nothing was
+    /// written anywhere**. Surfaced on the wire as [`OWNER_UNREACHABLE_ERROR`].
+    ///
+    /// This is a deliberate fail-closed answer. Falling back to a node-local
+    /// check would let two nodes both acquire the same lock — the bug owner
+    /// routing exists to close — so an unreachable owner means "not acquired",
+    /// never "acquired locally".
+    OwnerUnreachable,
+}
+
+/// Redis Cluster-style error returned when a conditional write (`SETNX`,
+/// `SET … NX`, `DELIFEQ`) cannot reach the cluster node that owns its key.
+///
+/// The `CLUSTERDOWN` prefix is what Redis Cluster uses for "the cluster
+/// cannot serve this right now", so a client that retries on it does the
+/// right thing here too: the owner is recomputed from live membership on every
+/// attempt, and a dead owner stops being the owner once gossip notices.
+pub const OWNER_UNREACHABLE_ERROR: &str =
+    "CLUSTERDOWN the cluster node that owns this key is unreachable; nothing was written";
+
+/// The cluster node that arbitrates a conditional write could not be reached.
+///
+/// Returned by [`Store::try_del_if_eq`]; the `SETNX` side reports the same
+/// condition as [`SetNxOutcome::OwnerUnreachable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerUnreachable;
+
+impl std::fmt::Display for OwnerUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(OWNER_UNREACHABLE_ERROR)
+    }
+}
+
+impl std::error::Error for OwnerUnreachable {}
+
+/// Where a [`Replicator`] says a conditional write must be decided.
+///
+/// `SETNX` and compare-and-delete are only atomic where they are *decided*.
+/// Each node's map is atomic under its own shard lock, but a cluster has one
+/// map per node, so deciding locally lets two nodes both see "absent" and both
+/// acquire. A clustered replicator therefore names a single arbiter per key and
+/// either lets this node decide (it is the arbiter) or forwards the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routed<T> {
+    /// Decide on this node's local map — this node is the key's arbiter, or
+    /// there is no cluster behind the replicator.
+    Local,
+    /// The owner decided; this is its answer. The owner has already applied
+    /// and published the effect, so the caller must not apply it again.
+    Owner(T),
+    /// The owner could not be reached. Nothing was applied anywhere.
+    OwnerUnreachable,
 }
 
 /// Compression algorithm for stored values.
@@ -286,6 +339,40 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
         let _ = key;
         Box::pin(std::future::ready(None))
     }
+
+    /// Decide where a `SETNX` on `key` is arbitrated.
+    ///
+    /// Called by [`Store::set_nx_outcome`] **before** it touches the local map.
+    /// A clustered implementation must pick exactly one arbiter per key (the
+    /// same node for every caller, given the same membership view) and, when
+    /// that is another node, perform the conditional insert *there* and return
+    /// [`Routed::Owner`] with its answer. Returning [`Routed::Local`] makes
+    /// this node decide on its own map.
+    ///
+    /// The default is [`Routed::Local`], which is correct for a replicator
+    /// with no cluster behind it (and for the test doubles in this crate). A
+    /// replicator that spans several nodes MUST override this — otherwise every
+    /// node decides `SETNX` on its own copy and two nodes can both acquire the
+    /// same lock.
+    ///
+    /// This is a **blocking** call: it may wait on a network round trip to the
+    /// owner. Callers are the RESP dispatcher, the PHP bridge and middleware —
+    /// all synchronous — so an async implementation must bridge accordingly.
+    fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
+        let _ = (key, value, ttl);
+        Routed::Local
+    }
+
+    /// Decide where a compare-and-delete on `key` is arbitrated — the release
+    /// side of [`route_set_nx`](Self::route_set_nx), with the same contract.
+    ///
+    /// It must route to the **same** arbiter as `route_set_nx`: a release
+    /// decided against a different node's copy can match a token that the
+    /// arbiter has already replaced, and delete a lock someone else now holds.
+    fn route_del_if_eq(&self, key: &str, token: &[u8]) -> Routed<bool> {
+        let _ = (key, token);
+        Routed::Local
+    }
 }
 
 /// Thread-safe in-memory KV store.
@@ -457,13 +544,15 @@ impl Store {
     ///
     /// * Two nodes incrementing the same counter concurrently can lose an
     ///   update (both publish their own total; the later arrival wins).
-    /// * [`Store::set_nx`] is atomic **per node**; cluster-wide it is
-    ///   last-arrival-wins, so two nodes can both believe they won. Do not
-    ///   build cross-node mutual exclusion on it without an external fence.
+    /// * [`Store::set_nx`] and [`Store::del_if_eq`] are **not** decided here:
+    ///   a clustered replicator routes them to the key's single owner first
+    ///   ([`Replicator::route_set_nx`]), and this publish is the owner fanning
+    ///   its decision out. See [`Store::set_nx_outcome`] for the guarantee and
+    ///   its membership-change limits.
     ///
-    /// Both are strictly better than the previous behaviour (no replication at
-    /// all, so peers never converged), and both are documented rather than
-    /// implied. True cross-node atomic counters/locks need a consensus tier,
+    /// The counter half is strictly better than the previous behaviour (no
+    /// replication at all, so peers never converged) and is documented rather
+    /// than implied. True cross-node atomic counters need a consensus tier,
     /// which this KV deliberately is not.
     fn replicate_published_value(&self, key: &str, value: Vec<u8>, expires_at: Option<Instant>) {
         let Some(rep) = self.active_replicator() else {
@@ -969,6 +1058,10 @@ impl Store {
     /// out-of-memory refusal — a distinction the RESP layer needs but this
     /// boolean cannot carry. Callers that only need "did it store?" (the
     /// distributed-lock / idempotency-key use cases) keep this signature.
+    ///
+    /// In a cluster this is decided by the key's owner node; `false` also
+    /// covers "the owner was unreachable" (see
+    /// [`set_nx_outcome`](Self::set_nx_outcome)).
     pub fn set_nx(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         matches!(self.set_nx_outcome(key, value, ttl), SetNxOutcome::Inserted)
     }
@@ -982,7 +1075,59 @@ impl Store {
     /// `nil`/`:0` when the key already exists and Redis' `-OOM` when the write
     /// was refused for memory. The two used to be indistinguishable, so a
     /// memory-refused `SETNX` looked identical to "key already present" (#477).
+    ///
+    /// # Clustering: one arbiter per key
+    ///
+    /// When a [`Replicator`] is installed, the decision is handed to
+    /// [`Replicator::route_set_nx`] first. A clustered replicator names the
+    /// key's owner node and, when that is not this node, performs the insert
+    /// *there* — so every node's `SETNX` on a key is serialised by the same
+    /// shard lock on the same node, and two nodes can no longer both acquire
+    /// it. Before this, each node checked its own copy and the result was
+    /// last-arrival-wins across the cluster.
+    ///
+    /// The guarantee is exactly as strong as agreement on who the owner is.
+    /// Ownership is computed from each node's own view of live membership, so
+    /// it holds while membership is stable and can briefly fail across a
+    /// membership change (a join, a leave, or the seconds it takes gossip to
+    /// declare a node dead), during which two nodes can name different owners.
+    /// A new owner also only knows about a lock its predecessor granted once
+    /// that grant has replicated to it. This is single-arbiter routing, not
+    /// consensus; the replicator's own docs give the precise window.
+    ///
+    /// An unreachable owner returns [`SetNxOutcome::OwnerUnreachable`] and
+    /// writes nothing (fail closed). On success the value reaches *this* node's
+    /// local map through normal replication, not synchronously.
     pub fn set_nx_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> SetNxOutcome {
+        if let Some(rep) = self.active_replicator() {
+            match rep.route_set_nx(&key, &value, ttl) {
+                Routed::Local => {}
+                // The owner applied and published the effect itself. Mirroring
+                // it into this node's map here would race the owner's own
+                // replication of a *later* decision on the same key (a release
+                // and re-acquire landing first) and leave a stale grant behind,
+                // so this node learns the value the same way every peer does.
+                Routed::Owner(outcome) => return outcome,
+                Routed::OwnerUnreachable => return SetNxOutcome::OwnerUnreachable,
+            }
+        }
+        self.set_nx_outcome_local(key, value, ttl)
+    }
+
+    /// [`set_nx_outcome`](Self::set_nx_outcome) decided on **this node's** map,
+    /// bypassing [`Replicator::route_set_nx`].
+    ///
+    /// This is what the owner runs when it serves a `SETNX` routed to it by a
+    /// peer — re-routing there could bounce the request between two nodes that
+    /// momentarily disagree about ownership. The winning value is still
+    /// published through the installed replicator. Everything else should call
+    /// [`set_nx_outcome`](Self::set_nx_outcome).
+    pub fn set_nx_outcome_local(
         &self,
         key: String,
         value: Vec<u8>,
@@ -1072,8 +1217,9 @@ impl Store {
         self.notify_write(&key_ref);
         // Broadcast the winning value. This path already *has* the exact
         // bytes and TTL it inserted (they are the caller's arguments), so
-        // there is nothing to re-read. Per-node atomic, cluster-wide
-        // last-arrival-wins — see `replicate_published_value`.
+        // there is nothing to re-read. In a cluster this node is the key's
+        // owner (or the caller routed here deliberately), so this publish is
+        // the arbiter announcing its decision.
         if let Some(value) = published_value {
             self.replicate_published_value(&key_ref, value, published_expiry);
         }
@@ -1120,15 +1266,53 @@ impl Store {
     ///
     /// # Clustering
     ///
-    /// Like [`set_nx`](Self::set_nx), the compare-and-delete is **per-node
-    /// atomic**; cluster-wide it is last-arrival-wins. When a [`Replicator`] is
-    /// installed the deletion is fanned out to peers via
+    /// Like [`set_nx_outcome`](Self::set_nx_outcome), the compare-and-delete is
+    /// decided by the key's **owner** when a clustered [`Replicator`] is
+    /// installed ([`Replicator::route_del_if_eq`]) — the same node that decides
+    /// `SETNX`, so a release is compared against the arbiter's copy and not
+    /// against a possibly-stale local one. (A stale local copy was exactly how
+    /// a holder whose lock had expired and been re-granted elsewhere could still
+    /// "match" its old token and broadcast a delete of the new holder's lock.)
+    /// The same membership-change limits apply.
+    ///
+    /// The owner fans the deletion out via
     /// [`Replicator::replicate_remove_published`] — a *publish-only* tombstone
-    /// that does **not** re-remove the local copy, so a value recreated on this
-    /// node between the removal and the broadcast survives locally. Do not build
-    /// cross-node mutual exclusion on this without an external fence, for the
-    /// same reason spelled out on [`replicate_published_value`](Self::replicate_published_value).
+    /// that does **not** re-remove the owner's local copy, so a value recreated
+    /// there between the removal and the broadcast survives.
+    ///
+    /// An unreachable owner deletes nothing and returns `false`; use
+    /// [`try_del_if_eq`](Self::try_del_if_eq) to tell that apart from a token
+    /// mismatch.
     pub fn del_if_eq(&self, key: &str, token: &[u8]) -> bool {
+        self.try_del_if_eq(key, token).unwrap_or(false)
+    }
+
+    /// [`del_if_eq`](Self::del_if_eq), distinguishing an unreachable owner
+    /// (`Err`) from "nothing matched" (`Ok(false)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnerUnreachable`] when a clustered replicator routed the
+    /// compare-and-delete to an owner node that could not be reached. Nothing
+    /// was deleted anywhere in that case.
+    pub fn try_del_if_eq(&self, key: &str, token: &[u8]) -> Result<bool, OwnerUnreachable> {
+        if let Some(rep) = self.active_replicator() {
+            match rep.route_del_if_eq(key, token) {
+                Routed::Local => {}
+                // As with SETNX: the owner removed and published; this node's
+                // copy goes away when the owner's tombstone arrives.
+                Routed::Owner(deleted) => return Ok(deleted),
+                Routed::OwnerUnreachable => return Err(OwnerUnreachable),
+            }
+        }
+        Ok(self.del_if_eq_local(key, token))
+    }
+
+    /// [`del_if_eq`](Self::del_if_eq) decided on **this node's** map, bypassing
+    /// [`Replicator::route_del_if_eq`] — what the owner runs when serving a
+    /// routed release. The deletion is still published through the installed
+    /// replicator.
+    pub fn del_if_eq_local(&self, key: &str, token: &[u8]) -> bool {
         // Atomic compare-and-delete on the LOCAL map. `remove_if` evaluates the
         // predicate under the shard write lock and only removes when it returns
         // true, so the compare and the delete are one indivisible step.
@@ -2544,6 +2728,154 @@ mod tests {
             rep.removes.lock().unwrap().is_empty(),
             "CAD must use the publish-only tombstone, not replicate_remove"
         );
+    }
+
+    // ── Owner-routed conditional writes ─────────────────────────────────
+
+    /// Stand-in for a clustered replicator: every conditional write is
+    /// arbitrated by one shared `owner` store (or the owner is "down"). Plain
+    /// writes are recorded and dropped, like [`RecordingReplicator`].
+    #[derive(Debug)]
+    struct OwnerRoutedReplicator {
+        owner: Option<Arc<Store>>,
+        routed_set_nx: AtomicUsize,
+    }
+
+    impl OwnerRoutedReplicator {
+        fn to(owner: &Arc<Store>) -> Arc<Self> {
+            Arc::new(Self { owner: Some(Arc::clone(owner)), routed_set_nx: AtomicUsize::new(0) })
+        }
+        fn unreachable() -> Arc<Self> {
+            Arc::new(Self { owner: None, routed_set_nx: AtomicUsize::new(0) })
+        }
+    }
+
+    impl Replicator for OwnerRoutedReplicator {
+        fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
+            true
+        }
+        fn replicate_remove(&self, _: &str) -> bool {
+            true
+        }
+        fn replicate_expire(&self, _: &str, _: Duration) -> bool {
+            true
+        }
+        fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
+        fn replicate_remove_published(&self, _: String) {}
+        fn route_set_nx(
+            &self,
+            key: &str,
+            value: &[u8],
+            ttl: Option<Duration>,
+        ) -> Routed<SetNxOutcome> {
+            self.routed_set_nx.fetch_add(1, Ordering::Relaxed);
+            match &self.owner {
+                Some(owner) => {
+                    Routed::Owner(owner.set_nx_outcome_local(key.to_string(), value.to_vec(), ttl))
+                }
+                None => Routed::OwnerUnreachable,
+            }
+        }
+        fn route_del_if_eq(&self, key: &str, token: &[u8]) -> Routed<bool> {
+            match &self.owner {
+                Some(owner) => Routed::Owner(owner.del_if_eq_local(key, token)),
+                None => Routed::OwnerUnreachable,
+            }
+        }
+    }
+
+    /// The cluster bug, at the store seam: two nodes each SETNX the same key.
+    /// Deciding on each node's own map, both won. Routed to one arbiter,
+    /// exactly one does — under real thread contention.
+    #[test]
+    fn routed_set_nx_has_one_winner_across_nodes() {
+        let owner = test_store();
+        let nodes: Vec<Arc<Store>> = (0..4)
+            .map(|_| {
+                let s = test_store();
+                s.set_replicator(Some(OwnerRoutedReplicator::to(&owner) as Arc<dyn Replicator>));
+                s
+            })
+            .collect();
+
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for (n, node) in nodes.iter().enumerate() {
+            for t in 0..8 {
+                let node = Arc::clone(node);
+                let winners = Arc::clone(&winners);
+                handles.push(std::thread::spawn(move || {
+                    let token = format!("node{n}-t{t}").into_bytes();
+                    if node.set_nx("lock".into(), token, None) {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::Relaxed), 1, "exactly one node may acquire the lock");
+        assert!(owner.get("lock").is_some(), "the owner holds the winning grant");
+        for node in &nodes {
+            assert_eq!(node.get("lock"), None, "a routed grant is not applied on the caller");
+        }
+    }
+
+    /// The stale-release half: a holder whose lock expired and was re-granted
+    /// to someone else still has its OLD token in its local copy. Compared
+    /// locally that matched and broadcast a delete of the new holder's lock;
+    /// compared on the owner it does not.
+    #[test]
+    fn routed_del_if_eq_compares_against_the_owner_not_a_stale_local_copy() {
+        let owner = test_store();
+        let node = test_store();
+        node.set_local("lock".into(), b"old-holder".to_vec(), None);
+        node.set_replicator(Some(OwnerRoutedReplicator::to(&owner) as Arc<dyn Replicator>));
+        owner.set_local("lock".into(), b"new-holder".to_vec(), None);
+
+        assert_eq!(node.try_del_if_eq("lock", b"old-holder"), Ok(false));
+        assert_eq!(owner.get("lock").as_deref(), Some(&b"new-holder"[..]), "new lock survives");
+
+        assert_eq!(node.try_del_if_eq("lock", b"new-holder"), Ok(true));
+        assert_eq!(owner.get("lock"), None);
+    }
+
+    /// An unreachable owner fails closed: not acquired, not released, and the
+    /// caller's own map is left exactly as it was.
+    #[test]
+    fn unreachable_owner_fails_closed() {
+        let node = test_store();
+        node.set_local("held".into(), b"tok".to_vec(), None);
+        node.set_replicator(Some(OwnerRoutedReplicator::unreachable() as Arc<dyn Replicator>));
+
+        assert_eq!(
+            node.set_nx_outcome("free".into(), b"v".to_vec(), None),
+            SetNxOutcome::OwnerUnreachable
+        );
+        assert!(!node.set_nx("free".into(), b"v".to_vec(), None));
+        assert_eq!(node.get("free"), None, "nothing may be acquired locally as a fallback");
+
+        assert_eq!(node.try_del_if_eq("held", b"tok"), Err(OwnerUnreachable));
+        assert!(!node.del_if_eq("held", b"tok"));
+        assert_eq!(node.get("held").as_deref(), Some(&b"tok"[..]), "nothing released locally");
+    }
+
+    /// The `*_local` variants are what the owner runs: they must never consult
+    /// the router (that is what keeps two nodes that disagree about ownership
+    /// from bouncing a request between them).
+    #[test]
+    fn local_variants_bypass_routing() {
+        let node = test_store();
+        let rep = OwnerRoutedReplicator::unreachable();
+        node.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert_eq!(
+            node.set_nx_outcome_local("k".into(), b"v".to_vec(), None),
+            SetNxOutcome::Inserted
+        );
+        assert!(node.del_if_eq_local("k", b"v"));
+        assert_eq!(rep.routed_set_nx.load(Ordering::Relaxed), 0);
     }
 
     #[test]
