@@ -56,7 +56,9 @@ impl ReplicationMode {
     /// Parse the `[cluster.kv] replication_mode` string.
     ///
     /// Anything other than `"sync"` (case-insensitive) is treated as
-    /// [`ReplicationMode::Async`], matching the config default.
+    /// [`ReplicationMode::Async`], matching the config default. A typo never
+    /// reaches here from a real config: `Config::validate` in `ephpm-config`
+    /// rejects anything but `async`/`sync` at startup.
     fn from_config(mode: &str) -> Self {
         if mode.eq_ignore_ascii_case("sync") { Self::Sync } else { Self::Async }
     }

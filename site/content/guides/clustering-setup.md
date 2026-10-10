@@ -41,7 +41,7 @@ role = "auto"                       # primary chosen by gossip (lowest node_id a
 
 There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with `[db.sqlite]` selects CDC replication unconditionally.
 
-> **Check the `role` spelling.** `role` is matched exactly (case-sensitive) and other values are not rejected: anything except `"auto"`, `"primary"` or `"replica"` gives a **single-node** database, even with `[cluster]` on. That is deliberate — `role = "single"` is how you keep one node's database local — but it means a typo like `"Primary"` silently turns replication off. After startup, look for the `embedded SQLite mode selected` log line; its `mode` field must read `clustered` (or `per-site-clustered`).
+> **`role` values are checked.** `role` is matched exactly (case-sensitive) against `"auto"`, `"primary"`, `"replica"`, `"single"` and `"none"`; anything else, including a typo like `"Primary"`, fails startup naming the value. `role = "single"` (or `"none"`) is how you keep one node's database local even with `[cluster]` on. After startup, look for the `embedded SQLite mode selected` log line; its `mode` field must read `clustered` (or `per-site-clustered`).
 
 "Lowest ordinal" means the alive node whose `[cluster] node_id` sorts lowest as a string. If `node_id` is left empty it is generated as `<hostname>-<random hex>`, so which node wins is effectively arbitrary; set `node_id` explicitly (`node-1`, `node-2`, …) if you want to choose the primary.
 

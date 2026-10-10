@@ -1370,7 +1370,8 @@ ePHPm picks single-node vs clustered at startup based on config:
 
 - `replication.role = "primary"` or `"replica"` → clustered
 - `replication.role = "auto"` AND `cluster.enabled = true` → clustered (role chosen by election)
-- otherwise → single-node (Turso in-process)
+- `replication.role = "auto"` with clustering off, or `"single"` / `"none"` → single-node (Turso in-process)
+- any other value → startup error naming the accepted values
 
 In clustered/auto mode, ePHPm replicates in-process via the Turso CDC path and watches for role changes via gossip — there is no child process to spawn or restart.
 

@@ -2,9 +2,10 @@
 //!
 //! Writes `/etc/systemd/system/ephpm.service` on registration and shells out to
 //! `systemctl` for lifecycle operations. The unit template is intentionally
-//! minimal: it relies on the daemon's own logging configuration to write to
-//! `/var/log/ephpm/ephpm.log`, while also forwarding output to the systemd
-//! journal so `journalctl -u ephpm` works.
+//! minimal: `StandardOutput=append:` / `StandardError=append:` send the
+//! server's output to `/var/log/ephpm/ephpm.log`. That means the journal does
+//! **not** receive it — `journalctl -u ephpm` shows only systemd's own
+//! start/stop lines — so `ephpm logs` reads the file.
 
 use std::process::Command;
 
@@ -19,11 +20,17 @@ use super::{Paths, Result, ServiceError, ServiceOwner, StatusReport};
 /// would silently break the common "web service on port 80" case.
 /// `ProtectSystem=strict` makes the whole filesystem read-only except `/dev`,
 /// `/proc`, `/sys`, and the paths listed in `ReadWritePaths`; those are the
-/// three directories ePHPm's own code needs to write after startup — the
-/// data dir (per-site SQLite files, ACME cache), the log directory, and the
-/// document root (multi-tenant `sites_dir` installs typically nest under or
-/// equal `document_root`; a `sites_dir` configured elsewhere needs adding to
-/// `ReadWritePaths` by hand). Each entry is `-`-prefixed (systemd's
+/// directories ePHPm's own code needs to write after startup — the data dir
+/// (per-site SQLite files, ACME cache), the log directory, the document root
+/// (multi-tenant `sites_dir` installs typically nest under or equal
+/// `document_root`; a `sites_dir` configured elsewhere needs adding to
+/// `ReadWritePaths` by hand), `/tmp` and `/var/tmp` (PHP sessions and
+/// uploads, the generated php.ini, per-vhost temp roots — `strict` would
+/// otherwise make `/tmp` read-only too), and any config-derived directory in
+/// [`Paths::extra_writable_dirs`] (an absolute `[db.sqlite] path`/`dir`, an
+/// ACME `cache_dir`). `WorkingDirectory` is the data dir, so a *relative*
+/// `[db.sqlite] path` (the default `ephpm.db`) or `cache_dir` (default
+/// `certs`) lands there instead of in `/`. Each entry is `-`-prefixed (systemd's
 /// ignore-if-missing marker) because `install()` never creates
 /// `document_root`, and a caller providing their own pre-seeded config with a
 /// `sites_dir` outside it may not create it either — an absent path would
@@ -35,15 +42,21 @@ fn owner_directives(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
         return String::new();
     };
     let log_dir = paths.log_file.parent().unwrap_or(&paths.log_file);
+    let extra = paths.extra_writable_dirs.iter().fold(String::new(), |mut s, d| {
+        s.push_str(" -");
+        s.push_str(&d.display().to_string());
+        s
+    });
     format!(
         "User={user}\n\
 Group={group}\n\
+WorkingDirectory={data_dir}\n\
 AmbientCapabilities=CAP_NET_BIND_SERVICE\n\
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n\
 NoNewPrivileges=true\n\
 ProtectSystem=strict\n\
 ProtectHome=true\n\
-ReadWritePaths=-{data_dir} -{log_dir} -{document_root}\n",
+ReadWritePaths=-{data_dir} -{log_dir} -{document_root} -/tmp -/var/tmp{extra}\n",
         data_dir = paths.data_dir.display(),
         log_dir = log_dir.display(),
         document_root = paths.document_root.display(),
@@ -152,8 +165,30 @@ pub(super) fn status(_paths: &Paths) -> Result<StatusReport> {
     Ok(StatusReport { state, pid, uptime: started })
 }
 
+/// Where `ephpm logs` reads from.
+#[derive(Debug, PartialEq, Eq)]
+enum LogSource {
+    /// The unit's `StandardOutput=append:` file — where the server's output goes.
+    File,
+    /// The journal: only for a unit that does not write the log file (e.g. a
+    /// hand-written unit without `StandardOutput=append:`).
+    Journal,
+}
+
+/// Pick the log source. The unit `install` writes sends stdout/stderr to the
+/// log file via `StandardOutput=append:`, so the journal only ever holds
+/// systemd's own lifecycle lines ("Started …", "Stopped …"). This used to try
+/// `journalctl -u ephpm.service` first — which exits 0 even with nothing
+/// useful to show — so the fallback to the file never ran and `ephpm logs`
+/// (and `logs -f`) never showed a single line of server output.
+fn log_source(log_file_exists: bool) -> LogSource {
+    if log_file_exists { LogSource::File } else { LogSource::Journal }
+}
+
 pub(super) fn logs(paths: &Paths, follow: bool) -> Result<()> {
-    // Prefer journalctl when available — it's the canonical systemd log source.
+    if log_source(paths.log_file.exists()) == LogSource::File {
+        return super::tail_file(&paths.log_file, follow);
+    }
     let mut cmd = Command::new("journalctl");
     cmd.arg("-u").arg("ephpm.service").arg("--no-pager");
     if follow {
@@ -163,7 +198,17 @@ pub(super) fn logs(paths: &Paths, follow: bool) -> Result<()> {
     }
     match cmd.status() {
         Ok(s) if s.success() => Ok(()),
-        Ok(_) | Err(_) => super::tail_file(&paths.log_file, follow),
+        Ok(s) => Err(ServiceError::command(
+            "journalctl",
+            format!(
+                "exited with {s}, and the service log file {} does not exist",
+                paths.log_file.display()
+            ),
+        )),
+        Err(e) => Err(ServiceError::command(
+            "journalctl",
+            format!("{e} (and the service log file {} does not exist)", paths.log_file.display()),
+        )),
     }
 }
 
@@ -194,6 +239,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/ephpm"),
             document_root: PathBuf::from("/var/www/html"),
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+            extra_writable_dirs: Vec::new(),
         }
     }
 
@@ -233,11 +279,42 @@ mod tests {
         assert!(body.contains("NoNewPrivileges=true"));
         assert!(body.contains("ProtectSystem=strict"));
         assert!(body.contains("ProtectHome=true"));
-        assert!(body.contains("ReadWritePaths=-/var/lib/ephpm -/var/log/ephpm -/var/www/html"));
+        assert!(body.contains(
+            "ReadWritePaths=-/var/lib/ephpm -/var/log/ephpm -/var/www/html -/tmp -/var/tmp\n"
+        ));
+        // Relative config paths (`[db.sqlite] path = "ephpm.db"`) must land in
+        // the data dir, not `/` (root-owned and read-only under strict).
+        assert!(body.contains("WorkingDirectory=/var/lib/ephpm\n"));
         // Unaffected by the owner directives.
         assert!(
             body.contains("ExecStart=/usr/local/bin/ephpm serve --config /etc/ephpm/ephpm.toml")
         );
         assert!(body.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn unit_body_with_owner_lists_config_derived_dirs() {
+        let mut paths = test_paths();
+        paths.extra_writable_dirs = vec![PathBuf::from("/srv/db"), PathBuf::from("/srv/acme")];
+        let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
+        let body = unit_body(&paths, Some(&owner));
+        assert!(body.contains("-/var/tmp -/srv/db -/srv/acme\n"), "{body}");
+    }
+
+    #[test]
+    fn unit_body_without_owner_has_no_working_directory() {
+        // The root unit stays byte-identical to the historical one: moving
+        // its working directory would move an existing relative database.
+        assert!(!unit_body(&test_paths(), None).contains("WorkingDirectory"));
+    }
+
+    #[test]
+    fn logs_read_the_file_the_unit_writes() {
+        // The unit sends stdout/stderr to the file, so the journal has only
+        // lifecycle lines; the file is the source whenever it exists.
+        assert_eq!(log_source(true), LogSource::File);
+        assert_eq!(log_source(false), LogSource::Journal);
+        let body = unit_body(&test_paths(), None);
+        assert!(body.contains("StandardOutput=append:/var/log/ephpm/ephpm.log"));
     }
 }

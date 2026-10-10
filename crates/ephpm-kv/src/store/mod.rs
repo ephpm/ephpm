@@ -99,6 +99,11 @@ pub enum CompressionAlgo {
 
 impl CompressionAlgo {
     /// Parse from the config string. Falls back to `None` on unknown values.
+    ///
+    /// On the `[kv] compression` path an unknown value never reaches here:
+    /// `Config::validate` in `ephpm-config` rejects anything outside its
+    /// `KV_COMPRESSION_ALGOS` list at startup. Keep that list in sync with the
+    /// arms below.
     #[must_use]
     pub fn from_str_lossy(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {

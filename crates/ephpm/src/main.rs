@@ -1617,6 +1617,32 @@ fn run_with_config(
     // Never let a parsed-but-unimplemented knob look like it took effect.
     warn_unimplemented_knobs(&config);
 
+    // `EPHPM_SERVER_LISTEN` (single underscore) maps to no key and the root
+    // config is lenient, so figment drops it silently. Say so. A variable the
+    // config itself references as `env:NAME` (a middleware secret) is read,
+    // just not as a key, so it is not reported.
+    let env_refs = config.env_references();
+    for var in ephpm_config::unmapped_env_vars(
+        std::env::vars_os()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .filter(|k| !env_refs.iter().any(|r| r == k)),
+    ) {
+        match var.suggestion {
+            Some(suggestion) => tracing::warn!(
+                var = %var.name,
+                "environment variable {} maps to no config key and is ignored — did you \
+                 mean {suggestion}? Nested keys are separated by a double underscore",
+                var.name
+            ),
+            None => tracing::warn!(
+                var = %var.name,
+                "environment variable {} maps to no config key and is ignored (config \
+                 overrides look like EPHPM_<SECTION>__<KEY>, e.g. EPHPM_SERVER__LISTEN)",
+                var.name
+            ),
+        }
+    }
+
     // Build the effective PHP ini file. If the user specified ini_overrides
     // in the config, we have to materialize them on disk and load them via
     // PHP's normal ini path: setting them at runtime via zend_alter_ini_entry

@@ -229,7 +229,7 @@ hrana_listen = "127.0.0.1:8080"           # Hrana HTTP (optional, for external t
 
 # Clustered mode only (ignored in single-node)
 [db.sqlite.replication]
-role = "auto"                             # "auto" | "primary" | "replica"
+role = "auto"                             # "auto" | "primary" | "replica" | "single" (anything else is a startup error)
 primary_grpc_url = ""                     # primary's cluster channel address; required when role = "replica"
 # max_snapshot_bytes = 1073741824         # cap on cold-replica snapshot bootstrap
 ```
@@ -269,11 +269,11 @@ There are four embedded-database modes. ePHPm first decides whether the node is
                                   └── no  ──► single-node  (one local DB at path)
 ```
 
-Per-site-clustered is a subset of clustered, so it is tested first. Any
-`role` value other than `"auto"`, `"primary"` or `"replica"` is treated as "not
-clustered" without an error — that is how you force single-node on a node with
-`[cluster]` on (e.g. `role = "single"`), and also how a typo silently disables
-replication. The mode actually chosen is logged once at startup as
+Per-site-clustered is a subset of clustered, so it is tested first. `role =
+"single"` (alias `"none"`) is how you force single-node on a node with
+`[cluster]` on. Any value other than `auto`, `primary`, `replica`, `single` or
+`none` (case-sensitive) fails startup naming the value; a typo used to disable
+replication silently. The mode actually chosen is logged once at startup as
 `embedded SQLite mode selected` with `mode` = `per-site-clustered`,
 `clustered`, `per-site` or `single-node`; check it after any config change.
 

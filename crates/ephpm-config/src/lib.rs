@@ -8,6 +8,141 @@ use serde::Deserialize;
 #[cfg(test)]
 mod test_env;
 
+/// Top-level config sections — the only first segments an `EPHPM_*`
+/// environment variable can map to. Keep in sync with the fields of
+/// [`Config`] (pinned by `config_top_level_sections_match_struct`).
+const TOP_LEVEL_SECTIONS: [&str; 7] =
+    ["server", "php", "db", "kv", "cluster", "middleware", "opcache"];
+
+/// `EPHPM_*` variables that are deliberately **not** configuration, so they
+/// must never trigger the "maps to no config key" startup warning. The names
+/// are without the `EPHPM_` prefix.
+///
+/// Built from every `EPHPM_*` environment read in the repository; the test
+/// `every_non_config_env_read_in_the_repo_is_exempt` scans the sources and
+/// fails when a new direct read is added without an entry here.
+///
+/// - Read by ePHPm itself: `SERVICE_LOG_FILE` (set by the Windows service
+///   wrapper), `FATAL_HANDLER`, `KV_PASSWORD` (`ephpm kv`/`deploy`/`cache`),
+///   `MIDDLEWARE_DIR` (middleware library search path).
+/// - Read at **build** time by `crates/ephpm/build.rs`: `RELEASE_VERSION`.
+///   The release workflows export it into the job environment, so binaries
+///   started later in the same job inherit it.
+/// - Secret names the docs recommend for `env:NAME` references
+///   (`SESSION_SECRET`, `PREVIEW_SESSION_SECRET`). Any other name referenced
+///   as `env:NAME` from a `[[middleware]]` config is exempted at runtime via
+///   [`Config::env_references`].
+/// - Set by the e2e / integration harnesses, whose spawned servers inherit
+///   them: the rest.
+const NON_CONFIG_ENV_VARS: &[&str] = &[
+    "SERVICE_LOG_FILE",
+    "FATAL_HANDLER",
+    "KV_PASSWORD",
+    "MIDDLEWARE_DIR",
+    "RELEASE_VERSION",
+    "SESSION_SECRET",
+    "PREVIEW_SESSION_SECRET",
+    "URL",
+    "BINARY",
+    "CLI_BINARY",
+    "DOCROOT",
+    "SITES_DIR",
+    "MIDDLEWARE_LIB",
+    "WORKER_URL",
+    "WORKER_STREAM_URL",
+    "PREVIEW_URL",
+    "EXT_URL",
+    "HRANA_URL",
+    "WP_URL",
+    "WP_ADMIN_USER",
+    "WP_ADMIN_PASS",
+    "CLUSTER_SIZE",
+    "CLUSTER_INTEG",
+    "E2E_CLUSTER",
+    "ELEVATED_E2E",
+    "KV_HOST",
+    "KV_PORT",
+    "REQUIRE_DB_TESTS",
+    "MYSQL_PROXY_TEST_URL",
+    "GITHUB_AUTH_CDYLIB",
+];
+
+/// Name prefixes (after `EPHPM_`) of non-configuration variable families —
+/// see [`NON_CONFIG_ENV_VARS`].
+const NON_CONFIG_ENV_PREFIXES: &[&str] = &["CLUSTER_URL_", "TEST_"];
+
+/// An `EPHPM_*` environment variable that maps to no configuration key, so
+/// figment drops it on the floor (the root [`Config`] is deliberately
+/// lenient — see its docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmappedEnvVar {
+    /// The variable name as found in the environment.
+    pub name: String,
+    /// The double-underscore spelling the operator most likely meant, when
+    /// the name looks like a single-underscore attempt at a nested key
+    /// (`EPHPM_SERVER_LISTEN` → `EPHPM_SERVER__LISTEN`).
+    pub suggestion: Option<String>,
+}
+
+/// Find the `EPHPM_*` variables among `names` that map to no configuration
+/// key and are not a known non-config variable.
+///
+/// figment's `Env::prefixed("EPHPM_").split("__")` nests on a **double**
+/// underscore, so `EPHPM_SERVER_LISTEN` becomes a top-level key
+/// `server_listen`, which the lenient root silently ignores — the server
+/// starts on the default listener with nothing in the logs. Startup calls
+/// this and warns once per hit. It never errors: the root has to stay
+/// lenient for `EPHPM_SERVICE_LOG_FILE` and the harness variables.
+///
+/// A name with `__` whose first segment is a real section is considered
+/// mapped — anything wrong *below* the section is already a hard error from
+/// that section's `deny_unknown_fields`.
+#[must_use]
+pub fn unmapped_env_vars<I, S>(names: I) -> Vec<UnmappedEnvVar>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out = Vec::new();
+    for name in names {
+        let name = name.as_ref();
+        // figment matches the prefix case-insensitively.
+        let Some(rest) =
+            name.get(..6).filter(|p| p.eq_ignore_ascii_case("EPHPM_")).map(|_| &name[6..])
+        else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let upper = rest.to_ascii_uppercase();
+        if NON_CONFIG_ENV_VARS.contains(&upper.as_str())
+            || NON_CONFIG_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+        {
+            continue;
+        }
+        let lower = rest.to_ascii_lowercase();
+        let first = lower.split("__").next().unwrap_or_default();
+        if TOP_LEVEL_SECTIONS.contains(&first) {
+            continue;
+        }
+        // Single-underscore attempt at a nested key: `<section>_<key>`.
+        let suggestion = TOP_LEVEL_SECTIONS.iter().find_map(|section| {
+            let tail = lower.strip_prefix(section)?.strip_prefix('_')?;
+            (!tail.is_empty() && !lower.contains("__")).then(|| {
+                format!(
+                    "{}{}__{}",
+                    &name[..6],
+                    section.to_ascii_uppercase(),
+                    &rest[section.len() + 1..]
+                )
+            })
+        });
+        out.push(UnmappedEnvVar { name: name.to_string(), suggestion });
+    }
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
@@ -93,6 +228,41 @@ pub struct Config {
     /// Governs cluster-wide OPcache invalidation. See [`OpcacheConfig`].
     #[serde(default)]
     pub opcache: OpcacheConfig,
+}
+
+impl Config {
+    /// Environment variable names this config references as `env:NAME`
+    /// string values inside a `[[middleware]]` mount's `config` table (e.g.
+    /// the `github-auth` module's `client_secret = "env:GH_CLIENT_SECRET"`).
+    ///
+    /// Startup uses this to keep the unmapped-`EPHPM_*` warning
+    /// ([`unmapped_env_vars`]) quiet for an operator who names such a secret
+    /// `EPHPM_SOMETHING`: the variable *is* read, just not as a config key.
+    #[must_use]
+    pub fn env_references(&self) -> Vec<String> {
+        fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(s) => {
+                    if let Some(name) = s.trim().strip_prefix("env:")
+                        && !name.is_empty()
+                        && !out.iter().any(|n| n == name)
+                    {
+                        out.push(name.to_string());
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+                serde_json::Value::Object(map) => map.values().for_each(|v| walk(v, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for mount in &self.middleware {
+            if let Some(config) = &mount.config {
+                walk(config, &mut out);
+            }
+        }
+        out
+    }
 }
 
 /// One middleware mount (`[[middleware]]`).
@@ -2722,17 +2892,21 @@ pub struct DeprecatedSqldConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
-    /// Replication role: `"auto"`, `"primary"`, or `"replica"`.
+    /// Replication role: `"auto"`, `"primary"`, `"replica"`, or `"single"`.
     ///
     /// - `"auto"`: elected via gossip (the alive node whose `node_id` sorts
-    ///   lowest wins); clustered only when `[cluster] enabled = true`
+    ///   lowest wins) when `[cluster] enabled = true`; single-node otherwise
     /// - `"primary"`: force this node as primary
     /// - `"replica"`: force this node as replica
+    /// - `"single"` (alias `"none"`): force single-node (no replication) even
+    ///   with `[cluster] enabled = true`
     ///
-    /// The match is exact and case-sensitive, and nothing validates other
-    /// values: any other string (e.g. `"single"`, or a typo like
-    /// `"Primary"`) selects single-node mode even with `[cluster]` on. The
-    /// `embedded SQLite mode selected` startup log line shows the result.
+    /// The match is exact and case-sensitive. Any other value (including a
+    /// different case, e.g. `"Primary"`) is rejected by [`Config::validate`]
+    /// at startup. It used to fall through to single-node silently, so a
+    /// typo'd `role = "primay"` came up unreplicated with every health check
+    /// green. The `embedded SQLite mode selected` startup log line shows the
+    /// mode actually chosen.
     #[serde(default = "default_replication_role")]
     pub role: String,
 
@@ -3109,9 +3283,10 @@ pub struct KvConfig {
 
     /// Compression algorithm for stored values.
     ///
-    /// Values: `"none"`, `"gzip"`, `"brotli"` (alias `"br"`), `"zstd"`,
-    /// matched case-insensitively. Not validated at startup: any other
-    /// value (including a typo) silently means `"none"`.
+    /// Values: `"none"`, `"gzip"`, `"brotli"` (alias `"br"`), `"zstd"`
+    /// (case-insensitive). Anything else is rejected by [`Config::validate`]
+    /// at startup — an unrecognised value used to fall back to `"none"`
+    /// silently.
     ///
     /// Default: `"none"` (no compression).
     #[serde(default = "default_kv_compression")]
@@ -4061,9 +4236,11 @@ impl Config {
     /// Load configuration from a TOML file with environment variable overrides.
     ///
     /// Precedence (highest to lowest):
-    /// 1. Environment variables prefixed with `EPHPM_`, nested with a
-    ///    **double** underscore (e.g. `EPHPM_SERVER__LISTEN` for
-    ///    `[server] listen`)
+    /// 1. Environment variables prefixed with `EPHPM_`, with `__` (double
+    ///    underscore) separating nesting levels (e.g. `EPHPM_SERVER__LISTEN`
+    ///    for `[server] listen`). A single-underscore name such as
+    ///    `EPHPM_SERVER_LISTEN` maps to no key and is ignored — startup warns
+    ///    about it, see [`unmapped_env_vars`].
     /// 2. TOML config file
     /// 3. Built-in defaults
     ///
@@ -4654,6 +4831,50 @@ impl Config {
                 "[kv] eviction_policy must be one of {}, got \"{}\"",
                 KV_EVICTION_POLICIES.join(", "),
                 self.kv.eviction_policy,
+            )));
+        }
+
+        // [kv] compression: `CompressionAlgo::from_str_lossy` (ephpm-kv) maps
+        // every unrecognised string to "none", so `compression = "gz"` stored
+        // every value uncompressed with nothing in the logs. Same rule as
+        // eviction_policy; matching is case-insensitive like the parser.
+        if !KV_COMPRESSION_ALGOS.iter().any(|a| a.eq_ignore_ascii_case(&self.kv.compression)) {
+            return Err(ConfigError::Validation(format!(
+                "[kv] compression must be one of {}, got \"{}\"",
+                KV_COMPRESSION_ALGOS.join(", "),
+                self.kv.compression,
+            )));
+        }
+
+        // [cluster.kv] replication_mode: the cluster parser treats anything
+        // but "sync" as "async", so a typo silently downgraded the durability
+        // the operator asked for. Case-insensitive like the parser.
+        if !CLUSTER_KV_REPLICATION_MODES
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&self.cluster.kv.replication_mode))
+        {
+            return Err(ConfigError::Validation(format!(
+                "[cluster.kv] replication_mode must be one of {}, got \"{}\"",
+                CLUSTER_KV_REPLICATION_MODES.join(", "),
+                self.cluster.kv.replication_mode,
+            )));
+        }
+
+        // [db.sqlite.replication] role selects the database *mode*
+        // (`is_clustered_sqlite` in ephpm-server matches the exact strings
+        // "primary" / "replica" / "auto"); anything else used to mean
+        // single-node, so a typo like "primay" came up unreplicated with
+        // every health check green. "single"/"none" remain the explicit way
+        // to force single-node with clustering on. Case-sensitive, because
+        // the mode check is.
+        if let Some(sqlite) = self.db.sqlite.as_ref()
+            && !SQLITE_REPLICATION_ROLES.contains(&sqlite.replication.role.as_str())
+        {
+            return Err(ConfigError::Validation(format!(
+                "[db.sqlite.replication] role must be one of {}, got \"{}\" \
+                 (use \"single\" to force single-node with [cluster] enabled)",
+                SQLITE_REPLICATION_ROLES.join(", "),
+                sqlite.replication.role,
             )));
         }
 
@@ -5979,8 +6200,9 @@ pub struct ClusterKvConfig {
     ///   against live peers). A replica that is down is logged but does
     ///   not fail the write — this is not a quorum/consensus protocol.
     ///
-    /// Any value other than `"sync"` (case-insensitive) is treated as
-    /// `"async"`.
+    /// Case-insensitive. Any other value is rejected by [`Config::validate`]
+    /// at startup — it used to be treated as `"async"` silently, so a typo'd
+    /// `"synch"` quietly dropped the durability the operator asked for.
     #[serde(default = "default_replication_mode")]
     pub replication_mode: String,
 
@@ -6837,6 +7059,23 @@ fn default_kv_memory_limit() -> String {
 /// typo into a startup failure instead of a silent switch to `allkeys-lru`.
 const KV_EVICTION_POLICIES: [&str; 4] =
     ["noeviction", "allkeys-lru", "volatile-lru", "allkeys-random"];
+
+/// Every accepted `[kv] compression` value (compared case-insensitively).
+///
+/// Must stay in sync with `ephpm_kv::store::CompressionAlgo::from_str_lossy`,
+/// which maps anything it does not know to `None`.
+const KV_COMPRESSION_ALGOS: [&str; 5] = ["none", "gzip", "brotli", "br", "zstd"];
+
+/// Every accepted `[cluster.kv] replication_mode` value (compared
+/// case-insensitively, like `ReplicationMode::from_config` in ephpm-cluster).
+const CLUSTER_KV_REPLICATION_MODES: [&str; 2] = ["async", "sync"];
+
+/// Every accepted `[db.sqlite.replication] role` value (case-sensitive).
+///
+/// `primary` / `replica` / `auto` are the clustered roles matched by
+/// `is_clustered_sqlite` in ephpm-server; `single` and `none` are the explicit
+/// "force single-node even with `[cluster] enabled`" values.
+const SQLITE_REPLICATION_ROLES: [&str; 5] = ["auto", "primary", "replica", "single", "none"];
 
 fn default_kv_eviction_policy() -> String {
     "allkeys-lru".to_string()
@@ -9911,6 +10150,259 @@ eviction_policy = "lru"
         // `validate()` (called by `ephpm` before startup) that rejects it.
         let config = Config::load(&file).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    // ── Mode-selecting string knobs: no silent fallback ──────────────────
+    //
+    // `[kv] compression`, `[cluster.kv] replication_mode` and
+    // `[db.sqlite.replication] role` are each parsed lossily downstream (an
+    // unknown value silently became "none" / "async" / single-node). These
+    // pin that `validate()` rejects a typo and names the accepted values.
+
+    fn validate_toml(body: &str) -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, body).unwrap();
+        Config::load(&file).unwrap().validate()
+    }
+
+    #[test]
+    fn test_kv_compression_accepts_every_documented_value() {
+        for algo in KV_COMPRESSION_ALGOS.iter().copied().chain(["GZIP", "Zstd"]) {
+            validate_toml(&format!("[kv]\ncompression = \"{algo}\"\n"))
+                .unwrap_or_else(|e| panic!("{algo} must validate, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_kv_compression_typo_is_rejected() {
+        let err = validate_toml("[kv]\ncompression = \"gz\"\n")
+            .expect_err("a typo must not silently mean \"none\"");
+        let msg = err.to_string();
+        assert!(msg.contains("\"gz\""), "the error must name the bad value: {msg}");
+        for algo in KV_COMPRESSION_ALGOS {
+            assert!(msg.contains(algo), "the error must list {algo}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_cluster_kv_replication_mode_values() {
+        for mode in ["async", "sync", "SYNC"] {
+            validate_toml(&format!("[cluster.kv]\nreplication_mode = \"{mode}\"\n"))
+                .unwrap_or_else(|e| panic!("{mode} must validate, got: {e}"));
+        }
+        let err = validate_toml("[cluster.kv]\nreplication_mode = \"synch\"\n")
+            .expect_err("a typo must not silently mean async");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"synch\"") && msg.contains("async") && msg.contains("sync"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_replication_role_values() {
+        for role in SQLITE_REPLICATION_ROLES {
+            validate_toml(&format!("[db.sqlite]\n[db.sqlite.replication]\nrole = \"{role}\"\n"))
+                .unwrap_or_else(|e| panic!("{role} must validate, got: {e}"));
+        }
+        // Omitting the section keeps the "auto" default and validates.
+        validate_toml("[db.sqlite]\n").expect("default role must validate");
+    }
+
+    #[test]
+    fn test_sqlite_replication_role_typo_is_rejected() {
+        // Both a misspelling and a wrong case used to fall through to
+        // single-node silently (`is_clustered_sqlite` matches exact strings).
+        for bad in ["primay", "Primary", "standalone", ""] {
+            let err =
+                validate_toml(&format!("[db.sqlite]\n[db.sqlite.replication]\nrole = \"{bad}\"\n"))
+                    .expect_err("a typo'd role must fail startup");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("\"{bad}\"")), "must name the bad value: {msg}");
+            for role in SQLITE_REPLICATION_ROLES {
+                assert!(msg.contains(role), "must list {role}: {msg}");
+            }
+        }
+    }
+
+    // ── Unmapped EPHPM_* environment variables ───────────────────────────
+
+    #[test]
+    fn unmapped_env_vars_flags_single_underscore_nesting() {
+        let hits = unmapped_env_vars([
+            "EPHPM_SERVER_LISTEN",
+            "EPHPM_DB_SQLITE_PATH",
+            "EPHPM_SERVER__LISTEN",
+            "PATH",
+        ]);
+        assert_eq!(
+            hits,
+            vec![
+                UnmappedEnvVar {
+                    name: "EPHPM_SERVER_LISTEN".into(),
+                    suggestion: Some("EPHPM_SERVER__LISTEN".into()),
+                },
+                UnmappedEnvVar {
+                    name: "EPHPM_DB_SQLITE_PATH".into(),
+                    suggestion: Some("EPHPM_DB__SQLITE_PATH".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unmapped_env_vars_flags_unknown_sections_without_suggestion() {
+        let hits = unmapped_env_vars(["EPHPM_SEVER__LISTEN", "EPHPM_LISTEN"]);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.suggestion.is_none()), "{hits:?}");
+    }
+
+    #[test]
+    fn unmapped_env_vars_stays_silent_for_non_config_vars() {
+        // The reasons the root config is lenient must not produce warnings.
+        let hits = unmapped_env_vars([
+            "EPHPM_SERVICE_LOG_FILE",
+            "EPHPM_URL",
+            "EPHPM_BINARY",
+            "EPHPM_KV_PASSWORD",
+            "EPHPM_MIDDLEWARE_DIR",
+            "EPHPM_FATAL_HANDLER",
+            "EPHPM_CLUSTER_URL_0",
+            "EPHPM_PHP__MEMORY_LIMIT",
+            "EPHPM_KV__SECRET",
+            "EPHPM_RELEASE_VERSION",
+            "EPHPM_SESSION_SECRET",
+            "EPHPM_PREVIEW_SESSION_SECRET",
+        ]);
+        assert_eq!(hits, []);
+    }
+
+    #[test]
+    fn env_references_collects_middleware_env_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[middleware]]\nlibrary = \"github-auth\"\norder = 1\n\
+             config = { client_secret = \"env:EPHPM_GH_SECRET\", nested = { list = \
+             [\"env:OTHER\", \"literal\", \"env:\"] } }\n\
+             [[middleware]]\nlibrary = \"cors\"\norder = 2\n\
+             config = { again = \"env:EPHPM_GH_SECRET\" }\n",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.env_references(), ["EPHPM_GH_SECRET", "OTHER"]);
+        assert!(Config::default().env_references().is_empty());
+    }
+
+    /// Every `EPHPM_*` variable the repository reads or sets directly (not
+    /// through the `EPHPM_<SECTION>__<KEY>` config mapping) must be exempt
+    /// from the unmapped-variable startup warning — otherwise ePHPm warns
+    /// about its own variables. Scans Rust env reads/sets (`var`, `var_os`,
+    /// `Command::env`, `set_var`, …) and `NAME=` / `NAME:` / `name: NAME`
+    /// assignments in workflow, k8s, Docker and shell files.
+    #[test]
+    fn every_non_config_env_read_in_the_repo_is_exempt() {
+        // Read only by commands that never run the startup check (`ephpm
+        // exec` / `ephpm php` tests), so exempting them would be noise.
+        const SCAN_IGNORE: &[&str] = &["EPHPM_EXEC_LEAK_CANARY", "EPHPM_CLI_TEST_VAR"];
+        const RUST_CALLS: &[&str] =
+            &["var", "var_os", "env", "set_var", "remove_var", "env_remove"];
+
+        fn name_at(text: &str, start: usize) -> &str {
+            let end = text[start..]
+                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                .map_or(text.len(), |i| start + i);
+            text[start..end].trim_end_matches('_')
+        }
+
+        fn scan(path: &Path, found: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(path) else { return };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if p.is_dir() {
+                    if !matches!(fname.as_str(), "target" | ".claude" | "node_modules" | "vendor")
+                    {
+                        scan(&p, found);
+                    }
+                    continue;
+                }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+                let is_rust = ext == "rs";
+                let is_other = matches!(ext, "yml" | "yaml" | "sh" | "ps1")
+                    || fname.starts_with("Dockerfile")
+                    || fname == "Tiltfile";
+                if !is_rust && !is_other {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&p) else { continue };
+                let mut from = 0;
+                while let Some(off) = text[from..].find("EPHPM_") {
+                    let at = from + off;
+                    from = at + 6;
+                    let name = name_at(&text, at);
+                    if name.len() <= 6 || name.contains("__") {
+                        continue;
+                    }
+                    let before = &text[..at];
+                    let after = &text[at + name.len()..];
+                    let hit = if is_rust {
+                        // `<call>(` + optional whitespace + `"EPHPM_…`
+                        before.strip_suffix('"').is_some_and(|b| {
+                            b.trim_end().strip_suffix('(').is_some_and(|b| {
+                                let ident_start = b
+                                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                    .map_or(0, |i| i + 1);
+                                RUST_CALLS.contains(&&b[ident_start..])
+                            })
+                        })
+                    } else {
+                        after.starts_with('=')
+                            || after.starts_with(':')
+                            || before.trim_end().ends_with("name:")
+                    };
+                    if hit {
+                        found.push((name.to_string(), p.display().to_string()));
+                    }
+                }
+            }
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found = Vec::new();
+        for dir in ["crates", "xtask", "examples", "docker", "k8s", ".github"] {
+            scan(&root.join(dir), &mut found);
+        }
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        // Sanity: the scan really sees the known direct reads.
+        for must in ["EPHPM_SERVICE_LOG_FILE", "EPHPM_KV_PASSWORD", "EPHPM_MIDDLEWARE_DIR", "EPHPM_URL"]
+        {
+            assert!(names.contains(&must), "scan did not find {must}; scanner is broken");
+        }
+        let unexempt: Vec<&(String, String)> = found
+            .iter()
+            .filter(|(n, _)| !SCAN_IGNORE.contains(&n.as_str()))
+            .filter(|(n, _)| !unmapped_env_vars([n.as_str()]).is_empty())
+            .collect();
+        assert!(
+            unexempt.is_empty(),
+            "these EPHPM_* variables are read/set directly but would trigger the \
+             unmapped-variable warning; add them to NON_CONFIG_ENV_VARS: {unexempt:#?}"
+        );
+    }
+
+    #[test]
+    fn config_top_level_sections_match_struct() {
+        // Every section name must be a real top-level key: setting it to an
+        // invalid scalar must be a load error, not silently ignored.
+        for section in TOP_LEVEL_SECTIONS {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("ephpm.toml");
+            std::fs::write(&file, format!("{section} = 1\n")).unwrap();
+            assert!(Config::load(&file).is_err(), "{section} is not a Config field");
+        }
     }
 
     // ── OPcache timestamp validation ────────────────────────────────────
