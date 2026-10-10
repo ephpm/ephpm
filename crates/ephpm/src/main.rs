@@ -747,11 +747,10 @@ fn run_dev(
         }
     };
 
-    // Resolve document root — CLI override, else CWD.
-    config.server.document_root = match document_root {
-        Some(root) => root,
-        None => std::env::current_dir().context("failed to read current directory")?,
-    };
+    // Resolve document root — CLI override (made absolute: PHP would resolve a
+    // relative script path against its own working directory), else CWD.
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    config.server.document_root = document_root.unwrap_or_else(|| cwd.clone());
 
     // When --sites is provided, point the vhost machinery at it and enable
     // the `.localhost` suffix-stripping so on-disk dirs are short names
@@ -761,6 +760,7 @@ fn run_dev(
         config.server.sites_dir = Some(canonical);
         config.server.sites_domain_suffix = Some(".localhost".into());
     }
+    config.resolve_relative_roots(&cwd);
 
     print_dev_banner(&config);
     run_with_config(config, verbose, true)
@@ -1953,6 +1953,13 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config:
     if let Some(root) = document_root {
         config.server.document_root = root;
     }
+
+    // Relative `document_root` / `sites_dir` resolve against the working
+    // directory, like every other relative path in the config — but they must
+    // be made absolute here, because PHP resolves a relative script path
+    // against its own per-thread working directory, not ours.
+    let cwd = std::env::current_dir().context("failed to read the current directory")?;
+    config.resolve_relative_roots(&cwd);
 
     // Validate cross-field invariants (e.g. the worker-mode script) AFTER
     // CLI overrides so document_root is final. Fails fast with a clear message.
