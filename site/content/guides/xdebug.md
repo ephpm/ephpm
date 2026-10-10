@@ -4,8 +4,7 @@ weight = 12
 +++
 
 [Xdebug](https://xdebug.org/) step debugging works in both of ePHPm's
-execution modes. In per-request mode nothing about it is ePHPm-specific
-(but see the [known issue](#per-request-mode) below). In
+execution modes. In per-request mode nothing about it is ePHPm-specific. In
 **worker mode** — where a worker boots your framework once and serves many
 requests — ePHPm gives each request that asks for the debugger its **own
 fresh worker and its own debug session**, while the warm pool keeps serving
@@ -221,13 +220,5 @@ a breakpoint never takes a serving slot.
 `[php] mode = "per_request"` (the default) runs a PHP request startup for
 every HTTP request, so Xdebug's own trigger handling applies with no routing
 involved, and `debug_workers` has no effect. Sessions start and breakpoints
-hit as under php-fpm.
-
-**Known issue:** per-request mode currently runs PHP's request *shutdown*
-lazily, when that pool thread starts its next request. The HTTP response is
-not delayed, but Xdebug's end-of-session (`stopping`) is only sent then, so
-your IDE shows the session as still running until another request reaches
-the same thread. A fix is in progress
-([#541](https://github.com/ephpm/ephpm/pull/541)). Worker mode's debug lane
-is not affected: its thread shuts its request down as soon as the response
-is sent.
+hit as under php-fpm, and the session ends (`stopping`) as soon as the request
+finishes.
