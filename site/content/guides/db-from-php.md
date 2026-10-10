@@ -393,16 +393,29 @@ try {
 
 ## Shutdown functions and destructors
 
-**Do not put queries in `register_shutdown_function()` callbacks or in
-`__destruct()`.** They are not guaranteed to reach the database, and the
-reason is specific to how ePHPm runs PHP.
+How end-of-request code behaves depends on the PHP execution mode.
 
-ePHPm does not call `php_request_shutdown()` between HTTP requests — the
-embedded SAPI keeps one long-lived request open per worker thread. So a
-shutdown function you register does **not** run at the end of *your*
-request. It runs later, when the worker thread itself retires (the
-execution pool retires the thread, or the server shuts down) — by which
-point that thread's per-request database state has already been released.
+**Per-request mode (`[php] mode = "per_request"`, the default).**
+`register_shutdown_function()` callbacks run at the end of **every**
+request, after your script finishes (including after `exit()` or a fatal
+error) and before the response is sent, just as under php-fpm. They run
+inside the request, against the same site's database, so queries there work.
+WordPress and other frameworks that finish their work in a shutdown hook
+depend on this.
+
+Do not rely on `__destruct()` to issue queries. An object freed while the
+script runs (it goes out of scope, or you `unset()` it) is destructed at
+that moment, inside the request. Objects still alive when the script ends
+are torn down as part of request shutdown, and the database context there is
+not something to build on. Issue the query explicitly, or from a shutdown
+function.
+
+**Worker mode (`[php] mode = "worker"`).** The worker script is one
+long-lived PHP request per worker thread, so a shutdown function registered
+there does **not** run after each request the loop handles. It runs when the
+worker thread itself retires (a recycle, or server shutdown), by which point
+that thread's per-request database state has already been released. A
+destructor that only runs at that point is in the same position.
 
 A query issued from there is **refused, not executed**, and throws:
 
@@ -423,14 +436,15 @@ returns an empty list, `ephpm_db_errno()` returns `0`,
 `ephpm_db_in_transaction()` and `ephpm_db_available()` return `false` — the
 same answers a thread that has run nothing reports.
 
-Do your database work inside the request. If you need end-of-request
-cleanup, do it explicitly (a `finally` block, or your framework's terminate
-hook, which runs while the request is still live) rather than relying on
-PHP's shutdown handlers.
+In worker mode, do your database work inside the loop iteration. If you
+need end-of-request cleanup, do it explicitly (a `finally` block, or your
+framework's terminate hook, which runs while the request is still live)
+rather than relying on PHP's shutdown handlers.
 
-The same rule applies to [`ephpm_kv_*`](/guides/kv-from-php/) (reads miss
-and writes are refused) and [`ephpm_ws_*`](/guides/websockets/) (the site
-scope is gone, so sends report no capability).
+The same split applies to [`ephpm_kv_*`](/guides/kv-from-php/#shutdown-functions-and-destructors)
+(in the worker-retirement case reads miss and writes are refused).
+WebSockets are per-request-mode only; see
+[WebSockets](/guides/websockets/#limitations).
 
 ## The session model
 
