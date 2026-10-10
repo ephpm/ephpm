@@ -645,6 +645,11 @@ pub struct Router {
     /// per-request mode. When set, PHP requests are dispatched to the pool
     /// instead of the per-request execution pool.
     worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
+    /// Worker-mode Xdebug debug lane (`[php.worker] debug_workers > 0` and
+    /// the xdebug extension loaded). A request carrying an Xdebug trigger is
+    /// dispatched here — a fresh one-request worker thread — instead of the
+    /// warm pool, so it gets its own DBGp session. `None` otherwise.
+    debug_lane: Option<Arc<crate::debug_lane::DebugLane>>,
     /// The dedicated per-request PHP execution pool (`mode = "per_request"`).
     /// `None` in worker mode. Its size ([`PhpConfig::effective_concurrency`])
     /// is the concurrency cap; capping it deliberately does NOT cap tokio's
@@ -1301,6 +1306,8 @@ impl Router {
                 if id.is_empty() { None } else { Some(id.to_string()) }
             },
             worker_pool,
+            // Wired by `serve()` via `with_debug_lane` (worker mode + xdebug).
+            debug_lane: None,
             fpm_pool,
             // Wired by `serve()` via `with_tenant_ebpf` only when
             // `[server.tenant_network] ebpf_policy = true` (Linux multi-tenant).
@@ -1926,6 +1933,14 @@ impl Router {
         tenant_ebpf: Option<Arc<crate::tenant_ebpf::TenantEbpf>>,
     ) -> Self {
         self.tenant_ebpf = tenant_ebpf;
+        self
+    }
+
+    /// Attach the worker-mode Xdebug debug lane. Only meaningful alongside a
+    /// worker pool; a `None` leaves triggered requests on the warm pool.
+    #[must_use]
+    pub fn with_debug_lane(mut self, lane: Option<Arc<crate::debug_lane::DebugLane>>) -> Self {
+        self.debug_lane = lane;
         self
     }
 
@@ -3780,9 +3795,25 @@ impl Router {
                 }
             };
 
+            // Xdebug debug lane: a request carrying a step-debug trigger
+            // (XDEBUG_TRIGGER / XDEBUG_SESSION in the query string or a
+            // cookie) runs on a fresh one-request worker thread so Xdebug's
+            // RINIT sees the trigger and the request gets its own DBGp
+            // session. Everything else stays on the warm pool.
+            let target = match &self.debug_lane {
+                Some(lane) if crate::debug_lane::xdebug_triggered(&query_string, &headers) => {
+                    tracing::info!(
+                        %uri,
+                        "Xdebug trigger detected — routing to the debug lane (fresh worker)"
+                    );
+                    crate::debug_lane::WorkerTarget::Debug(Arc::clone(lane))
+                }
+                _ => crate::debug_lane::WorkerTarget::Pool(pool),
+            };
+
             let resp = self
                 .handle_php_worker(
-                    &pool,
+                    &target,
                     method,
                     uri,
                     path,
@@ -4317,7 +4348,7 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     async fn handle_php_worker(
         &self,
-        pool: &Arc<crate::worker_pool::WorkerPool>,
+        target: &crate::debug_lane::WorkerTarget,
         method: String,
         uri: String,
         path: String,
@@ -4406,7 +4437,7 @@ impl Router {
         let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let queue_wait_start = php_start;
-        let recv = pool.dispatch(owned).await;
+        let recv = target.dispatch(owned).await;
         let queue_wait = queue_wait_start.elapsed();
         drop(queue_span);
         #[allow(clippy::cast_precision_loss)]
@@ -4466,7 +4497,7 @@ impl Router {
             }
             // Worker never responded in time — replace it, return 504.
             Err(_) => {
-                pool.note_hung();
+                target.note_hung();
                 counter!("ephpm_http_timeouts_total", "stage" => "worker").increment(1);
                 return with_php_timings(
                     error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),

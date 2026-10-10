@@ -209,6 +209,118 @@ pub struct WorkerJob {
     pub admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+impl WorkerBody {
+    /// The length PHP should expect: the actual size of a buffered body, or
+    /// the declared `Content-Length` (possibly `0`) of a streaming one.
+    #[must_use]
+    pub fn declared_len(&self) -> usize {
+        match self {
+            Self::Buffered(data) => data.len(),
+            Self::Streaming { declared_len, .. } => *declared_len,
+        }
+    }
+}
+
+// ── Debug lane: pre-seeded request startup ───────────────────────────────
+
+/// The request metadata a worker-mode **debug lane** thread pre-seeds into
+/// `SG(request_info)` *before* its `php_request_startup()`, so request-startup
+/// hooks (Xdebug's `start_with_request = trigger` check at RINIT) see the
+/// triggering HTTP request. Owned copies, taken from the
+/// [`WorkerRequestOwned`] before it is queued for `take_request()`.
+#[derive(Debug, Clone)]
+pub struct DebugSeed {
+    /// HTTP method.
+    pub method: String,
+    /// `REQUEST_URI`.
+    pub uri: String,
+    /// Query string without the leading `?` (`XDEBUG_TRIGGER=1` lives here).
+    pub query_string: String,
+    /// Raw `Cookie` header (`XDEBUG_SESSION=...` lives here).
+    pub cookie_data: String,
+    /// `Content-Type`, if any.
+    pub content_type: Option<String>,
+    /// Declared body length (see [`WorkerBody::declared_len`]).
+    pub content_length: usize,
+}
+
+impl From<&WorkerRequestOwned> for DebugSeed {
+    fn from(req: &WorkerRequestOwned) -> Self {
+        Self {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            query_string: req.query_string.clone(),
+            cookie_data: req.cookie_data.clone(),
+            content_type: req.content_type.clone(),
+            content_length: req.body.declared_len(),
+        }
+    }
+}
+
+/// C-string storage for the pre-seeded `SG(request_info)` pointers. Lives in
+/// a thread-local for the whole life of the debug worker thread: the C side
+/// keeps the pointers until `ephpm_thread_shutdown()` has run, and the thread
+/// retires through `worker_thread_shutdown()` as ordinary code — before TLS
+/// destructors — so the storage is still alive at that point.
+#[cfg(php_linked)]
+#[allow(dead_code)] // owns memory C borrows; never read from Rust after install
+struct PreseededStrings {
+    method: CString,
+    uri: CString,
+    query_string: CString,
+    cookie_data: CString,
+    content_type: Option<CString>,
+    path_translated: CString,
+}
+
+#[cfg(php_linked)]
+thread_local! {
+    /// The strings `SG(request_info)` borrows on a debug lane thread.
+    static PRESEEDED: RefCell<Option<PreseededStrings>> = const { RefCell::new(None) };
+}
+
+/// Register this thread with TSRM and start its long-lived request with
+/// `SG(request_info)` pre-seeded from `seed`. Returns the C status (`0` ok).
+///
+/// Only [`crate::PhpRuntime::worker_thread_init_preseeded`] should call this —
+/// it owns the registration guard that pairs with `worker_thread_shutdown`.
+#[cfg(php_linked)]
+pub(crate) fn thread_init_preseeded(seed: &DebugSeed, path_translated: &std::path::Path) -> c_int {
+    // Lossy on interior NULs, same policy as `build_current_request`.
+    let cstr = |s: &str| CString::new(s).unwrap_or_default();
+    let strings = PreseededStrings {
+        method: cstr(&seed.method),
+        uri: cstr(&seed.uri),
+        query_string: cstr(&seed.query_string),
+        cookie_data: cstr(&seed.cookie_data),
+        content_type: seed.content_type.as_deref().map(cstr),
+        path_translated: cstr(&path_translated.to_string_lossy()),
+    };
+    PRESEEDED.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        *slot = Some(strings);
+        let s = slot.as_ref().expect("just set");
+        // SAFETY: every pointer borrows from `s`, which lives in this
+        // thread-local until the thread exits — after `ephpm_thread_shutdown`
+        // has run (worker_thread_shutdown is called explicitly on the thread
+        // body, before TLS teardown). The C function registers the calling
+        // thread with TSRM and runs php_request_startup under PHP's own
+        // zend_try; no Rust destructor is live across it besides this
+        // RefCell borrow, which only releases a flag.
+        unsafe {
+            crate::ffi::ephpm_thread_init_preseeded(
+                s.method.as_ptr(),
+                s.uri.as_ptr(),
+                s.query_string.as_ptr(),
+                s.content_type.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                s.cookie_data.as_ptr(),
+                seed.content_length,
+                s.path_translated.as_ptr(),
+            )
+        }
+    })
+}
+
 // ── C-compatible request view ────────────────────────────────────────────
 
 /// Borrowed view of the next request, filled by [`take_request`] and read by

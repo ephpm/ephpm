@@ -3668,6 +3668,28 @@ pub struct WorkerConfig {
     /// Default: `1048576` (1 MiB).
     #[serde(default = "default_worker_stream_threshold")]
     pub stream_threshold: u64,
+
+    /// Cap on concurrently running **Xdebug debug-lane** workers. `0`
+    /// disables the lane.
+    ///
+    /// In worker mode a worker's whole life is one PHP request, so Xdebug —
+    /// which opens its DBGp session at request startup and closes it at
+    /// request shutdown — cannot debug individual HTTP requests on a warm
+    /// worker. When the xdebug extension is loaded, a request carrying a
+    /// step-debug trigger (`XDEBUG_TRIGGER` / `XDEBUG_SESSION_START` in the
+    /// query string, `XDEBUG_SESSION` / `XDEBUG_TRIGGER` cookie) is instead
+    /// run on a *fresh* worker thread whose request startup sees that
+    /// request: the framework boots inside the debug session, the one
+    /// request is served, and the thread retires — ending the session
+    /// cleanly. Untriggered requests keep using the warm pool. Each debugged
+    /// request pays one framework boot; the cap keeps a developer parked on
+    /// a breakpoint from consuming `[php] concurrency` slots.
+    ///
+    /// Inert unless the xdebug extension is loaded (logged once at startup).
+    ///
+    /// Default: `1`.
+    #[serde(default = "default_worker_debug_workers")]
+    pub debug_workers: usize,
 }
 
 impl Default for WorkerConfig {
@@ -3678,6 +3700,7 @@ impl Default for WorkerConfig {
             boot_timeout: default_worker_boot_timeout(),
             populate_superglobals: false,
             stream_threshold: default_worker_stream_threshold(),
+            debug_workers: default_worker_debug_workers(),
         }
     }
 }
@@ -3697,6 +3720,7 @@ impl WorkerConfig {
             || self.boot_timeout != default_worker_boot_timeout()
             || self.populate_superglobals
             || self.stream_threshold != default_worker_stream_threshold()
+            || self.debug_workers != default_worker_debug_workers()
     }
 }
 
@@ -6146,6 +6170,12 @@ fn default_worker_stream_threshold() -> u64 {
 
 fn default_worker_boot_timeout() -> u64 {
     30
+}
+
+fn default_worker_debug_workers() -> usize {
+    // One debugger at a time; a second triggered request queues behind it.
+    // Only in force when the xdebug extension is loaded.
+    1
 }
 
 fn default_cluster_bind() -> String {

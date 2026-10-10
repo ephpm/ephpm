@@ -154,6 +154,27 @@ mod ffi {
         /// NTS builds: no-op (returns 0).
         pub fn ephpm_thread_init() -> ::std::os::raw::c_int;
 
+        /// `ephpm_thread_init` with `SG(request_info)` pre-seeded from the
+        /// HTTP request this thread will serve, so request-startup hooks
+        /// (Xdebug's trigger check at RINIT) see it. Worker-mode debug lane.
+        /// Every pointer must outlive `ephpm_thread_shutdown`. Returns 0 on
+        /// success, -1 if request startup failed. NTS builds: no-op.
+        pub fn ephpm_thread_init_preseeded(
+            method: *const ::std::os::raw::c_char,
+            uri: *const ::std::os::raw::c_char,
+            query_string: *const ::std::os::raw::c_char,
+            content_type: *const ::std::os::raw::c_char,
+            cookie: *const ::std::os::raw::c_char,
+            content_length: usize,
+            path_translated: *const ::std::os::raw::c_char,
+        ) -> ::std::os::raw::c_int;
+
+        /// Whether a PHP extension is loaded, by lower-case registry name.
+        /// Reads the process-global `module_registry`; valid on any thread
+        /// after `php_embed_init`. Returns 1 if loaded, 0 otherwise.
+        pub fn ephpm_extension_loaded(name: *const ::std::os::raw::c_char)
+        -> ::std::os::raw::c_int;
+
         /// Shut down PHP on the current thread.
         /// Performs request shutdown and unregisters from TSRM.
         /// NTS builds: no-op.
@@ -1670,6 +1691,92 @@ impl PhpRuntime {
         #[cfg(not(php_linked))]
         {
             Ok(())
+        }
+    }
+
+    /// [`PhpRuntime::worker_thread_init`] for the worker-mode **Xdebug debug
+    /// lane**: register the current OS thread with TSRM and start its
+    /// long-lived request with `SG(request_info)` already describing
+    /// `seed` — the one triggered HTTP request this thread will serve.
+    ///
+    /// Why it exists: a persistent worker's whole life is one PHP request,
+    /// and the request `ephpm_thread_init()` starts carries no HTTP data, so
+    /// Xdebug's RINIT (where `start_with_request = trigger` looks at
+    /// `$_GET`/`$_COOKIE`) never sees a trigger and its session — opened at
+    /// RINIT, closed at RSHUTDOWN — can never be per-HTTP-request. Seeding
+    /// the request before `php_request_startup()` makes RINIT honour the
+    /// trigger natively; the framework then boots *inside* the DBGp session
+    /// and the thread's shutdown ends it cleanly.
+    ///
+    /// `path_translated` is what `SG(request_info).path_translated` reports
+    /// (the worker script — the file PHP actually executes on this thread).
+    /// The seed's strings are copied into a thread-local that outlives
+    /// [`PhpRuntime::worker_thread_shutdown`], as the C side requires.
+    ///
+    /// Must be the thread's *first* registration: a thread already holding a
+    /// PHP request cannot be re-seeded (its RINITs have run).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhpError::NotInitialized`] if PHP is not initialized, or
+    /// [`PhpError::ThreadInitFailed`] if the thread is already registered or
+    /// request startup fails.
+    #[allow(unused_variables)]
+    pub fn worker_thread_init_preseeded(
+        seed: &worker_bridge::DebugSeed,
+        path_translated: &std::path::Path,
+    ) -> Result<(), PhpError> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
+        #[cfg(php_linked)]
+        {
+            THREAD_REGISTERED.with(|guard| {
+                if guard.registered.get() {
+                    tracing::error!(
+                        "debug lane: thread already holds a PHP request; cannot pre-seed"
+                    );
+                    return Err(PhpError::ThreadInitFailed);
+                }
+                if worker_bridge::thread_init_preseeded(seed, path_translated) != 0 {
+                    return Err(PhpError::ThreadInitFailed);
+                }
+                // Same arming as `ensure_thread_registered`: the guard's Drop
+                // is the backstop, `worker_thread_shutdown` the normal retire.
+                guard.registered.set(true);
+                LIVE_PHP_THREADS.fetch_add(1, Ordering::AcqRel);
+                tracing::debug!("TSRM thread registered with pre-seeded request (debug lane)");
+                Ok(())
+            })
+        }
+        #[cfg(not(php_linked))]
+        {
+            Ok(())
+        }
+    }
+
+    /// Whether the PHP extension `name` (lower-case registry name, e.g.
+    /// `"xdebug"`) is loaded in this process. Valid on any thread once
+    /// [`PhpRuntime::init`] has run; always `false` in stub mode.
+    #[must_use]
+    #[allow(unused_variables)]
+    pub fn extension_loaded(name: &str) -> bool {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return false;
+        }
+        #[cfg(php_linked)]
+        {
+            let Ok(c_name) = std::ffi::CString::new(name) else {
+                return false;
+            };
+            // SAFETY: `c_name` is a valid NUL-terminated string that outlives
+            // the call. ephpm_extension_loaded only reads the process-global
+            // module_registry, which is immutable after php_embed_init.
+            unsafe { ffi::ephpm_extension_loaded(c_name.as_ptr()) != 0 }
+        }
+        #[cfg(not(php_linked))]
+        {
+            false
         }
     }
 

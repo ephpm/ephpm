@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod body;
 pub mod db_health;
+pub mod debug_lane;
 pub mod dns01;
 pub mod dns01_digitalocean;
 pub mod dns01_google;
@@ -730,7 +731,7 @@ async fn bind_listeners(
         );
 
         let pool = worker_pool::WorkerPool::spawn(
-            script,
+            script.clone(),
             concurrency,
             config.php.worker.max_requests,
             config.php.effective_queue_depth(),
@@ -741,7 +742,36 @@ async fn bind_listeners(
             Duration::from_secs(config.server.timeouts.idle),
             config.php.admission,
         );
-        Some(pool)
+
+        // Xdebug debug lane: fresh one-request worker threads for requests
+        // that carry a step-debug trigger. Armed only when the extension is
+        // actually loaded — without it the lane would just be a slow path.
+        let debug_workers = config.php.worker.debug_workers;
+        let debug_lane = if debug_workers == 0 {
+            tracing::info!("[php.worker] debug_workers = 0 — Xdebug debug lane disabled");
+            None
+        } else if ephpm_php::PhpRuntime::extension_loaded("xdebug") {
+            Some(debug_lane::DebugLane::new(
+                script,
+                debug_workers,
+                Duration::from_secs(config.server.timeouts.idle),
+            ))
+        } else {
+            // At the default this is the common case (no Xdebug in
+            // production); only an explicit setting earns an INFO line.
+            if debug_workers == ephpm_config::WorkerConfig::default().debug_workers {
+                tracing::debug!("xdebug not loaded — worker-mode debug lane inactive");
+            } else {
+                tracing::info!(
+                    debug_workers,
+                    "[php.worker] debug_workers is set but the xdebug extension is not \
+                     loaded — the Xdebug debug lane is inactive (load xdebug via [php] \
+                     ini_overrides zend_extension to use it)"
+                );
+            }
+            None
+        };
+        Some((pool, debug_lane))
     } else {
         // add-config-knob: `[php.worker]` is structurally scoped to worker
         // mode, but an operator who configured it still deserves one line
@@ -754,6 +784,10 @@ async fn bind_listeners(
             );
         }
         None
+    };
+    let (worker_pool, debug_lane) = match worker_pool {
+        Some((pool, lane)) => (Some(pool), lane),
+        None => (None, None),
     };
 
     // Native WebSockets (experimental). `None` when `[server.websocket]` is
@@ -835,6 +869,7 @@ async fn bind_listeners(
             file_cache.clone(),
             worker_pool.clone(),
         )
+        .with_debug_lane(debug_lane)
         .with_tenant_ebpf(tenant_ebpf)
         .with_middleware_chain(middleware_chain)
         // Expose the effective gossip node id to PHP (EPHPM_NODE_ID). When

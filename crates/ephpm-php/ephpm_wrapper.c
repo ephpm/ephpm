@@ -759,6 +759,83 @@ int ephpm_thread_init(void)
 }
 
 /*
+ * Worker-mode Xdebug debug lane: ephpm_thread_init() with SG(request_info)
+ * already describing the HTTP request this thread is about to serve.
+ *
+ * A persistent worker's whole life is ONE PHP request, and the request it
+ * starts in ephpm_thread_init() carries no HTTP data at all — so an extension
+ * whose RINIT inspects the request never sees anything. Xdebug is the one
+ * that matters: with xdebug.start_with_request=trigger it decides at RINIT,
+ * from $_GET/$_POST/$_COOKIE, whether to open a DBGp session, and it closes
+ * that session at request shutdown. Both events happen exactly once per
+ * worker thread, never per HTTP request.
+ *
+ * The debug lane turns that constraint into the mechanism: a thread that
+ * serves exactly one triggered request. Pre-seeding request_info here means
+ * php_request_startup() builds $_GET/$_COOKIE from the real request before
+ * zend_activate_modules() runs Xdebug's RINIT, so the trigger is honoured
+ * natively — no Xdebug-specific code, no per-iteration reset of its state.
+ * The framework then boots INSIDE the session (boot-code breakpoints work),
+ * take_request() hands over the pre-queued request, and when the loop ends
+ * after that one request ephpm_thread_shutdown()'s php_request_shutdown()
+ * runs Xdebug's RSHUTDOWN, which ends the session with a clean `stopping`.
+ *
+ * SG(server_context) is deliberately left NULL: sapi_activate() would
+ * otherwise run sapi_read_post_data() at startup, consuming a POST body that
+ * take_request()'s body reader has not been installed for yet. Consequence:
+ * only the GET (XDEBUG_TRIGGER / XDEBUG_SESSION_START) and Cookie
+ * (XDEBUG_SESSION / XDEBUG_TRIGGER) triggers are honoured on this lane; a
+ * POST-body trigger is not.
+ *
+ * Every pointer must stay valid until ephpm_thread_shutdown() returns:
+ * sapi_deactivate() does not free them, but php_request_shutdown() may still
+ * read SG(request_info) (the Rust side keeps the backing strings in a
+ * thread-local that outlives the shutdown call).
+ *
+ * Returns 0 on success, -1 if php_request_startup() failed.
+ */
+int ephpm_thread_init_preseeded(
+    const char *method,
+    const char *uri,
+    const char *query_string,
+    const char *content_type,
+    const char *cookie,
+    size_t content_length,
+    const char *path_translated)
+{
+    ts_resource(0);
+
+    /* Same thread-local mirrors the fpm path keeps, so the read_cookies /
+     * read_post SAPI callbacks see this request if anything consults them
+     * before take_request() re-points them at the dispatched job. */
+    req_method = method;
+    req_uri = uri;
+    req_query_string = query_string;
+    req_content_type = content_type;
+    req_cookie_data = cookie;
+    req_post_data = NULL;
+    req_post_data_len = 0;
+    req_post_data_offset = 0;
+    req_path_translated = path_translated;
+
+    SG(request_info).request_method = (char *)method;
+    SG(request_info).request_uri = (char *)uri;
+    SG(request_info).query_string = (char *)query_string;
+    SG(request_info).content_type = content_type;
+    SG(request_info).cookie_data = (char *)cookie;
+    SG(request_info).content_length = (zend_long)content_length;
+    SG(request_info).path_translated = (char *)path_translated;
+    SG(request_info).proto_num = 1001; /* HTTP/1.1 */
+
+    if (php_request_startup() != SUCCESS) {
+        return -1;
+    }
+
+    request_active = 1;
+    return 0;
+}
+
+/*
  * Shut down PHP on the current thread.
  *
  * Performs request shutdown and unregisters the thread from TSRM,
@@ -798,9 +875,36 @@ void ephpm_thread_shutdown(void)
 #else /* !ZTS — NTS stubs */
 
 int ephpm_thread_init(void) { return 0; }
+int ephpm_thread_init_preseeded(
+    const char *method,
+    const char *uri,
+    const char *query_string,
+    const char *content_type,
+    const char *cookie,
+    size_t content_length,
+    const char *path_translated)
+{
+    (void)method; (void)uri; (void)query_string; (void)content_type;
+    (void)cookie; (void)content_length; (void)path_translated;
+    return 0;
+}
 void ephpm_thread_shutdown(void) {}
 
 #endif /* ZTS */
+
+/*
+ * Whether a PHP extension (module) is loaded, by its lower-case registry
+ * name ("xdebug", "opcache", ...). module_registry is a true process global
+ * (not per-TSRM-thread), populated during php_embed_init(); readable from any
+ * thread afterwards without a TSRM context. Mirrors extension_loaded().
+ */
+int ephpm_extension_loaded(const char *name)
+{
+    if (!name) {
+        return 0;
+    }
+    return zend_hash_str_exists(&module_registry, name, strlen(name)) ? 1 : 0;
+}
 
 /* ===================================================================
  * Signal handling overrides
