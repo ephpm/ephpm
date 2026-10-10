@@ -3,6 +3,14 @@
 ePHPm exports Prometheus metrics when `[server.metrics] enabled = true`.
 The metrics endpoint defaults to `/metrics` (configurable via `path`).
 
+This page covers the design and the core families only. The
+[metrics reference](/reference/metrics/) is the complete, authoritative list:
+it also covers HTTP/3, WebSockets, the FPM and worker pools, middleware,
+OPcache, the JIT, the DB proxy, the reverse proxy and CDC replication.
+
+The endpoint is unauthenticated and answers on every listener for every
+`Host`; see [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
+
 ---
 
 ## Configuration
@@ -34,10 +42,11 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests processed. `handler` is `"php"`, `"static"`, `"health"`, or `"error"`. |
+| `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests processed. `handler` is one of `php`, `static`, `middleware`, `error`, `health`, `metrics`, `diagnostics`, `acme`, `proxy`, `websocket`, `auth`, `site_override_unusable` ([value table](/reference/metrics/#handler-label-values)). |
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | End-to-end request duration (includes PHP execution for PHP requests). |
-| `ephpm_http_requests_in_flight` | gauge | — | Number of requests currently being processed. |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests that hit the timeout. `stage` is `"request"`. |
+| `ephpm_http_requests_in_flight` | gauge | — | Number of requests currently being processed. Drifts upward on client disconnects (no drop guard on the decrement). |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests that hit the request timeout. `stage` is `request`, `fpm_pool` or `worker`; most record as `request` ([why](/reference/metrics/#timeouts-and-the-fpm_pool--worker-stages)). |
+| `ephpm_http_body_overflow_total` | counter | — | `413`s raised while reading an over-limit request body. |
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size in bytes. `method` is a standard verb or `OTHER`, never the client's raw verb. |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size in bytes (before compression). |
 | `ephpm_http_compression_ratio` | histogram | — | Compression ratio (compressed / original). Values near 0 = excellent compression. |
@@ -49,7 +58,7 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_php_execution_duration_seconds` | histogram | — | Time spent executing PHP code (excludes body read, response write). |
+| `ephpm_php_execution_duration_seconds` | histogram | — | Time from dispatch to the PHP pool until the response comes back. **Includes the dispatch-queue wait**, so it rises under saturation even when PHP itself is fast. Excludes the body read and the response write. |
 | `ephpm_php_executions_total` | counter | `status` | PHP executions by result. `status` is `"ok"` or `"error"`. |
 | `ephpm_php_output_bytes` | histogram | — | Raw PHP output size in bytes (before compression). |
 
@@ -111,8 +120,8 @@ Custom bucket configurations are tuned for PHP workloads:
 
 | Metric | Buckets |
 |--------|---------|
-| `ephpm_http_request_duration_seconds` | 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s |
-| `ephpm_php_execution_duration_seconds` | 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s |
+| `ephpm_http_request_duration_seconds`, `ephpm_http3_request_duration_seconds`, `ephpm_php_execution_duration_seconds`, `ephpm_worker_request_wait_seconds` | 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s |
+| `ephpm_worker_boot_duration_seconds` | 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 20s, 30s |
 | Body size histograms | 100B, 1KB, 10KB, 50KB, 100KB, 500KB, 1MB, 5MB, 10MB |
 | `ephpm_http_compression_ratio` | 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 |
 | `ephpm_cdc_apply_duration_seconds` | 100µs, 500µs, 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 500ms, 1s, 5s |
@@ -123,17 +132,15 @@ Custom bucket configurations are tuned for PHP workloads:
 ## Scraping
 
 The metrics endpoint returns `text/plain; version=0.0.4` (standard Prometheus
-text format). Example scrape output:
+text format) for `GET` only. No metric registers a description, so there are
+`# TYPE` lines but no `# HELP` lines. Example scrape output (abridged):
 
 ```
-# HELP ephpm_build_info Build information
 # TYPE ephpm_build_info gauge
 ephpm_build_info{version="0.1.0"} 1
-# HELP ephpm_http_requests_total Total HTTP requests
 # TYPE ephpm_http_requests_total counter
 ephpm_http_requests_total{method="GET",status="200",handler="php"} 42
 ephpm_http_requests_total{method="GET",status="200",handler="static"} 150
-# HELP ephpm_http_request_duration_seconds Request duration
 # TYPE ephpm_http_request_duration_seconds histogram
 ephpm_http_request_duration_seconds_bucket{method="GET",handler="php",le="0.01"} 5
 ...
@@ -143,5 +150,7 @@ ephpm_http_request_duration_seconds_bucket{method="GET",handler="php",le="0.01"}
 
 ## Disabling Metrics
 
-Set `enabled = false` (the default). When disabled, all `metrics` facade calls
-are zero-cost no-ops — there is no overhead from unused metric instrumentation.
+Set `enabled = false` (the default). When disabled, no recorder is installed and
+every `metrics` facade call is a no-op. The cost is near-zero rather than zero:
+a few call sites build their label values (query digest, middleware module,
+vhost, upstream) before the call.

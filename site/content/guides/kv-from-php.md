@@ -189,20 +189,21 @@ $count = $redis->incr('page:views');
 
 `DELIFEQ key token` is an ePHPm-specific compare-and-delete (not a standard Redis command): it deletes `key` only while its value equals `token`, returning `:1`/`:0`. It is the safe lock-release primitive — reach it over RESP with a raw command (e.g. Predis `$redis->executeRaw(['DELIFEQ', $key, $token])`), or, from in-process PHP, just call `ephpm_kv_del_if_eq()` above. It is a dedicated command rather than a `DEL key IFEQ token` variant because `DEL` is variadic over keys, where a positional marker would be ambiguous with a key named `IFEQ`.
 
-Not implemented: lists, sets, transactions, `SCAN`, pub/sub. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis.
+Not implemented: lists, sets, sorted sets, transactions (`MULTI`/`EXEC`), scripting (`EVAL`), `SCAN`, pub/sub, and common extras such as `UNLINK`, `HMGET` and `HINCRBY`. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis. Note that `INFO` reports `redis_version:7.0.0`, so clients that branch on the server version will assume Redis 7. The [KV RESP Protocol reference](/reference/kv-resp/) lists every command's behavior and where it differs from Redis.
 
 ### Multi-tenant note
 
-The RESP listener can be shared across virtual hosts — each site is isolated by AUTH. When both `[kv] secret` and `[server] sites_dir` are set, ePHPm derives a per-site password as `HMAC-SHA256(secret, hostname)` (lowercase hex, 64 chars) and injects four env vars into every PHP request so the site's code can connect without any per-vhost configuration:
+The RESP listener can be shared across virtual hosts — each site is isolated by AUTH. When `[kv.redis_compat] enabled = true`, `[kv] secret` and `[server] sites_dir` are all set, ePHPm derives a per-site password as `HMAC-SHA256(secret, site-key)` (lowercase hex, 64 chars) and injects four env vars into every PHP request so the site's code can connect without any per-vhost configuration:
 
 ```
-EPHPM_REDIS_HOST       # from [kv.redis_compat] listen
+EPHPM_REDIS_HOST       # host part of [kv.redis_compat] listen, verbatim (0.0.0.0 stays 0.0.0.0)
 EPHPM_REDIS_PORT
-EPHPM_REDIS_USERNAME   # the vhost hostname (e.g. alice-blog.com)
-EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, hostname) hex
+EPHPM_REDIS_USERNAME   # the canonical site key, e.g. "alice-blog" for alice-blog.localhost
+                       # with sites_domain_suffix = ".localhost" (not the raw Host)
+EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, site key) hex
 ```
 
-The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port.
+The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so a connection authenticated as `alice-blog` only sees alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port. In this mode `[kv.redis_compat] password` is ignored.
 
 A PHP app consumes them like any other Redis credentials — Predis, phpredis, or the `ephpm_kv_*` SAPI functions all work without code changes:
 
@@ -217,7 +218,9 @@ $redis = new Predis\Client([
 $redis->set('cache:page:home', $html);
 ```
 
-If `[kv] secret` is unset, no env vars are injected and the RESP listener treats the connection as the global store — fine for single-site mode, never use that combination with `sites_dir` set.
+If `[kv] secret` is unset, no env vars are injected. In single-site mode the listener then serves the global store. With `sites_dir` set, that combination is refused at startup, because it would hand every tenant one shared, unauthenticated store.
+
+**Single-site authentication.** With a plain `[kv.redis_compat] password`, configure clients with the password only and **no username**: the listener compares the first `AUTH` argument, so `AUTH <user> <pass>` fails. `[kv] secret` on its own does not protect a single-site listener (any `AUTH` succeeds); set `password` for that. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ### Automatic value compression
 

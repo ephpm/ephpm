@@ -73,7 +73,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 | `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). |
 | `compression_min_size` | usize (bytes) | `1024` | Minimum response size before compression applies. |
 | `compression_streaming` | string | `"off"` | Streamed worker-response (`send_response_stream`) compression: `"off"` (identity, byte-for-byte the previous behavior), `"sse"` (brotli with a per-event flush and a stream-lifetime window for `text/event-stream` responses), `"all"` (every streamed response). Needs `compression = true` and a client `Accept-Encoding: br`; unknown values warn at startup and act as `"off"`. Buffered responses are unaffected. |
-| `headers` | array of `[string, string]` | `[]` | Custom headers added to every response. |
+| `headers` | array of `[string, string]` | `[]` | Custom headers set on responses. A configured header **replaces** a same-named header the application set, and is **not** applied to `/_ephpm/*`, the metrics path, early gate errors (400/403/404/421), the per-IP 429 or the request-timeout 504. See [HTTP Endpoints → `[server.response] headers`](/reference/http-endpoints/#serverresponse-headers). |
 
 ### `[server.static]`
 
@@ -174,7 +174,14 @@ are escaped and cannot inject forged log lines.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the Prometheus `/metrics` endpoint. |
-| `path` | string | `"/metrics"` | URL path for the metrics endpoint. |
+| `path` | string | `"/metrics"` | URL path for the metrics endpoint (`GET` only). |
+
+> **Unauthenticated, on every listener and vhost.** The metrics path is served
+> before `trusted_hosts`, `blocked_paths` and middleware, and there is no
+> option to bind it to a separate port. On a multi-tenant node it exposes every
+> tenant's normalized SQL, vhost names and DB upstream addresses. Restrict it at
+> an upstream proxy or with a firewall. See
+> [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ### The `/_ephpm/` namespace is reserved
 
@@ -192,6 +199,12 @@ would get the *application's* answer (issue #444).
 | `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. |
 | any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
 | any of the above | not GET | `405` with `Allow: GET`. |
+| `/_ephpm/auth/…` | any | The one exception: routed to the `[[middleware]]` chain (the `github-auth` issuer), after `trusted_hosts` and vhost resolution. `404` when no module claims it. |
+
+These endpoints require **no authentication** and answer for every `Host` on
+every listener, ahead of `trusted_hosts`, `blocked_paths` and middleware.
+`/_ephpm/requests` holds request paths from every vhost. See
+[HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 The Prometheus endpoint is **not** in this namespace: its path is yours to
 choose (`[server.metrics] path`, default `/metrics`), so with
@@ -312,7 +325,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `google_project` | string | (none) | GCP project id owning the Cloud DNS zone. **Required** when `dns_provider = "google"`. |
 | `google_managed_zone` | string | (none) | Explicit Cloud DNS managed-zone name. When absent, resolved from the challenge FQDN by listing the project's managed zones. |
 | `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves HTTP and this serves HTTPS. |
-| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). |
+| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301) — including `/_ephpm/health`, `/_ephpm/ready` and the metrics path, so point HTTP-port probes and scrapes at the TLS listener. The `Location` is built from the client's `Host` header as sent. |
 
 Credentials follow one rule across every provider: the `*_file` variant wins over the inline value, and both can be supplied entirely from the environment (`EPHPM_SERVER__TLS__<FIELD>`) so no secret has to live in `ephpm.toml`. `Config::validate` requires the selected provider's credential(s) at startup and rejects an unknown `dns_provider` rather than silently doing nothing.
 

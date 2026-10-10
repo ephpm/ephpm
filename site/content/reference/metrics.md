@@ -13,7 +13,15 @@ enabled = true
 
 When `enabled = false`, no Prometheus recorder is installed, so every `metrics` façade call dispatches to a no-op. A handful of call sites still construct their label values first (the query digest, middleware module name, vhost, and upstream labels are cloned before dispatch), so the cost is *near*-zero rather than exactly zero.
 
-Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and exported through [`metrics_exporter_prometheus`](https://docs.rs/metrics-exporter-prometheus/).
+Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and exported through [`metrics_exporter_prometheus`](https://docs.rs/metrics-exporter-prometheus/). The scrape is `text/plain; version=0.0.4`. No metric registers a description, so the output has `# TYPE` lines but no `# HELP` lines.
+
+> **The endpoint is unauthenticated and not tenant-scoped.** It is served for
+> `GET` on every listener and for every `Host`, ahead of `trusted_hosts`,
+> `blocked_paths` and all middleware, and there is no option to move it to a
+> separate port. On a multi-tenant node it exposes every tenant's normalized SQL
+> (`digest`), vhost names and DB upstream addresses to anyone who can reach any
+> tenant's domain. Block the path at your edge proxy or firewall the listener.
+> See [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ## Build info
 
@@ -25,16 +33,57 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests handled. `handler` is the route class (e.g. `php`, `static`, `error`). To keep series cardinality bounded, `method` is one of the standard verbs (`GET`, `POST`, ...) or `OTHER` for any non-standard verb, and `status` is the numeric code for the common statuses this server and typical apps emit or `other` for uncommon codes. |
-| `ephpm_http_requests_in_flight` | gauge | — | Currently in-flight HTTP requests. |
+| `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests handled. `handler` is the route class; see the value table below. To keep series cardinality bounded, `method` is one of the standard verbs (`GET`, `POST`, ...) or `OTHER` for any non-standard verb, and `status` is the numeric code for the common statuses this server and typical apps emit or `other` for uncommon codes. Requests refused by the per-IP rate limit (`429`) are counted only in `ephpm_rate_limited_total`, not here. |
+| `ephpm_http_requests_in_flight` | gauge | — | Currently in-flight HTTP requests. **Drifts upward** when a client disconnects mid-request: the decrement runs after the handler returns, with no drop guard, so a request whose future is dropped never decrements. Treat the long-run level as unreliable; watch short-term changes. |
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | Request handling time, end-to-end (no `status` label). |
+| `ephpm_http_body_overflow_total` | counter | — | `413`s raised while **reading** a request body that turned out larger than `[server.request] max_body_size`: chunked or under-declared bodies, the middleware pre-buffer (`middleware_body_limit`), and worker-mode streamed bodies. A body whose declared `Content-Length` already exceeds the limit is refused before reading and is **not** counted. A body read error during the middleware pre-buffer is also answered `413` and counted here. |
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. `method` is bounded the same way as above (standard verb or `OTHER`). |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size before compression. Recorded on the PHP path only (`handler="php"`). |
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the per-request-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests answered `504` by `[server.timeouts] request`. Three values: `request` (the outer deadline around the whole request, in both modes), `fpm_pool` (per-request mode: the pool thread did not reply in time) and `worker` (worker mode: the worker did not reply in time). See the timeout note below: in practice most timeouts are recorded as `request`. |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 | `ephpm_site_rate_limited_total` | counter | — | 429s from the per-site PHP rate limit (`[server.limits] per_site_rate`; on by default under `[server] preview`). |
 | `ephpm_site_override_unusable_total` | counter | — | 503s from a per-site override file that exists but cannot be honoured (`[server] site_overrides_dir`). Non-zero means a vhost is serving nothing rather than falling back to its whole container — see [Virtual Hosts → Failure modes](/guides/virtual-hosts/#failure-modes-a-broken-override-takes-the-site-out-of-service). |
+
+### `handler` label values
+
+| Value | Requests |
+|---|---|
+| `php` | Everything dispatched to the PHP path, whatever the status: executions, a `304` from the PHP ETag cache, the per-site `429`, a shed or draining `503`, a `413` body overflow, and an `fpm_pool`/`worker`-stage `504`. In worker mode this includes every non-static request. |
+| `static` | Static files served from disk. |
+| `middleware` | A static-file request answered by a request-phase middleware `RESPOND` (auth denial, redirect). |
+| `error` | Server-generated error responses: `400` path decoding, `403`/`404` from the security gates, `404`/`405` in `/_ephpm/`, fallback `=NNN` statuses, a `403` from `allowed_php_paths`, and a `stage="request"` timeout `504`. |
+| `health` | `/_ephpm/health`, `/_ephpm/ready` **and** `/_ephpm/primary`. |
+| `metrics` | Scrapes of the metrics path. |
+| `diagnostics` | `/_ephpm/requests`. |
+| `acme` | `/.well-known/acme-challenge/*`. |
+| `proxy` | `[[server.proxy]]` forwards. |
+| `websocket` | WebSocket upgrade requests (the `101` or the refusal). |
+| `auth` | `/_ephpm/auth/*`. |
+| `site_override_unusable` | `503` from a per-site override file that cannot be honoured. |
+
+Filtering out `handler="health"` still leaves Prometheus's own scrapes
+(`metrics`) and timeline polls (`diagnostics`) in your request rate.
+
+### Timeouts and the `fpm_pool` / `worker` stages
+
+Two deadlines of the same length (`[server.timeouts] request`) are armed per
+PHP request. The outer one starts when the request arrives. The inner one
+starts only after routing, the body read and any dispatch-queue wait. Because
+the outer one starts first, it usually fires first and cancels the inner one.
+The `fpm_pool` and `worker` stages are recorded only when both deadlines expire
+on the same timer tick, which in practice means a request that got a thread
+within about a millisecond of arriving. Any request that queued for a thread
+times out as `stage="request"`.
+
+The difference matters beyond the label. Only the `fpm_pool`/`worker` path
+marks the stuck thread as hung, replaces it, and increments
+`ephpm_fpm_pool_recycles_total{reason="hung"}` or
+`ephpm_worker_recycles_total{reason="hung"}`. A `stage="request"` timeout
+answers the client with `504` but leaves the thread running the request until
+PHP finishes it (or `max_execution_time` stops it, where enforced), and no
+replacement thread is started. So a `hung` recycle count of `0` does not mean
+no request outlived the timeout.
 
 ## HTTP/3 (QUIC)
 
@@ -73,12 +122,24 @@ The upgrade request itself also increments the `ephpm_http_*` metrics above with
 | `ephpm_ws_send_queue_overflow_total` | counter | — | Sends refused because a connection's outbound queue was full. Each one also closes that connection with `1013`. **Worth alerting on**: it means clients are not draining and connections are being shed. |
 | `ephpm_ws_cross_site_denied_total` | counter | — | Attempts to reach a connection or channel belonging to a different virtual host. **Should be flat at zero.** Anything else is a bug or an attempt — the operation is refused either way, and reported to PHP as "not found" so it is not an existence oracle. |
 
+## Reverse proxy
+
+These appear once a `[[server.proxy]]` rule matches a request. See the
+[Reverse Proxy guide](/guides/reverse-proxy/). Proxied requests also count in
+`ephpm_http_*` with `handler="proxy"`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_proxy_requests_total` | counter | — | Requests matched by a proxy rule and forwarded (plain HTTP and WebSocket upgrades). |
+| `ephpm_proxy_errors_total` | counter | `kind` | Upstream failures answered `502`. `kind` is `read_timeout` (no response head within the rule's `read_timeout`), `connect` (the upstream HTTP request failed: refused, unreachable, connect timeout, reset), `ws_connect` (TCP connect to a WebSocket backend failed or timed out), `ws_handshake` (HTTP/1 handshake with the WebSocket backend failed) or `ws_request` (sending the upgrade request failed). |
+| `ephpm_proxy_ws_tunnels_total` | counter | — | WebSocket upgrades the backend accepted (`101` relayed to the client). Counted when the `101` is returned, before both sides have finished upgrading, so a client that drops at that moment is still counted. |
+
 ## PHP
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_php_executions_total` | counter | `status` | PHP requests executed. `status` is `ok` or `error`. Timeouts surface as HTTP 504 in the HTTP metrics, not here. |
-| `ephpm_php_execution_duration_seconds` | histogram | — | Time spent inside the PHP runtime, per request. |
+| `ephpm_php_execution_duration_seconds` | histogram | — | Time from dispatch to the PHP pool until the response comes back, per successfully dispatched request. **Includes the dispatch-queue wait** in both modes, so under saturation it grows with queueing, not with slow PHP. Use `ephpm_fpm_pool_queue_depth` / `ephpm_worker_dispatch_queue_depth` to tell queueing apart from slow PHP. Not recorded for timeouts or shed requests. |
 | `ephpm_php_output_bytes` | histogram | — | Bytes emitted by PHP per request. |
 | `ephpm_php_shed_total` | counter | `engine` | PHP requests rejected with `503` + `Retry-After` because no execution slot came free within `[php] shed_after_ms`. Only recorded under [`[php] overload = "shed"`](/reference/config/#php); always `0` on the default `"wait"` policy. `engine` is always `pool` (the dispatch backlog was full; the label is kept for continuity). A 503 from a *draining* pool is not counted here — that is shutdown, not overload. Rising values mean the server is saturated and saying so, which is the healthy failure mode; the alternative is client timeouts with no server-side signal at all. |
 
@@ -93,7 +154,7 @@ These appear in per-request mode (`[php] mode = "per_request"`, the default exec
 | `ephpm_fpm_pool_boot_failures_total` | counter | — | Pool threads that failed to start (thread spawn or TSRM registration failure). The pool respawns with exponential backoff. |
 | `ephpm_fpm_pool_panics_total` | counter | — | Rust panics escaping a PHP job. The request still gets a 500 and the thread is retired. A PHP bailout is *not* a panic and is not counted here. |
 | `ephpm_fpm_pool_contained_crashes_total` | counter | — | PHP C-stack overflows contained instead of aborting the process. Requires [`[php] crash_containment`](/reference/config/#php); always `0` without it. Any non-zero value means a request crashed PHP and a thread was poisoned. |
-| `ephpm_fpm_pool_recycles_total` | counter | `reason` | Pool threads retired and replaced. `reason` is `hung` (never responded within the request timeout; abandoned and replaced), `panic` (a Rust panic escaped the job), or `poisoned` (a crash was contained on it — abandoned **without** PHP teardown, since its Zend context is corrupt). |
+| `ephpm_fpm_pool_recycles_total` | counter | `reason` | Pool threads retired and replaced. `reason` is `hung` (never responded within the request timeout; abandoned and replaced; only recorded on a `stage="fpm_pool"` timeout, see [the timeout note](#timeouts-and-the-fpm_pool--worker-stages)), `panic` (a Rust panic escaped the job), or `poisoned` (a crash was contained on it — abandoned **without** PHP teardown, since its Zend context is corrupt). |
 
 ## Native middleware
 
@@ -101,7 +162,8 @@ These appear when at least one `[[middleware]]` mount is configured.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_middleware_invocations_total` | counter | `module`, `action` | Middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. |
+| `ephpm_middleware_invocations_total` | counter | `module`, `action` | Request-phase middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. |
+| `ephpm_middleware_response_invocations_total` | counter | `module` | Response-phase invocations (`invoke_response`), one per response-capable module per matching buffered response. Streamed responses bypass the response phase and are not counted. |
 
 **PHP mounts** (`library = "php:<path>"`, experimental) share this counter,
 with `module` set to the full `library` string. Their `action` is `continue`,
@@ -117,14 +179,14 @@ These appear when `[php] mode = "worker"`.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_worker_pool_size` | gauge | — | Configured number of persistent worker threads, set at pool startup. |
-| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. |
+| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. **Drifts upward** after a `stage="request"` timeout or a client disconnect while a request is waiting on its worker: the decrement is skipped when the waiting future is dropped. Long-run levels are unreliable. |
 | `ephpm_worker_idle` | gauge | — | Workers parked in `take_request()` waiting for work (recorded inside the dispatch recv; only moves in PHP-linked builds). |
 | `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs sitting in the dispatch queue, sampled at each dispatch. |
-| `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to enter the dispatch queue (backpressure when the queue is full). |
+| `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to **enter** the dispatch queue (backpressure when the queue is full). Time spent inside the queue waiting for a free worker is not included. |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | Time from worker-thread start to the framework's first `take_request()` (i.e. framework boot time). |
 | `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `[php.worker] boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
-| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `[php.worker] max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
+| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `[php.worker] max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced; only recorded on a `stage="worker"` timeout, see [the timeout note](#timeouts-and-the-fpm_pool--worker-stages)). |
 | `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than [`[server.timeouts] idle`](/reference/config/#servertimeouts-all-in-seconds) (default 60 s). Note that `idle` does double duty: it is both the connection idle timeout and the worker-mode streaming send timeout, so changing it moves this threshold too. |
 | `ephpm_worker_stream_aborts_total` | counter | — | Streamed responses whose worker died in a bailout after the headers were already sent. The body is deliberately ended with an error (no terminating chunk) so the client sees a failed transfer rather than a truncated 200. Any non-zero value is a PHP crash. |
 
@@ -201,7 +263,7 @@ series at all. The whole path is **experimental** — see
 
 Every node registers the **counters** and `ephpm_cdc_subscribers` at startup,
 zeroed, so an idle node is distinguishable from a build without the
-instrumentation. The four `*_change_id` gauges, the replication-lag gauge, and
+instrumentation. The three `*_change_id` gauges, the replication-lag gauge, and
 the two histograms are deliberately **not** pre-seeded — they are absent from
 `/metrics` until the first subscriber connects or the first batch is applied,
 so a query against them returns no data on an idle cluster. Which series
@@ -268,6 +330,31 @@ litewire change to carry `change_time` plus a matching CDC wire-format change �
 not an ePHPm-side calculation. Until both land, any "seconds behind" figure
 would be invented, so none is published.
 
+### Per-site clustered mode (`per_site = true`)
+
+With `[db.sqlite.replication] per_site = true`, every site replicates over its
+own CDC stream, but all of them record into the **same unlabelled series**
+above. There is no `site` label. What that means for each series:
+
+- **Counters** (`batches_*`, `rows_*`, `snapshot_bytes_*`, `snapshots_served_total`,
+  `streams_refused_total`, `apply_errors_total`, `tail_poll_errors_total`) and
+  both histograms are **sums across all sites**. They still work as
+  "is anything replicating" and "is anything failing" signals.
+- **`ephpm_cdc_subscribers`** counts attached per-site streams across all
+  sites, not replicas.
+- **`ephpm_cdc_applied_change_id`** is overwritten by whichever site applied or
+  bootstrapped last. Each site has its own change log, so the value is not a
+  watermark for anything.
+- **`ephpm_cdc_primary_head_change_id`** is the highest position seen in any
+  site's log, and **`ephpm_cdc_shipped_change_id`** the lowest cursor of any
+  attached stream. They come from different logs, so
+  **`ephpm_cdc_replication_lag_changes` is meaningless in this mode**. Do not
+  alert on it, or on the end-to-end lag query above.
+- **`ephpm_cdc_replica_connects_total`** and **`ephpm_cdc_bootstrap_total`**
+  are not recorded by the per-site driver and stay at `0`.
+
+There is currently no per-site replication-lag metric.
+
 ### Cardinality
 
 Every series above is either unlabelled or carries a label with a fixed, small
@@ -302,3 +389,4 @@ Buckets are custom per metric — configured with `Matcher::Full` rules in [`cra
 - [Query Stats with Prometheus](/guides/query-stats-prometheus/) — practical PromQL queries
 - [Architecture → Query Stats](/architecture/query-stats/) — how the digest normalizer works
 - [Architecture → Metrics](/architecture/metrics/) — design rationale
+- [HTTP Endpoints & Headers](/reference/http-endpoints/) — who can reach the metrics path, and how to restrict it

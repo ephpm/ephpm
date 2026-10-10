@@ -24,9 +24,9 @@ The server must be configured with `[kv.redis_compat] enabled = true` for these 
 
 ## Authentication
 
-The RESP listener requires `AUTH` as soon as either `[kv.redis_compat] password` or `[kv] secret` is set — until a connection authenticates, every command except `AUTH` and `QUIT` is answered with `-NOAUTH Authentication required`. There are two server-side modes:
+The RESP listener requires `AUTH` as soon as either `[kv.redis_compat] password` or `[kv] secret` is set — until a connection authenticates, every command except `AUTH` and `QUIT` is answered with `-NOAUTH Authentication required`. That gate is only as strong as what `AUTH` checks: on a **single-site** server with `[kv] secret` set and no `password`, any `AUTH` succeeds, so the secret alone protects nothing there. The full matrix is in [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication). There are two server-side modes that do check credentials:
 
-**Single password** (`[kv.redis_compat] password`) — pass `--password`, or set `EPHPM_KV_PASSWORD` and leave the flag off:
+**Single password** (`[kv.redis_compat] password`) — pass `--password`, or set `EPHPM_KV_PASSWORD` and leave the flag off. Do not add `--user` here: the server compares the first `AUTH` argument, so `AUTH <user> <password>` fails.
 
 ```bash
 ephpm kv --password "$KV_PASSWORD" keys '*'
@@ -35,11 +35,13 @@ export EPHPM_KV_PASSWORD=...
 ephpm kv keys '*'
 ```
 
-**Per-site HMAC** (`[kv] secret` together with `[server] sites_dir`) — the server expects `AUTH <hostname> <HMAC-SHA256(secret, hostname)>` and scopes the connection to that vhost's store. The derived password is the same value ePHPm injects into PHP as `EPHPM_REDIS_PASSWORD`, so pass it with `--user`:
+**Per-site HMAC** (`[kv] secret` together with `[server] sites_dir`) — the server expects `AUTH <site-key> <HMAC-SHA256(secret, site-key)>` and scopes the connection to that vhost's store. The site key is the vhost directory name (the value PHP sees as `EPHPM_REDIS_USERNAME`, with any `sites_domain_suffix` already stripped). The derived password is the same value ePHPm injects into PHP as `EPHPM_REDIS_PASSWORD`, so pass it with `--user`:
 
 ```bash
 ephpm kv --user blog.example.com --password "$DERIVED" keys '*'
 ```
+
+`[kv.redis_compat] password` is ignored in this mode.
 
 The CLI does not derive that value itself — it never reads `[kv] secret`.
 
