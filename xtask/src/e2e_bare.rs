@@ -910,6 +910,10 @@ trusted_hosts = [
     # can prove one tenant's connections are unreachable from the other.
     "ws-a.test",
     "ws-b.test",
+    # Consumed only by the `request_teardown` suite's cross-tenant destructor
+    # test (shared node, which runs multi-tenant). Inert elsewhere.
+    "teardown-a.test",
+    "teardown-b.test",
 ]
 
 [server.response]
