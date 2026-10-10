@@ -773,7 +773,7 @@ Request from 1.2.3.4:
   if count > limit: return 429
 ```
 
-**Rate limits are per node, not cluster-wide.** `INCR` and the other read-modify-write operations are local-only in the clustered KV — they are not replicated — so each node counts its own requests. Behind a load balancer across N nodes, a client can get up to roughly N times the configured limit. The built-in `ratelimit` middleware has the same property. Owner-routed `INCR` is designed in the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/) but not implemented.
+**Cluster-wide, but approximate.** An increment is atomic on the node that performs it, and since #416 every increment publishes its **resulting total** (with the counter's TTL) to the other nodes, so nodes converge on a shared count. Peers receive totals, not deltas, and apply them last-writer-wins. Concurrent increments on different nodes therefore overwrite each other instead of adding up: if two nodes each raise a counter from 5 to 6 at the same moment, the cluster settles on 6, not 7. The limit can under-count, and in the worst case a client spread across N nodes gets up to roughly N times the allowance. The built-in `ratelimit` middleware has the same property. Exact cluster-wide counting needs owner-routed `INCR`, designed in the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/) but not implemented.
 
 ---
 
@@ -806,7 +806,7 @@ The KV store and clustering should be built incrementally:
 | **9. ACME on KV** | Swap `DirCache` for `KvCache` in rustls-acme | Phase 8 |
 | **10. PHP response cache** | ETag interception, 304 short-circuit | Phase 7 |
 | **11. Distributed locks** | TTL-based locks, leader election | Phase 7 |
-| **12. Rate limiting** | Counters with TTL windows (per node today; cluster-wide needs owner-routed `INCR`) | Phase 7 |
+| **12. Rate limiting** | Counters with TTL windows (replicated as last-writer-wins totals today, so approximate; exact counting needs owner-routed `INCR`) | Phase 7 |
 
 Phases 1-5 (single-node) and Phase 6 (gossip) can be developed in parallel. Everything after Phase 7 depends on key ownership being operational. RESP lists, sets and sorted sets are deliberately **not** on this list: the KV is a cache, not a broker, and queue-style workloads belong on a real Redis.
 

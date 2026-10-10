@@ -103,7 +103,7 @@ data_port           = 7947
 - `replication_factor = 2` keeps each large value on its owner plus the next node on the ring; it is clamped to the number of alive nodes, so a factor larger than the cluster just keeps one copy per node.
 - `replication_mode = "async"` (default) returns after the primary/local write and replicates in the background; `"sync"` also awaits every reachable replica (best-effort — a down replica is logged, not fatal). Any other value silently means `"async"`.
 - `data_port` always binds `0.0.0.0`, whatever IP `[cluster] bind` uses — firewall it on multi-homed hosts. Every node must use the same port.
-- `INCR`/`DECR` are **not** replicated: counters (and so the `ratelimit` middleware) are per node.
+- Counters (`INCR`/`DECR`, and so the `ratelimit` middleware) are approximate cluster-wide. Each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes overwrite rather than add. Limits can under-count, up to roughly N times the allowance across N nodes in the worst case.
 
 The KV is a cache, not a message broker: there are no lists, sets or `MULTI`/`EVAL`, so Redis-backed job queues (Laravel queues included) need a real Redis. See [Architecture → Clustering → Redis Protocol](/architecture/clustering/#1-redis-protocol-resp--redis-compatible-for-caching-not-a-redis-replacement) for what the RESP listener does and does not support.
 
