@@ -55,7 +55,7 @@ How it works:
 
 ### Routing writes: `/_ephpm/primary`
 
-In this mode only the primary accepts writes; sending writes to a replica is unsupported. Every node answers `GET /_ephpm/primary` with `200 {"primary":true}` on the primary and `503 {"primary":false}` on a replica. Use it as the health check of a "writes" backend pool (or a Kubernetes Service backed by a readiness-style probe on that path) so write traffic follows the primary through a failover, and send read-only traffic to all nodes. A worked example is in the [Kubernetes roadmap → Active-passive writes](/roadmap/kubernetes/#active-passive-writes-_ephpmprimary).
+In this mode only the primary's writes replicate. A replica's wire listener still **accepts** writes (litewire has no read-only mode), but they are never replicated and silently diverge from the primary, so route every write to the primary. Every node answers `GET /_ephpm/primary` with `200 {"primary":true}` on the primary and `503 {"primary":false}` on a replica. Use it as the health check of a "writes" backend pool (or a Kubernetes Service backed by a readiness-style probe on that path) so write traffic follows the primary through a failover, and send read-only traffic to all nodes. A worked example is in the [Kubernetes roadmap → Active-passive writes](/roadmap/kubernetes/#active-passive-writes-_ephpmprimary).
 
 ## Per-site clustered databases (experimental)
 

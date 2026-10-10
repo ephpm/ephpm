@@ -7,19 +7,23 @@
 > (write-stamped tombstones broadcast over the same gossip
 > subscription — peers `remove_local` when the tombstone beats their
 > last-applied write) and to **EXPIRE** (re-emit the value with the new
-> expiry stamp; peers apply verbatim by last-arrival-wins). What remains
-> is **owner-routed `INCR`** — the counter-replication piece needed for
+> expiry stamp; peers apply verbatim by last-arrival-wins). Since #416,
+> `INCR` and `APPEND` publish their resulting value too, last-writer-wins.
+> What remains is **owner-routed `INCR`** — exact counting, needed for
 > cluster-correct rate limiting. This page still designs that.
 
 ## What v1 does not do (and warns about)
 
-One gap remains after v1.1:
+One gap remains after v1.1 and #416:
 
-1. **`INCR`/`APPEND` in-place mutations do not replicate.** Only the
-   new-key creation path routes through `Store::set`. Consequence: the
-   rate-limit middleware's counters are **per-node** in a cluster — a
-   client at the limit on node A is fresh on node B. Startup warns when
-   `[cluster].enabled` coexists with a ratelimit mount.
+1. **Counters replicate totals, not deltas.** `INCR` is atomic on the
+   node that runs it and then publishes the counter's new total; peers
+   apply it last-writer-wins. Concurrent increments on different nodes
+   therefore overwrite rather than sum, so the rate-limit middleware's
+   cluster-wide counts are **approximate** and can under-count — up to
+   roughly N times the allowance across N nodes in the worst case.
+   Startup warns when `[cluster].enabled` coexists with a ratelimit
+   mount.
 
 Two other v1 gaps have shipped as of v1.1 and are no longer roadmap
 work:

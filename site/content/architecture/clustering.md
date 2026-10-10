@@ -143,7 +143,7 @@ eviction_policy = "allkeys-lru"  # noeviction, allkeys-lru, volatile-lru, allkey
 
 ## PHP Access
 
-PHP reaches the KV store three ways. The SAPI functions and the native session handler run in-process; the RESP listener is a TCP socket for existing Redis clients. All three see the same store, and with clustering on, writes are replicated by the cluster layer described below.
+PHP reaches the KV store three ways. The SAPI functions and the native session handler run in-process; the RESP listener is a TCP socket for existing Redis clients. All three see the same store, and with clustering on, string writes (`SET`, `DEL`, `EXPIRE`, `INCR`) are replicated by the cluster layer described below. Hash commands (`HSET`/`HDEL`) and `FLUSHDB` stay node-local — see [KV Store → replication](/architecture/kv-store/).
 
 ### 1. Redis Protocol (RESP) — Redis-compatible for caching, not a Redis replacement
 
@@ -726,7 +726,7 @@ Caveats, all from the clustered KV's design:
 
 - Replication is asynchronous by default and write-time only. A session written on one node is visible elsewhere only after gossip converges or the data-plane write completes, and there is no background re-replication after a node loss.
 - When membership changes, ownership of large sessions remaps and existing copies are not moved; reads fall back to surviving replicas.
-- `session_destroy()` and lazy-write TTL refreshes are not replicated cluster-wide in KV v1 — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/).
+- `session_destroy()` (a `DEL`, replicated as a tombstone) and lazy-write TTL refreshes (an `EXPIRE`) do replicate, last-arrival-wins, so like every other session write they are eventually consistent rather than immediate.
 - Sessions count against `[kv] memory_limit` and can be evicted under memory pressure like any other key.
 
 ### Distributed Locking
