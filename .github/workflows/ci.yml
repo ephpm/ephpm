@@ -21,6 +21,21 @@ on:
       - "docs/**"
       - "**.md"
 
+# Cancel superseded PR runs. One push fans out ~10 Linux x64 jobs across this
+# workflow and e2e.yml onto a self-hosted pool of a few slots, so a PR pushed
+# three times otherwise holds three full sets in the queue, and only the head
+# commit's result matters. Only pull_request runs ever cancel.
+#
+# Non-PR runs (pushes to main) are keyed on their own run id, so they never
+# share a group with anything. GitHub keeps at most ONE pending run per group
+# and cancels the older pending one when another arrives, even with
+# cancel-in-progress false. Keying main on `github.ref` would drop CI for
+# commits in a burst of merges; the run id keeps every commit on main its own
+# result, exactly as before this group existed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -133,9 +148,15 @@ jobs:
           echo "==> deps stage built in $(( $(date +%s) - start ))s"
           # Again no `docker image rm` — the shim has no DELETE /images/.
 
+  # Format, Clippy and Cargo Deny run on GitHub-hosted runners (free for this
+  # public repo) so the cheap gates never queue behind 15-minute E2E legs on the
+  # few self-hosted Linux x64 slots. None of them needs the fleet: rustfmt and
+  # cargo-deny only read the source and the lockfile, and Clippy is a stub-mode
+  # build (no PHP_SDK_PATH, so ephpm-php links no libphp) whose prerequisites
+  # come from apt. The toolchain still comes from rust-toolchain.toml.
   fmt:
     name: Format
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -145,7 +166,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install build prerequisites
@@ -252,31 +273,12 @@ jobs:
 
   deny:
     name: Cargo Deny
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install build prerequisites
-        # Some runners in the fleet come up as root without `sudo` installed, so
-        # a bare `sudo apt-get` exits 127 (command not found) and reds out the
-        # job in under 10s for reasons unrelated to the change under test.
-        # Observed on both Clippy and E2E legs. Resolve the escalation method at
-        # run time rather than assuming it.
-        run: |
-          set -eu
-          if ! command -v apt-get >/dev/null 2>&1; then
-            echo "apt-get unavailable; assuming the image already provides build prerequisites"
-            exit 0
-          fi
-          if [ "$(id -u)" -eq 0 ]; then
-            SUDO=""
-          elif command -v sudo >/dev/null 2>&1; then
-            SUDO="sudo"
-          else
-            echo "::error::not running as root and sudo is unavailable"
-            exit 1
-          fi
-          $SUDO apt-get update
-          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      # cargo-deny reads `cargo metadata` and the advisory DB; no build script
+      # runs, so it needs no C toolchain or libclang. The prebuilt binary
+      # replaces a ~2-minute `cargo install` from source.
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install --locked cargo-deny
+      - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
