@@ -36,7 +36,7 @@ Why a built-in KV? PHP apps want a cache. The default answer is "run Redis." Tha
 └──────────────┘      └──────────────┘    └──────────────────────┘
 ```
 
-Hash entries are kept separate from string entries because Redis types are mutually exclusive — `WRONGTYPE` errors flow naturally from this split.
+Hash entries are kept in a separate map from string entries. Unlike Redis, the two do not exclude each other: there is no `WRONGTYPE` error, and one name can hold a string and a hash at the same time (`GET` on a hash name returns nil, `TYPE` reports `hash`). TTLs, `RENAME` and cluster replication apply to the string map only. See [KV RESP Protocol](/reference/kv-resp/#strings-and-hashes-do-not-collide).
 
 ## Storage
 
@@ -80,13 +80,13 @@ LRU isn't strict — maintaining a true global LRU over a sharded map would be e
 
 The on-wire format is Redis RESP2. We don't fork a Redis-compatible parser — we have a tight implementation in [`crates/ephpm-kv/src/resp/`](https://github.com/ephpm/ephpm/tree/main/crates/ephpm-kv/src/resp). Connections are tokio tasks reading line-buffered RESP frames; one connection = one task, no thread pool.
 
-Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`), keys, connection. See [KV from PHP](/guides/kv-from-php/) for the full command list.
+Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`), keys, connection. See [KV RESP Protocol](/reference/kv-resp/) for every command, its deviations from Redis, and what is not implemented.
 
 ## Multi-tenant isolation
 
-In vhost mode (`[server] sites_dir = ...`), whether the RESP listener is isolated per tenant depends entirely on `[kv] secret`.
+In vhost mode (`[server] sites_dir = ...`), the RESP listener requires `[kv] secret`.
 
-**Without `[kv] secret`**, it is a sharp tool: every connection dispatches against the process-wide default store, so any client that can reach the listener sees *every* site's keys. The optional `[kv.redis_compat] password` gates access but does not scope it. Recommended posture is to leave `[kv.redis_compat] enabled = false` and let PHP use the SAPI functions, which are namespaced per host regardless of this listener.
+**Without `[kv] secret`**, enabling `[kv.redis_compat]` is a **startup error**: the listener would otherwise serve the process-wide default store to every tenant with no authentication. Recommended posture is still to leave `[kv.redis_compat] enabled = false` and let PHP use the SAPI functions, which are namespaced per host regardless of this listener.
 
 **With `[kv] secret` set**, a connection must authenticate as a specific host and is then bound to that host's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
 
@@ -94,7 +94,9 @@ In vhost mode (`[server] sites_dir = ...`), whether the RESP listener is isolate
 password = HMAC-SHA256(secret, hostname)
 ```
 
-The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is unset, nothing is auto-generated — multi-tenant HMAC AUTH is simply disabled.
+The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. `[kv.redis_compat] password` is ignored in this mode. If `[kv] secret` is unset, nothing is auto-generated.
+
+In **single-site** mode `[kv] secret` does not protect the listener: clients are asked to `AUTH`, but any `AUTH` succeeds unless `[kv.redis_compat] password` is also set. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ## Clustered KV (when `[cluster] enabled = true`)
 
@@ -133,7 +135,7 @@ Cluster-tier writes carry a version number. Local hot-key cache entries store th
 
 ## Failure modes
 
-- **Eviction storm** — large bulk writes can push the store over `memory_limit`, triggering rapid eviction. Symptoms: spike in `ephpm_kv_evictions_total` (when implemented), p99 read latency rising as shards rebalance. Mitigation: raise `memory_limit`, enable compression, or use TTLs more aggressively.
+- **Eviction storm** — large bulk writes can push the store over `memory_limit`, triggering rapid eviction. Symptoms: p99 read latency rising as shards rebalance. The KV store exports no Prometheus metrics today (no eviction counter, no memory gauge; `ephpm_kv_evictions_total` is planned, not implemented). `INFO` over RESP reports `used_memory`. Mitigation: raise `memory_limit`, enable compression, or use TTLs more aggressively.
 - **Compression failure on read** — corrupted entry. Read returns an error. Rare; usually indicates an upstream bug (e.g. compression algorithm changed without a flush).
 - **Cluster split brain on writes** — async replication means a partitioned node can serve stale reads after a partition heals. The next gossip update invalidates the stale entry. Sync mode avoids this at the cost of write latency.
 

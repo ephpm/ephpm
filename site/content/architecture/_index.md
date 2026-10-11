@@ -137,7 +137,13 @@ Every ePHPm node runs as a serving node. The Node API is always present — it's
 
 ### Admin UI (`ephpm admin`)
 
-The admin UI is a **separate mode**, not an embedded feature of the serving node. It runs either standalone (connecting to remote nodes) or embedded in a serving node for dev convenience. Same binary, different subcommand.
+> **Planned — not yet implemented.** There is no `ephpm admin` subcommand and no
+> `ephpm serve --admin` flag. Both are rejected by the CLI today. This section,
+> and the [Node API Specification](#node-api-specification) below, describe the
+> intended design. See the [CLI reference](/reference/cli/) for the commands
+> that exist.
+
+The admin UI is designed as a **separate mode**, not an embedded feature of the serving node. It runs either standalone (connecting to remote nodes) or embedded in a serving node for dev convenience. Same binary, different subcommand.
 
 ```
 # Dev / single node — embedded admin, zero config
@@ -175,6 +181,8 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
 ```
 
 ### Production Cluster Layout
+
+The admin instance and Node API in this diagram are planned, not implemented (see above).
 
 ```
    ┌──────────────────────────── Production Cluster ────────────────────────────┐
@@ -249,7 +257,7 @@ secret = "your-shared-secret"       # bearer token auth
 # tls_key = "/path/to/key.pem"
 ```
 
-**`--admin` flag behavior:** When `ephpm serve --admin` is used, the serving node starts the admin web UI on a separate port (`:8080`) alongside the Node API. The embedded admin connects to its own Node API on `localhost:9090` — same code path as remote admin, just local. In `ephpm.toml`:
+**`--admin` flag behavior (planned, not implemented):** When `ephpm serve --admin` is used, the serving node starts the admin web UI on a separate port (`:8080`) alongside the Node API. The embedded admin connects to its own Node API on `localhost:9090` — same code path as remote admin, just local. In `ephpm.toml`:
 
 ```toml
 [admin]
@@ -270,7 +278,7 @@ password = "changeme"                 # admin UI auth (separate from node API au
 | **Multi-node production** | Admin runs on a small dedicated box/container. Consumes ~50-100MB RAM, minimal CPU. |
 | **Prometheus coexistence** | Node API `/metrics` works regardless of admin. Teams already using Grafana keep their setup and optionally add the admin UI. |
 | **Security boundary** | Node API auth (shared secret / mTLS) is separate from admin UI auth (username/password, SSO in enterprise). Internal API never exposed to the internet. |
-| **Same binary** | No separate build artifact. `ephpm serve` and `ephpm admin` are subcommands via `clap`. Simpler CI, simpler distribution. |
+| **Same binary** | No separate build artifact. `ephpm admin` would be another `clap` subcommand next to `ephpm serve` (planned). Simpler CI, simpler distribution. |
 
 ---
 
@@ -1281,19 +1289,19 @@ max_connections = 50
 inject_env = true   # auto-set DB env vars for the PHP app
 ```
 
-When `inject_env = true`, ePHPm injects environment variables into the PHP runtime before the app boots:
+When `inject_env = true`, ePHPm injects these variables into every PHP request's `$_SERVER` (they are **not** process environment variables, so `getenv()` does not return them):
 
 | Variable | Value | Consumed by |
 |---|---|---|
 | `DB_CONNECTION` | `mysql` | Laravel |
 | `DB_HOST` | `127.0.0.1` | Laravel, Symfony, generic |
 | `DB_PORT` | `3306` | Laravel, Symfony, generic |
-| `DB_DATABASE` | `myapp` | Laravel |
-| `DB_USERNAME` | `appuser` | Laravel |
+| `DB_NAME` | `myapp` | generic (Laravel reads `DB_DATABASE`, which proxy mode does not set) |
+| `DB_USER` | `appuser` | generic (Laravel reads `DB_USERNAME`, which proxy mode does not set) |
 | `DB_PASSWORD` | `secret` | Laravel |
 | `DATABASE_URL` | `mysql://appuser:secret@127.0.0.1:3306/myapp` | Symfony, Doctrine |
 
-Laravel reads `DB_HOST` from `.env` with a fallback to actual environment variables. Symfony reads `DATABASE_URL`. Both frameworks pick up ePHPm's injected values automatically — the connection goes through the proxy without any `.env` file changes or application code changes.
+Laravel's `env()` falls back to `$_SERVER`, so it picks up the injected `DB_CONNECTION`, `DB_HOST`, `DB_PORT` and `DB_PASSWORD` (its Dotenv loader does not overwrite values already present, so these win over `.env`), but it reads `DB_DATABASE`/`DB_USERNAME`, which proxy mode does not inject — set those in `.env`. Symfony reads `DATABASE_URL`, which is injected in full.
 
 The PHP app thinks it's talking to `127.0.0.1:3306`. ePHPm's proxy is listening there, pooling connections, analyzing queries, splitting reads/writes, and forwarding to the real database. Fully transparent.
 
@@ -1707,13 +1715,17 @@ Client ──HTTP──► hyper (tokio)
                         ├── send_header() → capture headers
                         ├── read_post() → provide POST data
                         └── read_cookies() → provide cookies
-                     4. php_request_shutdown()
-                     5. Return (status, headers, body)
+                     4. Return (status, headers, body)
                             │
                             ▼
                 Build hyper::Response
                             │
 Client ◄──HTTP──────────────┘
+
+             then, on the same PHP thread, after the reply:
+                     5. php_request_shutdown()
+                        (destructors, session write +
+                         unlock, extension RSHUTDOWN)
 ```
 
 ---

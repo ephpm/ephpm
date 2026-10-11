@@ -145,6 +145,14 @@ Three ways for PHP to access the KV store, each serving different use cases. All
 
 ### 1. Redis Protocol (RESP) — Zero Code Changes
 
+> **Design section — the shipped listener differs.** Unix-socket transport is
+> **not implemented** (`[kv.redis_compat] socket` only logs a warning), the
+> command set is smaller than the "MVP" list below (no `HMSET`, `HMGET` or
+> `SCAN`), and there are no lists, so queue drivers do not work. Framework
+> features that use `MULTI`/`EXEC`, Lua `EVAL` or sets (for example Laravel
+> queues, cache tags and lock release) will fail. The
+> [KV RESP Protocol reference](/reference/kv-resp/) is the accurate list.
+
 **Priority: implement first.** This gives instant compatibility with every PHP app that already uses Redis. WordPress, Laravel, Symfony, Drupal — they all have Redis session and cache drivers. No code changes, no new dependencies.
 
 ePHPm exposes a RESP (Redis Serialization Protocol) listener that PHP's existing Redis clients connect to as if it were a real Redis server. Two transport options:
@@ -702,6 +710,14 @@ The KV layer is a foundation for several higher-level features. Each section bel
 
 ### TLS Certificate Management (Clustered)
 
+> **Design section — not what shipped.** The lock and key names below
+> (an `acme:lock:<domain>` issuance lock, `certs:<domain>:*` keys) are the
+> original design. The implementation in `acme.rs` uses an `acme:leader` claim
+> with a heartbeat and `acme:cert:…` keys, and **challenge sharing is not
+> implemented**: nothing writes `acme:challenge:*`, and TLS-ALPN-01 material
+> stays on the ordering node. See [HTTP architecture → Automatic TLS](/architecture/http/#automatic-tls-acme)
+> for the shipped behavior.
+
 Single-node ACME is already implemented using filesystem-based `DirCache`. The clustered KV store replaces it with `KvCache`, enabling zero-config HTTPS across multiple nodes. See [http.md](http.md) for single-node ACME details.
 
 #### Problem 1: Cert Issuance Race Condition
@@ -884,7 +900,7 @@ PHP: session_start()
 
 The session handler is registered during SAPI initialization via `php_session_register_module()`. All functions go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` bailout protection.
 
-> **TODO verify / does not match the shipped code:** the C listing below is the *original design sketch*. The actual implementation in `crates/ephpm-php/ephpm_wrapper.c` does not use the `ephpm_kv_session_lock(const char *id, size_t id_len)` / `ephpm_kv_session_unlock(...)` FFI signatures shown here. Locking is done inside the wrapper via a KV op table (`g_kv_ops.set_nx` / `g_kv_ops.del`) and internal `static` helpers `ephpm_session_lock_acquire(sid, sid_len)` / `ephpm_session_lock_release(void)`, with the acquired sid tracked in thread-local state (`session_lock:<sid>`, 30s TTL, spin-with-backoff). See [the Sessions feature doc](/features/sessions/) for the authoritative behaviour.
+> **TODO verify / does not match the shipped code:** the C listing below is the *original design sketch*. The actual implementation in `crates/ephpm-php/ephpm_wrapper.c` does not use the `ephpm_kv_session_lock(const char *id, size_t id_len)` / `ephpm_kv_session_unlock(...)` FFI signatures shown here. Locking is done inside the wrapper via a KV op table (`g_kv_ops.set_nx` / `g_kv_ops.del`) and internal `static` helpers `ephpm_session_lock_acquire(sid, sid_len)` / `ephpm_session_lock_release(void)`, with the acquired sid tracked in thread-local state (`session_lock:<sid>`, 30s TTL, spin-with-backoff). See [the Sessions guide](/guides/sessions/) for the authoritative behaviour.
 
 ```c
 // ephpm_wrapper.c
@@ -1070,7 +1086,7 @@ fn session_lock(session_id: &str, timeout: Duration) -> bool {
 }
 ```
 
-With clustering, the lock key `session_lock:{id}` is small and rides the gossip tier (it is well under `small_key_threshold`), so it is replicated to every node — the `SETNX` and `DEL` operate on the local gossip-backed view. (In the shipped implementation the lock is node-local; see the [Sessions feature doc](/features/sessions/) for the exact cross-node semantics.)
+With clustering, the lock key `session_lock:{id}` is a small string key, so its `SETNX` and `DEL` replicate over the gossip tier like any other write — but acquisition is decided against the local node's view, and a peer sees the key only after gossip converges. The lock therefore reliably serializes only requests on the same node; see the [Sessions guide](/guides/sessions/) for the cross-node semantics.
 
 #### Serialization
 
@@ -1081,7 +1097,7 @@ PHP has a built-in session serializer (`session.serialize_handler`). By default 
 ```toml
 [php]
 ini_overrides = [
-    # Enable ephpm session handler (set automatically when [kv] is configured)
+    # Enable the ephpm session handler (opt-in; PHP's default is "files")
     ["session.save_handler", "ephpm"],
 
     # Standard PHP session settings still apply
@@ -1093,7 +1109,7 @@ ini_overrides = [
 ]
 ```
 
-When `[kv]` is configured in ephpm.toml, the session handler is registered automatically. If the user hasn't explicitly set `session.save_handler`, ephpm defaults to the KV handler. If they've set it to `files` or `redis` explicitly, we respect that.
+The `ephpm` handler is always registered, but nothing selects it for you: `session.save_handler` stays at PHP's default, `files`, until you set it as above (or with `ini_set()`). With `files`, sessions are node-local files and are **not** shared across the cluster. See the [Sessions guide](/guides/sessions/).
 
 #### Clustering Behavior
 

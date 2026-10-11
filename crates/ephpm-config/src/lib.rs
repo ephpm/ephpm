@@ -53,7 +53,10 @@ pub enum ConfigError {
 ///    to start as a Windows service. Nested sections have no such exposure:
 ///    nothing sets an `EPHPM_*` variable containing the `__` nesting
 ///    separator, so every key that reaches a section came from an operator
-///    asking for something. Pinned by
+///    asking for something. The cost of the lenient root: an operator
+///    variable mis-spelled with a single underscore at the first boundary
+///    (`EPHPM_SERVER_LISTEN` instead of `EPHPM_SERVER__LISTEN`) lands here as
+///    an unknown top-level key and is silently ignored. Pinned by
 ///    `config_root_stays_lenient_so_non_config_env_vars_cannot_block_startup`.
 /// 2. **[`DeprecatedSqldConfig`] is lenient**, because tolerating keys this
 ///    binary no longer declares is its entire purpose.
@@ -73,10 +76,13 @@ pub struct Config {
     #[serde(default)]
     pub cluster: ClusterConfig,
 
-    /// Native middleware chain (`[[middleware]]` blocks). Each mount loads a
-    /// shared library (`.so`/`.dylib`/`.dll`) at startup and evaluates it per
-    /// PHP-bound request, before the request body is read — see the loader in
-    /// `ephpm-server`. Mounts run in ascending `order`.
+    /// Native middleware chain (`[[middleware]]` blocks). Each mount resolves
+    /// at startup to a builtin compiled into the binary, a `php:` script, or a
+    /// shared library (`.so`/`.dylib`/`.dll`) — see the loader in
+    /// `ephpm-server`. The native request phase runs on PHP-bound **and**
+    /// static-file requests (and on `/_ephpm/auth/…`), before the request
+    /// body is read unless `[server.request] middleware_body_limit > 0`.
+    /// Mounts run in ascending `order`.
     ///
     /// Default: empty (no middleware loaded).
     #[serde(default)]
@@ -112,10 +118,13 @@ pub struct MiddlewareMount {
     /// 1. A `php:` prefix selects the **PHP middleware lane** (EXPERIMENTAL) —
     ///    the rest of the value is a path to a `.php` file, relative to the
     ///    request's document root. See [`MiddlewareMount::php_script`].
-    /// 2. Otherwise the value is checked against the builtin registry (`jwt`,
-    ///    `cors`, `ratelimit`/`rate-limit`, `security-headers`,
-    ///    `session-cookie` and their `ephpm-middleware-*` long forms are
-    ///    compiled into every binary — no dlopen).
+    /// 2. Otherwise the value is checked against the builtin registry — the
+    ///    twelve modules compiled into every binary, no dlopen: `jwt`,
+    ///    `session-cookie`, `cors`, `ratelimit`/`rate-limit`,
+    ///    `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`,
+    ///    `redirect`, `request-id`, `header-transform` and `preview-gate`,
+    ///    plus their `ephpm-middleware-*` long forms (`-`/`_`
+    ///    interchangeable).
     /// 3. Anything else is a shared library: either a bare name (resolved
     ///    through the middleware search path with a platform suffix, e.g.
     ///    `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
@@ -127,7 +136,9 @@ pub struct MiddlewareMount {
     /// Glob the request path must match for this mount to run. `*` matches
     /// any character sequence (including `/`); everything else is literal.
     ///
-    /// Default: unset (the middleware runs on every PHP-bound request).
+    /// Default: unset (the middleware runs on every request that reaches the
+    /// chain — PHP-bound and static-file alike; a `php:` mount runs only on
+    /// PHP requests).
     #[serde(rename = "match", default)]
     pub match_pattern: Option<String>,
 
@@ -224,7 +235,10 @@ pub struct ServerConfig {
     /// auto_prepend_file = ".preview-env.php"     # also relative to the container
     /// ```
     ///
-    /// Those two keys are the **whole** schema, and the boundary is deliberate:
+    /// Those two keys, plus a `[preview_auth]` section that turns the
+    /// per-site preview access gate on (parsed in `ephpm-server`'s
+    /// `site_overrides` module), are the **whole** schema, and the boundary
+    /// is deliberate:
     /// in the deployment this exists for, the daemon derives the file from a
     /// manifest committed inside the *tenant's* repository, so every value is
     /// transitively tenant-influenced. A free-form `ini` table would therefore
@@ -464,9 +478,11 @@ pub struct ServerConfig {
     ///
     /// `None` when the `[server.security]` section is absent from the TOML
     /// (and no `EPHPM_SERVER__SECURITY__*` env var is set). Presence of the
-    /// section feeds into the resolved defaults for `open_basedir` and
-    /// `disable_shell_exec` — see [`ServerConfig::effective_open_basedir`]
-    /// and [`ServerConfig::effective_disable_shell_exec`].
+    /// section — including one created only by such an env var — feeds into
+    /// the resolved defaults for `open_basedir`, `disable_shell_exec` and
+    /// `multi_tenant_hardening` — see [`ServerConfig::effective_open_basedir`],
+    /// [`ServerConfig::effective_disable_shell_exec`] and
+    /// [`ServerConfig::effective_multi_tenant_hardening`].
     #[serde(default)]
     pub security: Option<SecurityConfig>,
 
@@ -753,8 +769,12 @@ pub struct RequestConfig {
     /// Allowed `Host` header values. When non-empty, requests with
     /// a `Host` header not in this list receive a 421 Misdirected Request.
     ///
-    /// Prevents host header injection attacks. Values should include
-    /// the port if non-standard (e.g. `"example.com:8080"`).
+    /// Prevents host header injection attacks. Matching is
+    /// case-insensitive. A bare entry (`"example.com"`) matches that host on
+    /// **any** port (`example.com`, `example.com:8080`); an entry that
+    /// includes a port (`"example.com:8080"`) matches only that exact
+    /// `host:port`. A trailing dot is not stripped, so `example.com.` does
+    /// not match `"example.com"`.
     ///
     /// Default: `[]` (all hosts allowed).
     #[serde(default)]
@@ -778,7 +798,7 @@ pub struct RequestConfig {
     /// front bypasses worker-mode request streaming for such requests.
     ///
     /// Independent of `max_body_size`, which remains the hard cap that 413s an
-    /// oversized body. Env override: `EPHPM_SERVER_REQUEST__MIDDLEWARE_BODY_LIMIT`.
+    /// oversized body. Env override: `EPHPM_SERVER__REQUEST__MIDDLEWARE_BODY_LIMIT`.
     #[serde(default = "default_middleware_body_limit")]
     pub middleware_body_limit: u64,
 }
@@ -829,13 +849,17 @@ pub struct TimeoutsConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
-    /// Enable gzip compression for text responses.
+    /// Enable compression for text responses: brotli when the client's
+    /// `Accept-Encoding` allows it, gzip otherwise.
     ///
     /// Default: true.
     #[serde(default = "default_compression")]
     pub compression: bool,
 
-    /// Gzip compression level (1–9). 1 is fastest, 9 is best compression.
+    /// Compression level (1–9). 1 is fastest, 9 is best compression. Used
+    /// as the gzip level, and passed through unchanged (capped at 9) as the
+    /// brotli quality when brotli is negotiated — it is not rescaled onto
+    /// brotli's 0–11 range.
     ///
     /// Default: 1.
     #[serde(default = "default_compression_level")]
@@ -875,9 +899,10 @@ pub struct ResponseConfig {
     ///
     /// Useful for security headers like HSTS, CSP, X-Frame-Options, CORS.
     ///
-    /// Example: `{ "Strict-Transport-Security" = "max-age=31536000", "X-Frame-Options" = "DENY" }`
+    /// An array of `[name, value]` pairs (not a table), e.g.
+    /// `headers = [["Strict-Transport-Security", "max-age=31536000"], ["X-Frame-Options", "DENY"]]`.
     ///
-    /// Default: `{}` (none).
+    /// Default: `[]` (none).
     #[serde(default)]
     pub headers: Vec<[String; 2]>,
 }
@@ -1005,7 +1030,21 @@ pub struct SecurityConfig {
     /// Trusted reverse proxy addresses (CIDR notation).
     ///
     /// When a request comes from a trusted proxy, `X-Forwarded-For` is used
-    /// for `REMOTE_ADDR` and `X-Forwarded-Proto` for HTTPS detection.
+    /// for `REMOTE_ADDR` (the rightmost address that is not itself a trusted
+    /// proxy) and `X-Forwarded-Proto` for HTTPS detection — any value other
+    /// than `https` from a trusted peer turns `HTTPS` off, even on a
+    /// TLS-terminated connection. `X-Forwarded-Host`, `X-Forwarded-Port` and
+    /// RFC 7239 `Forwarded` are not read.
+    ///
+    /// The resolved address drives `per_ip_rate`, but
+    /// `[server.limits] per_ip_max_connections` is counted at accept time
+    /// against the raw TCP peer, so behind a load balancer it caps the
+    /// balancer's connections, not each client's.
+    ///
+    /// Setting this (in TOML or via `EPHPM_SERVER__SECURITY__TRUSTED_PROXIES`)
+    /// makes the `[server.security]` section present, which resolves the
+    /// unset isolation flags below to `true`; in single-site mode they are
+    /// inert and each logs a startup warning.
     ///
     /// Default: `[]` (trust no proxies).
     #[serde(default)]
@@ -1036,12 +1075,14 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_php_paths: Vec<String>,
 
-    /// Restrict PHP filesystem access to each site's document root.
+    /// Restrict PHP filesystem access to each site's container directory.
     ///
     /// **Multi-tenant only.** The restriction is applied on the vhost
     /// request path in `ephpm-server`, which runs only when `sites_dir` is
-    /// set: PHP's `open_basedir` is set per-request to the site's directory
-    /// plus the system temp dir, so a site cannot read or write outside it.
+    /// set: PHP's `open_basedir` is set per-request to the site container
+    /// (`sites_dir/<site-key>`) plus that site's own private temp/session
+    /// state root — never the shared system temp dir — so a site cannot read
+    /// or write outside them.
     ///
     /// **In single-site mode (`sites_dir` unset) this flag does nothing** —
     /// no `open_basedir` is applied, whatever it resolves to. The
@@ -1343,11 +1384,11 @@ impl ServerConfig {
     }
 
     /// The `[server.security]` isolation flags that resolve to `true` but
-    /// have no effect, because both are implemented only on the
+    /// have no effect, because all three are implemented only on the
     /// multi-tenant path and `sites_dir` is unset.
     ///
     /// Returns the config key names, in declaration order. Empty in
-    /// multi-tenant mode, and empty in single-site mode when neither flag
+    /// multi-tenant mode, and empty in single-site mode when no flag
     /// resolves to `true` — so a config that never mentions
     /// `[server.security]` stays quiet. `ephpm` warns once at startup for
     /// each name returned here (the no-silent-knob rule): an operator who
@@ -1370,7 +1411,7 @@ impl ServerConfig {
         inert
     }
 
-    /// Shared resolution for the two isolation flags.
+    /// Shared resolution for the three isolation flags.
     fn resolve_security_flag(&self, field: impl Fn(&SecurityConfig) -> Option<bool>) -> bool {
         match &self.security {
             // Section present: unset fields default to true (compat with
@@ -2028,10 +2069,10 @@ pub struct Http3Config {
     /// Default: `false`. HTTP/3 is opt-in because it binds an extra UDP
     /// socket and requires a static TLS certificate.
     ///
-    /// When `true` but TLS is absent or is in ACME mode, startup logs a
-    /// warning and the QUIC listener does not start — the TCP listeners are
-    /// unaffected. ePHPm never silently continues without the HTTP/3
-    /// listener an operator asked for.
+    /// When `true` but TLS is absent, is in ACME mode, or lacks either
+    /// `cert` or `key`, startup **fails** with an error naming the problem —
+    /// ePHPm never silently continues without the HTTP/3 listener an
+    /// operator asked for.
     #[serde(default)]
     pub enabled: bool,
 
@@ -3083,7 +3124,8 @@ pub enum OverloadPolicy {
     /// waited `[php] shed_after_ms` for an execution slot, instead of waiting
     /// further. Turns overload into fast, countable errors rather than client
     /// timeouts — the load-shedding behaviour a proxy or load balancer expects
-    /// to see from a saturated backend.
+    /// to see from a saturated backend. Per-request mode only: worker mode
+    /// ignores it (startup WARNs) and keeps waiting.
     Shed,
 }
 
@@ -3372,7 +3414,9 @@ pub struct PhpConfig {
     /// `ini_overrides`. This allows reusing an existing php.ini from your
     /// PHP installation or custom configuration.
     ///
-    /// If not set, PHP uses its default ini locations (or none if not found).
+    /// The file's contents are inlined into the php.ini ePHPm generates at
+    /// startup, which is the php.ini PHP loads — PHP does not search its own
+    /// default php.ini locations when the server runs.
     ///
     /// Default: `None` (no custom ini file).
     #[serde(default)]
@@ -3382,6 +3426,11 @@ pub struct PhpConfig {
     ///
     /// Applied after `ini_file` is loaded (if specified), so these take
     /// precedence over `ini_file` settings.
+    ///
+    /// ePHPm sets no `display_errors` line of its own, so unless one is given
+    /// here or in `ini_file`, PHP's compiled-in `display_errors=1` applies in
+    /// every mode and errors are written into the response body. Production
+    /// deployments should set `[["display_errors", "Off"], ["log_errors", "On"]]`.
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 
@@ -3474,7 +3523,8 @@ pub struct PhpConfig {
     ///
     /// When the queue is full, admission applies backpressure
     /// (`overload = "wait"`, the default) or answers `503` + `Retry-After`
-    /// (`overload = "shed"`), still bounded by the request timeout (504).
+    /// (`overload = "shed"`, per-request mode only — ignored in worker mode),
+    /// still bounded by the request timeout (504).
     ///
     /// Named `queue_depth` rather than `backlog` on purpose: `backlog`
     /// collides with the TCP listen backlog an operator may be tuning at the
@@ -3537,6 +3587,10 @@ pub struct PhpConfig {
     /// explicit-wins rule `[server.limits]` uses. Startup logs which one is in
     /// force. What `"shed"` bounds is the dispatch queue (`queue_depth`,
     /// default = effective concurrency): full queue → shed.
+    ///
+    /// **Per-request mode only.** In worker mode (`mode = "worker"`) `"shed"`
+    /// is ignored — startup logs a WARN — and the worker pool keeps waiting
+    /// in its own queue, answering `504` on a starved queue.
     ///
     /// Env override: `EPHPM_PHP__OVERLOAD=shed`.
     ///
@@ -3704,9 +3758,17 @@ impl Config {
     /// Load configuration from a TOML file with environment variable overrides.
     ///
     /// Precedence (highest to lowest):
-    /// 1. Environment variables prefixed with `EPHPM_` (e.g. `EPHPM_SERVER_LISTEN`)
+    /// 1. Environment variables prefixed with `EPHPM_`, nested with a
+    ///    **double** underscore (e.g. `EPHPM_SERVER__LISTEN` for
+    ///    `[server] listen`)
     /// 2. TOML config file
     /// 3. Built-in defaults
+    ///
+    /// A variable that uses a single underscore at a section boundary
+    /// (`EPHPM_SERVER_LISTEN`, `EPHPM_PHP_MODE`) does not reach any section:
+    /// it becomes the unknown top-level key `server_listen`, which the
+    /// deliberately lenient root ([`Config`]) ignores without a warning.
+    ///
     /// # Errors
     ///
     /// Returns `ConfigError::Load` if the TOML file cannot be read or parsed.
@@ -3724,6 +3786,43 @@ impl Config {
             .extract()
             .map_err(Box::new)?;
         Ok(config)
+    }
+
+    /// Make `[server] document_root` and `[server] sites_dir` absolute by
+    /// joining a relative value onto `cwd` — the working directory the server
+    /// was started from, which is what every other relative path in the
+    /// config (`[db.sqlite] path`, TLS files, ...) is already resolved against
+    /// by the OS.
+    ///
+    /// These two are different because the paths built from them are handed
+    /// to PHP, which resolves a relative script path against its OWN
+    /// per-thread working directory (PHP moves it to each executed script's
+    /// directory), not the directory ePHPm was started from. A relative
+    /// `document_root = "app"` (or `"./app"`) therefore made every PHP request
+    /// 500 with "Failed opening required 'app/index.php'". Absolute roots also keep
+    /// `open_basedir`, `$_SERVER['DOCUMENT_ROOT']`/`SCRIPT_FILENAME` and the
+    /// worker-script containment check unambiguous.
+    ///
+    /// Lexical only: `.` components are dropped, nothing is canonicalized, so a
+    /// root that does not exist yet still resolves (and fails later, where it
+    /// always did). Call after CLI overrides are applied.
+    pub fn resolve_relative_roots(&mut self, cwd: &std::path::Path) {
+        fn absolutize(path: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
+            if path.is_absolute() {
+                return path.to_path_buf();
+            }
+            let mut out = cwd.to_path_buf();
+            for component in path.components() {
+                if component != std::path::Component::CurDir {
+                    out.push(component);
+                }
+            }
+            out
+        }
+        self.server.document_root = absolutize(&self.server.document_root, cwd);
+        if let Some(sites_dir) = &self.server.sites_dir {
+            self.server.sites_dir = Some(absolutize(sites_dir, cwd));
+        }
     }
 
     /// Load configuration with defaults only (no file).
@@ -4695,8 +4794,9 @@ impl PhpConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JitMode {
-    /// Tracing JIT (`opcache.jit=tracing`) — traces hot loops/calls; the
-    /// recommended and default-on mode for single-site serve.
+    /// Tracing JIT (`opcache.jit=tracing`) — traces hot loops/calls. **Not**
+    /// a default in any mode: an unfixed upstream tracing-JIT defect crashes
+    /// the process (see [`JitReason::TracingJitBug`]), so it is opt-in only.
     Tracing,
     /// Function JIT (`opcache.jit=function`) — compiles whole hot functions;
     /// usually slower than tracing, offered for A/B comparison.
@@ -6483,6 +6583,40 @@ mod tests {
     // must install it with `EnvVars` — see `crate::test_env`; nothing else in
     // this module may touch `std::env` directly.
     use crate::test_env::EnvVars;
+
+    // ── relative [server] document_root / sites_dir ──────────────────
+    // (`load_toml` is the shared helper defined with the unknown-key tests.)
+
+    #[test]
+    fn relative_document_root_and_sites_dir_resolve_against_cwd() {
+        let cwd = std::env::temp_dir().join("ephpm-cwd");
+        let mut config = load_toml("[server]\ndocument_root = \"app\"\nsites_dir = \"./sites\"\n");
+        config.resolve_relative_roots(&cwd);
+        assert_eq!(config.server.document_root, cwd.join("app"));
+        assert_eq!(config.server.sites_dir, Some(cwd.join("sites")), "`./` is dropped");
+        assert!(config.server.document_root.is_absolute());
+    }
+
+    #[test]
+    fn default_document_root_resolves_to_cwd_itself() {
+        let cwd = std::env::temp_dir().join("ephpm-cwd");
+        let mut config = load_toml("");
+        assert_eq!(config.server.document_root, PathBuf::from("."), "the default is relative");
+        config.resolve_relative_roots(&cwd);
+        assert_eq!(config.server.document_root, cwd);
+        assert_eq!(config.server.sites_dir, None, "an unset sites_dir stays unset");
+    }
+
+    #[test]
+    fn absolute_roots_are_left_alone() {
+        let abs = std::env::temp_dir().join("www");
+        let mut config = Config::default_config().unwrap();
+        config.server.document_root.clone_from(&abs);
+        config.server.sites_dir = Some(abs.join("sites"));
+        config.resolve_relative_roots(&std::env::temp_dir().join("elsewhere"));
+        assert_eq!(config.server.document_root, abs);
+        assert_eq!(config.server.sites_dir, Some(abs.join("sites")));
+    }
 
     // ── [[middleware]] library = "php:<path>" ────────────────────────
 

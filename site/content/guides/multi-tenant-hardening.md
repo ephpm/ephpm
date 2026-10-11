@@ -156,12 +156,15 @@ never opens the target's file.
 
 The embedded KV store is namespaced per site key, so `ephpm_kv_*` from one tenant
 cannot read or overwrite another tenant's keys. The RESP listener (if enabled)
-authenticates with the same per-site derived password as `pdo_mysql`.
+authenticates with the same per-site derived password as `pdo_mysql`, and in
+this mode `[kv.redis_compat] password` is ignored. Multi-tenant mode with the
+RESP listener on and no `[kv] secret` is a startup error. See
+[KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ### 7. Two-uid process model + systemd sandbox
 
 > **Operator-supplied.** Unlike §1–§6, nothing in this section is produced by
-> ePHPm. `ephpm install` writes a single-uid systemd unit
+> ePHPm. [`ephpm install`](/reference/cli/#ephpm-install) writes a single-uid systemd unit
 > (`crates/ephpm/src/service/systemd.rs`): with `--user` it emits `User=`,
 > `Group=`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`,
 > a `CapabilityBoundingSet` of `CAP_NET_BIND_SERVICE`, and `ReadWritePaths`.
@@ -169,6 +172,10 @@ authenticates with the same per-site derived password as `pdo_mysql`.
 > there is no `ephpm-ctl` binary. The split below is a deployment pattern you
 > build on the host — the one the ePHPm preview fleet runs — described here so
 > it can be reproduced, not a default you inherit.
+
+To run a tenant's non-PHP commands (build or seed steps) under the tenant uid
+with a Landlock filesystem scope, use [`ephpm exec`](/reference/cli/exec/)
+(Linux only).
 
 Two OS users split the trust boundary:
 
@@ -296,6 +303,36 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
 - **PostgreSQL/PDO persistence** — see §3.
 - **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`
   and OOM the shared process (another availability, not confidentiality, gap).
+- **Server endpoints are process-wide.** See the next section.
+
+### Server endpoints are not tenant-scoped
+
+The metrics path (`[server.metrics]`) and the `/_ephpm/*` endpoints are
+**unauthenticated** and answer on **every** listener for **every** `Host`. They
+are matched before `trusted_hosts`, `blocked_paths`, the per-site preview gate
+and all middleware, so none of the layers above can restrict them. On a
+multi-tenant node that means any visitor to any tenant's domain, and any tenant
+that can make an HTTP request to its own public URL, can read:
+
+- `/metrics` (when enabled): every tenant's normalized SQL in the
+  `ephpm_query_*{digest}` label (table, column and query shape, never literal
+  values), vhost names in `ephpm_opcache_invalidations_total{vhost}`, and DB
+  proxy upstream addresses;
+- `/_ephpm/requests` (when the request timeline is on): the last 256 request
+  paths across **all** vhosts, in one buffer with no host field. It is off
+  under `ephpm serve` unless you set `[server.diagnostics] request_log = true`.
+
+There is no setting to authenticate these endpoints or move them to a separate
+listener. To keep them private:
+
+1. Deny the metrics path and `/_ephpm/` for public traffic at the load balancer
+   or reverse proxy in front of ePHPm, allowing only your probe and scrape
+   sources.
+2. Without a front proxy, firewall `[server] listen` so only trusted networks
+   reach it, or leave `[server.metrics] enabled = false`.
+3. Leave `request_log` unset (off) on shared nodes.
+
+Full details are in [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ## Validation status
 
