@@ -49,9 +49,10 @@ Not reported, because ePHPm or its tooling reads them directly rather than as co
 - the variables in [Other non-config environment variables](#other-non-config-environment-variables) (`EPHPM_KV_PASSWORD`, `EPHPM_SERVICE_LOG_FILE`, `EPHPM_MIDDLEWARE_DIR`) and `EPHPM_FATAL_HANDLER`;
 - `EPHPM_RELEASE_VERSION` (read at build time; the release workflows export it into the job environment);
 - `EPHPM_SESSION_SECRET` and `EPHPM_PREVIEW_SESSION_SECRET` (the secret names these docs use in `env:` examples), and any other variable that a `[[middleware]]` mount's `config` references as `env:NAME`;
+- variables the org's PHP packages read with `getenv()`: `EPHPM_APP_BASE` ([Laravel Octane](/guides/laravel-octane/)), `EPHPM_WORKER_BOOTSTRAP` ([PSR-15 worker](/guides/psr15-worker/)), `EPHPM_WP_PATH` (`ephpm/wordpress-worker`) and `EPHPM_SEED_TOKEN` (`ephpm/wordpress-sample`);
 - the variables the e2e and integration harnesses set (`EPHPM_URL`, `EPHPM_BINARY`, `EPHPM_CLUSTER_URL_*`, `EPHPM_TEST_*`, …).
 
-Any other `EPHPM_*` variable you set for some other purpose (for example one referenced as `env:NAME` from a per-site override file) is still reported. The warning is advisory: it changes nothing about how the variable is used.
+Any other `EPHPM_*` variable you set for some other purpose (for example one referenced as `env:NAME` from a per-site override file) is still reported. The warning is advisory: it changes nothing about how the variable is used. Two limits: the "did you mean" suggestion only fixes the separator after the section name (`EPHPM_DB_SQLITE_PATH` suggests `EPHPM_DB__SQLITE_PATH`, while the real key is `EPHPM_DB__SQLITE__PATH`), and a misspelling that collides with a harness variable (`EPHPM_SITES_DIR`, `EPHPM_DOCROOT`, `EPHPM_KV_HOST`, `EPHPM_KV_PORT`, `EPHPM_TEST_*`) is not reported.
 
 ## `ephpm dev` differs
 

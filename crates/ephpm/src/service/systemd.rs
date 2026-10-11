@@ -43,8 +43,8 @@ fn owner_directives(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     };
     let log_dir = paths.log_file.parent().unwrap_or(&paths.log_file);
     let extra = paths.extra_writable_dirs.iter().fold(String::new(), |mut s, d| {
-        s.push_str(" -");
-        s.push_str(&d.display().to_string());
+        s.push(' ');
+        s.push_str(&read_write_path_entry(d));
         s
     });
     format!(
@@ -61,6 +61,28 @@ ReadWritePaths=-{data_dir} -{log_dir} -{document_root} -/tmp -/var/tmp{extra}\n"
         log_dir = log_dir.display(),
         document_root = paths.document_root.display(),
     )
+}
+
+/// One `-`-prefixed `ReadWritePaths=` entry for a config-derived directory.
+///
+/// The list is whitespace-separated and systemd expands `%` specifiers in
+/// it, so a path from the operator's config (`/srv/my data`, `/srv/100%`)
+/// would otherwise split into two entries — the second silently ignored as
+/// non-absolute — or expand into a different path. `%` is doubled, and an
+/// entry containing whitespace, a quote or a backslash is double-quoted with
+/// C-style escaping (systemd unquotes before reading the `-` prefix).
+fn read_write_path_entry(dir: &std::path::Path) -> String {
+    let raw = format!("-{}", dir.display()).replace('%', "%%");
+    if raw.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')) {
+        let escaped = raw
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
+        format!("\"{escaped}\"")
+    } else {
+        raw
+    }
 }
 
 /// Render the systemd unit file body. `owner` is `None` for the historical
@@ -186,7 +208,12 @@ fn log_source(log_file_exists: bool) -> LogSource {
 }
 
 pub(super) fn logs(paths: &Paths, follow: bool) -> Result<()> {
-    if log_source(paths.log_file.exists()) == LogSource::File {
+    // `try_exists`, not `exists`: a log file this user cannot even stat (a
+    // non-root `ephpm logs` against a 0750 log dir) must surface the
+    // permission error, not be mistaken for "no log file" and fall through to
+    // a journal that holds only lifecycle lines.
+    let exists = paths.log_file.try_exists().map_err(|e| ServiceError::io(&paths.log_file, e))?;
+    if log_source(exists) == LogSource::File {
         return super::tail_file(&paths.log_file, follow);
     }
     let mut cmd = Command::new("journalctl");
@@ -227,7 +254,7 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -299,6 +326,16 @@ mod tests {
         let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
         let body = unit_body(&paths, Some(&owner));
         assert!(body.contains("-/var/tmp -/srv/db -/srv/acme\n"), "{body}");
+    }
+
+    #[test]
+    fn read_write_path_entries_survive_spaces_and_specifiers() {
+        // Unquoted, `/srv/my data` would split into `-/srv/my` and `data` (the
+        // second ignored as non-absolute) and `%` would be expanded by systemd.
+        assert_eq!(read_write_path_entry(Path::new("/srv/db")), "-/srv/db");
+        assert_eq!(read_write_path_entry(Path::new("/srv/100%")), "-/srv/100%%");
+        assert_eq!(read_write_path_entry(Path::new("/srv/my data")), "\"-/srv/my data\"");
+        assert_eq!(read_write_path_entry(Path::new("/srv/a\"b")), "\"-/srv/a\\\"b\"");
     }
 
     #[test]

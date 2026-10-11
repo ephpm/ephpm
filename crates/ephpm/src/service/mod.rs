@@ -322,9 +322,15 @@ struct WritableDir {
 /// Covers `[db.sqlite] path` (its parent directory), `[db.sqlite] dir`
 /// (per-site databases) and an ACME `[server.tls] cache_dir`. Deduplicated,
 /// in that order.
+/// `..` components are folded lexically, so a relative `path = "../app.db"`
+/// becomes `/var/lib/app.db` rather than `/var/lib/ephpm/../app.db` — which
+/// would otherwise pass a `starts_with(data_dir)` check while pointing
+/// outside it.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn config_writable_dirs(config: &ephpm_config::Config, working_dir: &Path) -> Vec<WritableDir> {
-    let abs = |p: &Path| if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) };
+    let abs = |p: &Path| {
+        normalize_lexically(&if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) })
+    };
     let mut dirs: Vec<WritableDir> = Vec::new();
     let mut push = |path: PathBuf, recursive: bool| {
         if let Some(existing) = dirs.iter_mut().find(|d| d.path == path) {
@@ -346,12 +352,47 @@ fn config_writable_dirs(config: &ephpm_config::Config, working_dir: &Path) -> Ve
             push(abs(Path::new(dir)), true);
         }
     }
+    // Same predicate privilege-drop uses to decide the ACME cache matters.
     if let Some(tls) = config.server.tls.as_ref()
-        && !tls.is_manual()
+        && tls.is_acme()
     {
         push(abs(&tls.cache_dir), true);
     }
     dirs
+}
+
+/// Fold `.` and `..` components without touching the filesystem (the
+/// directories may not exist yet). `..` at the root stays at the root.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_)) | None
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The numeric uid of `user`, via `id -u` (same shell-out approach as
+/// [`chown_impl`], no `getpwnam` FFI). `None` if it cannot be resolved.
+#[cfg(unix)]
+fn user_uid(user: &str) -> Option<u32> {
+    let out = std::process::Command::new("id").arg("-u").arg(user).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Create the config-derived writable directories for a `--user` install and
@@ -379,14 +420,24 @@ fn prepare_config_dirs(paths: &Paths, owner: &ServiceOwner) -> Result<Vec<PathBu
             return Ok(Vec::new());
         }
     };
+    use std::os::unix::fs::MetadataExt as _;
+
+    let service_uid = user_uid(&owner.user);
     let mut extra = Vec::new();
     for dir in config_writable_dirs(&config, &paths.data_dir) {
-        let existed = dir.path.exists();
+        let existing_uid = std::fs::metadata(&dir.path).ok().map(|m| m.uid());
         std::fs::create_dir_all(&dir.path).map_err(|e| ServiceError::io(&dir.path, e))?;
         if dir.path.starts_with(&paths.data_dir) {
             continue; // covered by the recursive chown of data_dir
         }
-        if existed {
+        // Already owned by the service account (typically: created and
+        // chowned by a previous `install --user` run) — nothing to do, and no
+        // point warning on every re-install.
+        if existing_uid.is_some() && existing_uid == service_uid {
+            extra.push(dir.path);
+            continue;
+        }
+        if existing_uid.is_some() {
             tracing::warn!(
                 path = %dir.path.display(),
                 user = %owner.user,
@@ -856,6 +907,26 @@ mod tests {
                 WritableDir { path: PathBuf::from("/srv/acme"), recursive: true },
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)] // Unix absolute paths; the function is only used on Unix.
+    fn config_writable_dirs_folds_parent_components() {
+        // `../app.db` relative to the data dir is `/var/lib`, which is NOT
+        // inside the data dir — a lexical `starts_with` on the unfolded
+        // `/var/lib/ephpm/../` path would have wrongly said it was.
+        let work = Path::new("/var/lib/ephpm");
+        let config = load_toml("[db.sqlite]\npath = \"../app.db\"\ndir = \"./sites/../tenants\"\n");
+        let dirs = config_writable_dirs(&config, work);
+        assert_eq!(
+            dirs,
+            [
+                WritableDir { path: PathBuf::from("/var/lib"), recursive: false },
+                WritableDir { path: work.join("tenants"), recursive: true },
+            ]
+        );
+        assert!(!dirs[0].path.starts_with(work));
+        assert_eq!(normalize_lexically(Path::new("/../a/./b/..")), PathBuf::from("/a"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ Four things stay lenient on purpose:
 
 Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sqld]`, `cdc_experimental`, `engine` — remain accepted and warn.
 
-Mode-selecting string *values* are checked too: an unrecognised `[db.sqlite.replication] role`, `[kv] compression`, `[kv] eviction_policy` or `[cluster.kv] replication_mode` fails startup with an error naming the value and the accepted ones. Each of these except `eviction_policy` used to fall back to a default silently (single-node, no compression, `async`).
+Mode-selecting string *values* are checked too: an unrecognised `[db.sqlite.replication] role`, `[kv] compression`, `[kv] eviction_policy` or `[cluster.kv] replication_mode` fails startup with an error naming the value and the accepted ones. Each of these except `eviction_policy` used to fall back to a default silently (single-node, no compression, `async`). These value checks run in `ephpm serve`; `ephpm dev` (which reads no config file, only defaults and `EPHPM_*` variables) does not run them.
 
 ## `[server]`
 

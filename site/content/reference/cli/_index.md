@@ -386,7 +386,7 @@ ephpm logs
 ephpm logs -f
 ```
 
-- **Every platform:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation). On Linux and macOS only the last 1 MiB of the file is read to find those lines, and bytes that are not valid UTF-8 are shown as `�` instead of failing the command.
+- **Every platform:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation). On Linux and macOS only the last 1 MiB of the file is read to find those lines, and bytes that are not valid UTF-8 are shown as `�` instead of failing the command. On Windows the whole file is read, and a file that is not valid UTF-8 makes `logs` fail.
 - **Linux:** the generated unit appends the server's stdout/stderr to `/var/log/ephpm/ephpm.log` (`StandardOutput=append:`), not to the journal, so the journal holds only systemd's own start/stop messages. `logs` therefore reads the file, and runs `journalctl -u ephpm.service --no-pager -n 200` (or `-f`) only when the file does not exist, for example under a hand-written unit that logs to the journal. If that `journalctl` fails too, `logs` exits `1`.
 
 The log file is at the path in [Where things live](#where-things-live). On macOS and Windows a missing log file makes `logs` exit `1`.

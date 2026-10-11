@@ -32,6 +32,12 @@ const TOP_LEVEL_SECTIONS: [&str; 7] =
 ///   (`SESSION_SECRET`, `PREVIEW_SESSION_SECRET`). Any other name referenced
 ///   as `env:NAME` from a `[[middleware]]` config is exempted at runtime via
 ///   [`Config::env_references`].
+/// - Read by PHP code via `getenv()` in the org's worker/app packages, which
+///   the docs tell operators to export before `ephpm serve`: `APP_BASE`
+///   (`ephpm/octane-driver`), `WORKER_BOOTSTRAP` (`ephpm/psr15-worker`),
+///   `WP_PATH` (`ephpm/wordpress-worker`), `SEED_TOKEN`
+///   (`ephpm/wordpress-sample`). These live in other repos, so the scan test
+///   cannot see them; it does scan this repo's docs for `EPHPM_X=` exports.
 /// - Set by the e2e / integration harnesses, whose spawned servers inherit
 ///   them: the rest.
 const NON_CONFIG_ENV_VARS: &[&str] = &[
@@ -42,6 +48,10 @@ const NON_CONFIG_ENV_VARS: &[&str] = &[
     "RELEASE_VERSION",
     "SESSION_SECRET",
     "PREVIEW_SESSION_SECRET",
+    "APP_BASE",
+    "WORKER_BOOTSTRAP",
+    "WP_PATH",
+    "SEED_TOKEN",
     "URL",
     "BINARY",
     "CLI_BINARY",
@@ -10293,20 +10303,25 @@ eviction_policy = "lru"
         .unwrap();
         let config = Config::load(&file).unwrap();
         assert_eq!(config.env_references(), ["EPHPM_GH_SECRET", "OTHER"]);
-        assert!(Config::default().env_references().is_empty());
+        assert_eq!(Config::default().env_references(), Vec::<String>::new());
     }
 
     /// Every `EPHPM_*` variable the repository reads or sets directly (not
     /// through the `EPHPM_<SECTION>__<KEY>` config mapping) must be exempt
     /// from the unmapped-variable startup warning — otherwise ePHPm warns
     /// about its own variables. Scans Rust env reads/sets (`var`, `var_os`,
-    /// `Command::env`, `set_var`, …) and `NAME=` / `NAME:` / `name: NAME`
-    /// assignments in workflow, k8s, Docker and shell files.
+    /// `Command::env`, `set_var`, …), `NAME=` / `NAME:` / `name: NAME`
+    /// assignments in workflow, k8s, Docker and shell files, and `NAME=`
+    /// exports in the Markdown docs.
     #[test]
     fn every_non_config_env_read_in_the_repo_is_exempt() {
         // Read only by commands that never run the startup check (`ephpm
         // exec` / `ephpm php` tests), so exempting them would be noise.
-        const SCAN_IGNORE: &[&str] = &["EPHPM_EXEC_LEAK_CANARY", "EPHPM_CLI_TEST_VAR"];
+        // Docs: `EPHPM_PHP_MODE=worker` is the deliberate wrong-spelling example
+        // in environment-variables.md, and `EPHPM_PID=$!` is a shell-local
+        // variable in a k8s snippet, never exported.
+        const SCAN_IGNORE: &[&str] =
+            &["EPHPM_EXEC_LEAK_CANARY", "EPHPM_CLI_TEST_VAR", "EPHPM_PHP_MODE", "EPHPM_PID"];
         const RUST_CALLS: &[&str] =
             &["var", "var_os", "env", "set_var", "remove_var", "env_remove"];
 
@@ -10323,18 +10338,18 @@ eviction_policy = "lru"
                 let p = entry.path();
                 let fname = entry.file_name().to_string_lossy().into_owned();
                 if p.is_dir() {
-                    if !matches!(fname.as_str(), "target" | ".claude" | "node_modules" | "vendor")
-                    {
+                    if !matches!(fname.as_str(), "target" | ".claude" | "node_modules" | "vendor") {
                         scan(&p, found);
                     }
                     continue;
                 }
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
                 let is_rust = ext == "rs";
+                let is_md = ext == "md";
                 let is_other = matches!(ext, "yml" | "yaml" | "sh" | "ps1")
                     || fname.starts_with("Dockerfile")
                     || fname == "Tiltfile";
-                if !is_rust && !is_other {
+                if !is_rust && !is_md && !is_other {
                     continue;
                 }
                 let Ok(text) = std::fs::read_to_string(&p) else { continue };
@@ -10358,6 +10373,9 @@ eviction_policy = "lru"
                                 RUST_CALLS.contains(&&b[ident_start..])
                             })
                         })
+                    } else if is_md {
+                        // Docs telling the operator to export a variable.
+                        after.starts_with('=')
                     } else {
                         after.starts_with('=')
                             || after.starts_with(':')
@@ -10372,12 +10390,16 @@ eviction_policy = "lru"
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut found = Vec::new();
-        for dir in ["crates", "xtask", "examples", "docker", "k8s", ".github"] {
+        for dir in [
+            "crates", "xtask", "examples", "docker", "k8s", ".github", "scripts", "tests", "site",
+            "docs",
+        ] {
             scan(&root.join(dir), &mut found);
         }
         let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
         // Sanity: the scan really sees the known direct reads.
-        for must in ["EPHPM_SERVICE_LOG_FILE", "EPHPM_KV_PASSWORD", "EPHPM_MIDDLEWARE_DIR", "EPHPM_URL"]
+        for must in
+            ["EPHPM_SERVICE_LOG_FILE", "EPHPM_KV_PASSWORD", "EPHPM_MIDDLEWARE_DIR", "EPHPM_URL"]
         {
             assert!(names.contains(&must), "scan did not find {must}; scanner is broken");
         }
