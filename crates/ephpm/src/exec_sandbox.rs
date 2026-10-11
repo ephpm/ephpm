@@ -15,7 +15,11 @@
 //! 4. irreversibly drops to the tenant uid/gid (reusing the server's audited
 //!    [`ephpm_server::privdrop::drop_to_user`] sequence), which is what arms
 //!    the host's uid-keyed `ephpm_egress` firewall; then
-//! 5. `execvp`s the command.
+//! 5. execs the command (`PATH` lookup) with a **cleared environment** plus a
+//!    fixed non-secret allowlist (`PATH`, `HOME`/`TMPDIR` in the tenant state
+//!    root, locale and `TERM`/`TZ`) — ePHPm's own environment, which can hold
+//!    `EPHPM_*` secrets and operator credentials, never reaches the tenant
+//!    command.
 //!
 //! Everything from step 2 on is `cfg(target_os = "linux")`; on any other
 //! platform the subcommand refuses (the sandbox mechanisms are Linux-only). The
@@ -182,7 +186,68 @@ pub fn run(
         );
     }
 
-    exec(program, command)
+    // The command never inherits ePHPm's environment: it starts from an empty
+    // environment plus a fixed, non-secret allowlist (see `sandbox_env`).
+    let env = sandbox_env(std::env::vars_os(), &site);
+    tracing::debug!(
+        vars = ?env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        "ephpm exec: command environment (cleared + allowlist)"
+    );
+    exec(program, command, &env)
+}
+
+/// The fixed `PATH` the sandboxed command runs with.
+///
+/// The caller's `PATH` is deliberately not inherited: under `sudo` it is the
+/// operator's (possibly pointing into `/root` or a home directory), and a
+/// tenant command has no business learning it. Every entry is under a
+/// Landlock read+execute grant, so binaries found here are runnable.
+#[cfg(target_os = "linux")]
+const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Whether a caller environment variable is passed through to the command.
+///
+/// Only locale and terminal settings: `LANG`, `LANGUAGE`, every `LC_*`,
+/// `TERM`, and `TZ`. None of them can carry a secret or change how the
+/// dynamic loader or an interpreter behaves. Everything else — `EPHPM_*`
+/// config overrides (including `EPHPM_KV__SECRET`), cloud credentials, tokens,
+/// `LD_PRELOAD`, `SSH_AUTH_SOCK`, `SUDO_*` — is dropped.
+#[cfg(target_os = "linux")]
+fn is_passthrough_var(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = name.as_bytes();
+    matches!(name, b"LANG" | b"LANGUAGE" | b"TERM" | b"TZ") || name.starts_with(b"LC_")
+}
+
+/// Build the sandboxed command's complete environment from the caller's.
+///
+/// The result **replaces** the environment (the command is exec'd with a
+/// cleared environment, never an inherited one), so anything not listed here
+/// is absent in the command:
+///
+/// - `PATH` = [`SANDBOX_PATH`] (fixed; the caller's is ignored);
+/// - `HOME` = the tenant's private state root, and `TMPDIR` = its `tmp/` — the
+///   two places the dropped tenant uid can write besides the site container;
+/// - the locale/terminal variables accepted by [`is_passthrough_var`], copied
+///   from the caller.
+///
+/// `ephpm exec` injects no credentials (no `DB_*`, no KV password): database
+/// access goes through a nested `ephpm php --site`, which derives its own.
+#[cfg(target_os = "linux")]
+fn sandbox_env(
+    caller: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    site: &ephpm_server::router::SandboxSite,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    let mut env: BTreeMap<OsString, OsString> =
+        caller.into_iter().filter(|(k, _)| is_passthrough_var(k)).collect();
+    env.insert("PATH".into(), SANDBOX_PATH.into());
+    env.insert("HOME".into(), site.state_root.clone().into_os_string());
+    env.insert("TMPDIR".into(), site.state_root.join("tmp").into_os_string());
+    env.into_iter().collect()
 }
 
 /// Create and chown the tenant's private state root (`state_root`, `tmp`,
@@ -643,33 +708,42 @@ fn ca_trust_dirs() -> [&'static std::path::Path; 3] {
     ]
 }
 
-/// `execvp` the command, replacing this process image. Returns only on failure.
+/// Exec the command with exactly `env` as its environment, replacing this
+/// process image. Returns only on failure.
+///
+/// The environment is cleared first, so nothing from ePHPm's own environment
+/// reaches the command unless [`sandbox_env`] put it there. `program` is
+/// looked up on the `PATH` in `env` (not the caller's), as `execvp` would.
 #[cfg(target_os = "linux")]
-fn exec(program: &str, command: &[String]) -> anyhow::Result<ExitCode> {
-    use std::ffi::CString;
+fn exec(
+    program: &str,
+    command: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> anyhow::Result<ExitCode> {
+    use std::os::unix::process::CommandExt as _;
 
     use anyhow::Context as _;
 
-    let prog_c =
-        CString::new(program.as_bytes()).context("command name contains an interior NUL byte")?;
-    let mut argv_owned: Vec<CString> = Vec::with_capacity(command.len());
-    for arg in command {
-        argv_owned.push(
-            CString::new(arg.as_bytes())
-                .context("command argument contains an interior NUL byte")?,
-        );
-    }
-    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|c| c.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    // SAFETY: `prog_c` and every `CString` in `argv_owned` outlive the call, and
-    // `argv` is NULL-terminated. On success execvp replaces the process image
-    // and never returns; on failure it returns -1 and we read errno immediately.
-    unsafe {
-        libc::execvp(prog_c.as_ptr(), argv.as_ptr());
-    }
-    let err = std::io::Error::last_os_error();
+    // `CommandExt::exec` replaces the process image (no fork) and only returns
+    // on failure. Stdio is inherited, argv[0] is `program`.
+    let err = sandboxed_command(program, command, env).exec();
     Err(err).with_context(|| format!("failed to exec {program:?}"))
+}
+
+/// Build the [`std::process::Command`] for the sandboxed program: `command[1..]`
+/// as arguments and a **cleared** environment holding only `env`.
+///
+/// Split out of [`exec`] so tests can spawn the same command as a child and
+/// observe the environment it actually receives.
+#[cfg(target_os = "linux")]
+fn sandboxed_command(
+    program: &str,
+    command: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(command.iter().skip(1)).env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    cmd
 }
 
 /// Non-Linux stub: sandboxed exec is unavailable, so the subcommand refuses.
@@ -821,6 +895,75 @@ mod tests {
                 "must not widen to a parent of the cert dirs: {s}"
             );
         }
+    }
+
+    /// Regression: the tenant command used to inherit ePHPm's whole
+    /// environment, so `EPHPM_KV__SECRET` (the master secret every tenant
+    /// password derives from), cloud credentials and `LD_PRELOAD` reached it.
+    #[test]
+    fn sandbox_env_drops_secrets_and_keeps_only_the_allowlist() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let site = site_at(PathBuf::from("/tmp/ephpm-vhosts/blog-abc"));
+        let caller: Vec<(OsString, OsString)> = [
+            ("EPHPM_KV__SECRET", "master-secret"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("GITHUB_TOKEN", "ghp"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("SUDO_USER", "operator"),
+            ("PATH", "/root/.cargo/bin:/usr/bin"),
+            ("HOME", "/root"),
+            ("TMPDIR", "/root/tmp"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("TERM", "xterm-256color"),
+            ("TZ", "UTC"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+
+        let env: BTreeMap<String, String> = super::sandbox_env(caller, &site)
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect();
+
+        let expected: BTreeMap<String, String> = [
+            ("HOME", "/tmp/ephpm-vhosts/blog-abc"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("PATH", super::SANDBOX_PATH),
+            ("TERM", "xterm-256color"),
+            ("TMPDIR", "/tmp/ephpm-vhosts/blog-abc/tmp"),
+            ("TZ", "UTC"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(env, expected);
+    }
+
+    /// The built command really runs with only the sandbox environment, even
+    /// though this test process's own environment is non-empty (it has at least
+    /// `PATH` and cargo's `CARGO_*` variables), and resolves the program on the
+    /// sandbox `PATH`.
+    #[test]
+    fn sandboxed_command_does_not_inherit_the_parent_environment() {
+        use std::ffi::OsString;
+
+        assert!(std::env::var_os("CARGO_PKG_NAME").is_some(), "cargo sets this for tests");
+        let env: Vec<(OsString, OsString)> =
+            vec![("PATH".into(), super::SANDBOX_PATH.into()), ("ONLY_THIS".into(), "1".into())];
+        let out = super::sandboxed_command("env", &["env".to_string()], &env)
+            .output()
+            .expect("spawn env on the sandbox PATH");
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let mut lines: Vec<&str> = stdout.lines().collect();
+        lines.sort_unstable();
+        let path_line = format!("PATH={}", super::SANDBOX_PATH);
+        assert_eq!(lines, vec!["ONLY_THIS=1", path_line.as_str()]);
     }
 
     #[test]
