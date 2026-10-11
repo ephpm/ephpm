@@ -13,14 +13,14 @@ ephpm kv [--host HOST] [--port PORT] [--password PW] [--user NAME] <subcommand> 
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--host` | `127.0.0.1` | KV server host |
+| `--host` | `127.0.0.1` | KV server address. **Must be an IP literal** (`10.0.1.5`, or `[::1]` for IPv6). Hostnames such as `localhost` or `redis.example.com` are not resolved and fail with `invalid address`. (`ephpm deploy` / `ephpm cache` do resolve hostnames.) |
 | `--port` | `6379` | KV server port |
 | `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the first command |
 | `--user` | (none) | First argument of the two-argument `AUTH <user> <password>` form. Requires `--password`. |
 
 Like `--host` and `--port`, these are flags of `ephpm kv` itself, so they go **before** the subcommand.
 
-The server must be configured with `[kv.redis_compat] enabled = true` for these commands to connect.
+The server must be configured with `[kv.redis_compat] enabled = true` for these commands to connect. An `ephpm dev` server reads no `ephpm.toml`, but it does honour `EPHPM_*` overrides, so `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` turns the listener on there.
 
 ## Authentication
 
@@ -106,11 +106,24 @@ ephpm kv incr counter --by 10
 
 ### `ttl <KEY>`
 
-Reports TTL info: a positive number (seconds), `-1` (no expiry), or `-2` (key missing).
+Reports TTL info as one of three lines. It sends `TTL` and `PTTL`, and prints a sentence rather than the raw integer:
 
 ```bash
-ephpm kv ttl session:abc123
+$ ephpm kv ttl session:abc123
+expires in 3542s (3541873ms)
+
+$ ephpm kv ttl greeting
+no expiry (persistent key)
+
+$ ephpm kv ttl nosuchkey
+key does not exist
 ```
+
+All three exit `0`.
+
+## Exit status
+
+`0` when the server answers normally, including `(nil)` from `get`, `(empty)` from `keys`, and `key does not exist` from `ttl`. `1` when the server answers with an error (`-ERR`, `-NOAUTH`, …), printed as `error: ...` on stderr. A connection failure, an authentication failure, or an invalid `--host` also prints `error: ...` and exits `1`.
 
 ## Common patterns
 

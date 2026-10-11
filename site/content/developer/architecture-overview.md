@@ -723,13 +723,17 @@ Client ──HTTP──► hyper (tokio)
                         ├── send_header() → capture headers
                         ├── read_post() → provide POST data
                         └── read_cookies() → provide cookies
-                     5. php_request_shutdown()
-                     6. Return (status, headers, body)
+                     5. Return (status, headers, body)
                             │
                             ▼
                 Build hyper::Response
                             │
 Client ◄──HTTP──────────────┘
+
+             then, on the same PHP thread, after the reply:
+                     6. php_request_shutdown()
+                        (destructors, session write +
+                         unlock, extension RSHUTDOWN)
 ```
 
 PHP execution is lock-free and concurrent: PHP is compiled with ZTS, and each execution-pool thread registers with TSRM on first use to get its own isolated PHP context. A `Mutex` guards only the one-time `init()`/`shutdown()` — never request execution.
@@ -825,6 +829,17 @@ This is the same approach FrankenPHP uses.
 | PHP 8.6 | Beta (8.6.0beta1, Aug 2026) | Experimental — pre-release, not GA. Built by the non-gating `release-php-beta.yml` lane against a beta SDK, automatically after every successful stable `v*` release (and on manual dispatch). Published as a **separate** `v<ref>-php<beta>` pre-release; never part of, and never able to block, the stable release. Windows/clang-TAILCALL beta legs are attached only once their php-sdk beta SDKs exist. |
 
 ### Release Naming
+
+> **Planned — not yet implemented.** The extension-suite model in this
+> section (`core` / `wordpress` / `laravel` / `full`, and the `-dev` variants
+> with Xdebug, PCOV and SPX compiled in) is a design, not what ships. Today's
+> releases are one archive per PHP minor and platform (plus an experimental
+> Windows TAILCALL build), named
+> `ephpm-vX.Y.Z+php<version>-<os>-<arch>.tar.gz` (see
+> `.github/workflows/release.yml`), all with the same statically linked
+> extension set. No build bundles Xdebug, PCOV or SPX; load them as shared
+> Zend extensions instead (see
+> [PHP Extensions — Zend extensions](/guides/php-extensions/#zend-extensions-xdebug-pcov-profilers)).
 
 Binaries are named: `ephpm-{version}-php{php}-{suite}-{platform}`:
 

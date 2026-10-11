@@ -276,9 +276,11 @@ ephpm kv del $(ephpm kv keys "session:*" | awk '{print $NF}')
 # Connect to a different host/port
 ephpm kv --host 10.0.1.5 --port 6379 ping
 
-# Override defaults
-ephpm kv --host redis.example.com --port 6380 keys "*"
+# Override defaults (--host must be an IP address; hostnames are not resolved)
+ephpm kv --host 10.0.1.5 --port 6380 keys "*"
 ```
+
+`ephpm kv --host` takes an IP literal only (`[::1]` for IPv6). A hostname such as `localhost` or `redis.example.com` fails with `invalid address`, so resolve the name yourself and pass the address.
 
 See [the `ephpm kv` CLI reference](../site/content/reference/cli/kv.md) for full CLI documentation.
 

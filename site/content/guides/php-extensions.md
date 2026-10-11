@@ -121,6 +121,30 @@ Because the `extension=` lines precede `ini_file`/`ini_overrides` in the
 generated ini, you can configure an extension's own ini settings in the
 same config file.
 
+### Zend extensions (Xdebug, PCOV, profilers)
+
+`[php] extensions` only writes `extension=` lines. **Zend extensions** —
+Xdebug, PCOV, and loaders/profilers such as ionCube and Blackfire's probe —
+must be loaded with `zend_extension=` instead; PHP refuses a Zend extension
+given to `extension=` ("appears to be a Zend Extension"). Load them through
+`ini_overrides`, with an **absolute path**:
+
+```toml
+[php]
+ini_overrides = [
+    ["zend_extension", "/opt/ephpm-ext/xdebug.so"],
+    ["xdebug.mode", "debug"],
+    ["xdebug.client_host", "127.0.0.1"],
+]
+```
+
+This has been verified with Xdebug on a Linux release build (v0.11.2). Use
+an absolute path: a bare name relies on `extension_dir`, which defaults to a
+baked-in placeholder (see above). The same ABI contract applies: the `.so`
+must be a ZTS build for the matching PHP minor. For one-off CLI use,
+`ephpm php -d zend_extension=/path/to/xdebug.so` works too (see
+[`ephpm php`](/reference/cli/php/)).
+
 An **empty string** entry fails validation at startup (it could never
 load anything, and PHP would silently ignore it). A `.so` that doesn't
 exist or doesn't match the ABI is reported by PHP at startup ("Unable to
@@ -140,7 +164,7 @@ don't:
 | Dimension | ePHPm's build |
 |---|---|
 | PHP minor version | The release you downloaded (8.3 / 8.4 / 8.5 — one binary per minor) |
-| Thread safety | **ZTS** on Linux and macOS, **NTS** on Windows |
+| Thread safety | **ZTS** on every platform (Linux, macOS and Windows) |
 | libc (Linux) | **glibc** — release binaries are glibc-dynamic (`<arch>-unknown-linux-gnu`) |
 
 In practice on Linux that means: a **ZTS** glibc build for the matching
@@ -148,8 +172,20 @@ PHP minor works; musl (Alpine) builds and NTS builds don't. Beware that
 distro/Sury `php8.x-<ext>` packages are **NTS** and are rejected at
 startup (verified July 2026: Sury's `php8.5-igbinary` fails with
 `undefined symbol: compiler_globals`; no `-zts` package variants exist in
-the Sury bookworm/trixie indexes). On Windows, use NTS x64 DLLs for the
-matching PHP minor; on macOS, arm64 ZTS builds.
+the Sury bookworm/trixie indexes). On macOS, use arm64 ZTS builds.
+
+### Windows
+
+Loading shared extensions on Windows is **not validated, and stock
+extension DLLs are not expected to work.** ePHPm's Windows build is ZTS (not
+NTS), and PHP is **statically linked** into `ephpm.exe`: there is no
+`php8ts.dll` beside it. The DLLs published on windows.php.net and by PECL
+are linked against `php8ts.dll` (or `php8.dll` for NTS builds), so they
+need a separate PHP runtime DLL that ePHPm does not ship, and loading one
+would not attach the extension to ePHPm's embedded PHP anyway. NTS DLLs are
+ruled out regardless, since the thread-safety mode does not match. Treat
+`[php] extensions` as Linux and macOS only for now, and rely on the
+statically linked set on Windows.
 
 If you build a fully static musl ePHPm yourself, `dlopen()` is
 unavailable there — `[php] extensions` (and shared middleware) cannot
@@ -158,7 +194,7 @@ precisely so that this mechanism works out of the box.
 
 ### ZTS caveats
 
-ePHPm is ZTS on Linux/macOS. Most mainstream PECL extensions (mongodb,
+ePHPm is ZTS on every platform. Most mainstream PECL extensions (mongodb,
 redis, igbinary, msgpack, yaml, uuid, apcu, ds) are ZTS-clean; a few
 assume NTS and misbehave under threads. Prefer extensions that publish
 ZTS support, and test before production.

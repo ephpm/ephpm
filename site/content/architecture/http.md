@@ -54,16 +54,18 @@ This document covers the HTTP server design, PHP execution model, request lifecy
 
 ### Per-Request Lifecycle
 
-Each HTTP request runs a full `php_request_shutdown()` / `php_request_startup()` cycle (`ephpm_execute_request()` in `ephpm_wrapper.c`) — the classic php-fpm isolation model. Request shutdown destroys user functions, classes, constants, statics, and the global symbol table, so nothing leaks between requests. OPcache's compiled bytecode lives in shared memory and survives the cycle, so the opcode cache (and JIT buffer) are preserved.
+Each HTTP request runs a full `php_request_startup()` → script → `php_request_shutdown()` cycle (`ephpm_begin_request()` / `ephpm_run_request()` / `ephpm_finish_request()` in `ephpm_wrapper.c`) — the classic php-fpm isolation model. Request shutdown destroys user functions, classes, constants, statics, and the global symbol table, so nothing leaks between requests. OPcache's compiled bytecode lives in shared memory and survives the cycle, so the opcode cache (and JIT buffer) are preserved.
 
 Per-request sequence:
-1. Tear down the previous request (`php_request_shutdown()`); reset the thread-local output/header buffers and the POST read cursor
+1. Reset the thread-local output/header buffers and the POST read cursor (and, only if a previous request on this thread was never finished, run its `php_request_shutdown()` first)
 2. Populate `SG(request_info)` (method, URI, query string, content type, cookies, content length) **before** startup — the SAPI callbacks read these fields during startup
 3. Set a non-NULL `SG(server_context)` sentinel — `sapi_activate()` only parses the POST body into `$_POST` when the server context is non-NULL (the same gate cli-server/cgi use)
 4. `php_request_startup()` builds all superglobals natively through the SAPI callbacks
 5. Reset response state (`http_response_code = 200`, `headers_sent`, `no_headers`) so an explicit status from a prior request on the same worker thread can't leak
-6. Replay buffered per-request INI overrides (e.g. per-vhost `open_basedir`) at `PHP_INI_STAGE_ACTIVATE` — they're buffered because applying them before startup would be undone by the shutdown/startup cycle
-7. Execute the script under bailout protection
+6. Replay buffered per-request INI overrides (e.g. per-vhost `open_basedir`) at `PHP_INI_STAGE_ACTIVATE` — they are buffered because a request may still be open on the thread when they are set, and its shutdown would undo them
+7. Run in-request maintenance queued for this request (OPcache cluster invalidation, JIT buffer sampling) — it needs a live executor, which a pool thread does not have between requests
+8. Execute the script under bailout protection, run `register_shutdown_function()` callbacks, flush every output buffer, and capture the response
+9. Send the response, then run `php_request_shutdown()` on the same thread: global objects' destructors, every extension's request shutdown (the session module writes the session and releases its lock here; Xdebug ends its debugger session), and INI restore. This runs after the reply so it adds no latency, and with the request's site scope still in place since destructors run tenant code. Before v0.11.3 this step ran lazily at the top of the thread's *next* request, which held session locks across requests and could hang a second request on the same session
 
 An earlier design reused one long-lived embed request and manually rebuilt the superglobals (destroying `PG(http_globals)` and re-running `sapi_module.treat_data`). That manual rebuild was removed: once the per-request lifecycle called `php_request_startup()` every request, it destroyed arrays startup had just created and caused a use-after-free SIGSEGV under load on tokio `spawn_blocking` threads. Superglobal construction is now owned entirely by `php_request_startup()`.
 
@@ -71,7 +73,7 @@ An earlier design reused one long-lived embed request and manually rebuilt the s
 
 PHP never runs on the tokio runtime. It runs on an **owned pool of dedicated OS threads** (`std::thread`) that ePHPm spawns, sizes, and drains itself. There are two pools, selected by `[php] mode`, and they share one scheduling design: the per-request pool (`[php] mode = "per_request"`, the default) lives in `crates/ephpm-server/src/fpm_pool.rs`, and the persistent worker pool (`mode = "worker"`) in `crates/ephpm-server/src/worker_pool.rs`. Both are sized by the same knobs — `[php] concurrency`, `queue_depth` and `admission` — which is why those knobs live on `[php]` rather than in a per-mode subsection. `overload` and `shed_after_ms` apply to the per-request pool only: worker mode always waits for a queue slot and never sheds.
 
-A pool thread's loop is deliberately dull: pull one job off a bounded dispatch queue, run exactly one PHP request under the bailout crash guard, reply on a `oneshot`, repeat. In per-request mode that one request is a full `php_request_startup()`/`php_request_shutdown()` cycle (the lifecycle above); in worker mode the framework is booted once per thread and the loop replays requests against it. Either way the concurrency ceiling is the thread count, not the arrival rate.
+A pool thread's loop is deliberately dull: pull one job off a bounded dispatch queue, run exactly one PHP request under the bailout crash guard, reply on a `oneshot`, finish the request (`php_request_shutdown()`), repeat. In per-request mode that one request is a full `php_request_startup()`/`php_request_shutdown()` cycle (the lifecycle above); in worker mode the framework is booted once per thread and the loop replays requests against it. Either way the concurrency ceiling is the thread count, not the arrival rate.
 
 #### Why an owned pool, not tokio `spawn_blocking`
 

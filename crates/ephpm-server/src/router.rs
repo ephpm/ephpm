@@ -3992,17 +3992,21 @@ impl Router {
         let run_php = move || -> Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError> {
             // Tag this thread with its vhost id for the kernel bind/connect
             // hooks, BEFORE any tenant code runs. The guard clears tag[tid] when
-            // this closure returns — on THIS blocking/pool thread, before it is
-            // reused. The Drop is a pure bpf `delete_elem` syscall, not a PHP
-            // call, so it does not cross PHP's setjmp/longjmp boundary
-            // (`PhpRuntime::execute` catches its own bailout and returns a
-            // `Result`, so the closure always unwinds normally). A stale tag on a
-            // reused ZTS thread would be a cross-tenant leak — this guard is the
-            // one hard invariant. `None` (feature off, or a host that matched no
-            // vhost) writes nothing, so there is nothing to clear. The shed / 503
-            // / hung-thread paths return before `run_php` runs at all, so they
-            // never write a tag.
-            let _ebpf_tag_guard = ebpf_tag.as_ref().map(|(e, key)| e.tag_current_thread(key));
+            // it drops — on THIS pool thread, before it is reused. It is parked
+            // with `hold_until_finished` rather than dropped when this closure
+            // returns, because the request's PHP teardown (destructors,
+            // RSHUTDOWN — this tenant's code) runs AFTER the closure, once the
+            // pool has sent the response; the pool releases it after that
+            // teardown on every exit path. The Drop is a pure bpf `delete_elem`
+            // syscall, not a PHP call, so it never crosses PHP's setjmp/longjmp
+            // boundary. A stale tag on a reused ZTS thread would be a
+            // cross-tenant leak — this guard is the one hard invariant. `None`
+            // (feature off, or a host that matched no vhost) writes nothing, so
+            // there is nothing to clear. The shed / 503 / hung-thread paths
+            // return before `run_php` runs at all, so they never write a tag.
+            if let Some(guard) = ebpf_tag.as_ref().map(|(e, key)| e.tag_current_thread(key)) {
+                crate::fpm_pool::hold_until_finished(guard);
+            }
 
             // Scope KV store to this virtual host for multi-tenant isolation.
             // Keyed on the same identity the injected `EPHPM_REDIS_USERNAME`
@@ -4119,32 +4123,36 @@ impl Router {
 
             // OPcache clustered invalidation (Phase 1): if the watcher told us
             // to invalidate, drop bytecode under this vhost's docroot BEFORE
-            // executing the script. Runs on the TSRM-registered blocking
-            // thread inside the thread's still-active previous/initial request
-            // (ephpm_thread_init leaves one open; execute() cycles it AFTER
-            // this point) — OPcache SHM effects survive that cycle.
-            // mark_invalidated deduplicates so concurrent requests coalesce on
-            // the per-vhost mutex.
+            // executing the script. The OPcache calls need a live PHP request,
+            // and between requests this pool thread has none (the previous one
+            // was finished right after its response), so the walk is queued to
+            // run inside THIS request, right after `php_request_startup()` and
+            // before the script. mark_invalidated deduplicates so concurrent
+            // requests coalesce on the per-vhost mutex.
             if let (Some(watcher), Some(version)) = (opcache_watcher, invalidate_version) {
                 // Scoped to the container, not the web root: a framework's
                 // compiled bytecode overwhelmingly lives in `vendor/` and `app/`
                 // *above* `public/`, so invalidating only under the web root
                 // would leave the stale code cached and defeat the purpose.
-                watcher.mark_invalidated(
-                    &vhost_name,
-                    &site_container,
-                    version,
-                    crate::opcache::InvalidationTrigger::Kv,
-                    PhpRuntime::opcache_invalidate_under,
-                );
+                let vhost_name = vhost_name.clone();
+                let site_container = site_container.clone();
+                PhpRuntime::at_request_start(move || {
+                    watcher.mark_invalidated(
+                        &vhost_name,
+                        &site_container,
+                        version,
+                        crate::opcache::InvalidationTrigger::Kv,
+                        PhpRuntime::opcache_invalidate_under,
+                    );
+                });
             }
 
-            // JIT buffer gauges: piggyback on the request path (same thread
-            // state the invalidator above relies on — TSRM-registered, inside
-            // the thread's still-active request). One relaxed atomic load per
-            // request; the FFI status call runs at most once per sampling
-            // interval process-wide. No-op in stub mode.
-            ephpm_php::jit_metrics::maybe_sample();
+            // JIT buffer gauges: piggyback on the request path (queued into the
+            // request for the same live-executor reason as the invalidator
+            // above). One relaxed atomic load per request; the FFI status call
+            // runs at most once per sampling interval process-wide. No-op in
+            // stub mode.
+            PhpRuntime::at_request_start(ephpm_php::jit_metrics::maybe_sample);
 
             let had_php_middleware = !php_middleware.is_empty();
             let result = PhpRuntime::execute(PhpRequest {
