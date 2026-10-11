@@ -58,14 +58,28 @@ pub const CONDITIONAL_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// - a current-thread runtime: blocking would deadlock the only worker, so
 ///   this returns `None` and the caller fails closed. Production runs the
 ///   multi-thread runtime; this case exists for tests.
+///
+/// A panic while blocking (the runtime is shutting down under a PHP thread
+/// that is still serving a request) also returns `None` rather than unwinding
+/// into the `extern "C"` caller, which would abort the process.
 fn block_on_cluster<F: std::future::Future>(
     handle: &tokio::runtime::Handle,
     fut: F,
 ) -> Option<F::Output> {
+    // `catch_unwind`: the callers include `extern "C"` PHP bridge functions on
+    // ePHPm-owned PHP threads, which are not joined before the runtime drops
+    // at shutdown. `block_on` + `tokio::time::timeout` on a runtime that is
+    // shutting down panics, and a panic unwinding out of an `extern "C"` fn
+    // aborts the process. Treat it as "owner unreachable" (fail closed).
     match tokio::runtime::Handle::try_current() {
-        Err(_) => Some(handle.block_on(fut)),
+        Err(_) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.block_on(fut))).ok()
+        }
         Ok(current) if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            Some(tokio::task::block_in_place(|| handle.block_on(fut)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            }))
+            .ok()
         }
         Ok(_) => {
             tracing::warn!(
@@ -1903,6 +1917,30 @@ enum ParseMemoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PHP thread routing a conditional write while the runtime is shutting
+    /// down must fail closed, not panic: the caller is an `extern "C"` bridge
+    /// fn, where an unwinding panic aborts the process.
+    #[test]
+    fn block_on_cluster_after_runtime_shutdown_fails_closed() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        drop(rt);
+        let out = std::thread::spawn(move || {
+            // Lazily built like the real `route_*` async fns, so the timer is
+            // touched only once polled on the (shut-down) runtime.
+            block_on_cluster(&handle, async {
+                tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()).await
+            })
+        })
+        .join()
+        .expect("block_on_cluster must not panic out of the calling thread");
+        assert!(out.is_none(), "a shut-down runtime is treated as unreachable");
+    }
 
     #[test]
     fn parse_memory_sizes() {

@@ -185,7 +185,9 @@ The guarantee, stated precisely:
   and the RESP commands answer `-CLUSTERDOWN …` (never `:0`/`nil`, which would
   claim the key exists or the token did not match). Nothing was written on the
   calling node, but a request that timed out may still have been applied on
-  the owner. Use a unique token per attempt and always set a TTL, so a grant
+  the owner. From PHP, `ephpm_kv_setnx()` returns `false` both when the key
+  exists and when the owner is unreachable, so you cannot tell the two
+  apart; use a unique token per attempt and always set a TTL, so a grant
   that landed after a timeout either expires or can be released with
   `del_if_eq` and that token. A dead owner stops being the owner once gossip
   declares it dead.
