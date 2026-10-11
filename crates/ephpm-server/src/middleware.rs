@@ -722,8 +722,8 @@ fn platform_tag() -> String {
 /// A value containing a path separator or a file extension is an explicit
 /// path, used as-is. Bare names try `<name>.<platform>.<ext>`,
 /// `lib<name>.<ext>` and `<name>.<ext>` (cargo-built artifacts) in the
-/// current directory, `$EPHPM_MIDDLEWARE_DIR` (when set) and
-/// `/usr/local/lib/ephpm/middleware`, in that order.
+/// current directory, `$EPHPM_MIDDLEWARE_DIR` (when set) and the platform
+/// default directories ([`default_middleware_dirs`]), in that order.
 fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
     let explicit =
         library.contains('/') || library.contains('\\') || Path::new(library).extension().is_some();
@@ -751,7 +751,7 @@ fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
     {
         dirs.push(PathBuf::from(dir));
     }
-    dirs.push(PathBuf::from("/usr/local/lib/ephpm/middleware"));
+    dirs.extend(default_middleware_dirs());
 
     let mut tried = Vec::new();
     for dir in &dirs {
@@ -764,6 +764,50 @@ fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!("middleware library \"{library}\" not found; tried: {}", tried.join(", "))
+}
+
+/// Platform default directories searched for bare middleware library names,
+/// after the current directory and `$EPHPM_MIDDLEWARE_DIR`.
+///
+/// - Unix: `/usr/local/lib/ephpm/middleware`.
+/// - Windows: derived from where ePHPm is installed rather than a Unix path —
+///   `<directory of ephpm.exe>\middleware` (e.g.
+///   `C:\Program Files\ephpm\middleware` for an `ephpm install`), then
+///   `%ProgramData%\ephpm\middleware` (next to the installed config). The
+///   Unix path used to be searched on Windows too, where it silently
+///   resolved to `\usr\local\lib\...` on the current drive.
+fn default_middleware_dirs() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        windows_middleware_dirs(
+            std::env::current_exe().ok().as_deref(),
+            std::env::var_os("ProgramData").as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/usr/local/lib/ephpm/middleware")]
+    }
+}
+
+/// Windows default middleware directories, from the running executable's path
+/// and the `%ProgramData%` value. Pure so it is testable on every platform.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn windows_middleware_dirs(
+    exe: Option<&Path>,
+    program_data: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = exe.and_then(Path::parent) {
+        dirs.push(dir.join("middleware"));
+    }
+    if let Some(pd) = program_data.filter(|p| !p.is_empty()) {
+        let dir = Path::new(pd).join("ephpm").join("middleware");
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Prepare a `php:` mount. There is nothing to load — the script is compiled by
@@ -1086,6 +1130,43 @@ mod tests {
         assert!(err.contains("lib"), "{err}");
         assert!(err.contains(std::env::consts::DLL_EXTENSION), "{err}");
         assert!(err.contains(&platform_tag()), "{err}");
+    }
+
+    #[test]
+    fn default_middleware_dirs_are_platform_appropriate() {
+        let dirs = default_middleware_dirs();
+        if cfg!(windows) {
+            // Never the Unix path, which resolves to `\usr\local\lib` on the
+            // current drive there.
+            assert!(
+                dirs.iter().all(|d| !d.to_string_lossy().replace('\\', "/").starts_with("/usr")),
+                "{dirs:?}"
+            );
+            assert!(dirs.iter().all(|d| d.is_absolute()), "{dirs:?}");
+            // `current_exe` always resolves in a test binary.
+            assert!(dirs.iter().any(|d| d.ends_with("middleware")), "{dirs:?}");
+        } else {
+            assert_eq!(dirs, [PathBuf::from("/usr/local/lib/ephpm/middleware")]);
+        }
+    }
+
+    #[test]
+    fn windows_middleware_dirs_derive_from_install_location() {
+        let exe = Path::new("D:/Apps/ephpm/ephpm.exe");
+        let dirs = windows_middleware_dirs(Some(exe), Some(std::ffi::OsStr::new("E:/ProgramData")));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("D:/Apps/ephpm").join("middleware"),
+                PathBuf::from("E:/ProgramData").join("ephpm").join("middleware"),
+            ]
+        );
+        // Missing inputs drop their entry rather than inventing a path.
+        assert_eq!(windows_middleware_dirs(None, None), Vec::<PathBuf>::new());
+        assert_eq!(
+            windows_middleware_dirs(None, Some(std::ffi::OsStr::new(""))),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]

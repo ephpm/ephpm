@@ -13,16 +13,21 @@ const LABEL: &str = "dev.ephpm";
 /// Render the `UserName`/`GroupName` plist keys. Empty when `owner` is `None`
 /// so the default plist is unaffected — see the `systemd::owner_directives`
 /// doc comment for the same backward-compatibility contract.
-fn owner_keys(owner: Option<&ServiceOwner>) -> String {
+///
+/// `WorkingDirectory` is the data dir, so a relative `[db.sqlite] path` (the
+/// default `ephpm.db`) resolves inside the directory `install` chowns to the
+/// service user rather than `/`, which that user cannot write.
+fn owner_keys(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     let Some(ServiceOwner { user, group }) = owner else {
         return String::new();
     };
+    let data_dir = paths.data_dir.display();
     // NOTE: no `\` line-continuations here — a trailing backslash swallows the
     // next source line's leading whitespace, which previously left the
     // `<string>`/`<key>` lines unindented (the launchd test caught it). Keep
     // every indent explicit as `\n    ` inside a single literal.
     format!(
-        "    <key>UserName</key>\n    <string>{user}</string>\n    <key>GroupName</key>\n    <string>{group}</string>\n"
+        "    <key>UserName</key>\n    <string>{user}</string>\n    <key>GroupName</key>\n    <string>{group}</string>\n    <key>WorkingDirectory</key>\n    <string>{data_dir}</string>\n"
     )
 }
 
@@ -33,7 +38,7 @@ fn plist_body(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     let binary = paths.binary.display();
     let config = paths.config.display();
     let log = paths.log_file.display();
-    let owner_keys = owner_keys(owner);
+    let owner_keys = owner_keys(paths, owner);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -149,6 +154,7 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/ephpm"),
             document_root: PathBuf::from("/var/www/html"),
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+            extra_writable_dirs: Vec::new(),
         };
         let body = plist_body(&paths, None);
         assert!(body.contains("<string>dev.ephpm</string>"));
@@ -168,10 +174,13 @@ mod tests {
             data_dir: PathBuf::from("/var/lib/ephpm"),
             document_root: PathBuf::from("/var/www/html"),
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+            extra_writable_dirs: Vec::new(),
         };
         let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
         let body = plist_body(&paths, Some(&owner));
         assert!(body.contains("<key>UserName</key>\n    <string>ephpm-web</string>"));
         assert!(body.contains("<key>GroupName</key>\n    <string>ephpm-web</string>"));
+        assert!(body.contains("<key>WorkingDirectory</key>\n    <string>/var/lib/ephpm</string>"));
+        assert!(!plist_body(&paths, None).contains("WorkingDirectory"));
     }
 }

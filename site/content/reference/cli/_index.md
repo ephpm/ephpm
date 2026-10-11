@@ -300,7 +300,7 @@ Install and manage ePHPm as a system service — systemd on Linux, launchd on ma
 | Log file | `/var/log/ephpm/ephpm.log` | `/var/log/ephpm/ephpm.log` | `C:\ProgramData\ephpm\logs\ephpm.log` |
 | Default document root (in the generated config) | `/var/www/html` | `/var/www/html` | `C:\ProgramData\ephpm\www` |
 
-The data dir is created by `install` and deleted by `uninstall`, but **the generated config does not point anything at it**. `[db.sqlite] path` defaults to `ephpm.db` and the ACME `cache_dir` defaults to `certs`. Both are relative to the service's working directory, which is not the data dir. To keep databases and certificates there, set absolute paths in the config (for example `path = "/var/lib/ephpm/app.db"`).
+The data dir is created by `install` and deleted by `uninstall`, but **the generated config does not point anything at it**. `[db.sqlite] path` defaults to `ephpm.db` and the ACME `cache_dir` defaults to `certs`. Both are relative to the service's working directory. With `install --user` on Linux/macOS that working directory is the data dir, so they land there. Without `--user` it is `/` (systemd/launchd) or `C:\Windows\System32` (a Windows service), not the data dir. To keep databases and certificates in the data dir in every case, set absolute paths in the config (for example `path = "/var/lib/ephpm/app.db"`).
 
 ### `ephpm install`
 
@@ -318,7 +318,7 @@ What it does, in order:
 
 1. Copies the **running** binary to the install path. If you run the installed binary itself, the copy is skipped.
 2. Writes a default config **only if none exists**. Re-running `install`, for example with a newer binary, keeps your config, so re-running is the upgrade path. The generated config listens on `0.0.0.0:8080`, serves the platform's default document root, and uses `[php] mode = "per_request"`, `max_execution_time = 30`, `memory_limit = "128M"`.
-3. Creates the data and log directories.
+3. Creates the data and log directories. With `--user`, it also creates the directories the config writes to (see below) and hands them to the service account.
 4. Registers the service: a systemd unit (enabled, `Restart=on-failure`, output appended to the log file), a launchd daemon (`RunAtLoad`, `KeepAlive`), or a Windows auto-start service running as `LocalSystem`. On Windows it also adds `C:\Program Files\ephpm` to the system `Path`. The Windows service runs the hidden `ephpm service-run` entry point, while systemd and launchd run `ephpm serve --config <config>`.
 5. Starts the service.
 
@@ -331,7 +331,8 @@ What it does, in order:
 
 What `--user` changes per platform:
 
-- **Linux:** the unit gets `User=` / `Group=` plus a hardening profile: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (so the service can still bind ports 80/443), and `ReadWritePaths=` for the data dir, log dir, and default document root. Under `ProtectSystem=strict` everything else is read-only, so any other path the server must write to has to be added to `ReadWritePaths` in a drop-in. That covers a `sites_dir`, database, or ACME cache outside those three directories, and relative database/cache paths, which resolve against `/`. It also covers the system temp directory: `ProtectSystem=strict` leaves `/tmp` read-only too, and that is where PHP writes uploads and file sessions by default and where multi-tenant mode keeps each site's private temp/session state (`/tmp/ephpm-vhosts/…`).
+- **Linux and macOS:** the service's working directory is the data dir (`WorkingDirectory=` in the unit, the `WorkingDirectory` plist key), so relative paths in the config — the default `[db.sqlite] path = "ephpm.db"` and the default ACME `cache_dir = "certs"` — land in the directory the account owns. Without `--user` the working directory stays `/` (unchanged, so an existing relative database does not move). The installer also reads the config and creates the absolute `[db.sqlite] path` parent directory, `[db.sqlite] dir` and ACME `[server.tls] cache_dir`. A directory it creates is chowned to the account (recursively for the per-site `dir` and the ACME cache, non-recursively for a database file's parent). A directory that **already existed** outside the data dir is not re-owned, because it may be a shared directory such as `/var/lib`: the installer logs a warning naming it, and granting access is up to you. It reads the config that exists at install time; if you later move the database, re-run `ephpm install --user …` (it keeps your config) or grant access by hand.
+- **Linux:** the unit also gets `User=` / `Group=` plus a hardening profile: `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (so the service can still bind ports 80/443), and `ReadWritePaths=` for the data dir, log dir, default document root, `/tmp`, `/var/tmp`, and the config-derived directories above. `ProtectSystem=strict` would otherwise leave `/tmp` read-only too, and that is where PHP writes uploads and file sessions by default and where multi-tenant mode keeps each site's private temp/session state (`/tmp/ephpm-vhosts/…`). Everything else stays read-only, so any other path the server must write to — a `sites_dir` outside the document root, an access-log file elsewhere — has to be added to `ReadWritePaths` in a drop-in.
 - **macOS:** the plist gets `UserName` / `GroupName`. No other hardening is added.
 - **Windows:** not supported. Passing `--user` is a hard error, because the SCM needs a stored account password that ePHPm has no secure way to collect. It does not quietly install as `LocalSystem`.
 
@@ -376,7 +377,7 @@ It prints the service state, PID, uptime, the `[server] listen` value read from 
 
 ### `ephpm logs`
 
-Show the service log.
+Print the last 200 lines of the service log file (`/var/log/ephpm/ephpm.log` on Linux/macOS, `C:\ProgramData\ephpm\logs\ephpm.log` on Windows).
 
 ```bash
 ephpm logs
@@ -385,10 +386,10 @@ ephpm logs
 ephpm logs -f
 ```
 
-- **Linux:** runs `journalctl -u ephpm.service --no-pager -n 200` (or `-f` with `--follow`). It falls back to the log file only if `journalctl` is missing or fails. The generated unit appends the server's stdout/stderr to `/var/log/ephpm/ephpm.log` (`StandardOutput=append:`), not to the journal, so the journal mostly holds systemd's own start/stop messages. Read the file for the server's output: `sudo tail -f /var/log/ephpm/ephpm.log`.
-- **macOS / Windows:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation).
+- **Every platform:** prints the last 200 lines of the log file. With `-f` it then polls for new lines every 500 ms and starts over from the beginning if the file shrinks (rotation). On Linux and macOS only the last 1 MiB of the file is read to find those lines, and bytes that are not valid UTF-8 are shown as `�` instead of failing the command. On Windows the whole file is read, and a file that is not valid UTF-8 makes `logs` fail.
+- **Linux:** the generated unit appends the server's stdout/stderr to `/var/log/ephpm/ephpm.log` (`StandardOutput=append:`), not to the journal, so the journal holds only systemd's own start/stop messages. `logs` therefore reads the file, and runs `journalctl -u ephpm.service --no-pager -n 200` (or `-f`) only when the file does not exist, for example under a hand-written unit that logs to the journal. If that `journalctl` fails too, `logs` exits `1`.
 
-The log file is at the path in [Where things live](#where-things-live). On Linux `logs` reads the systemd journal first and falls back to that file only when `journalctl` fails; on macOS and Windows (or that Linux fallback), a missing log file makes `logs` exit `1`.
+The log file is at the path in [Where things live](#where-things-live). On macOS and Windows a missing log file makes `logs` exit `1`.
 
 ---
 

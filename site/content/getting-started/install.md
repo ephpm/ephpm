@@ -108,7 +108,7 @@ sudo ephpm logs           # tail the service log
 sudo ephpm logs --follow  # follow new log lines
 ```
 
-The server's own log output goes to `/var/log/ephpm/ephpm.log` (`C:\ProgramData\ephpm\logs\ephpm.log` on Windows). On Linux, `ephpm logs` shows the systemd journal (`journalctl -u ephpm.service`) instead. The unit sends the server's stdout/stderr to the log file, not the journal, so the journal mostly holds systemd's start/stop messages. For the server's output on Linux, read the file: `sudo tail -f /var/log/ephpm/ephpm.log`. See [Where things live](/reference/cli/#where-things-live) for every path per platform.
+The server's own log output goes to `/var/log/ephpm/ephpm.log` (`C:\ProgramData\ephpm\logs\ephpm.log` on Windows). `ephpm logs` reads that file on every platform. On Linux the unit sends the server's stdout/stderr to the file, not the journal, so `journalctl -u ephpm` holds only systemd's start/stop messages; `ephpm logs` falls back to the journal only when the file does not exist. See [Where things live](/reference/cli/#where-things-live) for every path per platform.
 
 To run the server in the foreground without registering a service (useful for debugging):
 

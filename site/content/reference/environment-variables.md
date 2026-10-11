@@ -28,17 +28,31 @@ Examples:
 
 This works because ePHPm uses [figment](https://github.com/SergioBenitez/Figment) with `Env::prefixed("EPHPM_").split("__")`.
 
-## Single underscores are silently ignored
+## Single underscores do not nest (startup warns)
 
 The separator between levels must be a **double** underscore. Underscores inside a key name stay single (`MEMORY_LIMIT`, `DOCUMENT_ROOT`), so a missing underscore at a boundary is easy to type and fails in one of two ways:
 
 | Mistake | Becomes | Result |
 |---------|---------|--------|
-| `EPHPM_SERVER_LISTEN` (single `_` after the section) | top-level key `server_listen` | **Silently ignored.** No error, no warning — `listen` keeps its TOML or default value. |
-| `EPHPM_PHP_MODE=worker` | top-level key `php_mode` | **Silently ignored.** The server runs in the default `per_request` mode. |
+| `EPHPM_SERVER_LISTEN` (single `_` after the section) | top-level key `server_listen` | **Ignored, with a startup `WARN`** naming the variable and suggesting `EPHPM_SERVER__LISTEN`. `listen` keeps its TOML or default value. |
+| `EPHPM_PHP_MODE=worker` | top-level key `php_mode` | **Ignored, with a startup `WARN`** suggesting `EPHPM_PHP__MODE`. The server runs in the default `per_request` mode. |
 | `EPHPM_SERVER__REQUEST_MAX_BODY_SIZE` (single `_` at a deeper level) | `[server] request_max_body_size` | **Startup error** naming the unknown key. |
 
-The first case is silent because the top level of the config is deliberately lenient: every `EPHPM_*` variable in the environment becomes a top-level key, and some of them are not configuration (ePHPm's Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`; the e2e harness sets `EPHPM_URL`). Every section below the top level rejects unknown keys — see [Unknown keys are a startup error](/reference/config/#unknown-keys-are-a-startup-error). When an override seems to have no effect, check its underscores first, and confirm the value in the startup log.
+The first two cases are a warning rather than an error because the top level of the config is deliberately lenient: every `EPHPM_*` variable in the environment becomes a top-level key, and some of them are not configuration (ePHPm's Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`; the e2e harness sets `EPHPM_URL`). Every section below the top level rejects unknown keys — see [Unknown keys are a startup error](/reference/config/#unknown-keys-are-a-startup-error). `ephpm serve` and `ephpm dev` log one `WARN` per unmapped variable:
+
+```
+WARN environment variable EPHPM_SERVER_LISTEN maps to no config key and is ignored — did you mean EPHPM_SERVER__LISTEN? ...
+```
+
+Not reported, because ePHPm or its tooling reads them directly rather than as config keys:
+
+- the variables in [Other non-config environment variables](#other-non-config-environment-variables) (`EPHPM_KV_PASSWORD`, `EPHPM_SERVICE_LOG_FILE`, `EPHPM_MIDDLEWARE_DIR`) and `EPHPM_FATAL_HANDLER`;
+- `EPHPM_RELEASE_VERSION` (read at build time; the release workflows export it into the job environment);
+- `EPHPM_SESSION_SECRET` and `EPHPM_PREVIEW_SESSION_SECRET` (the secret names these docs use in `env:` examples), and any other variable that a `[[middleware]]` mount's `config` references as `env:NAME`;
+- variables the org's PHP packages read with `getenv()`: `EPHPM_APP_BASE` ([Laravel Octane](/guides/laravel-octane/)), `EPHPM_WORKER_BOOTSTRAP` ([PSR-15 worker](/guides/psr15-worker/)), `EPHPM_WP_PATH` (`ephpm/wordpress-worker`) and `EPHPM_SEED_TOKEN` (`ephpm/wordpress-sample`);
+- the variables the e2e and integration harnesses set (`EPHPM_URL`, `EPHPM_BINARY`, `EPHPM_CLUSTER_URL_*`, `EPHPM_TEST_*`, …).
+
+Any other `EPHPM_*` variable you set for some other purpose (for example one referenced as `env:NAME` from a per-site override file) is still reported. The warning is advisory: it changes nothing about how the variable is used. Two limits: the "did you mean" suggestion only fixes the separator after the section name (`EPHPM_DB_SQLITE_PATH` suggests `EPHPM_DB__SQLITE_PATH`, while the real key is `EPHPM_DB__SQLITE__PATH`), and a misspelling that collides with a harness variable (`EPHPM_SITES_DIR`, `EPHPM_DOCROOT`, `EPHPM_KV_HOST`, `EPHPM_KV_PORT`, `EPHPM_TEST_*`) is not reported.
 
 ## `ephpm dev` differs
 
@@ -157,7 +171,7 @@ These are read directly, not through the `EPHPM_` config mapping.
 | `EPHPM_KV_PASSWORD` | `ephpm kv`, `ephpm deploy`, `ephpm cache` | Fallback for `--password`: sent as the RESP `AUTH` password when the flag is absent. An empty value counts as unset. See [`ephpm kv` → Authentication](/reference/cli/kv/#authentication). |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT` | `serve`, `dev` | Enable OTLP trace export to this endpoint. **They take precedence over `[server.diagnostics] otlp_endpoint`** (the traces-specific one first). Release binaries include the exporter (`otlp` cargo feature). A binary built without it logs a startup warning and exports nothing. See [OTLP tracing](/guides/otlp-tracing/). |
 | `EPHPM_SERVICE_LOG_FILE` | `serve`, `dev` | Sends the main log output to this file (no ANSI colours) instead of stdout, creating its parent directory. The Windows service sets it to `C:\ProgramData\ephpm\logs\ephpm.log`, because a Windows service has no console. It is meant for that, but any `serve`/`dev` run honours it. It does not affect the separate `[server.logging] access` log. |
-| `EPHPM_MIDDLEWARE_DIR` | `serve`, `dev` (at startup, when loading `[[middleware]]`) | Extra directory searched for shared-library middleware named by a bare `library` value: after the process working directory and before `/usr/local/lib/ephpm/middleware`. Ignored when empty. Builtin names and explicit paths never consult it. Set it in the service's environment when ePHPm runs as a service. See [Native middleware → library resolution](/guides/native-middleware/#library-resolution). |
+| `EPHPM_MIDDLEWARE_DIR` | `serve`, `dev` (at startup, when loading `[[middleware]]`) | Extra directory searched for shared-library middleware named by a bare `library` value: after the process working directory and before the platform default (`/usr/local/lib/ephpm/middleware` on Linux/macOS; `<directory of ephpm.exe>\middleware`, then `%ProgramData%\ephpm\middleware` on Windows). Ignored when empty. Builtin names and explicit paths never consult it. Set it in the service's environment when ePHPm runs as a service. See [Native middleware → library resolution](/guides/native-middleware/#library-resolution). |
 | `MIMALLOC_PURGE_DELAY` | the mimalloc allocator (Linux/macOS builds) | Not an ePHPm setting: ePHPm uses [mimalloc](https://github.com/microsoft/mimalloc) as its allocator on Unix, and mimalloc reads its own `MIMALLOC_*` options from the environment. `MIMALLOC_PURGE_DELAY` (milliseconds) controls how long freed memory is kept before it is returned to the OS. That is the lever if resident memory looks high at steady state. Windows builds use the system allocator and ignore it. |
 
 ## See also

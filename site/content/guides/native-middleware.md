@@ -219,21 +219,23 @@ Search directories, in order:
 1. `.` — the ePHPm **process's** working directory (not the directory of
    `ephpm.toml`)
 2. `$EPHPM_MIDDLEWARE_DIR` (when set and non-empty)
-3. `/usr/local/lib/ephpm/middleware`
+3. the platform default:
+   - Linux/macOS: `/usr/local/lib/ephpm/middleware`
+   - Windows: `<directory of ephpm.exe>\middleware` (for an `ephpm install`,
+     `C:\Program Files\ephpm\middleware`), then
+     `%ProgramData%\ephpm\middleware` (next to the installed config)
 
 The startup error lists every candidate path tried, so a typo'd mount is
 easy to diagnose.
 
-Two consequences when ePHPm runs as a service. The working directory is
-whatever the service manager gives it — the systemd unit `ephpm install`
-generates sets no
-`WorkingDirectory=`, so that is `/`, and a Windows service normally starts in
-`C:\Windows\System32` — so the first search directory is rarely what you
-expect. And `/usr/local/lib/ephpm/middleware` is compiled in on **every**
-platform: on Windows it is a drive-relative path (`\usr\local\lib\ephpm\middleware`
-on the current drive), not a conventional Windows location. For a service,
-mount by explicit path or set `EPHPM_MIDDLEWARE_DIR` in the service's
-environment.
+When ePHPm runs as a service, the working directory is whatever the service
+manager gives it — `/` for the unit `ephpm install` generates without
+`--user` (the data dir `/var/lib/ephpm` with `--user`), and a Windows service
+normally starts in `C:\Windows\System32` — so the first search directory is
+rarely what you expect. Install modules into the platform default directory
+instead (on Windows, a `middleware` folder next to `ephpm.exe`, i.e.
+`C:\Program Files\ephpm\middleware` for an `ephpm install`), mount by
+explicit path, or set `EPHPM_MIDDLEWARE_DIR` in the service's environment.
 
 ## Chain semantics (v1)
 

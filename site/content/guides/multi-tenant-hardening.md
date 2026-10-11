@@ -166,8 +166,11 @@ RESP listener on and no `[kv] secret` is a startup error. See
 > **Operator-supplied.** Unlike §1–§6, nothing in this section is produced by
 > ePHPm. [`ephpm install`](/reference/cli/#ephpm-install) writes a single-uid systemd unit
 > (`crates/ephpm/src/service/systemd.rs`): with `--user` it emits `User=`,
-> `Group=`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`,
-> a `CapabilityBoundingSet` of `CAP_NET_BIND_SERVICE`, and `ReadWritePaths`.
+> `Group=`, `WorkingDirectory=` (the data dir), `NoNewPrivileges=true`,
+> `ProtectSystem=strict`, `ProtectHome=true`, a `CapabilityBoundingSet` of
+> `CAP_NET_BIND_SERVICE`, and `ReadWritePaths` (data, log and document-root
+> dirs, `/tmp`, `/var/tmp`, and the database/ACME directories named in the
+> config at install time).
 > It does **not** emit `PrivateTmp`, `IPAddressDeny`, or a second unit, and
 > there is no `ephpm-ctl` binary. The split below is a deployment pattern you
 > build on the host — the one the ePHPm preview fleet runs — described here so

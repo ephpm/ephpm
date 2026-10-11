@@ -122,6 +122,13 @@ pub struct Paths {
     pub document_root: PathBuf,
     /// File that the service logs to.
     pub log_file: PathBuf,
+    /// Extra directories, outside `data_dir` / the log dir / `document_root`,
+    /// that the configured server writes to (an absolute `[db.sqlite] path`
+    /// or `dir`, an ACME `cache_dir`). Filled by `install` from the config
+    /// for a `--user` install, and added to the systemd unit's
+    /// `ReadWritePaths`. Empty from [`Paths::for_current_platform`].
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub extra_writable_dirs: Vec<PathBuf>,
 }
 
 impl Paths {
@@ -137,6 +144,7 @@ impl Paths {
                 data_dir: PathBuf::from("/var/lib/ephpm"),
                 document_root: PathBuf::from("/var/www/html"),
                 log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+                extra_writable_dirs: Vec::new(),
             }
         }
 
@@ -149,6 +157,7 @@ impl Paths {
                 data_dir: PathBuf::from("/var/lib/ephpm"),
                 document_root: PathBuf::from("/var/www/html"),
                 log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+                extra_writable_dirs: Vec::new(),
             }
         }
 
@@ -161,6 +170,7 @@ impl Paths {
                 data_dir: PathBuf::from(r"C:\ProgramData\ephpm\data"),
                 document_root: PathBuf::from(r"C:\ProgramData\ephpm\www"),
                 log_file: PathBuf::from(r"C:\ProgramData\ephpm\logs\ephpm.log"),
+                extra_writable_dirs: Vec::new(),
             }
         }
 
@@ -173,6 +183,7 @@ impl Paths {
                 data_dir: PathBuf::from("/var/lib/ephpm"),
                 document_root: PathBuf::from("/var/www/html"),
                 log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+                extra_writable_dirs: Vec::new(),
             }
         }
     }
@@ -266,9 +277,17 @@ fn copy_binary(src: &Path, dest: &Path) -> Result<()> {
 /// (`systemctl`, `launchctl`) rather than linking their APIs directly.
 #[cfg(unix)]
 fn chown_path(path: &Path, owner: &ServiceOwner) -> Result<()> {
+    chown_impl(path, owner, true)
+}
+
+#[cfg(unix)]
+fn chown_impl(path: &Path, owner: &ServiceOwner, recursive: bool) -> Result<()> {
     let spec = format!("{}:{}", owner.user, owner.group);
-    let out = std::process::Command::new("chown")
-        .arg("-R")
+    let mut cmd = std::process::Command::new("chown");
+    if recursive {
+        cmd.arg("-R");
+    }
+    let out = cmd
         .arg(&spec)
         .arg(path)
         .output()
@@ -281,6 +300,156 @@ fn chown_path(path: &Path, owner: &ServiceOwner) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ))
     }
+}
+
+/// A directory the configured server writes to, derived from the config by
+/// [`config_writable_dirs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct WritableDir {
+    /// Absolute directory path.
+    path: PathBuf,
+    /// Whether ePHPm owns everything inside it (per-site DB dir, ACME cache)
+    /// — chowned recursively — or only puts its own files there (the parent
+    /// of a single-file `[db.sqlite] path`) — chowned non-recursively, since
+    /// SQLite must create its `-wal`/`-shm` siblings next to the database.
+    recursive: bool,
+}
+
+/// The directories the server will write, per `config`, with relative paths
+/// resolved against `working_dir` (the unit's `WorkingDirectory`).
+///
+/// Covers `[db.sqlite] path` (its parent directory), `[db.sqlite] dir`
+/// (per-site databases) and an ACME `[server.tls] cache_dir`. Deduplicated,
+/// in that order.
+/// `..` components are folded lexically, so a relative `path = "../app.db"`
+/// becomes `/var/lib/app.db` rather than `/var/lib/ephpm/../app.db` — which
+/// would otherwise pass a `starts_with(data_dir)` check while pointing
+/// outside it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn config_writable_dirs(config: &ephpm_config::Config, working_dir: &Path) -> Vec<WritableDir> {
+    let abs = |p: &Path| {
+        normalize_lexically(&if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) })
+    };
+    let mut dirs: Vec<WritableDir> = Vec::new();
+    let mut push = |path: PathBuf, recursive: bool| {
+        if let Some(existing) = dirs.iter_mut().find(|d| d.path == path) {
+            existing.recursive |= recursive;
+        } else {
+            dirs.push(WritableDir { path, recursive });
+        }
+    };
+    if let Some(sqlite) = config.db.sqlite.as_ref() {
+        let db = sqlite.path.trim();
+        if !db.is_empty()
+            && db != ":memory:"
+            && !db.starts_with("file:")
+            && let Some(parent) = abs(Path::new(db)).parent()
+        {
+            push(parent.to_path_buf(), false);
+        }
+        if let Some(dir) = sqlite.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            push(abs(Path::new(dir)), true);
+        }
+    }
+    // Same predicate privilege-drop uses to decide the ACME cache matters.
+    if let Some(tls) = config.server.tls.as_ref()
+        && tls.is_acme()
+    {
+        push(abs(&tls.cache_dir), true);
+    }
+    dirs
+}
+
+/// Fold `.` and `..` components without touching the filesystem (the
+/// directories may not exist yet). `..` at the root stays at the root.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_)) | None
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The numeric uid of `user`, via `id -u` (same shell-out approach as
+/// [`chown_impl`], no `getpwnam` FFI). `None` if it cannot be resolved.
+#[cfg(unix)]
+fn user_uid(user: &str) -> Option<u32> {
+    let out = std::process::Command::new("id").arg("-u").arg(user).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Create the config-derived writable directories for a `--user` install and
+/// give the service account write access to them. Returns the ones outside
+/// `data_dir` (which the caller chowns recursively anyway), for the unit's
+/// `ReadWritePaths`.
+///
+/// A directory this install **creates** is chowned to the service account. A
+/// directory that **already existed** outside `data_dir` is left alone — it
+/// may be a shared system directory such as `/var/lib` (an operator's
+/// `path = "/var/lib/app.db"`), and recursively re-owning something the
+/// installer did not create is not its call — and a warning names it so the
+/// operator can grant access deliberately.
+#[cfg(unix)]
+fn prepare_config_dirs(paths: &Paths, owner: &ServiceOwner) -> Result<Vec<PathBuf>> {
+    let config = match ephpm_config::Config::load(&paths.config) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(
+                path = %paths.config.display(),
+                error = %e,
+                "could not parse the config to find the directories the service writes; \
+                 only the data and log directories were given to the service user"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    use std::os::unix::fs::MetadataExt as _;
+
+    let service_uid = user_uid(&owner.user);
+    let mut extra = Vec::new();
+    for dir in config_writable_dirs(&config, &paths.data_dir) {
+        let existing_uid = std::fs::metadata(&dir.path).ok().map(|m| m.uid());
+        std::fs::create_dir_all(&dir.path).map_err(|e| ServiceError::io(&dir.path, e))?;
+        if dir.path.starts_with(&paths.data_dir) {
+            continue; // covered by the recursive chown of data_dir
+        }
+        // Already owned by the service account (typically: created and
+        // chowned by a previous `install --user` run) — nothing to do, and no
+        // point warning on every re-install.
+        if existing_uid.is_some() && existing_uid == service_uid {
+            extra.push(dir.path);
+            continue;
+        }
+        if existing_uid.is_some() {
+            tracing::warn!(
+                path = %dir.path.display(),
+                user = %owner.user,
+                "the configured server writes to this existing directory; it was not \
+                 re-owned — make sure the service user can write to it (chown/setfacl)"
+            );
+        } else {
+            chown_impl(&dir.path, owner, dir.recursive)?;
+        }
+        extra.push(dir.path);
+    }
+    Ok(extra)
 }
 
 /// Write the default config to `path` unless the file already exists. Returns
@@ -314,7 +483,8 @@ fn write_default_config(path: &Path, document_root: &Path) -> Result<bool> {
 /// yet support installing under a specific account (see `windows::register`).
 pub fn install(owner: Option<&ServiceOwner>) -> Result<()> {
     require_elevation()?;
-    let paths = Paths::for_current_platform();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut paths = Paths::for_current_platform();
 
     let current = std::env::current_exe()
         .map_err(|e| ServiceError::Other(format!("failed to resolve current executable: {e}")))?;
@@ -338,6 +508,13 @@ pub fn install(owner: Option<&ServiceOwner>) -> Result<()> {
     // is a no-op for `owner: None`, and idempotent on re-install.
     #[cfg(unix)]
     if let Some(owner) = owner {
+        // Directories the *configured* server writes outside the data dir
+        // (an absolute `[db.sqlite] path`/`dir`, an ACME `cache_dir`).
+        // Relative ones resolve inside `data_dir`: the non-root unit runs
+        // with `WorkingDirectory=<data_dir>` (without it, the default
+        // `[db.sqlite] path = "ephpm.db"` resolved to `/ephpm.db` — root's
+        // directory, read-only under `ProtectSystem=strict`).
+        paths.extra_writable_dirs = prepare_config_dirs(&paths, owner)?;
         chown_path(&paths.data_dir, owner)?;
         if let Some(parent) = paths.log_file.parent() {
             chown_path(parent, owner)?;
@@ -539,6 +716,11 @@ fn read_listen_address(config: &Path) -> Option<String> {
     None
 }
 
+/// How much of the end of the log file [`tail_file`] reads to find the last
+/// 200 lines.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const TAIL_WINDOW_BYTES: u64 = 1024 * 1024;
+
 /// Simple tail implementation used by Unix backends. Reads the last `lines`
 /// from `path` and prints them. When `follow` is true, continues to print new
 /// content as it is appended until the process is interrupted.
@@ -554,8 +736,15 @@ pub(crate) fn tail_file(path: &Path, follow: bool) -> Result<()> {
     }
 
     let mut file = std::fs::File::open(path).map_err(|e| ServiceError::io(path, e))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content).map_err(|e| ServiceError::io(path, e))?;
+    // Only the end of the file matters for the last 200 lines; don't pull a
+    // multi-GB log into memory. Bytes, not `read_to_string`: PHP output can
+    // carry non-UTF-8 bytes, which used to make the whole command fail.
+    let len = file.metadata().map_err(|e| ServiceError::io(path, e))?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_WINDOW_BYTES)))
+        .map_err(|e| ServiceError::io(path, e))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| ServiceError::io(path, e))?;
+    let content = String::from_utf8_lossy(&bytes);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let tail_lines: Vec<&str> = content.lines().rev().take(200).collect();
@@ -576,10 +765,10 @@ pub(crate) fn tail_file(path: &Path, follow: bool) -> Result<()> {
             file = std::fs::File::open(path).map_err(|e| ServiceError::io(path, e))?;
         }
         file.seek(SeekFrom::Start(pos)).map_err(|e| ServiceError::io(path, e))?;
-        let mut chunk = String::new();
-        let read = file.read_to_string(&mut chunk).map_err(|e| ServiceError::io(path, e))?;
+        let mut chunk = Vec::new();
+        let read = file.read_to_end(&mut chunk).map_err(|e| ServiceError::io(path, e))?;
         if read > 0 {
-            let _ = out.write_all(chunk.as_bytes());
+            let _ = out.write_all(&chunk);
             let _ = out.flush();
             pos += read as u64;
         }
@@ -680,6 +869,78 @@ mod tests {
         let config = dir.path().join("ephpm.toml");
         std::fs::write(&config, "[php]\nmemory_limit = \"128M\"\n").unwrap();
         assert!(read_listen_address(&config).is_none());
+    }
+
+    fn load_toml(body: &str) -> ephpm_config::Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ephpm.toml");
+        std::fs::write(&path, body).unwrap();
+        ephpm_config::Config::load(&path).expect("config must parse")
+    }
+
+    #[test]
+    fn config_writable_dirs_resolves_relative_paths_into_working_dir() {
+        // The default `[db.sqlite] path = "ephpm.db"` must land in the data
+        // dir (the --user unit's WorkingDirectory), not `/`.
+        let work = Path::new("/var/lib/ephpm");
+        let config = load_toml("[db.sqlite]\n");
+        assert_eq!(
+            config_writable_dirs(&config, work),
+            [WritableDir { path: work.to_path_buf(), recursive: false }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // Unix absolute paths; the function is only used on Unix.
+    fn config_writable_dirs_covers_db_path_dir_and_acme_cache() {
+        let work = Path::new("/var/lib/ephpm");
+        let config = load_toml(
+            "[server.tls]\ndomains = [\"example.com\"]\nemail = \"a@example.com\"\n\
+             cache_dir = \"/srv/acme\"\n\
+             [db.sqlite]\npath = \"/srv/data/app.db\"\ndir = \"sites\"\n",
+        );
+        assert_eq!(
+            config_writable_dirs(&config, work),
+            [
+                WritableDir { path: PathBuf::from("/srv/data"), recursive: false },
+                WritableDir { path: work.join("sites"), recursive: true },
+                WritableDir { path: PathBuf::from("/srv/acme"), recursive: true },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)] // Unix absolute paths; the function is only used on Unix.
+    fn config_writable_dirs_folds_parent_components() {
+        // `../app.db` relative to the data dir is `/var/lib`, which is NOT
+        // inside the data dir — a lexical `starts_with` on the unfolded
+        // `/var/lib/ephpm/../` path would have wrongly said it was.
+        let work = Path::new("/var/lib/ephpm");
+        let config = load_toml("[db.sqlite]\npath = \"../app.db\"\ndir = \"./sites/../tenants\"\n");
+        let dirs = config_writable_dirs(&config, work);
+        assert_eq!(
+            dirs,
+            [
+                WritableDir { path: PathBuf::from("/var/lib"), recursive: false },
+                WritableDir { path: work.join("tenants"), recursive: true },
+            ]
+        );
+        assert!(!dirs[0].path.starts_with(work));
+        assert_eq!(normalize_lexically(Path::new("/../a/./b/..")), PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn config_writable_dirs_skips_memory_db_and_manual_tls() {
+        let config = load_toml(
+            "[server.tls]\ncert = \"/etc/ssl/a.pem\"\nkey = \"/etc/ssl/a.key\"\n\
+             [db.sqlite]\npath = \":memory:\"\n",
+        );
+        assert_eq!(config_writable_dirs(&config, Path::new("/var/lib/ephpm")), []);
+        assert_eq!(
+            config_writable_dirs(&load_toml(""), Path::new("/var/lib/ephpm")),
+            [],
+            "no database, no TLS: nothing beyond the data/log dirs"
+        );
     }
 
     #[test]
