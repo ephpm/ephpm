@@ -8165,7 +8165,7 @@ listen = "0.0.0.0:8080"
     }
 
     /// The config baked into the published `ephpm/ephpm` image must stay a
-    /// minimal production default. Releases up to v0.11.2 shipped the E2E test
+    /// minimal production default. Releases up to v0.11.3 shipped the E2E test
     /// config there instead: `display_errors = On` and the Hrana SQL endpoint
     /// bound on `0.0.0.0:8081`, both live for anyone who ran the image without
     /// mounting a config of their own.

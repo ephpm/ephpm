@@ -80,7 +80,7 @@ look like nothing. Always run both c=1 and c=16.
    the "throughput" number is meaningless. **Verify 100% `2xx` in every
    cell** before believing it. This has silently corrupted results more
    than once.
-2. **The wrong image config.** Published images up to v0.11.2 ship a
+2. **The wrong image config.** Published images up to v0.11.3 ship a
    config tuned for their e2e tests (rate limiter, a 5 s request timeout,
    extra listeners); later images ship a minimal production default.
    Neither is a bench config. Mount a known bench config; don't inherit

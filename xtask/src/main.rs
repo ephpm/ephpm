@@ -1987,7 +1987,7 @@ mod tests {
 
     /// The published image (the Dockerfile's last stage, built by release.yml
     /// with `--target runtime`) must contain no E2E fixtures. Releases through
-    /// v0.11.2 baked `tests/docroot/` (info.php, shell_test.php, ...) and
+    /// v0.11.3 baked `tests/docroot/` (info.php, shell_test.php, ...) and
     /// `tests/ephpm-test.toml` (display_errors On, Hrana on 0.0.0.0:8081) into
     /// it. The fixtures now live only in the `e2e` stage that `k8s-e2e` builds.
     #[test]
