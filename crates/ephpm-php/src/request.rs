@@ -8,6 +8,18 @@ use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// The ePHPm build version: the release tag (leading `v` stripped) for a
+/// release build, else the workspace `CARGO_PKG_VERSION`. Resolved by this
+/// crate's `build.rs` from the same source as `ephpm --version`.
+pub const EPHPM_VERSION: &str = env!("EPHPM_VERSION");
+
+/// `$_SERVER['SERVER_SOFTWARE']`: `ePHPm/<build version>`.
+pub const SERVER_SOFTWARE: &CStr =
+    match CStr::from_bytes_with_nul(concat!("ePHPm/", env!("EPHPM_VERSION"), "\0").as_bytes()) {
+        Ok(s) => s,
+        Err(_) => panic!("EPHPM_VERSION contains a NUL byte"),
+    };
+
 /// One PHP middleware mount resolved for a single request.
 ///
 /// Produced by the router from a `[[middleware]] library = "php:<path>"` mount
@@ -572,7 +584,7 @@ pub fn build_server_variables_c(
     push(Cow::Borrowed(c"DOCUMENT_ROOT"), owned(&document_root.to_string_lossy()));
     push(Cow::Borrowed(c"SERVER_NAME"), owned(server_name));
     push(Cow::Borrowed(c"SERVER_PORT"), owned(&server_port.to_string()));
-    push(Cow::Borrowed(c"SERVER_SOFTWARE"), Some(Cow::Borrowed(c"ePHPm/0.1.0")));
+    push(Cow::Borrowed(c"SERVER_SOFTWARE"), Some(Cow::Borrowed(SERVER_SOFTWARE)));
     push(Cow::Borrowed(c"SERVER_PROTOCOL"), protocol_value(protocol));
     push(Cow::Borrowed(c"GATEWAY_INTERFACE"), Some(Cow::Borrowed(c"CGI/1.1")));
     push(Cow::Borrowed(c"QUERY_STRING"), owned(query_string));
@@ -601,13 +613,10 @@ pub fn build_server_variables_c(
     // validated against a PHP-linked multi-request test. The practical effect
     // today is limited to C extensions that read SG(request_info) directly.
     //
-    // Deliberately pushed HERE — before the header and env-var loops — rather
-    // than appended at the end. `ephpm_wrapper.c` registers at most
-    // MAX_SERVER_VARS (128) entries and silently drops the overflow, so a
-    // request carrying enough headers to reach the cap would otherwise lose
-    // exactly the keys an authenticating app is looking for. Their position in
-    // this Vec is otherwise irrelevant: $_SERVER is a hash, and no header can
-    // collide with these keys (every non-canonical header is prefixed `HTTP_`).
+    // Position in this Vec is irrelevant: `ephpm_wrapper.c` registers every
+    // entry (it once kept only the first 128 and silently dropped the rest),
+    // $_SERVER is a hash, and no header can collide with these keys (every
+    // non-canonical header is prefixed `HTTP_`).
     if let Some(auth) = authorization_header(headers).and_then(parse_authorization) {
         push(Cow::Borrowed(c"AUTH_TYPE"), owned(auth.auth_type));
         // Emitted as a pair or not at all — see AuthVars::credentials.
@@ -729,6 +738,18 @@ mod tests {
         }
     }
 
+    /// SERVER_SOFTWARE is the real build version, resolved like
+    /// `ephpm --version`: the release tag when `EPHPM_RELEASE_VERSION` is set
+    /// at build time, else the crate version — never a frozen literal.
+    #[test]
+    fn server_software_is_the_build_version() {
+        let expected = option_env!("EPHPM_RELEASE_VERSION")
+            .filter(|v| !v.is_empty())
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(EPHPM_VERSION, expected);
+        assert_eq!(SERVER_SOFTWARE.to_str().unwrap(), format!("ePHPm/{expected}"));
+    }
+
     /// Helper to find a server variable by key.
     fn find_var<'a>(vars: &'a [(String, String)], key: &str) -> Option<&'a str> {
         vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
@@ -744,7 +765,8 @@ mod tests {
         assert_eq!(find_var(&vars, "QUERY_STRING"), Some("page=1"));
         assert_eq!(find_var(&vars, "SERVER_NAME"), Some("example.com"));
         assert_eq!(find_var(&vars, "SERVER_PORT"), Some("8080"));
-        assert_eq!(find_var(&vars, "SERVER_SOFTWARE"), Some("ePHPm/0.1.0"));
+        let software = format!("ePHPm/{EPHPM_VERSION}");
+        assert_eq!(find_var(&vars, "SERVER_SOFTWARE"), Some(software.as_str()));
         assert_eq!(find_var(&vars, "SERVER_PROTOCOL"), Some("HTTP/1.1"));
         assert_eq!(find_var(&vars, "REMOTE_ADDR"), Some("192.168.1.1"));
         assert_eq!(find_var(&vars, "REMOTE_PORT"), Some("54321"));
@@ -1098,25 +1120,28 @@ mod tests {
         assert_eq!(find_var(&vars, "PHP_AUTH_USER"), Some("admin"));
     }
 
-    /// The wrapper registers at most MAX_SERVER_VARS (128) entries and silently
-    /// drops the rest, so the auth vars must sit in the fixed prefix rather than
-    /// after the unbounded header list. A request with enough headers to blow
-    /// the cap must still authenticate.
+    /// A header-heavy request must lose nothing on the Rust side: every
+    /// header, the auth vars, and the trailing ePHPm-injected per-site vars
+    /// (DB_*, WS_*) all reach the FFI set. The wrapper used to keep only the
+    /// first 128 entries, which dropped exactly those trailing vars; the C
+    /// half of this guarantee is pinned by the linked `tests/server_vars.rs`.
     #[test]
-    fn auth_vars_survive_the_server_var_cap() {
-        const MAX_SERVER_VARS: usize = 128; // ephpm_wrapper.c
+    fn header_heavy_request_keeps_auth_and_injected_vars() {
         let mut req = make_request();
         req.headers.push(("Authorization".into(), format!("Basic {}", b64(b"user:pw"))));
         for i in 0..200 {
             req.headers.push((format!("x-filler-{i}"), "v".into()));
         }
+        req.env_vars.push(("DB_USER".into(), "site-a".into()));
+        req.env_vars.push(("WS_CONNECTION_ID".into(), "conn-1".into()));
         let vars = req.server_variables();
 
-        let position = |key: &str| vars.iter().position(|(k, _)| k == key);
-        for key in ["AUTH_TYPE", "PHP_AUTH_USER", "PHP_AUTH_PW"] {
-            let at = position(key).unwrap_or_else(|| panic!("{key} missing"));
-            assert!(at < MAX_SERVER_VARS, "{key} at index {at} would be dropped by the C cap");
+        assert!(vars.len() > 200 + 2, "nothing may be dropped: {} vars", vars.len());
+        for key in ["AUTH_TYPE", "PHP_AUTH_USER", "PHP_AUTH_PW", "HTTP_X_FILLER_199"] {
+            assert!(find_var(&vars, key).is_some(), "{key} missing");
         }
+        assert_eq!(find_var(&vars, "DB_USER"), Some("site-a"));
+        assert_eq!(find_var(&vars, "WS_CONNECTION_ID"), Some("conn-1"));
     }
 
     /// fpm and worker dispatch must agree on the auth vars too — the lanes

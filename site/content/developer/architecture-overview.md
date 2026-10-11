@@ -513,7 +513,7 @@ SCRIPT_NAME          /index.php
 DOCUMENT_ROOT        /var/www/wordpress
 SERVER_NAME          example.com (from Host header)
 SERVER_PORT          8080
-SERVER_SOFTWARE      ePHPm/0.1.0
+SERVER_SOFTWARE      ePHPm/<version> (the build version, same as `ephpm --version`)
 SERVER_PROTOCOL      HTTP/1.1
 HTTPS                "on" if TLS (empty if not)
 HTTP_HOST            example.com:8080 (raw Host header)
@@ -531,6 +531,10 @@ Additionally, all HTTP request headers are exposed as `HTTP_*` variables (upperc
 - `Accept` → `HTTP_ACCEPT`
 - `User-Agent` → `HTTP_USER_AGENT`
 - `Authorization` → `HTTP_AUTHORIZATION`
+
+There is no cap on the number of `$_SERVER` entries: every header and every
+ePHPm-injected per-site variable (`DB_*`, `EPHPM_REDIS_*`, `EPHPM_NODE_ID`,
+`WS_*`) is registered, however many headers the request carries.
 
 ### Reference Implementations
 

@@ -17,6 +17,19 @@ fn main() {
     println!("cargo::rerun-if-changed=crash_guard.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
+    // The ePHPm build version, for $_SERVER['SERVER_SOFTWARE']. Resolved
+    // exactly like crates/ephpm/build.rs resolves `ephpm --version`: the
+    // release tag (EPHPM_RELEASE_VERSION, set by the release workflows from
+    // the git tag with the leading "v" stripped) when present, otherwise
+    // CARGO_PKG_VERSION. Emitted before the stub-mode early return so stub
+    // builds and tests see the same value.
+    println!("cargo::rerun-if-env-changed=EPHPM_RELEASE_VERSION");
+    let version = env::var("EPHPM_RELEASE_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo::rustc-env=EPHPM_VERSION={version}");
+
     println!(
         "cargo::warning=ephpm-php build.rs running. PHP_SDK_PATH={:?}",
         env::var_os("PHP_SDK_PATH")

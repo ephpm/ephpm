@@ -17,7 +17,7 @@
 //! The callbacks are installed by [`ephpm_install_sapi()`] (called once
 //! during runtime initialization) and invoked by PHP during request
 //! processing. Per-request data is passed from Rust to C via
-//! [`ephpm_request_set_info()`] and [`ephpm_request_add_server_var()`],
+//! [`ephpm_request_set_info()`] and [`ephpm_request_set_server_vars()`],
 //! and response data is retrieved via [`ephpm_get_output_buf()`],
 //! [`ephpm_get_response_code()`], and the structured header accessors
 //! [`ephpm_get_response_header_count()`] / [`ephpm_get_response_header()`].

@@ -336,6 +336,10 @@ struct PreseededStrings {
     content_type: Option<CString>,
     path_translated: CString,
     server_vars: Vec<CServerVar>,
+    /// The key/value pointer arrays `ephpm_request_set_server_vars`
+    /// borrows (into `server_vars`). Filled once the struct is in its cell.
+    server_var_keys: Vec<*const c_char>,
+    server_var_vals: Vec<*const c_char>,
     post_body: Option<Vec<u8>>,
 }
 
@@ -355,7 +359,9 @@ struct PreseededPtrs {
     content_type: *const c_char,
     cookie_data: *const c_char,
     path_translated: *const c_char,
-    server_vars: Vec<(*const c_char, *const c_char)>,
+    server_var_count: usize,
+    server_var_keys: *const *const c_char,
+    server_var_vals: *const *const c_char,
     post_data: *const c_char,
     post_len: usize,
 }
@@ -379,6 +385,8 @@ pub(crate) fn thread_init_preseeded(seed: DebugSeed, path_translated: &std::path
         content_type: seed.content_type.map(cstr),
         path_translated: cstr(path_translated.to_string_lossy().into_owned()),
         server_vars: seed.server_vars,
+        server_var_keys: Vec::new(),
+        server_var_vals: Vec::new(),
         post_body: seed.post_body,
     };
     // Install the storage, then take raw views with a short-lived shared
@@ -387,6 +395,10 @@ pub(crate) fn thread_init_preseeded(seed: DebugSeed, path_translated: &std::path
     // to do not move when the struct is moved into the cell.
     let ptrs = PRESEEDED.with(|cell| {
         *cell.borrow_mut() = Some(strings);
+        if let Some(s) = cell.borrow_mut().as_mut() {
+            s.server_var_keys = s.server_vars.iter().map(|(k, _)| k.as_ptr()).collect();
+            s.server_var_vals = s.server_vars.iter().map(|(_, v)| v.as_ptr()).collect();
+        }
         let slot = cell.borrow();
         let s = slot.as_ref().expect("PRESEEDED was set on the line above");
         PreseededPtrs {
@@ -396,17 +408,23 @@ pub(crate) fn thread_init_preseeded(seed: DebugSeed, path_translated: &std::path
             content_type: s.content_type.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             cookie_data: s.cookie_data.as_ptr(),
             path_translated: s.path_translated.as_ptr(),
-            server_vars: s.server_vars.iter().map(|(k, v)| (k.as_ptr(), v.as_ptr())).collect(),
+            server_var_count: s.server_var_keys.len(),
+            server_var_keys: s.server_var_keys.as_ptr(),
+            server_var_vals: s.server_var_vals.as_ptr(),
             post_data: s.post_body.as_ref().map_or(std::ptr::null(), |b| b.as_ptr().cast()),
             post_len: s.post_body.as_ref().map_or(0, Vec::len),
         }
     });
-    for (key, value) in &ptrs.server_vars {
-        // SAFETY: both pointers borrow NUL-terminated strings owned by this
-        // thread's PRESEEDED cell (see below for its lifetime). The C side
-        // only stores them in its thread-local registration list (no PHP
-        // call, cannot bail out); PHP reads them when it builds `$_SERVER`.
-        unsafe { crate::ffi::ephpm_request_add_server_var(*key, *value) };
+    // SAFETY: both arrays, and the NUL-terminated strings they point to, are
+    // owned by this thread's PRESEEDED cell (see below for its lifetime).
+    // The C side only stores the array pointers (no PHP call, cannot bail
+    // out); PHP reads them when it builds `$_SERVER`.
+    unsafe {
+        crate::ffi::ephpm_request_set_server_vars(
+            ptrs.server_var_count,
+            ptrs.server_var_keys,
+            ptrs.server_var_vals,
+        );
     }
     // SAFETY: every pointer borrows from the `PreseededStrings` now owned by
     // this thread's PRESEEDED cell, which is not written again until the POST

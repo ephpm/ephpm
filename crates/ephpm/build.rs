@@ -42,6 +42,9 @@ fn main() {
     // The workflow strips the leading "v" from the git ref name so this
     // value is the SemVer string ("0.1.1"), matching clap's default
     // `<bin> <version>` formatting.
+    //
+    // crates/ephpm-php/build.rs resolves the same value for
+    // $_SERVER['SERVER_SOFTWARE'] — keep the two in step.
     println!("cargo::rerun-if-env-changed=EPHPM_RELEASE_VERSION");
     let version = std::env::var("EPHPM_RELEASE_VERSION")
         .ok()
