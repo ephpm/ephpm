@@ -145,6 +145,14 @@ Three ways for PHP to access the KV store, each serving different use cases. All
 
 ### 1. Redis Protocol (RESP) — Zero Code Changes
 
+> **Design section — the shipped listener differs.** Unix-socket transport is
+> **not implemented** (`[kv.redis_compat] socket` only logs a warning), the
+> command set is smaller than the "MVP" list below (no `HMSET`, `HMGET` or
+> `SCAN`), and there are no lists, so queue drivers do not work. Framework
+> features that use `MULTI`/`EXEC`, Lua `EVAL` or sets (for example Laravel
+> queues, cache tags and lock release) will fail. The
+> [KV RESP Protocol reference](/reference/kv-resp/) is the accurate list.
+
 **Priority: implement first.** This gives instant compatibility with every PHP app that already uses Redis. WordPress, Laravel, Symfony, Drupal — they all have Redis session and cache drivers. No code changes, no new dependencies.
 
 ePHPm exposes a RESP (Redis Serialization Protocol) listener that PHP's existing Redis clients connect to as if it were a real Redis server. Two transport options:
@@ -701,6 +709,14 @@ Because ownership is `hash % alive_nodes` and replication is write-time only (no
 The KV layer is a foundation for several higher-level features. Each section below depends on the single-node KV store existing first, and the clustering sections depend on gossip being operational.
 
 ### TLS Certificate Management (Clustered)
+
+> **Design section — not what shipped.** The lock and key names below
+> (an `acme:lock:<domain>` issuance lock, `certs:<domain>:*` keys) are the
+> original design. The implementation in `acme.rs` uses an `acme:leader` claim
+> with a heartbeat and `acme:cert:…` keys, and **challenge sharing is not
+> implemented**: nothing writes `acme:challenge:*`, and TLS-ALPN-01 material
+> stays on the ordering node. See [HTTP architecture → Automatic TLS](/architecture/http/#automatic-tls-acme)
+> for the shipped behavior.
 
 Single-node ACME is already implemented using filesystem-based `DirCache`. The clustered KV store replaces it with `KvCache`, enabling zero-config HTTPS across multiple nodes. See [http.md](http.md) for single-node ACME details.
 

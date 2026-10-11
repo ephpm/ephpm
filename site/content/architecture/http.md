@@ -18,9 +18,15 @@ This document covers the HTTP server design, PHP execution model, request lifecy
         ▼
    Router::handle (wrapped by request timeout)
         │
+        ├──── metrics path, /_ephpm/* ──► answered here (no further checks)
+        │
         ▼
    Security checks
-     · hidden files · blocked paths · trusted proxy
+     · trusted_hosts · malformed Host · hidden files
+     · deploy manifests · blocked paths · trusted proxy
+        │
+        ▼
+   Reverse proxy rules · vhost resolution · WebSocket upgrade
         │
         ▼
    Fallback resolution
@@ -32,12 +38,12 @@ This document covers the HTTP server design, PHP execution model, request lifecy
         ├──── PHP file ─────► Allowlist check ──┐
         │                     Body size check    │
         │                     PHP execute        │
-        │                     Gzip               │
+        │                     Brotli / gzip      │
         │                                        │
         ├──── Static file ──► Path traversal ───┤
         │                     MIME detect       │
         │                     Cache-Control     │
-        │                     Gzip              │
+        │                     Brotli / gzip     │
         │                                       │
         └──── Status code ──► 404 / 403 / etc.──┤
                                                 ▼
@@ -65,7 +71,7 @@ An earlier design reused one long-lived embed request and manually rebuilt the s
 
 ### Execution Pool and Concurrency
 
-PHP never runs on the tokio runtime. It runs on an **owned pool of dedicated OS threads** (`std::thread`) that ePHPm spawns, sizes, and drains itself. There are two pools, selected by `[php] mode`, and they share one scheduling design: the per-request pool (`[php] mode = "per_request"`, the default) lives in `crates/ephpm-server/src/fpm_pool.rs`, and the persistent worker pool (`mode = "worker"`) in `crates/ephpm-server/src/worker_pool.rs`. Both are bounded by the same knobs — `[php] concurrency`, `queue_depth`, `admission`, `overload`, and `shed_after_ms` — which is why those knobs live on `[php]` rather than in a per-mode subsection.
+PHP never runs on the tokio runtime. It runs on an **owned pool of dedicated OS threads** (`std::thread`) that ePHPm spawns, sizes, and drains itself. There are two pools, selected by `[php] mode`, and they share one scheduling design: the per-request pool (`[php] mode = "per_request"`, the default) lives in `crates/ephpm-server/src/fpm_pool.rs`, and the persistent worker pool (`mode = "worker"`) in `crates/ephpm-server/src/worker_pool.rs`. Both are sized by the same knobs — `[php] concurrency`, `queue_depth` and `admission` — which is why those knobs live on `[php]` rather than in a per-mode subsection. `overload` and `shed_after_ms` apply to the per-request pool only: worker mode always waits for a queue slot and never sheds.
 
 A pool thread's loop is deliberately dull: pull one job off a bounded dispatch queue, run exactly one PHP request under the bailout crash guard, reply on a `oneshot`, finish the request (`php_request_shutdown()`), repeat. In per-request mode that one request is a full `php_request_startup()`/`php_request_shutdown()` cycle (the lifecycle above); in worker mode the framework is booted once per thread and the loop replays requests against it. Either way the concurrency ceiling is the thread count, not the arrival rate.
 
@@ -233,9 +239,12 @@ PHP must be initialized **before** the tokio runtime to avoid signal conflicts:
 
 - MIME type detection via `mime_guess` (file extension based)
 - Path traversal protection via `canonicalize()` + prefix check
-- Gzip compression for compressible content types above minimum size
+- Brotli (preferred) or gzip compression for compressible content types above minimum size, with `Vary: Accept-Encoding`. Files over 1 MiB are streamed from disk uncompressed; open-file-cache hits are offered gzip only.
 - `Cache-Control` header when configured
-- `ETag` generation (weak, hash-based) + `If-None-Match` → 304 Not Modified
+- Weak `ETag` + `If-None-Match` → 304 Not Modified. Files up to 1 MiB read from disk get a content-hash tag; streamed files and file-cache hits get an mtime+size tag (`W/"<mtime>-<size>"`), and keep sending it even with `[server.static] etag = false`.
+- No `Range`/`206` support and no `Last-Modified`/`If-Modified-Since`.
+
+The full list of response headers ePHPm adds is in [HTTP Endpoints & Headers](/reference/http-endpoints/#response-headers-ephpm-adds-or-changes).
 
 ### Percent-Decoding of URI Paths
 
@@ -357,7 +366,7 @@ cache_dir = "/var/lib/ephpm/certs"
 | Problem | What happens | What ePHPm does |
 |---------|-------------|----------|
 | **Renewal stampede** | N nodes all try to renew simultaneously; five duplicate certificates for the same domain set in a week is a hard Let's Encrypt lockout | Only the elected leader drives the `rustls-acme` state machine. A follower's cache lookup is held open instead of reporting a miss, and a miss is the only thing that makes `rustls-acme` place an order. |
-| **Challenge routing** | Let's Encrypt connects to the domain, DNS round-robins to any node, but only the ordering node holds the challenge material | **Not yet implemented.** ePHPm uses TLS-ALPN-01, and `rustls-acme` keeps that challenge certificate in the ordering node's in-memory resolver — it is not shared. Validation succeeds only when Let's Encrypt's connection reaches the leader. Point the domain at a single node, or use manual TLS, until challenge sharing lands. (`ephpm-server` can serve an HTTP-01 response out of `acme:challenge:<token>`, but nothing writes those keys yet.) |
+| **Challenge routing** | Let's Encrypt connects to the domain, DNS round-robins to any node, but only the ordering node holds the challenge material | **Not yet implemented.** With the default TLS-ALPN-01 challenge, `rustls-acme` keeps the challenge certificate in the ordering node's in-memory resolver — it is not shared. Validation succeeds only when Let's Encrypt's connection reaches the leader. Point the domain at a single node, use DNS-01 (`[server.tls] dns_provider`), or use manual TLS until challenge sharing lands. (`ephpm-server` can serve an HTTP-01 response out of `acme:challenge:<token>`, but nothing writes those keys yet.) |
 | **Cert distribution** | After one node obtains the cert, all nodes need it | The leader's cache writes the PEM to the KV store (`acme:cert:<domains>:cert:<directory-hash>`) as part of the `rustls-acme` state machine; gossip replicates it, and each follower loads it on its own first cache lookup. |
 | **Leader election** | Only one node should drive ordering and renewal | `acme:leader` key with a TTL heartbeat, plus a lowest-node-id tie-break. |
 
@@ -388,7 +397,13 @@ Level controlled by `server.response.compression_level` (1=fast, 9=best).
 
 ## Security Layers
 
-Evaluated in order for every request:
+Evaluated in order for every request. This is a subset of the full pipeline:
+the metrics path and `/_ephpm/*` are answered right after path decoding and
+skip every layer from `trusted_hosts` on (they are unauthenticated), and
+`trusted_hosts` (421) and the malformed-Host gate (404) run between those
+endpoints and the hidden-file check. The reverse proxy, site-override `503`,
+`/_ephpm/auth/*`, WebSocket upgrade and middleware come after `blocked_paths`.
+The complete order is in [HTTP Endpoints → Request processing order](/reference/http-endpoints/#request-processing-order).
 
 0. **Path decoding** — The URI path is percent-decoded once, before any gate below sees it, and the request is refused with 400 if it contains a `..` segment, a malformed escape, invalid UTF-8, or a `/` or `\` in **any** form — encoded (`%2F`, `%5C`) or literal. The literal `\` matters because Windows treats it as a path separator once the path is joined onto a document root: `/wp-content\.htaccess` opened the dotfile while presenting to the gates below as one segment starting with `w`, bypassing both `hidden_files` and `blocked_paths`. Refusing here rather than in each matcher is what makes every gate below cover the backslash spelling at once. Applies on all platforms, so a rule verified on Linux behaves identically on Windows.
 
@@ -408,7 +423,9 @@ Evaluated in order for every request:
 
 When `server.security.trusted_proxies` contains CIDR ranges and the connecting IP matches:
 - `X-Forwarded-For` is parsed right-to-left, returning the first untrusted IP as `REMOTE_ADDR`
-- `X-Forwarded-Proto: https` sets `$_SERVER['HTTPS'] = 'on'`
+- `X-Forwarded-Proto: https` sets `$_SERVER['HTTPS'] = 'on'`; any other value turns it off, even on a native TLS connection
+- `X-Forwarded-Host`, `X-Forwarded-Port` and `Forwarded` are ignored
+- The accept-time `per_ip_max_connections` limit always uses the raw TCP peer, so behind a proxy it limits the proxy's total connections. See [Running behind a load balancer](/reference/http-endpoints/#running-behind-a-load-balancer-or-reverse-proxy).
 
 ## Fallback Resolution
 
@@ -444,7 +461,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.response.compression` | bool | `true` | Enable response compression (Brotli preferred, gzip fallback) |
 | `server.response.compression_level` | int | `1` | Compression level (1-9) |
 | `server.response.compression_min_size` | int | `1024` | Min bytes to compress |
-| `server.response.headers` | [string, string][] | `[]` | Custom response headers (CORS, CSP, HSTS) |
+| `server.response.headers` | [string, string][] | `[]` | Custom response headers. **Replace** a same-named header the app set, and are **not** applied to `/_ephpm/*`, the metrics path, early gate errors (400/403/404/421), the per-IP 429 or the request-timeout 504 ([details](/reference/http-endpoints/#serverresponse-headers)) |
 | `server.static.cache_control` | string | `""` | Cache-Control header for static files |
 | `server.static.hidden_files` | string | `"deny"` | Dotfile handling: deny, ignore, allow |
 | `server.static.deploy_manifests` | string | `"deny"` | Deploy-manifest (`ephpm.yaml`/`.yml`/`.json`) handling: deny, ignore, allow |

@@ -104,7 +104,7 @@ The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub
 | `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). It is the gzip level, and the same number (capped at 9) is used as the brotli quality when brotli is negotiated — it is not rescaled onto brotli's 0–11 range. |
 | `compression_min_size` | usize (bytes) | `1024` | Minimum response size before compression applies. |
 | `compression_streaming` | string | `"off"` | Streamed worker-response (`send_response_stream`) compression: `"off"` (identity, byte-for-byte the previous behavior), `"sse"` (brotli with a per-event flush and a stream-lifetime window for `text/event-stream` responses), `"all"` (every streamed response). Needs `compression = true` and a client `Accept-Encoding: br`; unknown values warn at startup and act as `"off"`. Buffered responses are unaffected. |
-| `headers` | array of `[string, string]` | `[]` | Custom headers added to every response. |
+| `headers` | array of `[string, string]` | `[]` | Custom headers set on responses. A configured header **replaces** a same-named header the application set, and is **not** applied to `/_ephpm/*`, the metrics path, early gate errors (400/403/404/421), the per-IP 429 or the request-timeout 504. See [HTTP Endpoints → `[server.response] headers`](/reference/http-endpoints/#serverresponse-headers). |
 
 ### `[server.static]`
 
@@ -221,7 +221,14 @@ are escaped and cannot inject forged log lines.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the Prometheus `/metrics` endpoint. |
-| `path` | string | `"/metrics"` | URL path for the metrics endpoint. |
+| `path` | string | `"/metrics"` | URL path for the metrics endpoint (`GET` only). |
+
+> **Unauthenticated, on every listener and vhost.** The metrics path is served
+> before `trusted_hosts`, `blocked_paths` and middleware, and there is no
+> option to bind it to a separate port. On a multi-tenant node it exposes every
+> tenant's normalized SQL, vhost names and DB upstream addresses. Restrict it at
+> an upstream proxy or with a firewall. See
+> [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ### The `/_ephpm/` namespace is reserved
 
@@ -242,6 +249,12 @@ instead (see the table) — it still never reaches the application.
 | `/_ephpm/auth/…` | any | **Carved out for auth middleware.** Not answered by the server directly: after `trusted_hosts` and vhost resolution it is handed to the global `[[middleware]]` request-phase chain, so an auth module (e.g. the `github-auth` issuer's `/_ephpm/auth/github/login` and `/callback`) can serve it. If no mounted module responds, or no chain is mounted, the answer is `404`. It never reaches your application, and a per-site `[preview_auth]` gate is not run on it. |
 | any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
 | any of the above except `/_ephpm/auth/…` | not GET | `405` with `Allow: GET`. |
+
+These endpoints (all but `/_ephpm/auth/…`) require **no authentication** and
+answer for every `Host` on every listener, ahead of `trusted_hosts`,
+`blocked_paths` and middleware. `/_ephpm/requests` holds request paths from
+every vhost. See
+[HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 The Prometheus endpoint is **not** in this namespace: its path is yours to
 choose (`[server.metrics] path`, default `/metrics`), so with
@@ -362,7 +375,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `google_project` | string | (none) | GCP project id owning the Cloud DNS zone. **Required** when `dns_provider = "google"`. |
 | `google_managed_zone` | string | (none) | Explicit Cloud DNS managed-zone name. When absent, resolved from the challenge FQDN by listing the project's managed zones. |
 | `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves plain HTTP and this serves HTTPS. **When unset, `[server] listen` serves HTTPS only and there is no plain-HTTP listener at all** — enabling TLS on a default `0.0.0.0:8080` config turns that port into HTTPS and drops HTTP. Set this (e.g. `"0.0.0.0:443"`, with `[server] listen = "0.0.0.0:80"`) to serve both. |
-| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). When `false`, that listener keeps serving plain HTTP normally. Has no effect without `listen` (startup logs a warning). |
+| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301) — including `/_ephpm/health`, `/_ephpm/ready` and the metrics path, so point HTTP-port probes and scrapes at the TLS listener. The `Location` is built from the client's `Host` header as sent. When `false`, that listener keeps serving plain HTTP normally. Has no effect without `listen` (startup logs a warning). |
 
 Credentials follow one rule across every provider: the `*_file` variant wins over the inline value, and both can be supplied entirely from the environment (`EPHPM_SERVER__TLS__<FIELD>`) so no secret has to live in `ephpm.toml`. `Config::validate` requires the selected provider's credential(s) at startup and rejects an unknown `dns_provider` rather than silently doing nothing.
 

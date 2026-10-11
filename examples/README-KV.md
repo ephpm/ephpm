@@ -83,7 +83,7 @@ php examples/kv-redis-predis.php
 
 - Familiar Redis commands and patterns
 - Works with standard PHP Redis libraries (Predis, phpredis, etc.)
-- Portable — your code works on Redis, Memcached, or ePHPm
+- Portable — the same client code works against a real Redis server or ePHPm (for the commands below)
 - Simple key-value string storage with expiration and counters
 
 **Supported Commands:**
@@ -92,12 +92,14 @@ php examples/kv-redis-predis.php
 |-------|----------|
 | **Strings** | GET, SET, SETEX, MGET, MSET, SETNX, INCR, DECR, INCRBY, DECRBY, APPEND, STRLEN, GETSET |
 | **Hashes** | HSET, HGET, HDEL, HGETALL, HKEYS, HVALS, HLEN, HEXISTS |
-| **Keys** | DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, DBSIZE, FLUSHDB, FLUSHALL, RENAME |
+| **Keys** | DEL, DELIFEQ (ePHPm-specific compare-and-delete), EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, DBSIZE, FLUSHDB, FLUSHALL, RENAME |
 | **Connection** | PING, ECHO, SELECT, QUIT, COMMAND, INFO, AUTH |
+
+Behavior differences from Redis (no `WRONGTYPE`, TTLs on strings only, `INFO` reporting `redis_version:7.0.0`, and others) are listed in the [KV RESP Protocol reference](https://ephpm.dev/reference/kv-resp/).
 
 **Not Yet Implemented:**
 
-Lists, Sets, Sorted Sets, Transactions (MULTI/EXEC), Pub/Sub, SCAN — these would require architectural changes (multi-type store, per-connection state). If you need those data structures, use a real Redis server. For ePHPm's use case (session caching, counters, hashes), the commands above cover 99% of patterns.
+Lists, Sets, Sorted Sets, Transactions (MULTI/EXEC), scripting (EVAL), Pub/Sub, SCAN — these would require architectural changes (multi-type store, per-connection state). If you need those data structures, use a real Redis server. For ePHPm's use case (session caching, counters, hashes), the commands above cover 99% of patterns.
 
 ## Configuration
 

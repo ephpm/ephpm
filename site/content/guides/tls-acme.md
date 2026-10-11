@@ -50,6 +50,13 @@ key  = "/etc/ssl/ephpm/privkey.pem"
 redirect_http = true           # 301 every HTTP request to its HTTPS equivalent
 ```
 
+`redirect_http` redirects **every** request on the plain listener, including
+`/_ephpm/health`, `/_ephpm/ready` and the metrics path. A Kubernetes probe or
+Prometheus scrape pointed at the HTTP port gets a `301`, so point them at the
+HTTPS listener. The redirect target is `https://` + the request's `Host`
+header (port included) + path, and the `Host` is not checked against
+`trusted_hosts`.
+
 Manual mode never reaches out to the network.
 
 ## Automatic via ACME (Let's Encrypt)

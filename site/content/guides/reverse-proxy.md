@@ -65,6 +65,9 @@ A proxy rule can therefore never be used to reach a path an operator has blocked
 * **Streaming both ways.** Request bodies (uploads) stream to the upstream unbuffered; response bodies (SSE, large downloads) stream back unbuffered.
 * **`connect_timeout_secs`** (default 5) bounds the TCP connect. A rule that matches an **unreachable** upstream returns `502 Bad Gateway` within this bound — never a hang.
 * **`read_timeout_secs`** (default 60) bounds only the time to receive the response **head** (time-to-first-byte). It does **not** bound the streamed body, so SSE and long downloads are safe. The outer `[server.timeouts] request` ceiling still applies to the whole request.
+* **Metrics.** `ephpm_proxy_requests_total`, `ephpm_proxy_errors_total{kind}` (one increment per `502`: `read_timeout`, `connect`, `ws_connect`, `ws_handshake`, `ws_request`) and `ephpm_proxy_ws_tunnels_total` — see the [metrics reference](/reference/metrics/#reverse-proxy).
+
+This guide is about ePHPm proxying **to** a backend. If ePHPm itself sits behind nginx, a load balancer or Cloudflare, see [Running behind a load balancer](/reference/http-endpoints/#running-behind-a-load-balancer-or-reverse-proxy) instead.
 
 ## WebSockets
 
