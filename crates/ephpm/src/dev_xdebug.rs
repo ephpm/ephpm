@@ -518,6 +518,14 @@ impl Target {
         }
     }
 
+    /// A human name for this platform's catalog flavor (`macOS aarch64`).
+    fn platform_label(&self) -> String {
+        match self.os {
+            CatalogOs::LinuxGnu => format!("Linux {} (glibc)", self.arch),
+            CatalogOs::Macos => format!("macOS {}", self.arch),
+        }
+    }
+
     /// The cache subdirectory: everything that determines ABI compatibility.
     fn cache_key(&self) -> String {
         format!("{}-{}-{}", self.api_no, if self.zts { "zts" } else { "nts" }, self.arch)
@@ -1281,8 +1289,12 @@ pub(crate) fn resolve_from_catalog(
     notice(&format!("downloading {exact_asset} (catalog release {exact_tag})"));
     let mut tried: Vec<String> = Vec::new();
     let mut network_error: Option<anyhow::Error> = None;
+    // Whether any release had a tarball for this platform at all; when none
+    // did, the catalog simply does not publish this platform yet.
+    let mut platform_asset_seen = false;
     match source.fetch_asset(&exact_tag, &exact_asset) {
         Ok(Some(bytes)) => {
+            platform_asset_seen = true;
             let archive =
                 unpack_catalog(&bytes).with_context(|| format!("catalog release {exact_tag}"))?;
             if let Some(resolved) =
@@ -1326,6 +1338,7 @@ pub(crate) fn resolve_from_catalog(
             tried.push(format!("{tag} (missing)"));
             continue;
         };
+        platform_asset_seen = true;
         let archive = unpack_catalog(&bytes).with_context(|| format!("catalog release {tag}"))?;
         if let Err(e) = check_manifest_abi(&archive.manifest, target) {
             notice(&format!("{tag} skipped: {e}"));
@@ -1342,6 +1355,19 @@ pub(crate) fn resolve_from_catalog(
             return Ok(resolved);
         }
         tried.push(format!("{tag} (no xdebug)"));
+    }
+
+    if !platform_asset_seen && network_error.is_none() {
+        let minor = parse_minor(&target.php_version)
+            .map_or_else(|| target.php_version.clone(), |(ma, mi)| format!("{ma}.{mi}"));
+        bail!(
+            "--xdebug: the ePHPm extension catalog does not publish {} builds for PHP {minor} \
+             yet — no release has an `{}` asset (tried: {}). Pass --xdebug-path <xdebug.so> with \
+             a ZTS Xdebug build for PHP {minor}.",
+            target.platform_label(),
+            target.asset_name("<version>"),
+            if tried.is_empty() { "nothing".to_string() } else { tried.join(", ") }
+        );
     }
 
     bail!(
@@ -1911,6 +1937,24 @@ mod tests {
         assert!(err.contains("network unreachable"), "{err}");
         assert!(err.contains("--xdebug-path"), "{err}");
         assert!(err.contains("20250925-zts-x86_64"), "{err}");
+    }
+
+    #[test]
+    fn unpublished_platform_says_so_plainly() {
+        // Today's macOS situation: every catalog release carries Linux
+        // tarballs only, so a macOS binary finds nothing for its platform.
+        let root = tempfile::tempdir().unwrap();
+        let mac = macos_target();
+        let cache = ExtCache::new(root.path(), &mac);
+        let entries = [entry("xdebug", xdebug_so())];
+        let source = MockSource::default()
+            .with("8.5.7", tarball("8.5.7", "20250925", &entries))
+            .with("8.5.11", tarball("8.5.11", "20250925", &entries));
+        let err = resolve_from_catalog(&source, &mac, &cache, &mut |_| {}).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("does not publish macOS aarch64 builds for PHP 8.5"), "{err}");
+        assert!(err.contains("-macos-aarch64.tar.gz"), "{err}");
+        assert!(err.contains("--xdebug-path"), "{err}");
     }
 
     #[test]

@@ -116,9 +116,11 @@ loopback address. The release listing uses the unauthenticated GitHub
 API (60 requests/hour); a rate-limited response is reported as such.
 
 > **Catalog status:** the Linux catalog ships Xdebug 3.5.3 for PHP 8.3, 8.4
-> and 8.5 (and 3.6.0alpha1 for the 8.6 beta). macOS arm64 tarballs are being
-> added; when no release for your PHP minor has one, `--xdebug` says so
-> (listing what it tried) — use `--xdebug-path` with your own ZTS build in
+> and 8.5 — including the `ext-8.3.33`, `ext-8.4.23` and `ext-8.5.7`
+> releases the current binaries are built against — and 3.6.0alpha1 for the
+> 8.6 beta. macOS arm64 tarballs are not published yet: on macOS `--xdebug`
+> stops with "the ePHPm extension catalog does not publish macOS aarch64
+> builds for PHP 8.x yet" — use `--xdebug-path` with your own ZTS build in
 > the meantime.
 
 `ephpm dev` runs PHP in the default per-request mode, where Xdebug's own
