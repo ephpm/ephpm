@@ -834,8 +834,8 @@ PHP Worker calls mysql_connect("127.0.0.1:3306") or PDO("mysql:host=127.0.0.1")
 │  ┌─────────────────────────────────────────────────┐    │
 │  │              Metrics / Trace Emitter            │    │
 │  │  → Query digest stats (count, sum/min/max time) │    │
-│  │  → Slow query log (with EXPLAIN output)         │    │
-│  │  → OTel spans per query (for trace correlation) │    │
+│  │  → Slow query WARN log (EXPLAIN: planned)       │    │
+│  │  → OTel spans per query (planned)               │    │
 │  │  → Prometheus metrics (pool utilization, QPS)   │    │
 │  └─────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
@@ -937,7 +937,7 @@ struct DigestStore {
 }
 ```
 
-This gives the admin UI ProxySQL-grade query intelligence:
+This gives ProxySQL-style per-digest statistics, exported today as Prometheus metrics (`ephpm_query_*`). The admin UI that would show this table is planned, not built:
 
 | digest | digest_text | count | avg_time | max_time |
 |---|---|---|---|---|
@@ -947,16 +947,17 @@ This gives the admin UI ProxySQL-grade query intelligence:
 
 ### Slow Query Detection & Auto-EXPLAIN
 
-When a query exceeds a configurable threshold, ePHPm captures it and optionally runs `EXPLAIN` on a replica:
+**What ships today:** a query slower than `[db.analysis] slow_query_threshold` is logged at `WARN` and counted in `ephpm_query_slow_total`. Nothing more.
+
+> **Auto-EXPLAIN: Planned — not yet implemented.** `auto_explain` and `auto_explain_target` are parsed but unused, there is no `"replica"` target, and there is no slow-query store or admin UI. The sketch below is the intended design, not current code.
 
 ```toml
 [db.analysis]
-slow_query_threshold = "100ms"
-auto_explain = true              # run EXPLAIN on slow queries
-auto_explain_target = "replica"  # don't hit primary with EXPLAINs
+slow_query_threshold = "100ms"   # implemented
 ```
 
 ```rust
+// DESIGN SKETCH — not the shipped code
 async fn handle_query_result(
     query: &str,
     digest: u64,
@@ -991,7 +992,7 @@ async fn handle_query_result(
 }
 ```
 
-The admin UI surfaces this as a slow query dashboard with the EXPLAIN plan inline — no need for external tools like pt-query-digest or Percona Monitoring.
+The intended end state is an admin-UI slow-query dashboard with the plan inline. **Planned — not yet implemented**; today use the `WARN` log and the `ephpm_query_*` metrics.
 
 ### Read/Write Splitting
 
@@ -1301,7 +1302,7 @@ When `inject_env = true`, ePHPm injects these variables into every PHP request's
 | `DB_PASSWORD` | `secret` | Laravel |
 | `DATABASE_URL` | `mysql://appuser:secret@127.0.0.1:3306/myapp` | Symfony, Doctrine |
 
-Laravel's `env()` falls back to `$_SERVER`, so it picks up the injected `DB_CONNECTION`, `DB_HOST`, `DB_PORT` and `DB_PASSWORD` (its Dotenv loader does not overwrite values already present, so these win over `.env`), but it reads `DB_DATABASE`/`DB_USERNAME`, which proxy mode does not inject — set those in `.env`. Symfony reads `DATABASE_URL`, which is injected in full.
+Laravel's `env()` falls back to `$_SERVER`, so it picks up the injected `DB_CONNECTION`, `DB_HOST`, `DB_PORT` and `DB_PASSWORD` (its Dotenv loader does not overwrite values already present, so these win over `.env`), but it reads `DB_DATABASE`/`DB_USERNAME`, which proxy mode does not inject — set those in `.env`. Symfony reads `DATABASE_URL`, which is injected in full. See [Database proxy → Auto-configuration](/architecture/database/db-proxy/#auto-configuration-via-environment-injection).
 
 The PHP app thinks it's talking to `127.0.0.1:3306`. ePHPm's proxy is listening there, pooling connections, analyzing queries, splitting reads/writes, and forwarding to the real database. Fully transparent.
 
@@ -1319,7 +1320,8 @@ For Postgres, the same pattern applies:
 [db.postgres]
 url = "postgres://appuser:secret@real-pg:5432/myapp"
 inject_env = true
-# Injects: DB_HOST=127.0.0.1, DB_PORT=5432, DATABASE_URL=postgres://...@127.0.0.1:5432/myapp
+# Injects: DB_CONNECTION=pgsql, DB_HOST=127.0.0.1, DB_PORT=5432, DB_NAME, DB_USER,
+#          DB_PASSWORD, DATABASE_URL=pgsql://appuser:secret@127.0.0.1:5432/myapp
 ```
 
 When `inject_env` is disabled, the developer manually points their app at the proxy (e.g., `DB_HOST=127.0.0.1` in `.env`). This is useful when running ePHPm alongside an existing setup or when the developer wants explicit control.

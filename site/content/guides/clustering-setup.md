@@ -34,12 +34,16 @@ Add `[db.sqlite.replication]` so ePHPm elects a primary via gossip and replicate
 path = "/var/lib/ephpm/app.db"
 
 [db.sqlite.replication]
-role = "auto"                       # primary chosen by gossip (lowest ordinal alive node wins)
+role = "auto"                       # primary chosen by gossip (lowest node_id among alive nodes wins)
 # role = "primary"                  # force this node — for static topologies
 # role = "replica"                  # force this node, set primary_grpc_url to the primary's cluster channel address
 ```
 
 There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with `[db.sqlite]` selects CDC replication unconditionally.
+
+> **Check the `role` spelling.** `role` is matched exactly (case-sensitive) and other values are not rejected: anything except `"auto"`, `"primary"` or `"replica"` gives a **single-node** database, even with `[cluster]` on. That is deliberate — `role = "single"` is how you keep one node's database local — but it means a typo like `"Primary"` silently turns replication off. After startup, look for the `embedded SQLite mode selected` log line; its `mode` field must read `clustered` (or `per-site-clustered`).
+
+"Lowest ordinal" means the alive node whose `[cluster] node_id` sorts lowest as a string. If `node_id` is left empty it is generated as `<hostname>-<random hex>`, so which node wins is effectively arbitrary; set `node_id` explicitly (`node-1`, `node-2`, …) if you want to choose the primary.
 
 How it works:
 
@@ -48,6 +52,34 @@ How it works:
 - On a role flip the node reconfigures its CDC role in-process — there is no child process to restart.
 
 > Clustered SQLite is tested on Linux/macOS; on Windows it is untested. Single-node SQLite and the MySQL/PostgreSQL proxy work fine on Windows.
+
+### Routing writes: `/_ephpm/primary`
+
+In this mode only the primary's writes replicate. A replica's wire listener still **accepts** writes (litewire has no read-only mode), but they are never replicated and silently diverge from the primary, so route every write to the primary. Every node answers `GET /_ephpm/primary` with `200 {"primary":true}` on the primary and `503 {"primary":false}` on a replica. Use it as the health check of a "writes" backend pool (or a Kubernetes Service backed by a readiness-style probe on that path) so write traffic follows the primary through a failover, and send read-only traffic to all nodes. A worked example is in the [Kubernetes roadmap → Active-passive writes](/roadmap/kubernetes/#active-passive-writes-_ephpmprimary).
+
+## Per-site clustered databases (experimental)
+
+On a multi-site node (`[server] sites_dir`), the clustered mode above shares **one** database between every site, and startup warns about it. To give each site its own database that replicates across the cluster, opt in:
+
+```toml
+[server]
+sites_dir = "/srv/sites"
+
+[db.sqlite]
+dir = "/var/lib/ephpm/dbs"          # required: one <site-key>.db per site
+
+[db.sqlite.replication]
+per_site = true                     # role stays "auto"
+```
+
+How it differs from whole-database clustering:
+
+- **No cluster-wide primary.** Each site has its own owner, chosen by rendezvous hashing (HRW) over the alive nodes, so sites spread across the cluster and a node failure moves only that node's sites.
+- **Every node accepts writes for every site.** A node that does not own a site forwards that site's statements to the owner over the cluster channel — for both the `ephpm_db_*` bridge and stock `pdo_mysql`. `/_ephpm/primary` therefore returns `200` on every healthy node; use plain round-robin routing.
+- **A connection is routed once, when it opens.** If ownership moves while it is open (a node joining is enough), the tenant sees a connection error until it reconnects.
+- **Ownership moves carry the data.** A new owner without the site's data pulls a snapshot from the previous owner before serving.
+
+This mode is **experimental**: the Turso engine is Beta upstream and multi-node ownership churn is unit-tested, not validated on a live cluster. The full rules are in the [`[db.sqlite.replication]` reference](/reference/config/#dbsqlitereplication-clustered-mode-only) and [Multi-tenant `pdo_mysql` → Clustered mode](/guides/multi-tenant-pdo-mysql/#clustered-mode).
 
 ## KV replication
 
@@ -69,7 +101,13 @@ data_port           = 7947
 ```
 
 - `replication_factor = 2` keeps each large value on its owner plus the next node on the ring; it is clamped to the number of alive nodes, so a factor larger than the cluster just keeps one copy per node.
-- `replication_mode = "async"` (default) returns after the primary/local write and replicates in the background; `"sync"` also awaits every reachable replica (best-effort — a down replica is logged, not fatal).
+- `replication_mode = "async"` (default) returns after the primary/local write and replicates in the background; `"sync"` also awaits every reachable replica (best-effort — a down replica is logged, not fatal). Any other value silently means `"async"`.
+- `data_port` always binds `0.0.0.0`, whatever IP `[cluster] bind` uses — firewall it on multi-homed hosts. Every node must use the same port.
+- Counters (`INCR`/`DECR`, and so the `ratelimit` middleware) are approximate cluster-wide. Each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes overwrite rather than add. Limits can under-count, up to roughly N times the allowance across N nodes in the worst case.
+
+The KV is a cache, not a message broker: there are no lists, sets or `MULTI`/`EVAL`, so Redis-backed job queues (Laravel queues included) need a real Redis. See [Architecture → Clustering → Redis Protocol](/architecture/clustering/#1-redis-protocol-resp--redis-compatible-for-caching-not-a-redis-replacement) for what the RESP listener does and does not support.
+
+PHP sessions are **not** stored in the KV unless you enable the native handler (`session.save_handler = ephpm`); by default they are node-local files. See [Architecture → Clustering → Session Storage](/architecture/clustering/#session-storage).
 
 > **Membership caveat:** replication is write-time only — there's no active rebalancing yet. A node that was down during a write won't have that key until it's rewritten or fetched-through, and existing keys aren't re-replicated when membership changes. A value that must survive `replication_factor - 1` simultaneous node losses, or any topology churn, is safer under `small_key_threshold` (it gossips everywhere) or in the clustered SQLite database.
 
@@ -83,7 +121,7 @@ enabled = true
 join = ["ephpm-headless.default.svc.cluster.local:7946"]
 ```
 
-`StatefulSet` + headless `Service` works well — pod-stable DNS gives consistent ordinals, which the primary election prefers. There is no Helm chart; the worked manifests live in [`k8s/base/`](https://github.com/ephpm/ephpm/tree/main/k8s/base) — [`ephpm-cluster.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-cluster.yaml) is the clustered StatefulSet + headless Service the E2E suite runs against, and [`ephpm-single.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-single.yaml) is its single-node counterpart. They are test fixtures rather than a packaged release artifact, so treat them as a starting point.
+`StatefulSet` + headless `Service` works well. With `node_id` unset, the generated id starts with the pod name (`ephpm-0-…`), so the lowest-numbered pod tends to win the election — but ids compare as strings (`ephpm-10` sorts before `ephpm-2`), so set `node_id` explicitly if the primary's identity matters. There is no Helm chart; the worked manifests live in [`k8s/base/`](https://github.com/ephpm/ephpm/tree/main/k8s/base) — [`ephpm-cluster.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-cluster.yaml) is the clustered StatefulSet + headless Service the E2E suite runs against, and [`ephpm-single.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-single.yaml) is its single-node counterpart. They are test fixtures rather than a packaged release artifact, so treat them as a starting point.
 
 ## Verify the cluster
 

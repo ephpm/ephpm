@@ -154,8 +154,12 @@ There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with
 | In-process PHP bridge (`ephpm_db_*`) | **Implemented** (v0.6.3; adapter introspection surface v0.7.4) | `ephpm-php` (`db_bridge`) |
 | Turso engine (`[db.sqlite]`, single-node) | **Implemented — Beta engine upstream** | `litewire-turso` |
 | Clustered Turso CDC replication (no sqld sidecar) | **Implemented — experimental** | `ephpm-server` (`turso_cdc`) |
-| PostgreSQL wire protocol frontend | Placeholder | `litewire-postgres` (pgwire) |
-| TDS (SQL Server) wire protocol frontend | Placeholder | `litewire-tds` |
+| PostgreSQL wire protocol frontend (`postgres_listen`) | **Implemented** — single-site mode only; unauthenticated; not started in multi-site mode | `litewire-postgres` (pgwire) |
+| TDS (SQL Server) wire protocol frontend (`tds_listen`) | **Implemented** — single-site mode only; unauthenticated; not started in multi-site mode | `litewire-tds` |
+| Per-site databases (`[server] sites_dir` + `[db.sqlite] dir`) | **Implemented** | `ephpm-server` (`site_backends`, `site_wire_auth`) |
+| Per-site clustered replication (`[db.sqlite.replication] per_site = true`) | **Implemented — experimental** | `ephpm-server` (`turso_cdc`, `sql_forward`) |
+
+These are the **embedded-database** frontends (litewire in front of Turso). They are separate from the `[db.tds]` *proxy* to a real SQL Server, which is not implemented — see [Database proxy](/architecture/database/db-proxy/).
 
 > **Removed in v0.7.0:** the rusqlite backend, the sqld sidecar (`ephpm-sqld` crate, binary embedding, `sqld` auto-download, `--no-sqld`/`--sqld-binary` xtask flags), the `HranaClient` backend that talked to it, the `[db.sqlite.sqld]` block and its `write_permits` knob, and the `cdc_experimental` flag. Clustered mode is now the in-process Turso CDC path unconditionally.
 
@@ -197,7 +201,7 @@ Clustered mode replicates in-process — there is no separate database server bi
 
 ePHPm uses its gossip clustering (SWIM protocol via chitchat) to elect the primary:
 
-1. On cluster formation, the lowest-ordinal alive node becomes primary — after a short startup grace (~15s, longer than claim TTL + heartbeat), so a node joining an *existing* cluster always observes the incumbent's claim before it may elect itself (a joining node used to steal the role — issue #314)
+1. On cluster formation, the lowest-ordinal alive node becomes primary ("ordinal" here means the order of `[cluster] node_id` strings: the alive node whose id sorts lowest wins; with auto-generated ids that is effectively arbitrary, so set `node_id` explicitly if you care which node is primary) — after a short startup grace (~15s, longer than claim TTL + heartbeat), so a node joining an *existing* cluster always observes the incumbent's claim before it may elect itself (a joining node used to steal the role — issue #314)
 2. The primary's identity is stored in gossip KV (`kv:sqlite:primary`) — the claim carries the node id, the cluster-channel address peers dial, and the node's **CDC log identity** (the per-database fingerprint from issue #315)
 3. The primary heartbeats this key every 5s with a 10s TTL
 4. If the primary dies, gossip detects it (phi-accrual failure detector)
@@ -240,21 +244,66 @@ EPHPM_DB__SQLITE__REPLICATION__ROLE=auto
 
 ### Mode Detection
 
+There are four embedded-database modes. ePHPm first decides whether the node is
+**clustered**, then whether it is **multi-site** (`[server] sites_dir` set):
+
 ```
    [db.sqlite] configured?
         │
-        ├── no  ──► no SQLite (only DB proxy if [db.mysql])
+        ├── no  ──► no embedded DB (only the DB proxy, if [db.mysql]/[db.postgres])
         │
-        └── yes ──► replication.role?
-                       │
-                       ├── primary | replica ──► clustered (Turso CDC)
-                       │
-                       └── auto ──► [cluster] enabled?
-                                       │
-                                       ├── yes ──► clustered (Turso CDC)
-                                       │
-                                       └── no  ──► single-node (Turso, in-process)
+        └── yes ──► clustered?  (role = "primary" | "replica",
+                    │            or role = "auto" with [cluster] enabled = true)
+                    │
+                    ├── yes ──► sites_dir set AND replication.per_site = true?
+                    │             │
+                    │             ├── yes ──► per-site-clustered  (one replicated DB per site)
+                    │             │
+                    │             └── no  ──► clustered  (one replicated DB shared by every
+                    │                                      site; warns if sites_dir is set)
+                    │
+                    └── no  ──► sites_dir set?
+                                  │
+                                  ├── yes ──► per-site  (one local DB per site; dir required)
+                                  │
+                                  └── no  ──► single-node  (one local DB at path)
 ```
+
+Per-site-clustered is a subset of clustered, so it is tested first. Any
+`role` value other than `"auto"`, `"primary"` or `"replica"` is treated as "not
+clustered" without an error — that is how you force single-node on a node with
+`[cluster]` on (e.g. `role = "single"`), and also how a typo silently disables
+replication. The mode actually chosen is logged once at startup as
+`embedded SQLite mode selected` with `mode` = `per-site-clustered`,
+`clustered`, `per-site` or `single-node`; check it after any config change.
+
+### Per-site databases (multi-site)
+
+With `[server] sites_dir` set, each virtual host gets its **own** database file
+at `[db.sqlite] dir`/`<site-key>.db`, opened lazily on the site's first query.
+One file per site is the tenant-isolation boundary, because Turso has no
+per-schema access control. `dir` is required (startup fails closed without it),
+and `max_open_dbs` (default 256) is a soft LRU bound on how many site databases
+are open at once.
+
+Both routes into the database are per-site. The `ephpm_db_*` bridge follows the
+request's site. Stock `pdo_mysql` uses one shared MySQL listener, and the
+credential decides the database: `DB_USER` is the site key and `DB_PASSWORD` is
+derived from it, both injected into that site's `$_SERVER`. The Hrana,
+PostgreSQL and TDS frontends are not started in this mode, because they cannot
+bind a database per connection. See
+[Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/) and the
+[`[db.sqlite]` reference](/reference/config/#dbsqlite).
+
+With `[db.sqlite.replication] per_site = true` on a clustered node, each site's
+database also replicates across the cluster (**experimental**). Each site has
+one owner, chosen by rendezvous hashing (HRW) over the alive nodes; a node that
+does not own a site forwards that site's statements to the owner, on both the
+bridge and `pdo_mysql` routes, so reads and writes work on any node. There is
+no cluster-wide primary in this mode, and `/_ephpm/primary` returns `200` on
+every healthy node. See
+[`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only)
+for the ownership-move rules.
 
 Full detail on the engine, including its Beta-upstream limits and file-format
 compatibility, is in [Database engines](/architecture/database/engines/).

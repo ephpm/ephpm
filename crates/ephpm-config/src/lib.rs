@@ -2310,7 +2310,9 @@ pub struct SqliteConfig {
     /// set, `[db.sqlite]` is present (single-node), and `dir` is unset, rather
     /// than silently scattering per-site files or falling back to one shared
     /// database (which would defeat tenant isolation). Ignored (with a startup
-    /// warning) in single-site mode. Not yet supported in clustered mode.
+    /// warning) in single-site mode. Also required (and used) in per-site
+    /// clustered mode (`[db.sqlite.replication] per_site = true`); unused in
+    /// whole-database clustered mode (`per_site = false`).
     ///
     /// Default: `None`.
     #[serde(default)]
@@ -2408,8 +2410,9 @@ pub struct SqliteProxyConfig {
     /// bounds those threads. The Hrana HTTP frontend is stateless and is
     /// not counted.
     ///
-    /// Default: `0` (unlimited), matching `[db.mysql] max_connections` and
-    /// `[server.limits] max_connections`.
+    /// Default: `0` (unlimited). Not the same knob as the `[db.mysql]`
+    /// `max_connections`, which sizes the proxy's *backend* pool (default
+    /// 20) and makes callers wait `pool_timeout` rather than refusing them.
     #[serde(default)]
     pub max_connections: usize,
 
@@ -2506,9 +2509,15 @@ pub struct DeprecatedSqldConfig {
 pub struct ReplicationConfig {
     /// Replication role: `"auto"`, `"primary"`, or `"replica"`.
     ///
-    /// - `"auto"`: elected via gossip (lowest-ordinal alive node wins)
+    /// - `"auto"`: elected via gossip (the alive node whose `node_id` sorts
+    ///   lowest wins); clustered only when `[cluster] enabled = true`
     /// - `"primary"`: force this node as primary
     /// - `"replica"`: force this node as replica
+    ///
+    /// The match is exact and case-sensitive, and nothing validates other
+    /// values: any other string (e.g. `"single"`, or a typo like
+    /// `"Primary"`) selects single-node mode even with `[cluster]` on. The
+    /// `embedded SQLite mode selected` startup log line shows the result.
     #[serde(default = "default_replication_role")]
     pub role: String,
 
@@ -2577,11 +2586,11 @@ pub struct ReplicationConfig {
     /// replicates everywhere. Reads and writes therefore both work on any
     /// node, and read-your-writes holds because one node serves both.
     ///
-    /// **Gap:** forwarding is wired into the `ephpm_db_*` bridge only. A
-    /// stock `pdo_mysql` connection to a non-owner node still resolves that
-    /// node's *local* database, so its writes are not forwarded and not
-    /// replicated. Use the `db-*` drop-in packages (which call `ephpm_db_*`)
-    /// on the per-site clustered path.
+    /// Forwarding covers **both** tenant routes: the `ephpm_db_*` bridge and
+    /// stock `pdo_mysql` on the multi-tenant wire listener (`SiteWireRoute`,
+    /// backed by the same `ClusteredSiteResolver`). A connection is routed
+    /// once, when it opens; if ownership moves while it is open, the old
+    /// owner refuses and the client sees an error until it reconnects.
     ///
     /// **Experimental.** The Turso engine is Beta upstream and this mode
     /// layers per-site CDC on top of it.
@@ -2798,7 +2807,8 @@ pub struct DbAnalysisConfig {
 
     /// Duration threshold for logging slow queries.
     ///
-    /// Queries exceeding this time trigger `EXPLAIN` analysis.
+    /// Queries exceeding this time are logged at WARN and counted in
+    /// `ephpm_query_slow_total`. No `EXPLAIN` is run (see `auto_explain`).
     ///
     /// Default: `"1s"`.
     #[serde(default = "default_slow_query_threshold")]
@@ -2831,7 +2841,9 @@ pub struct DbAnalysisConfig {
 
     /// Maximum number of distinct `digest` label values emitted to
     /// Prometheus. Digests beyond the cap fold into `digest="__other__"`,
-    /// bounding metric cardinality. `0` = unlimited.
+    /// bounding metric cardinality. There is no unlimited setting: admission
+    /// is `len() < metric_label_series_max`, so `0` admits no digest and
+    /// folds every one into `__other__`. Use a large value for a high cap.
     ///
     /// Default: `1000`.
     #[serde(default = "default_metric_label_series_max")]
@@ -2882,13 +2894,17 @@ pub struct KvConfig {
 
     /// Compression algorithm for stored values.
     ///
-    /// Values: `"none"`, `"gzip"`, `"brotli"`, `"zstd"`.
+    /// Values: `"none"`, `"gzip"`, `"brotli"` (alias `"br"`), `"zstd"`,
+    /// matched case-insensitively. Not validated at startup: any other
+    /// value (including a typo) silently means `"none"`.
     ///
     /// Default: `"none"` (no compression).
     #[serde(default = "default_kv_compression")]
     pub compression: String,
 
-    /// Compression level (1 = fastest, 9 = best compression).
+    /// Compression level, passed unchanged to the selected algorithm, so its
+    /// range and meaning depend on `compression`: gzip 0-9, brotli quality
+    /// 0-11, zstd 1-22. Lower is faster, higher compresses more.
     ///
     /// Default: `6`.
     #[serde(default = "default_kv_compression_level")]
@@ -2914,8 +2930,11 @@ pub struct KvConfig {
     /// listener would serve one shared global store to every tenant — so
     /// [`Config::validate`] **refuses to start** (fail closed). In single-site
     /// (no `sites_dir`) mode the shared store is the intended behavior and a
-    /// secret is not required; RESP AUTH is then a no-op unless a
-    /// `[kv.redis_compat] password` is set.
+    /// secret is not required. Note that in single-site mode a set secret
+    /// does **not** protect the RESP listener: it makes the listener demand
+    /// `AUTH` (clients get `NOAUTH` first), but with no
+    /// `[kv.redis_compat] password` any `AUTH` argument is accepted. Only
+    /// `[kv.redis_compat] password` authenticates a single-site listener.
     ///
     /// **Also seeds the per-site MySQL wire-auth secret (#471).** When set, the
     /// multi-tenant MySQL listener (`site_wire_auth.rs`) derives each vhost's
@@ -10758,7 +10777,7 @@ metric_label_series_max = 250
     }
 
     #[test]
-    fn test_db_analysis_metric_label_series_max_zero_is_unlimited() {
+    fn test_db_analysis_metric_label_series_max_zero_parses() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
@@ -10770,8 +10789,9 @@ metric_label_series_max = 0
         )
         .unwrap();
         let config = Config::load(&file).unwrap();
-        // 0 is the documented "unlimited" sentinel — parses as 0 and is
-        // interpreted by the query-stats crate as no cap.
+        // 0 parses as 0. It is NOT an "unlimited" sentinel: the query-stats
+        // crate admits a digest label while `len() < max`, so 0 admits none
+        // and folds every digest into `digest="__other__"`.
         assert_eq!(config.db.analysis.metric_label_series_max, 0);
     }
 

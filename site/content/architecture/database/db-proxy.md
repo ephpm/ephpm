@@ -237,8 +237,8 @@ PHP Worker calls mysql_connect("127.0.0.1:3306") or PDO("mysql:host=127.0.0.1")
 │  ┌─────────────────────────────────────────────────┐    │
 │  │              Metrics / Trace Emitter            │    │
 │  │  → Query digest stats (count, sum/min/max time) │    │
-│  │  → Slow query log (with EXPLAIN output)         │    │
-│  │  → OTel spans per query (for trace correlation) │    │
+│  │  → Slow query WARN log (EXPLAIN: planned)       │    │
+│  │  → OTel spans per query (planned)               │    │
 │  │  → Prometheus metrics (pool utilization, QPS)   │    │
 │  └─────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
@@ -486,7 +486,7 @@ struct DigestStore {
 }
 ```
 
-This gives the admin UI ProxySQL-grade query intelligence:
+This gives ProxySQL-style per-digest statistics, exported as Prometheus metrics (`ephpm_query_*`, labelled by normalized digest). There is no admin UI; the table below is an illustration of the data, not a screen that exists:
 
 | digest | digest_text | count | avg_time | max_time |
 |--------|-------------|-------|----------|----------|
@@ -500,16 +500,17 @@ Query digests must **never** log sensitive parameter values. The normalization s
 
 ### Slow Query Detection
 
-When a query exceeds a configurable threshold, ePHPm captures it and optionally runs `EXPLAIN` on a replica:
+**What ships today:** a query slower than `[db.analysis] slow_query_threshold` is logged at `WARN` (normalized SQL, digest, duration) and counted in `ephpm_query_slow_total`. That is all. Nothing captures the plan, nothing stores a slow-query list, and there is no admin UI.
 
 ```toml
 [db.analysis]
-slow_query_threshold = "100ms"
-auto_explain = true              # run EXPLAIN on slow queries
-auto_explain_target = "replica"  # don't hit primary with EXPLAINs
+slow_query_threshold = "100ms"   # implemented: WARN log + ephpm_query_slow_total
 ```
 
+> **Auto-EXPLAIN: Planned — not yet implemented.** `auto_explain` and `auto_explain_target` are parsed but nothing reads them. The design below (run `EXPLAIN ANALYZE` on a replica in the background and keep the plan alongside the slow query) is a sketch of the intended feature, not the current code. `auto_explain_target` is documented as `"stderr"`/`"stdout"`; there is no `"replica"` value.
+
 ```rust
+// DESIGN SKETCH — not the shipped code
 async fn handle_query_result(
     query: &str,
     digest: u64,
@@ -542,7 +543,7 @@ async fn handle_query_result(
 }
 ```
 
-The admin UI surfaces this as a slow query dashboard with the EXPLAIN plan inline — no need for external tools like `pt-query-digest` or Percona Monitoring.
+The intended end state is a slow-query view with the plan inline. **Planned — not yet implemented:** there is no admin UI or slow-query dashboard today. Use the `WARN` log lines and the `ephpm_query_*` metrics (see [Query stats with Prometheus](/guides/query-stats-prometheus/)).
 
 ---
 
@@ -645,17 +646,19 @@ max_connections = 50
 inject_env = true   # auto-set DB env vars for the PHP app
 ```
 
-When `inject_env = true`, ePHPm injects these variables into every PHP request's `$_SERVER` (they are **not** process environment variables, so `getenv()` does not return them):
+When `inject_env = true`, ePHPm injects these variables into every request's `$_SERVER`. They are **`$_SERVER` only**, not process environment variables, so `getenv()` does not see them (Laravel's and Symfony's `env()` helpers read `$_SERVER` and do):
 
 | Variable | Value | Consumed by |
 |----------|-------|-------------|
 | `DB_CONNECTION` | `mysql` | Laravel |
-| `DB_HOST` | `127.0.0.1` | Laravel, Symfony, generic |
-| `DB_PORT` | `3306` | Laravel, Symfony, generic |
+| `DB_HOST` | `127.0.0.1` (host part of `listen`) | Laravel, Symfony, generic |
+| `DB_PORT` | `3306` (port part of `listen`) | Laravel, Symfony, generic |
 | `DB_NAME` | `myapp` | generic (Laravel reads `DB_DATABASE`, which proxy mode does not set) |
 | `DB_USER` | `appuser` | generic (Laravel reads `DB_USERNAME`, which proxy mode does not set) |
 | `DB_PASSWORD` | `secret` | Laravel |
 | `DATABASE_URL` | `mysql://appuser:secret@127.0.0.1:3306/myapp` | Symfony, Doctrine |
+
+The proxy path does **not** set `DB_DATABASE` or `DB_USERNAME`, the names Laravel's stock `config/database.php` reads. Set them yourself in `.env`, or edit `config/database.php` to read `DB_NAME`/`DB_USER`. (The per-site embedded-SQLite path is different: it sets both spellings — see [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/).) If both `[db.mysql]` and `[db.postgres]` have `inject_env = true`, only the MySQL values are injected.
 
 ```
 Developer configures:  ephpm.toml → url = "mysql://...@real-db:3306/myapp"
@@ -671,8 +674,11 @@ For Postgres, the same pattern applies:
 [db.postgres]
 url = "postgres://appuser:secret@real-pg:5432/myapp"
 inject_env = true
-# Injects: DB_HOST=127.0.0.1, DB_PORT=5432, DATABASE_URL=postgres://...@127.0.0.1:5432/myapp
+# Injects: DB_CONNECTION=pgsql, DB_HOST=127.0.0.1, DB_PORT=5432, DB_NAME, DB_USER,
+#          DB_PASSWORD, DATABASE_URL=pgsql://appuser:secret@127.0.0.1:5432/myapp
 ```
+
+Note the `pgsql://` scheme (it is the `DB_CONNECTION` value reused). Doctrine accepts `pgsql://`; a client that only understands `postgres://` or `postgresql://` needs the URL rewritten.
 
 When `inject_env` is disabled, the developer manually points their app at the proxy (e.g., `DB_HOST=127.0.0.1` in `.env`).
 
@@ -739,6 +745,8 @@ ePHPm parses the SQL, extracts the shard key from the WHERE clause, hashes it, a
 
 ## Feature Comparison
 
+The last column is the **goal**, not current state. Of the ePHPm goals below, auto-EXPLAIN, replication lag awareness, per-query OTel spans, the admin UI and everything sharding-related are **not implemented** — see [Status](#status) for what ships.
+
 | Feature | ProxySQL | PgBouncer | PgDog | ePHPm Goal |
 |---------|----------|-----------|-------|------------|
 | Connection pooling | Yes | Yes | Yes | v1 |
@@ -771,9 +779,11 @@ ePHPm parses the SQL, extracts the shard key from the WHERE clause, hashes it, a
 
 ---
 
-## Node API Endpoints
+## Node API Endpoints — Planned, not yet implemented
 
-| Endpoint | Method | Description |
+None of these endpoints exist. No `/api/db/*` route is served; today the same data is available only as Prometheus metrics on `/metrics` and as `WARN` log lines for slow queries. The table records the intended design.
+
+| Endpoint (planned) | Method | Description |
 |----------|--------|-------------|
 | `/api/db/digests` | GET | Query digest table: digest hash, normalized SQL, count, sum/min/max/avg time, rows |
 | `/api/db/slow` | GET | Slow query log: recent slow queries with EXPLAIN output |

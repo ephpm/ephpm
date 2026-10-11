@@ -294,7 +294,7 @@ hot_key_max_memory = "64MB"
 
 ### Multi-tenant security
 
-When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint (when `[kv] secret` is set and `[kv.redis_compat] enabled = true`), ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so `phpredis` can `AUTH` without any per-site config in your code. It is set in `$_SERVER` only, so `getenv()` does not see it.
+When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint (when `[kv.redis_compat] enabled = true` and `[kv] secret` is set), ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, site_key)` and injects it into PHP `$_SERVER` (not the process environment) as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
 
 ### How it works under the hood
 

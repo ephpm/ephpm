@@ -86,17 +86,17 @@ Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `H
 
 In vhost mode (`[server] sites_dir = ...`), the RESP listener requires `[kv] secret`.
 
-**Without `[kv] secret`**, enabling `[kv.redis_compat]` is a **startup error**: the listener would otherwise serve the process-wide default store to every tenant with no authentication. Recommended posture is still to leave `[kv.redis_compat] enabled = false` and let PHP use the SAPI functions, which are namespaced per host regardless of this listener.
+**Without `[kv] secret`**, ePHPm refuses to start the RESP listener in vhost mode: `[kv.redis_compat] enabled = true` with `sites_dir` set and no secret is a **hard startup error**, because the listener would otherwise serve one shared store to every tenant. Either set the secret or leave `[kv.redis_compat] enabled = false` (the default) and let PHP use the SAPI functions, which are namespaced per site regardless of this listener.
 
-**With `[kv] secret` set**, a connection must authenticate as a specific host and is then bound to that host's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
+**With `[kv] secret` set**, a connection must authenticate as a specific site (`AUTH <site> <password>`) and is then bound to that site's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
 
 ```
-password = HMAC-SHA256(secret, hostname)
+password = HMAC-SHA256(secret, site_key)
 ```
 
-The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. `[kv.redis_compat] password` is ignored in this mode. If `[kv] secret` is unset, nothing is auto-generated.
+The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. `[kv.redis_compat] password` is ignored in this mode. The same secret also derives each site's MySQL wire password, so anyone who can read the config can impersonate any tenant — see [`[kv] secret`](/reference/config/#kv).
 
-In **single-site** mode `[kv] secret` does not protect the listener: clients are asked to `AUTH`, but any `AUTH` succeeds unless `[kv.redis_compat] password` is also set. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
+**Single-site mode** (no `sites_dir`) has one shared store. There, only `[kv.redis_compat] password` authenticates the listener; setting `[kv] secret` alone makes the listener ask for `AUTH` but accepts any value. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ## Clustered KV (when `[cluster] enabled = true`)
 
@@ -108,7 +108,9 @@ Values up to `[cluster.kv] small_key_threshold` (default 512 bytes) ride the gos
 
 Applies are **last-arrival-wins** by origin `write_ms`: each node keeps a per-key `last-applied` timestamp shared between the gossip applier and the origin-side write path, and skips any incoming write whose `write_ms` is not strictly newer. This prevents a slow gossip echo of an older write from clobbering a newer write already materialized locally. The origin itself records its own `write_ms` in the same map, so even the echo of its own gossip broadcast cannot overwrite a follow-up local write.
 
-**`SET`, `DEL`, and `EXPIRE` replicate today.** A `DEL` broadcasts a write-stamped tombstone marker over the same gossip subscription — peers apply it to their local copies (both gossip-materialized and any locally-held data-plane replica) when the tombstone's `write_ms` beats their last-applied write. `EXPIRE` re-emits the existing value with the new expiry stamp, so a session TTL refresh (which *extends* the expiry) propagates just like a shorten. `INCR`, `DECR`, and other read-modify-write ops are still **local-only** — they mutate the owner node's counter without gossiping the new value. The built-in `ratelimit` middleware uses `INCR`, so rate-limit windows are enforced **per node**, not cluster-wide (see [`clustered-kv-v2` roadmap](/roadmap/clustered-kv-v2/) for the owner-routed `INCR` design).
+**`SET`, `DEL`, and `EXPIRE` replicate today.** A `DEL` broadcasts a write-stamped tombstone marker over the same gossip subscription — peers apply it to their local copies (both gossip-materialized and any locally-held data-plane replica) when the tombstone's `write_ms` beats their last-applied write. `EXPIRE` re-emits the existing value with the new expiry stamp, so a session TTL refresh (which *extends* the expiry) propagates just like a shorten. `INCR` and `DECR` replicate too (since #416): each increment is atomic on its own node and then publishes the counter's **new total**, with its TTL. Peers apply totals last-writer-wins, not deltas, so concurrent increments on different nodes overwrite each other instead of summing. The built-in `ratelimit` middleware uses `INCR`, so its windows are cluster-wide but **approximate**: they can under-count, up to roughly N times the allowance across N nodes in the worst case (see the [`clustered-kv-v2` roadmap](/roadmap/clustered-kv-v2/) for the owner-routed `INCR` design that would make them exact).
+
+**Hashes and `FLUSHDB` do not replicate.** The replication tier carries string keys only, so `HSET`/`HDEL` stay on the node that ran them even in a cluster (a `WARN` is logged once per process the first time it happens), and hash values cannot be given a TTL. `FLUSHDB`/`FLUSHALL` empty only the local node's store, deliberately: replicating a flush would let one node erase the whole cluster's data. Use string keys for anything that must be cluster-visible.
 
 This is where `kv:sqlite:primary` and other cluster-wide control state lives. Designed for small, frequently-read, eventually-consistent values.
 
@@ -147,7 +149,9 @@ We could. But:
 - The SAPI path is ~100x faster than the network path. For hot counters and rate limiters, that matters.
 - The whole stack (HTTP, PHP, KV, DB proxy) shares one tokio runtime — no inter-process coordination, no extra socket budget, no separate config.
 
-If you outgrow it, the RESP listener means swapping back to standalone Redis is a one-line config change in your PHP app.
+If you outgrow it, the RESP listener means swapping back to standalone Redis is a one-line config change in your PHP app — for code that sticks to the commands the KV implements.
+
+**It is a cache, not a broker.** The KV deliberately implements strings, hashes, TTLs and counters only. There are no lists, sets, sorted sets, streams, pub/sub, `MULTI`/`EXEC` or `EVAL`. Job queues (Laravel queues, Symfony Messenger's Redis transport, Sidekiq-style workers) need those, so run a real Redis for queues and keep the ePHPm KV for caching, sessions and counters.
 
 ## See also
 
