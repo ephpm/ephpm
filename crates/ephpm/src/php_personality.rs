@@ -50,7 +50,8 @@ use std::path::Path;
 /// Deliberately not under `[php]`'s `EPHPM_PHP__` nesting: figment's
 /// `Env::prefixed("EPHPM_")` maps this to the top-level key `php_cli`, which the
 /// lenient top-level `Config` ignores, so an `ephpm serve` started from inside a
-/// PHP script is unaffected.
+/// PHP script is unaffected. It is listed in ephpm-config's
+/// `NON_CONFIG_ENV_VARS`, so that server does not warn about it either.
 pub(crate) const MARKER_ENV: &str = "EPHPM_PHP_CLI";
 
 /// ePHPm's own top-level flags. Without the marker these keep their ePHPm
