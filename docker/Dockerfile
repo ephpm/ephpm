@@ -205,7 +205,7 @@ RUN mkdir -p \
     # example at examples/mw_probe_abi_v2.rs" -- before a single dependency is
     # fetched. Keep this list in sync with the [[example]] blocks in
     # crates/ephpm-server/Cargo.toml.
-    for e in mw_probe_v1 mw_probe_abi_v2 mw_probe_no_invoke mw_response_gzip mw_response_header; do \
+    for e in mw_probe_v1 mw_probe_abi_v2 mw_probe_no_invoke mw_probe_legacy mw_probe_c_keys mw_probe_c_bad_keys mw_response_gzip mw_response_header; do \
         printf 'fn main() {}\n' > crates/ephpm-server/examples/$e.rs; \
     done && \
     # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo

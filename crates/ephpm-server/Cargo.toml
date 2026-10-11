@@ -176,6 +176,10 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 # runs `cargo build --workspace --lib --examples` before its test step, and a
 # local `cargo test -p ephpm-server` needs the same command first or the dlopen
 # tests fail on a missing artifact.
+#
+# Adding or renaming an [[example]] here also means updating the stub list in
+# docker/Dockerfile's dependency stage, or the Docker build fails at
+# `cargo fetch` with "can't find `<name>` example".
 [[example]]
 name = "mw_probe_v1"
 crate-type = ["cdylib"]
