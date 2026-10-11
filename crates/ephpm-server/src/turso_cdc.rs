@@ -131,8 +131,8 @@
 //!
 //! Why a logical dump and not a physical file copy:
 //!
-//! - turso 0.7.0 exposes no online-backup, `serialize`, or local
-//!   `checkpoint` API (verified against the pinned `turso = 0.7.0`
+//! - turso 0.7.0 (still true of 0.8.2) exposes no online-backup, `serialize`, or local
+//!   `checkpoint` API (verified against `turso = 0.7.0` and re-checked on 0.8.2
 //!   crate: `Database`/`Connection` have `execute`/`query`/`prepare`/
 //!   `pragma_*` but nothing that yields a consistent byte image, and
 //!   the `checkpoint()` method exists only on the remote sync database,
@@ -3770,6 +3770,44 @@ mod tests {
         assert!(got_batch, "no CDC batch arrived on the subscriber opened before the first write");
 
         task.abort();
+    }
+
+    /// A tenant on a capturing session (every clustered write session) cannot
+    /// switch the database to MVCC, and its writes keep reaching `turso_cdc`.
+    ///
+    /// `PRAGMA journal_mode` passes the tenant SQL screen, and turso 0.7.2
+    /// accepted WAL -> MVCC on a capturing connection, after which upstream
+    /// documents capture stopping silently: writes committed locally and
+    /// never replicated. Turso 0.8 refuses the change (ephpm#535). This pins
+    /// it at the layer tenants actually reach, a litewire `Backend` session
+    /// with `enable_cdc_on_connect`.
+    #[tokio::test]
+    async fn tenant_journal_mode_switch_cannot_stop_capture() {
+        use litewire::backend::Backend;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let wire = Turso::builder(&path).enable_cdc_on_connect(true).build().await.unwrap();
+        let session = wire.connect().await.unwrap();
+        session.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await.unwrap();
+
+        let err = session
+            .query("PRAGMA journal_mode = mvcc", &[])
+            .await
+            .expect_err("a journal_mode switch on a capturing session must be refused");
+        assert!(err.to_string().contains("CDC capture is active"), "unexpected error: {err}");
+
+        session.execute("INSERT INTO t VALUES (1, 'after')", &[]).await.unwrap();
+        let mgmt = Turso::open(&path).await.unwrap();
+        let mut tailer = CdcTailer::new(&mgmt, 0);
+        let mut captured_insert = false;
+        while let Some(batch) = tailer.poll_batch().await.unwrap() {
+            captured_insert |= batch
+                .rows
+                .iter()
+                .any(|r| r.table_name.as_deref() == Some("t") && r.change_type == 1);
+        }
+        assert!(captured_insert, "the INSERT after the refused PRAGMA must reach turso_cdc");
     }
 
     // -----------------------------------------------------------------
