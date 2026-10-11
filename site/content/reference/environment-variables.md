@@ -27,9 +27,31 @@ Examples:
 
 This works because ePHPm uses [figment](https://github.com/SergioBenitez/Figment) with `Env::prefixed("EPHPM_").split("__")`.
 
+## Single underscores are silently ignored
+
+The separator between levels must be a **double** underscore. Underscores inside a key name stay single (`MEMORY_LIMIT`, `DOCUMENT_ROOT`), so a missing underscore at a boundary is easy to type and fails in one of two ways:
+
+| Mistake | Becomes | Result |
+|---------|---------|--------|
+| `EPHPM_SERVER_LISTEN` (single `_` after the section) | top-level key `server_listen` | **Silently ignored.** No error, no warning — `listen` keeps its TOML or default value. |
+| `EPHPM_PHP_MODE=worker` | top-level key `php_mode` | **Silently ignored.** The server runs in the default `per_request` mode. |
+| `EPHPM_SERVER__REQUEST_MAX_BODY_SIZE` (single `_` at a deeper level) | `[server] request_max_body_size` | **Startup error** naming the unknown key. |
+
+The first case is silent because the top level of the config is deliberately lenient: every `EPHPM_*` variable in the environment becomes a top-level key, and some of them are not configuration (ePHPm's Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`; the e2e harness sets `EPHPM_URL`). Every section below the top level rejects unknown keys — see [Unknown keys are a startup error](/reference/config/#unknown-keys-are-a-startup-error). When an override seems to have no effect, check its underscores first, and confirm the value in the startup log.
+
+## `ephpm dev` differs
+
+The table above describes `ephpm serve`. Under `ephpm dev` (and a bare `ephpm`, which runs it):
+
+- **No `ephpm.toml` is read at all**, not even one in the current directory. Only the built-in defaults and `EPHPM_*` variables apply.
+- `EPHPM_SERVER__LISTEN` and `EPHPM_SERVER__DOCUMENT_ROOT` have **no effect**: dev always replaces them with its own values — `--listen`, or `127.0.0.1` on the first free port from `--port` (default `8080`); `--document-root`, or the current directory.
+- With `--sites <dir>`, dev also sets `sites_dir` to that directory and forces `sites_domain_suffix = ".localhost"`, overriding any variable for either key.
+
+Other `EPHPM_*` variables apply in dev as they do in serve.
+
 ## Precedence
 
-Highest to lowest:
+Highest to lowest, for `ephpm serve` (for `ephpm dev`, see [`ephpm dev` differs](#ephpm-dev-differs)):
 
 1. **CLI flags** (`--listen`, `--document-root`, `--config`)
 2. **Environment variables** (`EPHPM_*`)
@@ -47,6 +69,8 @@ Values come in as strings; figment + serde coerce them:
 - arrays — JSON-style: `EPHPM_SERVER__INDEX_FILES='["index.php","index.html"]'`
 - nested tables — usually easier to keep these in TOML; you *can* set them via JSON env values but it gets unwieldy
 
+A variable creates its section even when the TOML has none. That matters for one section: setting any `EPHPM_SERVER__SECURITY__*` variable makes `[server.security]` "present", which changes the defaults of its isolation flags — see the note under [`[server.security]`](/reference/config/#serversecurity).
+
 ## Common production overrides
 
 ```bash
@@ -54,6 +78,10 @@ Values come in as strings; figment + serde coerce them:
 EPHPM_SERVER__LISTEN=0.0.0.0:8080
 EPHPM_SERVER__DOCUMENT_ROOT=/var/www/app
 EPHPM_DB__SQLITE__PATH=/data/app.db
+
+# Keep PHP errors out of HTTP responses: display_errors is ON by default
+# (ePHPm does not change PHP's built-in default) — see reference/config.md
+EPHPM_PHP__INI_OVERRIDES='[["display_errors","Off"],["log_errors","On"]]'
 
 # Logging
 RUST_LOG=info                                       # or info,ephpm_php=debug
@@ -95,6 +123,8 @@ EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE=86400
 RUST_LOG=info,ephpm_query_stats=debug,ephpm_cluster=trace
 ```
 
+For `serve` and `dev`, the order is `RUST_LOG`, then `-v`/`-vv`, then `[server.logging] level`. The CLI subcommands `analyze`, `exec`, `php --site`, and the service lifecycle commands (`install`, `status`, …) also honour `RUST_LOG`, defaulting to `info`. They write their logs to **stderr**, so stdout stays clean for the command's output (for example `ephpm analyze --format sarif`).
+
 ## Crash-diagnostics env var
 
 `EPHPM_FATAL_HANDLER` controls the fatal-signal diagnostic handler. It is **not**
@@ -116,6 +146,17 @@ exceptions rather than signals, and that path is not implemented.
 
 See [Diagnosing crashes](/guides/diagnosing-crashes/) for how to read the
 report.
+
+## Other non-config environment variables
+
+These are read directly, not through the `EPHPM_` config mapping.
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `EPHPM_KV_PASSWORD` | `ephpm kv`, `ephpm deploy`, `ephpm cache` | Fallback for `--password`: sent as the RESP `AUTH` password when the flag is absent. An empty value counts as unset. See [`ephpm kv` → Authentication](/reference/cli/kv/#authentication). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT` | `serve`, `dev` | Enable OTLP trace export to this endpoint. **They take precedence over `[server.diagnostics] otlp_endpoint`** (the traces-specific one first). Release binaries include the exporter (`otlp` cargo feature). A binary built without it logs a startup warning and exports nothing. See [OTLP tracing](/guides/otlp-tracing/). |
+| `EPHPM_SERVICE_LOG_FILE` | `serve`, `dev` | Sends the main log output to this file (no ANSI colours) instead of stdout, creating its parent directory. The Windows service sets it to `C:\ProgramData\ephpm\logs\ephpm.log`, because a Windows service has no console. It is meant for that, but any `serve`/`dev` run honours it. It does not affect the separate `[server.logging] access` log. |
+| `MIMALLOC_PURGE_DELAY` | the mimalloc allocator (Linux/macOS builds) | Not an ePHPm setting: ePHPm uses [mimalloc](https://github.com/microsoft/mimalloc) as its allocator on Unix, and mimalloc reads its own `MIMALLOC_*` options from the environment. `MIMALLOC_PURGE_DELAY` (milliseconds) controls how long freed memory is kept before it is returned to the OS. That is the lever if resident memory looks high at steady state. Windows builds use the system allocator and ignore it. |
 
 ## See also
 

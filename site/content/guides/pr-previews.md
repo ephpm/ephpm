@@ -185,10 +185,12 @@ $pdo = new PDO(
 Both naming conventions are injected in per-site mode (`DB_DATABASE`/`DB_USERNAME`
 as well as `DB_NAME`/`DB_USER`, plus `DB_CONNECTION` and `DATABASE_URL`), so
 Laravel's default `mysql` connection works unmodified. The password is
-HMAC-derived from a master secret: `[kv] secret` when it is set (then the
-password is stable across restarts), otherwise a random secret held only in
-memory (then it **rotates on every restart of the host**). Either way, read it
-per request and never bake it into a cached config. The username is a claim; the credential is the identity, and
+`HMAC-SHA256(master_secret, site_key)`. The master secret is the host's
+`[kv] secret` when that is set — then passwords are **stable across
+restarts**, and anyone who can read the host's config can derive every
+tenant's password — and otherwise a per-process random secret, in which case
+the password **rotates on every restart of the host**. Either way, read it per
+request and never bake it into a cached config. The username is a claim; the credential is the identity, and
 authentication happens before the backend is resolved. See
 [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/).
 

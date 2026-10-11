@@ -354,24 +354,27 @@ telling you to set `[kv] secret`.
 > tenant's database password is `HMAC-SHA256(secret, site_key)` over a *public*
 > site name. So **read access to the config file is enough to impersonate any
 > tenant's database connection.** That is the same trust boundary
-> [`ephpm exec`](/guides/multi-tenant-hardening/) already assumes ("whoever can
+> [`ephpm exec`](/reference/cli/exec/#who-may-run-it) already assumes ("whoever can
 > read this config can already impersonate any tenant"); keep the config
 > `0600` / in a secret mount, exactly as you would the secret itself. If you do
 > not need the CLI wire path, leave `[kv] secret` unset and the property never
 > applies.
 
-### Sandboxed on Linux: compose with `ephpm exec`
+### Sandboxed on Linux: composing with `ephpm exec` (not working yet)
 
-On Linux, nest the two subcommands so the database-touching tool runs inside the
-tenant's Landlock + uid sandbox:
+The intended design nests the two subcommands, so the outer
+[`ephpm exec`](/reference/cli/exec/) provides the filesystem/uid containment
+and the inner `ephpm php --site` binds the database:
 
 ```bash
 ephpm exec --site shop -- ephpm php --site shop --config /etc/ephpm/ephpm.toml -- wp core version
 ```
 
-The outer `ephpm exec` establishes the filesystem/uid containment; the inner
-`ephpm php --site` binds the database. See
-[Multi-tenant hardening](/guides/multi-tenant-hardening/).
+**This does not currently work** with the config in `/etc/ephpm`. The sandbox
+denies `/etc/ephpm` on purpose, since it holds `[kv] secret`, so the inner
+`ephpm php` cannot read the config it needs. Run `ephpm php --site` as the
+operator, outside `ephpm exec`. See
+[`ephpm exec` → Database access](/reference/cli/exec/#database-access).
 
 ## See also
 

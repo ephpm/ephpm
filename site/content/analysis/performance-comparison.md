@@ -87,7 +87,7 @@ The actual application logic — database queries, business logic, template rend
 |---|---|---|
 | All stacks | Same PHP engine (Zend VM) | Roughly constant — but see the caveat below |
 
-The PHP execution time is *approximately* the constant, and everything else in this document is overhead on top of it. It is not exactly constant: ePHPm runs **ZTS** (thread-safe) PHP on Linux and macOS, while several of these stacks run NTS. ePHPm's own [benchmarking methodology](/benchmarking/methodology/) puts the ZTS tax at roughly 50% on tight hash loops in isolation and 5–10% on realistic scripts. Do not read the rest of this page as if the engine leg were free.
+The PHP execution time is *approximately* the constant, and everything else in this document is overhead on top of it. It is not exactly constant: ePHPm runs **ZTS** (thread-safe) PHP on every platform — Linux, macOS and Windows — while several of these stacks run NTS. ePHPm's own [benchmarking methodology](/benchmarking/methodology/) puts the ZTS tax at roughly 50% on tight hash loops in isolation and 5–10% on realistic scripts. Do not read the rest of this page as if the engine leg were free.
 
 ### Stage 5: Database Access
 

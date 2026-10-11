@@ -15,7 +15,7 @@ ephpm analyze [PATH] [--config FILE] [--format FORMAT] [--profile NAME] [--fail-
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `PATH` | current directory | Directory to analyze |
-| `--config` | `<PATH>/.ephpm-analyze.yml` when present | Analysis configuration file. An explicit `--config` that doesn't exist is an error, never a silent fallback to defaults. |
+| `--config` | `<PATH>/.ephpm-analyze.yml`, else `<PATH>/.ephpm-analyze.yaml`, when present | Analysis configuration file. An explicit `--config` that doesn't exist is an error, never a silent fallback to defaults. |
 | `--format` | `text` | `text` or `sarif` (SARIF v2.1.0 JSON). Overrides the config file. |
 | `--profile` | `security` | `security` or `none`. Overrides the config file. |
 | `--fail-on` | `quarantine` | Least severe verdict that fails the exit code: `allow` (report-only), `quarantine`, or `deny`. Overrides the config file. |
@@ -177,6 +177,8 @@ The exception is `analyzers.deny_hard`: an explicit operator entry fires regardl
 Surfacing: the text output tags suspected findings with `[suspected]`; SARIF results carry `rank` (confirmed 80, suspected 40) and `properties["ephpm/confidence"]`.
 
 ## Configuration: `.ephpm-analyze.yml`
+
+Without `--config`, `ephpm analyze` looks for `.ephpm-analyze.yml` in the analyzed directory, then `.ephpm-analyze.yaml`, and uses built-in defaults when neither exists.
 
 All keys with their defaults. **Every section rejects unknown keys** — a typo fails the run naming the key rather than silently doing nothing.
 

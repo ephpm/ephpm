@@ -78,6 +78,19 @@ Three rules, all enforced by the engine:
    state (the current user, the current request) anywhere that outlives the
    iteration.
 
+### Detecting worker mode
+
+The worker functions and the `Envelope` class are registered by an internal
+module named `ephpm_worker`, which is present under ePHPm in **every** mode.
+`extension_loaded('ephpm_worker')` or
+`function_exists('Ephpm\Worker\take_request')` therefore tells you that the
+script is running under ePHPm, not that worker mode is on.
+
+Outside worker mode (a per-request script, or `ephpm php`),
+`take_request()` returns `null` immediately and `send_response()` /
+`send_response_stream()` do nothing. A worker script started in the wrong
+mode simply falls off the end of its loop.
+
 ### What the `Envelope` gives you
 
 | Method | Returns | Notes |
@@ -86,9 +99,18 @@ Three rules, all enforced by the engine:
 | `headers()` | `array` | Request headers. Duplicates arrive pre-joined with `", "` (`"; "` for `Cookie`). |
 | `query()` / `cookies()` | `array` | Split on delimiters only — **not url-decoded**. Re-parse with `parse_str($vars['QUERY_STRING'], $q)` / `urldecode()` if you need decoded values or `a[]=` arrays. |
 | `rawBody()` | `string` | The request body. For streamed bodies this drains the incremental reader into a string (re-buffers — prefer `bodyStream()` for large uploads). |
-| `bodyStream()` | `resource` | A real readable stream over the incremental body — a multi-GB upload flows through in fixed-size reads with flat memory. The body is consumed **once**, shared between `rawBody()`, `bodyStream()`, and PHP's own POST reader: pick one. A stream resource stashed across requests reads EOF (it can never see the next request's body). |
+| `bodyStream()` | `resource\|false` | `false` if the stream cannot be opened. Otherwise a real readable stream over the incremental body — a multi-GB upload flows through in fixed-size reads with flat memory. The body is consumed **once**, shared between `rawBody()`, `bodyStream()`, and PHP's own POST reader: pick one. A stream resource stashed across requests reads EOF (it can never see the next request's body). |
 | `parsedBody()` | `?array` | **Always `null`** — form/multipart parsing is your job, or enable `[php.worker] populate_superglobals` and read `$_POST`/`$_FILES` natively. |
 | `files()` | `array` | **Always empty** — same deal. |
+
+An `Envelope` is only valid for the iteration that returned it. If you keep
+one past the next `take_request()`, `serverVars()`, `headers()`, `cookies()`
+and `query()` return `[]` for anything you had not already read during that
+iteration (values read earlier stay cached on the object), so a stashed
+envelope can never expose the next request's data.
+
+`Ephpm\Worker\Envelope` is not `final` and allows dynamic properties, so an
+adapter may subclass it or attach its own fields.
 
 ### Sending responses
 
@@ -97,10 +119,16 @@ Three rules, all enforced by the engine:
 \Ephpm\Worker\send_response_stream(int $status, array $headers, $resource);
 ```
 
+- `$headers` must be keyed by header name. Entries with **integer keys are
+  silently dropped**, so `['Content-Type: text/plain']` sends nothing; write
+  `['Content-Type' => 'text/plain']`.
 - Header values may be **list arrays** — `'Set-Cookie' => [$c1, $c2]` emits
   one wire header per element. This is the only correct way to send repeated
   headers; never comma-join `Set-Cookie` (its `expires=` attribute contains
   commas).
+- `send_response_stream()`'s third argument must be a stream **resource**
+  (from `fopen()`, `php://temp`, and so on); passing a string is a
+  `TypeError`. Use `send_response()` for a string body.
 - `send_response_stream()` pumps the resource to the client in 64 KiB chunks
   with backpressure — use it for large downloads so worker memory stays flat.
   A client that stops reading for longer than `[server.timeouts] idle`

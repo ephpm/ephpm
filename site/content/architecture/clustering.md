@@ -533,6 +533,14 @@ The KV layer is a foundation for several higher-level features. Each section bel
 
 ### TLS Certificate Management (Clustered)
 
+> **Design section — not what shipped.** The lock and key names below
+> (an `acme:lock:<domain>` issuance lock, `certs:<domain>:*` keys) are the
+> original design. The implementation in `acme.rs` uses an `acme:leader` claim
+> with a heartbeat and `acme:cert:…` keys, and **challenge sharing is not
+> implemented**: nothing writes `acme:challenge:*`, and TLS-ALPN-01 material
+> stays on the ordering node. See [HTTP architecture → Automatic TLS](/architecture/http/#automatic-tls-acme)
+> for the shipped behavior.
+
 Single-node ACME is already implemented using filesystem-based `DirCache`. The clustered KV store replaces it with `KvCache`, enabling zero-config HTTPS across multiple nodes. See [http.md](http.md) for single-node ACME details.
 
 #### Problem 1: Cert Issuance Race Condition
@@ -691,6 +699,8 @@ ini_overrides = [
 ```
 
 ePHPm generates the `php.ini` PHP reads, so a line in a system `php.ini` has no effect; use `ini_overrides` (or `ini_set()` before `session_start()`).
+
+The `ephpm` handler is always registered, but nothing selects it for you: `session.save_handler` stays at PHP's default, `files`, until you set it as above (or with `ini_set()`). With `files`, sessions are node-local files and are **not** shared across the cluster. See the [Sessions guide](/guides/sessions/).
 
 #### Request lifecycle
 

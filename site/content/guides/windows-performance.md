@@ -325,8 +325,10 @@ Set expectations before you deploy; none of these are silent — each logs a
 startup WARN when the configuration touches it.
 
 - **`[php] max_execution_time` is not natively enforced.** The Windows PHP
-  SDK has no per-thread execution timers, and PHP's process-wide fallback
-  timer is unsafe on tokio worker threads, so it stays disabled. The
+  SDK is ZTS but lacks per-thread execution timers
+  (`ZEND_MAX_EXECUTION_TIMERS`). ePHPm treats a build without them as having
+  no native PHP timeout, and startup warns when you set `max_execution_time`
+  to a non-default value on one. The
   per-request ceiling actually in force is `[server.timeouts] request`
   (default 300 s), enforced at the HTTP layer as a 504. Keep it set to
   something sane — on Windows it is the *only* runaway-request backstop, and

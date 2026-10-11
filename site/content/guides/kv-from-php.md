@@ -37,21 +37,70 @@ ephpm_kv_del_if_eq("lock:job", "owner-1");     // true only if still "owner-1"
 ephpm_kv_incr("page:views");                   // 1
 ephpm_kv_incr_by("page:views", 5);             // 6
 
-// TTL (in seconds)
-ephpm_kv_set("session:abc", "data");
-ephpm_kv_expire("session:abc", 60);            // 60 seconds; returns bool
-ephpm_kv_ttl("session:abc");                   // ~60      (seconds)
-ephpm_kv_pttl("session:abc");                  // ~60000   (milliseconds)
+// TTL (in seconds) — pass it as set()'s third argument so the value and
+// its expiry land in one atomic write
+ephpm_kv_set("cache:abc", "data", 60);         // expires in 60 seconds
+ephpm_kv_expire("cache:abc", 120);             // change the TTL of an existing key; returns bool
+ephpm_kv_ttl("cache:abc");                     // ~120     (seconds)
+ephpm_kv_pttl("cache:abc");                    // ~120000  (milliseconds)
 // both return -1 if no expiry, -2 if missing
 
 ephpm_kv_decr("page:views");
-ephpm_kv_flush_all();                          // empties the store
+ephpm_kv_flush_all();                          // empties this site's store (see below)
 ```
 
-The full set of SAPI functions: `ephpm_kv_get`, `ephpm_kv_set`,
-`ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_del_if_eq`, `ephpm_kv_exists`,
-`ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`,
-`ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`.
+### Function reference
+
+| Function | Returns | Notes |
+|---|---|---|
+| `ephpm_kv_get(string $key)` | `?string` | `null` on a miss. |
+| `ephpm_kv_set(string $key, string $value, int $ttl = 0)` | `bool` | `$ttl` in seconds; `0` or negative means no expiry. |
+| `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic per node). Same `$ttl` rules as `set`. |
+| `ephpm_kv_del(string $key)` | `int` | Number of keys deleted (`0` or `1`). |
+| `ephpm_kv_del_if_eq(string $key, string $token)` | `bool` | Compare-and-delete — see below. |
+| `ephpm_kv_exists(string $key)` | `bool` | |
+| `ephpm_kv_incr(string $key)` / `ephpm_kv_decr(string $key)` | `int\|false` | Adds / subtracts 1. A missing key starts at 0. |
+| `ephpm_kv_incr_by(string $key, int $delta)` | `int\|false` | `$delta` may be negative. |
+| `ephpm_kv_expire(string $key, int $ttl)` | `bool` | `$ttl` in seconds. `false` if the key is missing. |
+| `ephpm_kv_ttl(string $key)` | `int` | Seconds remaining, rounded **up** (1–999 ms reads as `1`). `-1` = no expiry, `-2` = missing. |
+| `ephpm_kv_pttl(string $key)` | `int` | Milliseconds remaining. `-1` / `-2` as above. |
+| `ephpm_kv_flush_all()` | `bool` | Empties the store this request is scoped to. |
+| `ephpm_kv_wait(string $key, int $last_version, int $timeout_ms)` | `array\|false` | Blocking watch — see below. |
+
+Edge cases worth knowing:
+
+- **`ephpm_kv_expire($key, 0)` (or a negative TTL) returns `false` and leaves
+  the key untouched.** This differs from Redis, where a non-positive
+  `EXPIRE` deletes the key. Use `ephpm_kv_del()` to remove a key.
+- **TTLs are whole seconds.** `set`, `setnx` and `expire` take seconds, so
+  there is no sub-second expiry from PHP. `pttl` only *reads* milliseconds.
+- **`incr` / `decr` / `incr_by` return `false`** when the stored value is not
+  an integer.
+- **Keys are C strings; values are binary-safe.** A key containing a NUL byte
+  is truncated at the NUL (`"a\0b"` addresses the key `"a"`), and a key that
+  is not valid UTF-8 never matches anything: reads miss (`ttl`/`pttl` report
+  `-2`) and writes fail (`false`, or `0` from `del`). Values may hold any bytes.
+- **`ephpm_kv_flush_all()` is per-site in multi-tenant mode.** With
+  `[server] sites_dir` set, it empties only the calling virtual host's
+  keyspace, never another tenant's. In single-site mode it empties the whole
+  store.
+- **No store means silent misses, not errors.** When no KV store is wired to
+  PHP, nothing throws: `get` returns `null`, `set` / `setnx` / `exists` /
+  `expire` / `del_if_eq` / `flush_all` return `false`, `incr*` return
+  `false`, `del` returns `0`, `ttl` / `pttl` return `-2`, and `wait` returns
+  `false`. The server always wires one, so in practice this is what
+  [`ephpm php`](#under-ephpm-php-the-cli) sees.
+
+### Under `ephpm php` (the CLI)
+
+The `ephpm_kv_*` functions are *defined* under `ephpm php` (so code that
+calls them still compiles and runs), but the CLI does not connect to a KV
+store, not even with `--site`. Every call takes the "no store" path above:
+reads miss and writes are dropped without an error. A `wp` or `artisan`
+command run through `ephpm php` with a KV-backed cache drop-in therefore
+reads nothing from, and flushes nothing in, the running server's cache. Use
+[`ephpm kv`](/reference/cli/kv/) to inspect or change the live store from
+the command line.
 
 ### Safe lock release — `ephpm_kv_del_if_eq()`
 
@@ -189,20 +238,25 @@ $count = $redis->incr('page:views');
 
 `DELIFEQ key token` is an ePHPm-specific compare-and-delete (not a standard Redis command): it deletes `key` only while its value equals `token`, returning `:1`/`:0`. It is the safe lock-release primitive — reach it over RESP with a raw command (e.g. Predis `$redis->executeRaw(['DELIFEQ', $key, $token])`), or, from in-process PHP, just call `ephpm_kv_del_if_eq()` above. It is a dedicated command rather than a `DEL key IFEQ token` variant because `DEL` is variadic over keys, where a positional marker would be ambiguous with a key named `IFEQ`.
 
-Not implemented: lists, sets, transactions, `SCAN`, pub/sub. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis.
+Not implemented: lists, sets, sorted sets, transactions (`MULTI`/`EXEC`), scripting (`EVAL`), `SCAN`, pub/sub, and common extras such as `UNLINK`, `HMGET` and `HINCRBY`. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis. Note that `INFO` reports `redis_version:7.0.0`, so clients that branch on the server version will assume Redis 7. The [KV RESP Protocol reference](/reference/kv-resp/) lists every command's behavior and where it differs from Redis.
 
 ### Multi-tenant note
 
-The RESP listener can be shared across virtual hosts — each site is isolated by AUTH. When both `[kv] secret` and `[server] sites_dir` are set, ePHPm derives a per-site password as `HMAC-SHA256(secret, hostname)` (lowercase hex, 64 chars) and injects four env vars into every PHP request so the site's code can connect without any per-vhost configuration:
+The RESP listener can be shared across virtual hosts — each site is isolated by AUTH. When **all three** of `[kv.redis_compat] enabled = true`, `[kv] secret`, and `[server] sites_dir` are set, ePHPm derives a per-site password as `HMAC-SHA256(secret, site_key)` (lowercase hex, 64 chars) and injects four variables into every PHP request so the site's code can connect without any per-vhost configuration:
 
 ```
-EPHPM_REDIS_HOST       # from [kv.redis_compat] listen
+EPHPM_REDIS_HOST       # host part of [kv.redis_compat] listen, verbatim (0.0.0.0 stays 0.0.0.0)
 EPHPM_REDIS_PORT
-EPHPM_REDIS_USERNAME   # the vhost hostname (e.g. alice-blog.com)
-EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, hostname) hex
+EPHPM_REDIS_USERNAME   # the canonical site key (e.g. alice-blog.com; "alice-blog" for
+                       # alice-blog.localhost with sites_domain_suffix = ".localhost")
+EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, site key) hex
 ```
 
-The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port.
+The site key is the vhost's canonical name: the `Host` header lowercased, with any port and trailing dot removed, and with `[server] sites_domain_suffix` stripped when one is configured. It matches the site's directory name under `sites_dir`. A `Host` that matches no site falls back to its own normalized name.
+
+These are **`$_SERVER` entries, not process environment variables**: read `$_SERVER['EPHPM_REDIS_PASSWORD']`. `getenv()` returns `false` for them, because a process-wide environment would be shared by every tenant's threads.
+
+The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port. In this mode `[kv.redis_compat] password` is ignored.
 
 A PHP app consumes them like any other Redis credentials — Predis, phpredis, or the `ephpm_kv_*` SAPI functions all work without code changes:
 
@@ -217,7 +271,9 @@ $redis = new Predis\Client([
 $redis->set('cache:page:home', $html);
 ```
 
-If `[kv] secret` is unset, no env vars are injected and the RESP listener treats the connection as the global store — fine for single-site mode, never use that combination with `sites_dir` set.
+If `[kv] secret` is unset, no variables are injected. In single-site mode the listener then serves the global store. With `sites_dir` set, that combination is refused at startup, because it would hand every tenant one shared, unauthenticated store.
+
+**Single-site authentication.** With a plain `[kv.redis_compat] password`, configure clients with the password only and **no username**: the listener compares the first `AUTH` argument, so `AUTH <user> <pass>` fails. `[kv] secret` on its own does not protect a single-site listener (any `AUTH` succeeds); set `password` for that. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ### Automatic value compression
 
@@ -231,14 +287,13 @@ If `[kv] secret` is unset, no env vars are injected and the RESP listener treats
 $key = "cache:user:{$id}";
 $cached = ephpm_kv_get($key);
 if ($cached === null) {
-    $cached = expensive_lookup($id);
-    ephpm_kv_set($key, json_encode($cached));
-    ephpm_kv_expire($key, 300);             // 5 minutes (seconds)
+    $cached = json_encode(expensive_lookup($id));
+    ephpm_kv_set($key, $cached, 300);       // 5 minutes (seconds), set atomically with the value
 }
 return json_decode($cached, true);
 ```
 
-### Token-bucket rate limit
+### Fixed-window rate limit
 
 ```php
 $key   = "ratelimit:{$ip}";
@@ -249,27 +304,39 @@ if ($count === 1) {
 return $count <= $max_per_minute;
 ```
 
+`incr` has no TTL argument, so the window's expiry is a second call. If the
+process dies between the two, the counter has no expiry; `ephpm_kv_ttl($key)
+=== -1` detects that.
+
 ### Session storage
 
+For PHP's own `$_SESSION`, use the native [`ephpm` session save
+handler](/guides/sessions/) rather than hand-rolling it. For ad-hoc session
+blobs:
+
 ```php
-ephpm_kv_set("session:{$id}", json_encode($data));
-ephpm_kv_expire("session:{$id}", 3600);         // 1 hour (seconds)
+ephpm_kv_set("session:{$id}", json_encode($data), 3600);   // 1 hour (seconds)
 ```
 
 ## Shutdown functions and destructors
 
-**Do not put KV calls in `register_shutdown_function()` callbacks or in
-`__destruct()`.** ePHPm keeps one long-lived SAPI request open per worker
-thread, so a shutdown function does not run at the end of *your* request —
-it runs when the worker thread itself retires, by which point that thread's
-per-request KV state is gone.
+**Per-request mode (the default):** both work. `register_shutdown_function()`
+callbacks run right after the script, before the response is captured;
+global objects' `__destruct()` runs in `php_request_shutdown()` right after
+the response is sent, on the same thread and still scoped to the request's
+own keyspace. (Before v0.11.3 that teardown waited for the thread's next
+request.) Output from a destructor is discarded.
 
-Calls made from there fail closed rather than crashing the server: a `get`
-reports a miss, a `set` returns `false`, and in multi-tenant mode nothing
-falls back to another site's keyspace. Do your KV work inside the request.
+**Worker mode:** a worker keeps one long-lived SAPI request open per thread,
+so shutdown functions and end-of-script destructors run when the worker
+thread itself retires, by which point that thread's per-request KV state is
+gone. Calls made from there fail closed rather than crashing the server: a
+`get` reports a miss, a `set` returns `false`, and in multi-tenant mode
+nothing falls back to another site's keyspace. Do your KV work inside the
+request.
 
-The same rule applies to [`ephpm_db_*`](/guides/db-from-php/), which throws
-a distinct exception in that situation.
+The same split applies to [`ephpm_db_*`](/guides/db-from-php/#shutdown-functions-and-destructors),
+which throws a distinct exception in the worker-mode case.
 
 ## Configuration
 
@@ -295,4 +362,6 @@ See [Configuration reference](/reference/config/) for every key.
 - [KV store architecture](/architecture/kv-store/) — how it works under the hood
 - [PHP packages](/reference/php-packages/) — PSR-6/PSR-16 caches, WordPress/Laravel/Symfony adapters, and a session handler built on these functions
 - [Database from PHP](/guides/db-from-php/) — the sibling `ephpm_db_*` functions
+- [Sessions](/guides/sessions/) — the native `ephpm` session save handler built on this store
+- [PHP API reference](/reference/php-api/) — every native function and injected `$_SERVER` variable in one place
 - Examples in the repo: [`examples/kv-sapi-basic.php`](https://github.com/ephpm/ephpm/blob/main/examples/kv-sapi-basic.php), [`examples/kv-redis-predis.php`](https://github.com/ephpm/ephpm/blob/main/examples/kv-redis-predis.php)

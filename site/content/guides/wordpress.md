@@ -171,9 +171,10 @@ Everything flows WordPress → cache-wordpress `ObjectCache` → `ephpm_kv_*`
 
 > **Why not `ephpm kv keys "*"`?** The `ephpm kv` CLI is a *separate process*,
 > so it can only reach the store over the RESP listener — which is
-> `[kv.redis_compat] enabled = false` by default. `ephpm dev` is deliberately
-> configuration-free (it ignores `ephpm.toml` entirely), so there is no way to
-> turn the listener on for a dev server. To use the CLI, run under
+> `[kv.redis_compat] enabled = false` by default. `ephpm dev` ignores
+> `ephpm.toml` entirely, but it does apply `EPHPM_*` environment overrides, so
+> `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` turns the listener on
+> (default `127.0.0.1:6379`). Alternatively, run under
 > `ephpm serve --config ephpm.toml` with:
 >
 > ```toml
