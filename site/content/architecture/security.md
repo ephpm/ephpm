@@ -260,6 +260,7 @@ multi-tenant guarantee gets misread in both directions:
 
 - Single binary — dynamic library loading happens only for what the operator's config explicitly lists (`[[middleware]]` shared-library mounts, `[php] extensions`); nothing is loaded from ambient search paths without a config entry
 - The baseline ~45 PHP extensions are compiled in at build time; additional shared extensions load only via the `[php] extensions` config knob. Note that ePHPm does **not** explicitly set `enable_dl` — runtime `dl()` availability is whatever the embed SAPI's own default gives you. If you need it guaranteed off, set `enable_dl=0` through `[php] ini_overrides`.
+- `ephpm serve` defaults `display_errors=Off` and `log_errors=On`, so PHP diagnostics (which include absolute script paths) go to ePHPm's log, never into HTTP responses; `ephpm dev` keeps them visible. `[php] ini_overrides` / `ini_file` can change either (see [`[php]`](/reference/config/#php)).
 
 ---
 

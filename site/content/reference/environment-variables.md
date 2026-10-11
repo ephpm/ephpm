@@ -79,9 +79,9 @@ EPHPM_SERVER__LISTEN=0.0.0.0:8080
 EPHPM_SERVER__DOCUMENT_ROOT=/var/www/app
 EPHPM_DB__SQLITE__PATH=/data/app.db
 
-# Keep PHP errors out of HTTP responses: display_errors is ON by default
-# (ePHPm does not change PHP's built-in default) — see reference/config.md
-EPHPM_PHP__INI_OVERRIDES='[["display_errors","Off"],["log_errors","On"]]'
+# Show PHP errors in HTTP responses (staging only): `ephpm serve` defaults
+# display_errors to Off and logs them instead — see reference/config.md
+EPHPM_PHP__INI_OVERRIDES='[["display_errors","On"]]'
 
 # Logging
 RUST_LOG=info                                       # or info,ephpm_php=debug

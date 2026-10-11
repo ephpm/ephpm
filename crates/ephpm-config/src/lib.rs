@@ -3482,10 +3482,10 @@ pub struct PhpConfig {
     /// Applied after `ini_file` is loaded (if specified), so these take
     /// precedence over `ini_file` settings.
     ///
-    /// ePHPm sets no `display_errors` line of its own, so unless one is given
-    /// here or in `ini_file`, PHP's compiled-in `display_errors=1` applies in
-    /// every mode and errors are written into the response body. Production
-    /// deployments should set `[["display_errors", "Off"], ["log_errors", "On"]]`.
+    /// ePHPm seeds mode-dependent error defaults *before* these lines
+    /// (`display_errors=Off`, `display_startup_errors=Off`, `log_errors=On`
+    /// under `ephpm serve`; display on under `ephpm dev`), so an entry here
+    /// such as `[["display_errors", "On"]]` overrides them.
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 

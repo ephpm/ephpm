@@ -138,7 +138,9 @@ ePHPm generates a `php.ini` at startup and points PHP at it, so **a system
 
 In the order they appear in the generated file, so later lines win:
 
-1. `log_errors=On` — worker mode only.
+1. `display_errors`, `display_startup_errors` and `log_errors`: `Off`/`Off`/`On`
+   under `ephpm serve`, `On`/`On`/`On` under `ephpm dev`. See
+   [Where PHP errors go](/reference/config/#where-php-errors-go).
 2. `extension=<entry>` — one per `[php] extensions` entry.
 3. The contents of `[php] ini_file`, if set.
 4. `opcache.validate_timestamps` (always), plus the autotuned OPcache,
@@ -160,27 +162,20 @@ In multi-tenant mode, `open_basedir`, `sys_temp_dir`, `upload_tmp_dir`,
 `session.save_path` and a site's `auto_prepend_file` are also set per
 request. See [Virtual Hosts](/guides/virtual-hosts/).
 
-### What ePHPm leaves at PHP's defaults — `display_errors` is on
+### What ePHPm leaves at PHP's defaults
 
-ePHPm does **not** set `display_errors`, so it keeps PHP's compiled-in
-default of `1`, and `error_reporting` defaults to `E_ALL`. Together with the
-embed SAPI's built-in `html_errors=0`, warnings, notices and fatal errors
-are written **into the HTTP response**, including file paths:
+`error_reporting` keeps PHP's default of `E_ALL`. Under `ephpm serve`,
+`display_errors` is off (item 1 above), so warnings, notices and fatal errors
+go to ePHPm's log, not into the HTTP response. Under `ephpm dev` they are
+displayed as plain text (the embed SAPI sets `html_errors=0`), including file
+paths:
 
 ```
 Warning: Undefined variable $x in /var/www/app/index.php on line 3
 ```
 
-That is fine in development but leaks internals in production. Turn it off
-and log instead:
-
-```toml
-[php]
-ini_overrides = [
-    ["display_errors", "Off"],
-    ["log_errors", "On"],
-]
-```
+Through v0.11.3 ePHPm set no `display_errors` line, so this display was on
+under `serve` too.
 
 The embed SAPI's other built-in values also apply: `output_buffering=0`,
 `implicit_flush=1`, `register_argc_argv=1` and `max_input_time=-1`. PHP

@@ -66,6 +66,13 @@ mod ffi {
         /// Override default embed SAPI callbacks with our implementations.
         pub fn ephpm_install_sapi();
 
+        /// Install the sink that receives PHP's error-log lines in the
+        /// server (CLI mode keeps php-cli's stderr behaviour). Only stores a
+        /// pointer; call before `php_embed_init()`.
+        pub fn ephpm_set_log_sink(
+            sink: Option<unsafe extern "C" fn(message: *const ::std::os::raw::c_char, len: usize)>,
+        );
+
         /// Shut down the initial request started by `php_embed_init()`.
         /// Must be called after `ephpm_install_sapi()` so HTTP requests
         /// start from a clean state.
@@ -739,6 +746,64 @@ fn precscan_cli_ini_flags(args: &[String]) -> (Option<String>, bool, Vec<String>
     (if no_ini { None } else { ini_path }, no_ini, ini_defines)
 }
 
+/// Map a PHP error-log line to a tracing level from its severity prefix.
+///
+/// `php_error_cb` formats log lines as `PHP <Type>:  <message> in <file> on
+/// line <n>`. Fatal/parse/core/compile errors map to `ERROR`, warnings to
+/// `WARN`, notices and deprecations to `INFO`; anything else (userland
+/// `error_log()` calls, which carry no prefix) logs at `WARN`.
+#[must_use]
+pub fn php_log_level(message: &str) -> tracing::Level {
+    let Some(rest) = message.strip_prefix("PHP ") else {
+        return tracing::Level::WARN;
+    };
+    if rest.starts_with("Fatal error")
+        || rest.starts_with("Parse error")
+        || rest.starts_with("Recoverable fatal error")
+        || rest.starts_with("Core error")
+        || rest.starts_with("Compile error")
+    {
+        tracing::Level::ERROR
+    } else if rest.starts_with("Notice")
+        || rest.starts_with("Deprecated")
+        || rest.starts_with("Strict Standards")
+    {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+/// Emit one PHP error-log line on the `php` tracing target.
+///
+/// The message is attacker-influenced (it can quote request data), so it is
+/// written with `escape_debug` — an embedded newline cannot forge a second
+/// log record.
+pub fn emit_php_log(message: &str) {
+    let escaped = message.escape_debug();
+    match php_log_level(message) {
+        tracing::Level::ERROR => tracing::error!(target: "php", "{escaped}"),
+        tracing::Level::INFO => tracing::info!(target: "php", "{escaped}"),
+        _ => tracing::warn!(target: "php", "{escaped}"),
+    }
+}
+
+/// C-ABI sink installed via `ephpm_set_log_sink`: receives PHP's error-log
+/// lines from `ephpm_sapi_log_message` and forwards them to tracing.
+#[cfg(php_linked)]
+unsafe extern "C" fn php_log_sink(message: *const std::os::raw::c_char, len: usize) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: the C side passes a pointer to `len` initialized bytes (it took
+    // `len` from strlen on the same NUL-terminated buffer), valid for the
+    // duration of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(message.cast::<u8>(), len) };
+    let text = String::from_utf8_lossy(bytes);
+    // A panic must never unwind into PHP's C frames.
+    let _ = std::panic::catch_unwind(|| emit_php_log(&text));
+}
+
 /// Whether the PHP module has been initialized (set once by `init()`).
 ///
 /// Checked by `execute()` without acquiring the mutex — the atomic
@@ -789,6 +854,15 @@ impl PhpRuntime {
             // Safety: must run before php_embed_init() so the shim is installed
             // when embed's startup callback is invoked. No PHP state exists yet.
             unsafe { ffi::ephpm_pre_init() };
+
+            // Route PHP's error log (`log_errors=On` with no `error_log` file)
+            // into ePHPm's tracing output rather than raw stderr — stderr is
+            // not where the service log file (Windows SCM) or a log shipper
+            // tailing stdout looks.
+            // SAFETY: only stores a function pointer in a C static; no PHP
+            // state exists yet. `php_log_sink` never calls into PHP (so no
+            // longjmp can cross it) and never unwinds.
+            unsafe { ffi::ephpm_set_log_sink(Some(php_log_sink)) };
 
             // Keep the CString alive until php_embed_init() completes so the
             // pointer remains valid while PHP reads the configuration.
@@ -2495,5 +2569,17 @@ mod tests {
 
         let err = PhpRuntime::execute(make_test_request()).unwrap_err();
         assert!(matches!(err, PhpError::NotInitialized), "expected NotInitialized, got {err}");
+    }
+
+    #[test]
+    fn php_log_level_maps_severity_prefixes() {
+        use tracing::Level;
+        assert_eq!(php_log_level("PHP Fatal error:  Uncaught Error in /a.php"), Level::ERROR);
+        assert_eq!(php_log_level("PHP Parse error:  syntax error"), Level::ERROR);
+        assert_eq!(php_log_level("PHP Warning:  Undefined variable $x"), Level::WARN);
+        assert_eq!(php_log_level("PHP Notice:  something"), Level::INFO);
+        assert_eq!(php_log_level("PHP Deprecated:  old thing"), Level::INFO);
+        // Userland error_log() lines carry no prefix.
+        assert_eq!(php_log_level("my app message"), Level::WARN);
     }
 }
