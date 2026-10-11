@@ -153,9 +153,9 @@ fn main() {
         // `-undefined dynamic_lookup`) resolves its Zend/TSRM imports against
         // the hosting executable at dlopen time.
         //
-        // Without it, ld64 treats an executable's globals as not exported
-        // and rustc's `-dead_strip` removes every libphp.a function ePHPm
-        // itself never calls. Most of the Zend API survives by accident
+        // Without it, ld64 still exports the globals that survive linking, but
+        // rustc's `-dead_strip` first removes every libphp.a function nothing
+        // in ePHPm references. Most of the Zend API survives by accident
         // (something reachable references it), but not all: Xdebug
         // imports 123 PHP symbols and 8 of them (e.g.
         // `_smart_string_alloc_persistent`) were stripped from the v0.11.2

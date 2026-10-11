@@ -175,8 +175,9 @@ startup (verified July 2026: Sury's `php8.5-igbinary` fails with
 the Sury bookworm/trixie indexes). On macOS, use arm64 ZTS builds, loaded
 by an ePHPm binary newer than v0.11.3 (earlier macOS binaries were linked
 without `-export_dynamic` and fail with `symbol not found in flat
-namespace`). macOS binds a bundle's symbols at load time, so list an
-extension after the ones it depends on (`igbinary` before `redis`).
+namespace`). The SDKs are built with `--enable-rtld-now`, so on every
+platform an extension's symbols bind when it loads: list an extension after
+the ones it depends on (`igbinary` and `msgpack` before `redis`).
 
 ### Windows
 
