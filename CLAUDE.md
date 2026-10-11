@@ -34,6 +34,10 @@ cargo xtask release --target windows --variant clang
 # build that can load extension DLLs (Xdebug: `ephpm dev --xdebug`). Detected
 # by build.rs from lib/php8ts.lib (cfg `php_shared`); the extension preload
 # list comes from the SDK's ephpm-sdk.json (crates/ephpm-php/src/shared.rs).
+# Never run the STATIC exe beside a php8ts.dll: loading an extension DLL then
+# binds a second PHP engine and crashes (0xC0000005). The static build refuses
+# [php] extensions, and a static xtask release removes a stale php8ts.dll/ext\
+# from the output dir.
 cargo xtask release --target windows --variant shared
 ```
 

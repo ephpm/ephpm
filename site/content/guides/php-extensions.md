@@ -211,6 +211,13 @@ the ones it depends on (`igbinary` and `msgpack` before `redis`).
 The default Windows build links PHP **statically** into `ephpm.exe` — there
 is no `php8ts.dll` beside it — so stock extension DLLs, which import
 `php8ts.dll`, cannot attach to it; rely on the statically linked set there.
+That build refuses `[php] extensions` at startup. Do not load extension DLLs
+into it any other way (`ephpm php -d extension=`, `extension=` /
+`zend_extension=` in `ini_file` or `ini_overrides`) either: with no
+`php8ts.dll` reachable PHP only reports `Failed loading …`, but when one is
+reachable — in the exe's directory, the working directory, or on `PATH`
+(a local PHP install) — Windows binds the DLL to that second PHP engine and
+ePHPm crashes (`0xC0000005`).
 The opt-in **shared-engine** build (`cargo xtask release --target windows
 --variant shared`, `php8ts.dll` beside `ephpm.exe`) can load them: use the
 `-ts-` x64 DLLs for the matching PHP minor — e.g. PECL's

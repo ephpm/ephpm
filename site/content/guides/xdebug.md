@@ -36,7 +36,7 @@ the warm pool keeps serving everybody else; see
 | Linux, glibc, x86_64 / aarch64 | Supported | Xdebug fetched from the ePHPm extension catalog (see below), or `--xdebug-path`. Verified with Xdebug 3.5.3 on PHP 8.5.7 and 8.5.11 (ZTS). |
 | macOS, arm64 | Supported (untested live) | `--xdebug` downloads `ephpm-ext-<php>-macos-aarch64.tar.gz` from the catalog (published for PHP 8.3, 8.4 and 8.5), or use `--xdebug-path`. Needs an ePHPm macOS binary newer than v0.11.3: earlier ones were linked without `-export_dynamic`, so `-dead_strip` removed PHP functions that ePHPm never calls but Xdebug imports, and loading fails with `symbol not found in flat namespace`. |
 | Windows x64, **shared-engine build** | Supported (built from source) | A `cargo xtask release --target windows --variant shared` build links the official `php8ts.dll` and loads `php_xdebug.dll` from the catalog's Windows entry (the official xdebug.org ZTS DLL for the PHP minor). See [Windows](#windows). |
-| Windows x64, default build | Not available | The default Windows binary links PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs; `--xdebug` refuses with that reason. Use the shared-engine build, or ePHPm under WSL. |
+| Windows x64, default build | Not available | The default Windows binary links PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs; `--xdebug` refuses with that reason. Use the shared-engine build, or ePHPm under WSL. Do not load `php_xdebug.dll` into it by hand (`-d zend_extension=`, `ini_overrides`): if a `php8ts.dll` is reachable it crashes — see [Windows](#windows). |
 
 Xdebug must be a **ZTS** build for the PHP minor your ePHPm binary embeds
 (`ephpm php -v` shows both). Distro and Sury packages are NTS and will not
@@ -206,6 +206,18 @@ on the same Windows machine the defaults (`127.0.0.1:9003`, no
 
 Status: the shared-engine build is opt-in and built from source; release
 artifacts ship the default static build only.
+
+> **Known issue — the static build crashes on an extension DLL when a
+> `php8ts.dll` is reachable.** The default `ephpm.exe` has no `php8ts.dll`
+> of its own. Asked to load `php_xdebug.dll` anyway (`ephpm php -d
+> zend_extension=…`, or a `zend_extension` line in `ini_file` /
+> `ini_overrides`), it normally just reports `Failed loading …`. But if a
+> `php8ts.dll` is in the exe's directory, the working directory, or on
+> `PATH` — for example from a local PHP install, or because the static exe
+> was copied into a shared build's directory — Windows binds the DLL to that
+> second PHP engine and the process crashes (`0xC0000005`). Use the
+> shared-engine build for Xdebug, and keep the two builds in separate
+> directories.
 
 ## WSL
 

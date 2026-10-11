@@ -242,8 +242,8 @@ pub(crate) fn prepare(args: &XdebugArgs, config: &mut ephpm_config::Config) -> a
             os,
         };
         let cache_root = user_cache_root().context(
-            "--xdebug: cannot determine a cache directory (set XDG_CACHE_HOME or HOME), or pass \
-             --xdebug-path",
+            "--xdebug: cannot determine a cache directory (set XDG_CACHE_HOME or HOME; \
+             LOCALAPPDATA on Windows), or pass --xdebug-path",
         )?;
         let cache = ExtCache::new(&cache_root, &target);
         // Scope the client so its runtime thread is joined before PHP starts.
@@ -557,6 +557,7 @@ impl Target {
         match self.os {
             CatalogOs::LinuxGnu => format!("Linux {} (glibc)", self.arch),
             CatalogOs::Macos => format!("macOS {}", self.arch),
+            CatalogOs::Windows => format!("Windows {}", self.arch),
         }
     }
 
@@ -1410,7 +1411,7 @@ pub(crate) fn resolve_from_catalog(
 
     bail!(
         "--xdebug: no ePHPm extension catalog release ships Xdebug for PHP {} (API {}, {}) yet \
-         (tried: {}). Pass --xdebug-path <xdebug.so> with a ZTS build for this PHP minor.",
+         (tried: {}). Pass --xdebug-path <xdebug.so / php_xdebug.dll> with a ZTS build for this PHP minor.",
         target.php_version,
         target.api_no,
         target.arch,
@@ -2215,8 +2216,10 @@ mod tests {
 
     #[test]
     fn xdebug_refuses_clearly_where_it_cannot_work() {
-        if ephpm_php::PhpRuntime::abi().is_some() && !cfg!(windows) {
-            return; // PHP-linked: would really resolve; covered by the E2E.
+        if ephpm_php::PhpRuntime::abi().is_some()
+            && (!cfg!(windows) || ephpm_php::shared::SharedRuntime::is_shared_build())
+        {
+            return; // PHP-linked where it works: would really resolve; covered by the E2E.
         }
         let mut config = ephpm_config::Config::default_config().unwrap();
         let args = XdebugArgs { xdebug: true, ..XdebugArgs::default() };

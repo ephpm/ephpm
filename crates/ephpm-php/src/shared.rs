@@ -60,6 +60,12 @@ pub enum SharedError {
         /// The absent file.
         missing: String,
     },
+    /// The executable's own directory (where `ext\` must be) is unknown.
+    #[error(
+        "cannot locate the directory of the running executable, so the shared PHP engine's \
+         ext\\ directory cannot be found; refusing to load extension DLLs from a relative path"
+    )]
+    NoExeDir,
     /// The path cannot be written into a php.ini value safely.
     #[error(
         "cannot reference {0} from php.ini: the path must not contain quotes, line breaks, or \
@@ -87,7 +93,10 @@ pub fn parse_preload(encoded: &str) -> Result<Vec<PreloadEntry>, SharedError> {
                 "z" => true,
                 _ => return Err(SharedError::BadPreload(item.into())),
             };
-            if file.is_empty() || file.contains(['/', '\\', '"']) {
+            if file.is_empty()
+                || file.starts_with('.')
+                || !file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            {
                 return Err(SharedError::BadPreload(item.into()));
             }
             Ok(PreloadEntry { file: file.to_string(), zend_extension })
@@ -117,11 +126,14 @@ impl SharedRuntime {
             // build bug, so fall back to no preload rather than refusing to
             // start, and let ini_lines() report the directory problem.
             let preload = parse_preload(env!("EPHPM_PHP_PRELOAD")).unwrap_or_default();
-            let exe_dir = std::env::current_exe()
+            // When the executable's directory cannot be determined, leave
+            // ext_dir empty: ini_lines() refuses a non-absolute directory
+            // rather than loading DLLs from a cwd-relative `ext`.
+            let ext_dir = std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .and_then(|p| p.parent().map(|d| d.join("ext")))
                 .unwrap_or_default();
-            Some(Self { ext_dir: exe_dir.join("ext"), preload })
+            Some(Self { ext_dir, preload })
         }
         #[cfg(not(php_shared))]
         {
@@ -149,6 +161,9 @@ impl SharedRuntime {
     /// DLL and start without them. [`SharedError::UnsafePath`] when the path
     /// cannot be quoted into php.ini.
     pub fn ini_lines(&self) -> Result<Vec<String>, SharedError> {
+        if !self.ext_dir.is_absolute() {
+            return Err(SharedError::NoExeDir);
+        }
         if !self.ext_dir.is_dir() {
             return Err(SharedError::MissingRuntimeFile {
                 missing: self.ext_dir.display().to_string(),
@@ -198,7 +213,16 @@ mod tests {
 
     #[test]
     fn rejects_malformed_entries() {
-        for bad in ["php_mbstring.dll", "x:php_a.dll", "e:", "e:../php_a.dll", "e:a\\b.dll"] {
+        for bad in [
+            "php_mbstring.dll",
+            "x:php_a.dll",
+            "e:",
+            "e:../php_a.dll",
+            "e:a\\b.dll",
+            "e:a\nb.dll",
+            "e:.hidden.dll",
+            "e:a b.dll",
+        ] {
             assert!(parse_preload(bad).is_err(), "{bad:?} should be rejected");
         }
     }
@@ -227,6 +251,15 @@ mod tests {
 
     #[test]
     fn missing_runtime_files_fail_closed() {
+        // Unknown executable directory: never fall back to a relative `ext`.
+        let rt = SharedRuntime {
+            ext_dir: PathBuf::new(),
+            preload: parse_preload("e:php_mbstring.dll").unwrap(),
+        };
+        assert_eq!(rt.ini_lines(), Err(SharedError::NoExeDir));
+        let rt = SharedRuntime { ext_dir: PathBuf::from("ext"), preload: Vec::new() };
+        assert_eq!(rt.ini_lines(), Err(SharedError::NoExeDir));
+
         let dir = tempfile::tempdir().unwrap();
         let rt = SharedRuntime {
             ext_dir: dir.path().join("ext"),

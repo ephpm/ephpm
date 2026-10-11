@@ -532,6 +532,16 @@ fn release_windows(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // A previous `--variant shared` build into the same directory left
+    // php8ts.dll and ext\ here. The static exe must never sit beside a
+    // php8ts.dll: asked to load an extension DLL, Windows would resolve its
+    // php8ts.dll import to that file — a second, separate PHP engine — and
+    // the process crashes (0xC0000005) instead of failing to load.
+    if let Err(e) = remove_stale_shared_runtime(&exe_dir) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+
     eprintln!();
     eprintln!("==> Windows binary ready:");
     eprintln!("    {}", exe_dir.join("ephpm.exe").display());
@@ -562,6 +572,26 @@ fn copy_dir_contents(src: &Path, dest: &Path) -> io::Result<()> {
         } else {
             fs::copy(entry.path(), &to)?;
         }
+    }
+    Ok(())
+}
+
+/// Remove `php8ts.dll` and `ext\` that a `--variant shared` build left in
+/// `exe_dir`, so a static `ephpm.exe` written there never runs beside a
+/// foreign PHP engine. The other runtime DLLs (OpenSSL, ICU, …) are inert
+/// without `php8ts.dll` and are left alone.
+fn remove_stale_shared_runtime(exe_dir: &Path) -> Result<(), String> {
+    let engine = exe_dir.join("php8ts.dll");
+    if engine.exists() {
+        fs::remove_file(&engine)
+            .map_err(|e| format!("failed to remove stale {}: {e}", engine.display()))?;
+        eprintln!("==> removed {} left by a shared-engine build", engine.display());
+    }
+    let ext = exe_dir.join("ext");
+    if ext.is_dir() {
+        fs::remove_dir_all(&ext)
+            .map_err(|e| format!("failed to remove stale {}: {e}", ext.display()))?;
+        eprintln!("==> removed {} left by a shared-engine build", ext.display());
     }
     Ok(())
 }
@@ -2116,6 +2146,27 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_release_removes_a_stale_shared_runtime() {
+        let dir = env::temp_dir().join(format!("xtask-stale-runtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ext")).unwrap();
+        fs::write(dir.join("php8ts.dll"), b"").unwrap();
+        fs::write(dir.join("ext").join("php_xdebug.dll"), b"").unwrap();
+        fs::write(dir.join("libssl-3-x64.dll"), b"").unwrap();
+        fs::write(dir.join("ephpm.exe"), b"").unwrap();
+
+        remove_stale_shared_runtime(&dir).unwrap();
+        assert!(!dir.join("php8ts.dll").exists());
+        assert!(!dir.join("ext").exists());
+        // Inert without php8ts.dll, and the exe itself: left alone.
+        assert!(dir.join("libssl-3-x64.dll").exists());
+        assert!(dir.join("ephpm.exe").exists());
+        // Idempotent on a clean directory.
+        remove_stale_shared_runtime(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Split a Dockerfile into `(stage name, parent, body lines)`, one entry per
     /// `FROM`. Line continuations are not joined; the checks below only look at

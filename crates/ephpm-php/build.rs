@@ -120,8 +120,15 @@ fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
 /// carries the whole engine and there is no `php8ts.*` in it at all.
 fn is_shared_sdk(lib_dir: &Path, target_os: &str) -> bool {
     let import_lib = lib_dir.join("php8ts.lib");
-    println!("cargo::rerun-if-changed={}", import_lib.display());
-    target_os == "windows" && import_lib.exists()
+    let shared = target_os == "windows" && import_lib.exists();
+    // Only watch the file when it exists: Cargo treats a missing
+    // rerun-if-changed path as always stale, which would rerun this script
+    // (bindgen + the C wrapper) on every build with every other SDK. A
+    // different SDK variant means a different PHP_SDK_PATH anyway.
+    if shared {
+        println!("cargo::rerun-if-changed={}", import_lib.display());
+    }
+    shared
 }
 
 /// Bake the shared SDK's extension preload list into the crate as
@@ -166,8 +173,12 @@ fn emit_shared_preload(sdk_path: &Path) {
             .get("file")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_else(|| panic!("{}: preload entry without \"file\"", manifest.display()));
+        // Baked into a `cargo::rustc-env` line: a line break would inject a
+        // cargo directive, so accept only plain file-name characters.
         assert!(
-            !file.is_empty() && !file.contains(['/', '\\', ';', ':', '"']),
+            !file.is_empty()
+                && !file.starts_with('.')
+                && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
             "{}: preload file {file:?} must be a plain file name",
             manifest.display()
         );

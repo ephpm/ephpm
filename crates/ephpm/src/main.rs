@@ -1784,8 +1784,23 @@ fn run_with_config(
             // / libc) are rejected by PHP at startup with an explicit
             // API-version error.
             if !config.php.extensions.is_empty() {
-                let cwd = std::env::current_dir().context("failed to read current directory")?;
                 let abi = ephpm_php::PhpRuntime::abi();
+                // The default Windows build links PHP statically: it cannot
+                // load extension DLLs (they import php8ts.dll), and when some
+                // php8ts.dll is reachable the load attaches a second PHP
+                // engine and crashes the process. Refuse instead.
+                if cfg!(windows)
+                    && abi.is_some()
+                    && !ephpm_php::shared::SharedRuntime::is_shared_build()
+                {
+                    anyhow::bail!(
+                        "[php] extensions is not supported by this Windows build: it links PHP \
+                         statically and cannot load extension DLLs. Use the shared-engine build \
+                         (`cargo xtask release --target windows --variant shared`), or remove \
+                         [php] extensions"
+                    );
+                }
+                let cwd = std::env::current_dir().context("failed to read current directory")?;
                 let ext_dir = ext_ini::effective_extension_dir(
                     &config.php.ini_overrides,
                     abi.as_ref().and_then(|a| a.default_extension_dir.as_deref()),
