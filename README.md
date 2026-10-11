@@ -44,8 +44,9 @@ Composer's `install`, `update`, `require`, `remove` and `dump-autoload` that is
 compiled into the binary, so `ephpm composer install` from a lock file needs no
 PHP and no `composer.phar`, in every build (including stub mode) and on
 **Windows**. It is not full Composer: no other commands exist, scripts don't
-run by default, `update`/`require` need a `php` (a PHP-linked `ephpm` uses
-itself; a stub build needs one on `PATH`), and locks it can't
+run by default, `update`/`require`/`remove` run a `php` for the platform
+check (a PHP-linked `ephpm` uses its own embedded PHP, so no system PHP is
+needed; a stub build needs `php` on `PATH`), and locks it can't
 install natively are handed to a real `composer`. Read
 [the `ephpm composer` reference](https://ephpm.dev/reference/cli/composer/)
 before you put it in CI.

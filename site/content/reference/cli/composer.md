@@ -22,13 +22,16 @@ read them before you put it in CI.
 > `[patch.crates-io]` entry): upstream v0.20.0 plus one change that accepts
 > Composer's global `-n`/`-q`/`-v`/`--no-ansi` on every command. Flags and
 > behavior can change when that pin moves, so this page describes that build
-> only. `ephpm composer --version` prints the version your binary embeds.
+> only. Released binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1
+> embeds 0.15.0, and v0.11.2 and v0.11.3 embed 0.17.0; this build ships in the
+> first release after v0.11.3. `ephpm composer --version` prints the version
+> your binary embeds.
 
 ## What needs PHP or Composer
 
 | You run | Needs a `php` executable? | Needs a real `composer`? |
 |---|---|---|
-| `install`, `dump-autoload` (lock in scope) | No. Without one, platform requirements are skipped with a warning | No |
+| `install`, `dump-autoload` (lock in scope) | No. Without one, `install` skips the platform check (with a warning if the lock declares platform requirements) | No |
 | `update`, `require`, `remove` | **Yes**, for the platform probe ([details](#platform-requirements)). A PHP-linked `ephpm` is its own `php`, so only a **stub** build needs one installed | No |
 | Any command that is [out of scope](#fallback-to-composer) | — | Yes, or it exits `3` |
 | `--run-scripts` (on `install` or `dump-autoload`) | Whatever your scripts need | Yes, or it exits `3` |
@@ -133,7 +136,7 @@ These are parsed so Composer command lines keep working, and they do nothing:
 
 | Option | Commands | Note |
 |---|---|---|
-| `--no-scripts` | all five | Scripts never run anyway. On `dump-autoload` it cannot be combined with `--run-scripts` (exit `2`) |
+| `--no-scripts` | all five | Scripts only run with `--run-scripts`. On `install` it cancels `--run-scripts` (no scripts run, and a [fallback](#fallback-to-composer) passes `--no-scripts` to Composer). On `dump-autoload` it cannot be combined with `--run-scripts` (exit `2`) |
 | `--no-audit`, `--audit-format <FORMAT>` | `--no-audit`: update, require, remove. `--audit-format`: require, remove | vivacity has no audit |
 | `--prefer-source`, `--prefer-dist`, `--prefer-install <X>` | require | vivacity always installs dist archives (on `install` they are honored, see ⁵) |
 | `-n`, `--no-interaction` | all five | vivacity never prompts |
@@ -147,7 +150,7 @@ These are parsed so Composer command lines keep working, and they do nothing:
 These exit `1` with an error rather than doing something different from Composer:
 
 - `update lock`, `update nothing`, `update mirrors`: refreshing lock metadata is not supported.
-- `-m`, `--minimal-changes`, `COMPOSER_MINIMAL_CHANGES=1` and `config.update-with-minimal-changes: true` on `require` and `remove` (`update` has no `-m`, so it exits `2` there).
+- `-m`, `--minimal-changes`, `COMPOSER_MINIMAL_CHANGES=1` and `config.update-with-minimal-changes: true` on `require` and `remove`. `update` has no `-m` (it exits `2` there), and it does not read the variable or the config key, so an `update` with either set resolves without minimal changes.
 - An alternate manifest via `COMPOSER=other.json`, on every command.
 - A root `composer.json` that Composer itself refuses (an invalid root package name, a package that requires itself, an invalid link name), on every command and before anything is written, with Composer's message and exit code.
 - `require` with `config.lock: false`, unless you also pass `--no-install`.
@@ -157,8 +160,8 @@ These exit `1` with an error rather than doing something different from Composer
 ### `install` and `dump-autoload` need a lock
 
 Composer's `install` without a `composer.lock` falls back to an update.
-vivacity's does not. It exits `1` with `no composer.lock in <dir> — `install`
-needs one; run `vivacity update` to resolve and write it`. Commit your lock, or
+vivacity's does not. It exits `1` with ``no composer.lock in <dir> — `install`
+needs one; run `vivacity update` to resolve and write it``. Commit your lock, or
 run `ephpm composer update` first.
 `dump-autoload` also needs a `composer.lock` and exits `1` without one, while
 Composer's works from `installed.json` alone.
@@ -166,9 +169,10 @@ Composer's works from `installed.json` alone.
 ### Scripts are not run
 
 **vivacity never executes the `scripts` section of `composer.json`, and it
-does not print a warning when it skips them.** `--no-scripts` is accepted but
-changes nothing. `post-install-cmd`, `post-update-cmd`, `post-autoload-dump`
-and the rest are skipped silently.
+does not print a warning when it skips them.** `--no-scripts` is accepted; it
+only matters next to `install --run-scripts`, which it cancels.
+`post-install-cmd`, `post-update-cmd`, `post-autoload-dump` and the rest are
+skipped silently.
 
 The opt-in is `--run-scripts`, on `install` and `dump-autoload` only:
 
@@ -191,30 +195,40 @@ A non-zero exit from a script stops the command with that exit code.
 
 ### Plugins are emulated, never executed
 
-vivacity never loads plugin code. A `composer-plugin` package in the lock
-falls into one of four groups, all subject to your `config.allow-plugins`:
+vivacity never loads plugin code. At install time a `composer-plugin`
+package in the lock falls into one of four groups, decided by its name:
 
 - **Emulated:** vivacity reproduces the plugin's effect natively.
   `composer/installers`, `roots/wordpress-core-installer`,
   `mnsami/composer-custom-directory-installer`, `symfony/runtime`,
-  `pestphp/pest-plugin`, `dealerdirect/phpcodesniffer-composer-installer`,
+  `symfony/flex` (its install-time `.env.dist` → `.env` copy),
+  `composer/package-versions-deprecated`, `pestphp/pest-plugin`,
+  `dealerdirect/phpcodesniffer-composer-installer`,
   `phpstan/extension-installer`, `rector/extension-installer`,
   `wikimedia/composer-merge-plugin`, `yiisoft/yii2-composer`, `codeception/c3`
-  and `bamarni/composer-bin-plugin`. Some of these have configurations
-  vivacity does not emulate, which push the lock out of scope:
-  `yiisoft/yii2-composer` together with `yiisoft/yii2-dev`,
-  `bamarni/composer-bin-plugin` with `forward-command: true`, a merge-plugin
-  include that declares its own `repositories`, and install paths that
-  `composer/installers` cannot reproduce.
+  and `bamarni/composer-bin-plugin`. Emulation follows your
+  `config.allow-plugins` as Composer would: for example, a
+  `composer/installers` that `allow-plugins` denies installs everything into
+  `vendor/`, and one it does not mention at all is out of scope (Composer
+  would refuse to run). Some of these have configurations vivacity does not
+  emulate, which push the lock out of scope: `yiisoft/yii2-composer` together
+  with `yiisoft/yii2-dev`, `bamarni/composer-bin-plugin` with
+  `forward-command: true`, a merge-plugin configuration vivacity cannot merge,
+  and install paths that `composer/installers` cannot reproduce.
 - **Installed as plain libraries, with a note:** these plugins are known to
-  write nothing at install time. `symfony/flex`,
-  `composer/package-versions-deprecated`, `php-http/discovery`,
-  `drupal/core-project-message`, `drupal/core-recipe-unpack`, `symfony/thanks`
-  and `ergebnis/composer-normalize`.
+  write nothing at install time. `php-http/discovery`,
+  `drupal/core-project-message`, `drupal/core-recipe-unpack`,
+  `ibexa/post-install`, `symfony/thanks`, `ergebnis/composer-normalize` and
+  `metasyntactical/composer-plugin-license-check` (out of scope instead when
+  it is allowed and `extra` gives it an allow-list or deny-list).
 - **Always out of scope:** these change the install layout or package
   contents. `cweagans/composer-patches` and
   `oomphinc/composer-installers-extender`.
 - **Any other plugin** is out of scope.
+
+The last two groups do not consult `allow-plugins`: an unknown or
+layout-changing plugin puts the lock out of scope even when `allow-plugins`
+denies it. Only `--no-plugins` (below) lets such a lock install natively.
 
 `--no-plugins` works as it does in Composer: no plugin runs, so **emulated
 plugins are switched off too**. Every package goes into `vendor/`, custom
@@ -228,10 +242,18 @@ installed (project and global `installed.json`) and allowed. It delegates the
 whole command to Composer when one of them would change what gets resolved or
 written:
 
-- `symfony/flex`: on `require`, or with an install (`--no-install` resolves natively)
+- `symfony/flex`: on `require`, and on `remove` with an install. On `update`
+  (and `remove --no-install`) only when Flex would write files vivacity does
+  not emulate, such as a recipe or bundle registration for a package
+  `symfony.lock` does not record yet, removing a package it does record, an
+  `.env.dist` copy, a `package.json`/`importmap.php`
+  synchronisation, or a `flex-require` merge. That is decided before anything
+  is written
 - `symfony/thanks`: on `update` with an install
 - `yiisoft/yii2-composer`: with an install
 - `drupal/core-recipe-unpack`: on `require`
+- `wikimedia/composer-merge-plugin`: when a merged file declares its own
+  `repositories`
 - any plugin that is not on vivacity's lists
 
 ### Fallback to Composer
@@ -299,7 +321,9 @@ vivacity has no `audit` command and does not audit after `update`/`require`.
 ### Output
 
 All of vivacity's narrative goes to **stderr**. stdout is empty, apart from
-the `codeception/c3` emulation's messages. A successful `install` ends with a
+`--help`/`--version`, the `codeception/c3` emulation's messages, and the hint
+Composer also prints there when an `update --with` constraint conflicts with
+`composer.json`. A successful `install` ends with a
 summary line such as `vivacity: 1 installed, 0 unchanged, 0 removed (…) in
 0.25s`.
 
@@ -319,15 +343,22 @@ probe script through a `php` executable, as `$VIVACITY_PHP <probe.php>`
 
 Then:
 
-- **`install`:** if a `php` is found, the lock is checked against it.
+- **`install`:** if the probe runs, the lock is checked against it.
   Unsatisfied requirements exit `4`
-  (`Your lock file cannot be installed on this platform`). If no `php` is
-  found (stub build only), the check is skipped with
-  `Warning: php not found, platform requirements were not checked`, and the
-  install goes ahead.
-- **`update`, `require`, `remove`:** the probe is **mandatory**. Without a
-  `php` (stub build only), they exit `1` with `Error: cannot run php: program
-  not found`, even with `--ignore-platform-reqs` or `config.platform` set.
+  (`Your lock file cannot be installed on this platform`). If the probe
+  cannot run (no `php` in a stub build, or a `VIVACITY_PHP` that does not
+  work), the check is skipped and the install goes ahead. vivacity then prints
+  `Warning: php not found, platform requirements were not checked` only when
+  the lock declares platform requirements (`platform`, or `platform-dev`
+  outside `--no-dev`). With `--ignore-platform-reqs` the probe is not run at
+  all.
+- **`update`, `require`, `remove`:** the probe is **mandatory**. When it
+  cannot run they exit `1`, even with `--ignore-platform-reqs` or
+  `config.platform` set. A missing executable reads
+  `Error: cannot run <php>:` followed by the operating system's error
+  ("No such file or directory" on Linux and macOS, "program not found" on
+  Windows). In a PHP-linked build this only happens when `VIVACITY_PHP`
+  points somewhere unusable.
 - `config.platform` overrides and `--ignore-platform-req(s)` apply on top of
   the probed platform, as in Composer. `COMPOSER_IGNORE_PLATFORM_REQS` and
   `COMPOSER_IGNORE_PLATFORM_REQ` are honored on `update`, `require` and
@@ -337,11 +368,16 @@ To probe a different PHP — say, a system `php` whose extensions match a
 production php-fpm — set `VIVACITY_PHP` explicitly; `ephpm composer` never
 overrides a value you set.
 
-vivacity caches the probe result. The cache is keyed on the probed
-executable's path, size and mtime (plus the ini files it loaded), so replacing
-the `ephpm` binary invalidates it. With a wrapper script as `VIVACITY_PHP`
-that executable is the wrapper, not what it runs: after changing what it runs,
-pass `VIVACITY_NO_PLATFORM_CACHE=1` once so the probe runs again.
+vivacity caches the probe result (`platform-probe.json` in its cache
+directory). The cache is keyed on the probed executable's path, size and
+mtime, every ini file PHP loaded or scanned plus the scan directory, and the
+`PHPRC`, `PHP_INI_SCAN_DIR`, `XDEBUG_MODE` and `XDEBUG_CONFIG` variables, so
+replacing the `ephpm` binary invalidates it. It does not notice a change to a
+shared library or shared extension PHP loads, and with a wrapper script as
+`VIVACITY_PHP` the executable is the wrapper, not what it runs. After either
+kind of change, delete `platform-probe.json`. `VIVACITY_NO_PLATFORM_CACHE=1`
+skips the cache for that run only: it neither reads nor rewrites the file, so
+a later run without it still gets the old result.
 
 What actually guards production is the runtime check. Like Composer, the
 generated autoloader includes `vendor/composer/platform_check.php`, which
@@ -376,11 +412,11 @@ support custom lists (`policy.<name>`).
 | Code | Meaning |
 |---|---|
 | `0` | Success. Also `--help`, `--version`, `--dry-run`, and `--check-scope` on an in-scope lock |
-| `1` | Runtime error: missing `composer.lock` on `install`, no `php` for `update`/`require`/`remove` (stub build), an unsupported repository type, a refused option, local I/O failures |
-| `100` | A fetch failed (a dist or repository that answers an HTTP error, is unreachable, or a local dist path that is missing), after Composer's retry policy (up to three attempts). Composer exits `100` for the same failures |
+| `1` | Runtime error: missing `composer.lock` on `install`, a platform probe that cannot run on `update`/`require`/`remove`, an unsupported repository type, a refused option, local I/O failures |
 | `2` | Usage error (unknown command or option, or no command at all). Also Composer's code `2`: an unsolvable dependency set, a lock blocked by policy, or `remove` leaving the package installed |
-| `3` | Out of scope with no fallback possible (`--no-fallback`, `--check-scope`, or no `composer` on `PATH`), or `--run-scripts` without `composer` |
+| `3` | Out of scope with no fallback possible (`--no-fallback`, `--check-scope`, or no `composer` on `PATH`), or `--run-scripts` without `composer`. Also Composer's code `3` for a partial `update <packages>` with no `composer.lock` |
 | `4` | Platform requirements not met on `install`, or `composer.json` requires something the lock does not contain |
+| `100` | A fetch failed (a dist or repository that answers an HTTP error, is unreachable, or a local dist path that is missing), after Composer's retry policy (at most three retries, and only for the errors Composer retries, so a 404 fails at once). Composer exits `100` for the same failures |
 | other | When vivacity delegates to Composer or runs scripts, the exit code of that process |
 
 ## Environment and caches
@@ -422,7 +458,8 @@ support custom lists (`policy.<name>`).
   ```
 
   The alternative is `ephpm composer install --run-scripts`, which needs a
-  real `composer` and a `php` on `PATH`. `post-update-cmd`
+  real `composer` on `PATH` (it can run on the embedded PHP, see
+  [Relationship to `ephpm php`](#relationship-to-ephpm-php)). `post-update-cmd`
   (`vendor:publish --tag=laravel-assets`) never runs under vivacity, so run it
   by hand if you rely on it.
 - The skeleton's allowed plugins (`pestphp/pest-plugin`, `php-http/discovery`)

@@ -194,10 +194,12 @@ enum Commands {
     /// real `composer` on `PATH` (exit 3 without one). `install` and
     /// `dump-autoload` need no PHP, so they work in every build, including
     /// stub mode, and on Windows. `update`, `require` and `remove` run a `php`
-    /// to probe platform requirements: in a PHP-linked build that is this
-    /// `ephpm` binary itself (so no system PHP is needed), in a stub build
-    /// `VIVACITY_PHP` or `php` on `PATH`. The process exits with vivacity's
-    /// exit code.
+    /// to probe platform requirements (`install` uses it when it can):
+    /// `VIVACITY_PHP` if set, otherwise in a PHP-linked build this `ephpm`
+    /// binary itself (so no system PHP is needed) and in a stub build `php` on
+    /// `PATH`. Composer's global `-n`/`-q`/`-v`/`--no-ansi` are accepted as
+    /// no-ops (`-q` does not silence output). The process exits with
+    /// vivacity's exit code.
     ///
     /// Examples: `ephpm composer install --no-dev --optimize-autoloader`,
     /// `ephpm composer dump-autoload -o`, `ephpm composer --version`.

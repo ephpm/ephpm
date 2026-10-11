@@ -6260,7 +6260,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vivacity"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "anyhow",
  "clap",
@@ -6275,7 +6275,7 @@ dependencies = [
 [[package]]
 name = "vivacity-autoload"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "md-5 0.10.6",
  "memchr",
@@ -6291,7 +6291,7 @@ dependencies = [
 [[package]]
 name = "vivacity-core"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6316,7 +6316,7 @@ dependencies = [
 [[package]]
 name = "vivacity-pcre2"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6326,7 +6326,7 @@ dependencies = [
 [[package]]
 name = "vivacity-pcre2-sys"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6335,7 +6335,7 @@ dependencies = [
 [[package]]
 name = "vivacity-resolver"
 version = "0.20.0"
-source = "git+https://github.com/ephpm/vivace.git?rev=6882fc083100d599321633237a150feea630e4ac#6882fc083100d599321633237a150feea630e4ac"
+source = "git+https://github.com/ephpm/vivace.git?rev=73b884f08c7c80d43398e34fcbe1181c670ed7a9#73b884f08c7c80d43398e34fcbe1181c670ed7a9"
 dependencies = [
  "serde",
  "serde_json",

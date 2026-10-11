@@ -451,13 +451,15 @@ turso = { version = "=0.7.2", default-features = false }
 # its upstream's stated target). It links no PHP, so the subcommand works in
 # stub mode too. At runtime it shells out to a real `composer` for the
 # out-of-scope fallback and `--run-scripts`, and `update`/`require`/`remove`
-# run a `php` for the platform probe (`$VIVACITY_PHP`; a PHP-linked ephpm sets
+# run a `php` for the platform probe (`install` too when one is available)
+# (`$VIVACITY_PHP`; unless the operator set it, a PHP-linked ephpm sets
 # it to its own executable, which answers as php-cli — see
 # crates/ephpm/src/php_personality.rs). User-facing docs, pinned to
 # this version: site/content/reference/cli/composer.md. Pinned to
 # the exact published version whose `vivacity::run()` embed entry point was
 # verified (argv[0] = program name; returns the process exit code as `i32`).
-# MIT-licensed. Published on crates.io. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).
+# MIT-licensed. Published on crates.io; currently built from the ePHPm fork via
+# the [patch.crates-io] entry below. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).
 # Like 0.11.1, 0.15.0 keeps the C decompression libs (bzip2-sys/xz2/zstd-sys)
 # out of `zip` in favor of pure-Rust backends, so this PHP-linked binary no
 # longer collides with libphp's bundled bzip2/xz/zstd at link time
@@ -473,7 +475,8 @@ turso = { version = "=0.7.2", default-features = false }
 # `remove` over to real Composer when an installed plugin changes resolution.
 # All keep byte-identical output. The only linking-side delta across the range
 # is memchr → 2.8.3 (pure Rust, no C symbols); no version adds a new C dep.
-# 0.18–0.20: `update --with` / `a/b:^1` temporary constraints (0.18);
+# 0.18–0.20: `update --with` / `a/b:^1` temporary constraints, and
+# symfony/flex + composer/package-versions-deprecated emulated at install (0.18);
 # `install --prefer-dist/--prefer-source/--prefer-install` and `--no-progress`
 # accepted (0.19); transport failures exit 100 with Composer's retry policy,
 # hardened dist extraction (symlink-chain escape, decompressed-size limit,
@@ -540,11 +543,13 @@ used_underscore_binding = "allow"
 opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
 # vivacity 0.20.0 from the ePHPm fork (github.com/ephpm/vivace): upstream
 # v0.20.0 plus one commit that accepts Composer's global options
-# (-n/--no-interaction, -q, -v, --no-ansi) on install/update/dump-autoload, so
+# (-n/--no-interaction, -q/--quiet, -v/-vv/-vvv/--verbose, --no-ansi) as
+# no-ops on install/update/dump-autoload, adds --no-ansi to require/remove, and
+# lets dump-autoload take --no-scripts (conflicts with --run-scripts), so
 # the usual CI line `composer install --no-dev --no-interaction --prefer-dist -o`
-# runs instead of exiting 2 (ephpm/vivace#2). The fork's version is 0.20.0, so
-# the exact `=0.20.0` pin above still holds and Vivacity Pin Watch keeps
-# working: a bump PR to a newer crates.io version leaves this patch unused
+# runs instead of exiting 2 (ephpm/vivace#2; the rev is its squash-merge
+# commit on the fork's main). The fork's version is 0.20.0, so the exact
+# `=0.20.0` pin above still holds and Vivacity Pin Watch keeps working: a bump PR to a newer crates.io version leaves this patch unused
 # (cargo warns), which is the cue to drop it if upstream has taken the change.
 # Retire when upstream vivacity ships the same flags.
-vivacity = { git = "https://github.com/ephpm/vivace.git", rev = "6882fc083100d599321633237a150feea630e4ac" }
+vivacity = { git = "https://github.com/ephpm/vivace.git", rev = "73b884f08c7c80d43398e34fcbe1181c670ed7a9" }
