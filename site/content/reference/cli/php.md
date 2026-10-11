@@ -185,8 +185,8 @@ exactly as `ephpm php <args…>`.
 The binary takes the php-cli role when **any** of these holds:
 
 1. **It is invoked under a php name.** If `argv[0]`'s file name is `php` or
-   `php` plus a version (`php8`, `php8.4`, `php84`; `.exe` ignored on
-   Windows), it *is* php-cli for every argument, including ones that look like
+   `php` plus a version (`php8`, `php8.4`, `php84`; on Windows `.exe` is
+   ignored and case does not matter), it *is* php-cli for every argument, including ones that look like
    ePHPm subcommands. This makes a symlink a complete php install:
 
    ```bash
@@ -203,7 +203,7 @@ The binary takes the php-cli role when **any** of these holds:
    inherits it. A child `ephpm` that sees the marker treats its arguments as
    php's — including no arguments at all (program on stdin) and `-v`, `-h`,
    `--version`, which then mean what they mean to php. An argument that names
-   an `ephpm` subcommand (`ephpm kv …`, `ephpm cache purge`, `ephpm help`)
+   an `ephpm` subcommand (`ephpm kv …`, `ephpm cache reset`, `ephpm help`)
    still runs that subcommand, so scripts that drive ePHPm keep working.
 
 3. **Its first argument is php-shaped**, even without the marker (a library
@@ -226,7 +226,7 @@ The re-invoked process is a fresh `ephpm php`: it does not inherit
 `--site`/`--config`, so a child of `ephpm php --site shop …` has no tenant
 database bound.
 
-> **Added after v0.11.2.** Before, re-invoking `PHP_BINARY` reached `ephpm`'s
+> **Added after v0.11.3.** Before, re-invoking `PHP_BINARY` reached `ephpm`'s
 > own argument parser: `PHP_BINARY script.php` was a usage error, and a bare
 > `PHP_BINARY` fed a program on stdin started the dev server.
 

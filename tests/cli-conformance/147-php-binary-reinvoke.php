@@ -3,7 +3,9 @@
 // (PhpExecutableFinder), Composer's `@php` handler and PHPUnit process
 // isolation all run `PHP_BINARY <php-cli args>`. Under ePHPm, PHP_BINARY is the
 // ephpm executable, which must then answer like php-cli for every argv shape
-// below — including the bare, stdin-fed form (which used to start `ephpm dev`).
+// below. (The bare, stdin-fed form with no arguments at all, which used to
+// start `ephpm dev`, is covered by the cli e2e suite: every call here passes
+// `-n` first.)
 $run = function (array $args, string $stdin = ''): void {
     $p = proc_open(
         array_merge([PHP_BINARY, '-n'], $args),

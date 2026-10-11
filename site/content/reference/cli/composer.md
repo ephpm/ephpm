@@ -299,7 +299,7 @@ probe script through a `php` executable, as `$VIVACITY_PHP <probe.php>`
 (otherwise `php` on `PATH`). Which `php` that is depends on the build:
 
 - **PHP-linked `ephpm` (release builds):** unless you set `VIVACITY_PHP`
-  yourself, `ephpm composer` sets it to the path of the running `ephpm`
+  yourself (an empty value counts as unset), `ephpm composer` sets it to the path of the running `ephpm`
   executable before vivacity starts. vivacity's `ephpm <probe.php>` then runs
   the script on the embedded PHP CLI ([`ephpm php`](../php/#re-invoking-php_binary)),
   so the probe reports exactly the PHP version and extensions `ephpm php -m`

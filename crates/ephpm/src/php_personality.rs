@@ -24,7 +24,7 @@
 //!    subcommand.** `ephpm php` and `ephpm composer` export [`MARKER_ENV`]
 //!    `=1` into their own environment before PHP (or vivacity) runs, so every
 //!    child they spawn inherits it. A child `ephpm` that sees the marker and is
-//!    *not* asked for a real subcommand (`ephpm kv …`, `ephpm cache purge`, …
+//!    *not* asked for a real subcommand (`ephpm kv …`, `ephpm cache reset`, …
 //!    keep working from inside PHP scripts) is a re-invocation of
 //!    `PHP_BINARY`, including the no-argument stdin form and `-v`/`-h`/
 //!    `--version`, which then mean what they mean to php.
@@ -123,6 +123,8 @@ fn is_php_name(argv0: &OsStr) -> bool {
         }
         _ => stem.to_owned(),
     };
+    // Windows file names are case-insensitive: `PHP.EXE` is `php.exe`.
+    let name = if cfg!(windows) { name.to_ascii_lowercase() } else { name };
     let Some(version) = name.strip_prefix("php") else {
         return false;
     };
@@ -150,7 +152,8 @@ pub(crate) fn marker_set() -> bool {
 pub(crate) fn export_for_children(point_vivacity_here: bool) {
     let vivacity_php = if point_vivacity_here
         && ephpm_php::PHP_LINKED
-        && std::env::var_os("VIVACITY_PHP").is_none()
+        // An empty value counts as unset: vivacity would try to run "".
+        && std::env::var_os("VIVACITY_PHP").is_none_or(|v| v.is_empty())
     {
         std::env::current_exe().ok()
     } else {
@@ -189,7 +192,12 @@ mod tests {
     #[test]
     fn php_named_argv0_is_always_php() {
         // `\` is a path separator only on Windows.
-        let windows_path: &[&str] = if cfg!(windows) { &[r"C:\tools\php8.4.exe"] } else { &[] };
+        // Windows names are case-insensitive.
+        let windows_path: &[&str] = if cfg!(windows) {
+            &[r"C:\tools\php8.4.exe", r"C:\PHP\PHP.EXE", "Php8.exe"]
+        } else {
+            &[]
+        };
         for &a0 in
             ["php", "/usr/local/bin/php", "php8", "php8.4", "/opt/bin/php8.5", "php84", "php.exe"]
                 .iter()
@@ -208,6 +216,10 @@ mod tests {
     fn non_php_argv0_is_not_php() {
         for a0 in ["ephpm", "php-fpm", "phpunit", "phpize", "php8-x", "ephpm.exe", "xphp"] {
             assert_eq!(decide(&[a0, "serve"], false, &[]), None, "argv0 {a0}");
+        }
+        // Unix names are case-sensitive: `PHP` is not `php` there.
+        if !cfg!(windows) {
+            assert_eq!(decide(&["PHP", "serve"], false, &[]), None);
         }
     }
 
