@@ -552,31 +552,38 @@ alt_svc_max_age = 86400
 | `shed_after_ms` | u64 (ms) | `0` | How long a request may wait for a PHP execution slot before `overload = "shed"` rejects it. `0` = do not wait at all — take a free slot if there is one, otherwise shed immediately (the dispatch queue, `queue_depth` slots, is already the buffer). Raise it to absorb bursts before shedding. Inert when the policy is `"wait"`. Env: `EPHPM_PHP__SHED_AFTER_MS=250`. |
 | `admission` | string | `"fifo"` | Dispatch-admission policy for the bounded queues in front of PHP execution — the per-request pool and the worker pool. `"fifo"` (**default**) admits waiters in strict arrival order via a FIFO-fair semaphore — removes the multi-lap starvation tail (worker-mode P99 280 ms → 58 ms at unchanged throughput, issue #442). `"barge"` restores the pre-fix racing admission (wait in the bounded channel's own `send()`, where a fresh request can steal a freed slot ahead of parked waiters) — work-conserving but unfair; operator escape hatch. An unknown value is a startup error. Startup logs the effective policy on the pool-started line. Env: `EPHPM_PHP__ADMISSION=barge`. |
 
-### PHP errors are displayed to clients by default
+### Where PHP errors go
 
-> **`display_errors` is on in every mode, including `ephpm serve`.** ePHPm
-> never writes a `display_errors` line into the php.ini it generates, so PHP's
-> compiled-in default applies: `display_errors=1`. Warnings, notices and fatal
-> errors are written into the **HTTP response body**, as plain text (the
-> embedded SAPI sets `html_errors=0`), including the script's full filesystem
-> path. In per-request mode `log_errors` is also left at PHP's default of `0`,
-> so by default these messages reach the client and **not** ePHPm's log.
-> There is no separate "production" default — `ephpm serve` and `ephpm dev`
-> behave the same here.
+ePHPm writes mode-dependent error defaults at the top of the php.ini it
+generates, so `[php] ini_file`, `[php] ini_overrides` and per-site overrides
+all win over them:
 
-For production, turn display off and logging on:
+| Mode | `display_errors` | `display_startup_errors` | `log_errors` |
+|------|------------------|--------------------------|--------------|
+| `ephpm serve` | `Off` | `Off` | `On` |
+| `ephpm dev` / bare `ephpm` | `On` | `On` | `On` |
+
+Worker mode gets the same defaults as per-request mode. Under `ephpm serve`,
+warnings, notices and fatal errors (which quote the script's full filesystem
+path) never reach the HTTP response. With no `error_log` file configured, each
+one appears in ePHPm's own log on the `php` target, for example
+`WARN php: PHP Warning:  Undefined variable $x in /var/www/app/index.php on line 3`.
+Fatal and parse errors log at ERROR, warnings at WARN, notices and deprecations
+at INFO, and userland `error_log()` lines at WARN. If you set an `error_log`
+file, PHP writes there instead. `ephpm php` keeps php-cli's defaults.
+
+To show errors in responses under `serve` (for example on a staging host):
 
 ```toml
 [php]
-ini_overrides = [
-  ["display_errors", "Off"],
-  ["log_errors", "On"],
-]
+ini_overrides = [["display_errors", "On"]]
 ```
 
-or, from the environment, `EPHPM_PHP__INI_OVERRIDES='[["display_errors","Off"],["log_errors","On"]]'`. With `log_errors` on, each message appears in ePHPm's own log as a `[PHP] PHP Warning: …` line. A `display_errors` line in your `[php] ini_file` works too. Check the effective value with `ini_get('display_errors')` from a request.
+or, from the environment, `EPHPM_PHP__INI_OVERRIDES='[["display_errors","On"]]'`. Check the effective value with `ini_get('display_errors')` from a request.
 
-Worker mode is the one exception on the logging side: it seeds `log_errors=On` (see `ini_overrides` above), but `display_errors` is still PHP's default there too.
+Through v0.11.3, ePHPm set no `display_errors` line, so PHP's compiled-in
+`display_errors=1` applied in every mode (`serve` included), and outside worker
+mode `log_errors` stayed at `0`.
 
 ### `[php.worker]`
 
