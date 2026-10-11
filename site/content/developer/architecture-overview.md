@@ -366,7 +366,7 @@ Release artifacts are named per platform. One binary per PHP version per platfor
 | Platform | Linking | Runtime dependencies |
 |---|---|---|
 | Linux | Static libphp, glibc-dynamic (gnu target, `--export-dynamic`) | glibc — any mainstream distro; enables `dlopen` of shared extensions/middleware (not Alpine/`FROM scratch`) |
-| macOS | Static libphp, dynamic libSystem | `libSystem.dylib` (always present, Apple-mandated) |
+| macOS | Static libphp, dynamic libSystem (`-export_dynamic`) | `libSystem.dylib` (always present, Apple-mandated); `-export_dynamic` keeps the Zend API exported so shared extension bundles can `dlopen` |
 | Windows | Static libphp, static CRT (`/MT`) | Windows system libraries only |
 
 ---

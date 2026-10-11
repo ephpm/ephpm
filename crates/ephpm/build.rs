@@ -145,6 +145,24 @@ fn main() {
                 );
             }
         }
+
+        // Export the binary's own symbols into the dynamic symbol table — the
+        // ld64 spelling of the `--export-dynamic` the Linux branch passes
+        // below, for the same reason: a shared extension loaded via
+        // `extension=` / `zend_extension=` (a Mach-O bundle built with
+        // `-undefined dynamic_lookup`) resolves its Zend/TSRM imports against
+        // the hosting executable at dlopen time.
+        //
+        // Without it, ld64 still exports the globals that survive linking, but
+        // rustc's `-dead_strip` first removes every libphp.a function nothing
+        // in ePHPm references. Most of the Zend API survives by accident
+        // (something reachable references it), but not all: Xdebug
+        // imports 123 PHP symbols and 8 of them (e.g.
+        // `_smart_string_alloc_persistent`) were stripped from the v0.11.2
+        // binary, so the load failed with "symbol not found in flat
+        // namespace". `-export_dynamic` both exports the symbols and keeps
+        // them live through dead-stripping.
+        println!("cargo::rustc-link-arg=-Wl,-export_dynamic");
         return;
     }
 
