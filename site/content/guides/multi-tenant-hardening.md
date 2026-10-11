@@ -320,12 +320,10 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
 
 ### Server endpoints are not tenant-scoped
 
-The metrics path (`[server.metrics]`) and the `/_ephpm/*` endpoints are
-**unauthenticated** and answer on **every** listener for **every** `Host`. They
-are matched before `trusted_hosts`, `blocked_paths`, the per-site preview gate
-and all middleware, so none of the layers above can restrict them. On a
-multi-tenant node that means any visitor to any tenant's domain, and any tenant
-that can make an HTTP request to its own public URL, can read:
+The metrics path (`[server.metrics]`) and the `/_ephpm/*` endpoints answer for
+**every** `Host`. They are matched before `trusted_hosts`, `blocked_paths`, the
+per-site preview gate and all middleware, so none of the layers above can
+restrict them. Two of them carry cross-tenant data:
 
 - `/metrics` (when enabled): every tenant's normalized SQL in the
   `ephpm_query_*{digest}` label (table, column and query shape, never literal
@@ -335,15 +333,21 @@ that can make an HTTP request to its own public URL, can read:
   paths across **all** vhosts, in one buffer with no host field. It is off
   under `ephpm serve` unless you set `[server.diagnostics] request_log = true`.
 
-There is no setting to authenticate these endpoints or move them to a separate
-listener. To keep them private:
+Every tenant's PHP can reach loopback and every port the server listens on, so
+an IP ACL or a private listener address cannot keep a tenant out; only a
+credential can. On a multi-site node both endpoints therefore answer `403`
+until one is configured, and startup logs an ERROR naming the setting:
 
-1. Deny the metrics path and `/_ephpm/` for public traffic at the load balancer
-   or reverse proxy in front of ePHPm, allowing only your probe and scrape
-   sources.
-2. Without a front proxy, firewall `[server] listen` so only trusted networks
-   reach it, or leave `[server.metrics] enabled = false`.
-3. Leave `request_log` unset (off) on shared nodes.
+1. Set `[server.metrics] token` (and `[server.diagnostics] token` if you use
+   the timeline) **in the config file**, not through `EPHPM_SERVER__*__TOKEN`:
+   tenant PHP can read the process environment with `getenv()`.
+2. Or move both endpoints to an mTLS listener with `[server.metrics] listen`,
+   `tls_cert`/`tls_key` and `client_ca`; a verified client certificate counts
+   as the credential.
+3. Leave `request_log` unset (off) on shared nodes unless you need it.
+
+The probes (`/_ephpm/health`, `/ready`, `/primary`) stay open and return only a
+status. See [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
 
 Full details are in [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 

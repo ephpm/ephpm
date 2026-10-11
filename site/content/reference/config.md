@@ -227,7 +227,7 @@ are escaped and cannot inject forged log lines.
 | `token` | string | (none) | Bearer token. When set, a scrape must send `Authorization: Bearer <token>` or get `401`. **Required on a multi-site node** (`sites_dir` set) unless the mTLS listener below is used; without it the endpoint answers `403`. Must not be empty. Env override: `EPHPM_SERVER__METRICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
 | `listen` | string | (none) | Serve the metrics endpoint **and** `/_ephpm/requests` on this separate `IP:port` (e.g. `"127.0.0.1:9100"`) instead of the main listener. When set, the main listener no longer answers either one: the metrics path becomes an ordinary application path there, and `/_ephpm/requests` answers `404` naming this key. Health, readiness and primary probes stay on the main listener. The ACL and token still apply. A bind failure fails startup. |
 | `tls_cert` / `tls_key` | path | (none) | PEM certificate chain and key, which serve the `listen` listener over HTTPS. They must be set together, and both require `listen`. |
-| `client_ca` | path | (none) | PEM CA bundle for **mutual TLS** on the `listen` listener. Every client must present a certificate signed by one of these CAs, or the TLS handshake fails. Requires `tls_cert`/`tls_key`. A verified client certificate counts as the credential a multi-site node requires. |
+| `client_ca` | path | (none) | PEM CA bundle for **mutual TLS** on the `listen` listener. Every client must present a certificate signed by one of these CAs, or the TLS handshake fails. Requires `tls_cert`/`tls_key`. A verified client certificate counts as the credential a multi-site node requires. Any certificate that chains to this bundle is accepted, so use a CA dedicated to scrapers, not one that also signs tenant or cluster certificates. |
 
 ### Access to internal endpoints
 
@@ -306,7 +306,18 @@ the token. How the ACL sees the client:
   Without this rule, a reverse proxy on the same host would connect from
   loopback and launder every internet client behind it. Add the proxy to
   `trusted_proxies` so the real client address is used.
+- From a trusted proxy, the client is read from `X-Forwarded-For` (every
+  header line, in order). If the proxy sends only `X-Real-IP` or `Forwarded`,
+  or the chain has an entry that is not a bare IP address (such as
+  `ip:port`), the client cannot be resolved and the request is refused rather
+  than judged by the proxy's own address.
 - Spoofing these headers can only remove access, never grant it.
+- **A same-host proxy that adds no forwarding header at all** (nginx
+  `proxy_pass` without `proxy_set_header X-Forwarded-For`, HAProxy without
+  `option forwardfor`) is indistinguishable from a local client. If such a
+  proxy fronts ePHPm, do not admit loopback in `allow`; use a token.
+- IPv4-mapped addresses (`::ffff:a.b.c.d`) are matched as IPv4, for the
+  client, for `trusted_proxies`, and for `allow`/`deny` entries.
 
 Address-rewriting NAT, such as Docker's userland proxy, rootless
 Podman/slirp4netns and some load balancers, makes every client look the same to

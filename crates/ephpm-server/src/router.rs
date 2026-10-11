@@ -4750,12 +4750,7 @@ impl Router {
             return (remote_addr, is_tls);
         }
 
-        let real_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|xff| self.resolve_xff(xff))
-            .unwrap_or(remote_addr.ip());
+        let real_ip = self.forwarded_client_ip(req).unwrap_or(remote_addr.ip());
 
         let is_https = req
             .headers()
@@ -4778,13 +4773,46 @@ impl Router {
         mtls_verified: bool,
     ) -> crate::internal_access::Client<'r> {
         let (effective, _) = self.resolve_proxy_info(req, remote_addr, is_tls);
+        let peer_is_trusted_proxy =
+            !self.trusted_proxies.is_empty() && self.is_trusted_proxy(remote_addr.ip());
+        // A trusted proxy that relays a request but whose `X-Forwarded-For`
+        // does not name a client (absent, because it only sent `X-Real-IP` or
+        // `Forwarded`; or unparseable) leaves `effective` as the proxy's own
+        // address. That would launder every client behind it through the
+        // proxy's (often allowlisted) address, so the ACL treats it as an
+        // unknown origin.
+        let forwarded_unresolved = peer_is_trusted_proxy
+            && crate::internal_access::has_forwarding_headers(req.headers())
+            && self.forwarded_client_ip(req).is_none();
         crate::internal_access::Client {
             ip: effective.ip(),
-            peer_is_trusted_proxy: !self.trusted_proxies.is_empty()
-                && self.is_trusted_proxy(remote_addr.ip()),
+            peer_is_trusted_proxy,
+            forwarded_unresolved,
             mtls_verified,
             headers: req.headers(),
         }
+    }
+
+    /// The client address a trusted proxy reports in `X-Forwarded-For`, or
+    /// `None` when there is no such header or its chain cannot be resolved.
+    ///
+    /// Every `X-Forwarded-For` header line is read, in order, as one
+    /// comma-joined list (RFC 7230 §3.2.2). Some proxies (HAProxy
+    /// `option forwardfor`, some Envoy setups) append a new line instead of
+    /// extending the existing one; reading only the first line would hand the
+    /// decision to the client-supplied entry that came in ahead of it.
+    fn forwarded_client_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
+        let mut lines = req.headers().get_all("x-forwarded-for").iter();
+        let first = lines.next()?.to_str().ok()?;
+        let Some(second) = lines.next() else {
+            return self.resolve_xff(first);
+        };
+        let mut joined = String::from(first);
+        for line in std::iter::once(second).chain(lines) {
+            joined.push(',');
+            joined.push_str(line.to_str().ok()?);
+        }
+        self.resolve_xff(&joined)
     }
 
     /// Lift the multi-site credential requirement for `ephpm dev`.
@@ -5387,22 +5415,29 @@ impl Router {
 
     /// Check if an IP address matches any trusted proxy CIDR.
     fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        // An IPv4 peer on a dual-stack listener arrives as `::ffff:a.b.c.d`;
+        // match it against IPv4 `trusted_proxies` entries.
+        let ip = ip.to_canonical();
         self.trusted_proxies.iter().any(|net| net.contains(&ip))
     }
 
     /// Walk X-Forwarded-For from right to left, return the first untrusted IP.
     ///
+    /// An entry that does not parse as an IP address stops the walk with
+    /// `None`: everything to its left was supplied by someone the trusted hops
+    /// do not vouch for, so skipping past it would let the client pick its own
+    /// address.
+    ///
     /// Uses `rsplit` to scan right-to-left in place — no `Vec` allocation for
     /// the (typically 1-3 element) proxy chain on this per-request path.
     fn resolve_xff(&self, xff: &str) -> Option<IpAddr> {
         for ip_str in xff.rsplit(',') {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>()
-                && !self.is_trusted_proxy(ip)
-            {
+            let ip = ip_str.trim().parse::<IpAddr>().ok()?;
+            if !self.is_trusted_proxy(ip) {
                 return Some(ip);
             }
         }
-        // All IPs in the chain are trusted (or unparseable) — use the leftmost.
+        // All IPs in the chain are trusted — use the leftmost.
         xff.split(',').next().and_then(|s| s.trim().parse().ok())
     }
 }
@@ -8880,6 +8915,55 @@ mod tests {
         let (status, _) =
             probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "10.1.1.1")]).await;
         assert_eq!(status, StatusCode::OK, "allowed client behind a trusted proxy");
+
+        // A proxy that appends its own `X-Forwarded-For` line (HAProxy
+        // `option forwardfor`) after the client's spoofed one: every line is
+        // read in order, so the proxy-appended real client decides.
+        let (status, _) = probe_from(
+            &router,
+            "/metrics",
+            "127.0.0.1",
+            &[("x-forwarded-for", "10.0.0.1"), ("x-forwarded-for", "198.51.100.4")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a spoofed first XFF line must not decide");
+    }
+
+    /// Under an ACL that admits the trusted proxy's own address, a relayed
+    /// request whose client cannot be resolved from `X-Forwarded-For` must
+    /// not fall back to that address.
+    #[tokio::test]
+    async fn metrics_acl_refuses_unresolvable_forwarding_from_a_trusted_proxy() {
+        let (_dir, router) = access_router(|c| {
+            c.server.security.get_or_insert_default().trusted_proxies =
+                vec!["127.0.0.1/32".to_string()];
+            c.server.metrics.allow = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+        });
+        let (status, _) = probe_from(&router, "/metrics", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::OK, "control: the proxy host itself, not relaying");
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "10.1.1.1")]).await;
+        assert_eq!(status, StatusCode::OK, "control: resolvable allowed client");
+
+        // A trusted proxy that names the client only in `X-Real-IP` or
+        // `Forwarded` (which ePHPm does not resolve) would otherwise leave the
+        // proxy's own address to decide: unknown origin, refused.
+        for name in ["x-real-ip", "forwarded"] {
+            let (status, _) =
+                probe_from(&router, "/metrics", "127.0.0.1", &[(name, "198.51.100.4")]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name} from a trusted proxy");
+        }
+
+        // An unparseable rightmost entry (`ip:port`) stops the walk instead of
+        // skipping to the client-supplied entries on its left.
+        let (status, _) = probe_from(
+            &router,
+            "/metrics",
+            "127.0.0.1",
+            &[("x-forwarded-for", "10.0.0.1, 198.51.100.4:5678")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "unparseable XFF entry");
     }
 
     #[tokio::test]
@@ -11470,6 +11554,14 @@ echo "post response";
         }
     }
 
+    /// Wire an in-memory KV store into the middleware host table, as `serve()`
+    /// always does. First call in the test binary wins; every test shares it.
+    fn wire_middleware_kv() {
+        ephpm_middleware::host::set_kv_store(&ephpm_kv::store::Store::new(
+            ephpm_kv::store::StoreConfig::default(),
+        ));
+    }
+
     /// Issue #487, end to end through the real router: a `[preview_auth]`
     /// override gates a preview on BOTH the static-file path and the PHP path,
     /// fail-closed, and a credential is bound to its own site.
@@ -11498,6 +11590,9 @@ echo "post response";
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let token =
             |site: &str| mint_share_token(SECRET.as_bytes(), site, "jti-1", now, now + 3600);
+        // Share-token revocation reads KV and fails closed when it cannot;
+        // `serve()` always wires a store, so the fixture must too.
+        wire_middleware_kv();
 
         let f = fleet();
         // Gated preview: a static asset and a PHP entrypoint.
@@ -11822,6 +11917,7 @@ echo "post response";
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let tok =
             mint_share_token(SECRET.as_bytes(), "pr-9.preview.test", "jti-ws", now, now + 3600);
+        wire_middleware_kv();
 
         let f = fleet();
         f.site("pr-9.preview.test", &[]); // no websocket entrypoint on disk

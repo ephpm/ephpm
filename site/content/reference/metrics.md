@@ -128,13 +128,14 @@ When `enabled = false`, no Prometheus recorder is installed, so every `metrics` 
 
 Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and exported through [`metrics_exporter_prometheus`](https://docs.rs/metrics-exporter-prometheus/). The scrape is `text/plain; version=0.0.4`. No metric registers a description, so the output has `# TYPE` lines but no `# HELP` lines.
 
-> **The endpoint is unauthenticated and not tenant-scoped.** It is served for
-> `GET` on every listener and for every `Host`, ahead of `trusted_hosts`,
-> `blocked_paths` and all middleware, and there is no option to move it to a
-> separate port. On a multi-tenant node it exposes every tenant's normalized SQL
-> (`digest`), vhost names and DB upstream addresses to anyone who can reach any
-> tenant's domain. Block the path at your edge proxy or firewall the listener.
-> See [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
+> **The endpoint is not tenant-scoped.** It is served for `GET` for every
+> `Host`, ahead of `trusted_hosts`, `blocked_paths` and all middleware, and it
+> carries every tenant's normalized SQL (`digest`), vhost names and DB upstream
+> addresses. On a single-site node it is open by default; restrict it with
+> `[server.metrics] allow`/`deny`, a `token`, or a separate `listen` address.
+> On a multi-site node it answers `403` until a `token` or an mTLS `listen` is
+> configured. See [access to internal endpoints](/reference/config/#access-to-internal-endpoints)
+> and [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ## Build info
 

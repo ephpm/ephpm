@@ -399,7 +399,9 @@ Level controlled by `server.response.compression_level` (1=fast, 9=best).
 
 Evaluated in order for every request. This is a subset of the full pipeline:
 the metrics path and `/_ephpm/*` are answered right after path decoding and
-skip every layer from `trusted_hosts` on (they are unauthenticated), and
+skip every layer from `trusted_hosts` on (the metrics path and
+`/_ephpm/requests` carry their own ACL/token check instead, see
+[access to internal endpoints](/reference/config/#access-to-internal-endpoints)), and
 `trusted_hosts` (421) and the malformed-Host gate (404) run between those
 endpoints and the hidden-file check. The reverse proxy, site-override `503`,
 `/_ephpm/auth/*`, WebSocket upgrade and middleware come after `blocked_paths`.

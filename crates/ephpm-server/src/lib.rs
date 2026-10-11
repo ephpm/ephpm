@@ -1998,7 +1998,10 @@ fn warn_internal_access_exposure(
         "EPHPM_SERVER__{}__TOKEN",
         section.trim_start_matches("[server.").trim_end_matches(']').to_ascii_uppercase()
     );
-    if multi_site && policy.has_token() && std::env::var_os(&env_key).is_some() {
+    // figment matches the `EPHPM_` env names case-insensitively, so do the same.
+    let token_from_env = std::env::vars_os()
+        .any(|(k, _)| k.to_str().is_some_and(|k| k.eq_ignore_ascii_case(&env_key)));
+    if multi_site && policy.has_token() && token_from_env {
         tracing::warn!(
             endpoint,
             "{section} token comes from {env_key}: tenant PHP shares the process environment \
@@ -2018,7 +2021,23 @@ fn warn_internal_access_exposure(
         );
         return;
     }
-    let loopback_only = separate.is_some_and(|a| a.ip().is_loopback());
+    // Not network-exposed: a separate listener on loopback, or (with no
+    // separate listener) every main listener — plain, TLS, HTTP/3 — bound to
+    // loopback, as under `ephpm dev`.
+    let is_loopback = |s: &str| s.parse::<SocketAddr>().is_ok_and(|a| a.ip().is_loopback());
+    let loopback_only = match separate {
+        Some(a) => a.ip().is_loopback(),
+        None => {
+            is_loopback(&config.server.listen)
+                && config
+                    .server
+                    .tls
+                    .as_ref()
+                    .and_then(|t| t.listen.as_deref())
+                    .is_none_or(is_loopback)
+                && config.server.http3.listen.as_deref().is_none_or(is_loopback)
+        }
+    };
     if policy.admits_public() && !loopback_only {
         tracing::warn!(
             endpoint,

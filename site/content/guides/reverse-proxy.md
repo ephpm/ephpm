@@ -102,6 +102,12 @@ or a cloud load balancer. The ACL is `[server.metrics]` or
   real origin is unknown. Without this rule, a proxy on the same host would
   connect from `127.0.0.1` and pass a loopback-only ACL for every internet
   client behind it.
+- **The trusted proxy must send `X-Forwarded-For`.** A trusted proxy that
+  names the client only in `X-Real-IP` or `Forwarded`, or whose chain has an
+  entry that is not a bare IP address, is refused under an ACL: the client
+  cannot be resolved.
+- **A same-host proxy that sends no forwarding header** looks like a local
+  client. If one fronts ePHPm, do not admit loopback in `allow`; use a token.
 - **To scrape through a proxy, list the proxy in `trusted_proxies`.** The ACL
   then sees the real client address:
 

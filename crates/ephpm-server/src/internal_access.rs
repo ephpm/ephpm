@@ -48,7 +48,11 @@
 //!    `X-Forwarded-For`, `X-Real-IP`) from a peer that is **not** a trusted
 //!    proxy has an unknown origin — typically a same-host reverse proxy whose
 //!    loopback address would otherwise launder every internet client behind
-//!    it — and is refused. Spoofing those headers can only remove access.
+//!    it — and is refused. Spoofing those headers can only remove access. A
+//!    trusted proxy whose `X-Forwarded-For` names no resolvable client is
+//!    refused the same way (`Client::forwarded_unresolved`). A same-host proxy
+//!    that sends no forwarding header at all is indistinguishable from a local
+//!    client; only a token covers that case.
 //! 3. Bearer token, when set (`401` otherwise; constant-time compare).
 //!
 //! Invalid ACL entries are a startup error (`Config::validate`); if one
@@ -104,6 +108,11 @@ pub struct Client<'a> {
     pub ip: IpAddr,
     /// Whether the TCP peer is a configured trusted proxy.
     pub peer_is_trusted_proxy: bool,
+    /// A trusted proxy relayed the request but its `X-Forwarded-For` names no
+    /// resolvable client (it sent only `Forwarded`/`X-Real-IP`, or the chain
+    /// has an unparseable entry), so `ip` is the proxy's own address. Under an
+    /// ACL that is an unknown origin and is refused.
+    pub forwarded_unresolved: bool,
     /// Whether the connection presented a client certificate the mTLS
     /// metrics listener verified against `client_ca`.
     pub mtls_verified: bool,
@@ -112,7 +121,7 @@ pub struct Client<'a> {
 }
 
 /// A resolved access policy for one endpoint family.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InternalAccess {
     /// Config section named in denial messages, e.g. `"[server.metrics]"`.
     section: &'static str,
@@ -124,6 +133,20 @@ pub struct InternalAccess {
     /// Multi-site: a credential (token, or a verified client certificate) is
     /// mandatory.
     require_credential: bool,
+}
+
+/// Redacts the token, like the config structs it is built from.
+impl std::fmt::Debug for InternalAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalAccess")
+            .field("section", &self.section)
+            .field("allow", &self.allow)
+            .field("deny", &self.deny)
+            .field("deny_all", &self.deny_all)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("require_credential", &self.require_credential)
+            .finish()
+    }
 }
 
 impl InternalAccess {
@@ -202,9 +225,10 @@ impl InternalAccess {
         if self.deny_all {
             return false;
         }
-        if !client.peer_is_trusted_proxy
-            && FORWARDING_HEADERS.iter().any(|h| client.headers.contains_key(*h))
-        {
+        if !client.peer_is_trusted_proxy && has_forwarding_headers(client.headers) {
+            return false;
+        }
+        if client.forwarded_unresolved {
             return false;
         }
         let ip = client.ip.to_canonical();
@@ -285,12 +309,36 @@ impl InternalAccess {
     }
 }
 
+/// Whether `headers` carry any marker of a relayed request (`Forwarded`,
+/// `X-Forwarded-For`, `X-Real-IP`; any case, any number of instances, empty
+/// values included).
+#[must_use]
+pub fn has_forwarding_headers(headers: &HeaderMap<HeaderValue>) -> bool {
+    FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
 /// Parse an ACL entry: a CIDR (`10.0.0.0/8`) or a bare address (`192.0.2.7`,
 /// meaning a single host).
+///
+/// An IPv4-mapped IPv6 entry (`::ffff:203.0.113.0/120`) is normalized to the
+/// IPv4 net it denotes (`203.0.113.0/24`), because client addresses are
+/// matched in canonical (IPv4) form; left as IPv6 it would never match, which
+/// silently disables a `deny` rule. A mapped entry shorter than `/96` spans
+/// more than the mapped range and is rejected.
 #[must_use]
 pub fn parse_net(s: &str) -> Option<IpNet> {
     let s = s.trim();
-    s.parse::<IpNet>().ok().or_else(|| s.parse::<IpAddr>().ok().map(IpNet::from))
+    let net = s.parse::<IpNet>().ok().or_else(|| s.parse::<IpAddr>().ok().map(IpNet::from))?;
+    match net {
+        IpNet::V6(v6) => match v6.addr().to_ipv4_mapped() {
+            Some(v4) => {
+                let len = v6.prefix_len().checked_sub(96)?;
+                ipnet::Ipv4Net::new(v4, len).ok().map(|n| IpNet::V4(n.trunc()))
+            }
+            None => Some(net),
+        },
+        IpNet::V4(_) => Some(net),
+    }
 }
 
 /// Extract the token from an `Authorization: Bearer <token>` value. The scheme
@@ -301,12 +349,11 @@ fn bearer_token(value: &str) -> Option<&str> {
 }
 
 /// Length-leaking but content-constant-time comparison. The length of a
-/// bearer token is not the secret; its bytes are.
+/// bearer token is not the secret; its bytes are. `subtle` keeps the
+/// optimizer from turning the comparison into an early exit.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use subtle::ConstantTimeEq as _;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]
@@ -317,6 +364,7 @@ mod tests {
         Client {
             ip: ip.parse().unwrap(),
             peer_is_trusted_proxy: false,
+            forwarded_unresolved: false,
             mtls_verified: false,
             headers,
         }
@@ -391,10 +439,40 @@ mod tests {
         let trusted = Client {
             ip: "127.0.0.7".parse().unwrap(),
             peer_is_trusted_proxy: true,
+            forwarded_unresolved: false,
             mtls_verified: false,
             headers: &h,
         };
         assert_eq!(p.check(&trusted), Verdict::Allow);
+
+        // A trusted proxy whose forwarding headers name no resolvable client
+        // leaves `ip` as the proxy's own (allowlisted) address: refused.
+        let unresolved = Client { forwarded_unresolved: true, ..trusted };
+        assert_eq!(p.check(&unresolved), Verdict::Forbidden);
+        // Without an ACL nothing changes (the default-open guarantee).
+        assert_eq!(policy(&[], &[], None).check(&unresolved), Verdict::Allow);
+    }
+
+    /// An IPv4-mapped entry denotes the IPv4 net and matches IPv4 clients;
+    /// left as IPv6 it would never match, silently disabling a `deny`.
+    #[test]
+    fn ipv4_mapped_acl_entries_match_as_ipv4() {
+        assert_eq!(parse_net("::ffff:203.0.113.0/120"), parse_net("203.0.113.0/24"));
+        assert_eq!(parse_net("::ffff:203.0.113.9"), parse_net("203.0.113.9/32"));
+        assert_eq!(parse_net("::ffff:0.0.0.0/64"), None, "wider than the mapped range");
+        let d = policy(&[], &["::ffff:203.0.113.0/120"], None);
+        let h = HeaderMap::new();
+        assert_eq!(d.check(&client("203.0.113.9", &h)), Verdict::Forbidden);
+        assert_eq!(d.check(&client("::ffff:203.0.113.9", &h)), Verdict::Forbidden);
+        assert_eq!(d.check(&client("198.51.100.1", &h)), Verdict::Allow);
+    }
+
+    #[test]
+    fn debug_redacts_the_token() {
+        let p = policy(&[], &[], Some("s3cret-token"));
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("s3cret"), "{dbg}");
+        assert!(dbg.contains("redacted"), "{dbg}");
     }
 
     #[test]

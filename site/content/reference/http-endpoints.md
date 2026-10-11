@@ -9,8 +9,8 @@ which response headers it adds or changes.
 
 ## Exposure: read this first
 
-> **The metrics path and every `/_ephpm/*` endpoint are unauthenticated, and
-> they are served on every listener and for every `Host`.**
+> **The metrics path and every `/_ephpm/*` endpoint are served for every
+> `Host`, ahead of the usual request gates.**
 >
 > - They are matched **before** `trusted_hosts`, the malformed-Host gate,
 >   `hidden_files`, `blocked_paths`, the built-in reverse proxy, the per-site
@@ -18,11 +18,16 @@ which response headers it adds or changes.
 >   or protect them. (The per-IP rate limit and the accept-time connection
 >   limits do still apply.)
 > - They answer on the plain listener, the TLS listener and HTTP/3, and for any
->   `Host` header, including a vhost name. On a multi-tenant node,
->   `https://any-tenant.example/metrics` returns the whole process's metrics.
-> - There is **no** option to bind them to a separate port or address, and no
->   option to require a token. `[server.metrics] enabled` and
->   `[server.diagnostics] request_log` are the only switches.
+>   `Host` header, including a vhost name.
+> - The two data-bearing ones, the metrics path and `/_ephpm/requests`, have
+>   their own access control: an IP `allow`/`deny` ACL, a bearer `token`, and
+>   (metrics, plus the timeline) a separate `[server.metrics] listen` address
+>   with optional mTLS. The ACL is **open by default**, so on a single-site node
+>   with no access config they are readable by anyone who reaches the listener.
+>   On a **multi-site** node (`[server] sites_dir`) they answer `403` until a
+>   token or an mTLS listener is configured. See
+>   [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
+> - The probes (`/_ephpm/health`, `/ready`, `/primary`) are always open.
 >
 > What a reader learns:
 >
@@ -30,24 +35,26 @@ which response headers it adds or changes.
 > |---|---|
 > | metrics path (when `[server.metrics] enabled = true`) | Every tenant's normalized SQL (`ephpm_query_*{digest}`: table, column and query shape, no literal values), vhost names (`ephpm_opcache_invalidations_total{vhost}`), DB proxy upstream `host:port` (`ephpm_db_proxy_*{upstream}`), middleware module names, request and error rates, the binary version (`ephpm_build_info`). |
 > | `/_ephpm/requests` (when the request timeline is on) | The last 256 request **paths** (no query string, no headers) with method, status and timings, from **every** vhost in one process-wide buffer with no host field. On by default under `ephpm dev` and bare `ephpm`; off under `ephpm serve`. |
-> | `/_ephpm/health`, `/ready`, `/primary` | Liveness, readiness (while a DB proxy has never connected, the 503 body names its listen address and upstream `host:port`), and whether this node is the writable clustered-SQLite primary. |
+> | `/_ephpm/health`, `/ready`, `/primary` | Liveness, readiness, and whether this node is the writable clustered-SQLite primary. While a DB proxy has never connected, the `/ready` 503 body names its listen address and upstream `host:port`, but only to clients the `[server.diagnostics]` IP ACL admits (everyone by default); others see only the proxy kind. |
 >
-> **Hardening, using controls that exist today:**
+> **Hardening:**
 >
-> 1. **Block the paths at the edge.** If a load balancer or reverse proxy fronts
->    ePHPm, deny the metrics path and `/_ephpm/` there for public traffic, and
->    let only your probe and scrape sources through (for example by source
->    address). This is the only way to keep them off the public listener and
->    still use them.
-> 2. **Firewall the listener.** When nothing fronts ePHPm, the endpoints are
->    reachable by anyone who can reach `[server] listen`. Restrict that port
->    with a host or cloud firewall, or scrape over a private network the public
->    cannot route to.
-> 3. **Turn off what you do not use.** Leave `[server.metrics] enabled = false`
+> 1. **Require a credential.** Set `[server.metrics] token` and
+>    `[server.diagnostics] token`, or serve both endpoints on an mTLS
+>    `[server.metrics] listen` with `client_ca`. On a multi-site node this is
+>    mandatory, because tenant PHP can reach every address the scraper can.
+> 2. **Move them off the public port.** `[server.metrics] listen = "10.0.0.5:9100"`
+>    (or a loopback address) serves the metrics path and `/_ephpm/requests`
+>    only there.
+> 3. **Restrict by address.** `allow`/`deny` on `[server.metrics]` and
+>    `[server.diagnostics]`. Behind a reverse proxy, list it in
+>    `[server.security] trusted_proxies`; with an ACL set, forwarded requests
+>    from an untrusted peer are refused.
+> 4. **Turn off what you do not use.** Leave `[server.metrics] enabled = false`
 >    (the default) if nothing scrapes it, and do not set
 >    `[server.diagnostics] request_log = true` under `ephpm serve` on a shared
 >    or public node.
-> 4. **Do not rely on an obscure `path`.** `[server.metrics] path` changes where
+> 5. **Do not rely on an obscure `path`.** `[server.metrics] path` changes where
 >    metrics are served, not who can read them.
 >
 > Probes and scrapes are exempt from `trusted_hosts` on purpose: Kubernetes and
@@ -59,11 +66,11 @@ which response headers it adds or changes.
 
 | Path | Method | Answer | `handler` metric label |
 |---|---|---|---|
-| `[server.metrics] path` (default `/metrics`) | `GET` only | Prometheus text format, `text/plain; version=0.0.4`. Only when `[server.metrics] enabled = true`. Any other method, or metrics disabled, falls through to normal routing, so your application answers it. There is no `405` here, unlike `/_ephpm/*`. | `metrics` |
+| `[server.metrics] path` (default `/metrics`) | `GET` only | Prometheus text format, `text/plain; version=0.0.4`. Only when `[server.metrics] enabled = true`, and only on the main listener when `[server.metrics] listen` is unset. Any other method, metrics disabled, or a separate `listen` set, falls through to normal routing, so your application answers it. There is no `405` here, unlike `/_ephpm/*`. `401`/`403` per the [access policy](/reference/config/#access-to-internal-endpoints). | `metrics` |
 | `/_ephpm/health` | `GET` | `200 {"status":"ok"}`. Liveness. | `health` |
 | `/_ephpm/ready` | `GET` | `200 {"status":"ready"}`, or `503 {"status":"not_ready","reason":"..."}` until PHP is initialized, at least one worker has booted (worker mode), and every configured DB proxy has connected to its upstream once. | `health` |
 | `/_ephpm/primary` | `GET` | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a single-database clustered-SQLite replica. | `health` |
-| `/_ephpm/requests` | `GET` | The request timeline as JSON, newest first, when `[server.diagnostics] request_log` is on. Otherwise `404` naming the knob. | `diagnostics` |
+| `/_ephpm/requests` | `GET` | The request timeline as JSON, newest first, when `[server.diagnostics] request_log` is on. Otherwise `404` naming the knob. `401`/`403` per the `[server.diagnostics]` [access policy](/reference/config/#access-to-internal-endpoints); `404` naming `[server.metrics] listen` when that moves it to the metrics listener. | `diagnostics` |
 | `/_ephpm`, any other `/_ephpm/...` | `GET` | `404`, listing the four endpoints above. | `error` |
 | any `/_ephpm/...` above | not `GET` | `405` with `Allow: GET`. `HEAD` is refused too. | `error` |
 | `/_ephpm/auth/...` | any | **Not** answered by the server directly. Dispatched to the global `[[middleware]]` request-phase chain (the `github-auth` issuer's login and callback), *after* `trusted_hosts`, the malformed-Host gate, the hidden-file, manifest and blocked-path gates, and vhost resolution. `404` when no mounted module claims the path. The per-site preview gate does not run here. | `auth` |
@@ -102,7 +109,9 @@ Each request is checked in this order. The first step that answers ends it.
    everything below. On expiry the answer is `504`.
 6. **Path decoding.** Malformed escapes, encoded or literal `/`/`\` tricks,
    `..` segments and invalid UTF-8 are `400`.
-7. **Metrics path**, then **`/_ephpm/*`**, as in the table above.
+7. **Metrics path**, then **`/_ephpm/*`**, as in the table above. The metrics
+   path and `/_ephpm/requests` apply their own credential, IP ACL and token
+   checks here (`403`/`401`).
 8. **`trusted_hosts`** (`[server.request]`). `421` when the `Host` matches no
    entry. Compared case-insensitively, with and without the port, but **not**
    with a trailing dot stripped: `example.com.` gets a `421` even when
@@ -130,7 +139,7 @@ Each request is checked in this order. The first step that answers ends it.
 | Header | Used for |
 |---|---|
 | `Host` (or HTTP/2 and HTTP/3 `:authority` when `Host` is absent) | `trusted_hosts`, vhost resolution (port and trailing dot stripped, lowercased, `sites_domain_suffix` removed), `$_SERVER['SERVER_NAME']`, the `redirect_http` `Location`. |
-| `X-Forwarded-For` | Client IP (`REMOTE_ADDR`, per-IP rate limit, access log), **only** when the TCP peer is inside `[server.security] trusted_proxies`. Walked right to left; the first address that is not a trusted proxy wins. If every address is trusted, the leftmost is used. |
+| `X-Forwarded-For` | Client IP (`REMOTE_ADDR`, per-IP rate limit, access log), **only** when the TCP peer is inside `[server.security] trusted_proxies`. Every `X-Forwarded-For` line is read, in order, as one list, walked right to left; the first address that is not a trusted proxy wins. If every address is trusted, the leftmost is used. An entry that is not a bare IP address (for example `ip:port`) stops the walk, and the TCP peer is used instead. IPv4-mapped peers match IPv4 `trusted_proxies` entries. |
 | `X-Forwarded-Proto` | `$_SERVER['HTTPS']`, only from a trusted proxy. When present, it **replaces** the connection's own TLS status: any value other than `https` turns `HTTPS` off, even on a native TLS connection. When absent, the connection's TLS status stands. |
 | `Accept-Encoding` | Brotli is chosen when the client accepts `br`, else gzip, else identity. |
 | `If-None-Match` | Static-file `304`s, and the PHP ETag cache. |
@@ -161,8 +170,11 @@ ePHPm:
   listener turns `HTTPS` off.
 - **Pass the original `Host` through.** ePHPm does not read
   `X-Forwarded-Host`.
-- **Block the metrics path and `/_ephpm/` at the proxy** for public traffic
-  (see [Exposure](#exposure-read-this-first)).
+- **Block the metrics path and `/_ephpm/requests` at the proxy** for public
+  traffic, or protect them with a token (see
+  [Exposure](#exposure-read-this-first)). If you set an `allow`/`deny` ACL on
+  them, the proxy must be in `trusted_proxies`: a forwarded request from an
+  untrusted peer is refused.
 
 The built-in `[[server.proxy]]` is the opposite direction (ePHPm proxying to a
 backend); see [Reverse Proxy](/guides/reverse-proxy/).

@@ -1768,10 +1768,24 @@ fn validate_internal_access(
     for (key, list) in [("allow", allow), ("deny", deny)] {
         for entry in list {
             let e = entry.trim();
-            let ok = e.parse::<ipnet::IpNet>().is_ok() || e.parse::<std::net::IpAddr>().is_ok();
-            if !ok {
+            let net = e
+                .parse::<ipnet::IpNet>()
+                .ok()
+                .or_else(|| e.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from));
+            let Some(net) = net else {
                 return Err(ConfigError::Validation(format!(
                     "{section} {key}: {entry:?} is not a CIDR (e.g. \"10.0.0.0/8\") or IP address"
+                )));
+            };
+            // An IPv4-mapped entry is matched as the IPv4 net it denotes, which
+            // only exists for a prefix of at least /96.
+            if let ipnet::IpNet::V6(v6) = net
+                && v6.addr().to_ipv4_mapped().is_some()
+                && v6.prefix_len() < 96
+            {
+                return Err(ConfigError::Validation(format!(
+                    "{section} {key}: {entry:?} is an IPv4-mapped range wider than /96; write \
+                     the IPv4 CIDR instead"
                 )));
             }
         }
@@ -7682,6 +7696,11 @@ idle_timeout_secs = 15
         expect_err("[server.metrics]\nallow = [\"10.0.0.0/33\"]\n", "[server.metrics] allow");
         expect_err("[server.metrics]\ndeny = [\"nope\"]\n", "[server.metrics] deny");
         expect_err("[server.diagnostics]\nallow = [\"localhost\"]\n", "[server.diagnostics] allow");
+        expect_err("[server.metrics]\ndeny = [\"::ffff:0.0.0.0/64\"]\n", "wider than /96");
+        assert!(
+            load("[server.metrics]\ndeny = [\"::ffff:203.0.113.0/120\"]\n").validate().is_ok(),
+            "a mapped range within /96 is accepted (matched as 203.0.113.0/24)"
+        );
         expect_err("[server.metrics]\ntoken = \"  \"\n", "token");
         expect_err("[server.metrics]\nlisten = \"not-an-addr\"\n", "listen");
         expect_err("[server.metrics]\ntls_cert = \"/c\"\ntls_key = \"/k\"\n", "set listen too");
