@@ -8,8 +8,10 @@ This page covers the design and the core families only. The
 it also covers HTTP/3, WebSockets, the FPM and worker pools, middleware,
 OPcache, the JIT, the DB proxy, the reverse proxy and CDC replication.
 
-The endpoint is unauthenticated and answers on every listener for every
-`Host`; see [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
+The endpoint answers for every `Host`, ahead of `trusted_hosts` and
+middleware. It is open by default on a single-site node and needs a token or
+mTLS on a multi-site node; see
+[HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
 
 ---
 
@@ -20,6 +22,12 @@ The endpoint is unauthenticated and answers on every listener for every
 enabled = true
 path = "/metrics"     # default
 ```
+
+Access control (IP ACL, bearer token, separate mTLS listener, and the token
+requirement on multi-site nodes) is described under
+[access to internal endpoints](/reference/config/#access-to-internal-endpoints);
+Prometheus scrape configs are in
+[Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
 
 Or via environment variables:
 

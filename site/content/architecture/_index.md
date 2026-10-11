@@ -226,7 +226,7 @@ The admin instance and Node API in this diagram are planned, not implemented (se
 > `ephpm-config` — writing them into `ephpm.toml` does nothing at all.
 > **In particular, do not read the "Authentication" paragraph below as a
 > security control that exists.** The only endpoints ePHPm actually serves
-> beyond your application are `/metrics` (opt-in, read-only, unauthenticated),
+> beyond your application are `/metrics` (opt-in, read-only; optional IP ACL, separate mTLS listener and bearer token — a token or mTLS is required on multi-site nodes),
 > `/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/primary`, and `/_ephpm/requests`. See
 > [Security → Secrets](/architecture/security/), which correctly states that
 > ePHPm exposes no admin interface.

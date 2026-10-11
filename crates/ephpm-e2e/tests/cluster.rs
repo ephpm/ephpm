@@ -173,6 +173,7 @@ async fn cluster_nodes_discover_each_other() {
         for (i, url) in urls.iter().enumerate() {
             let resp = client
                 .get(format!("{url}/metrics"))
+                .bearer_auth(ephpm_e2e::E2E_METRICS_TOKEN)
                 .send()
                 .await
                 .unwrap_or_else(|e| panic!("GET /metrics on node {i} failed: {e}"));
@@ -338,6 +339,7 @@ async fn cluster_metrics_on_all_nodes() {
     for (i, url) in urls.iter().enumerate() {
         let resp = client
             .get(format!("{url}/metrics"))
+                .bearer_auth(ephpm_e2e::E2E_METRICS_TOKEN)
             .send()
             .await
             .unwrap_or_else(|e| panic!("GET /metrics on node {i} failed: {e}"));

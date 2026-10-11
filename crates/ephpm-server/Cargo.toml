@@ -65,6 +65,9 @@ sha2.workspace = true
 # (src/dns01_route53.rs). Already a workspace dep (RustCrypto, MIT/Apache) — a
 # new edge, not a new crate in the lock.
 hmac.workspace = true
+# subtle: constant-time bearer-token comparison for the internal endpoints
+# (src/internal_access.rs). Already in the lock via hmac.
+subtle.workspace = true
 # aws-lc-rs: RS256 signing of the OAuth2 JWT assertion for the Google Cloud DNS
 # provider (src/dns01_google.rs). Already the workspace's single rustls crypto
 # provider (#241) — a new edge, keeps `ring` out of the tree.

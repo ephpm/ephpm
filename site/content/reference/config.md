@@ -222,13 +222,121 @@ are escaped and cannot inject forged log lines.
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the Prometheus `/metrics` endpoint. |
 | `path` | string | `"/metrics"` | URL path for the metrics endpoint (`GET` only). |
+| `allow` | array of strings | `[]` (allow all) | IP ACL allowlist: client addresses (CIDR, or a bare IP for one host) allowed to read the metrics endpoint. Empty allows every address. Clients outside the list get `403`. An invalid entry fails startup. Limits network exposure only. See [access to internal endpoints](#access-to-internal-endpoints). |
+| `deny` | array of strings | `[]` | IP ACL denylist (CIDR or bare IP). A match gets `403`, even when `allow` also matches: deny wins. An invalid entry fails startup. |
+| `token` | string | (none) | Bearer token. When set, a scrape must send `Authorization: Bearer <token>` or get `401`. **Required on a multi-site node** (`sites_dir` set) unless the mTLS listener below is used; without it the endpoint answers `403`. Must not be empty. Env override: `EPHPM_SERVER__METRICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
+| `listen` | string | (none) | Serve the metrics endpoint **and** `/_ephpm/requests` on this separate `IP:port` (e.g. `"127.0.0.1:9100"`) instead of the main listener. When set, the main listener no longer answers either one: the metrics path becomes an ordinary application path there, and `/_ephpm/requests` answers `404` naming this key. Health, readiness and primary probes stay on the main listener. The ACL and token still apply. A bind failure fails startup. |
+| `tls_cert` / `tls_key` | path | (none) | PEM certificate chain and key, which serve the `listen` listener over HTTPS. They must be set together, and both require `listen`. |
+| `client_ca` | path | (none) | PEM CA bundle for **mutual TLS** on the `listen` listener. Every client must present a certificate signed by one of these CAs, or the TLS handshake fails. Requires `tls_cert`/`tls_key`. A verified client certificate counts as the credential a multi-site node requires. Any certificate that chains to this bundle is accepted, so use a CA dedicated to scrapers, not one that also signs tenant or cluster certificates. |
 
-> **Unauthenticated, on every listener and vhost.** The metrics path is served
-> before `trusted_hosts`, `blocked_paths` and middleware, and there is no
-> option to bind it to a separate port. On a multi-tenant node it exposes every
-> tenant's normalized SQL, vhost names and DB upstream addresses. Restrict it at
-> an upstream proxy or with a firewall. See
-> [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
+### Access to internal endpoints
+
+> **Upgrading: multi-site nodes need a token.** Before this change, `/metrics`
+> and `/_ephpm/requests` were served to any client. After upgrading, a
+> multi-site node (`[server] sites_dir` set) answers both with `403` until a
+> credential is configured. Startup logs an ERROR naming the setting. To restore
+> scraping:
+>
+> 1. Set `[server.metrics] token` (and `[server.diagnostics] token` if you read
+>    the request timeline).
+> 2. Send it from Prometheus. See
+>    [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
+>
+> An mTLS `[server.metrics] listen` also works instead of a token.
+> Single-site nodes are unaffected: the IP ACL defaults to open and no token
+> is required.
+
+`/metrics` and `/_ephpm/*` are answered **before** `trusted_hosts`,
+`blocked_paths`, site resolution and middleware, because Kubernetes probes and
+Prometheus scrapes address a pod by IP. Two of them carry data that should not
+be public:
+
+- **`/metrics`** includes every tenant's normalized SQL digests, vhost names,
+  and DB-proxy upstream `host:port` labels.
+- **`/_ephpm/requests`** is one process-wide list of recent request paths
+  across every vhost.
+
+They face two different threats, and each threat needs a different control.
+
+**Network exposure: someone on the internet reaching the port.** Two settings
+address this:
+
+- **IP ACL** (`allow` / `deny`): a makeshift firewall.
+- **Separate listener** (`[server.metrics] listen`, optionally with TLS and
+  mTLS): moves the endpoints off the public port. This follows the pattern of
+  Caddy's admin API on `localhost:2019`, Envoy's admin listener and Traefik's
+  metrics entrypoint.
+
+The ACL is **open by default**, so an upgrade with no config change serves
+exactly what it served before. ePHPm logs a startup warning when an endpoint is
+readable from public addresses with no token or mTLS. A separate listener bound
+to loopback does not trigger the warning.
+
+**Tenant isolation: one tenant reading another's data on a multi-site node.**
+Every tenant's PHP runs on the node. It can reach loopback, every internal
+port, and every unix socket the server listens on. Anywhere the scraper can
+connect, a tenant can connect too. No IP ACL and no listener address can tell
+them apart; only a **credential** can:
+
+- the bearer `token`, or
+- a client certificate verified by an mTLS `listen` with `client_ca`.
+
+So on a multi-site node, **both endpoints answer `403` until a credential is
+configured**: `[server.metrics] token` (or mTLS) for `/metrics`, and
+`[server.diagnostics] token` (or mTLS, when `/_ephpm/requests` is on the metrics
+listener) for the timeline. The 403 names the setting, and startup logs an
+ERROR. The server still starts. Refusing to start would take every tenant's
+site offline over an observability setting, while the 403 already keeps the
+data in. `ephpm dev` is exempt, because all of its sites belong to the
+developer.
+
+The probes `/_ephpm/health`, `/_ephpm/ready` and `/_ephpm/primary` are never
+restricted, in either mode. Load balancers and kubelets send no credentials,
+and these probes return only a status. The `503` body of `/_ephpm/ready` names
+the unreachable DB upstream (`host:port`). It includes that address only for
+clients the `[server.diagnostics]` IP ACL admits, which is everyone by default.
+
+Evaluation order: credential requirement (multi-site), then the IP ACL, then
+the token. How the ACL sees the client:
+
+- It is the TCP peer, resolved through `[server.security] trusted_proxies`
+  exactly as `REMOTE_ADDR` is.
+- When an ACL is configured, a request carrying `Forwarded`, `X-Forwarded-For`
+  or `X-Real-IP` from a peer that is **not** a trusted proxy is refused.
+  Without this rule, a reverse proxy on the same host would connect from
+  loopback and launder every internet client behind it. Add the proxy to
+  `trusted_proxies` so the real client address is used.
+- From a trusted proxy, the client is read from `X-Forwarded-For` (every
+  header line, in order). If the proxy sends only `X-Real-IP` or `Forwarded`,
+  or the chain has an entry that is not a bare IP address (such as
+  `ip:port`), the client cannot be resolved and the request is refused rather
+  than judged by the proxy's own address.
+- Spoofing these headers can only remove access, never grant it.
+- **A same-host proxy that adds no forwarding header at all** (nginx
+  `proxy_pass` without `proxy_set_header X-Forwarded-For`, HAProxy without
+  `option forwardfor`) is indistinguishable from a local client. If such a
+  proxy fronts ePHPm, do not admit loopback in `allow`; use a token.
+- IPv4-mapped addresses (`::ffff:a.b.c.d`) are matched as IPv4, for the
+  client, for `trusted_proxies`, and for `allow`/`deny` entries.
+
+Address-rewriting NAT, such as Docker's userland proxy, rootless
+Podman/slirp4netns and some load balancers, makes every client look the same to
+the ACL. Use a token or mTLS there too.
+
+**Startup messages.** Configuration errors stop startup. Warnings and errors
+are logged once per endpoint (`/metrics`, and `/_ephpm/requests` when the
+timeline is on):
+
+| Level | When | Effect |
+|---|---|---|
+| Startup error (exits) | An `allow`/`deny` entry is not a CIDR or IP address | Server does not start |
+| Startup error (exits) | `token` is set but empty | Server does not start |
+| Startup error (exits) | `[server.metrics] listen` is not an `IP:port` address, or cannot be bound | Server does not start |
+| Startup error (exits) | `tls_cert`/`tls_key`/`client_ca` set without `listen`; only one of `tls_cert`/`tls_key`; `client_ca` without TLS; unreadable or invalid PEM files | Server does not start |
+| ERROR | Multi-site node with no token and no mTLS listener | Endpoint answers `403` naming the setting; server runs |
+| WARN | Endpoint readable from public addresses (empty `allow`, or an `allow` reaching outside private ranges) with no token and no mTLS. A separate `listen` on loopback is exempt | Informational: the endpoint is served |
+| WARN | Multi-site node whose token comes from `EPHPM_SERVER__METRICS__TOKEN` / `EPHPM_SERVER__DIAGNOSTICS__TOKEN` | Informational: tenant PHP can read it with `getenv()`; move it into the config file |
+| INFO | Always, per enabled endpoint | Logs the listener, whether an ACL/token/mTLS is set, and whether a credential is required |
 
 ### The `/_ephpm/` namespace is reserved
 
@@ -242,19 +350,20 @@ instead (see the table) — it still never reaches the application.
 
 | Path | Method | Answer |
 |---|---|---|
-| `/_ephpm/health` | GET | `200 {"status":"ok"}` — liveness. |
-| `/_ephpm/ready` | GET | `200`/`503` — readiness (PHP initialized, workers booted, DB proxies connected). |
-| `/_ephpm/primary` | GET | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a clustered-SQLite replica. |
-| `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. |
+| `/_ephpm/health` | GET | `200 {"status":"ok"}` — liveness. Open to every client. |
+| `/_ephpm/ready` | GET | `200`/`503` — readiness (PHP initialized, workers booted, DB proxies connected). Open to every client; the DB upstream address in a `503` reason is shown only to clients the `[server.diagnostics]` IP ACL admits (everyone by default). |
+| `/_ephpm/primary` | GET | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a clustered-SQLite replica. Open to every client. |
+| `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. Subject to `[server.diagnostics]` `allow`/`deny`/`token` (`403`/`401`); requires a token on a multi-site node; moves to the metrics listener when `[server.metrics] listen` is set — see [access to internal endpoints](#access-to-internal-endpoints). |
 | `/_ephpm/auth/…` | any | **Carved out for auth middleware.** Not answered by the server directly: after `trusted_hosts` and vhost resolution it is handed to the global `[[middleware]]` request-phase chain, so an auth module (e.g. the `github-auth` issuer's `/_ephpm/auth/github/login` and `/callback`) can serve it. If no mounted module responds, or no chain is mounted, the answer is `404`. It never reaches your application, and a per-site `[preview_auth]` gate is not run on it. |
 | any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
 | any of the above except `/_ephpm/auth/…` | not GET | `405` with `Allow: GET`. |
 
-These endpoints (all but `/_ephpm/auth/…`) require **no authentication** and
-answer for every `Host` on every listener, ahead of `trusted_hosts`,
-`blocked_paths` and middleware. `/_ephpm/requests` holds request paths from
-every vhost. See
-[HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first).
+These endpoints (all but `/_ephpm/auth/…`) answer for every `Host`, ahead of
+`trusted_hosts`, `blocked_paths` and middleware. The probes need no
+authentication. `/_ephpm/requests` holds request paths from every vhost, so it
+is gated by `[server.diagnostics]` (see
+[access to internal endpoints](#access-to-internal-endpoints) and
+[HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first)).
 
 The Prometheus endpoint is **not** in this namespace: its path is yours to
 choose (`[server.metrics] path`, default `/metrics`), so with
@@ -267,6 +376,9 @@ itself. Pointing `path` *into* `/_ephpm/` works — metrics are matched first.
 |-----|------|---------|-------------|
 | `request_log` | bool | (mode default) | Per-request timeline: the last 256 completed requests (method, path, status, total/queue-wait/PHP durations in ms, response bytes, timestamp) served as JSON at `GET /_ephpm/requests`, newest first. Unset resolves per mode: **on** under `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. `queue_wait_ms` records the dispatch-queue wait in both modes (`null` for requests that never dispatch to PHP, e.g. static files); `php_ms` includes the queue wait, matching `ephpm_php_execution_duration_seconds`. Requests to `/_ephpm/*` and the metrics path are not recorded. When off, `GET /_ephpm/requests` answers 404 naming this knob — the path is never routed to your application (see [the reserved namespace](#the-_ephpm-namespace-is-reserved)). Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`. |
 | `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"`. The transport is chosen by `OTEL_EXPORTER_OTLP_PROTOCOL` — **http/protobuf** by default (`/v1/traces` appended when missing, conventional port 4318) or **grpc** (used as-is, no path appended, conventional port 4317). Exports one `http.request` **server** span per request (attrs: `http.request.method`, `url.path`, `http.response.status_code`, plus `error.type` on a 5xx and `ephpm.site` in multi-site mode) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. A 5xx sets the span status to `ERROR`; a 4xx does not, per OTel HTTP semantic conventions for server spans. Requires a binary built with the `otlp` cargo feature. **Official release binaries and the Docker image have it** (`cargo xtask release` builds with it); a plain `cargo build` does not, and there a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs (verified — thread count is identical to a binary without the feature). Both `http://` and `https://` endpoints are supported on both transports — see the notes below. |
+| `allow` | array of strings | `[]` (allow all) | IP ACL allowlist for `/_ephpm/requests` (others get `403`). Also decides who sees the DB upstream address in a `503` `/_ephpm/ready` body. Same syntax as `[server.metrics] allow`; empty allows everyone. Never restricts the probe status. See [access to internal endpoints](#access-to-internal-endpoints). |
+| `deny` | array of strings | `[]` | IP ACL denylist for `/_ephpm/requests`; deny wins over allow. |
+| `token` | string | (none) | Bearer token for `/_ephpm/requests` (`401` without it). **Required on a multi-site node**, unless the timeline is served on an mTLS `[server.metrics] listen`. Not required by the probes. Must not be empty. Env override: `EPHPM_SERVER__DIAGNOSTICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
 | `otlp_protocol` | string | (none → `http/protobuf`) | OTLP wire protocol for `otlp_endpoint`: `"grpc"` or `"http/protobuf"`. `"http/json"` is rejected at startup. The standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` env vars take precedence over this knob. Setting it without an endpoint logs a startup warning and does nothing. Env override: `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`. |
 
 **OTLP transport selection.** `OTEL_EXPORTER_OTLP_PROTOCOL` (or

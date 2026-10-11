@@ -29,6 +29,26 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tempfile::TempDir;
 
+/// Bearer token the E2E configs set as `[server.metrics] token` /
+/// `[server.diagnostics] token` on every multi-site (`sites_dir`) node.
+///
+/// A multi-site node refuses `/metrics` and `/_ephpm/requests` (403) unless a
+/// credential is configured, because every tenant's PHP can reach the
+/// listener. The token is fixed (these nodes are throwaway, loopback-bound) and
+/// sent on every scrape: a single-site node with no token configured ignores
+/// the header, so one helper works on both kinds of node.
+pub const E2E_METRICS_TOKEN: &str = "e2e-metrics-token-not-for-production";
+
+/// GET an internal data endpoint (`/metrics`, `/_ephpm/requests`) with the
+/// E2E bearer token. See [`E2E_METRICS_TOKEN`].
+///
+/// # Errors
+///
+/// Propagates the request error.
+pub async fn get_metrics(url: &str) -> reqwest::Result<reqwest::Response> {
+    reqwest::Client::new().get(url).bearer_auth(E2E_METRICS_TOKEN).send().await
+}
+
 /// Read an environment variable or panic with a helpful message.
 pub fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} environment variable must be set"))

@@ -49,7 +49,7 @@ In one process:
 - PHP runtime (ZTS) ready to dispatch on the dedicated execution pool
 - The MySQL proxy on `127.0.0.1:3306` if `[db.mysql]` or `[db.sqlite]` is configured
 - The KV store on `127.0.0.1:6379` if `[kv.redis_compat] enabled = true`
-- The `/metrics` endpoint if `[server.metrics] enabled = true`
+- The `/metrics` endpoint if `[server.metrics] enabled = true`, on the main listener or on `[server.metrics] listen` when set (multi-site nodes answer `403` until a token or mTLS is configured — see [access to internal endpoints](/reference/config/#access-to-internal-endpoints))
 - TLS listener (manual cert or ACME) if `[server.tls]` is set
 - Gossip on UDP `7946` and KV data plane on TCP `7947` if `[cluster] enabled = true`
 

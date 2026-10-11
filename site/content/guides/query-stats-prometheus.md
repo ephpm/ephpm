@@ -23,6 +23,8 @@ slow_query_threshold = "500ms" # queries slower than this are logged at WARN
 
 That's it. PHP keeps using `pdo_mysql` against `127.0.0.1:3306`. ePHPm intercepts the wire, normalizes each statement, hashes it to a digest, and updates the metrics.
 
+The digests show the shape of your SQL. If the port is reachable beyond your network, restrict it with `[server.metrics] allow`/`deny` or move it to a separate `listen` address. On a multi-site node, `/metrics` answers `403` until `[server.metrics] token` (or an mTLS listener) is set. Prometheus sends the token through `authorization: { credentials: ... }` in the scrape config. See [access to internal endpoints](/reference/config/#access-to-internal-endpoints). Copy-paste Prometheus configs (bearer token and mTLS) are in [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
+
 ## What you get
 
 `/metrics` exposes (among others):

@@ -41,6 +41,9 @@ enabled = true
 
 [server.metrics]
 enabled = true
+# Multi-site (`sites_dir` above): /metrics is refused unless a credential is
+# set. The e2e scrape helper (`ephpm_e2e::get_metrics`) sends this token.
+token = "e2e-metrics-token-not-for-production"
 
 [server.security]
 # Patterns are matched against URI paths (which always start with "/"),

@@ -86,6 +86,47 @@ The upstream sees a correct client view:
 
 Hop-by-hop headers (`Connection`, `Transfer-Encoding`, …) are stripped in both directions, per RFC 7230.
 
+### Proxies and the `/metrics` / `/_ephpm/requests` ACL
+
+This applies whenever an ePHPm node sits behind a proxy and you configure an
+IP ACL for its internal endpoints. The proxy can be another ePHPm (an edge
+instance from this guide, which always sets `X-Forwarded-For`), nginx, Caddy,
+or a cloud load balancer. The ACL is `[server.metrics]` or
+`[server.diagnostics]` `allow`/`deny`.
+
+- **The ACL sees the resolved client address.** That is the TCP peer, resolved
+  through `[server.security] trusted_proxies` exactly as `REMOTE_ADDR` is.
+- **Forwarded requests from an untrusted proxy are refused.** When an ACL is
+  configured, a request carrying `Forwarded`, `X-Forwarded-For` or
+  `X-Real-IP` from a peer that is **not** in `trusted_proxies` gets `403`. Its
+  real origin is unknown. Without this rule, a proxy on the same host would
+  connect from `127.0.0.1` and pass a loopback-only ACL for every internet
+  client behind it.
+- **The trusted proxy must send `X-Forwarded-For`.** A trusted proxy that
+  names the client only in `X-Real-IP` or `Forwarded`, or whose chain has an
+  entry that is not a bare IP address, is refused under an ACL: the client
+  cannot be resolved.
+- **A same-host proxy that sends no forwarding header** looks like a local
+  client. If one fronts ePHPm, do not admit loopback in `allow`; use a token.
+- **To scrape through a proxy, list the proxy in `trusted_proxies`.** The ACL
+  then sees the real client address:
+
+  ```toml
+  [server.security]
+  trusted_proxies = ["10.0.0.2/32"]   # the edge / load balancer
+
+  [server.metrics]
+  enabled = true
+  allow = ["10.0.0.0/8"]              # judged against the resolved client address
+  ```
+
+- **No ACL, no restriction.** With no `allow`/`deny` set (the default), the
+  ACL admits everyone and forwarding headers are not checked.
+- **Spoofing only removes access.** A client that adds forwarding headers
+  itself cannot gain access this way, only lose it.
+
+See [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
+
 ## Not in v1
 
 Out of scope, and enforced as such — these either error at startup or simply do not exist:

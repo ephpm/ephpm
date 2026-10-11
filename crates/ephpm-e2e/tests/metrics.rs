@@ -19,7 +19,7 @@ use ephpm_e2e::required_env;
 /// Scrape `/metrics` and return the body as a string.
 async fn scrape_metrics(base_url: &str) -> String {
     let url = format!("{base_url}/metrics");
-    let resp = reqwest::get(&url)
+    let resp = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     assert_eq!(
@@ -36,7 +36,7 @@ async fn metrics_endpoint_returns_prometheus_format() {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/metrics");
 
-    let resp = reqwest::get(&url)
+    let resp = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
 

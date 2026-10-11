@@ -40,6 +40,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 
 [server.metrics]
 enabled = true                 # exposes /metrics for Prometheus
+# token = "..."                # REQUIRED on multi-site (sites_dir) nodes, else /metrics answers 403
 # path = "/metrics"            # default
 
 [php]

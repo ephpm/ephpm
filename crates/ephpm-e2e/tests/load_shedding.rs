@@ -69,7 +69,7 @@ async fn saturating_burst(count: usize, seconds: f32) -> Vec<(u16, Option<String
 async fn metric_total(name: &str) -> f64 {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/metrics");
-    let body = reqwest::get(&url)
+    let body = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))
         .text()
@@ -151,7 +151,7 @@ async fn shed_responses_are_counted_in_metrics() {
 
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/metrics");
-    let body = reqwest::get(&url).await.expect("metrics").text().await.unwrap_or_default();
+    let body = ephpm_e2e::get_metrics(&url).await.expect("metrics").text().await.unwrap_or_default();
     assert!(
         body.lines().any(|l| l.starts_with("ephpm_php_shed_total") && l.contains("pool")),
         "the shed counter must name the engine that shed:\n{body}"
@@ -172,7 +172,7 @@ async fn server_recovers_after_the_burst() {
     let mut last = 0;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        last = reqwest::get(&url).await.map(|r| r.status().as_u16()).unwrap_or(0);
+        last = ephpm_e2e::get_metrics(&url).await.map(|r| r.status().as_u16()).unwrap_or(0);
         if last == 200 {
             break;
         }
@@ -181,7 +181,7 @@ async fn server_recovers_after_the_burst() {
 
     // And an idle server never sheds: sequential requests all succeed.
     for i in 0..5 {
-        let status = reqwest::get(&url).await.expect("request").status().as_u16();
+        let status = ephpm_e2e::get_metrics(&url).await.expect("request").status().as_u16();
         assert_eq!(status, 200, "request {i} on an idle server must not be shed");
     }
 }

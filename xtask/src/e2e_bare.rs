@@ -932,6 +932,7 @@ enabled = true
 
 [server.metrics]
 enabled = true
+{METRICS_TOKEN_LINE}
 
 # ETag cache is off by default; the etag_cache suite needs it ON. The container
 # path sets this via `-e EPHPM_SERVER__PHP_ETAG_CACHE__ENABLED=true` on the
@@ -1042,6 +1043,10 @@ data_port = {KV_DATA_PORT}
 /// bound to loopback plus a scratch unix socket. It exists only because the
 /// server fails closed without it — see [`SingleNodeOptions::with_sites_dir`].
 const E2E_KV_SECRET: &str = "e2e-kv-secret-not-for-production";
+
+/// `[server.metrics] token` for every multi-site node. Must equal
+/// `ephpm_e2e::E2E_METRICS_TOKEN` (the scrape helper sends it).
+const E2E_METRICS_TOKEN: &str = "e2e-metrics-token-not-for-production";
 
 /// Per-fixture single-node config knobs.
 ///
@@ -1625,12 +1630,22 @@ impl SingleNodeSpawn {
             )
         };
 
+        // A multi-site node refuses `/metrics` (403) unless a credential is
+        // configured: every tenant's PHP can reach the listener. The e2e
+        // scrape helper (`ephpm_e2e::get_metrics`) always sends this token.
+        let metrics_token_line = if opts.with_sites_dir {
+            format!("token = \"{E2E_METRICS_TOKEN}\"")
+        } else {
+            String::new()
+        };
+
         let config = SINGLE_NODE_TEMPLATE
             .replace("{HTTP_PORT}", &http_port.to_string())
             .replace("{SITES_DIR_LINE}", &sites_dir_line)
             .replace("{PREVIEW_LINE}", preview_line)
             .replace("{DB_SQLITE_BLOCK}", &db_sqlite_block)
             .replace("{KV_SECRET_LINE}", &kv_secret_line)
+            .replace("{METRICS_TOKEN_LINE}", &metrics_token_line)
             .replace("{OPCACHE_BLOCK}", &opcache_block)
             .replace("{WEBSOCKET_BLOCK}", websocket_block)
             .replace("{MIDDLEWARE_BLOCK}", &middleware_block)

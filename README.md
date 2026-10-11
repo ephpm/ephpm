@@ -346,6 +346,8 @@ Point Grafana, Datadog, or any Prometheus-compatible tool at `http://your-ephpm:
 
 Query stats are collected by default, but **the `/metrics` endpoint itself is opt-in**: `[server.metrics] enabled` defaults to `false`, and with no recorder installed the metric calls are no-ops.
 
+Once enabled, `/metrics` exposes normalized SQL and upstream addresses, so lock it down for anything beyond a private network. Three settings do this: `[server.metrics] allow`/`deny` (an IP ACL, open by default), `listen` (a separate metrics port, optionally with TLS/mTLS), and `token` (`Authorization: Bearer <token>`). **On a multi-site node, `/metrics` answers `403` until a `token` (or an mTLS listener) is set**, because every tenant's PHP can reach the listener. See [access to internal endpoints](https://ephpm.dev/reference/config/#access-to-internal-endpoints).
+
 See [site/content/architecture/query-stats.md](site/content/architecture/query-stats.md) for the full design.
 
 ## Virtual Hosts: Multi-Tenant Hosting

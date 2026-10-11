@@ -598,6 +598,16 @@ pub struct Router {
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
+    /// Who may read the metrics endpoint (`[server.metrics]` ACL / token /
+    /// multi-site credential requirement).
+    metrics_access: crate::internal_access::InternalAccess,
+    /// Who may read `/_ephpm/requests`, and whose IP ACL gates
+    /// `/_ephpm/ready`'s upstream detail (`[server.diagnostics]`).
+    diagnostics_access: crate::internal_access::InternalAccess,
+    /// `false` when `[server.metrics] listen` moves the metrics endpoint and
+    /// `/_ephpm/requests` to their own listener: the main listener then does
+    /// not answer them (see [`Router::handle_metrics_listener`]).
+    internal_on_main: bool,
     limiter: Option<Arc<crate::rate_limit::Limiter>>,
     /// Preview-host mode (`[server] preview = true`). When set, every
     /// response — success, error, timeout, rate-limited — carries
@@ -1286,6 +1296,23 @@ impl Router {
             php_etag_cache_config: config.server.php_etag_cache.clone(),
             metrics_handle,
             metrics_path: config.server.metrics.path.clone(),
+            // Multi-site requires a credential by default (fail closed);
+            // `serve` lifts it for `ephpm dev` via `with_dev_mode_access`.
+            metrics_access: crate::internal_access::InternalAccess::new(
+                "[server.metrics]",
+                &config.server.metrics.allow,
+                &config.server.metrics.deny,
+                config.server.metrics.token.as_deref(),
+                config.server.sites_dir.is_some(),
+            ),
+            diagnostics_access: crate::internal_access::InternalAccess::new(
+                "[server.diagnostics]",
+                &config.server.diagnostics.allow,
+                &config.server.diagnostics.deny,
+                config.server.diagnostics.token.as_deref(),
+                config.server.sites_dir.is_some(),
+            ),
+            internal_on_main: config.server.metrics.listen.is_none(),
             limiter,
             preview: config.server.preview,
             file_cache,
@@ -2702,11 +2729,26 @@ impl Router {
         // endpoint whose path the operator chooses: pointing
         // `[server.metrics] path` into the reserved namespace must serve
         // metrics, not the namespace's 404.
-        if method_ref == hyper::Method::GET
+        //
+        // Ahead of every security check also means ahead of every *access*
+        // check, so the data-bearing endpoints carry their own: the
+        // `[server.metrics]` / `[server.diagnostics]` allowlist + optional
+        // bearer token (`crate::internal_access`). Without it anyone who can
+        // reach the listener reads every tenant's SQL digests here.
+        //
+        // With `[server.metrics] listen` set, the metrics path is not
+        // intercepted here at all: it is served on that listener only, and on
+        // this one it is an ordinary application path.
+        if self.internal_on_main
+            && method_ref == hyper::Method::GET
             && let Some(ref handle) = self.metrics_handle
             && uri_path == self.metrics_path
         {
-            return Ok((metrics::render(handle), "metrics"));
+            let client = self.internal_client(&req, remote_addr, is_tls, false);
+            return Ok(match self.metrics_access.check(&client) {
+                crate::internal_access::Verdict::Allow => (metrics::render(handle), "metrics"),
+                denied => (self.metrics_access.deny_response(denied), "metrics"),
+            });
         }
 
         // The reserved `/_ephpm/` namespace. One pre-dispatch check, ahead of
@@ -2720,7 +2762,8 @@ impl Router {
             || uri_path == INTERNAL_PREFIX.trim_end_matches('/'))
             && !uri_path.starts_with(AUTH_NAMESPACE_PREFIX)
         {
-            return Ok(self.handle_internal(&uri_path, &method_ref));
+            let client = self.internal_client(&req, remote_addr, is_tls, false);
+            return Ok(self.handle_internal(&uri_path, &method_ref, &client));
         }
 
         // Validate Host header against trusted hosts list.
@@ -4707,12 +4750,7 @@ impl Router {
             return (remote_addr, is_tls);
         }
 
-        let real_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|xff| self.resolve_xff(xff))
-            .unwrap_or(remote_addr.ip());
+        let real_ip = self.forwarded_client_ip(req).unwrap_or(remote_addr.ip());
 
         let is_https = req
             .headers()
@@ -4721,6 +4759,137 @@ impl Router {
             .map_or(is_tls, |proto| proto.eq_ignore_ascii_case("https"));
 
         (SocketAddr::new(real_ip, remote_addr.port()), is_https)
+    }
+
+    /// The facts [`crate::internal_access`] decides on: the client address
+    /// after `trusted_proxies` resolution (the same `REMOTE_ADDR` PHP sees),
+    /// whether the TCP peer is itself a trusted proxy, whether the connection
+    /// was mTLS-verified, and the headers.
+    fn internal_client<'r, B>(
+        &self,
+        req: &'r Request<B>,
+        remote_addr: SocketAddr,
+        is_tls: bool,
+        mtls_verified: bool,
+    ) -> crate::internal_access::Client<'r> {
+        let (effective, _) = self.resolve_proxy_info(req, remote_addr, is_tls);
+        let peer_is_trusted_proxy =
+            !self.trusted_proxies.is_empty() && self.is_trusted_proxy(remote_addr.ip());
+        // A trusted proxy that relays a request but whose `X-Forwarded-For`
+        // does not name a client (absent, because it only sent `X-Real-IP` or
+        // `Forwarded`; or unparseable) leaves `effective` as the proxy's own
+        // address. That would launder every client behind it through the
+        // proxy's (often allowlisted) address, so the ACL treats it as an
+        // unknown origin.
+        let forwarded_unresolved = peer_is_trusted_proxy
+            && crate::internal_access::has_forwarding_headers(req.headers())
+            && self.forwarded_client_ip(req).is_none();
+        crate::internal_access::Client {
+            ip: effective.ip(),
+            peer_is_trusted_proxy,
+            forwarded_unresolved,
+            mtls_verified,
+            headers: req.headers(),
+        }
+    }
+
+    /// The client address a trusted proxy reports in `X-Forwarded-For`, or
+    /// `None` when there is no such header or its chain cannot be resolved.
+    ///
+    /// Every `X-Forwarded-For` header line is read, in order, as one
+    /// comma-joined list (RFC 7230 §3.2.2). Some proxies (HAProxy
+    /// `option forwardfor`, some Envoy setups) append a new line instead of
+    /// extending the existing one; reading only the first line would hand the
+    /// decision to the client-supplied entry that came in ahead of it.
+    fn forwarded_client_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
+        let mut lines = req.headers().get_all("x-forwarded-for").iter();
+        let first = lines.next()?.to_str().ok()?;
+        let Some(second) = lines.next() else {
+            return self.resolve_xff(first);
+        };
+        let mut joined = String::from(first);
+        for line in std::iter::once(second).chain(lines) {
+            joined.push(',');
+            joined.push_str(line.to_str().ok()?);
+        }
+        self.resolve_xff(&joined)
+    }
+
+    /// Lift the multi-site credential requirement for `ephpm dev`.
+    ///
+    /// Under `ephpm dev --sites` every "tenant" is a site on the developer's
+    /// own machine, and the request timeline is on by default there; requiring
+    /// a token would only break the dev dashboard. `ephpm serve` never calls
+    /// this, so a multi-site production node keeps the requirement.
+    #[must_use]
+    pub fn with_dev_mode_access(mut self, dev_mode: bool) -> Self {
+        if dev_mode {
+            self.metrics_access.set_require_credential(false);
+            self.diagnostics_access.set_require_credential(false);
+        }
+        self
+    }
+
+    /// Serve one request on the separate metrics listener
+    /// (`[server.metrics] listen`).
+    ///
+    /// That listener answers exactly two paths — the metrics path and
+    /// `/_ephpm/requests` — under the same access policies as on the main
+    /// listener, plus the connection's mTLS status (`mtls_verified`, a client
+    /// certificate verified against `client_ca`), which counts as the
+    /// credential a multi-site node requires. Everything else is `404`: no
+    /// application, no static files, no probes (those stay on the main
+    /// listener, where load balancers expect them).
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the only builder call assembles a fixed `405` from
+    /// constant, valid header values.
+    pub fn handle_metrics_listener<B>(
+        &self,
+        req: &Request<B>,
+        remote_addr: SocketAddr,
+        is_tls: bool,
+        mtls_verified: bool,
+    ) -> Response<ServerBody> {
+        use crate::internal_access::Verdict;
+
+        if req.method() != hyper::Method::GET {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("content-type", "text/plain")
+                .header("allow", "GET")
+                .body(body::buffered(Full::new(Bytes::from_static(b"405 Method Not Allowed"))))
+                .expect("static 405 response");
+        }
+        let path = req.uri().path();
+        let client = self.internal_client(req, remote_addr, is_tls, mtls_verified);
+        if path == self.metrics_path
+            && let Some(ref handle) = self.metrics_handle
+        {
+            return match self.metrics_access.check(&client) {
+                Verdict::Allow => metrics::render(handle),
+                denied => self.metrics_access.deny_response(denied),
+            };
+        }
+        if path == "/_ephpm/requests" {
+            return match self.request_log {
+                Some(ref log) => match self.diagnostics_access.check(&client) {
+                    Verdict::Allow => json_response_owned(StatusCode::OK, log.to_json()),
+                    denied => self.diagnostics_access.deny_response(denied),
+                },
+                None => error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: the request timeline is disabled. Enable it with \
+                     [server.diagnostics] request_log = true.",
+                ),
+            };
+        }
+        error_response(
+            StatusCode::NOT_FOUND,
+            "404 Not Found: this is the ePHPm metrics listener; it serves only the metrics \
+             path and /_ephpm/requests.",
+        )
     }
 
     /// Validate the `Host` header against the trusted hosts list.
@@ -4781,8 +4950,11 @@ impl Router {
     /// Check server readiness for the `/ready` probe.
     ///
     /// Returns 200 if PHP is initialized. Returns 503 with a reason
-    /// string otherwise.
-    fn readiness_check(&self) -> Response<ServerBody> {
+    /// string otherwise. `detail` controls whether a DB-proxy reason names the
+    /// upstream `host:port` — granted only to clients on the
+    /// `[server.diagnostics] allow` list (see [`crate::internal_access`]); the
+    /// status code is the same for everyone.
+    fn readiness_check(&self, detail: bool) -> Response<ServerBody> {
         if !PhpRuntime::is_ready() {
             return json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4805,7 +4977,7 @@ impl Router {
         // rollout containing it must stall. Deliberately a *first-connect*
         // gate, not a live database probe: see `crate::db_health` for why a
         // post-startup outage must not evict every replica at once.
-        if let Some(resp) = Self::db_not_ready(self.db_health.as_ref()) {
+        if let Some(resp) = Self::db_not_ready(self.db_health.as_ref(), detail) {
             return resp;
         }
         json_response(StatusCode::OK, r#"{"status":"ready"}"#)
@@ -4850,10 +5022,17 @@ impl Router {
     /// rather than a fall-through, so a health checker configured with `HEAD`
     /// or `OPTIONS` (HAProxy's `option httpchk` default) gets an answer from
     /// the server instead of a verdict computed by the application.
+    ///
+    /// Access: the probes (`health`, `ready`, `primary`) answer everyone — a
+    /// load balancer or kubelet sends no credentials, and a status code is all
+    /// they reveal. `/_ephpm/requests` (every vhost's request paths) is gated
+    /// by `[server.diagnostics] allow`/`token`, and `/_ephpm/ready`'s DB
+    /// upstream detail by the same allowlist. See [`crate::internal_access`].
     fn handle_internal(
         &self,
         uri_path: &str,
         method: &hyper::Method,
+        client: &crate::internal_access::Client<'_>,
     ) -> (Response<ServerBody>, &'static str) {
         if method != hyper::Method::GET {
             let resp = Response::builder()
@@ -4870,7 +5049,9 @@ impl Router {
             "/_ephpm/health" => (json_response(StatusCode::OK, r#"{"status":"ok"}"#), "health"),
 
             // Readiness probe — checks PHP initialization and DB proxy.
-            "/_ephpm/ready" => (self.readiness_check(), "health"),
+            "/_ephpm/ready" => {
+                (self.readiness_check(self.diagnostics_access.ip_allowed(client)), "health")
+            }
 
             // Primary probe — the load-balancer target for active-passive
             // routing to the writable SQLite node. 200 when this node accepts
@@ -4886,10 +5067,21 @@ impl Router {
             // Request timeline (dev mode / [server.diagnostics] request_log):
             // the ring buffer as JSON, newest first. Disabled is answered here,
             // naming the knob — never handed to the application.
+            "/_ephpm/requests" if !self.internal_on_main => (
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: the request timeline is served on the separate metrics \
+                     listener ([server.metrics] listen), not on this one.",
+                ),
+                "diagnostics",
+            ),
             "/_ephpm/requests" => match self.request_log {
-                Some(ref log) => {
-                    (json_response_owned(StatusCode::OK, log.to_json()), "diagnostics")
-                }
+                Some(ref log) => match self.diagnostics_access.check(client) {
+                    crate::internal_access::Verdict::Allow => {
+                        (json_response_owned(StatusCode::OK, log.to_json()), "diagnostics")
+                    }
+                    denied => (self.diagnostics_access.deny_response(denied), "diagnostics"),
+                },
                 None => (
                     error_response(
                         StatusCode::NOT_FOUND,
@@ -4923,15 +5115,20 @@ impl Router {
     /// configured SQL proxy has never reached its upstream, `None` otherwise.
     ///
     /// Split out so the behavior can be tested without a live PHP runtime.
+    ///
+    /// With `detail = false` the reason omits the proxy's listen and upstream
+    /// addresses (internal topology) and names only its kind.
     fn db_not_ready(
         db_health: Option<&Arc<crate::db_health::DbProxyHealth>>,
+        detail: bool,
     ) -> Option<Response<ServerBody>> {
         let pending = db_health?.first_never_connected()?;
+        let what = if detail { pending.describe() } else { format!("{} proxy", pending.kind()) };
         Some(json_response_owned(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 r#"{{"status":"not_ready","reason":"database proxy has not reached its upstream: {}"}}"#,
-                json_escape(&pending.describe())
+                json_escape(&what)
             ),
         ))
     }
@@ -5218,22 +5415,29 @@ impl Router {
 
     /// Check if an IP address matches any trusted proxy CIDR.
     fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        // An IPv4 peer on a dual-stack listener arrives as `::ffff:a.b.c.d`;
+        // match it against IPv4 `trusted_proxies` entries.
+        let ip = ip.to_canonical();
         self.trusted_proxies.iter().any(|net| net.contains(&ip))
     }
 
     /// Walk X-Forwarded-For from right to left, return the first untrusted IP.
     ///
+    /// An entry that does not parse as an IP address stops the walk with
+    /// `None`: everything to its left was supplied by someone the trusted hops
+    /// do not vouch for, so skipping past it would let the client pick its own
+    /// address.
+    ///
     /// Uses `rsplit` to scan right-to-left in place — no `Vec` allocation for
     /// the (typically 1-3 element) proxy chain on this per-request path.
     fn resolve_xff(&self, xff: &str) -> Option<IpAddr> {
         for ip_str in xff.rsplit(',') {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>()
-                && !self.is_trusted_proxy(ip)
-            {
+            let ip = ip_str.trim().parse::<IpAddr>().ok()?;
+            if !self.is_trusted_proxy(ip) {
                 return Some(ip);
             }
         }
-        // All IPs in the chain are trusted (or unparseable) — use the leftmost.
+        // All IPs in the chain are trusted — use the leftmost.
         xff.split(',').next().and_then(|s| s.trim().parse().ok())
     }
 }
@@ -8608,6 +8812,305 @@ mod tests {
         );
     }
 
+    // ── Internal-endpoint access policy (crate::internal_access) ─────────
+
+    /// A metrics-enabled router over an empty docroot, with `tweak` applied
+    /// to the config first.
+    fn access_router(tweak: impl FnOnce(&mut Config)) -> (tempfile::TempDir, Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.metrics.enabled = true;
+        tweak(&mut config);
+        // Local recorder handle: `metrics::init()` would install a global one.
+        let handle =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder().handle();
+        let router = Router::new(&config, test_store(), None, Some(handle), None, None, None)
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        (dir, router)
+    }
+
+    /// GET `path` from the TCP peer `peer` with extra request headers.
+    async fn probe_from(
+        router: &Router,
+        path: &str,
+        peer: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let addr: SocketAddr = format!("{peer}:4321").parse().unwrap();
+        let mut builder = Request::builder().method("GET").uri(path);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let resp = router.handle(builder.body(Empty::<Bytes>::new()).unwrap(), addr, false).await;
+        let resp = resp.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The upgrade guarantee: with no access config, `/metrics` answers every
+    /// client on a single-site node, exactly as before the ACL existed.
+    #[tokio::test]
+    async fn metrics_is_open_by_default_on_a_single_site_node() {
+        let (_dir, router) = access_router(|_| {});
+        for peer in ["127.0.0.1", "10.0.0.5", "203.0.113.9"] {
+            let (status, body) = probe_from(&router, "/metrics", peer, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{peer}: {body}");
+        }
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "198.51.100.4")])
+                .await;
+        assert_eq!(status, StatusCode::OK, "no ACL configured: forwarded requests are served");
+    }
+
+    /// The IP ACL: allow restricts, deny wins, and with an ACL configured a
+    /// same-host reverse proxy (loopback peer, not trusted) cannot launder an
+    /// internet client.
+    #[tokio::test]
+    async fn metrics_acl_allow_deny_and_forwarded_laundering() {
+        let (_dir, router) = access_router(|c| {
+            c.server.metrics.allow = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+            c.server.metrics.deny = vec!["10.9.0.0/16".to_string()];
+        });
+        let (status, body) = probe_from(&router, "/metrics", "203.0.113.9", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("[server.metrics]"), "the denial names the knob: {body}");
+        let (status, _) = probe_from(&router, "/metrics", "10.0.0.5", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = probe_from(&router, "/metrics", "10.9.0.5", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "deny wins over allow");
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "198.51.100.4")])
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "untrusted forwarder must not launder");
+    }
+
+    /// With `trusted_proxies`, the resolved client address decides — the
+    /// same address PHP sees as `REMOTE_ADDR`.
+    #[tokio::test]
+    async fn metrics_access_uses_the_trusted_proxy_resolved_address() {
+        let (_dir, router) = access_router(|c| {
+            c.server.security.get_or_insert_default().trusted_proxies =
+                vec!["127.0.0.1/32".to_string()];
+            c.server.metrics.allow = vec!["10.0.0.0/8".to_string()];
+        });
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "198.51.100.4")])
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "public client behind a trusted proxy");
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "10.1.1.1")]).await;
+        assert_eq!(status, StatusCode::OK, "allowed client behind a trusted proxy");
+
+        // A proxy that appends its own `X-Forwarded-For` line (HAProxy
+        // `option forwardfor`) after the client's spoofed one: every line is
+        // read in order, so the proxy-appended real client decides.
+        let (status, _) = probe_from(
+            &router,
+            "/metrics",
+            "127.0.0.1",
+            &[("x-forwarded-for", "10.0.0.1"), ("x-forwarded-for", "198.51.100.4")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a spoofed first XFF line must not decide");
+    }
+
+    /// Under an ACL that admits the trusted proxy's own address, a relayed
+    /// request whose client cannot be resolved from `X-Forwarded-For` must
+    /// not fall back to that address.
+    #[tokio::test]
+    async fn metrics_acl_refuses_unresolvable_forwarding_from_a_trusted_proxy() {
+        let (_dir, router) = access_router(|c| {
+            c.server.security.get_or_insert_default().trusted_proxies =
+                vec!["127.0.0.1/32".to_string()];
+            c.server.metrics.allow = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+        });
+        let (status, _) = probe_from(&router, "/metrics", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::OK, "control: the proxy host itself, not relaying");
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("x-forwarded-for", "10.1.1.1")]).await;
+        assert_eq!(status, StatusCode::OK, "control: resolvable allowed client");
+
+        // A trusted proxy that names the client only in `X-Real-IP` or
+        // `Forwarded` (which ePHPm does not resolve) would otherwise leave the
+        // proxy's own address to decide: unknown origin, refused.
+        for name in ["x-real-ip", "forwarded"] {
+            let (status, _) =
+                probe_from(&router, "/metrics", "127.0.0.1", &[(name, "198.51.100.4")]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{name} from a trusted proxy");
+        }
+
+        // An unparseable rightmost entry (`ip:port`) stops the walk instead of
+        // skipping to the client-supplied entries on its left.
+        let (status, _) = probe_from(
+            &router,
+            "/metrics",
+            "127.0.0.1",
+            &[("x-forwarded-for", "10.0.0.1, 198.51.100.4:5678")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "unparseable XFF entry");
+    }
+
+    #[tokio::test]
+    async fn metrics_token() {
+        let (_dir, router) = access_router(|c| {
+            c.server.metrics.token = Some("scrape-token-123".to_string());
+        });
+        let (status, _) = probe_from(&router, "/metrics", "203.0.113.9", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) =
+            probe_from(&router, "/metrics", "203.0.113.9", &[("authorization", "Bearer wrong")])
+                .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = probe_from(
+            &router,
+            "/metrics",
+            "203.0.113.9",
+            &[("authorization", "Bearer scrape-token-123")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Multi-site: every tenant's PHP is on loopback, so without a credential
+    /// both data endpoints are refused for everyone — loopback included — and
+    /// the 403 names the setting. A token restores access. `ephpm dev` lifts
+    /// the requirement. Probes are never affected.
+    #[tokio::test]
+    async fn multi_site_requires_a_token_for_metrics_and_the_timeline() {
+        let sites = tempfile::tempdir().unwrap();
+        let sites_path = sites.path().to_path_buf();
+        let (_dir, router) = access_router(|c| c.server.sites_dir = Some(sites_path.clone()));
+        for path in ["/metrics", "/_ephpm/requests"] {
+            let (status, body) = probe_from(&router, path, "127.0.0.1", &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+            assert!(body.contains("token"), "{path}: names the setting: {body}");
+        }
+        for path in ["/_ephpm/health", "/_ephpm/primary"] {
+            let (status, _) = probe_from(&router, path, "203.0.113.9", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{path} stays open on multi-site");
+        }
+
+        let (_dir, router) = access_router(|c| {
+            c.server.sites_dir = Some(sites_path.clone());
+            c.server.metrics.token = Some("m-token".to_string());
+            c.server.diagnostics.token = Some("d-token".to_string());
+        });
+        let (status, _) =
+            probe_from(&router, "/metrics", "127.0.0.1", &[("authorization", "Bearer m-token")])
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = probe_from(
+            &router,
+            "/_ephpm/requests",
+            "127.0.0.1",
+            &[("authorization", "Bearer d-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_dir, router) = access_router(|c| c.server.sites_dir = Some(sites_path.clone()));
+        let router = router.with_dev_mode_access(true);
+        let (status, _) = probe_from(&router, "/_ephpm/requests", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::OK, "ephpm dev keeps the dashboard working");
+    }
+
+    /// `/_ephpm/requests` follows its own ACL/token; the probes a load
+    /// balancer or kubelet hits with no credentials stay open.
+    #[tokio::test]
+    async fn request_timeline_is_gated_but_probes_stay_open() {
+        let (_dir, router) =
+            access_router(|c| c.server.diagnostics.allow = vec!["10.0.0.0/8".to_string()]);
+        let (status, body) = probe_from(&router, "/_ephpm/requests", "203.0.113.9", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("[server.diagnostics]"), "{body}");
+        let (status, _) = probe_from(&router, "/_ephpm/requests", "10.0.0.5", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        for path in ["/_ephpm/health", "/_ephpm/primary"] {
+            let (status, body) = probe_from(&router, path, "203.0.113.9", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{path} must answer a public LB: {body}");
+        }
+
+        let (_dir, router) =
+            access_router(|c| c.server.diagnostics.token = Some("diag-token".to_string()));
+        let (status, _) = probe_from(&router, "/_ephpm/requests", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = probe_from(
+            &router,
+            "/_ephpm/requests",
+            "127.0.0.1",
+            &[("authorization", "Bearer diag-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = probe_from(&router, "/_ephpm/health", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::OK, "the token never gates a probe");
+    }
+
+    /// With `[server.metrics] listen`, the main listener stops answering the
+    /// metrics path (it becomes an application path) and `/_ephpm/requests`
+    /// (404 naming the knob); the dedicated handler serves both. Probes stay
+    /// on the main listener.
+    #[tokio::test]
+    async fn separate_listener_moves_metrics_and_timeline_off_the_main_listener() {
+        let (_dir, router) =
+            access_router(|c| c.server.metrics.listen = Some("127.0.0.1:9100".to_string()));
+        let (status, body) = probe_from(&router, "/metrics", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "falls through to the (empty) app: {body}");
+        assert!(!body.contains("ephpm_"), "no metrics on the main listener: {body}");
+        let (status, body) = probe_from(&router, "/_ephpm/requests", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("[server.metrics] listen"), "{body}");
+        let (status, _) = probe_from(&router, "/_ephpm/health", "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let get = |path: &str| Request::builder().uri(path).body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle_metrics_listener(&get("/metrics"), peer, false, false);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router.handle_metrics_listener(&get("/_ephpm/requests"), peer, false, false);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router.handle_metrics_listener(&get("/_ephpm/health"), peer, false, false);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "probes are not on the metrics listener");
+        let resp = router.handle_metrics_listener(&get("/index.php"), peer, false, false);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// On the metrics listener, a verified client certificate is the
+    /// multi-site credential.
+    #[tokio::test]
+    async fn mtls_on_the_metrics_listener_satisfies_the_multi_site_requirement() {
+        let sites = tempfile::tempdir().unwrap();
+        let sites_path = sites.path().to_path_buf();
+        let (_dir, router) = access_router(|c| {
+            c.server.sites_dir = Some(sites_path.clone());
+            c.server.metrics.listen = Some("127.0.0.1:9100".to_string());
+        });
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let req = Request::builder().uri("/metrics").body(Empty::<Bytes>::new()).unwrap();
+        assert_eq!(
+            router.handle_metrics_listener(&req, peer, true, false).status(),
+            StatusCode::FORBIDDEN,
+            "TLS without a verified client certificate is not a credential"
+        );
+        assert_eq!(router.handle_metrics_listener(&req, peer, true, true).status(), StatusCode::OK);
+    }
+
     // ── Load shedding (`[php] overload`, issue #301) ────────────────────
 
     /// A router whose execution pool has exactly one thread and one dispatch
@@ -11051,6 +11554,14 @@ echo "post response";
         }
     }
 
+    /// Wire an in-memory KV store into the middleware host table, as `serve()`
+    /// always does. First call in the test binary wins; every test shares it.
+    fn wire_middleware_kv() {
+        ephpm_middleware::host::set_kv_store(&ephpm_kv::store::Store::new(
+            ephpm_kv::store::StoreConfig::default(),
+        ));
+    }
+
     /// Issue #487, end to end through the real router: a `[preview_auth]`
     /// override gates a preview on BOTH the static-file path and the PHP path,
     /// fail-closed, and a credential is bound to its own site.
@@ -11079,6 +11590,9 @@ echo "post response";
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let token =
             |site: &str| mint_share_token(SECRET.as_bytes(), site, "jti-1", now, now + 3600);
+        // Share-token revocation reads KV and fails closed when it cannot;
+        // `serve()` always wires a store, so the fixture must too.
+        wire_middleware_kv();
 
         let f = fleet();
         // Gated preview: a static asset and a PHP entrypoint.
@@ -11403,6 +11917,7 @@ echo "post response";
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let tok =
             mint_share_token(SECRET.as_bytes(), "pr-9.preview.test", "jti-ws", now, now + 3600);
+        wire_middleware_kv();
 
         let f = fleet();
         f.site("pr-9.preview.test", &[]); // no websocket entrypoint on disk
@@ -13778,8 +14293,8 @@ data: two
     #[test]
     fn readiness_ignores_databases_when_no_proxy_is_configured() {
         let health = crate::db_health::DbProxyHealth::from_config(&Config::default()).unwrap();
-        assert!(Router::db_not_ready(Some(&health)).is_none());
-        assert!(Router::db_not_ready(None).is_none());
+        assert!(Router::db_not_ready(Some(&health), true).is_none());
+        assert!(Router::db_not_ready(None, true).is_none());
     }
 
     /// The reported hole: the proxy never reached its upstream, yet the
@@ -13787,12 +14302,12 @@ data: two
     #[test]
     fn readiness_fails_while_a_proxy_has_never_reached_its_upstream() {
         let health = health_with_mysql();
-        let resp = Router::db_not_ready(Some(&health)).expect("must report not ready");
+        let resp = Router::db_not_ready(Some(&health), true).expect("must report not ready");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         health.mysql().unwrap().record_up();
         assert!(
-            Router::db_not_ready(Some(&health)).is_none(),
+            Router::db_not_ready(Some(&health), true).is_none(),
             "one upstream handshake must clear the readiness gate"
         );
     }
@@ -13803,7 +14318,7 @@ data: two
     #[tokio::test]
     async fn readiness_body_names_the_pending_proxy() {
         let health = health_with_mysql();
-        let resp = Router::db_not_ready(Some(&health)).expect("not ready");
+        let resp = Router::db_not_ready(Some(&health), true).expect("not ready");
         let bytes = http_body_util::BodyExt::collect(resp.into_body())
             .await
             .expect("collect body")
@@ -13814,6 +14329,24 @@ data: two
         let reason = parsed["reason"].as_str().expect("reason string");
         assert!(reason.contains("mysql"), "reason names the proxy kind: {reason}");
         assert!(reason.contains("127.0.0.1:3307"), "reason names the upstream: {reason}");
+    }
+
+    /// A client outside `[server.diagnostics] allow` gets the same 503 but
+    /// not the internal `host:port` topology.
+    #[tokio::test]
+    async fn readiness_body_hides_the_upstream_without_detail() {
+        let health = health_with_mysql();
+        let resp = Router::db_not_ready(Some(&health), false).expect("not ready");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("probe body is JSON");
+        let reason = parsed["reason"].as_str().expect("reason string");
+        assert!(reason.contains("mysql"), "{reason}");
+        assert!(!reason.contains("3307") && !reason.contains("3306"), "{reason}");
     }
 
     /// A post-startup outage must NOT flap readiness. If this test starts
@@ -13827,7 +14360,7 @@ data: two
         mysql.record_down(&"connection refused");
         assert!(!mysql.is_up(), "the live gauge must reflect the outage");
         assert!(
-            Router::db_not_ready(Some(&health)).is_none(),
+            Router::db_not_ready(Some(&health), true).is_none(),
             "a database outage must not evict the pod from rotation"
         );
     }
@@ -13844,13 +14377,13 @@ data: two
         let health = health_with_mysql();
         let router = test_router(dir.path()).with_db_health(Arc::clone(&health));
         assert_eq!(
-            router.readiness_check().status(),
+            router.readiness_check(true).status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "/_ephpm/ready must be 503 while the proxy has never reached its upstream"
         );
 
         health.mysql().unwrap().record_up();
-        assert_eq!(router.readiness_check().status(), StatusCode::OK);
+        assert_eq!(router.readiness_check(true).status(), StatusCode::OK);
     }
 
     // ── Primary probe: active-passive LB routing (/_ephpm/primary) ────────
