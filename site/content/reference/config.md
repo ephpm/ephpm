@@ -11,7 +11,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 **Every section rejects keys it does not recognize**, failing startup with an error that names the offending key. This covers `[server]` and all its subsections, `[php]`, `[db]` and all its subsections, `[kv]`, `[cluster]`, `[opcache]`, and `[[middleware]]` / `[[server.proxy]]` blocks.
 
-That now includes the **contents** of a `[[middleware]]` mount's `config` table for the ten built-in modules, which each declare the keys they read: `config = { per_ip_rp = 50 }` on a `ratelimit` mount fails startup with a "did you mean `per_ip_rps`?" instead of silently running the default limit. See [Native middleware → Unknown `config` keys](/guides/native-middleware/#unknown-config-keys) for what stays unchecked (free-form maps, and third-party modules that have not declared a key set).
+That now includes the **contents** of a `[[middleware]]` mount's `config` table for the twelve built-in modules, which each declare the keys they read: `config = { per_ip_rp = 50 }` on a `ratelimit` mount fails startup with a "did you mean `per_ip_rps`?" instead of silently running the default limit. See [Native middleware → Unknown `config` keys](/guides/native-middleware/#unknown-config-keys) for what stays unchecked (free-form maps, and third-party modules that have not declared a key set).
 
 A key this binary does not declare is far more likely to be a typo — or a knob from a newer version — than something safe to ignore, and ignoring it silently turns an explicit instruction into a no-op that every health check reports green. The case that prompted this: `per_site = true` on a binary predating the knob parsed fine, was dropped on the floor, and brought the node up in whole-database clustered mode with every tenant sharing one database.
 
@@ -19,7 +19,7 @@ The forward-compatibility cost is intended. A config naming a knob your binary d
 
 Four things stay lenient on purpose:
 
-- **Unknown *top-level* keys** (outside any section). `EPHPM_`-prefixed environment variables are merged as top-level keys and not all of them are configuration — ePHPm's own Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`, and the e2e harness sets `EPHPM_URL` / `EPHPM_BINARY`. Rejecting these would stop the server starting as a Windows service.
+- **Unknown *top-level* keys** (outside any section). `EPHPM_`-prefixed environment variables are merged as top-level keys and not all of them are configuration — ePHPm's own Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`, and the e2e harness sets `EPHPM_URL` / `EPHPM_BINARY`. Rejecting these would stop the server starting as a Windows service. **The cost:** an override variable with a single underscore where the section ends — `EPHPM_SERVER_LISTEN` instead of `EPHPM_SERVER__LISTEN`, `EPHPM_PHP_MODE` instead of `EPHPM_PHP__MODE` — becomes an unknown top-level key and is **silently ignored**, with no warning. Unlike the other lenient cases below, this one is easy to hit by accident and says nothing. See [Environment variables → Single underscores are silently ignored](/reference/environment-variables/#single-underscores-are-silently-ignored).
 - **`[db.sqlite.sqld]`**, which exists only so pre-v0.7.0 configs keep parsing (see below).
 - **The `config` payload of a third-party (`dlopen`ed) middleware module**, unless that module declares its key set. The host does not know an out-of-tree module's schema and cannot check it for them; the authoring kit lets a module opt in, and every in-tree module has.
 - **Unknown keys in a per-site override file** (`<[server] site_overrides_dir>/<site-key>.toml`) — a different file, not part of `ephpm.toml`. It understands `document_root`, `auto_prepend_file` and the `[preview_auth]` section (the access gate); a key it does not implement at all is ignored with a `WARN` naming the file, the site, the keys and a "did you mean" hint, because that file is written by a separately-released provisioning daemon and strict parsing would let one of its deploys take a whole fleet off its web roots. A key ePHPm *does* implement with a value it cannot honour is **not** lenient — that site refuses to serve (503) rather than fall back to serving its container. See [Virtual Hosts → Failure modes](/guides/virtual-hosts/#failure-modes-a-broken-override-takes-the-site-out-of-service).
@@ -30,16 +30,47 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `listen` | string | `"0.0.0.0:8080"` | Address to listen on. |
-| `document_root` | path | `"."` | Document root for static files and PHP scripts. |
-| `sites_dir` | path | (none) | Virtual host directory. Each subdirectory is named after a domain. Omit for single-site mode. |
+| `listen` | string | `"0.0.0.0:8080"` | Address to listen on. Plain HTTP, unless `[server.tls]` is configured **without** `[server.tls] listen` — then this address serves HTTPS only (see [`[server.tls]`](#servertls)). Overridden by `ephpm serve --listen`; ignored by `ephpm dev`. |
+| `document_root` | path | `"."` | Document root for static files and PHP scripts. A relative path is resolved against the working directory ePHPm is started from (made absolute at startup). |
+| `sites_dir` | path | (none) | Virtual host directory. Each subdirectory is named after a domain. A `Host` that matches no subdirectory falls back to `document_root` and gets no per-site identity (no per-site database, credentials or KV keyspace). A `Host` that cannot be a safe directory name (traversal, separators, non-DNS characters) is rejected with `404` whether or not `trusted_hosts` is set. Omit for single-site mode. A relative path is resolved against the working directory ePHPm is started from (made absolute at startup). See [Virtual Hosts](/guides/virtual-hosts/). |
 | `sites_domain_suffix` | string | (none) | Suffix stripped from the `Host` header before resolving vhosts against `sites_dir` (e.g. `".localhost"` maps `blog.localhost` → `<sites_dir>/blog`). Used by `ephpm dev --sites`. **Must begin with a dot** — startup fails closed otherwise (a dotless suffix would let the apex host strip to the empty vhost key and resolve the whole `sites_dir` as one virtual host). |
-| `site_overrides_dir` | path | (none) | **Multi-tenant only.** Directory of operator-supplied per-site overrides, one `<site-key>.toml` per virtual host. Keys: `document_root = "public"` (that site's web root), `auto_prepend_file = ".preview-env.php"` (a PHP file that site runs before every request — per-request mode only), and a `[preview_auth]` section that turns the [preview access gate](/roadmap/preview-access-gate/) on for that vhost (enforced on the static **and** PHP paths, fail-closed). `document_root`/`auto_prepend_file` are relative to the **site container** and refused if they resolve outside it. A file that exists but cannot be honoured takes **that one site** out of service (503) rather than falling back to serving its container, which would be wider than the operator asked for. **The directory must live outside `sites_dir`** — startup fails closed otherwise. `open_basedir` is unaffected and stays the site container. Unset disables the mechanism. See [Virtual Hosts → Per-site document root](/guides/virtual-hosts/#per-site-document-root-frameworks-with-a-public-directory) and [Per-site `auto_prepend_file`](/guides/virtual-hosts/#per-site-auto_prepend_file-bootstrap-one-site-before-every-request). |
+| `site_overrides_dir` | path | (none) | **Multi-tenant only.** Directory of operator-supplied per-site overrides, one `<site-key>.toml` per virtual host. Keys: `document_root = "public"` (that site's web root), `auto_prepend_file = ".preview-env.php"` (a PHP file that site runs before every request — per-request mode only), and a `[preview_auth]` section that turns the [preview access gate](/guides/virtual-hosts/#preview_auth-the-access-gate) on for that vhost (enforced on the static **and** PHP paths, fail-closed) — full key list in [Per-site override files](#per-site-override-files-site_overrides_dir) below. `document_root`/`auto_prepend_file` are relative to the **site container** and refused if they resolve outside it. A file that exists but cannot be honoured takes **that one site** out of service (503) rather than falling back to serving its container, which would be wider than the operator asked for. **The directory must live outside `sites_dir`** — startup fails closed otherwise. `open_basedir` is unaffected and stays the site container. Unset disables the mechanism. See [Virtual Hosts → Per-site document root](/guides/virtual-hosts/#per-site-document-root-frameworks-with-a-public-directory) and [Per-site `auto_prepend_file`](/guides/virtual-hosts/#per-site-auto_prepend_file-bootstrap-one-site-before-every-request). |
 | `run_as_user` | string | (none) | **Unix only.** Numeric uid or username to drop the whole process to after binding privileged ports and opening root-owned files, before serving. See [Virtual Hosts → Dropping root](/guides/virtual-hosts/#dropping-root-run_as_user). A **single non-root uid for the whole process, not per-tenant.** Ignored (with a warning) when not started as root or on Windows. |
 | `run_as_group` | string | (none) | **Unix only.** Numeric gid or group name to drop to alongside `run_as_user`. Defaults to the user's primary group (named user) or the same numeric id as the uid. Only consulted when `run_as_user` is set. |
 | `index_files` | array of strings | `["index.php", "index.html"]` | Index file names to try when a directory is requested. |
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
-| `preview` | bool | `false` | Preview-host preset for **not-production** PR-preview instances. Adds `X-Ephpm-Preview: 1` to every response, and every `[server.limits]` knob you did not set explicitly resolves to a preview default instead of "off": `max_connections = 256`, `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`, `per_site_burst = 20`. The preset also supplies one `[php]` knob: [`overload = "shed"`](#php), so a saturated preview instance answers `503` + `Retry-After` instead of absorbing requests until the client times out. Explicit values always win — including explicit `0`, which disables that limit even under preview, and an explicit `overload = "wait"`. Startup logs exactly which values the preset supplied. Env override: `EPHPM_SERVER__PREVIEW=true`. |
+| `preview` | bool | `false` | Preview-host preset for **not-production** PR-preview instances. Adds `X-Ephpm-Preview: 1` to every response, and every `[server.limits]` knob you did not set explicitly resolves to a preview default instead of "off": `max_connections = 256`, `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`, `per_site_burst = 20`. The preset also supplies one `[php]` knob: [`overload = "shed"`](#php), so a saturated preview instance answers `503` + `Retry-After` instead of absorbing requests until the client times out. Explicit values always win — including explicit `0`, which disables that limit even under preview, and an explicit `overload = "wait"`. Startup logs exactly which values the preset supplied. **Behind a load balancer** the preset's `per_ip_max_connections = 32` counts the balancer, not each client, and so caps the whole node — see [Behind a load balancer](#behind-a-load-balancer-or-reverse-proxy). Env override: `EPHPM_SERVER__PREVIEW=true`. |
+
+### Per-site override files (`site_overrides_dir`)
+
+Not part of `ephpm.toml`: one `<site_overrides_dir>/<site-key>.toml` per virtual host, written by the operator or a provisioning daemon and never by the tenant. Multi-tenant mode only. `<site-key>` is the canonical site key (the vhost directory name under `sites_dir`); a file whose name matches no site is never read. Unknown keys — at the top level or inside `[preview_auth]` — are ignored with a `WARN`; a key ePHPm implements with a value it cannot honour takes that one site out of service (`503`). See [Virtual Hosts](/guides/virtual-hosts/#per-site-document-root-frameworks-with-a-public-directory) for the narrative.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `document_root` | path | (the site container) | The site's web root, relative to the site container. Must resolve to a directory inside it. |
+| `auto_prepend_file` | path | (none) | A PHP file run before every request to this site, relative to the container. Must resolve to a regular file inside it. Per-request mode only; worker mode warns that it is inert. |
+| `[preview_auth]` | section | (absent = no gate) | Turns the [preview access gate](/guides/virtual-hosts/#preview_auth-the-access-gate) on for this vhost. ePHPm builds a per-site [`preview-gate`](/guides/native-middleware/#preview-gate) instance from it and runs it on the static, PHP and WebSocket paths, fail-closed. Keys below. |
+
+**`[preview_auth]` keys.** `session_secret` and `login_url` are required. Every other key is optional and, when omitted, takes the `preview-gate` builtin's default. A declared section that cannot be honoured — a missing required key, a secret shorter than 32 bytes, an unset `env:` variable, an unreadable `file:`, a malformed `repo` — takes the site out of service (`503`); it never serves the preview ungated.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `session_secret` | string | **required** | HS256 secret shared with the `github-auth` issuer. Accepts a literal, `env:NAME` (read that environment variable), or `file:/abs/path` (read the file); the value is trimmed and must be **at least 32 bytes**. Prefer `env:`/`file:` — this file is usually derived from tenant-influenced input. Passed to the gate as its `secret` key. |
+| `login_url` | string | **required** | Where an unauthenticated browser is redirected — the issuer's login endpoint, normally `/_ephpm/auth/github/login` (reachable, see [the reserved namespace](#the-_ephpm-namespace-is-reserved)). |
+| `repo` | string | (none) | The preview's repository as `owner/name`. Validated here and handed to the OAuth issuer for per-preview authorization; it is **not** given to the gate's verifier. |
+| `cookie` | string | `"ephpm_session"` | Session cookie name. Must match the issuer's `cookie_name`. |
+| `issuer` | string | (none) | Required `iss` claim. |
+| `audience` | string | (none) | Required `aud` claim. |
+| `require_https` | bool | `true` | Refuse a credential presented over cleartext (loopback exempt). |
+| `require_site` | bool | `true` | Require the token's `site` claim to equal this vhost's site key, so a session for one preview never opens another. |
+| `share_param` | string | `"ephpm_share"` | Query parameter carrying a shareable-URL capability token. |
+| `share_epoch` | integer | `0` | Static revoke-all floor: a share token issued (`iat`) before this Unix time is refused. |
+| `share_revocation` | bool | `true` | Consult the per-site KV deny-list and epoch for share tokens. |
+| `return_to_param` | string | (none) | Query parameter on `login_url` carrying the validated same-origin return path. |
+| `site_param` | string | (none) | Query parameter on `login_url` carrying this vhost's site key. |
+| `exempt_paths` | array of strings | `[]` | Absolute request paths that bypass the gate. Not needed for the default `/_ephpm/auth/…` endpoints, which the gate never sees. |
+
+The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub OAuth App's client secret) is **not** configured here. It is an out-of-tree module mounted globally under `[[middleware]]` — see the [GitHub auth middleware guide](/guides/github-auth-middleware/).
 
 ### `[server]` — WebSocket entrypoint
 
@@ -53,7 +84,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 |-----|------|---------|-------------|
 | `max_body_size` | u64 (bytes) | `10_485_760` (10 MiB) | Max request body. `0` = unlimited. Exceeding sends 413. |
 | `max_header_size` | usize (bytes) | `8192` | Max total request header size. |
-| `trusted_hosts` | array of strings | `[]` | Allowed `Host` header values. Empty = allow all. Mismatched hosts get 421. `/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/primary`, `/_ephpm/requests` (when the request timeline is enabled), and the metrics path are exempt (probes/scrapes address pods by IP). |
+| `trusted_hosts` | array of strings | `[]` | Allowed `Host` header values. Empty = allow all. Mismatched hosts get 421. Case-insensitive. A bare entry (`"example.com"`) matches that host on any port; an entry with a port (`"example.com:8080"`) matches only that exact `host:port`. A trailing dot is not stripped, so `example.com.` is refused by `"example.com"`. `/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/primary`, `/_ephpm/requests` (when the request timeline is enabled), and the metrics path are exempt (probes/scrapes address pods by IP). |
 | `middleware_body_limit` | u64 (bytes) | `0` (disabled) | Max request-body bytes buffered and exposed to **request-phase** native middleware via the `request_body` ABI accessor. `0` (default) disables buffering — the chain runs before the body is read, so a `RESPOND` never pays for the transfer. When `> 0` **and** a `[[middleware]]` chain is mounted, the body is buffered up front so middleware can inspect up to this many bytes (a longer body is truncated *for the middleware view only*; the full body, subject to `max_body_size`, still reaches PHP). Enables webhook/HMAC verification, CSRF-with-body, and payload validation. Buffering bypasses worker-mode request streaming for such requests. |
 
 ### `[server.timeouts]` (all in seconds)
@@ -61,7 +92,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `header_read` | u64 | `30` | Time to receive complete request headers after connect. |
-| `idle` | u64 | `60` | Idle connection timeout. |
+| `idle` | u64 | `60` | Idle connection timeout: a connection with no read or write activity for this long is shut down gracefully. `0` disables it. |
 | `request` | u64 | `300` | Total request timeout including PHP execution. `0` disables the per-request deadline (the router skips arming a tokio timer per request); a stuck request then relies on the idle/header-read timeouts instead of a hard cutoff. |
 | `shutdown` | u64 | `30` | Grace period for in-flight connections during shutdown. |
 
@@ -70,7 +101,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `compression` | bool | `true` | Enable compression for text responses — brotli when the client accepts it, gzip fallback. |
-| `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). |
+| `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). It is the gzip level, and the same number (capped at 9) is used as the brotli quality when brotli is negotiated — it is not rescaled onto brotli's 0–11 range. |
 | `compression_min_size` | usize (bytes) | `1024` | Minimum response size before compression applies. |
 | `compression_streaming` | string | `"off"` | Streamed worker-response (`send_response_stream`) compression: `"off"` (identity, byte-for-byte the previous behavior), `"sse"` (brotli with a per-event flush and a stream-lifetime window for `text/event-stream` responses), `"all"` (every streamed response). Needs `compression = true` and a client `Accept-Encoding: br`; unknown values warn at startup and act as `"off"`. Buffered responses are unaffected. |
 | `headers` | array of `[string, string]` | `[]` | Custom headers added to every response. |
@@ -96,7 +127,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
+| `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. From a trusted peer, the client address (`REMOTE_ADDR`, the access log's `client_ip`, `per_ip_rate`) is the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy, and `HTTPS` follows `X-Forwarded-Proto`. See [Behind a load balancer](#behind-a-load-balancer-or-reverse-proxy) for what is *not* honoured. |
 | `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. Patterns are matched against the `/`-separated URI path; a request path containing a literal `\` is refused with 400 before matching, so a `/`-written glob cannot be walked around with a backslash on Windows. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
 | `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the **site container** (the vhost directory under `sites_dir`) plus that site's own private temp/session state root (never the shared system temp — see [Virtual Hosts → Filesystem Isolation](/guides/virtual-hosts/#filesystem-isolation-temp-sessions)). Note *container*, not document root: with `site_overrides_dir` a site's web root may be a subdirectory, and the sandbox deliberately stays the whole container so PHP can `require` from above the web root. **Multi-tenant only — see below.** |
@@ -108,13 +139,17 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 > when `[server] sites_dir` is set. In single-site mode the values resolve
 > normally but nothing acts on them: `open_basedir` is gated on
 > `sites_dir.is_some()` before the per-request ini hook applies it, and
-> `disable_shell_exec` is gated the same way before it is written into the
-> generated `php.ini`. Setting either to `true` on a single-site deployment
-> gives you **no sandboxing and no warning**. To harden a single-site install,
+> `disable_shell_exec` and `multi_tenant_hardening` are gated the same way
+> before anything is written into the generated `php.ini`. Setting any of the
+> three to `true` on a single-site deployment gives you **no sandboxing** —
+> ePHPm logs a startup warning for each flag that resolves to `true` while
+> inert, but it does not refuse to start. To harden a single-site install,
 > use `[php] ini_overrides` to set `open_basedir` / `disable_functions`
 > directly.
 
 **Note:** an explicitly set value always wins. When unset, these three resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation, shell-exec hardening, and the full hardening denylist by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do). `multi_tenant_hardening = false` keeps persistent DB/socket connections at the cost of the cross-tenant channels the preset closes.
+
+"Section present" includes a section created only by an environment variable: setting **any** `EPHPM_SERVER__SECURITY__*` variable — for example `EPHPM_SERVER__SECURITY__TRUSTED_PROXIES` — makes `[server.security]` present, so the three flags resolve to `true` unless set. In multi-tenant mode that changes nothing (they already default to `true` there). In single-site mode they stay inert, but adding `trusted_proxies` alone is enough to produce the three "inert" startup warnings; set the flags to `false` explicitly to silence them.
 
 **These flags do nothing in single-site mode** (`server.sites_dir` unset). They are implemented only on the vhost request path: `open_basedir` is set per-request from the resolved site's directory, and the `disable_functions` line (baseline + hardening) is only written into the generated php.ini when `sites_dir` is set. Because a single-site `document_root` is the *web root* rather than a site container directory, confining PHP to it would break any application that keeps its code above the web root — so the multi-tenant mechanism is not reused here. ephpm logs a warning at startup for each flag that resolves to `true` while inert, rather than silently doing nothing.
 
@@ -127,6 +162,18 @@ ini_overrides = [
   ["disable_functions", "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"],
 ]
 ```
+
+### Behind a load balancer or reverse proxy
+
+When ePHPm sits behind nginx, HAProxy, a cloud load balancer or Cloudflare, every TCP connection comes from the balancer. What that changes:
+
+- **Set `[server.security] trusted_proxies`** to the balancer's address range. Without it, `REMOTE_ADDR`, the access log's `client_ip` and `[server.limits] per_ip_rate` all see the balancer's IP, so one rate-limit bucket throttles all traffic.
+- **`per_ip_max_connections` ignores `trusted_proxies`.** It is enforced when the connection is accepted, against the raw TCP peer, before any header is read. Behind a balancer it caps the balancer's connections to this node, not each client's. The `[server] preview` preset sets it to `32`, which then caps the **whole node** at 32 concurrent connections from that balancer; set `per_ip_max_connections = 0` (or a value sized for the balancer) under `[server.limits]` when previews run behind one. `max_connections` is unaffected.
+- **Only `X-Forwarded-For` and `X-Forwarded-Proto` are read.** `X-Forwarded-Host`, `X-Forwarded-Port` and RFC 7239 `Forwarded` are ignored: vhost resolution, `trusted_hosts` and `SERVER_NAME` always use the request's own `Host` (or HTTP/2–3 `:authority`), so the balancer must forward the original `Host` unchanged. PHP still sees those headers as ordinary `HTTP_*` variables.
+- **A trusted `X-Forwarded-Proto` overrides the connection.** From a trusted peer, any value other than `https` turns `HTTPS` off — even on a connection ePHPm terminated with TLS itself. Make the balancer send `X-Forwarded-Proto: https` for HTTPS traffic, or strip the header.
+- Headers from a peer **outside** `trusted_proxies` are ignored, so a client cannot spoof its address by sending `X-Forwarded-For` directly.
+
+The built-in [`[[server.proxy]]`](#serverproxy--built-in-reverse-proxy) is the opposite direction (ePHPm forwarding to an upstream) and is covered separately.
 
 ### `[server.tenant_network]`
 
@@ -182,7 +229,9 @@ Every path at or under `/_ephpm/` is answered by ePHPm itself and is **never**
 routed to your application — in per-request and worker
 mode alike. This matters most in worker mode, where the framework owns every
 non-static path: without the reservation an operator probing a server endpoint
-would get the *application's* answer (issue #444).
+would get the *application's* answer (issue #444). The one sub-namespace not
+answered by ePHPm itself is `/_ephpm/auth/`, which goes to auth middleware
+instead (see the table) — it still never reaches the application.
 
 | Path | Method | Answer |
 |---|---|---|
@@ -190,8 +239,9 @@ would get the *application's* answer (issue #444).
 | `/_ephpm/ready` | GET | `200`/`503` — readiness (PHP initialized, workers booted, DB proxies connected). |
 | `/_ephpm/primary` | GET | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a clustered-SQLite replica. |
 | `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. |
+| `/_ephpm/auth/…` | any | **Carved out for auth middleware.** Not answered by the server directly: after `trusted_hosts` and vhost resolution it is handed to the global `[[middleware]]` request-phase chain, so an auth module (e.g. the `github-auth` issuer's `/_ephpm/auth/github/login` and `/callback`) can serve it. If no mounted module responds, or no chain is mounted, the answer is `404`. It never reaches your application, and a per-site `[preview_auth]` gate is not run on it. |
 | any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
-| any of the above | not GET | `405` with `Allow: GET`. |
+| any of the above except `/_ephpm/auth/…` | not GET | `405` with `Allow: GET`. |
 
 The Prometheus endpoint is **not** in this namespace: its path is yours to
 choose (`[server.metrics] path`, default `/metrics`), so with
@@ -259,8 +309,8 @@ including explicit `0` = that limit off.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_connections` | usize | `0` (preview preset: `256`) | Total concurrent connections. `0` = unlimited. Connections beyond the limit get a raw 503 at accept time and are closed, not served. |
-| `per_ip_max_connections` | usize | `0` (preview preset: `32`) | Per-IP concurrent connections. `0` = unlimited. |
-| `per_ip_rate` | f64 | `0.0` (preview preset: `10.0`) | Per-IP requests/second (token bucket). Over-limit requests get 429. `0` = unlimited. |
+| `per_ip_max_connections` | usize | `0` (preview preset: `32`) | Per-IP concurrent connections. `0` = unlimited. Counted at accept time against the **raw TCP peer** — `trusted_proxies` does not apply, so behind a load balancer this limits the balancer's connections to the node (see [Behind a load balancer](#behind-a-load-balancer-or-reverse-proxy)). |
+| `per_ip_rate` | f64 | `0.0` (preview preset: `10.0`) | Per-IP requests/second (token bucket), keyed by the client address after `[server.security] trusted_proxies` resolution. Over-limit requests get 429. `0` = unlimited. |
 | `per_ip_burst` | u32 | `50` (preview preset: `50`) | Burst allowance for per-IP rate limiting. |
 | `per_site_rate` | f64 | `0.0` (preview preset: `5.0`) | Per-virtual-host **PHP executions**/second (token bucket), keyed by the canonical site key from vhost resolution — so one tenant addressed as `blog.localhost` and `blog` drains one bucket. Over-limit requests get 429 with `Retry-After`, before PHP runs. Static files and PHP-ETag-cache 304s are not counted. Only acts when `[server] sites_dir` is set (requests that match no site have no site key and are not per-site-capped). `0` = unlimited. |
 | `per_site_burst` | u32 | `20` (preview preset: `20`) | Burst allowance for the per-site rate limit: PHP executions a site may make instantly before `per_site_rate` applies. |
@@ -311,8 +361,8 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `google_service_account_json` | string | (none) | Service-account JSON key **contents** inline. Usually supplied via `EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON`. |
 | `google_project` | string | (none) | GCP project id owning the Cloud DNS zone. **Required** when `dns_provider = "google"`. |
 | `google_managed_zone` | string | (none) | Explicit Cloud DNS managed-zone name. When absent, resolved from the challenge FQDN by listing the project's managed zones. |
-| `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves HTTP and this serves HTTPS. |
-| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). |
+| `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves plain HTTP and this serves HTTPS. **When unset, `[server] listen` serves HTTPS only and there is no plain-HTTP listener at all** — enabling TLS on a default `0.0.0.0:8080` config turns that port into HTTPS and drops HTTP. Set this (e.g. `"0.0.0.0:443"`, with `[server] listen = "0.0.0.0:80"`) to serve both. |
+| `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). When `false`, that listener keeps serving plain HTTP normally. Has no effect without `listen` (startup logs a warning). |
 
 Credentials follow one rule across every provider: the `*_file` variant wins over the inline value, and both can be supplied entirely from the environment (`EPHPM_SERVER__TLS__<FIELD>`) so no secret has to live in `ephpm.toml`. `Config::validate` requires the selected provider's credential(s) at startup and rejects an unknown `dns_provider` rather than silently doing nothing.
 
@@ -472,7 +522,7 @@ alt_svc_max_age = 86400
 | `opcache_memory_consumption` | u32 (MB) | (auto-derived) | Override `opcache.memory_consumption`. Unset → auto-derived in serve mode (~18% of the detected memory budget, clamped `[64, 512]` MB on Linux/macOS and `[64, 256]` MB on Windows); dev keeps PHP's 128 MB. An explicit value is honoured on every platform. See [Resource-aware autotuning](#resource-aware-autotuning). |
 | `opcache_interned_strings_buffer` | u32 (MB) | (auto-derived) | Override `opcache.interned_strings_buffer`. Unset → auto-derived (~1 MB per 16 MB of opcache SHM, clamped `[8, 64]` MB) in serve mode; PHP default in dev. |
 | `opcache_jit_buffer_size` | u32 (MB) | (auto-derived) | Override `opcache.jit_buffer_size`. Unset → auto-sized (~1/64 of memory, clamped `[32, 64]` MB) in serve mode. Whether the JIT *uses* the buffer is governed by `opcache_jit` (below). When the JIT is on and no size was derived (dev mode), the same derivation is forced so an enabled JIT is never silently bufferless. An explicit `0` is respected — and warned about — because it makes the JIT inert. |
-| `opcache_jit` | string | (shaped — see [OPcache JIT](#opcache-jit)) | `opcache.jit` mode: `"tracing"`, `"function"`, or `"disable"` (anything else is a startup error; raw CRTO digits are deliberately not accepted — use `ini_overrides` if you truly need them). Set explicitly, it wins in **every** mode. **Unset, the default is shaped:** `tracing` in single-site `ephpm serve`; `disable` in multi-tenant serve (`sites_dir` set — per-vhost invalidation never reclaims JIT buffer), in worker mode (not positively verified against the persistent-worker lifecycle), and in dev. Startup always logs the effective state and why. Env: `EPHPM_PHP__OPCACHE_JIT=disable`. |
+| `opcache_jit` | string | unset (→ `disable` in every mode — see [OPcache JIT](#opcache-jit)) | `opcache.jit` mode: `"tracing"`, `"function"`, or `"disable"` (anything else is a startup error; raw CRTO digits are deliberately not accepted — use `ini_overrides` if you truly need them). Set explicitly, it wins in **every** mode. **Unset, the JIT is off (`disable`) in every mode**, for a different reason in each: single-site serve (an unfixed upstream tracing-JIT defect crashes the process), multi-tenant serve (`sites_dir` set — per-vhost invalidation never reclaims JIT buffer), worker mode (not positively verified against the persistent-worker lifecycle), and dev (no `opcache.jit` line is emitted). Startup always logs the effective state and why. Env: `EPHPM_PHP__OPCACHE_JIT=disable`. |
 | `opcache_max_accelerated_files` | u32 | `20000` (serve) | Override `opcache.max_accelerated_files`. A generous **fixed** default in serve mode (PHP default in dev). Deliberately *not* derived from memory — the right value is shaped by how many `.php` files the app has, not the machine size. |
 | `php_memory_limit` | string | (auto-derived) | Override the per-request `memory_limit`, taking precedence over `memory_limit` **and** the derivation. Unset → serve mode derives `(memory_budget − opcache_shm − ~64 MB overhead) / concurrency`, floored at `128 MB`; with no detectable memory budget it keeps PHP's `128M`. Dev keeps `memory_limit`. |
 | `realpath_cache_size` | string | `16M` (serve) | Override `realpath_cache_size`. Serve uses `16M` (vs PHP's `256K`) to cut `realpath()`/`stat()` traffic on deep autoload trees; dev keeps the PHP default so new files resolve instantly. |
@@ -488,6 +538,32 @@ alt_svc_max_age = 86400
 | `overload` | string | unset (`"wait"`; `"shed"` under `[server] preview`) | What a PHP request does when no execution slot is free. `"wait"` queues and waits — historical behaviour, where the outer `[server.timeouts] request` deadline is the only bound. `"shed"` answers `503 Service Unavailable` + `Retry-After: 1` once the request has waited `shed_after_ms`, turning overload into fast, countable errors instead of client timeouts. **Unset is not the same as `"wait"`**: it resolves to `"shed"` under `[server] preview = true` (set `"wait"` explicitly to opt out). What it bounds is the dispatch queue (`queue_depth`), which always exists, so shedding works out of the box. Startup logs which policy is in force and where it came from. Ignored in worker mode (startup WARNs). Shed responses are counted by `ephpm_php_shed_total`. An unknown value is a startup error. Env: `EPHPM_PHP__OVERLOAD=shed`. |
 | `shed_after_ms` | u64 (ms) | `0` | How long a request may wait for a PHP execution slot before `overload = "shed"` rejects it. `0` = do not wait at all — take a free slot if there is one, otherwise shed immediately (the dispatch queue, `queue_depth` slots, is already the buffer). Raise it to absorb bursts before shedding. Inert when the policy is `"wait"`. Env: `EPHPM_PHP__SHED_AFTER_MS=250`. |
 | `admission` | string | `"fifo"` | Dispatch-admission policy for the bounded queues in front of PHP execution — the per-request pool and the worker pool. `"fifo"` (**default**) admits waiters in strict arrival order via a FIFO-fair semaphore — removes the multi-lap starvation tail (worker-mode P99 280 ms → 58 ms at unchanged throughput, issue #442). `"barge"` restores the pre-fix racing admission (wait in the bounded channel's own `send()`, where a fresh request can steal a freed slot ahead of parked waiters) — work-conserving but unfair; operator escape hatch. An unknown value is a startup error. Startup logs the effective policy on the pool-started line. Env: `EPHPM_PHP__ADMISSION=barge`. |
+
+### PHP errors are displayed to clients by default
+
+> **`display_errors` is on in every mode, including `ephpm serve`.** ePHPm
+> never writes a `display_errors` line into the php.ini it generates, so PHP's
+> compiled-in default applies: `display_errors=1`. Warnings, notices and fatal
+> errors are written into the **HTTP response body**, as plain text (the
+> embedded SAPI sets `html_errors=0`), including the script's full filesystem
+> path. In per-request mode `log_errors` is also left at PHP's default of `0`,
+> so by default these messages reach the client and **not** ePHPm's log.
+> There is no separate "production" default — `ephpm serve` and `ephpm dev`
+> behave the same here.
+
+For production, turn display off and logging on:
+
+```toml
+[php]
+ini_overrides = [
+  ["display_errors", "Off"],
+  ["log_errors", "On"],
+]
+```
+
+or, from the environment, `EPHPM_PHP__INI_OVERRIDES='[["display_errors","Off"],["log_errors","On"]]'`. With `log_errors` on, each message appears in ePHPm's own log as a `[PHP] PHP Warning: …` line. A `display_errors` line in your `[php] ini_file` works too. Check the effective value with `ini_get('display_errors')` from a request.
+
+Worker mode is the one exception on the logging side: it seeds `log_errors=On` (see `ini_overrides` above), but `display_errors` is still PHP's default there too.
 
 ### `[php.worker]`
 
@@ -840,19 +916,29 @@ and the membership check is per-host and trusts the TCP source address.
 ## `[[middleware]]`
 
 Native middleware mounts — repeatable array-of-tables. Each mount resolves
-against the **builtin registry first**: the eleven official modules (`jwt`,
+against the **builtin registry first**: the twelve official modules (`jwt`,
 `session-cookie`, `cors`, `ratelimit`, `security-headers`, `api-key`,
 `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`,
-`header-transform`) are compiled into every binary and run in-process — no
-shared library on disk,
+`header-transform`, `preview-gate`) are compiled into every binary and run
+in-process — no shared library on disk,
 no `dlopen`. `request-id` and `header-transform` also run in the response
-phase. Any other name
+phase. (`preview-gate` is usually activated per site through a
+[`[preview_auth]` override](#per-site-override-files-site_overrides_dir)
+rather than mounted here.) Any other name
 loads a shared library (`.so`/`.dylib`/`.dll`) at startup. Loading is
 fail-fast: a builtin rejecting its config, an unresolvable library, a
-missing ABI symbol, or a failing module `init` aborts server startup. The
-chain is evaluated on every PHP-bound request, before the request body is
-read. Mounts apply globally, not per vhost — a module can discriminate by
-vhost via the request's server name. See the
+missing ABI symbol, or a failing module `init` aborts server startup.
+
+**Where the chain runs.** The native request phase runs on PHP-bound
+requests **and** on static-file requests (before the file is read, so a
+mount can gate confidential static assets), and on the
+[`/_ephpm/auth/` sub-namespace](#the-_ephpm-namespace-is-reserved). It runs
+before the request body is read, unless `[server.request]
+middleware_body_limit` is above `0`, in which case the body is buffered first
+so modules can inspect it. Internal endpoints (the rest of `/_ephpm/*`, metrics, ACME)
+and the `trusted_hosts` / hidden-file / `blocked_paths` rejections answer
+before the chain and are never seen by it. Mounts apply globally, not per
+vhost — a module can discriminate by vhost via the request's server name. See the
 [Native Middleware guide](/guides/native-middleware/).
 
 **Built-ins work in every binary.** Shared-library mounts (custom
@@ -865,8 +951,8 @@ at startup) — see the guide's
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `library` | string | **required** | A `php:`-prefixed script path (**experimental PHP lane** — see below), a builtin name (`jwt`, `session-cookie`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
-| `match` | string | (none) | Glob the request path must match for the mount to run. `*` matches any character sequence, including `/`. Unset = every PHP-bound request. |
+| `library` | string | **required** | A `php:`-prefixed script path (**experimental PHP lane** — see below), a builtin name (`jwt`, `session-cookie`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform`, `preview-gate`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
+| `match` | string | (none) | Glob the request path must match for the mount to run. `*` matches any character sequence, including `/`. Unset = every request the chain sees — PHP-bound **and** static-file (a `php:` mount only ever runs on PHP requests). |
 | `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. Orders sort **within a lane**, not across the two lanes — see the PHP lane below. |
 | `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init` (native lanes) or returned by `ephpm_middleware_config()` (PHP lane). |
 
@@ -886,8 +972,8 @@ config  = { realm = "admin" }
 ```
 
 **This is a different chain position from the native lanes, not a third
-implementation of the same one.** Native modules run before the request body
-is read and outside PHP; a `php:` mount runs after the body has been read and
+implementation of the same one.** Native modules run outside PHP, before the
+request body is read (unless `middleware_body_limit > 0`); a `php:` mount runs after the body has been read and
 after every native module. So a `php:` mount **cannot reject before the body
 transfer**, which is the main reason the native lane exists. Startup logs the
 resolved two-phase plan.

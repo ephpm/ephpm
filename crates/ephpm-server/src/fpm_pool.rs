@@ -4,10 +4,30 @@
 //! A fixed pool of dedicated OS threads (`std::thread`, NOT tokio's
 //! `spawn_blocking`) each pull one per-request job off a bounded
 //! [`async_channel`] dispatch queue, run exactly one PHP request, reply on a
-//! [`tokio::sync::oneshot`], and loop. This is the php-fpm model — every
-//! request runs a full `php_request_startup`/`shutdown` cycle inside
-//! [`PhpRuntime::execute`], so framework state never leaks across requests —
-//! but on threads ePHPm owns rather than tokio's shared blocking pool.
+//! [`tokio::sync::oneshot`], finish that request, and loop. This is the
+//! php-fpm model — every request runs a full `php_request_startup`/`shutdown`
+//! cycle, so framework state never leaks across requests — but on threads
+//! ePHPm owns rather than tokio's shared blocking pool.
+//!
+//! # Request end: reply first, then `php_request_shutdown`
+//!
+//! [`PhpRuntime::execute`] returns with the PHP request still open (shutdown
+//! functions have run and the response is complete). The thread sends the
+//! response and only then calls [`PhpRuntime::finish_request`] —
+//! `php_request_shutdown()`: destructors, extension `RSHUTDOWN`, INI restore —
+//! the same order as php-fpm's `fastcgi_finish_request()`. The teardown never
+//! adds to response latency, and it is never deferred to the thread's *next*
+//! request: before v0.11.3 it was, and because the session module writes the
+//! session and releases its lock in `RSHUTDOWN`, a second request on the same
+//! session landed on another thread and blocked on a lock held by an idle one.
+//!
+//! Destructors run tenant code, so the request's per-thread scope must still be
+//! in place during the finish. The KV/DB/WebSocket scopes persist until the
+//! next request overwrites them; anything scope-shaped that the job would
+//! otherwise drop on return (the eBPF tenant tag) is parked with
+//! [`hold_until_finished`] and released after the finish. A finish that runs
+//! longer than [`SLOW_FINISH`] is logged: the thread is idle-but-busy then, with
+//! no request attached that a timeout could charge it to.
 //!
 //! # Why dedicated threads
 //!
@@ -51,7 +71,8 @@
 //!
 //! Owning the threads is what makes crash containment safe, and this is the
 //! part tokio's shared blocking pool could not provide. When
-//! [`PhpRuntime::execute`] contains a C-stack overflow it answers
+//! [`PhpRuntime::execute`] — or the request's teardown,
+//! [`PhpRuntime::finish_request`] — contains a C-stack overflow it answers
 //! [`PhpError::Contained`] and the thread's Zend context is **poisoned** — its
 //! ZMM free lists and `EG(objects_store)` were abandoned mid-mutation. This
 //! pool then, in order: delivers the 500 to the waiting request, runs **no**
@@ -105,6 +126,59 @@ pub type FpmExecOutput = Result<PhpResponse, PhpError>;
 /// `open_basedir`/temp/session INI, OPcache invalidation, and the
 /// `PhpRuntime::execute` bailout crash guard).
 pub type FpmTask = Box<dyn FnOnce() -> FpmExecOutput + Send + 'static>;
+
+/// A request teardown ([`PhpRuntime::finish_request`]) slower than this is
+/// logged at WARN. A hanging destructor or `RSHUTDOWN` ties up a pool thread
+/// with no request attached — invisible to the request timeout, which has
+/// already answered the client — so it gets a line of its own.
+const SLOW_FINISH: Duration = Duration::from_secs(5);
+
+thread_local! {
+    /// Per-request scope parked by [`hold_until_finished`] on this pool
+    /// thread, released once the request's teardown has run.
+    static HELD_UNTIL_FINISHED: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Keep `scope` alive until the current request's PHP teardown
+/// ([`PhpRuntime::finish_request`]) has run on this pool thread, then drop it.
+///
+/// For per-request, per-thread state the [`FpmTask`] would otherwise drop when
+/// it returns — but that must still cover the destructors and `RSHUTDOWN`
+/// handlers that run in the teardown after the response is sent, because they
+/// execute the same tenant's code. The router parks the eBPF tenant tag guard
+/// here. Released on every exit path of the job (normal, contained crash,
+/// panic), after any teardown that path runs. Dropping `scope` must not call
+/// into PHP.
+pub fn hold_until_finished(scope: impl std::any::Any) {
+    HELD_UNTIL_FINISHED.with(|held| held.borrow_mut().push(Box::new(scope)));
+}
+
+/// Drop everything parked by [`hold_until_finished`] on this thread.
+fn release_held_scope() {
+    // Take first, drop outside the borrow: a guard's Drop must never observe
+    // the cell mid-borrow.
+    let held = HELD_UNTIL_FINISHED.with(|held| std::mem::take(&mut *held.borrow_mut()));
+    drop(held);
+}
+
+/// Run the teardown of the request this pool thread just answered, timing it.
+/// Returns `false` if a crash was contained during it (the thread is then
+/// poisoned and must be retired without any further PHP teardown).
+fn finish_request(thread_id: usize) -> bool {
+    let started = Instant::now();
+    let finished = PhpRuntime::finish_request();
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_FINISH {
+        tracing::warn!(
+            thread_id,
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "PHP request teardown (destructors / extension RSHUTDOWN, after the response \
+             was sent) was slow — this pool thread was unavailable meanwhile"
+        );
+    }
+    !matches!(finished, Err(PhpError::Contained(_)))
+}
 
 /// The dispatch channel is closed (pool draining or all threads gone). The
 /// router turns this into a 503.
@@ -647,6 +721,23 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
                     exit = ThreadExit::Poisoned;
                     break;
                 }
+                // The client has its answer; now end the PHP request
+                // (destructors, session write + lock release, extension
+                // RSHUTDOWN, INI restore) while this request's scope is still
+                // in place. A crash contained here poisons the thread exactly
+                // like one contained during execution.
+                if !finish_request(thread_id) {
+                    counter!("ephpm_fpm_pool_contained_crashes_total").increment(1);
+                    tracing::error!(
+                        thread_id,
+                        "fpm pool thread contained a PHP C-stack overflow during request \
+                         teardown (response already delivered) — thread poisoned; abandoning \
+                         it (no PHP teardown) and spawning a replacement"
+                    );
+                    exit = ThreadExit::Poisoned;
+                    break;
+                }
+                release_held_scope();
             }
             Err(_) => {
                 counter!("ephpm_fpm_pool_panics_total").increment(1);
@@ -684,6 +775,10 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
             counter!("ephpm_fpm_pool_recycles_total", "reason" => "panic").increment(1);
         }
     }
+    // A panicked job's request was torn down (if at all) by the shutdown
+    // above; a poisoned one never will be. Either way nothing of its scope is
+    // needed any more.
+    release_held_scope();
     pool.state.live.fetch_sub(1, Ordering::AcqRel);
 
     if exit == ThreadExit::Poisoned {
@@ -833,6 +928,60 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(pool.live_count(), 0, "drain retires every thread");
+    }
+
+    /// Sets its flag when dropped — stands in for the eBPF tag guard.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Scope parked with `hold_until_finished` outlives the job closure — it
+    /// must still be alive when the response is delivered (the teardown that
+    /// runs tenant code comes after) — and is released once the request is
+    /// finished, on the normal path and on the contained-crash path alike.
+    #[tokio::test]
+    async fn held_scope_outlives_the_job_and_is_released_after_finish() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(1, 4, AdmissionPolicy::Fifo);
+        assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
+
+        for contained in [false, true] {
+            let released = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&released);
+            let observed_at_return = Arc::new(AtomicBool::new(true));
+            let observed = Arc::clone(&observed_at_return);
+            let task: FpmTask = Box::new(move || {
+                let probe = Arc::clone(&flag);
+                hold_until_finished(DropFlag(flag));
+                // Still held when the job returns — the closure's own frame is
+                // gone, the scope is not.
+                observed.store(probe.load(Ordering::SeqCst), Ordering::SeqCst);
+                if contained {
+                    Err(PhpError::Contained("teardown test".into()))
+                } else {
+                    Ok(PhpResponse { status: 200, headers: Vec::new(), body: Vec::new() })
+                }
+            });
+            let rx = pool.dispatch(task).await.expect("dispatch ok");
+            let _ = rx.await.expect("thread replied");
+            assert!(
+                !observed_at_return.load(Ordering::SeqCst),
+                "the parked scope must survive the job closure's return"
+            );
+            assert!(
+                wait_for(|| released.load(Ordering::SeqCst)).await,
+                "the parked scope must be released after the request is finished \
+                 (contained = {contained})"
+            );
+            assert!(wait_for(|| pool.ready_count() == 1).await, "pool back to strength");
+        }
+
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the thread");
     }
 
     /// Poison-thread retirement, end to end in stub mode. A job that reports a

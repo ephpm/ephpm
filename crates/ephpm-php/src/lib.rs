@@ -79,8 +79,9 @@ mod ffi {
         /// Reset per-request state.
         pub fn ephpm_request_clear();
 
-        /// Set core request info fields. Pointers must stay valid until
-        /// `ephpm_execute_request` returns.
+        /// Set core request info fields. Pointers must stay valid until the
+        /// request is finished (`ephpm_finish_request`, or the next
+        /// `ephpm_begin_request`): PHP reads them again during shutdown.
         pub fn ephpm_request_set_info(
             method: *const ::std::os::raw::c_char,
             uri: *const ::std::os::raw::c_char,
@@ -93,7 +94,7 @@ mod ffi {
         );
 
         /// Add a `$_SERVER` variable. Pointers must stay valid until
-        /// `ephpm_execute_request` returns.
+        /// `ephpm_begin_request` returns.
         pub fn ephpm_request_add_server_var(
             key: *const ::std::os::raw::c_char,
             value: *const ::std::os::raw::c_char,
@@ -101,7 +102,7 @@ mod ffi {
 
         /// Queue one PHP middleware script for this request, in chain order.
         /// `config_json` may be null. Pointers must stay valid until
-        /// `ephpm_execute_request` returns.
+        /// `ephpm_run_request` returns.
         pub fn ephpm_request_add_middleware(
             path: *const ::std::os::raw::c_char,
             config_json: *const ::std::os::raw::c_char,
@@ -116,13 +117,23 @@ mod ffi {
         /// one is the mount `ephpm_middleware_outcome` describes.
         pub fn ephpm_middleware_ran() -> ::std::os::raw::c_int;
 
-        /// Execute a PHP request with full lifecycle management.
+        /// Start a fresh PHP request on this thread (closing any request
+        /// still open on it). Returns `EPHPM_EXEC_OK` or
+        /// `EPHPM_EXEC_STARTUP_FAIL` — mirrored by `super::exec_code`.
+        pub fn ephpm_begin_request() -> ::std::os::raw::c_int;
+
+        /// Execute the script in the request `ephpm_begin_request` started,
+        /// run shutdown functions, and capture the response. Leaves the
+        /// request active for `ephpm_finish_request`.
         ///
         /// Returns one of the `EPHPM_EXEC_*` codes defined in
         /// `ephpm_wrapper.c` — mirrored by `super::exec_code`.
-        pub fn ephpm_execute_request(
-            filename: *const ::std::os::raw::c_char,
-        ) -> ::std::os::raw::c_int;
+        pub fn ephpm_run_request(filename: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+
+        /// End the active request on this thread (`php_request_shutdown`:
+        /// destructors, extension RSHUTDOWN, INI restore). Idempotent —
+        /// returns 1 if a request was finished, 0 if none was active.
+        pub fn ephpm_finish_request() -> ::std::os::raw::c_int;
 
         /// Get the captured output buffer. Sets `*out_len` to the length.
         pub fn ephpm_get_output_buf(out_len: *mut usize) -> *const ::std::os::raw::c_char;
@@ -348,8 +359,9 @@ impl Drop for ThreadPhpGuard {
         }
         // SAFETY: this thread is TSRM-registered (the flag was set) and is
         // exiting, so no further PHP executes on it. ephpm_thread_shutdown
-        // runs php_request_shutdown (ending the lazily-kept-open final
-        // request on the thread that owns it — its RSHUTDOWNs free
+        // runs php_request_shutdown (ending any request still open on the
+        // thread that owns it — normally none, since every request is
+        // finished eagerly via `PhpRuntime::finish_request`; its RSHUTDOWNs free
         // request-lifetime state, e.g. pcre subpattern-name strings, into
         // this thread's own Zend MM heap) and then ts_free_thread, which
         // destroys this thread's TSRM resources in reverse-id order on this
@@ -432,6 +444,33 @@ fn is_thread_poisoned() -> bool {
     THREAD_POISONED.with(std::cell::Cell::get)
 }
 
+/// Work queued by [`PhpRuntime::at_request_start`], run inside the next
+/// request on this thread right after `php_request_startup()`.
+#[cfg(php_linked)]
+type RequestStartTask = Box<dyn FnOnce()>;
+
+#[cfg(php_linked)]
+thread_local! {
+    /// Tasks queued by [`PhpRuntime::at_request_start`] for the next request
+    /// executed on this thread.
+    static AT_REQUEST_START: std::cell::RefCell<Vec<RequestStartTask>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The host-owned memory the C wrapper borrows for the request currently
+    /// open on this thread (method/URI/query/cookie/content-type/script
+    /// strings, `$_SERVER` entries, middleware mounts, the request body).
+    ///
+    /// `SG(request_info)` keeps pointing at these strings until the request
+    /// ends, and `php_request_shutdown()` drains any unread body through the
+    /// `read_post` callback — so they must outlive the request, not just
+    /// `ephpm_run_request()`. Kept here until [`PhpRuntime::finish_request`]
+    /// (or the next request's `ephpm_begin_request`, which closes an
+    /// unfinished request first) has run `php_request_shutdown()`. Pure Rust
+    /// allocations: dropping them never calls into PHP.
+    static IN_FLIGHT_REQUEST: std::cell::RefCell<Option<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PhpError {
     /// PHP module initialization (`php_embed_init`) failed.
@@ -484,8 +523,9 @@ pub enum PhpError {
     Contained(String),
 }
 
-/// The `EPHPM_EXEC_*` return codes of `ephpm_execute_request` (defined in
-/// `crates/ephpm-php/ephpm_wrapper.c` — keep the two in sync).
+/// The `EPHPM_EXEC_*` return codes of `ephpm_begin_request` /
+/// `ephpm_run_request` (defined in `crates/ephpm-php/ephpm_wrapper.c` — keep
+/// the two in sync).
 #[cfg(php_linked)]
 mod exec_code {
     /// The script ran to completion.
@@ -833,7 +873,7 @@ impl PhpRuntime {
     /// Finalize initialization for HTTP serve mode.
     ///
     /// `php_embed_init()` starts a request automatically. This marks it as
-    /// active so that the first call to `ephpm_execute_request()` properly
+    /// active so that the first request (`ephpm_begin_request()`) properly
     /// shuts it down before starting its own request lifecycle.
     ///
     /// Must be called after [`init()`] and before the first HTTP request.
@@ -852,7 +892,7 @@ impl PhpRuntime {
         #[cfg(php_linked)]
         {
             // Safety: Called once after init, marks the embed's initial request
-            // as active so ephpm_execute_request shuts it down on first call.
+            // as active so ephpm_begin_request shuts it down on first call.
             unsafe { ffi::ephpm_finalize_init() };
             tracing::debug!("PHP embed initial request marked active (ready for HTTP)");
         }
@@ -1062,8 +1102,24 @@ impl PhpRuntime {
     ///
     /// Returns `PhpError::NotInitialized` if the runtime hasn't been
     /// initialized, or `PhpError::ThreadInitFailed` if TSRM registration fails.
+    ///
+    /// # Request end
+    ///
+    /// The PHP request is left **open** when this returns: registered shutdown
+    /// functions have run and output buffers are flushed (the response is
+    /// complete), but `php_request_shutdown()` — object destructors, extension
+    /// `RSHUTDOWN` (session write and session-lock release, Xdebug's debugger
+    /// session end), INI restore — has not. Call [`Self::finish_request`] on the
+    /// same thread once the response has been delivered. A caller that never
+    /// does still gets a correct (if late) teardown: the next `execute` on the
+    /// thread closes the open request first.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn execute(request: PhpRequest) -> Result<PhpResponse, PhpError> {
+    pub fn execute(#[allow(unused_mut)] mut request: PhpRequest) -> Result<PhpResponse, PhpError> {
+        // Whatever was queued for this request runs inside it or not at all —
+        // never inside some later, unrelated request on this thread.
+        #[cfg(php_linked)]
+        let start_tasks = AT_REQUEST_START.with(|q| std::mem::take(&mut *q.borrow_mut()));
+
         if !PHP_INITIALIZED.load(Ordering::Acquire) {
             return Err(PhpError::NotInitialized);
         }
@@ -1091,7 +1147,7 @@ impl PhpRuntime {
 
         #[cfg(php_linked)]
         {
-            let result = Self::execute_php(&request);
+            let result = Self::execute_php(&mut request, start_tasks);
             // Per-request DB-bridge teardown (fpm-mode seam). This is the
             // single choke point every fpm-style request passes through on
             // the same execution thread that ran the script, whatever
@@ -1162,7 +1218,10 @@ impl PhpRuntime {
     /// Sets up per-request state in C, executes the script with proper
     /// request lifecycle management, and captures the response.
     #[cfg(php_linked)]
-    fn execute_php(request: &PhpRequest) -> Result<PhpResponse, PhpError> {
+    fn execute_php(
+        request: &mut PhpRequest,
+        start_tasks: Vec<RequestStartTask>,
+    ) -> Result<PhpResponse, PhpError> {
         use std::ffi::CString;
 
         // Clear previous request state in the C wrapper's thread-local buffers.
@@ -1171,7 +1230,8 @@ impl PhpRuntime {
         unsafe { ffi::ephpm_request_clear() };
 
         // Prepare C strings for the request info.
-        // These must stay alive until ephpm_execute_request returns.
+        // These must stay alive until the request is shut down: they are
+        // moved into IN_FLIGHT_REQUEST after execution (see below).
         let method = CString::new(request.method.as_str())
             .map_err(|e| PhpError::ExecutionFailed(format!("invalid method: {e}")))?;
         let uri = CString::new(request.uri.as_str())
@@ -1214,7 +1274,7 @@ impl PhpRuntime {
         // and every dynamic one is allocated exactly once (issue #133).
         let c_server_vars = request.server_variables_c();
         for (key, value) in &c_server_vars {
-            // Safety: the pointers stay valid until ephpm_execute_request
+            // Safety: the pointers stay valid until ephpm_begin_request
             // returns — static literals live forever, owned CStrings live in
             // `c_server_vars`, which outlives the call.
             unsafe {
@@ -1230,7 +1290,7 @@ impl PhpRuntime {
         // silently mounting a *different* script: the router only ever produces
         // paths under the request's document root, so an interior NUL here
         // means something upstream is wrong and skipping is the safe read.
-        // The strings are bound to locals that outlive ephpm_execute_request.
+        // The strings are bound to locals that outlive ephpm_run_request.
         let c_middleware: Vec<(CString, Option<CString>)> = request
             .middleware
             .iter()
@@ -1253,76 +1313,82 @@ impl PhpRuntime {
         for (path, config) in &c_middleware {
             let config_ptr = config.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
             // Safety: both CStrings live until this function returns, which is
-            // after ephpm_execute_request has consumed them.
+            // after ephpm_run_request has consumed them.
             unsafe {
                 ffi::ephpm_request_add_middleware(path.as_ptr(), config_ptr);
             }
         }
 
-        // Execute the PHP request on this thread's TSRM context.
-        //
-        // Two shapes, selected by the `[php] crash_containment` master switch:
-        //
-        // - OFF (default): the bare FFI call, byte-identical to every release
-        //   before containment existed. A C-stack overflow aborts the process
-        //   via the fatal-signal handler, as it always has.
-        // - ON: the same call inside the per-thread `sigsetjmp` recovery region.
-        //   The region wraps the WHOLE call deliberately, because the deep free
-        //   that overflows the stack can happen in three places inside it — the
-        //   script's own `$graph = null`, the LAZY `php_request_shutdown` of the
-        //   *previous* request at the top of `ephpm_execute_request`, or a
-        //   registered shutdown function.
-        //
-        // Nothing is allocated inside the guarded closure: on containment the
-        // `siglongjmp` skips every Rust destructor between here and the recovery
-        // point, so the closure body is exactly one FFI call and the CStrings /
-        // Vec above (created OUTSIDE it) still drop normally afterwards.
-        let ret = if crash_guard::enabled() {
-            let filename_ptr = script_filename.as_ptr();
-            let mut ret: std::os::raw::c_int = exec_code::BAILOUT;
-            let guarded = crash_guard::run_guarded(|| {
-                // SAFETY: This thread is registered with TSRM. All PHP globals
-                // accessed by ephpm_execute_request are thread-local under ZTS.
-                // The C function uses setjmp/longjmp bailout protection for
-                // PHP-level bailouts; a hardware stack-overflow SIGSEGV escapes
-                // that and is caught by the crash guard's signal-handler
-                // recovery instead. `script_filename` outlives the call.
-                ret = unsafe { ffi::ephpm_execute_request(filename_ptr) };
-            });
+        // Keep every pointer the C side borrows for this request alive until
+        // the request is shut down (`finish_request`, or the next request's
+        // `ephpm_begin_request` if nobody finishes it) — including on a panic
+        // out of a start task, after which the pool's teardown still runs
+        // `php_request_shutdown()` over these strings. Moving the owners into
+        // the slot does not move their heap buffers, so pointers already
+        // handed to C stay valid. The PREVIOUS request's memory is held in
+        // `previous` until `ephpm_begin_request` has closed that request (if
+        // it was still open), and only then dropped.
+        let filename_ptr = script_filename.as_ptr();
+        let in_flight: Box<dyn std::any::Any> = Box::new((
+            [method, uri, query_string, content_type, cookie, script_filename],
+            c_server_vars,
+            c_middleware,
+            std::mem::take(&mut request.body),
+        ));
+        let previous = IN_FLIGHT_REQUEST.with(|slot| slot.borrow_mut().replace(in_flight));
 
-            if guarded == crash_guard::Guarded::Contained {
-                // The recovery jumped out mid-object-destruction: this thread's
-                // ZMM free lists and EG(objects_store) are inconsistent. The
-                // damage is confined to THIS thread, but it must never run PHP
-                // again nor be torn down through php_request_shutdown /
-                // ts_free_thread (both walk the poisoned heap and would
-                // re-crash). mark_thread_poisoned() latches the refusal,
-                // disarms the TLS retirement guard, and makes process teardown
-                // skip module shutdown; the poisoned Zend context is
-                // deliberately leaked. Retiring the OS thread is the caller's
-                // job — see PhpError::Contained.
-                mark_thread_poisoned();
-                tracing::error!(
-                    script = %request.script_filename.display(),
-                    method = %request.method,
-                    uri = %request.uri,
-                    "PHP request overflowed the C stack (deep object-graph free) — \
-                     contained on this thread, returning 500; the thread is poisoned \
-                     and must be retired"
-                );
-                return Err(PhpError::Contained(format!(
-                    "{} ({} {})",
-                    request.script_filename.display(),
-                    request.method,
-                    request.uri
-                )));
+        // Execute the PHP request on this thread's TSRM context, in two FFI
+        // calls with this request's queued maintenance between them:
+        //
+        // 1. `ephpm_begin_request` — `php_request_startup()` (and, only if a
+        //    previous request on this thread was never finished, its
+        //    `php_request_shutdown()` first).
+        // 2. The tasks queued with `at_request_start` (OPcache invalidation,
+        //    JIT stats) — they need a live executor, and between requests a
+        //    per-request thread has none, because `finish_request` closed it.
+        // 3. `ephpm_run_request` — the script, shutdown functions, capture.
+        //
+        // Each FFI call runs through `lifecycle_call`, i.e. inside the
+        // per-thread `sigsetjmp` crash-containment region when
+        // `[php] crash_containment` is on. The deep free that overflows the
+        // C stack can happen in the script's own `$graph = null`, a registered
+        // shutdown function, or an unfinished previous request's teardown in
+        // step 1 — and, for the request's own teardown, in `finish_request`,
+        // which is guarded the same way. The maintenance tasks run OUTSIDE the
+        // guarded region: they are ordinary Rust (whose destructors a
+        // `siglongjmp` would skip) calling C helpers that carry their own
+        // bailout guards and never free user object graphs.
+        let begin = Self::lifecycle_call(|| {
+            // SAFETY: This thread is registered with TSRM; every PHP global
+            // ephpm_begin_request touches is thread-local under ZTS. The
+            // request strings it hands PHP live in IN_FLIGHT_REQUEST until
+            // the request is shut down, and a still-open previous request's
+            // strings are held in `previous` across this call.
+            unsafe { ffi::ephpm_begin_request() }
+        });
+        drop(previous);
+        let ret = match begin {
+            None => return Err(Self::contained(request)),
+            Some(exec_code::OK) => {
+                for task in start_tasks {
+                    task();
+                }
+                let run = Self::lifecycle_call(|| {
+                    // SAFETY: This thread is registered with TSRM and the
+                    // request begun above is active. The C function uses
+                    // setjmp/longjmp bailout protection for PHP-level
+                    // bailouts; a hardware stack-overflow SIGSEGV escapes that
+                    // and is caught by the crash guard's signal-handler
+                    // recovery instead. `filename_ptr` points into the
+                    // script-path CString held in IN_FLIGHT_REQUEST.
+                    unsafe { ffi::ephpm_run_request(filename_ptr) }
+                });
+                let Some(ret) = run else {
+                    return Err(Self::contained(request));
+                };
+                ret
             }
-            ret
-        } else {
-            // SAFETY: This thread is registered with TSRM. All PHP globals
-            // accessed by ephpm_execute_request are thread-local under ZTS.
-            // The C function uses setjmp/longjmp bailout protection.
-            unsafe { ffi::ephpm_execute_request(script_filename.as_ptr()) }
+            Some(other) => other,
         };
 
         // Retrieve the captured response from C
@@ -1447,9 +1513,150 @@ impl PhpRuntime {
                 }
             }
             other => Err(PhpError::ExecutionFailed(format!(
-                "ephpm_execute_request returned an unknown code {other}"
+                "ephpm_run_request returned an unknown code {other}"
             ))),
         }
+    }
+
+    /// Run one PHP-lifecycle FFI call (`ephpm_begin_request`,
+    /// `ephpm_run_request`, `ephpm_finish_request`), inside the per-thread
+    /// stack-overflow recovery region when `[php] crash_containment` is on.
+    ///
+    /// Two shapes, selected by that master switch:
+    ///
+    /// - OFF (default): the bare FFI call, byte-identical to every release
+    ///   before containment existed. A C-stack overflow aborts the process via
+    ///   the fatal-signal handler, as it always has.
+    /// - ON: the same call inside the `sigsetjmp` region.
+    ///
+    /// Returns `None` when a crash was contained. The thread is then already
+    /// marked poisoned: the recovery jumped out mid-object-destruction, so this
+    /// thread's ZMM free lists and `EG(objects_store)` are inconsistent. The
+    /// damage is confined to THIS thread, but it must never run PHP again nor
+    /// be torn down through `php_request_shutdown` / `ts_free_thread` (both
+    /// walk the poisoned heap and would re-crash). `mark_thread_poisoned()`
+    /// latches the refusal, disarms the TLS retirement guard, and makes process
+    /// teardown skip module shutdown; the poisoned Zend context is deliberately
+    /// leaked. Retiring the OS thread is the caller's job — see
+    /// [`PhpError::Contained`].
+    ///
+    /// Nothing is allocated inside the guarded closure: on containment the
+    /// `siglongjmp` skips every Rust destructor between the call and the
+    /// recovery point, so `call` must be exactly one FFI call whose borrowed
+    /// arguments were created OUTSIDE it.
+    #[cfg(php_linked)]
+    fn lifecycle_call(call: impl FnOnce() -> std::os::raw::c_int) -> Option<std::os::raw::c_int> {
+        if !crash_guard::enabled() {
+            return Some(call());
+        }
+        let mut ret: std::os::raw::c_int = exec_code::BAILOUT;
+        let guarded = crash_guard::run_guarded(|| ret = call());
+        if guarded == crash_guard::Guarded::Contained {
+            mark_thread_poisoned();
+            return None;
+        }
+        Some(ret)
+    }
+
+    /// Log a contained crash for `request` and build its error. The thread has
+    /// already been poisoned by [`Self::lifecycle_call`].
+    #[cfg(php_linked)]
+    fn contained(request: &PhpRequest) -> PhpError {
+        tracing::error!(
+            script = %request.script_filename.display(),
+            method = %request.method,
+            uri = %request.uri,
+            "PHP request overflowed the C stack (deep object-graph free) — \
+             contained on this thread, returning 500; the thread is poisoned \
+             and must be retired"
+        );
+        PhpError::Contained(format!(
+            "{} ({} {})",
+            request.script_filename.display(),
+            request.method,
+            request.uri
+        ))
+    }
+
+    /// End the PHP request [`Self::execute`] left open on this thread:
+    /// `php_request_shutdown()`.
+    ///
+    /// This is where PHP's end-of-request work happens — global objects'
+    /// `__destruct`, every extension's `RSHUTDOWN` (the session module writes
+    /// the session and **releases its lock** here; Xdebug ends its DBGp session
+    /// and flushes profiler output), and INI restore (which unwinds the
+    /// per-vhost `open_basedir`/temp/session directives). Call it on the same
+    /// thread right after the response has been handed to the client, so the
+    /// teardown costs no response latency but is never deferred to the
+    /// thread's *next* request: deferring it is what made a second request on
+    /// the same session block on the lock held by an idle thread.
+    ///
+    /// Runs under the crash guard exactly like execution (a deep object-graph
+    /// free here can overflow the C stack too). Any per-thread state the caller
+    /// set for the request (KV keyspace, DB site, WebSocket scope, eBPF tag)
+    /// should still be in place, since destructors run tenant code. Idempotent:
+    /// a no-op when no request is open, on a poisoned thread, before
+    /// [`Self::init`], and in stub mode.
+    ///
+    /// # Errors
+    ///
+    /// [`PhpError::Contained`] if a C-stack overflow was contained during the
+    /// teardown. The thread is then poisoned and must be retired without any
+    /// further PHP teardown — the same contract as a contained `execute`.
+    pub fn finish_request() -> Result<(), PhpError> {
+        #[cfg(php_linked)]
+        {
+            if !PHP_INITIALIZED.load(Ordering::Acquire) || is_thread_poisoned() {
+                return Ok(());
+            }
+            if !THREAD_REGISTERED.with(|g| g.registered.get()) {
+                return Ok(());
+            }
+            let finished = Self::lifecycle_call(|| {
+                // SAFETY: This thread is registered with TSRM and not poisoned.
+                // ephpm_finish_request is a no-op without an active request and
+                // wraps php_request_shutdown in zend_try, so no bailout reaches
+                // Rust. The strings the request borrowed are still alive in
+                // IN_FLIGHT_REQUEST, which is released only after this returns.
+                unsafe { ffi::ephpm_finish_request() }
+            });
+            let Some(_) = finished else {
+                tracing::error!(
+                    "PHP request teardown overflowed the C stack (deep object-graph free in a \
+                     destructor) — contained on this thread; the thread is poisoned and must be \
+                     retired"
+                );
+                return Err(PhpError::Contained("request teardown (php_request_shutdown)".into()));
+            };
+            IN_FLIGHT_REQUEST.with(|slot| slot.borrow_mut().take());
+            // Destructors and RSHUTDOWN handlers can use `ephpm_db_*` too; give
+            // anything they left behind (an open transaction, staged results)
+            // the same end-of-request rollback/release the script's own state
+            // got in `execute`. Pure Rust + litewire — no Zend calls.
+            db_bridge::on_request_end();
+        }
+        Ok(())
+    }
+
+    /// Queue `task` to run inside the next PHP request [`Self::execute`] runs
+    /// on this thread, right after `php_request_startup()` and before the
+    /// script.
+    ///
+    /// For maintenance that needs a live PHP executor — OPcache invalidation,
+    /// JIT buffer sampling — but must happen before the script runs. Between
+    /// requests a per-request thread has no active PHP request (see
+    /// [`Self::finish_request`]), so calling such helpers directly from the
+    /// dispatch closure would reach the engine with its executor shut down.
+    ///
+    /// Tasks queued on a thread that then fails before the request starts
+    /// (not initialized, poisoned, TSRM registration failure, startup failure)
+    /// are dropped unrun, never carried into a later request. In stub mode
+    /// (no libphp) the task runs immediately.
+    pub fn at_request_start(task: impl FnOnce() + 'static) {
+        #[cfg(php_linked)]
+        AT_REQUEST_START.with(|q| q.borrow_mut().push(Box::new(task)));
+        #[cfg(not(php_linked))]
+        task();
     }
 
     /// Register the KV store so PHP native `ephpm_kv_*` functions can

@@ -1715,13 +1715,17 @@ Client ──HTTP──► hyper (tokio)
                         ├── send_header() → capture headers
                         ├── read_post() → provide POST data
                         └── read_cookies() → provide cookies
-                     4. php_request_shutdown()
-                     5. Return (status, headers, body)
+                     4. Return (status, headers, body)
                             │
                             ▼
                 Build hyper::Response
                             │
 Client ◄──HTTP──────────────┘
+
+             then, on the same PHP thread, after the reply:
+                     5. php_request_shutdown()
+                        (destructors, session write +
+                         unlock, extension RSHUTDOWN)
 ```
 
 ---
