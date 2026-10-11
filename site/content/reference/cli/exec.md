@@ -32,7 +32,8 @@ sudo ephpm exec --config /etc/ephpm/ephpm.toml --site shop --timeout 600 -- bash
 ```
 
 Everything after `--` is the command and its arguments. The command is looked up
-on `PATH` (`execvp`).
+on the sandbox's fixed `PATH` (see [Environment](#environment)), not the
+caller's.
 
 ## Flags
 
@@ -95,7 +96,8 @@ In order:
    that the drop took). The drop cannot be undone.
 7. Changes into the site's web root. If that fails, it logs a warning and
    stays in the current directory.
-8. Replaces itself with the command.
+8. Replaces itself with the command, with a cleared environment (see
+   [Environment](#environment)).
 
 Each run logs the site, uid/gid, timeout, and command at INFO before the
 sandbox is entered.
@@ -106,10 +108,6 @@ sandbox is entered.
   only. ePHPm itself adds no egress rules. A host can filter by the tenant's uid
   (the ePHPm preview fleet does this with an operator-managed nftables table),
   but that is your host's configuration, not part of this command.
-- **It does not clean the environment.** The command inherits `ephpm exec`'s
-  environment unchanged. Don't run it with secrets in the environment
-  (`EPHPM_KV__SECRET`, cloud credentials, tokens) unless the command is meant to
-  see them.
 - **It does not hide paths readable through the read+execute grants.** Anything
   under `/usr`, `/opt`, `/lib`, `/bin` or `/sbin` is readable inside the
   sandbox. Don't keep the ePHPm config or other secrets there.
@@ -120,6 +118,34 @@ sandbox is entered.
 `access(2)` (for example `test -r`) is not checked by Landlock. A sandboxed
 command can still learn that a file is readable by its uid, even though opening
 it fails.
+
+## Environment
+
+The command does **not** inherit `ephpm exec`'s environment. It starts from an
+empty environment plus this fixed allowlist:
+
+| Variable | Value |
+|----------|-------|
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` (the caller's `PATH` is ignored) |
+| `HOME` | the tenant's private state root |
+| `TMPDIR` | the state root's `tmp/` |
+| `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ` | copied from the caller, when set |
+
+Everything else is dropped, with or without `--no-sandbox`: `EPHPM_*` overrides
+such as `EPHPM_KV__SECRET` (the master secret every tenant credential derives
+from), cloud credentials, tokens, `SSH_AUTH_SOCK`, `SUDO_*`, `LD_PRELOAD`.
+`ephpm exec` injects no credentials of its own either. To give the command a
+specific non-secret variable, set it inside the command:
+
+```bash
+sudo ephpm exec --site shop -- env NODE_ENV=production npm run build
+```
+
+Through v0.11.3 the command inherited `ephpm exec`'s whole environment
+unchanged. A build step that relied on that (for example `COMPOSER_AUTH`, or a
+binary found through the caller's `PATH` such as `/root/.composer/vendor/bin`)
+now has to set the variable or use the full path explicitly, and only for
+values the tenant is allowed to see.
 
 ## Timeout
 
@@ -136,7 +162,9 @@ clamped.
 caller's full privileges** (root, under `sudo`): no Landlock scope, no uid
 drop, no `PR_SET_NO_NEW_PRIVS`. A warning is logged. It does not need root, but the tenant user (`run_as_user`, else `ephpm-web`) is still resolved first, so that account must exist.
 The config is still loaded, the site is still resolved, `--timeout` still
-applies, and the command still starts in the site's web root.
+applies, the command still starts in the site's web root, and its environment
+is still cleared. Because step 2 is skipped, `HOME` and `TMPDIR` may point at a
+state root that does not exist yet.
 
 It removes all containment. Never use it for a command you don't trust. It does
 not enable `ephpm exec` on non-Linux platforms.
@@ -176,8 +204,10 @@ ephpm exec --site shop -- ephpm php --site shop --config /etc/ephpm/ephpm.toml -
 > purpose. Hiding that file from the tenant command is the point of the
 > sandbox. As shipped, the inner command cannot load its config and fails.
 > Don't work around it by moving the config somewhere the sandbox can read, or
-> by passing `EPHPM_KV__SECRET` in the environment: either one hands the master
-> secret to the tenant's command. Until this is resolved, run
+> by setting `EPHPM_KV__SECRET` inside the command (`-- env EPHPM_KV__SECRET=...`):
+> either one hands the master secret to the tenant's command. (A secret in the
+> caller's own environment never reaches the command; see
+> [Environment](#environment).) Until this is resolved, run
 > `ephpm php --site` as the operator, outside `ephpm exec`.
 
 ## See also
