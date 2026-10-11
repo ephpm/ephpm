@@ -79,6 +79,14 @@ on:
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+# Cancel superseded PR runs: only the head commit needs to be green, and the
+# self-hosted Linux x64 pool is a few slots. Pushes to main, the daily schedule
+# and dispatches are keyed on their own run id, so nothing ever cancels or
+# displaces them (see the note in ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Credentials for throwaway loopback containers that live for the duration of
