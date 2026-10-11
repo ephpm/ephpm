@@ -72,10 +72,12 @@ use abi::{EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 /// unmatched host into one bucket is the fail-closed direction.
 ///
 /// A module that must *deny* rather than bucket unmatched requests should
-/// branch on `None` directly instead of using this.
+/// branch on `None` directly instead of using this — and only when
+/// [`Request::node_is_multi_tenant`] is `true`, since on an untenanted node
+/// `None` is every request.
 ///
 /// Note this is the **only** bucket a single-site node ever uses: with no
-/// `sites_dir` and no `[[site]]`, the router matches no vhost, so every request
+/// `sites_dir`, the router matches no vhost, so every request
 /// has `vhost_id() == None`. A single-site deployment therefore sees keys like
 /// `mw:maintenance:_UNMATCHED` — that is the expected shape there, not a
 /// degraded one.
@@ -100,6 +102,13 @@ pub trait Middleware: Sized + Send + Sync + 'static {
     /// have been updated. **All twelve in-tree builtins declare their keys**:
     /// they ship inside the same binary as this check, so there is no
     /// cross-version skew to tolerate.
+    ///
+    /// On the dlopen lane [`declare!`] also exports the declaration to the
+    /// host as the optional `ephpm_middleware_config_keys` symbol
+    /// ([`abi::SYM_CONFIG_KEYS`], issue #480), so the host checks the mount
+    /// before `init` runs — and can tell a module that declared from one that
+    /// cannot say. `None` exports a NULL, which the host reads as "not
+    /// declared", exactly like a module built before the symbol existed.
     ///
     /// Only the top level is described here. A module whose config nests
     /// (sections, e.g. `header_transform`'s `request` / `response`) checks the
@@ -282,11 +291,13 @@ impl Request<'_> {
     /// client input. A gate should treat `None` as "no tenant" and fail closed
     /// rather than substituting the header (issue #390).
     ///
-    /// **`None` is the normal case on a single-site node.** With neither
-    /// `sites_dir` nor any `[[site]]` configured the router matches no vhost at
+    /// **`None` is the normal case on a single-site node.** With no
+    /// `sites_dir` configured the router matches no vhost at
     /// all, so this is `None` on every request there — treat it as "one
     /// tenant", not as an error. [`UNMATCHED_VHOST`] is the conventional key
-    /// component for that bucket.
+    /// component for that bucket. [`node_is_multi_tenant`](Self::node_is_multi_tenant)
+    /// (ABI minor 5) tells that case apart from "multi-site node, unmatched
+    /// `Host`".
     ///
     /// Normalization is the router's, not the header's: `Site.Example`,
     /// `site.example:8080` and `site.example.` all resolve to one key, and a
@@ -376,6 +387,24 @@ impl Request<'_> {
         // SAFETY: contract of `from_raw`; the minor gate above guarantees the
         // `request_gate_repo` field is present on this host's table.
         self.opt_str_of(unsafe { (self.host.request_gate_repo)(self.raw) })
+    }
+
+    /// Whether this node has virtual hosting configured (ABI minor 5) — what
+    /// tells the two meanings of [`vhost_id`](Self::vhost_id)` == None` apart.
+    ///
+    /// * `false`: the node has no tenancy, so every request has no vhost. Serve
+    ///   it as the one untenanted bucket ([`UNMATCHED_VHOST`]).
+    /// * `true`: the node is multi-tenant, so `None` means this request's
+    ///   `Host` matched no site. "Deny unknown tenants" denies exactly this.
+    ///
+    /// `false` on a host older than [`abi::ABI_MINOR_NODE_TENANCY`], which
+    /// cannot say — deliberately the serving answer, so a module never denies
+    /// all traffic on an untenanted node because the host was too old to tell
+    /// it otherwise (issue #453). Shorthand for
+    /// `req.host().node_is_multi_tenant()`.
+    #[must_use]
+    pub fn node_is_multi_tenant(&self) -> bool {
+        self.host().node_is_multi_tenant()
     }
 
     /// Bounded, read-only view of the buffered request body (borrowed; valid
@@ -772,6 +801,23 @@ impl<'a> Host<'a> {
         (rc == 0).then_some(out)
     }
 
+    /// Whether this node has virtual hosting configured (ABI minor 5). See
+    /// [`Request::node_is_multi_tenant`] for what each answer means.
+    ///
+    /// A node-level fact, so unlike the request accessors it is meaningful
+    /// outside `invoke` too. `false` on a host older than
+    /// [`abi::ABI_MINOR_NODE_TENANCY`] — the serving answer, never the denying
+    /// one.
+    #[must_use]
+    pub fn node_is_multi_tenant(&self) -> bool {
+        if self.minor() < abi::ABI_MINOR_NODE_TENANCY {
+            return false;
+        }
+        // SAFETY: takes no arguments; the minor gate above guarantees the
+        // `node_is_multi_tenant` field is present on this host's table.
+        (unsafe { (self.table.node_is_multi_tenant)() }) != 0
+    }
+
     /// Log through the host's `tracing` subscriber.
     pub fn log(&self, level: i32, msg: &str) {
         // SAFETY: valid slice for the duration of the call.
@@ -914,7 +960,10 @@ impl ResponseView<'_> {
 
 // ── declare! ──────────────────────────────────────────────────────────────
 
-/// Generate the four C ABI exports around a [`Middleware`] implementation.
+/// Generate the C ABI exports around a [`Middleware`] implementation: the
+/// three mandatory symbols, `describe`, the config-key declaration
+/// ([`abi::SYM_CONFIG_KEYS`], from [`Middleware::CONFIG_KEYS`]), and — with
+/// `declare!(Type, response)` — the response phase.
 ///
 /// Handles: ABI major-version check, config JSON parsing, host-table
 /// stashing (retrievable via `__ephpm_mw_host()` for [`Host`]), response
@@ -1088,6 +1137,24 @@ macro_rules! declare {
                     .as_ptr()
             }
 
+            static CONFIG_KEYS_JSON: std::sync::OnceLock<Option<CString>> =
+                std::sync::OnceLock::new();
+
+            // The optional config-key declaration (issue #480), read by the
+            // host BEFORE `init`. A macro cannot decide whether to emit a
+            // symbol from an associated const's value, so it is always
+            // exported and returns NULL for `CONFIG_KEYS = None` — which the
+            // host treats exactly like an absent symbol ("not declared").
+            #[unsafe(no_mangle)]
+            unsafe extern "C" fn ephpm_middleware_config_keys() -> *const c_char {
+                CONFIG_KEYS_JSON
+                    .get_or_init(|| {
+                        $crate::__config_keys_json(<$ty as $crate::Middleware>::CONFIG_KEYS)
+                    })
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| c.as_ptr())
+            }
+
             // Optional response-phase export, emitted only for
             // `declare!($ty, response)`. `$response` is the literal token
             // `response`; referencing it in the doc attribute keeps the `?`
@@ -1181,6 +1248,20 @@ macro_rules! declare {
 
 // Re-export for the macro body.
 pub use serde_json;
+
+/// Internal: the [`abi::SYM_CONFIG_KEYS`] answer for a module's
+/// [`Middleware::CONFIG_KEYS`] — a JSON array of the key names, or `None` (the
+/// symbol returns NULL) when the module does not declare. Used by [`declare!`].
+///
+/// A key name containing NUL cannot be a C string; rather than export a
+/// truncated list the host would then enforce, the module reports itself as
+/// undeclared. Unreachable for real schema names.
+#[doc(hidden)]
+#[must_use]
+pub fn __config_keys_json(keys: Option<&[&str]>) -> Option<CString> {
+    let json = serde_json::to_string(keys?).ok()?;
+    CString::new(json).ok()
+}
 
 impl Response {
     /// Internal: raw action code (used by [`declare!`] glue).

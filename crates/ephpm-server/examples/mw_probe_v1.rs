@@ -25,8 +25,10 @@ pub struct Probe {
 
 impl Middleware for Probe {
     /// Declared so the dlopen lane's enforcement of `CONFIG_KEYS` is covered
-    /// by a real cdylib built through `declare!` — the check lives in the
-    /// authoring kit compiled into the module, not in the host.
+    /// by a real cdylib built through `declare!`. Since issue #480 that is
+    /// enforced twice: by the host, from the `ephpm_middleware_config_keys`
+    /// symbol `declare!` exports, before `init`; and again by the authoring
+    /// kit compiled into the module, inside `init`.
     const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["tag"]);
 
     fn init(config: &serde_json::Value) -> Result<Self, String> {
@@ -56,6 +58,11 @@ impl Middleware for Probe {
             .response_header("X-Probe-Secure", if req.is_secure() { "1" } else { "0" })
             .response_header("X-Probe-Host", req.http_host())
             .response_header("X-Probe-Body", String::from_utf8_lossy(req.body()).into_owned())
+            // Minor 5 (issue #469): the node-level tenancy flag.
+            .response_header(
+                "X-Probe-Multi-Tenant",
+                if req.node_is_multi_tenant() { "1" } else { "0" },
+            )
     }
 
     fn describe() -> &'static str {

@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -779,6 +780,28 @@ unsafe extern "C" fn kv_incr_ttl_global(
     unsafe { kv_incr_ttl_in(kv_global_store(), key, key_len, by, ttl_secs, out) }
 }
 
+// ── Node tenancy (minor 5) ────────────────────────────────────────────────
+
+/// Whether this node has virtual hosting configured — the answer behind the
+/// `node_is_multi_tenant` slot. Set once at startup by
+/// [`set_node_multi_tenant`]; `false` until then, which is the safe default
+/// (an untenanted node serves, it does not deny — issue #453).
+///
+/// An atomic rather than a `OnceLock` so tests can drive both answers; the
+/// server writes it exactly once, before any module is loaded.
+static NODE_MULTI_TENANT: AtomicBool = AtomicBool::new(false);
+
+/// Tell the host table whether this node has virtual hosting configured
+/// (`[server] sites_dir`). Call once at startup **before** loading any
+/// middleware: a module may read the flag from its `init`.
+pub fn set_node_multi_tenant(multi_tenant: bool) {
+    NODE_MULTI_TENANT.store(multi_tenant, Ordering::Release);
+}
+
+unsafe extern "C" fn node_is_multi_tenant() -> c_int {
+    c_int::from(NODE_MULTI_TENANT.load(Ordering::Acquire))
+}
+
 unsafe extern "C" fn host_log(level: c_int, msg: *const u8, msg_len: usize) {
     if msg.is_null() {
         return;
@@ -822,6 +845,7 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_incr_global,
     kv_incr_ttl_global,
     request_gate_repo,
+    node_is_multi_tenant,
 };
 
 /// Wire the process-global KV store into the host table. Call once at startup,
@@ -945,6 +969,38 @@ mod tests {
         // SAFETY: ctx and `old` outlive the view.
         let req = unsafe { Request::from_raw(ctx.as_abi(), &old) };
         assert_eq!(req.gate_repo(), None, "an older host has no gate-repo slot to read");
+    }
+
+    /// Issue #469: the safe accessors read the minor-5 slot, and a module built
+    /// for minor 5 talking to a minor-4 host must neither read past that
+    /// host's table nor assume tenancy. The stub below *answers* "multi-tenant"
+    /// so the older-host case can only come out `false` by honouring the minor
+    /// gate — the fallback that keeps a single-site node served (#453).
+    #[test]
+    fn node_tenancy_reads_the_slot_and_is_false_on_an_older_host() {
+        unsafe extern "C" fn yes() -> c_int {
+            1
+        }
+        unsafe extern "C" fn no() -> c_int {
+            0
+        }
+
+        let multi = EphpmHostV1 { node_is_multi_tenant: yes, ..*host_table() };
+        let single = EphpmHostV1 { node_is_multi_tenant: no, ..*host_table() };
+        let ctx = ctx();
+        for (table, expected) in [(&multi, true), (&single, false)] {
+            // SAFETY: ctx and `table` outlive the view.
+            let req = unsafe { Request::from_raw(ctx.as_abi(), table) };
+            assert_eq!(req.node_is_multi_tenant(), expected);
+            assert_eq!(Host::new(table).node_is_multi_tenant(), expected);
+        }
+
+        let old = EphpmHostV1 { abi_version: 0x0100_0004, ..multi };
+        assert!((old.abi_version & 0x00FF_FFFF) < abi::ABI_MINOR_NODE_TENANCY);
+        // SAFETY: ctx and `old` outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), &old) };
+        assert!(!req.node_is_multi_tenant(), "an older host must read as untenanted");
+        assert!(!Host::new(&old).node_is_multi_tenant());
     }
 
     #[test]

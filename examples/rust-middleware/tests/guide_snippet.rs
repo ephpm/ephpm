@@ -117,8 +117,9 @@ fn guide_quotes_the_compiled_tenant_scope_block() {
 /// `let Some(x) = req.vhost_id() else { ... }` has no correct unconditional
 /// form: the `else` arm runs on every request of a single-site node, so a
 /// snippet written that way either denies all traffic or teaches a reader to.
-/// A module that genuinely wants to deny gates it on operator config (see the
-/// `require_vhost` branch of the block above) rather than on `None` alone.
+/// A module that genuinely wants to deny gates it on the node actually being
+/// multi-tenant (`node_is_multi_tenant()`, ABI minor 5) or on operator config
+/// (see the deny branch of the block above) rather than on `None` alone.
 #[test]
 fn no_unconditional_vhost_denial_in_the_guide() {
     for (n, line) in GUIDE.lines().enumerate() {

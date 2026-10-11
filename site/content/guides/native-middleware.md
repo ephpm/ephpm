@@ -165,10 +165,17 @@ Two things are deliberately *not* checked:
   `response.set`. Any key is valid there by definition. Section names are
   checked: `header-transform`'s `response = { sett = ... }` is an error.
 - **Third-party (`dlopen`ed) modules that do not declare a key set.** The host
-  cannot know a module's schema, so strictness there is the module's own
-  choice — see [Writing your own module](#writing-your-own-module-in-rust). A
-  module built against an older authoring kit keeps the old lenient behaviour;
-  its `config` typos are still silent.
+  cannot know a module's schema unless the module exports it through the
+  optional `ephpm_middleware_config_keys` symbol. A Rust module does this by
+  declaring `CONFIG_KEYS` (see
+  [Writing your own module](#writing-your-own-module-in-rust)); a C module
+  exports the symbol by hand (see [The C ABI](#the-c-abi-for-non-rust-modules)).
+  ePHPm then checks the mount before the module's `init` runs. A module that
+  does not export it — including anything built against an authoring kit older
+  than the symbol — gets no host-side check: a `config` typo is caught only if
+  the module's own `init` checks (as a kit-built module with `CONFIG_KEYS`
+  does), and is otherwise silent. The startup log line says which case a mount is
+  (`config_keys=declared` / `config_keys=undeclared`).
 
 ### Secrets in `config` are literal
 
@@ -850,7 +857,7 @@ impl Middleware for MyAuth {
     // you read. A mount carrying anything else then fails startup naming the
     // key, instead of running your defaults. Omit it and unknown keys stay
     // silently ignored — the pre-#473 behaviour, kept as the default because
-    // the host cannot know your schema.
+    // the host cannot know your schema unless you tell it.
     const CONFIG_KEYS: Option<&'static [&'static str]> = Some(&["api_key"]);
 
     fn init(config: &serde_json::Value) -> Result<Self, String> {
@@ -871,18 +878,29 @@ impl Middleware for MyAuth {
 declare!(MyAuth);
 ```
 
-`declare!(MyAuth)` generates the four C ABI exports, the ABI major-version
-check, config JSON parsing, the `CONFIG_KEYS` check, response marshaling, and
-panic containment (a panicking `invoke` becomes a fail-closed 500). To add the
-optional response phase, implement `ResponseMiddleware` and write
-`declare!(MyAuth, response)` — see
+`declare!(MyAuth)` generates the C ABI exports (the three mandatory symbols,
+`describe`, and the optional `ephpm_middleware_config_keys`), the ABI
+major-version check, config JSON parsing, the `CONFIG_KEYS` check, response
+marshaling, and panic containment (a panicking `invoke` becomes a fail-closed
+500). To add the optional response phase, implement `ResponseMiddleware` and
+write `declare!(MyAuth, response)` — see
 [Response phase](#response-phase-transforming-the-response).
 
-`CONFIG_KEYS` is enforced by the authoring kit compiled into *your* module, not
-by the host, so it needs no ABI support and works with any ePHPm that can load
-the module at all. It describes the **top level** only: if your config nests,
-call `ephpm_middleware::config::reject_unknown_keys(&section, "section", &[...])`
+`CONFIG_KEYS` is enforced twice. The authoring kit compiled into *your* module
+checks it inside `init`, which works with any ePHPm that can load the module at
+all. `declare!` also exports the list as `ephpm_middleware_config_keys`, and an
+ePHPm that knows that symbol checks the mount **before** calling `init`, with
+the same error a builtin gives — the mount, the key, and a did-you-mean. The
+host check is what lets a module written in C or Zig get the same protection;
+see [The C ABI](#the-c-abi-for-non-rust-modules). The list describes the **top
+level** only: if your config nests, call
+`ephpm_middleware::config::reject_unknown_keys(&section, "section", &[...])`
 from your own `init` for each section, and leave free-form maps unchecked.
+
+The startup line for a dlopened module says which applies:
+`middleware initialised ... config_keys=declared` (the host checked this
+mount) or `config_keys=undeclared` (the module does not export a key list, so a
+typo in its `config` is invisible to ePHPm).
 
 Inside `invoke`, `req.host()` exposes host services:
 
@@ -1001,22 +1019,29 @@ gets a fresh keyspace (and a fresh rate-limit budget) per `Host` value they
 invent.
 
 **`None` is the normal case on a single-site node**, not an edge case. With
-neither `sites_dir` nor any `[[site]]` configured there are no vhosts to match,
+no `sites_dir` configured there are no vhosts to match,
 so `vhost_id()` is `None` on every request. Handle it as "one tenant", not as
 an error — the stock modules bucket it under `UNMATCHED_VHOST`, which is why a
 single-site `maintenance-mode` flag lives at `mw:maintenance:_UNMATCHED`. (C
 modules get a raw NULL here and **must** null-check; Rust's `Option` makes it a
 compile error.)
 
-**`None` is two situations the ABI cannot tell apart** (issue
-[#453](https://github.com/ephpm/ephpm/issues/453)): "this node has no tenancy
-configured" and "this multi-site node matched nothing". The ABI (as of minor
-4) exposes no `multi_tenant` flag, so a module cannot distinguish them. That makes *denying*
-on `None` an operator decision, not a module default: a module that denies
-unconditionally — a bare `let Some(site) = … else { return deny };` over
-`vhost_id()` — denies **100% of traffic** on the single-site shape, which is
-the majority of deployments. Expose it as a config knob (below, `require_vhost`, default
-`false`) and let the operator who knows the node is multi-tenant switch it on.
+**`None` is two situations**: "this node has no tenancy configured" and
+"this multi-site node matched nothing". `req.node_is_multi_tenant()` (ABI
+minor 5, issue [#469](https://github.com/ephpm/ephpm/issues/469)) tells them
+apart: it is `true` when the node has `[server] sites_dir` set, `false`
+otherwise. Use it. A module that denies on `None` alone — a bare
+`let Some(site) = … else { return deny };` over `vhost_id()` — denies **100%
+of traffic** on the single-site shape, which is the majority of deployments
+(issue [#453](https://github.com/ephpm/ephpm/issues/453)). Deny `None` only
+when `node_is_multi_tenant()` is `true`.
+
+`node_is_multi_tenant()` is a node-level fact, valid outside `invoke` too
+(`req.host().node_is_multi_tenant()`, or `Host::new(__ephpm_mw_host())` from a
+`declare!`d module's `init`). Against a host older than minor 5, which cannot
+report it, it returns **`false`**. That is deliberately the answer that keeps
+traffic flowing. A module that needs to deny unknown hosts even on such an
+older host can add an operator knob as a fallback, like `require_vhost` below.
 
 The three-way handling, quoted verbatim from
 [`examples/rust-middleware`](https://github.com/ephpm/ephpm/blob/main/examples/rust-middleware/src/lib.rs)
@@ -1029,18 +1054,22 @@ build if this block and that source ever diverge:
 //
 // `vhost_id()` is the router's canonical site key. `None` does *not*
 // mean "hostile": it is every request on a single-site node (no
-// `sites_dir`, no `[[site]]`, so nothing to match) and an unmatched
-// `Host` on a multi-site one — and the ABI cannot tell those two
-// apart (issue #453). A bare `let Some(site) = … else { deny }`
-// therefore denies 100% of traffic on the most common node shape.
+// `sites_dir`, so nothing to match) and an unmatched `Host` on a
+// multi-site one. `node_is_multi_tenant()` (ABI minor 5) tells the
+// two apart. A bare `let Some(site) = … else { deny }` ignores it,
+// and so denies 100% of traffic on the most common node shape
+// (issue #453).
 let vhost = match req.vhost_id() {
     // A router-resolved tenant. Scope per-site state to this key —
     // never to `http_host()`, which the client chose.
     Some(site) => site,
-    // No tenant, and the operator has declared this node multi-tenant
-    // (`require_vhost = true`), so an unmatched `Host` really is
-    // unknown: deny. Opt-in only, for the reason above.
-    None if self.require_vhost => return Self::reject(404, "unknown host"),
+    // No tenant on a node that HAS tenants: this `Host` matched no
+    // site, so it really is unknown — deny. `require_vhost = true`
+    // forces the same answer on a host older than minor 5, where
+    // `node_is_multi_tenant()` can only answer `false`.
+    None if req.node_is_multi_tenant() || self.require_vhost => {
+        return Self::reject(404, "unknown host");
+    }
     // No tenant and tenancy is not in use: serve the request as the
     // single untenanted bucket. `UNMATCHED_VHOST` is unspellable as a
     // site key, so it cannot collide with a real tenant, and every
@@ -1050,12 +1079,12 @@ let vhost = match req.vhost_id() {
 };
 ```
 
-`Self::reject` is that module's own JSON-error helper and `require_vhost` is a
-key in its `config` table, defaulting to `false`. The stock `ratelimit` and
-`maintenance-mode` modules take the third branch unconditionally — plain
-`req.vhost_id().unwrap_or(UNMATCHED_VHOST)`, no knob — because a shared bucket
-is the right answer for them either way. Reserve the deny branch for an
-operator gate (an `api-key`-shaped module), and keep it behind config.
+`Self::reject` is that module's own JSON-error helper. `require_vhost` is a key
+in its `config` table, defaulting to `false`, and only matters on a pre-minor-5
+host. The stock `ratelimit` and `maintenance-mode` modules take the third
+branch unconditionally — plain `req.vhost_id().unwrap_or(UNMATCHED_VHOST)`, no
+deny — because a shared bucket is the right answer for them either way.
+Reserve the deny branch for an operator gate (an `api-key`-shaped module).
 
 Reach for `http_host()` only when you genuinely want the host as sent — a
 canonical-host redirect, a log line — never as a lookup key for per-tenant
@@ -1103,9 +1132,25 @@ const char* ephpm_middleware_describe(void);   /* optional, nullable */
 int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
                                          const ephpm_response_ctx_t* response,
                                          ephpm_response_edit_t* edit_out);
+
+/* Optional: the top-level `config` keys this module accepts, as a static,
+   NUL-terminated JSON array of strings, e.g. "[\"burst\",\"per_ip_rps\"]".
+   Absent symbol or NULL return = "not declared" (no host-side check). */
+const char* ephpm_middleware_config_keys(void);
 ```
 
-- `abi_version` is `0x01_00_00_04` — major **1**, minor **4**. The **major
+- `ephpm_middleware_config_keys` (issue
+  [#480](https://github.com/ephpm/ephpm/issues/480)) is how a module that does
+  not use the Rust authoring kit gets ePHPm to check its `config`. The host
+  calls it **before** `init`. When it returns an array, a mount whose `config`
+  names any other top-level key fails startup with the same message a builtin
+  gives (mount, key, did-you-mean), so your `init` never sees the typo. When the
+  symbol is absent or returns NULL, the mount loads exactly as it always did,
+  unchecked. `[]` is a real declaration ("accepts no keys"). Anything that is
+  not a JSON array of strings refuses the mount, naming the symbol. The string
+  must stay valid for the life of the library. Exporting it needs no minor
+  check: it flows module → host, and an older ePHPm simply never looks it up.
+- `abi_version` is `0x01_00_00_05` — major **1**, minor **5**. The **major
   byte** gates compatibility; modules must refuse to init (return non-zero)
   when the host's major is newer than they were built for. The lower three
   bytes are an additive **minor** level: growth (new host-table fields, the
@@ -1115,8 +1160,10 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   minor **1** added the response phase, minor **2** the appended request
   accessors (`request_scheme`/`request_is_secure`/`request_host`), minor
   **3** the appended process-global KV slots (`kv_get_global` and its four
-  siblings), minor **4** the appended `request_gate_repo` accessor (purely
-  additive — nothing existing changed in minor 4).
+  siblings), minor **4** the appended `request_gate_repo` accessor, minor
+  **5** the appended `node_is_multi_tenant` slot (both purely additive —
+  nothing existing changed in minor 4 or 5). Gate on `>=` the minor you need,
+  never on an exact minor, or your module stops loading on the next ePHPm.
 - **Minor 3 also redefined two existing surfaces** (issues #390 and #376), and
   the two have *different* blast radii — do not read them as one bullet:
   - `request_vhost_id` changes on **every** node. It returns the canonical
@@ -1154,7 +1201,12 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   the allocation rather than touching a store), and — minor 4 —
   `request_gate_repo`: the vhost's operator-declared `[preview_auth] repo` as
   an `owner/name` C string, or **NULL** when unset (C modules must null-check
-  it, and must check the host's minor is ≥ 4 before reading the slot).
+  it, and must check the host's minor is ≥ 4 before reading the slot), and —
+  minor 5 — `int32_t (*node_is_multi_tenant)(void)`: `1` when this node has
+  `[server] sites_dir` set, `0` when it does not. It takes no request pointer
+  and may be called from `init`. Check the host's minor is ≥ 5 first, and treat
+  an older host as `0` (not multi-tenant): assuming `1` there would make a gate
+  deny every request on a single-site node.
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
   `invoke` returns — the host copies before unwinding. The same rule applies

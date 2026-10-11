@@ -23,7 +23,7 @@ Everything below was verified end to end — see
 | Request | Verdict | Result |
 |---|---|---|
 | `GET /health.php` | `ACTION_CONTINUE` | PHP runs untouched; `X-Api-Gate: bypass` appended |
-| `GET /api/v1/users` (no vhost matched, `require_vhost = true`) | `ACTION_RESPOND` | `404` JSON, PHP never runs — **off by default**, see [`require_vhost`](#require_vhost-and-why-the-default-is-false) |
+| `GET /api/v1/users` (no vhost matched on a multi-tenant node) | `ACTION_RESPOND` | `404` JSON, PHP never runs — never on an untenanted node, see [Tenancy](#tenancy-unknown-hosts-and-require_vhost) |
 | `GET /api/v1/users` (no key) | `ACTION_RESPOND` | `401` JSON, PHP never runs |
 | `GET /api/v1/users` (revoked key) | `ACTION_RESPOND` | `403` JSON, PHP never runs |
 | `GET /api/v1/users` (over budget) | `ACTION_RESPOND` | `429` + `Retry-After`, PHP never runs |
@@ -38,10 +38,10 @@ ePHPm's `tracing` stream).
 
 ## The ABI in one page
 
-A middleware module is a shared library exporting four C symbols. The
-canonical definition is
+A middleware module is a shared library exporting three mandatory C symbols
+plus optional ones. The canonical definition is
 [`crates/ephpm-middleware/src/abi.rs`](../../crates/ephpm-middleware/src/abi.rs);
-this is the summary.
+this is the summary (the optional response-phase symbol is omitted here).
 
 ```c
 int32_t     ephpm_middleware_init(uint32_t abi_version,
@@ -50,8 +50,13 @@ int32_t     ephpm_middleware_init(uint32_t abi_version,
 int32_t     ephpm_middleware_invoke(const ephpm_request_t* request,
                                     ephpm_response_t* response_out);
 void        ephpm_middleware_shutdown(void);
-const char* ephpm_middleware_describe(void);   /* optional, nullable */
+const char* ephpm_middleware_describe(void);     /* optional, nullable */
+const char* ephpm_middleware_config_keys(void);  /* optional, nullable: JSON array of accepted config keys */
 ```
+
+`declare!` emits all of these. `ephpm_middleware_config_keys` comes from the
+module's `CONFIG_KEYS`; ePHPm reads it before `init` and refuses a mount whose
+`config` names any other top-level key.
 
 **The host table is passed by pointer**, not `dlsym`'d out of the host
 executable. Exporting symbols from an executable needs `-rdynamic` on Linux
@@ -66,8 +71,8 @@ simply never reads that far.
 
 ### Two rules you must honour
 
-1. **Refuse a newer host major.** `ABI_V1` is `0x01_00_00_00`; the top byte
-   gates compatibility. If `abi_version >> 24` exceeds what you were built
+1. **Refuse a newer host major.** `ABI_V1` is `0x01_00_00_05` (major 1,
+   minor 5); the top byte gates compatibility. If `abi_version >> 24` exceeds what you were built
    for, return non-zero from `init` and do not load. A struct-layout
    disagreement that loads anyway is memory corruption, not a warning.
    `declare!` does this check and returns `-1`.
@@ -177,22 +182,31 @@ than silently not running — which is the only safe default for an auth module.
 | `prefix` (string) | `"/api/"` | only paths with this prefix are gated |
 | `strip_prefix` (string) | unset | removed from the front of the path on `REWRITE` |
 | `requests_per_window` (integer) | `100` | budget per tenant per 10-second window |
-| `require_vhost` (bool) | `false` | deny requests that matched no virtual host — see below |
+| `require_vhost` (bool) | `false` | deny unmatched hosts even on an ePHPm too old to report tenancy — see below |
 
-### `require_vhost`, and why the default is `false`
+The module declares exactly these keys (`CONFIG_KEYS`), so a typo such as
+`requests_per_windw` fails startup with a did-you-mean instead of silently
+running the default budget.
 
-`req.vhost_id()` is `None` for **two** situations the ABI cannot tell apart
-(issue [#453](https://github.com/ephpm/ephpm/issues/453)): a node with no
-tenancy configured (no `sites_dir`, no `[[site]]` — nothing to match, so *every*
-request is `None`), and a multi-site node that matched nothing. A module that
-denies on `None` unconditionally therefore denies all traffic on the first
-shape, which is the majority of deployments.
+### Tenancy: unknown hosts, and `require_vhost`
 
-So this module treats "no tenant" as one untenanted bucket
-(`ephpm_middleware::UNMATCHED_VHOST`) by default — the same choice the stock
-`ratelimit` and `maintenance-mode` modules make — and denial is an operator
-opt-in via `require_vhost = true`, set only by someone who knows the node is
-multi-tenant. The three-way block that implements this is the one the
+`req.vhost_id()` is `None` in **two** situations: a node with no tenancy
+configured (no `sites_dir`, so nothing to match and *every* request is `None`),
+and a multi-site node that matched nothing. A module that denies on `None`
+unconditionally therefore denies all traffic on the first shape, which is the
+majority of deployments (issue
+[#453](https://github.com/ephpm/ephpm/issues/453)).
+
+`req.node_is_multi_tenant()` (ABI minor 5, issue
+[#469](https://github.com/ephpm/ephpm/issues/469)) tells the two apart. This
+module denies `None` only when it is `true`, which is exactly "unknown tenant".
+On an untenanted node it treats every request as one untenanted bucket
+(`ephpm_middleware::UNMATCHED_VHOST`), the same bucket the stock `ratelimit`
+and `maintenance-mode` modules use. An ePHPm older than minor 5 cannot report
+tenancy, and the accessor then returns `false`, the answer that keeps traffic
+flowing. `require_vhost = true` forces the deny on such a host. Set it only
+when you know the node is multi-tenant. The three-way block that implements
+this is the one the
 [native-middleware guide](https://ephpm.dev/guides/native-middleware/) quotes;
 `tests/guide_snippet.rs` fails the build if the guide and `src/lib.rs` drift
 apart, and `a_single_site_node_is_served_not_denied` in `src/lib.rs` asserts

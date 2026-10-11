@@ -188,6 +188,22 @@ crate-type = ["cdylib"]
 name = "mw_probe_no_invoke"
 crate-type = ["cdylib"]
 
+# Hand-rolled (no `declare!`) fixtures for the optional config-key symbol and
+# ABI-minor compatibility (issues #469/#480): a pre-minor-5 module that exports
+# no key declaration, a C-style module that declares its keys but does not check
+# them itself, and one whose declaration is malformed.
+[[example]]
+name = "mw_probe_legacy"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_c_keys"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_c_bad_keys"
+crate-type = ["cdylib"]
+
 # Response-phase proof module (tests/middleware_response_phase.rs). Opts into
 # the response phase via `declare!(Type, response)`, so it exports the optional
 # `ephpm_middleware_invoke_response` symbol the mw_probe_* fixtures do not.
