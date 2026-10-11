@@ -12,10 +12,10 @@ The container-based flow below is still valid for reproducing failures when you 
 ## 1. Build the release image
 
 ```bash
-podman build -f docker/Dockerfile -t ephpm:<tag> .        # full PHP-linked release build
+podman build -f docker/Dockerfile --target e2e -t ephpm:<tag> .   # full PHP-linked release build, E2E stage
 podman tag docker.io/library/ephpm:<tag> localhost/ephpm:<tag>   # REQUIRED: podman run resolves localhost/, docker-style builds land in docker.io/library/
 ```
-The image bakes `tests/docroot/` -> `/var/www/html` and `tests/ephpm-test.toml` -> `/etc/ephpm/ephpm.toml`.
+The `e2e` stage bakes `tests/docroot/` -> `/var/www/html` and `tests/ephpm-test.toml` -> `/etc/ephpm/ephpm.toml`. Without `--target e2e` you get the default `runtime` stage — the published image, with only a placeholder page and a minimal config — and every suite will fail.
 
 ## 2. Run it
 

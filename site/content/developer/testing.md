@@ -335,14 +335,15 @@ k8s/
     └── e2e-job.yaml        # Job that runs ephpm-e2e test binary
 
 docker/
-├── Dockerfile              # Multi-stage: build ephpm with PHP → minimal runtime
+├── Dockerfile              # Multi-stage: build ephpm with PHP → `runtime` (published, default)
+│                           #   or `e2e` (runtime + tests/docroot + tests/ephpm-test.toml)
 └── Dockerfile.e2e          # Multi-stage: build test binary → minimal runner
 ```
 
 ### Tiltfile
 
 The Tiltfile (`k8s/Tiltfile`) handles:
-- Building `ephpm:dev` image from `docker/Dockerfile`
+- Building `ephpm:dev` image from `docker/Dockerfile` with `--target e2e` (the only stage that bakes in the test docroot and test config; the default stage is the fixture-free published image). In CI mode `cargo xtask k8s-e2e` does this build before Tilt runs.
 - Building `ephpm-e2e:dev` image from `docker/Dockerfile.e2e`
 - Deploying ephpm Deployment + Service
 - Deploying the E2E test Job with `EXPECTED_PHP_VERSION` injected via string replacement

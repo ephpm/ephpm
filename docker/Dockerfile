@@ -23,6 +23,10 @@
 # Build:
 #   podman build -f docker/Dockerfile --build-arg PHP_SDK_VERSION=8.5.2 -t ephpm:dev .
 #
+# That builds the published `runtime` image (placeholder docroot + minimal
+# production config). For the E2E image with the test fixtures baked in, add
+# `--target e2e` — see the runtime stages at the bottom of this file.
+#
 # `cargo xtask e2e` resolves the shorthand (e.g. "8.5") to the pinned full
 # version via xtask::PHP_SDK_VERSIONS and passes it as PHP_SDK_VERSION.
 
@@ -334,7 +338,25 @@ RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm &
 #
 # Pinned to the multi-arch OCI-index digest (resolves per-arch). See the
 # "Base image digest pins" block near the top of this file to refresh.
-FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+#
+# Three runtime stages share this base:
+#
+#   runtime-base  binary + tini + entrypoint, NO docroot and NO config.
+#   e2e           runtime-base + the E2E fixtures (tests/docroot, the test
+#                 config). `cargo xtask k8s-e2e` builds `--target e2e`.
+#   runtime       runtime-base + the minimal production default under
+#                 docker/default/. LAST stage, so it is what a plain
+#                 `docker build` (and release.yml, which also passes
+#                 `--target runtime` explicitly) produces.
+#
+# The published image used to be built from a single stage that baked in the
+# E2E fixtures: ~48 test scripts under /var/www/html (info.php, shell_test.php,
+# server_vars.php, memory_hog.php, ...) and tests/ephpm-test.toml as the default
+# config, which turns display_errors On and binds the Hrana SQL endpoint on
+# 0.0.0.0:8081. Never COPY anything from tests/ into `runtime` or
+# `runtime-base`; xtask's `published_docker_image_has_no_test_fixtures` test
+# fails the build if one appears.
+FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini ca-certificates \
@@ -342,11 +364,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /ephpm /usr/local/bin/ephpm
 
-# Test docroot — baked into image for E2E testing
-COPY tests/docroot/ /var/www/html/
-COPY tests/ephpm-test.toml /etc/ephpm/ephpm.toml
-
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--"]
 CMD ["ephpm", "serve", "--config", "/etc/ephpm/ephpm.toml"]
+
+# ── Stage 6: e2e — test fixtures (NOT published) ─────────────────────────────
+
+FROM runtime-base AS e2e
+
+COPY tests/docroot/ /var/www/html/
+COPY tests/ephpm-test.toml /etc/ephpm/ephpm.toml
+
+# ── Stage 7: runtime — the published image (default target) ──────────────────
+#
+# A placeholder page and a minimal production config: HTTP on :8080 only, no
+# embedded database or SQL wire listeners, no KV RESP listener, no metrics
+# endpoint, PHP errors logged rather than displayed. Users mount their own
+# site at /var/www/html and their own config at /etc/ephpm/ephpm.toml.
+
+FROM runtime-base AS runtime
+
+COPY docker/default/www/ /var/www/html/
+COPY docker/default/ephpm.toml /etc/ephpm/ephpm.toml

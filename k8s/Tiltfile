@@ -26,6 +26,7 @@ cluster_e2e = os.getenv("CLUSTER_E2E", "") == "1"
 #     "ephpm:dev",
 #     context="..",
 #     dockerfile="../docker/Dockerfile",
+#     target="e2e",  # the default (last) stage is the fixture-free published image
 #     only=["crates/", "xtask/", "Cargo.toml", "Cargo.lock", "tests/", "docker/"],
 # )
 

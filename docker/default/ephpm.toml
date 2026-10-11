@@ -1,0 +1,30 @@
+# Default configuration baked into the published ephpm/ephpm Docker image.
+#
+# Deliberately minimal: an HTTP listener on :8080 and nothing else. No embedded
+# database (so no MySQL/Hrana/PostgreSQL/TDS wire listener), no KV RESP
+# listener, no /metrics endpoint. PHP errors go to ePHPm's log, never into the
+# HTTP response.
+#
+# Replace it by mounting your own file over /etc/ephpm/ephpm.toml:
+#
+#   docker run -p 8080:8080 \
+#     -v /path/to/site:/var/www/html \
+#     -v /path/to/ephpm.toml:/etc/ephpm/ephpm.toml:ro \
+#     ephpm/ephpm:latest
+#
+# Pinned by `published_docker_config_is_minimal` in crates/ephpm-config.
+
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/html"
+index_files = ["index.php", "index.html"]
+
+[php]
+mode = "per_request"
+max_execution_time = 30
+memory_limit = "128M"
+ini_overrides = [
+    ["display_errors", "Off"],
+    ["display_startup_errors", "Off"],
+    ["log_errors", "On"],
+]

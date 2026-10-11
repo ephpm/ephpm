@@ -11,7 +11,14 @@ ePHPm ships as a single binary that manages itself. There's no install script �
 docker run -p 8080:8080 ephpm/ephpm:latest
 ```
 
-That starts ePHPm with default settings on `http://localhost:8080`. Mount your document root at `/var/www/html` and your config at `/etc/ephpm/ephpm.toml` to serve a real site:
+That starts ePHPm on `http://localhost:8080` serving a placeholder page. Out of the box the image contains only:
+
+- `/var/www/html/index.php` — a static "ePHPm is running" placeholder.
+- `/etc/ephpm/ephpm.toml` — a minimal production config ([`docker/default/ephpm.toml`](https://github.com/ephpm/ephpm/blob/main/docker/default/ephpm.toml)): HTTP on `0.0.0.0:8080` and nothing else (no embedded database or SQL wire listener, no KV RESP listener, no `/metrics`), with PHP's `display_errors` off and `log_errors` on, so PHP warnings go to the container log instead of the HTTP response.
+
+Images up to and including v0.11.3 instead baked in ePHPm's E2E test fixtures: dozens of test scripts under `/var/www/html` (among them `info.php`, which calls `phpinfo()`, and `shell_test.php`) and the E2E test config, which turned `display_errors` on and bound the Hrana SQL endpoint on `0.0.0.0:8081`. If you run one of those images without mounting your own document root *and* config, upgrade, or mount over both paths.
+
+Mount your document root at `/var/www/html` and your config at `/etc/ephpm/ephpm.toml` to serve a real site:
 
 ```bash
 docker run -p 8080:8080 \

@@ -80,9 +80,11 @@ look like nothing. Always run both c=1 and c=16.
    the "throughput" number is meaningless. **Verify 100% `2xx` in every
    cell** before believing it. This has silently corrupted results more
    than once.
-2. **The wrong image config.** The published image ships a config tuned
-   for its e2e tests, not for benchmarking. Mount a known bench config;
-   don't inherit the image default.
+2. **The wrong image config.** Published images up to v0.11.3 ship a
+   config tuned for their e2e tests (rate limiter, a 5 s request timeout,
+   extra listeners); later images ship a minimal production default.
+   Neither is a bench config. Mount a known bench config; don't inherit
+   the image default.
 3. **musl vs glibc.** musl's allocator is markedly slower on
    allocation-heavy loops (~3–4× on some microbenchmarks). Compare
    glibc-to-glibc; ePHPm's Linux release is glibc-dynamic.

@@ -918,6 +918,7 @@ jobs:
           docker build \
             --no-cache \
             -f docker/Dockerfile \
+            --target runtime \
             --build-arg "PHP_SDK_VERSION=${PHP_FULL}" \
             --build-arg "EPHPM_RELEASE_VERSION=${RELEASE_VERSION}" \
             --label "org.opencontainers.image.title=ephpm" \
