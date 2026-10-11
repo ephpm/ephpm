@@ -3501,6 +3501,8 @@ typedef struct {
     int  (*get)(const char *key);
     void (*get_result)(const char **ptr, size_t *len);
     int  (*set)(const char *key, const char *val, size_t val_len, long long ttl_ms);
+    /* 1 inserted, 0 not inserted (exists / OOM), -1 clustered owner
+     * unreachable: outcome unknown (a timed-out request may have landed). */
     int  (*set_nx)(const char *key, const char *val, size_t val_len, long long ttl_ms);
     long (*del)(const char *key);
     int  (*exists)(const char *key);
@@ -3521,6 +3523,32 @@ typedef struct {
 
 static EphpmKvOps g_kv_ops = {0};
 
+/* Called by every ephpm_kv_* function when no KV store is wired into this
+ * process — which happens under `ephpm php` (the CLI runs PHP without
+ * starting the server, so there is no store to attach), and in nothing the
+ * server itself runs. The functions still return their documented failure
+ * value (null / false / 0 / -2), but they used to do so silently, so a CLI
+ * script that wrote a cache entry or took a lock "succeeded" at doing
+ * nothing. Warn once per thread (once per `ephpm php` process): loud enough
+ * to see, without burying a long script's output under one line per call. */
+static EPHPM_TLS int kv_unwired_warned = 0;
+static void ephpm_kv_warn_unwired(void)
+{
+    if (kv_unwired_warned) {
+        return;
+    }
+    kv_unwired_warned = 1;
+    /* zend_error with an explicit "name():" prefix rather than
+     * php_error_docref: under `ephpm php` the docref prefix resolves to
+     * "PHP Request Startup" instead of the calling function. */
+    zend_error(E_WARNING,
+        "%s(): no ePHPm KV store is attached to this process, so this call did nothing "
+        "and returned its failure value. `ephpm php` does not run the server's KV "
+        "store; reach a running server's KV through its RESP listener "
+        "([kv.redis_compat]) instead. Further ephpm_kv_* calls will not repeat "
+        "this warning", get_active_function_name());
+}
+
 /* ── PHP_FUNCTION implementations ─────────────────────────────── */
 
 PHP_FUNCTION(ephpm_kv_get)
@@ -3530,7 +3558,7 @@ PHP_FUNCTION(ephpm_kv_get)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.get) { RETURN_NULL(); }
+    if (!g_kv_ops.get) { ephpm_kv_warn_unwired(); RETURN_NULL(); }
     if (!g_kv_ops.get(key)) { RETURN_NULL(); }
 
     const char *ptr; size_t len;
@@ -3550,7 +3578,7 @@ PHP_FUNCTION(ephpm_kv_set)
         Z_PARAM_LONG(ttl)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.set) { RETURN_FALSE; }
+    if (!g_kv_ops.set) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     RETURN_BOOL(g_kv_ops.set(key, val, val_len, ttl_ms));
 }
@@ -3567,13 +3595,15 @@ PHP_FUNCTION(ephpm_kv_setnx)
         Z_PARAM_LONG(ttl)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.set_nx) { RETURN_FALSE; }
+    if (!g_kv_ops.set_nx) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     /* Returns true if the value was inserted, false if a live entry was
      * already present at this key. The check-and-set is atomic under the
      * KV store's per-shard lock — this is the primitive the PHP-side lock
-     * libraries (Cache::lock, Symfony LockFactory) build on. */
-    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms));
+     * libraries (Cache::lock, Symfony LockFactory) build on. The op returns
+     * -1 when a clustered owner was unreachable (outcome unknown) — only 1
+     * means inserted. */
+    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms) == 1);
 }
 
 PHP_FUNCTION(ephpm_kv_del)
@@ -3583,7 +3613,7 @@ PHP_FUNCTION(ephpm_kv_del)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.del) { RETURN_LONG(0); }
+    if (!g_kv_ops.del) { ephpm_kv_warn_unwired(); RETURN_LONG(0); }
     RETURN_LONG(g_kv_ops.del(key));
 }
 
@@ -3596,7 +3626,7 @@ PHP_FUNCTION(ephpm_kv_del_if_eq)
         Z_PARAM_STRING(token, token_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.del_if_eq) { RETURN_FALSE; }
+    if (!g_kv_ops.del_if_eq) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     /* Deletes key only while its stored value still equals `token`; returns
      * true if this call removed it, false otherwise (mismatch, absent, or
      * expired). The compare-and-delete is atomic under the KV store's per-key
@@ -3613,7 +3643,7 @@ PHP_FUNCTION(ephpm_kv_exists)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.exists) { RETURN_FALSE; }
+    if (!g_kv_ops.exists) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     RETURN_BOOL(g_kv_ops.exists(key));
 }
 
@@ -3624,7 +3654,7 @@ PHP_FUNCTION(ephpm_kv_incr)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, 1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -3637,7 +3667,7 @@ PHP_FUNCTION(ephpm_kv_decr)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, -1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -3652,7 +3682,7 @@ PHP_FUNCTION(ephpm_kv_incr_by)
         Z_PARAM_LONG(delta)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, (long long)delta, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -3667,7 +3697,7 @@ PHP_FUNCTION(ephpm_kv_expire)
         Z_PARAM_LONG(ttl)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.expire) { RETURN_FALSE; }
+    if (!g_kv_ops.expire) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     RETURN_BOOL(g_kv_ops.expire(key, ttl_ms));
 }
@@ -3679,7 +3709,7 @@ PHP_FUNCTION(ephpm_kv_ttl)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.pttl) { RETURN_LONG(-2); }
+    if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
     long long pttl = g_kv_ops.pttl(key);
     if (pttl < 0) {
         /* -1 = no expiry, -2 = missing — pass through */
@@ -3697,7 +3727,7 @@ PHP_FUNCTION(ephpm_kv_pttl)
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.pttl) { RETURN_LONG(-2); }
+    if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
     RETURN_LONG((zend_long)g_kv_ops.pttl(key));
 }
 
@@ -3710,7 +3740,7 @@ PHP_FUNCTION(ephpm_kv_flush_all)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
-    if (!g_kv_ops.flush_all) { RETURN_FALSE; }
+    if (!g_kv_ops.flush_all) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     RETURN_BOOL(g_kv_ops.flush_all());
 }
 
@@ -3747,7 +3777,7 @@ PHP_FUNCTION(ephpm_kv_wait)
         Z_PARAM_LONG(timeout_ms)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!g_kv_ops.wait) { RETURN_FALSE; }
+    if (!g_kv_ops.wait) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
 
     long long new_version = 0;
     int rc = g_kv_ops.wait(key, (long long)last_version, (long long)timeout_ms,
@@ -5211,28 +5241,37 @@ static long long ephpm_session_ttl_ms(void)
  * clobbers the first (lost update).
  *
  * PS_READ acquires "session_lock:<sid>" via SETNX with a TTL before
- * fetching the blob; PS_CLOSE (which PHP guarantees after WRITE, including
- * during request shutdown after a bailout) releases it with DEL. On
- * contention we spin with exponential backoff (start 10ms, cap 100ms) up
- * to a total wait of 30s; if the lock is still held we log an E_WARNING
- * and proceed WITHOUT the lock — a degraded read-modify-write race is
- * strictly better than deadlocking the worker thread.
+ * fetching the blob, storing a random per-acquisition token as the lock
+ * value; PS_CLOSE (which PHP guarantees after WRITE, including during
+ * request shutdown after a bailout) releases it with a compare-and-delete
+ * (del_if_eq) against that token. On contention we spin with exponential
+ * backoff (start 10ms, cap 100ms) up to a total wait of 30s; if the lock is
+ * still held we log an E_WARNING and proceed WITHOUT the lock — a degraded
+ * read-modify-write race is strictly better than deadlocking the worker
+ * thread.
  *
  * The 30s TTL guards against crashed/stuck holders: a thread that dies
  * while holding the lock stops blocking the session forever.
  *
- * KNOWN LIMITATION (accepted for v1): if a holder outlives the 30s TTL,
- * the lock expires and another request may acquire it. Our release path
- * is an unconditional DEL — the KV ops table has no compare-and-delete —
- * so the original holder would then release the *new* holder's lock,
- * letting a third request in early. The window requires a request that
- * both holds a session open for >30s and overlaps two competitors, and
- * the failure mode is the same lost-update race that exists without
- * locking at all.
+ * Why the token: if a holder outlives the 30s TTL, the lock expires and
+ * another request may acquire it. An unconditional DEL on release would
+ * then delete the *new* holder's lock and let a third request in early.
+ * del_if_eq only deletes while the stored value is still this
+ * acquisition's own token, so a late release is a harmless no-op. (The
+ * overrunning request itself still runs unlocked past its TTL — that part
+ * is inherent to any TTL lock.)
+ *
+ * Clustered: SETNX and del_if_eq are decided by the lock key's owner node
+ * (ephpm-cluster routes them over the KV data plane), so two nodes cannot
+ * both hold one session's lock while membership is stable. An unreachable
+ * owner (set_nx returns -1) is NOT treated like contention: the request
+ * proceeds at once without a confirmed lock and with a warning, still
+ * tracking its token so PS_CLOSE's compare-and-delete cleans up a grant that
+ * may have landed despite the timeout.
  *
  * Windows is ZTS like Linux/macOS (#326), so the same concurrent-request
  * locking applies there. On a hypothetical NTS build PHP execution is
- * serialized in-process and the lock is simply uncontended — the SETNX/DEL
+ * serialized in-process and the lock is simply uncontended — the SETNX/DELIFEQ
  * pair still balances.
  */
 
@@ -5250,10 +5289,49 @@ static long long ephpm_session_ttl_ms(void)
 /* Lock ownership for the request running on this thread: the sid we hold
  * the lock for (plain malloc — must survive Zend's per-request allocator),
  * or NULL when no lock is held. NULL also covers the "gave up and
- * proceeded lockless" case, so the release path never deletes a lock this
- * thread did not acquire (except the TTL-expiry window described above). */
+ * proceeded lockless" case, so the release path never touches a lock this
+ * thread did not acquire. */
 static EPHPM_TLS char *session_lock_sid = NULL;
 static EPHPM_TLS size_t session_lock_sid_len = 0;
+
+/* The value this thread stored in the lock key when it acquired it: 32 hex
+ * chars of a random 128-bit token, unique per acquisition. Release is a
+ * compare-and-delete against it, so a release that arrives after the lock
+ * expired and was re-acquired elsewhere cannot delete the new holder's lock.
+ * Valid only while session_lock_sid is non-NULL. */
+#define EPHPM_SESSION_LOCK_TOKEN_LEN 32
+static EPHPM_TLS char session_lock_token[EPHPM_SESSION_LOCK_TOKEN_LEN + 1];
+
+#include <stdint.h>
+#include <time.h>
+#if PHP_VERSION_ID >= 80400
+# include "ext/random/php_random_csprng.h"
+#else
+# include "ext/random/php_random.h"
+#endif
+
+/* Fill session_lock_token with a fresh token. Uses PHP's CSPRNG; if that
+ * fails (no entropy source — practically never), falls back to a value built
+ * from the clock, this thread's TLS address and a per-thread counter, which
+ * is still unique per acquisition within the cluster for the purpose of a
+ * lock token (it only has to differ from every other holder's). */
+static void ephpm_session_lock_new_token(void)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char raw[EPHPM_SESSION_LOCK_TOKEN_LEN / 2];
+    if (php_random_bytes_silent(raw, sizeof(raw)) != SUCCESS) {
+        static EPHPM_TLS unsigned long long counter = 0;
+        unsigned long long a = (unsigned long long)(uintptr_t)&counter;
+        unsigned long long b = (unsigned long long)time(NULL) ^ (++counter << 20);
+        memcpy(raw, &a, sizeof(a));
+        memcpy(raw + sizeof(a), &b, sizeof(b));
+    }
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        session_lock_token[2 * i] = hex[raw[i] >> 4];
+        session_lock_token[2 * i + 1] = hex[raw[i] & 0x0f];
+    }
+    session_lock_token[EPHPM_SESSION_LOCK_TOKEN_LEN] = '\0';
+}
 
 /* Millisecond sleep for the lock spin loop (portable). */
 #if defined(PHP_WIN32) || defined(_WIN32)
@@ -5261,6 +5339,11 @@ static EPHPM_TLS size_t session_lock_sid_len = 0;
 static void ephpm_sleep_ms(unsigned int ms)
 {
     Sleep(ms);
+}
+/* Monotonic milliseconds, for the lock wait budget. */
+static unsigned long long ephpm_monotonic_ms(void)
+{
+    return (unsigned long long)GetTickCount64();
 }
 #else
 #include <time.h>
@@ -5271,23 +5354,33 @@ static void ephpm_sleep_ms(unsigned int ms)
     ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
     nanosleep(&ts, NULL);
 }
+/* Monotonic milliseconds, for the lock wait budget. */
+static unsigned long long ephpm_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull
+        + (unsigned long long)(ts.tv_nsec / 1000000L);
+}
 #endif
 
 /* Release the lock this thread holds, if any. Safe to call when no lock
- * is held (no-op). */
+ * is held (no-op). Compare-and-delete against this acquisition's token: if
+ * the lock expired and someone else holds it now, this deletes nothing. */
 static void ephpm_session_lock_release(void)
 {
     if (!session_lock_sid) {
         return;
     }
-    if (g_kv_ops.del) {
+    if (g_kv_ops.del_if_eq) {
         char stack[128];
         int used_heap = 0;
         char *lock_key = ephpm_session_make_prefixed_key(
             EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
             session_lock_sid, session_lock_sid_len,
             stack, sizeof(stack), &used_heap);
-        (void)g_kv_ops.del(lock_key);
+        (void)g_kv_ops.del_if_eq(lock_key, session_lock_token,
+                                 EPHPM_SESSION_LOCK_TOKEN_LEN);
         ephpm_session_key_free(lock_key, used_heap);
     }
     free(session_lock_sid);
@@ -5301,7 +5394,7 @@ static void ephpm_session_lock_release(void)
  * warns and returns without the lock. */
 static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
 {
-    if (!g_kv_ops.set_nx || !g_kv_ops.del) {
+    if (!g_kv_ops.set_nx || !g_kv_ops.del_if_eq) {
         /* No store (or no lock primitives) wired — nothing to lock with.
          * The read path already degrades to an empty session in this
          * configuration, so silently running lockless is consistent. */
@@ -5327,31 +5420,55 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
         EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
         sid, sid_len, stack, sizeof(stack), &used_heap);
 
-    unsigned int waited_ms = 0;
     unsigned int backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_START_MS;
     int acquired = 0;
+    /* Set when a clustered owner could not be reached: the acquire's outcome
+     * is unknown (a timed-out request may still have landed on the owner). */
+    int owner_unreachable = 0;
+    /* The wait budget is wall time on a monotonic clock, not summed sleeps:
+     * in a cluster each set_nx is an owner round trip (up to the 2s routing
+     * timeout), which summed sleeps would not count. */
+    const unsigned long long start_ms = ephpm_monotonic_ms();
+    unsigned long long waited_ms = 0;
+
+    /* One token for this acquisition attempt; it becomes ours only on a
+     * successful set_nx, and is what the release compares against. */
+    ephpm_session_lock_new_token();
 
     for (;;) {
-        if (g_kv_ops.set_nx(lock_key, "1", 1, EPHPM_SESSION_LOCK_TTL_MS)) {
+        int rc = g_kv_ops.set_nx(lock_key, session_lock_token, EPHPM_SESSION_LOCK_TOKEN_LEN,
+                                 EPHPM_SESSION_LOCK_TTL_MS);
+        if (rc == 1) {
             acquired = 1;
             break;
         }
+        if (rc < 0) {
+            /* No arbiter. This is not contention, so do not spin for 30s
+             * against it (a rolling upgrade or a dead owner would add that to
+             * every request). Stop now and go lockless — but because the
+             * request may have been applied, keep tracking our unique token
+             * so PS_CLOSE still issues a del_if_eq for it: if the grant did
+             * land, that releases it instead of orphaning it for the TTL; if
+             * it did not, the compare-and-delete deletes nothing. */
+            owner_unreachable = 1;
+            break;
+        }
+        waited_ms = ephpm_monotonic_ms() - start_ms;
         if (waited_ms >= EPHPM_SESSION_LOCK_MAX_WAIT_MS) {
             break;
         }
         unsigned int sleep_ms = backoff_ms;
         if (sleep_ms > EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms) {
-            sleep_ms = EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms;
+            sleep_ms = (unsigned int)(EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms);
         }
         ephpm_sleep_ms(sleep_ms);
-        waited_ms += sleep_ms;
         backoff_ms *= 2u;
         if (backoff_ms > EPHPM_SESSION_LOCK_BACKOFF_MAX_MS) {
             backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_MAX_MS;
         }
     }
 
-    if (acquired) {
+    if (acquired || owner_unreachable) {
         char *owned = (char *)malloc(sid_len + 1);
         if (owned) {
             memcpy(owned, sid, sid_len);
@@ -5362,16 +5479,23 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
             /* OOM copying the sid: we cannot track ownership, so we must
              * not keep the lock — a lock we can't release would block the
              * session until the TTL fires. Undo and run lockless. */
-            (void)g_kv_ops.del(lock_key);
+            (void)g_kv_ops.del_if_eq(lock_key, session_lock_token,
+                                     EPHPM_SESSION_LOCK_TOKEN_LEN);
             php_error_docref(NULL, E_WARNING,
                 "ephpm session handler: out of memory tracking session lock; "
                 "proceeding without lock");
+        }
+        if (owner_unreachable) {
+            php_error_docref(NULL, E_WARNING,
+                "ephpm session handler: the cluster node that owns this "
+                "session's lock is unreachable; proceeding without a "
+                "confirmed lock");
         }
     } else {
         php_error_docref(NULL, E_WARNING,
             "ephpm session handler: could not acquire session lock after "
             "%u ms; proceeding without lock (concurrent request may still "
-            "hold it)", waited_ms);
+            "hold it)", (unsigned int)waited_ms);
     }
 
     ephpm_session_key_free(lock_key, used_heap);

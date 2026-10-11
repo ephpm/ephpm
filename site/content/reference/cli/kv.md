@@ -13,7 +13,7 @@ ephpm kv [--host HOST] [--port PORT] [--password PW] [--user NAME] <subcommand> 
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--host` | `127.0.0.1` | KV server address. **Must be an IP literal** (`10.0.1.5`, or `[::1]` for IPv6). Hostnames such as `localhost` or `redis.example.com` are not resolved and fail with `invalid address`. (`ephpm deploy` / `ephpm cache` do resolve hostnames.) |
+| `--host` | `127.0.0.1` | KV server host: a hostname (`localhost`, `kv.internal` — resolved, every returned address tried in turn), an IPv4 literal, or an IPv6 literal with or without brackets (`::1` / `[::1]`) |
 | `--port` | `6379` | KV server port |
 | `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the first command |
 | `--user` | (none) | First argument of the two-argument `AUTH <user> <password>` form. Requires `--password`. |
@@ -138,8 +138,9 @@ ephpm kv keys 'session:*' | wc -l
 # Clear all sessions
 ephpm kv keys 'session:*' | xargs -r ephpm kv del
 
-# Connect to a remote instance
+# Connect to a remote instance (by IP or by name)
 ephpm kv --host 10.0.1.5 --port 6379 keys '*'
+ephpm kv --host kv.internal keys '*'
 
 # Connect to a password-protected listener
 ephpm kv --host 10.0.1.5 --password "$KV_PASSWORD" keys '*'

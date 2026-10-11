@@ -2124,14 +2124,25 @@ async fn run_kv(
 /// TCP connection helper. Authenticates before returning, so every caller
 /// gets a stream that is ready for real commands.
 async fn kv_connect(host: &str, port: u16, auth: &KvAuth) -> anyhow::Result<TcpStream> {
-    let addr: std::net::SocketAddr = format!("{host}:{port}")
-        .parse()
-        .with_context(|| format!("invalid address: {host}:{port}"))?;
-    let mut stream = TcpStream::connect(addr)
+    let mut stream = kv_tcp_connect(host, port)
         .await
         .with_context(|| format!("could not connect to KV server at {host}:{port}"))?;
     kv_authenticate(&mut stream, auth).await?;
     Ok(stream)
+}
+
+/// Open a TCP connection to `host:port`, where `host` is a hostname, an IPv4
+/// literal, or an IPv6 literal with or without brackets (`::1` / `[::1]`).
+///
+/// This used to parse `"{host}:{port}"` as a `SocketAddr`, which accepts only
+/// IP literals — so `--host localhost` or `--host kv.internal` failed with
+/// "invalid address" — and mis-split a bare IPv6 literal on its colons. Passing
+/// the `(host, port)` pair lets the resolver handle names and tries every
+/// address it returns, so `localhost` works whether it resolves to `::1` or
+/// `127.0.0.1` first.
+async fn kv_tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    TcpStream::connect((host, port)).await
 }
 
 /// Send `AUTH` and check the reply.
@@ -2422,10 +2433,8 @@ async fn kv_set_raw(
     key: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let stream = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .with_context(|| resp_connect_hint(host, port))?;
-    let mut stream = stream;
+    let mut stream =
+        kv_tcp_connect(host, port).await.with_context(|| resp_connect_hint(host, port))?;
     kv_authenticate(&mut stream, auth).await?;
     let cmd = Frame::Array(vec![
         Frame::bulk(b"SET".to_vec()),
@@ -3124,6 +3133,79 @@ mod cli_tests {
     fn kv_auth_rejects_user_without_password() {
         let err = KvAuth::resolve(Some("h".to_string()), None).unwrap_err();
         assert!(err.to_string().contains("--user requires a password"), "got: {err}");
+    }
+
+    /// A one-shot RESP responder: answers the first command on each of
+    /// `conns` connections with `+PONG`.
+    async fn pong_server(listener: tokio::net::TcpListener, conns: usize) {
+        for _ in 0..conns {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 256];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"+PONG\r\n").await.unwrap();
+        }
+    }
+
+    fn ping() -> Frame {
+        Frame::Array(vec![Frame::bulk("PING")])
+    }
+
+    /// `--host` accepts a hostname. It used to be parsed as a `SocketAddr`, so
+    /// anything but an IP literal (`localhost`, `kv.internal`) failed with
+    /// "invalid address" before a connection was even attempted.
+    #[tokio::test]
+    async fn kv_host_resolves_hostnames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(pong_server(listener, 2));
+        let auth = KvAuth { user: None, password: None };
+
+        // `localhost` may resolve to `::1` first; the connect must fall through
+        // to `127.0.0.1` rather than giving up on the first address.
+        let reply = kv_roundtrip("localhost", port, &auth, ping()).await.unwrap();
+        assert_eq!(reply, Frame::Simple("PONG".into()));
+        // The deploy/cache write path shares the same connector.
+        assert!(kv_tcp_connect("localhost", port).await.is_ok());
+        server.await.unwrap();
+    }
+
+    /// IP literals keep working, including IPv6 with or without brackets (a
+    /// bare `::1` used to be mis-split on its colons).
+    #[tokio::test]
+    async fn kv_host_accepts_ip_literals() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(pong_server(listener, 1));
+        let auth = KvAuth { user: None, password: None };
+        let reply = kv_roundtrip("127.0.0.1", port, &auth, ping()).await.unwrap();
+        assert_eq!(reply, Frame::Simple("PONG".into()));
+        server.await.unwrap();
+
+        // IPv6 loopback is not configured on every CI host; skip that half
+        // rather than fail on the environment.
+        let Ok(listener6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipping IPv6 half: no ::1 on this host");
+            return;
+        };
+        let port6 = listener6.local_addr().unwrap().port();
+        let server6 = tokio::spawn(pong_server(listener6, 2));
+        for host in ["::1", "[::1]"] {
+            let reply = kv_roundtrip(host, port6, &auth, ping()).await.unwrap();
+            assert_eq!(reply, Frame::Simple("PONG".into()), "host {host}");
+        }
+        server6.await.unwrap();
+    }
+
+    /// An unresolvable name is a connection error naming the target — not a
+    /// panic and not the old "invalid address" parse failure.
+    #[tokio::test]
+    async fn kv_host_unresolvable_name_is_a_clear_error() {
+        let auth = KvAuth { user: None, password: None };
+        let err = kv_connect("no-such-host.invalid", 6379, &auth).await.unwrap_err();
+        assert!(
+            err.to_string().contains("could not connect to KV server at no-such-host.invalid:6379"),
+            "got: {err}"
+        );
     }
 
     #[test]

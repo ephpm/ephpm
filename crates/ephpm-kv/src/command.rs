@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::resp::Frame;
-use crate::store::{OOM_ERROR, SetNxOutcome, Store};
+use crate::store::{OOM_ERROR, OWNER_UNREACHABLE_ERROR, SetNxOutcome, Store};
 
 /// Error frame for a write refused by the memory budget (Redis `-OOM`).
 fn oom() -> Frame {
@@ -162,6 +162,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 SetNxOutcome::Inserted => Frame::integer(1),
                 SetNxOutcome::Exists => Frame::integer(0),
                 SetNxOutcome::OutOfMemory => oom(),
+                // Clustered: the key's owner could not be reached, so nothing
+                // was written anywhere. Not `:0` — that would claim it exists.
+                SetNxOutcome::OwnerUnreachable => Frame::error(OWNER_UNREACHABLE_ERROR),
             }
         }
         "INCR" => {
@@ -256,7 +259,12 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             // ambiguous with a key literally named "IFEQ".
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            Frame::integer(i64::from(store.del_if_eq(&key, argv[1])))
+            // Clustered: decided by the key's owner node. An unreachable owner is
+            // an error, not :0 — :0 would claim the token did not match.
+            match store.try_del_if_eq(&key, argv[1]) {
+                Ok(deleted) => Frame::integer(i64::from(deleted)),
+                Err(_) => Frame::error(OWNER_UNREACHABLE_ERROR),
+            }
         }
         "EXISTS" => {
             if argv.is_empty() {
@@ -528,6 +536,9 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
             // A memory refusal is `-OOM`, distinct from the `nil` that means
             // "the key already existed" (#477).
             SetNxOutcome::OutOfMemory => oom(),
+            // Clustered: the key's owner could not be reached, so nothing was
+            // written anywhere. Not `nil` — that would claim the key exists.
+            SetNxOutcome::OwnerUnreachable => Frame::error(OWNER_UNREACHABLE_ERROR),
             SetNxOutcome::Inserted => {
                 if get {
                     // NX+GET on a successful insert: no prior value.
@@ -619,6 +630,53 @@ mod tests {
 
     fn int(f: &Frame) -> Option<i64> {
         if let Frame::Integer(n) = f { Some(*n) } else { None }
+    }
+
+    // ── Owner-routed conditional writes (clustered) ──────────────────────
+
+    /// A replicator whose key owner is always unreachable.
+    #[derive(Debug)]
+    struct DownOwner;
+
+    impl crate::store::Replicator for DownOwner {
+        fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<std::time::Duration>) -> bool {
+            true
+        }
+        fn replicate_remove(&self, _: &str) -> bool {
+            true
+        }
+        fn replicate_expire(&self, _: &str, _: std::time::Duration) -> bool {
+            true
+        }
+        fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<std::time::Duration>) {}
+        fn replicate_remove_published(&self, _: String) {}
+        fn route_set_nx(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<std::time::Duration>,
+        ) -> crate::store::Routed<SetNxOutcome> {
+            crate::store::Routed::OwnerUnreachable
+        }
+        fn route_del_if_eq(&self, _: &str, _: &[u8]) -> crate::store::Routed<bool> {
+            crate::store::Routed::OwnerUnreachable
+        }
+    }
+
+    /// An unreachable owner is a `-CLUSTERDOWN` error on every conditional
+    /// command — never `:0` / `nil`, which would tell a lock client "someone
+    /// else holds it" (or "your token did not match") when nothing was decided.
+    #[test]
+    fn unreachable_owner_is_clusterdown_not_a_normal_miss() {
+        let s = store();
+        s.set_replicator(Some(Arc::new(DownOwner)));
+        let is_clusterdown =
+            |f: &Frame| matches!(f, Frame::Error(e) if e.starts_with("CLUSTERDOWN"));
+
+        assert!(is_clusterdown(&cmd(&s, &["SETNX", "k", "v"])));
+        assert!(is_clusterdown(&cmd(&s, &["SET", "k", "v", "NX"])));
+        assert!(is_clusterdown(&cmd(&s, &["SET", "k", "v", "NX", "PX", "500"])));
+        assert!(is_clusterdown(&cmd(&s, &["DELIFEQ", "k", "v"])));
     }
 
     // ── Connection commands ──────────────────────────────────────────────

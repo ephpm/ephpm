@@ -122,8 +122,9 @@ pub struct EphpmKvOps {
     /// Atomically set a key only if it doesn't already exist (SETNX).
     /// Returns 1 if the value was inserted, 0 if a live entry was
     /// already present at this key (or the write was refused under
-    /// `NoEviction`). The check-and-set is performed under the same
-    /// per-key shard lock, so concurrent callers see exactly one winner.
+    /// `NoEviction`), and -1 if a clustered owner was unreachable (outcome
+    /// unknown). The check-and-set is performed under the same per-key
+    /// shard lock, so concurrent callers see exactly one winner.
     pub set_nx: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
@@ -320,7 +321,22 @@ unsafe extern "C" fn kv_set_nx(
         None
     };
 
-    i32::from(store.set_nx(key_str.to_string(), val_bytes.to_vec(), ttl))
+    set_nx_rc(store.set_nx_outcome(key_str.to_string(), val_bytes.to_vec(), ttl))
+}
+
+/// C return code for `set_nx`: `1` inserted, `0` not inserted (key exists,
+/// or refused for memory), `-1` the clustered owner could not be reached —
+/// the outcome is **unknown** (a timed-out request may still have been
+/// applied), so the session lock path treats it differently from contention.
+/// `ephpm_kv_setnx()` maps only `1` to `true`.
+#[cfg_attr(not(php_linked), allow(dead_code))]
+fn set_nx_rc(outcome: ephpm_kv::store::SetNxOutcome) -> std::os::raw::c_int {
+    use ephpm_kv::store::SetNxOutcome;
+    match outcome {
+        SetNxOutcome::Inserted => 1,
+        SetNxOutcome::OwnerUnreachable => -1,
+        SetNxOutcome::Exists | SetNxOutcome::OutOfMemory => 0,
+    }
 }
 
 #[cfg(php_linked)]
@@ -1152,5 +1168,22 @@ mod tests {
             Some(&b"seed"[..]),
             "the refused write must not have reached the store"
         );
+    }
+}
+
+#[cfg(test)]
+mod set_nx_rc_tests {
+    use ephpm_kv::store::SetNxOutcome;
+
+    use super::set_nx_rc;
+
+    #[test]
+    fn owner_unreachable_is_distinct_from_contention() {
+        // The session lock loop relies on -1 meaning "outcome unknown", not
+        // "someone else holds it"; ephpm_kv_setnx() maps only 1 to true.
+        assert_eq!(set_nx_rc(SetNxOutcome::Inserted), 1);
+        assert_eq!(set_nx_rc(SetNxOutcome::Exists), 0);
+        assert_eq!(set_nx_rc(SetNxOutcome::OutOfMemory), 0);
+        assert_eq!(set_nx_rc(SetNxOutcome::OwnerUnreachable), -1);
     }
 }

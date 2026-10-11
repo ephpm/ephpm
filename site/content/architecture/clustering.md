@@ -722,11 +722,11 @@ Without a lock, two concurrent requests on one session (typically AJAX) can each
 
 The handler takes a pessimistic per-session lock in `read()` and releases it in `close()`:
 
-- The lock key is `session_lock:<id>`, set with `SETNX` and a **30-second TTL**, so a crashed request cannot hold it forever.
+- The lock key is `session_lock:<id>`, set with `SETNX` and a **30-second TTL**, so a crashed request cannot hold it forever. Its value is a random 128-bit token unique to the acquisition.
 - A contending request retries with backoff (10 ms, doubling, capped at 100 ms) for up to **30 seconds** in total. If the lock is still held, it logs an `E_WARNING` and continues **without** the lock — a possible lost update rather than a stuck worker.
-- The lock is released with an unconditional delete. If a request holds the lock longer than its 30-second TTL, another request may take it, and the first request's `close()` then deletes the second one's lock.
+- The lock is released with a compare-and-delete (`del_if_eq`) against the holder's own token. If a request holds the lock longer than its 30-second TTL and another request takes it, the first request's `close()` deletes nothing. (Through v0.11.3 this was an unconditional delete that released the second request's lock.)
 
-With clustering on, the lock is a small key and therefore rides the gossip tier, which is eventually consistent. Two requests for the same session on **different** nodes at the same moment can both acquire it, so the lock is only reliable for requests that land on the same node.
+With clustering on, `SETNX` and the compare-and-delete are both **routed to the lock key's owner node** (`hash(key) % sorted alive nodes`, the same owner the large-value tier uses) over the KV data plane and decided under that one node's shard lock. Two nodes can therefore not both hold one session's lock while cluster membership is stable. The limits: ownership is computed from each node's own view of membership, so during a membership change (a join, a leave, or the seconds before gossip declares a dead node dead) two nodes can briefly name different owners; a partition lets each side grant on its own; a new owner only knows about a lock its predecessor granted once that grant has replicated to it (gossip, typically 1–3 seconds), so a grant lost with a crashed or restarted owner can be granted again; and if the owner cannot be reached (2-second timeout) the handler proceeds at once without a confirmed lock, with a warning, and still issues its compare-and-delete at `close()` in case the timed-out acquire landed. Only `SETNX` and the compare-and-delete are arbitrated; see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster) for the full list of limits. This is single-arbiter routing, not consensus.
 
 #### Clustering behaviour
 
@@ -761,11 +761,10 @@ if (ephpm_kv_setnx("deploy:mutex", $token, 30)) {
 }
 ```
 
-These are reliable on a single node. With clustering on, a small lock key is
-replicated over the eventually-consistent gossip tier, so two nodes can both
-acquire the same lock at the same moment; do not rely on it for cross-node
-mutual exclusion. See [KV from PHP](/guides/kv-from-php/) for the function
-reference.
+In a cluster both calls are decided by the key's owner node, so one caller
+cluster-wide wins while membership is stable — with the membership-change and
+unreachable-owner limits described under [Session Locking](#session-locking) and in
+[KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster).
 
 ePHPm uses the same KV + TTL pattern internally to elect a single ACME
 certificate requester across the cluster, but that coordination lives in Rust

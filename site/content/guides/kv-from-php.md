@@ -14,6 +14,8 @@ The store is the same in both cases; only the path differs — by roughly **500�
 
 No external dependency. Available as native PHP functions whenever PHP is running inside ePHPm.
 
+**Not under `ephpm php`.** The CLI runs PHP without starting the server, so no KV store is attached: the functions exist but every call returns its failure value (`null` / `false` / `0` / `-2`) and the first call emits an `E_WARNING` saying so. To reach a running server's KV from a script, use its RESP listener (`[kv.redis_compat]`) with any Redis client.
+
 ```php
 ephpm_kv_set("greeting", "hello");
 $greeting = ephpm_kv_get("greeting");          // "hello"
@@ -55,7 +57,7 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 |---|---|---|
 | `ephpm_kv_get(string $key)` | `?string` | `null` on a miss. |
 | `ephpm_kv_set(string $key, string $value, int $ttl = 0)` | `bool` | `$ttl` in seconds; `0` or negative means no expiry. |
-| `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic per node). Same `$ttl` rules as `set`. |
+| `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic; in a cluster decided by the key's owner node, see [Locks in a cluster](#locks-in-a-cluster)). Same `$ttl` rules as `set`. |
 | `ephpm_kv_del(string $key)` | `int` | Number of keys deleted (`0` or `1`). |
 | `ephpm_kv_del_if_eq(string $key, string $token)` | `bool` | Compare-and-delete — see below. |
 | `ephpm_kv_exists(string $key)` | `bool` | |
@@ -140,9 +142,67 @@ was deleted; `false` when the token differs, the key is absent, or the key
 has expired (an expired entry is treated as absent). Tokens are compared
 byte-exactly and may be binary.
 
-Like `ephpm_kv_setnx()`, the compare-and-delete is atomic **per node**;
-across a cluster it is last-arrival-wins, so do not build cross-node mutual
-exclusion on it without an external fence.
+### Locks in a cluster
+
+With `[cluster]` enabled, `ephpm_kv_setnx()` and `ephpm_kv_del_if_eq()` (and
+their RESP forms `SETNX`, `SET … NX`, `DELIFEQ`) are **routed to the key's
+owner node** — `hash(key) % sorted alive nodes`, the same owner the
+large-value tier uses — and decided there under that node's shard lock. Every
+node's attempt on a key is therefore serialized by one lock on one node, and
+two nodes cannot both acquire it. (Before this, each node decided on its own
+copy and both could win.)
+
+The guarantee, stated precisely:
+
+- **It holds while membership is stable.** Each node computes the owner from
+  its own view of cluster membership. Across a membership change — a node
+  joining or leaving, or the seconds before gossip declares a dead node dead —
+  two nodes can briefly name different owners and both grant the same lock.
+  A network partition is worse than brief: each side drops the other from its
+  membership and grants locks on its own until the partition heals.
+- **A new owner learns about existing locks by replication.** If ownership
+  moves, the new owner knows about a lock its predecessor granted only once
+  that grant has replicated to it (gossip; typically 1–3 seconds, longer in
+  large clusters). A grant that had not replicated when its owner died, or
+  when the owner restarted (a restarted node comes back with an empty store),
+  is lost, and the lock can be granted again.
+- **Lock values must fit the gossip tier.** Only values at or under
+  `[cluster.kv] small_key_threshold` (default 512 bytes) replicate to every
+  node. A larger lock value lives on `replication_factor` nodes only, and a new
+  owner outside that set never learns about the lock. Keep lock tokens short
+  (a 32-character hex token is plenty).
+- **Only `setnx` and `del_if_eq` are arbitrated.** `ephpm_kv_set()`,
+  `ephpm_kv_expire()`, `ephpm_kv_del()` and `incr` on a lock key (and their
+  RESP forms) are still decided on the calling node and replicated
+  last-writer-wins. They can overwrite an owner-granted lock with a stale
+  local value — for example, extending a lease with `ephpm_kv_expire()` on a
+  node whose copy still holds a previous holder's token re-publishes that old
+  token cluster-wide. Do not extend or overwrite a lock key; acquire with
+  `setnx` and release with `del_if_eq` only.
+- **An unreachable owner fails closed, with an unknown outcome.** If the owner
+  does not answer within 2 seconds, the call reports failure:
+  `ephpm_kv_setnx()` returns `false`, `ephpm_kv_del_if_eq()` returns `false`,
+  and the RESP commands answer `-CLUSTERDOWN …` (never `:0`/`nil`, which would
+  claim the key exists or the token did not match). Nothing was written on the
+  calling node, but a request that timed out may still have been applied on
+  the owner. From PHP, `ephpm_kv_setnx()` returns `false` both when the key
+  exists and when the owner is unreachable, so you cannot tell the two
+  apart; use a unique token per attempt and always set a TTL, so a grant
+  that landed after a timeout either expires or can be released with
+  `del_if_eq` and that token. A dead owner stops being the owner once gossip
+  declares it dead.
+- **The caller's own copy follows by replication.** A routed `setnx()` win is
+  visible to `ephpm_kv_get()` on the calling node once the owner's write has
+  replicated back, not synchronously.
+- **Rolling upgrades:** a node running a version without owner routing cannot
+  answer a routed request, so lock keys it owns are refused (fail closed) until
+  it is upgraded. It also still decides its own `setnx` calls locally and
+  replicates the result last-writer-wins, so there is no mutual exclusion
+  against not-yet-upgraded nodes until every node runs this version.
+
+This is single-arbiter routing, not consensus. If you need mutual exclusion
+that survives membership changes, fence the protected resource itself (for
+example with a monotonically increasing token checked by the database).
 
 ### Blocking waits — `ephpm_kv_wait()`
 
