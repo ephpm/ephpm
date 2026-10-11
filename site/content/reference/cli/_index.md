@@ -72,6 +72,13 @@ ephpm dev --document-root ./public
 # *.localhost vhosting — each subdirectory of ./sites becomes
 # http://<name>.localhost:<port> (no /etc/hosts edit needed)
 ephpm dev --sites ./sites
+
+# Step debugging: fetch (first run) and load an ABI-matched Xdebug,
+# then debug any request with ?XDEBUG_TRIGGER=1 (Linux)
+ephpm dev --xdebug
+
+# ... with your own Xdebug build (no network), IDE on another host
+ephpm dev --xdebug-path ~/xdebug.so --xdebug-client-host 172.20.0.1
 ```
 
 | Flag | Long | Default | Purpose |
@@ -81,6 +88,12 @@ ephpm dev --sites ./sites
 | `-s` | `--sites <DIR>` | — | Sites directory for `*.localhost` vhosting |
 | `-l` | `--listen <ADDR>` | `127.0.0.1:<port>` | Override the listen address entirely |
 | `-v` | `--verbose` | off | Increase log verbosity (repeatable) |
+| | `--xdebug` | off | Load Xdebug for step debugging. Linux (glibc, x86_64/aarch64) and macOS (arm64): an ABI-matched ZTS build is downloaded from the ePHPm extension catalog on first use, verified (API number, ZTS, OS, libc, arch, sha256), and cached under the user cache dir; later runs work offline. Refused on Windows (static PHP cannot load extension DLLs). macOS catalog tarballs are still being added; until one exists for your PHP minor, use `--xdebug-path`. See [Debugging with Xdebug](/guides/xdebug/) |
+| | `--xdebug-path <FILE>` | — | Load this local Xdebug shared object instead (implies `--xdebug`, no network). Must be a ZTS build for this binary's PHP minor |
+| | `--xdebug-client-host <HOST>` | `127.0.0.1` | `xdebug.client_host` — where the IDE listens (from WSL with the IDE on Windows: the Windows host IP). Requires `--xdebug`/`--xdebug-path` |
+| | `--xdebug-client-port <PORT>` | `9003` | `xdebug.client_port`. Requires `--xdebug`/`--xdebug-path` |
+
+With `--xdebug`, the dev server also sets `xdebug.mode=debug,develop` and `xdebug.start_with_request=trigger`, disables the request deadline (`[server.timeouts] request = 0`) and — where PHP enforces it natively — `max_execution_time`, so a request paused on a breakpoint is not cut off. Startup fails with a clear error if Xdebug does not register as a Zend extension. `EPHPM_EXT_CATALOG_URL` (download base, laid out as `<base>/<tag>/<asset>`) and `EPHPM_EXT_CATALOG_API` (a GitHub-releases-shaped listing) point the download at a mirror; both must be `https://` unless they point at a loopback address.
 
 **Configuration in dev mode:** `ephpm dev` never reads an `ephpm.toml`, not even one in the current directory. It starts from the built-in defaults and **does** apply `EPHPM_*` environment overrides, except for the listen address and document root, which `dev` always sets itself — from the flags above, or from their defaults — so `EPHPM_SERVER__LISTEN` and `EPHPM_SERVER__DOCUMENT_ROOT` have no effect. `--sites` likewise overrides the sites directory. So a dev server can still turn features on through the environment, for example `EPHPM_KV__REDIS_COMPAT__ENABLED=true ephpm dev` to enable the RESP listener for [`ephpm kv`](kv/). For anything more, use `ephpm serve --config`.
 
@@ -419,7 +432,7 @@ Any other failure, such as a connection error, an unreadable config, or an inval
 ```
 ephpm                Local dev server (same as `ephpm dev`)
 ephpm serve          Start the production server (--config/--listen/--document-root/-v)
-ephpm dev            Development server (--port/--document-root/--sites)
+ephpm dev            Development server (--port/--document-root/--sites/--xdebug)
 ephpm php            Run the embedded PHP CLI (pure passthrough)
 ephpm composer       Embedded vivacity installer: install/update/require/remove/dump-autoload
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)

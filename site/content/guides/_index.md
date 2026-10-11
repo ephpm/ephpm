@@ -25,6 +25,7 @@ Task-oriented walkthroughs for common deployments.
 - **[PSR-15 Apps (Worker Mode)](psr15-worker/)** — Slim, Mezzio, or any PSR-15 handler on the generic `ephpm/psr15-worker` adapter.
 - **[Native Middleware](native-middleware/)** — compiled `.so` middleware (JWT, CORS, rate limiting, security headers) running in front of PHP, with KV-backed cluster-wide state.
 - **[PHP Extensions](php-extensions/)** — loading prebuilt shared extensions beyond the compiled-in set.
+- **[Debugging with Xdebug](xdebug/)** — `ephpm dev --xdebug` fetches an ABI-matched Xdebug and wires it up; VS Code, WSL, and `ephpm serve` setup.
 - **[Cluster-Wide OPcache Invalidation](opcache-cluster-invalidation/)** — `ephpm deploy` and the deploys-are-events contract.
 - **[Diagnosing Crashes](diagnosing-crashes/)** — reading the fatal-signal report when an extension, a middleware, or PHP itself faults.
 - **[Getting the Most from PHP on a Windows Box](windows-performance/)** — workload-honest Windows tuning: the TAILCALL build and the JIT for CPU-bound work, serve-mode defaults and fewer file operations for real apps.

@@ -60,6 +60,25 @@ litewire.workspace = true
 # forwards raw SQL (issue #471). `minimal-rust` (no TLS / no rsa) is fine: the
 # connection is loopback to a co-located server using mysql_native_password.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
+# `ephpm dev --xdebug` (src/dev_xdebug.rs) downloads an ABI-matched Xdebug from
+# the php-sdk extension catalog: reqwest (blocking, no crypto provider — the
+# workspace pin, #241) + rustls/webpki-roots for its TLS config, flate2 + tar to
+# unpack the catalog tarball in memory, sha2 to verify every file against the
+# manifest, serde/serde_json for the manifest + GitHub release listing.
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+flate2.workspace = true
+# No default features: the archive is only read into memory, never unpacked
+# to disk, so the `xattr` support is dead weight.
+tar = { version = "0.4", default-features = false }
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Read-only symbol inspection of shared objects (src/ext_ini.rs): a library
+# exporting `zend_extension_entry` must be loaded with `zend_extension=`, not
+# `extension=`. ELF (Linux) + Mach-O (macOS) only; no write support.
+object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "std"] }
 # tempfile is a runtime dependency, not just a test one: the generated
 # php.ini is materialised into a private mkdtemp directory (see
 # `run_with_config`), because a predictable path under a shared /tmp is
@@ -166,6 +185,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde_json = "1"
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Writes the tiny fake ELF shared objects the Zend-extension detection tests
+# inspect (src/ext_ini.rs) — test-only.
+object = { version = "0.37", default-features = false, features = ["write_std", "elf"] }
 
 [lints]
 workspace = true

@@ -313,6 +313,29 @@ mod ffi {
         /// Safe to call before `php_embed_init()`.
         pub fn ephpm_get_php_version() -> *const ::std::os::raw::c_char;
 
+        /// `ZEND_MODULE_API_NO` of the linked libphp (compile-time constant).
+        pub fn ephpm_zend_module_api_no() -> ::std::os::raw::c_ulong;
+
+        /// 1 on a ZTS build, 0 on NTS (compile-time constant).
+        pub fn ephpm_is_zts() -> ::std::os::raw::c_int;
+
+        /// Compiled-in default `extension_dir`, or NULL (compile-time).
+        pub fn ephpm_default_extension_dir() -> *const ::std::os::raw::c_char;
+
+        /// Version of a loaded module by lower-case registry name; `""` when
+        /// it declares none, NULL when not loaded. Valid after
+        /// `php_embed_init()`; reads the process-global module registry.
+        pub fn ephpm_loaded_module_version(
+            lcname: *const ::std::os::raw::c_char,
+        ) -> *const ::std::os::raw::c_char;
+
+        /// Version of a loaded Zend extension by case-insensitive name; `""`
+        /// when it declares none, NULL when not loaded. Valid after
+        /// `php_embed_init()`; reads the process-global extension list.
+        pub fn ephpm_zend_extension_version(
+            name: *const ::std::os::raw::c_char,
+        ) -> *const ::std::os::raw::c_char;
+
         /// PHP CLI main entry point. Parses argc/argv using php_getopt
         /// and dispatches to the appropriate PHP APIs. Call after
         /// `php_embed_init()`. Returns the process exit code.
@@ -528,6 +551,22 @@ thread_local! {
     /// allocations: dropping them never calls into PHP.
     static IN_FLIGHT_REQUEST: std::cell::RefCell<Option<Box<dyn std::any::Any>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// ABI identity of the linked libphp, from [`PhpRuntime::abi`].
+///
+/// A shared extension loads only when it was built for the same
+/// `api_no` and thread-safety mode (and, on Linux, libc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpAbi {
+    /// `PHP_VERSION`, e.g. `"8.5.7"`.
+    pub php_version: String,
+    /// `ZEND_MODULE_API_NO`, e.g. `20250925`.
+    pub api_no: u64,
+    /// Whether the build is ZTS (thread-safe).
+    pub zts: bool,
+    /// The compiled-in default `extension_dir`, when the headers expose it.
+    pub default_extension_dir: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1146,6 +1185,120 @@ impl PhpRuntime {
     #[must_use]
     pub fn php_version() -> &'static str {
         "not available (stub mode — no libphp linked)"
+    }
+
+    /// The ABI identity of the linked libphp — what a shared extension must
+    /// have been built for to load into this binary.
+    ///
+    /// Compile-time constants; does not require the runtime to be
+    /// initialized. `None` in stub mode (no libphp linked, so there is no
+    /// ABI to match).
+    #[must_use]
+    pub fn abi() -> Option<PhpAbi> {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: all three return compile-time constants (a number, a
+            // flag, and a pointer to a static string literal or NULL); none
+            // touches PHP runtime state, so they are callable before init.
+            let (api_no, zts, ext_dir) = unsafe {
+                (
+                    ffi::ephpm_zend_module_api_no(),
+                    ffi::ephpm_is_zts() != 0,
+                    ffi::ephpm_default_extension_dir(),
+                )
+            };
+            let default_extension_dir = if ext_dir.is_null() {
+                None
+            } else {
+                // SAFETY: non-NULL means a pointer to the static
+                // PHP_EXTENSION_DIR literal, valid for the whole process.
+                Some(unsafe { std::ffi::CStr::from_ptr(ext_dir) }.to_string_lossy().into_owned())
+            };
+            // `c_ulong` is 64-bit on LP64 but 32-bit on Windows (LLP64), so
+            // the widening is a no-op on one family and needed on the other.
+            #[allow(clippy::useless_conversion)]
+            let api_no = u64::from(api_no);
+            Some(PhpAbi {
+                php_version: Self::php_version().to_string(),
+                api_no,
+                zts,
+                default_extension_dir,
+            })
+        }
+        #[cfg(not(php_linked))]
+        {
+            None
+        }
+    }
+
+    /// Version of a loaded PHP module by registry name (case-insensitive),
+    /// e.g. `loaded_module_version("xdebug")`.
+    ///
+    /// `Some("")` when the module is loaded but declares no version, `None`
+    /// when it is not loaded, PHP is not initialized, or this is stub mode.
+    #[must_use]
+    pub fn loaded_module_version(name: &str) -> Option<String> {
+        #[cfg(php_linked)]
+        {
+            if !PHP_INITIALIZED.load(Ordering::Acquire) {
+                return None;
+            }
+            let c_name = std::ffi::CString::new(name.to_ascii_lowercase()).ok()?;
+            // SAFETY: PHP is initialized (checked above), so module_registry
+            // is fully populated and is only mutated during startup/shutdown.
+            // The helper is a hash lookup with no bailout path. A non-NULL
+            // result borrows the module entry's static version string, which
+            // is copied out before any other PHP call.
+            unsafe {
+                let ptr = ffi::ephpm_loaded_module_version(c_name.as_ptr());
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                }
+            }
+        }
+        #[cfg(not(php_linked))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
+    /// Version of a loaded **Zend** extension by name (case-insensitive),
+    /// e.g. `zend_extension_version("xdebug")` → `Some("3.5.3")`.
+    ///
+    /// This is the check that proves a library went through
+    /// `zend_extension=` rather than `extension=`. `Some("")` when it
+    /// declares no version, `None` when it is not registered, PHP is not
+    /// initialized, or this is stub mode.
+    #[must_use]
+    pub fn zend_extension_version(name: &str) -> Option<String> {
+        #[cfg(php_linked)]
+        {
+            if !PHP_INITIALIZED.load(Ordering::Acquire) {
+                return None;
+            }
+            let c_name = std::ffi::CString::new(name).ok()?;
+            // SAFETY: PHP is initialized (checked above), so the global
+            // zend_extensions list is complete and only changes at
+            // startup/shutdown. The helper is a list walk with no bailout
+            // path; the returned string is the extension's static version,
+            // copied out immediately.
+            unsafe {
+                let ptr = ffi::ephpm_zend_extension_version(c_name.as_ptr());
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                }
+            }
+        }
+        #[cfg(not(php_linked))]
+        {
+            let _ = name;
+            None
+        }
     }
 
     /// Run the PHP CLI with the given arguments.

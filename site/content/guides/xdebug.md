@@ -3,76 +3,126 @@ title = "Debugging with Xdebug"
 weight = 12
 +++
 
-[Xdebug](https://xdebug.org/) step debugging works in both of ePHPm's
-execution modes. In per-request mode nothing about it is ePHPm-specific. In
-**worker mode** — where a worker boots your framework once and serves many
-requests — ePHPm gives each request that asks for the debugger its **own
-fresh worker and its own debug session**, while the warm pool keeps serving
-everybody else.
+[Xdebug](https://xdebug.org/) step debugging works with ePHPm's embedded PHP,
+in both execution modes. The fastest path is one flag on the dev server:
+
+```bash
+cd my-app/public
+ephpm dev --xdebug
+```
+
+then start your IDE listening for Xdebug on port 9003 and load any page with
+`?XDEBUG_TRIGGER=1`.
+
+In per-request mode (the default, and what `ephpm dev` runs) nothing about
+Xdebug is ePHPm-specific. In **worker mode** — where a worker boots your
+framework once and serves many requests — ePHPm gives each request that asks
+for the debugger its **own fresh worker and its own debug session**, while
+the warm pool keeps serving everybody else; see
+[Worker mode](#worker-mode-how-it-works).
 
 > **Development only.** Never load Xdebug on a production or
 > internet-facing server. It slows every request, and anyone who can send a
 > trigger can make the server open a debugger connection — with
 > `xdebug.discover_client_host` on, to a host of *their* choosing, where a
-> debugger can run arbitrary code. ePHPm logs a warning at startup whenever
-> the worker-mode debug lane is armed.
+> debugger can run arbitrary code. `ephpm dev` binds `127.0.0.1` by default
+> for this reason, and `ephpm serve` logs a warning at startup whenever the
+> worker-mode debug lane is armed.
 
 ## Platform support
 
-| Platform | Status |
-|---|---|
-| Linux (glibc release binaries) | Supported — verified with Xdebug 3.5.3 on PHP 8.5.7 (ZTS). |
-| macOS | Untested. |
-| Windows | Not possible with the current static builds. |
+| Platform | `ephpm dev --xdebug` | Notes |
+|---|---|---|
+| Linux, glibc, x86_64 / aarch64 | Supported | Xdebug fetched from the ePHPm extension catalog (see below), or `--xdebug-path`. Verified with Xdebug 3.5.3 on PHP 8.5.7 (ZTS). |
+| macOS, arm64 | Supported once the catalog ships macOS builds | `--xdebug` downloads `ephpm-ext-<php>-macos-aarch64.tar.gz` from the catalog; until a release carries one, use `--xdebug-path`. Needs an ePHPm macOS binary newer than v0.11.3: earlier ones were linked without `-export_dynamic`, so `-dead_strip` removed PHP functions that ePHPm never calls but Xdebug imports, and loading fails with `symbol not found in flat namespace`. |
+| Windows | Not available with the release binaries | The Windows release binaries link PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs. Loading Xdebug needs a build against a shared `php8ts.dll`. Use ePHPm under WSL today. |
 
 Xdebug must be a **ZTS** build for the PHP minor your ePHPm binary embeds
 (`ephpm php -v` shows both). Distro and Sury packages are NTS and will not
 load; build Xdebug from source against the matching php-sdk headers the same
 way as any other shared extension — see [PHP Extensions](/guides/php-extensions/).
 
-## Loading Xdebug
-
-Xdebug is a *Zend* extension, so it is loaded with `zend_extension` through
-`[php] ini_overrides`, not through `[php] extensions` (which writes plain
-`extension=` lines). Use an **absolute path**: a relative path is resolved
-against PHP's `extension_dir`, which in ePHPm is a baked-in placeholder, and
-fails to load.
-
-```toml
-[php]
-ini_overrides = [
-  ["zend_extension", "/opt/xdebug/xdebug.so"],     # absolute path
-  ["xdebug.mode", "debug"],                        # step debugging on
-  ["xdebug.start_with_request", "trigger"],        # only when a trigger is sent
-  ["xdebug.client_host", "127.0.0.1"],             # where your IDE listens
-  ["xdebug.client_port", "9003"],
-  # Optional but recommended: require a shared secret as the trigger value.
-  # ["xdebug.trigger_value", "change-me"],
-]
-
-[server.timeouts]
-# A request paused on a breakpoint must not be cut off.
-request = 0
-```
-
-Check that the build loads:
+## `ephpm dev --xdebug`
 
 ```console
-$ ephpm php -d zend_extension=/opt/xdebug/xdebug.so -r 'var_dump(phpversion("xdebug"));'
-string(5) "3.5.3"
+$ ephpm dev --xdebug
+  xdebug: downloading ephpm-ext-8.5.7-linux-x86_64-gnu.tar.gz (catalog release ext-8.5.7)
+
+  ePHPm <version> — dev server
+    serving:  /home/me/my-app/public
+    url:      http://127.0.0.1:8080
+    php:      8.5.7
+    press ctrl+c to stop
+
+  Xdebug 3.5.3 loaded (dev only: never load Xdebug in production)
+    library:  /home/me/.cache/ephpm/ext/20250925-zts-x86_64/xdebug-3.5.3.so (catalog ext-8.5.7)
+    ide:      DBGp to 127.0.0.1:9003 (start the IDE listening first)
+    trigger:  http://127.0.0.1:8080/?XDEBUG_TRIGGER=1
+              or cookie XDEBUG_SESSION=1, or a browser "Xdebug helper" extension
+    timeouts: request deadline and max_execution_time lifted while debugging
+    vscode:   .vscode/launch.json → { "name": "Listen for Xdebug", "type": "php", "request": "launch", "port": 9003 }
+              (no pathMappings needed when the IDE and ephpm share the filesystem)
 ```
 
-A relative `zend_extension=xdebug.so` fails here with `Failed loading Zend
-extension 'xdebug.so' (tried: /lib/php/extensions/no-debug-zts-…/xdebug.so …)`.
-At server startup, ePHPm logs a warning when the worker-mode debug lane is
-armed, or an info line saying why it is not (for example `xdebug.mode` lacking
-`debug`).
+What the flag does:
 
-`[server.timeouts] request` is the server's per-request deadline. Leave it
-at a non-zero value while debugging and a request you sit on longer than
-that is answered `504` — the debug session itself keeps going in your IDE,
-but its response is discarded. ePHPm warns about this at startup when the
-worker-mode debug lane is armed.
+1. **Finds an ABI-matched Xdebug.** The binary knows its PHP version,
+   `ZEND_MODULE_API_NO`, thread-safety mode, and CPU. It downloads the
+   [extension catalog](/guides/php-extensions/#the-extension-catalog)
+   tarball for its own PHP release (`ext-<php version>` on
+   `github.com/ephpm/php-sdk`). If that release is missing or does not ship
+   Xdebug, it falls back to the newest release of the **same PHP minor whose
+   manifest declares the same API number** — patch releases of one minor
+   share the extension ABI — and says so.
+2. **Verifies before loading.** The manifest's `php_api_no`, `zts`, `os`,
+   `libc` and `arch` must match the binary, and every file the manifest
+   lists must be in the tarball and hash to its manifest sha256. Any
+   mismatch is a hard refusal with the reason — never a silent fallback to
+   another release. The hashes catch a corrupted or inconsistent download;
+   they are not a signature (the manifest ships in the same tarball). What
+   makes the download trustworthy is HTTPS to GitHub: the catalog URLs must
+   be `https://` (plain `http://` is accepted only for a loopback mirror).
+3. **Caches it** at `<user cache dir>/ephpm/ext/<api>-zts-<arch>/`
+   (`$XDG_CACHE_HOME` or `~/.cache` on Linux) with a small `xdebug.json`
+   record. Later runs re-verify the cached file's sha256 and use it with no
+   network access at all, so `--xdebug` works offline after the first run.
+   A cached build is kept even after a newer catalog release appears (any
+   release with the same API number is ABI-compatible); delete the directory
+   to force a fresh download. On Linux and macOS a cache directory that is
+   not owned by you or is world-writable is never used.
+4. **Loads it as a Zend extension with an absolute path** and sets
+   `xdebug.mode=debug,develop`, `xdebug.start_with_request=trigger`,
+   `xdebug.client_host`, and `xdebug.client_port`.
+5. **Lifts the timeouts** for the session: `[server.timeouts] request = 0`
+   and, where PHP enforces it natively (Linux), `max_execution_time = 0`, so
+   a request paused on a breakpoint is not killed.
+6. **Checks that it worked.** After PHP starts, ePHPm confirms Xdebug
+   registered as a Zend extension and refuses to start otherwise; PHP's own
+   startup message (for example "Failed loading …") names the reason.
+
+Flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--xdebug` | off | Enable, using the catalog build (cached after the first download). |
+| `--xdebug-path <FILE>` | — | Use a local `xdebug.so` instead; implies `--xdebug`, no network. |
+| `--xdebug-client-host <HOST>` | `127.0.0.1` | Where the IDE listens (see [WSL](#wsl)). |
+| `--xdebug-client-port <PORT>` | `9003` | The IDE's port. |
+
+`EPHPM_EXT_CATALOG_URL` (download base, laid out as `<base>/<tag>/<asset>`)
+and `EPHPM_EXT_CATALOG_API` (a GitHub-releases-shaped listing) point the
+download at a mirror; both must be `https://` URLs unless they point at a
+loopback address. The release listing uses the unauthenticated GitHub
+API (60 requests/hour); a rate-limited response is reported as such.
+
+> **Catalog status:** the Linux catalog ships Xdebug 3.5.3 for PHP 8.3, 8.4
+> and 8.5 (and 3.6.0alpha1 for the 8.6 beta). macOS arm64 tarballs are being
+> added; when no release for your PHP minor has one, `--xdebug` says so
+> (listing what it tried) — use `--xdebug-path` with your own ZTS build in
+> the meantime.
+
+`ephpm dev` runs PHP in the default per-request mode, where Xdebug's own
+trigger handling applies unchanged.
 
 ## Starting a session
 
@@ -81,7 +131,7 @@ Send any trigger Xdebug understands:
 - **Browser**: a helper extension (Xdebug helper for Chrome/Firefox) that
   sets the `XDEBUG_SESSION` cookie.
 - **curl / scripts**: `?XDEBUG_TRIGGER=1` on the URL, or
-  `-b XDEBUG_SESSION=PHPSTORM`.
+  `-b XDEBUG_SESSION=1`.
 - **Forms**: an `XDEBUG_TRIGGER` field in an
   `application/x-www-form-urlencoded` POST body.
 - The legacy `XDEBUG_SESSION_START=<idekey>` query/form parameter.
@@ -90,11 +140,117 @@ With `xdebug.trigger_value` set, `XDEBUG_TRIGGER` / `XDEBUG_SESSION` must
 carry one of its values, and `XDEBUG_SESSION_START` is refused — Xdebug's
 own rules.
 
-Your IDE needs nothing ePHPm-specific: listen on the client port (VS Code
-`php-debug`, PhpStorm "Start Listening for PHP Debug Connections") and map
-your project path if ePHPm runs in a container.
+Requests without a trigger run normally and never contact the IDE.
+
+## VS Code
+
+Install the **PHP Debug** extension (`xdebug.php-debug`) and add
+`.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Listen for Xdebug",
+      "type": "php",
+      "request": "launch",
+      "port": 9003
+    }
+  ]
+}
+```
+
+Start "Listen for Xdebug", set a breakpoint, and load a page with the
+trigger. No `pathMappings` are needed when VS Code and ePHPm see the same
+filesystem paths (same machine, or VS Code Remote - WSL / Remote - SSH /
+Dev Containers attached to where ePHPm runs). Add them only when the IDE sees
+the code under a different path than PHP does (for example ePHPm in a
+container with the project bind-mounted elsewhere):
+
+```json
+"pathMappings": { "/app": "${workspaceFolder}" }
+```
+
+PhpStorm: *Run → Start Listening for PHP Debug Connections* (port 9003).
+
+## WSL
+
+- **IDE inside WSL** (VS Code Remote - WSL, the recommended setup): the
+  defaults work — Xdebug connects to `127.0.0.1:9003` inside the distro and
+  the paths match.
+- **IDE on Windows, ePHPm in WSL** (default NAT networking): Xdebug must
+  connect *out* of WSL to the Windows host. Pass the host's address —
+  typically the default gateway seen from WSL — and allow inbound TCP 9003
+  in the Windows firewall:
+
+  ```bash
+  ephpm dev --xdebug --xdebug-client-host "$(ip route show default | awk '{print $3}')"
+  ```
+
+  With WSL **mirrored networking** (`networkingMode=mirrored` in
+  `.wslconfig`), `127.0.0.1` reaches Windows and the default works. In either
+  case the Windows IDE sees the files as `\\wsl.localhost\<distro>\…`, so add
+  `pathMappings` from the Linux path to that one.
+
+## Using Xdebug with `ephpm serve`
+
+`ephpm dev` is configuration-free; for `ephpm serve` (or a dev setup you
+want to keep in a config file) load Xdebug yourself. Get a ZTS build — the
+cached catalog file from `ephpm dev --xdebug`, the catalog tarball, or your
+own `phpize` build — and list it in `[php] extensions`. ePHPm detects that it
+is a Zend extension and emits `zend_extension=` with an absolute path:
+
+```toml
+[php]
+extensions = ["/opt/xdebug/xdebug.so"]   # loaded via zend_extension=
+max_execution_time = 0                   # don't time out a paused request
+ini_overrides = [
+  ["xdebug.mode", "debug,develop"],
+  ["xdebug.start_with_request", "trigger"],  # only when a trigger is sent
+  ["xdebug.client_host", "127.0.0.1"],       # where your IDE listens
+  ["xdebug.client_port", "9003"],
+  # Optional: require a shared secret as the trigger value.
+  # ["xdebug.trigger_value", "change-me"],
+]
+
+[server.timeouts]
+# A request paused on a breakpoint must not be cut off.
+request = 0
+```
+
+Loading it through `ini_overrides` works too —
+`["zend_extension", "/opt/xdebug/xdebug.so"]` — but the path **must be
+absolute** there: PHP resolves a relative `zend_extension` against
+`extension_dir` (a baked-in placeholder in ePHPm), not the current directory.
+
+Check that a build loads:
+
+```console
+$ ephpm php -d zend_extension=/opt/xdebug/xdebug.so -v
+PHP 8.5.7 (cli) (built: …) (ZTS)
+Copyright (c) The PHP Group
+Zend Engine v4.5.7, Copyright (c) Zend Technologies
+    with Xdebug v3.5.3, Copyright (c) 2002-2026, by Derick Rethans
+    with Zend OPcache v8.5.7, Copyright (c), by Zend Technologies
+```
+
+A relative `zend_extension=xdebug.so` fails with `Failed loading Zend
+extension 'xdebug.so' (tried: /lib/php/extensions/no-debug-zts-…/xdebug.so …)`.
+At server startup in worker mode, ePHPm logs a warning when the worker-mode
+debug lane is armed, or an info line saying why it is not (for example
+`xdebug.mode` lacking `debug`).
+
+`[server.timeouts] request` is the server's per-request deadline. Leave it
+at a non-zero value while debugging and a request you sit on longer than
+that is answered `504` — the debug session itself keeps going in your IDE,
+but its response is discarded. ePHPm warns about this at startup when the
+worker-mode debug lane is armed.
 
 ## Worker mode: how it works
+
+`ephpm dev` does not run worker mode; this applies to `ephpm serve` with
+`[php] mode = "worker"` and Xdebug loaded as in the previous section.
 
 To PHP, a persistent worker's whole life is *one* request: request startup
 runs once when the worker boots, then `take_request()` hands it thousands of
