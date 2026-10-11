@@ -280,7 +280,7 @@ mod tests {
         BuiltinModule::init::<Probe>(&serde_json::json!({ "mode": mode })).expect("init")
     }
 
-    /// A module that declares its key set (as all ten in-tree builtins do).
+    /// A module that declares its key set (as all twelve in-tree builtins do).
     struct Strict;
 
     impl Middleware for Strict {

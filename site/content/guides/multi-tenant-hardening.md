@@ -32,7 +32,7 @@ importantly — the residual risks it does *not* close.
   takes everyone down until restart. This is a shared-fate *availability*
   problem, not a confidentiality one; closing it needs per-tenant process
   isolation, which the single-process density model deliberately does not
-  provide. See [Residual risks](#residual-risks).
+  provide. See [Residual risks](#residual-risks-honest-limits).
 
 The core difficulty: because it is **one process, one uid, fungible ZTS
 threads**, the kernel cannot tell tenants apart on its own. Every layer below

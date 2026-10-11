@@ -25,7 +25,7 @@ Ten thousand idle connections cost no PHP at all. A message costs exactly one PH
 enabled = true
 ```
 
-That is the only required line; every bound has a default (see [Configuration](/reference/config/#server-websocket)).
+That is the only required line; every bound has a default (see [Configuration](/reference/config/#serverwebsocket)).
 
 The entrypoint is `websocket.php` at the **vhost's document root** — `index.php` for WebSockets. The name is configurable, `index_files`-style:
 

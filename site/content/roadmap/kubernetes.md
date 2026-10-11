@@ -78,7 +78,7 @@ node would therefore only remove capacity.
 Use plain round-robin (or any read balancing you like) in this mode; keep the
 active-passive `/_ephpm/primary` backend for single-database clustered mode.
 Note the documented gap: forwarding covers the `ephpm_db_*` bridge, not stock
-`pdo_mysql` — see [`per_site`](/reference/config/#dbsqlitereplication).
+`pdo_mysql` — see [`per_site`](/reference/config/#dbsqlitereplication-clustered-mode-only).
 
 ```yaml
 # Example: an LB backend that only accepts the writable node.

@@ -6,7 +6,7 @@ weight = 10
 
 Forward-looking design documents — what we're planning, what we're considering, and what we've decided not to do (yet).
 
-These pages describe targets, not currently-shipped behavior. For what works today, see [Architecture](/docs/architecture/) and [Feature Status](/docs/introduction/feature-status/).
+These pages describe targets, not currently-shipped behavior. For what works today, see [Architecture](/architecture/) and [Feature Status](/architecture/#feature-status).
 
 - **[Performance Master List](performance/)** — every measured or audited performance item in one living table: shipped (with numbers), backlog, gated, unexplored.
 - **[Worker Dispatch Fast Path](worker-dispatch-fastpath/)** — closing the measured gap to in-process runtimes: lazy Envelope, handoff economics, quota-aware defaults.

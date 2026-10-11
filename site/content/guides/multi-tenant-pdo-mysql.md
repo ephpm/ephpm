@@ -53,7 +53,7 @@ too, populated per request.
 2. **Read the password from `$_SERVER` every request; don't hard-code it.**
    Without `[kv] secret` it is derived from a random secret generated in memory
    at startup, so it *changes on every restart*. With `[kv] secret` set (see
-   [Running wp-cli against a site](#running-wp-cli-artisan-against-a-site) below)
+   [Running wp-cli against a site](#running-wp-cli--artisan-against-a-site) below)
    it is stable across restarts, but reading it from `$_SERVER` is still the
    right habit — it works under both, and it is the only place ePHPm injects it.
 

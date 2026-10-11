@@ -125,7 +125,7 @@ has no stale BPF state to reconcile.
 
 **Closed sidecar ports return to the pool only on ePHPm restart.** The
 close-time reclaim path (`sock_release` + `bpf_sk_storage`) is **not yet
-implemented** — as of v0.8.6 it remains open, with no target release: the
+implemented** — as of v0.11.2 it remains open, with no target release: the
 current Rust BPF loader cannot load an `SK_STORAGE` map, and reading
 the source port in `sock_release` is verifier-rejected on current kernels. In
 the meantime, a vhost re-binding the *same* virtual port reuses its existing

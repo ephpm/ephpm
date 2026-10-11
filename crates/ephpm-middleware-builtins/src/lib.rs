@@ -39,7 +39,7 @@
 //! [`ephpm_middleware::Middleware::CONFIG_KEYS`], so a mount carrying a key
 //! none of them reads is a **startup error** naming the mount, the key and the
 //! nearest accepted spelling — not a silent no-op running the default (issue
-//! #473). These ten ship inside the binary that enforces the check, so there
+//! #473). These twelve ship inside the binary that enforces the check, so there
 //! is no cross-version skew to tolerate; a third-party module keeps the
 //! lenient default until it declares its own keys. See
 //! [`ephpm_middleware::config`].

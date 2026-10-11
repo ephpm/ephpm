@@ -7,7 +7,7 @@
 //!
 //! Each mount resolves through two lanes, in order:
 //!
-//! 1. **Builtin registry** ([`builtin`]) — the ten in-tree official modules
+//! 1. **Builtin registry** ([`builtin`]) — the twelve in-tree official modules
 //!    compiled into this binary and invoked in-process (no FFI, no dlopen).
 //!    Works in every binary, including custom fully static builds where
 //!    `dlopen` does not exist. Two of them (`request-id`, `header-transform`)
@@ -283,7 +283,7 @@ impl MiddlewareChain {
     /// Test-only: mount one in-process module directly, bypassing the
     /// `library`-name registry in [`builtin`].
     ///
-    /// [`MiddlewareChain::load`] can only reach the ten shipped modules, and
+    /// [`MiddlewareChain::load`] can only reach the twelve shipped modules, and
     /// none of them touches the KV store in its **response** phase — so there
     /// is otherwise no way to write a test that observes whether the router
     /// entered the per-vhost KV scope around `run_response_phase` (issue

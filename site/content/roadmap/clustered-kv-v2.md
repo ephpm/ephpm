@@ -71,9 +71,9 @@ the key's owner**.
 
 **Failure mode:** owner unreachable → increment applies locally with a
 `degraded` flag and a warning metric; the window self-heals on the next
-ring change. Rate limiting degrades to per-node rather than failing
-requests — the same behavior as v1, now as a *fallback* instead of the
-steady state.
+ring change. Rate limiting degrades to today's approximate
+last-writer-wins counting rather than failing requests — the current
+behavior, now as a *fallback* instead of the steady state.
 
 ### Deletes: tombstone application — SHIPPED (v1.1)
 
@@ -126,6 +126,7 @@ Remove the startup warning; add
 |---|---|---|
 | Tombstone gossip + applier | small (machinery existed) | shipped v1.1 |
 | Gossip-tier TTL replication | small (re-encode + fresh write_ms) | shipped v1.1 |
+| Publish results of `INCR`/`APPEND`/`PERSIST` (last-writer-wins totals) | small | shipped (#416) |
 | `OP_INCR`/`OP_INCRBY`/`OP_EXPIRE` data-plane frames + owner routing | the bulk | remaining |
 | Ratelimit warning removal + degraded metric | trivial | after INCR |
 | Two-node e2e: cross-node limit enforcement | moderate | after INCR |

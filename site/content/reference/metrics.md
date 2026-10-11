@@ -162,7 +162,7 @@ These appear when at least one `[[middleware]]` mount is configured.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_middleware_invocations_total` | counter | `module`, `action` | Request-phase middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. |
+| `ephpm_middleware_invocations_total` | counter | `module`, `action` | Request-phase middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. `php:` mounts (the PHP lane) record into the same counter with `continue`, `respond` (the mount called `exit()`) or `error` (the mount raised a fatal; the request fails closed), never `rewrite`; mounts after the one that ended the chain are not counted. |
 | `ephpm_middleware_response_invocations_total` | counter | `module` | Response-phase invocations (`invoke_response`), one per response-capable module per matching buffered response. Streamed responses bypass the response phase and are not counted. |
 
 **PHP mounts** (`library = "php:<path>"`, experimental) share this counter,

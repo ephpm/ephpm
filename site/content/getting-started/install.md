@@ -25,7 +25,7 @@ docker run -p 8080:8080 \
 | Tag | What it tracks |
 |-----|----------------|
 | `ephpm/ephpm:latest` | Rolling latest release with the default PHP minor |
-| `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` | Rolling latest release pinned to a PHP minor |
+| `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` / `ephpm/ephpm:8.3` | Rolling latest stable release pinned to a PHP minor |
 | `ephpm/ephpm:vX.Y.Z` | Pinned ePHPm release with the default PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5` | Pinned release × rolling PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5.7` | Pinned release × pinned PHP patch (fully reproducible) |

@@ -134,7 +134,7 @@ define( 'WP_CACHE', true );
 # 'Failed to open stream' on subdirectory requests.
 ephpm dev --port 8088 --document-root "$(pwd)/wordpress"
 
-#   ePHPm 0.8.6 — dev server
+#   ePHPm 0.11.2 — dev server
 #     serving:  /path/to/wordpress
 #     url:      http://127.0.0.1:8088
 #     php:      8.5.7
@@ -415,7 +415,7 @@ spec:
               mountPath: /etc/ephpm
 
         - name: wordpress-install
-          image: ephpm/ephpm:v0.8.6-php8.5
+          image: ephpm/ephpm:v0.11.2-php8.5
           command:
             - sh
             - -c
@@ -443,7 +443,7 @@ spec:
 
       containers:
         - name: ephpm
-          image: ephpm/ephpm:v0.8.6-php8.5
+          image: ephpm/ephpm:v0.11.2-php8.5
           command: [ephpm, serve, --config, /etc/ephpm/ephpm.toml]
           ports:
             - name: http

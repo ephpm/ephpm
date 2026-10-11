@@ -249,6 +249,16 @@ key = "/etc/letsencrypt/live/example.com/privkey.pem"
 
 If Nginx is proxying to multiple PHP-FPM pools or other backends, ePHPm doesn't replace that. For pure PHP serving (the most common case), ePHPm replaces both Nginx and PHP-FPM. If you need Nginx as a reverse proxy to non-PHP services, keep Nginx for those and point it at ePHPm for PHP.
 
+If Nginx (or any load balancer) stays in front of ePHPm, list its address in
+`[server.security] trusted_proxies`. Otherwise every request appears to come
+from the proxy: `REMOTE_ADDR` is the proxy's IP, `per_ip_rate` throttles all
+clients as one, and `per_ip_max_connections` always counts the proxy's TCP
+connections even when `trusted_proxies` is set. ePHPm reads only
+`X-Forwarded-For` and `X-Forwarded-Proto`; `X-Forwarded-Host`, `X-Real-IP`
+and `Forwarded` are ignored, so Nginx must pass the original `Host` header
+(`proxy_set_header Host $host;`). See
+[Behind a load balancer or reverse proxy](/reference/config/#behind-a-load-balancer-or-reverse-proxy).
+
 ### 6. Switch Over
 
 ```bash
