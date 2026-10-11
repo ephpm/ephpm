@@ -14,7 +14,7 @@ ePHPm cannot recover from that in general, and does not try. What it does is
 
 There is one narrow, opt-in exception as of v0.7.0: with
 [`[php] crash_containment = true`](/reference/config/#php) (which requires
-per-request mode), a PHP **C-stack overflow** — and only that fault
+per-request mode, and is Linux/macOS only — Windows has no containment), a PHP **C-stack overflow** — and only that fault
 class — is contained instead of fatal: the offending request is answered
 `500` and the pool thread that ran it is retired and replaced. Heap
 corruption and wild writes still kill the process exactly as described on

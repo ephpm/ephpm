@@ -29,6 +29,18 @@ if (isset($_GET['script'])) {
     }
 }
 
+// Canonicalize to the exact spelling OPcache keys the script under. OPcache
+// stores a script by its resolved path, but opcache_is_script_cached() looks
+// up the string it is given verbatim. On Windows DOCUMENT_ROOT uses `\` while
+// the concatenation above adds a `/`, so the mixed-separator spelling never
+// matches the `\`-only key and the probe reported `target_cached: false` for a
+// script that was cached (issue #454). realpath() yields the same resolved
+// form OPcache uses (on Unix it only matters for a symlinked docroot).
+$resolved = realpath($target);
+if ($resolved !== false) {
+    $target = $resolved;
+}
+
 $warm = !isset($_GET['warm']) || $_GET['warm'] !== '0';
 if ($warm && is_file($target)) {
     include_once $target;

@@ -1936,7 +1936,19 @@ fn run_with_config(
     // so a guard can never be armed with no hook to recover it. Left entirely
     // alone when the knob is off: no hook is registered, no guard is ever armed,
     // and a C-stack overflow aborts the process exactly as it always has.
-    if config.php.is_crash_containment_active() {
+    //
+    // Windows has no containment at all (the guard is POSIX-signal based and
+    // Windows raises SEH exceptions), so there the knob is ignored — and said
+    // so, rather than logging the "containment is ON" banner below for a
+    // mechanism that cannot fire (issue #454).
+    if config.php.crash_containment && !cfg!(unix) {
+        tracing::warn!(
+            "[php] crash_containment = true is IGNORED on Windows — stack-overflow \
+             containment is Unix-only (it relies on POSIX signal handling; Windows \
+             delivers the fault as an SEH exception). A PHP C-stack overflow will \
+             abort the process as usual."
+        );
+    } else if config.php.is_crash_containment_active() {
         fatal_signal::set_recover_hook(ephpm_php::crash_guard::recover_hook());
         ephpm_php::crash_guard::set_enabled(true);
         tracing::warn!(
