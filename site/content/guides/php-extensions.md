@@ -173,7 +173,7 @@ distro/Sury `php8.x-<ext>` packages are **NTS** and are rejected at
 startup (verified July 2026: Sury's `php8.5-igbinary` fails with
 `undefined symbol: compiler_globals`; no `-zts` package variants exist in
 the Sury bookworm/trixie indexes). On macOS, use arm64 ZTS builds, loaded
-by an ePHPm binary newer than v0.11.2 (earlier macOS binaries were linked
+by an ePHPm binary newer than v0.11.3 (earlier macOS binaries were linked
 without `-export_dynamic` and fail with `symbol not found in flat
 namespace`). macOS binds a bundle's symbols at load time, so list an
 extension after the ones it depends on (`igbinary` before `redis`).
