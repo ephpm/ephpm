@@ -28,6 +28,18 @@ cargo nextest run -p ephpm-server                # single crate
 cargo nextest run -p ephpm-server test_routing   # single test
 ```
 
+**The middleware `dlopen` tests need their libraries built first.**
+`crates/ephpm-server/tests/middleware_dlopen.rs` and
+`middleware_response_phase.rs` load real cdylib fixtures (the `ephpm-server` examples,
+`examples/mw_probe_*.rs` and `mw_response_*.rs`).
+`cargo test` / `cargo nextest run` do **not** build example artifacts, so on a
+clean checkout those tests fail on a missing library unless you first run the
+same step CI runs before its test step:
+
+```bash
+cargo build --workspace --lib --examples
+```
+
 Integration tests that require PHP are `#[ignore]` by default. Run them after building with `cargo xtask release`:
 
 ```bash

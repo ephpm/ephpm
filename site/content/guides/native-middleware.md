@@ -11,21 +11,27 @@ PHP and never pays for the body transfer.
 
 Middleware can call back into the host: the embedded (cluster-replicated)
 KV store and the `tracing` logger are one function call away. That's what
-makes a cluster-wide rate limiter a ~100-line module — the replicated
-counter is a single `kv_incr`.
+makes a rate limiter a ~100-line module — the counter is a single
+`kv_incr_ttl`, replicated (last-arrival-wins, so approximately) across a
+cluster.
 
 There are **two ways a compiled module runs** — plus an experimental
 [PHP lane](#the-php-lane-experimental) for middleware written in plain PHP,
 which trades the "before PHP, before the body" position for not needing a
 compiler at all:
 
-- **Built-in (static registry).** Eleven official modules — `jwt`,
-  `session-cookie`, `cors`, `ratelimit`, `security-headers`, `api-key`,
-  `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, and
+- **Built-in (static registry).** Twelve official modules — `jwt`,
+  `session-cookie`, `preview-gate`, `cors`, `ratelimit`, `security-headers`,
+  `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, and
   `header-transform` — are compiled into **every** ePHPm binary. `library =
   "jwt"` just works: no shared library on disk, no `dlopen`, no special build.
   Two of them (`request-id`, `header-transform`) also run in the **response
-  phase**.
+  phase**. (`preview-gate` can be mounted like the others, but in a preview
+  fleet it is normally activated per vhost by a
+  [`[preview_auth]`](/guides/virtual-hosts/#preview_auth-the-access-gate)
+  override instead — see [`preview-gate`](#preview-gate).) The
+  [built-in middleware reference](/reference/middleware/) lists all twelve with
+  their accepted spellings and config keys.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
@@ -115,7 +121,7 @@ config  = { api_key = "..." }
 | Key | Required | Meaning |
 |-----|----------|---------|
 | `library` | yes | Built-in name or shared library to load — bare name or explicit path (see below). Must not be empty. |
-| `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every PHP-bound request. |
+| `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every request the chain sees — PHP **and** static files (see [Coverage](#coverage)). |
 | `order` | yes | Chain position. Lower runs first; equal orders keep declaration order. |
 | `config` | no | Table serialised to JSON and handed to the module's `init`. For the built-in modules a key the module does not read is a startup error — see [Unknown `config` keys](#unknown-config-keys). |
 
@@ -147,7 +153,7 @@ was logged at any level, so the operator's explicit instruction became a no-op
 that every health check reported green — and for `ip-allowlist`, `api-key`,
 `jwt` and `ratelimit` a no-op is a *widening*: the rule you wrote down is not
 the rule being enforced. The same reasoning as [unknown keys elsewhere in
-`ephpm.toml`](/reference/config/#unknown-keys-are-a-startup-error), and the ten
+`ephpm.toml`](/reference/config/#unknown-keys-are-a-startup-error), and the
 built-ins ship inside the binary that checks them, so there is no
 version-skew case to tolerate. If an upgrade fails startup naming a `config`
 key, **that key was already doing nothing**.
@@ -164,15 +170,41 @@ Two things are deliberately *not* checked:
   module built against an older authoring kit keeps the old lenient behaviour;
   its `config` typos are still silent.
 
+### Secrets in `config` are literal
+
+**The built-in modules do not expand `env:NAME` or `file:/path` references.**
+The `secret` key of `jwt`, `session-cookie` and `preview-gate` is used as the
+HMAC key **byte for byte** — `secret = "env:EPHPM_SESSION_SECRET"` makes the
+key the public string `env:EPHPM_SESSION_SECRET` itself, and anyone who
+can read that string (it is in these docs) can mint tokens your gate accepts.
+Nothing warns: the value is a valid, non-empty string. The built-ins also
+enforce no minimum length beyond "not empty", so choose a long random key
+(32+ bytes, e.g. `openssl rand -hex 32`) yourself.
+
+Two places in ePHPm *do* resolve references, and only these two:
+
+| Where | `env:NAME` | `file:/abs/path` | Minimum length |
+|---|---|---|---|
+| [`[preview_auth]`](/guides/virtual-hosts/#preview_auth-the-access-gate) `session_secret` (per-site override file) | yes | yes | 32 bytes, fail-closed |
+| Out-of-tree modules that implement it themselves — e.g. the [`github-auth`](/guides/github-auth-middleware/#configuration) issuer's `client_secret`, `session_secret`, `bypass_token` | yes | no | `session_secret`/`bypass_token`: 32 bytes |
+
+ePHPm does no variable substitution inside `ephpm.toml`. So for a built-in,
+keep the secret out of version control by controlling the config file itself:
+render `ephpm.toml` at deploy time from your secret store, and make it
+readable only by the ePHPm service user. If the issuer on the other side reads
+the same key via `env:`, the two values must be identical byte for byte (the
+`github-auth` issuer does not trim the variable; `[preview_auth]` does trim
+surrounding whitespace).
+
 ### Library resolution
 
 The `library` value is checked against the **builtin registry first**.
 Each built-in answers to its short name and its crate name, with `-` and
-`_` interchangeable: `jwt`, `session-cookie`, `cors`, `ratelimit` (also
-`rate-limit`), `security-headers`, `api-key`, `ip-allowlist`,
-`maintenance-mode`, `redirect`, `request-id`, `header-transform`, and the
-`ephpm-middleware-*` / `ephpm_middleware_*` long forms. Builtin mounts
-never touch the filesystem.
+`_` interchangeable: `jwt`, `session-cookie`, `preview-gate`, `cors`,
+`ratelimit` (also `rate-limit`), `security-headers`, `api-key`,
+`ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`,
+`header-transform`, and the `ephpm-middleware-*` / `ephpm_middleware_*` long
+forms. Builtin mounts never touch the filesystem.
 
 Anything else is resolved as a shared library. A value containing a path
 separator or a file extension is used as-is. A bare name tries, in each
@@ -184,12 +216,24 @@ search directory:
 
 Search directories, in order:
 
-1. the server's working directory
-2. `$EPHPM_MIDDLEWARE_DIR` (when set)
+1. `.` — the ePHPm **process's** working directory (not the directory of
+   `ephpm.toml`)
+2. `$EPHPM_MIDDLEWARE_DIR` (when set and non-empty)
 3. `/usr/local/lib/ephpm/middleware`
 
 The startup error lists every candidate path tried, so a typo'd mount is
 easy to diagnose.
+
+Two consequences when ePHPm runs as a service. The working directory is
+whatever the service manager gives it — the systemd unit `ephpm install`
+generates sets no
+`WorkingDirectory=`, so that is `/`, and a Windows service normally starts in
+`C:\Windows\System32` — so the first search directory is rarely what you
+expect. And `/usr/local/lib/ephpm/middleware` is compiled in on **every**
+platform: on Windows it is a drive-relative path (`\usr\local\lib\ephpm\middleware`
+on the current drive), not a conventional Windows location. For a service,
+mount by explicit path or set `EPHPM_MIDDLEWARE_DIR` in the service's
+environment.
 
 ## Chain semantics (v1)
 
@@ -230,7 +274,9 @@ v1 rules worth knowing:
   CSRF-with-body, and payload validation — while the full body still reaches
   PHP intact. See the [config reference](../../reference/config/).
 
-**Coverage.** The request phase runs on **both** the PHP path and the
+### Coverage
+
+The request phase runs on **both** the PHP path and the
 **static-file** path, in every mode — so a `RESPOND` verdict gates a static
 asset just as it gates a PHP request, and it does so *before the file is read
 from disk*. Only the router's own pre-routing replies (internal
@@ -238,8 +284,9 @@ from disk*. Only the router's own pre-routing replies (internal
 trusted-host / hidden-file / blocked-path 4xx gates) answer ahead of the chain
 and are never seen by it.
 
-> **Static assets are gated too.** A gating mount (`basic-auth`,
-> `session-cookie`, `github-auth`, `jwt`, …) that matches a static asset's path
+> **Static assets are gated too.** A gating mount (`session-cookie`, `jwt`,
+> `api-key`, `ip-allowlist`, the out-of-tree `github-auth`, a custom module
+> built from the `basic-auth` template, …) that matches a static asset's path
 > now denies it before the bytes leave disk — scope the mount's `match` glob to
 > cover the asset paths you mean to protect (e.g. `match = "/wp-content/uploads/*"`).
 > Defense in depth still applies: keep truly confidential files out of a
@@ -269,9 +316,11 @@ Key properties:
   handler that errors or panics leaves the response **unchanged**. A response
   module is a transform, **not a security gate** — do your gating in the
   request phase.
-- **May run without a request phase.** On the static path no request phase ran
-  for this module, and an upstream `RESPOND` can short-circuit before it — so a
-  response handler must not assume state its own request phase would have set.
+- **May run without a request phase.** An upstream `RESPOND` short-circuits
+  the request phase before later modules run, yet the response phase still
+  unwinds over the response it produced, and error responses (a fallback
+  `=404`, for example) pass through it too — so a response handler must not
+  assume state its own request phase would have set.
 - **Opt-in per module.** Only modules that export the optional
   `ephpm_middleware_invoke_response` symbol participate; every existing v1
   module is unaffected (see [The C ABI](#the-c-abi-for-non-rust-modules)).
@@ -314,12 +363,20 @@ files too — ships as
 
 ## The built-in modules
 
-All eleven are compiled into every ePHPm binary and run in-process — mount
+All twelve are compiled into every ePHPm binary and run in-process — mount
 them by short name (`library = "jwt"`) with no shared library on disk.
 `request-id` and `header-transform` additionally run in the response phase.
-Loadable cdylib builds of the same implementations (for the dlopen lane, or
-as authoring templates) live in the
-[`ephpm/middleware-examples`](https://github.com/ephpm/middleware) repo.
+The [built-in middleware reference](/reference/middleware/) summarises them on
+one page.
+
+Loadable cdylib builds of five of them — `cors`, `jwt`, `ratelimit`,
+`security-headers`, `session-cookie` — live in this repository as thin
+`declare!` shells (`crates/ephpm-middleware-{cors,jwt,ratelimit,security-headers,session-cookie}`)
+over the same implementations, for dynamically linked builds that want to
+`dlopen` them. Stand-alone teaching templates (`basic-auth`, `api-key`,
+`redirect`, `header-transform`) live in the separate
+[`ephpm/middleware-examples`](https://github.com/ephpm/middleware-examples)
+repo; those are examples to copy, not the shipped modules.
 
 ### `security-headers`
 
@@ -359,7 +416,7 @@ are enforced when configured.
 
 | key | default | meaning |
 |-----|---------|---------|
-| `secret` (string) | **required** | HS256 shared secret |
+| `secret` (string) | **required** | HS256 shared secret, used literally — `env:`/`file:` are **not** expanded ([why](#secrets-in-config-are-literal)) |
 | `issuer` (string) | unset | required `iss` claim value |
 | `audience` (string) | unset | required `aud` value (string or array member) |
 | `header` (string) | `"Authorization"` | request header carrying the token; `Bearer ` prefix stripped |
@@ -395,7 +452,7 @@ provider rate limits, no OAuth client secret on the serving nodes.
 
 | key | default | meaning |
 |-----|---------|---------|
-| `secret` (string) | **required** | HS256 shared secret — the same key the login service signs with |
+| `secret` (string) | **required** | HS256 shared secret — the same key the login service signs with. Used literally: `env:`/`file:` are **not** expanded ([why](#secrets-in-config-are-literal)) |
 | `login_url` (string) | **required** | where to send unauthenticated browsers. Must be an `https://`/`http://` URL or a same-origin absolute path; `javascript:`/`//host` fail startup |
 | `cookie` (string) | `"ephpm_session"` | name of the cookie carrying the token |
 | `return_to_param` (string) | unset — no return-to is sent | query parameter on `login_url` carrying the validated, same-origin return path |
@@ -410,14 +467,17 @@ provider rate limits, no OAuth client secret on the serving nodes.
 [[middleware]]
 library = "session-cookie"
 order   = 10
-config  = {
-  secret          = "shared-with-the-login-service",
-  login_url       = "https://previews.example/auth/start",
-  return_to_param = "next",
-  site_param      = "site",
-  claims_header   = "X-Session-Claims",
-}
+[middleware.config]
+secret          = "REPLACE-ME-the-literal-key-the-login-service-signs-with"  # not env:
+login_url       = "https://previews.example/auth/start"
+return_to_param = "next"
+site_param      = "site"
+claims_header   = "X-Session-Claims"
 ```
+
+(A `config = { … }` inline table must stay on **one line** — the TOML 1.0
+parser ePHPm uses rejects line breaks inside `{ }`. For anything longer, use
+the `[middleware.config]` sub-table form shown here.)
 
 Verification is exactly `jwt`'s (signature first, constant-time HMAC, `alg`
 pinned to HS256, `exp` required, `nbf`/`iss`/`aud` enforced when configured),
@@ -495,7 +555,7 @@ configured with login/callback paths outside `/_ephpm/auth/`.
 
 | key | default | meaning |
 |-----|---------|---------|
-| `secret` (string) | **required** | HS256 shared secret — the same key the `github-auth` issuer signs sessions with |
+| `secret` (string) | **required** | HS256 shared secret — the same key the `github-auth` issuer signs sessions with. As a `[[middleware]]` mount it is used literally (`env:`/`file:` not expanded, no minimum length); via `[preview_auth] session_secret`, `env:`/`file:` work and ≥ 32 bytes is enforced |
 | `login_url` (string) | **required** | `https://`/`http://` URL or same-origin absolute path unauthenticated browsers are redirected to |
 | `cookie` (string) | `"ephpm_session"` | session cookie name (must match the issuer's `cookie_name`) |
 | `exempt_paths` (array) | `[]` | request paths that bypass the gate (the issuer's login/callback) |
@@ -516,6 +576,27 @@ ePHPm ships the reference minter (`preview_gate::mint_share_token`) but no mint
 endpoint. See the [roadmap page](/roadmap/preview-access-gate/) for the full
 threat model and the switchboard contract.
 
+The share-token contract, as the shipped code implements it:
+
+- **Format.** An HS256 JWT signed with the gate's `secret`. The reference
+  minter writes exactly `site` (the preview's canonical site key), `via:
+  "share"`, `jti`, `iat` and `exp`. The verifier requires `exp`, the `site`
+  binding (unless `require_site = false`), and `iss`/`aud` only when those are
+  configured.
+- **Revoke one link** by writing any value to `preview:share:revoked:<jti>`;
+  presence is what counts. A token with no `jti` cannot be revoked this way.
+- **Revoke every link** by writing a unix timestamp to `preview:share:epoch`:
+  a share token whose `iat` is below the greater of that value and the static
+  `share_epoch` is refused. A value that does not parse as an integer is
+  ignored.
+- Both keys live in the **preview's own KV keyspace** (the per-vhost store on
+  a multi-tenant node — the same one that site's PHP reaches through
+  `ephpm_kv_*`), not the process-global store.
+- **Revocation is best-effort, not fail-closed.** The host's KV read returns
+  "absent" both for a missing key and for a KV failure, so if the store cannot
+  be read, a revoked share token is admitted until its `exp`. Keep share
+  `exp` short for that reason.
+
 ### `ratelimit`
 
 Fixed-window per-client rate limiting backed by the embedded KV store.
@@ -523,19 +604,49 @@ Requests are counted in 10-second windows; each window allows
 `per_ip_rps × 10 + burst` requests per client. Over the limit: `429` with
 `Retry-After` for the seconds left in the window.
 
-**Cluster scope: per-node only, not cluster-wide (v1).** The counter is
-maintained with KV `INCR`, which is not yet gossip-replicated across
-nodes — only `SET`/`DEL` writes propagate. That means each node enforces
-its own window independently: a client hitting N nodes gets up to N ×
-the configured allowance. A cluster-wide window is planned (issue #150),
-tracked with replicated `INCR`. Startup logs a `warn!` when `ratelimit`
-is mounted with `[cluster].enabled = true` so operators see the gap.
-
 | key | default | meaning |
 |-----|---------|---------|
 | `per_ip_rps` (integer) | **required**, > 0 | sustained requests/second per client |
 | `burst` (integer) | `per_ip_rps` | extra headroom per window |
 | `key_headers` (array) | unset | identify clients by the first present header (e.g. `X-Api-Key`) instead of client IP |
+
+**Behind a load balancer, configure `trusted_proxies` or every client shares
+one budget.** The "client" is the first present `key_headers` header, else
+the request's client IP — and the client IP is the **TCP peer address** unless
+that peer is listed in
+[`[server.security] trusted_proxies`](/reference/config/), in which case it is
+the rightmost `X-Forwarded-For` entry that is not itself a trusted proxy.
+Behind an LB or reverse proxy with `trusted_proxies` unset, every request
+arrives from the proxy's address, so the whole site shares a single
+`per_ip_rps` budget. ePHPm reads only `X-Forwarded-For` for this —
+`Forwarded` (RFC 7239) and `X-Real-IP` are ignored — and `ratelimit` never
+parses forwarding headers itself. Don't point `key_headers` at
+`X-Forwarded-For`: a client can set any value there and mint itself a fresh
+budget per request.
+
+**The budget is per tenant.** Counters are keyed by the request's canonical
+site key (`mw:rl:<site>:<client>:<window>`; requests that matched no vhost
+share the `_UNMATCHED` bucket) and, on a multi-tenant node, live in that
+site's own KV keyspace — so one tenant's traffic cannot spend another's
+budget.
+
+**Cluster scope: replicated, but approximate.** The counter is bumped with
+the KV store's atomic increment, which is atomic **per node**. With
+`[cluster].enabled`, each increment's *resulting value* is replicated to
+peers as a last-arrival-wins write (since #416), not as a cluster-wide atomic
+add — so nodes converge on a shared count, but concurrent increments on
+different nodes can overwrite one another and undercount. Treat the limit as
+roughly cluster-wide under light cross-node concurrency, and as up to
+N × the allowance in the worst case for a client spread across N nodes. It
+is not a strict cluster-wide quota.
+
+At startup ePHPm logs a `WARN` when a mount named exactly `ratelimit` is
+loaded with `[cluster].enabled = true`. Two caveats about that line, both
+code-side: it does not fire for the other accepted spellings (`rate-limit`,
+`ephpm-middleware-ratelimit`, …), and its text — "KV INCR is not yet
+replicated … rate limits are enforced PER NODE" — predates the replication
+described above. The [ratelimit reference](/reference/middleware/ratelimit/)
+is the page that warning points operators to.
 
 **Fail-open by design:** if the KV store is unavailable, requests are
 allowed through with a warning log — a rate limiter that hard-fails would
@@ -562,6 +673,17 @@ At least one of `keys` / `kv_key_template` must be configured.
 | `keys` (object) | unset | static `key → consumer-id` map |
 | `kv_key_template` (string) | unset | KV lookup key with a `<key>` placeholder (e.g. `apikey:<key>`); the stored value is the consumer id |
 | `consumer_header` (string) | `"X-Consumer-Id"` | header injected for PHP with the resolved consumer id |
+
+The static `keys` map is checked first, then the KV lookup. **The KV lookup
+reads the request's own tenant keyspace**, not the process-global store: on a
+multi-tenant node (`[server] sites_dir`) each vhost has its own KV store, so a
+key seeded once as `apikey:<k>` in the global store (or in another site's
+store) is **not** found, and every tenant answers `401`. Seed each site's keys
+in that site's keyspace — e.g. from the site's own PHP with
+`ephpm_kv_set('apikey:'.$key, $consumerId)`. On a single-site node there is
+one store and this distinction disappears. A KV miss, a KV read error, a
+non-UTF-8 value and an empty value are all treated as "unrecognised key" —
+`401`, never a pass-through.
 
 ### `ip-allowlist`
 
@@ -766,11 +888,30 @@ host.kv_set("k", b"v", 60);          // TTL in seconds; 0 = no expiry
 let v = host.kv_get("k");            // Option<Vec<u8>>
 let created = host.kv_set_nx("k", b"0", 30);
 let n = host.kv_incr("counter", 1);  // Option<i64>, atomic
+// Atomic increment that sets the TTL only when it creates the key — the
+// right primitive for a fixed-window counter (no key without an expiry):
+let w = host.kv_incr_ttl("rl:client:window", 1, 30);
 host.log(ephpm_middleware::abi::LOG_INFO, "hello from middleware");
 ```
 
 The KV operations hit the same embedded store PHP sees through
 `ephpm_kv_*` — replicated across the cluster when clustering is enabled.
+
+Verdicts are built on `Response`. `Response::respond(status, body)` answers
+the client directly, and its `.header(..)` sets headers **on that answer**.
+To let the request through *and* add a header to whatever PHP or the static
+handler produces, use `.response_header(..)` on a `cont()` or `rewrite()`
+verdict; `.header(..)` on a `rewrite()` instead overrides a **request**
+header PHP sees:
+
+```rust
+// CONTINUE, appending a header to the eventual response (CORS-style).
+Response::cont().response_header("X-Frame-Options", "DENY")
+// REWRITE: a request header for PHP, plus a response header for the client.
+Response::rewrite()
+    .header("X-Consumer-Id", "acme")
+    .response_header("X-Rate-Remaining", "41")
+```
 
 #### KV scope: per-tenant by default
 
@@ -829,6 +970,17 @@ fn invoke(&self, req: &Request<'_>) -> Response {
 buffered body. Against an older host that predates these (ABI minor < 2) they
 fall back to `"http"` / `false` / `""` rather than reading past a shorter table.
 
+`req.gate_repo()` (ABI minor 4) returns `Option<&str>`: the `owner/name`
+repository the operator declared in this vhost's
+[`[preview_auth]`](/guides/virtual-hosts/#preview_auth-the-access-gate)
+`repo` override, or `None` when there is none (or the host predates minor 4).
+It is populated by the router from the operator-owned override file only —
+never from a request header — so an authorization module may trust it the
+same way it trusts `vhost_id()`. Its intended consumer is the
+[`github-auth`](/guides/github-auth-middleware/#per-preview-authorization-access--per-preview)
+issuer's `access = "per-preview"` mode; a gate that needs a target and gets
+`None` must fail closed rather than invent one.
+
 #### `vhost_id()` is the tenant identity; `http_host()` is not
 
 `req.vhost_id()` returns `Option<&str>`: the **canonical site key** the router
@@ -854,8 +1006,8 @@ compile error.)
 
 **`None` is two situations the ABI cannot tell apart** (issue
 [#453](https://github.com/ephpm/ephpm/issues/453)): "this node has no tenancy
-configured" and "this multi-site node matched nothing". Minor 3 exposes no
-`multi_tenant` flag, so a module cannot distinguish them. That makes *denying*
+configured" and "this multi-site node matched nothing". The ABI (as of minor
+4) exposes no `multi_tenant` flag, so a module cannot distinguish them. That makes *denying*
 on `None` an operator decision, not a module default: a module that denies
 unconditionally — a bare `let Some(site) = … else { return deny };` over
 `vhost_id()` — denies **100% of traffic** on the single-site shape, which is
@@ -917,10 +1069,11 @@ cargo build --release -p my-auth
 
 The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
-the search path. The ten official modules are already compiled into every
-ePHPm binary (mount them by short name); loadable cdylib builds of the same
-implementations, useful as authoring templates, live in the
-[`ephpm/middleware-examples`](https://github.com/ephpm/middleware) repo and
+the search path. The twelve official modules are already compiled into every
+ePHPm binary (mount them by short name). The in-tree cdylib shells
+(`crates/ephpm-middleware-{cors,jwt,ratelimit,security-headers,session-cookie}`)
+and the stand-alone templates in
+[`ephpm/middleware-examples`](https://github.com/ephpm/middleware-examples)
 build exactly the same way.
 
 Build on a distro whose glibc is not newer than the deployment target's
@@ -948,7 +1101,7 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
                                          ephpm_response_edit_t* edit_out);
 ```
 
-- `abi_version` is `0x01_00_00_03` — major **1**, minor **3**. The **major
+- `abi_version` is `0x01_00_00_04` — major **1**, minor **4**. The **major
   byte** gates compatibility; modules must refuse to init (return non-zero)
   when the host's major is newer than they were built for. The lower three
   bytes are an additive **minor** level: growth (new host-table fields, the
@@ -958,7 +1111,8 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   minor **1** added the response phase, minor **2** the appended request
   accessors (`request_scheme`/`request_is_secure`/`request_host`), minor
   **3** the appended process-global KV slots (`kv_get_global` and its four
-  siblings).
+  siblings), minor **4** the appended `request_gate_repo` accessor (purely
+  additive — nothing existing changed in minor 4).
 - **Minor 3 also redefined two existing surfaces** (issues #390 and #376), and
   the two have *different* blast radii — do not read them as one bullet:
   - `request_vhost_id` changes on **every** node. It returns the canonical
@@ -993,7 +1147,10 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   `response_headers`/`response_body`), and — minor 3 — the process-global KV
   operations (`kv_get_global`/`kv_set_global`/`kv_set_nx_global`/
   `kv_incr_global`/`kv_incr_ttl_global`; `kv_free` is shared, since it frees
-  the allocation rather than touching a store).
+  the allocation rather than touching a store), and — minor 4 —
+  `request_gate_repo`: the vhost's operator-declared `[preview_auth] repo` as
+  an `owner/name` C string, or **NULL** when unset (C modules must null-check
+  it, and must check the host's minor is ≥ 4 before reading the slot).
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
   `invoke` returns — the host copies before unwinding. The same rule applies
@@ -1195,8 +1352,10 @@ A policy layer that silently vanishes is how bypasses ship.
 - Scripts run at **global scope**, so their variables are visible to the
   application script — same as `auto_prepend_file`. Wrap logic in a function
   or `return` early.
-- The lane runs only where the native chain runs: PHP-dispatched requests.
-  Static files and router error responses do not pass through it.
+- The lane runs only on PHP-dispatched requests. Static files and router
+  error responses do not pass through it — unlike the native chain, whose
+  request phase also gates static files (see [Coverage](#coverage)). To gate
+  static assets, use a native module.
 
 ## Observability
 
@@ -1230,8 +1389,15 @@ naming the faulting `.so` and function before it dies — see
 
 ## Not implemented (yet)
 
-Planned — not yet implemented: request-body access from middleware, an
-async `invoke` variant, hot reload of modules, per-vhost mounts, a WASM
-loader for sandboxed modules, and the wider module catalog (basic-auth,
-webhook signatures, GeoIP, response cache, OpenTelemetry). The design notes
-live in the git history of the roadmap page this guide replaced.
+Planned — not yet implemented: an async `invoke` variant, hot reload of
+modules, general per-vhost `[[middleware]]` mounts (today mounts are global;
+the only per-vhost activation is `preview-gate` via a `[preview_auth]`
+override), a WASM loader for sandboxed modules, and a wider built-in catalog
+(basic-auth as a built-in — it exists today only as a template in
+[`ephpm/middleware-examples`](https://github.com/ephpm/middleware-examples) —
+plus webhook signatures, GeoIP, response cache, OpenTelemetry). The design
+notes live in the git history of the roadmap page this guide replaced.
+
+Request-body access is **not** on this list: it shipped, opt-in, via
+`[server.request] middleware_body_limit` and `req.body()` — see
+[Chain semantics](#chain-semantics-v1).
