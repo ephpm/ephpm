@@ -641,15 +641,20 @@ fn ensure_php_sdk_variant(
             php_sdk_variant_suffix(variant),
             dest.display()
         );
-        if let Err(msg) = check_sdk_php_version(&dest, version) {
-            eprintln!("error: {msg}");
-            eprintln!(
-                "       Delete {} to re-download it once the php-sdk release is fixed.",
-                dest.display()
-            );
-            return Err(());
+        match check_sdk_php_version(&dest, version) {
+            Ok(()) => return Ok(()),
+            // A cache filled from a since-rebuilt asset (the 8.5.7 macOS SDK
+            // was republished after carrying 8.5.8-dev) must not need a manual
+            // delete on every machine: evict it and download again. The fresh
+            // download goes through the same check below.
+            Err(msg) => {
+                eprintln!("warning: {msg}");
+                eprintln!("==> Discarding the cached SDK and downloading it again");
+                fs::remove_dir_all(&dest).map_err(|e| {
+                    eprintln!("error: failed to remove {}: {e}", dest.display());
+                })?;
+            }
         }
-        return Ok(());
     }
 
     fs::create_dir_all(&dest).map_err(|e| {
@@ -707,7 +712,7 @@ fn sdk_php_version(sdk_dir: &Path) -> Option<String> {
 /// replaced out of band: `php-sdk-8.5.7-macos-aarch64.tar.gz` on `v8.5.7` was
 /// overwritten by a side-branch validation run that built a php-src branch tip
 /// (`PHP_VERSION` "8.5.8-dev"), and the ePHPm macOS binaries labelled
-/// `php8.5.7` from v0.5.1 through v0.11.2 shipped it. Checking here makes a
+/// `php8.5.7` from v0.5.1 through v0.11.3 shipped it. Checking here makes a
 /// release leg fail instead of publishing a binary whose name lies about the
 /// PHP inside it. Same idea as the consumer-side [`verify_tailcall_vm`] gate.
 fn check_sdk_php_version(sdk_dir: &Path, version: &str) -> Result<(), String> {
