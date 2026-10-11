@@ -131,7 +131,8 @@ affinity by client IP) makes the per-node count exact for that client.
 At startup, ePHPm logs this `WARN` when the module is mounted with
 `[cluster].enabled = true`, whichever spelling the mount uses (`ratelimit`,
 `rate-limit`, `rate_limit`, `ephpm-middleware-ratelimit`,
-`ephpm_middleware_ratelimit`, or a path to the module's cdylib):
+`ephpm_middleware_ratelimit`, or a path to the module's cdylib). It is one
+log line, wrapped here for display:
 
 ```
 [middleware] ratelimit mounted with [cluster].enabled = true — the counter
@@ -139,7 +140,7 @@ replicates across nodes as a last-arrival-wins value, not a cluster-wide atomic
 add, so concurrent increments on different nodes can overwrite each other. The
 limit is approximate: up to N × the configured allowance in the worst case for
 a client spread across N nodes. See
-https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster.
+https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster for details.
 ```
 
 It restates [In a cluster](#in-a-cluster); nothing in your config is wrong.

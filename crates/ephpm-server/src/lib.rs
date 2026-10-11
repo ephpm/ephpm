@@ -82,7 +82,7 @@ const CLUSTER_RATELIMIT_WARNING: &str = "[middleware] ratelimit mounted with [cl
      atomic add, so concurrent increments on different nodes can overwrite each other. The \
      limit is approximate: up to N × the configured allowance in the worst case for a client \
      spread across N nodes. See \
-     https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster.";
+     https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster for details.";
 
 /// Start the HTTP server with the given configuration.
 ///

@@ -189,7 +189,10 @@ passes is always answered (`504`) and counted under `stage="fpm_pool"` or
 routing, middleware, or a dispatch queue so full the job never got in.
 
 A PHP-stage timeout replaces a thread only if the job had **started** on it:
-the thread is marked hung, a replacement is spawned, and
+the thread is marked hung, a replacement is spawned (unless as many hung
+threads as the pool size are already outstanding, so a stream of slow
+requests cannot grow the pool past twice its size; past that cap an ERROR is
+logged and nothing is spawned), and
 `ephpm_fpm_pool_recycles_total{reason="hung"}` /
 `ephpm_worker_recycles_total{reason="hung"}` increments. A job still queued at
 the deadline is overload and replaces nothing. The hung thread keeps running

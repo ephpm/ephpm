@@ -119,7 +119,7 @@ The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Cache PHP-emitted ETags in the KV store; answer a GET/HEAD whose `If-None-Match` matches the stored tag (weak comparison) with 304 without running PHP. Only a `200` with an `ETag`, no `Set-Cookie` and no `Cache-Control: no-store`/`private` is stored; any other non-304 response to the same URL removes the stored tag. Applies to worker-mode front-controller routes too. Independent of `[server.static] etag`. |
+| `enabled` | bool | `false` | Cache PHP-emitted ETags in the KV store; answer a GET/HEAD whose `If-None-Match` matches the stored tag (weak comparison) with 304 without running PHP. Only a `200` with an `ETag`, no `Set-Cookie` and no `Cache-Control: no-store`/`private` is stored; any other non-304 response to the same URL removes the stored tag. Applies to worker-mode front-controller routes too. Independent of `[server.static] etag`. **Inactive** (no lookup, no store) while any `[[middleware]]` chain is mounted, and for a site with a `[preview_auth]` gate: the 304 would otherwise be answered before the gate runs. |
 | `ttl_secs` | i64 | `300` | TTL for cached entries. `<=0` means cache indefinitely. |
 | `key_prefix` | string | `"etag:"` | KV key prefix for cached entries. Full key is `{prefix}{site}:{method}:{path}?{query}`, where `{site}` is the request's canonical site key (empty for a host matching no vhost — i.e. always empty on a single-site node). |
 

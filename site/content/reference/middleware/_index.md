@@ -84,7 +84,7 @@ store on a single-site node or for a request whose `Host` matched no vhost. See
 | `INFO` | each builtin mount initialised | `middleware initialised (builtin) module=<library> …` |
 | `INFO` | chain built | `middleware chain loaded count=… modules=[…]` |
 | `INFO` | any `php:` mount configured | `PHP middleware mounted (EXPERIMENTAL) …` |
-| `WARN` | a mount whose `library` is literally `ratelimit`, with `[cluster].enabled = true` | `[middleware] ratelimit mounted with [cluster].enabled = true — …` — see [ratelimit](ratelimit/#the-cluster-startup-warning) for what it does and does not mean |
+| `WARN` | the ratelimit module (any spelling of its `library`), with `[cluster].enabled = true` | `[middleware] ratelimit mounted with [cluster].enabled = true — …` — see [ratelimit](ratelimit/#the-cluster-startup-warning) |
 | error (startup aborts) | unknown `config` key or bad value in a builtin mount | `… builtin middleware "<library>" init failed: …` |
 | error (startup aborts) | a non-builtin `library` that cannot be found | `failed to load native middleware chain: middleware library "<name>" not found; tried: …` |
 

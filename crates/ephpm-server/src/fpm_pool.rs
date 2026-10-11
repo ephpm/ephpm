@@ -564,9 +564,24 @@ impl FpmPool {
     /// and a replacement is spawned to keep the pool at `thread_count` serving
     /// threads. Pair every call with [`FpmPool::note_recovered`] once the
     /// thread answers, or the pool stays one thread larger for good.
+    ///
+    /// Replacements are capped at `thread_count` outstanding hung threads
+    /// (at most twice the configured threads alive): every request that
+    /// outlasts the deadline — a slow endpoint, a client that sends and
+    /// disconnects — would otherwise add a full ZTS context without bound.
+    /// Past the cap the thread is still counted hung but not replaced.
     pub fn note_hung(self: &Arc<Self>) {
-        self.state.hung.fetch_add(1, Ordering::AcqRel);
+        let hung = self.state.hung.fetch_add(1, Ordering::AcqRel) + 1;
         counter!("ephpm_fpm_pool_recycles_total", "reason" => "hung").increment(1);
+        if hung > self.thread_count {
+            tracing::error!(
+                hung,
+                cap = self.thread_count,
+                "fpm pool thread appeared hung, but as many hung threads as the pool size are \
+                 already outstanding — not spawning a replacement"
+            );
+            return;
+        }
         // The stuck thread still holds its dispatch-receiver clone and may
         // eventually finish; we simply add capacity. A brief over-provision is
         // preferable to a wedged pool.
@@ -855,16 +870,27 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
 
 /// Spawn a replacement thread unless the pool is draining or already at target.
 ///
-/// Gating on `live < thread_count` keeps hung-thread replacement from
-/// compounding: `note_hung` spawns a replacement (live -> count+1) while the
-/// stuck thread is abandoned. If the stuck thread comes back, `note_recovered`
-/// and `claim_surplus` retire one thread between jobs; if it exits instead
-/// (poisoned / panicked), this gate sees `live == count` and spawns nothing.
+/// The gate counts *serving* threads: `live` minus threads marked hung (alive
+/// but stuck). Gating on plain `live` would let a hung thread stand in for a
+/// serving one, so after a hung thread's replacement any routine exit
+/// (panic, poisoned context) would leave the pool a thread short. Hung-thread
+/// replacement still cannot compound: `note_hung` spawns a replacement while
+/// the stuck thread is abandoned; if the stuck thread comes back,
+/// `note_recovered` and `claim_surplus` retire one thread between jobs; if it
+/// exits instead, its reply or dropped sender came first, so `note_recovered`
+/// has normally run and this gate sees serving == count and spawns nothing.
+/// (If the watcher task has not processed that reply yet, one extra thread is
+/// spawned and later retires through `claim_surplus`.)
 fn respawn_if_running(pool: &Arc<FpmPool>) {
     if pool.state.draining.load(Ordering::Acquire) {
         return;
     }
-    if pool.state.live.load(Ordering::Acquire) >= pool.thread_count {
+    let serving = pool
+        .state
+        .live
+        .load(Ordering::Acquire)
+        .saturating_sub(pool.state.hung.load(Ordering::Acquire));
+    if serving >= pool.thread_count {
         return;
     }
     // Basic boot-storm backoff: if TSRM init keeps failing, pause before
@@ -1355,5 +1381,26 @@ mod tests {
         assert!(matches!(outcome, ReplyOutcome::TimedOut { hung: false }));
         assert_eq!(pool.threads_spawned(), 0, "overload must not grow the pool");
         assert_eq!(pool.state.hung.load(Ordering::Acquire), 0);
+    }
+
+    /// Hung-thread replacement is capped at the pool size: requests that
+    /// keep outlasting the deadline cannot grow the pool without bound.
+    #[tokio::test]
+    async fn hung_thread_replacement_is_capped_at_the_pool_size() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(2, 4, AdmissionPolicy::Fifo);
+        assert!(wait_for(|| pool.ready_count() == 2).await, "threads should register");
+        let spawned_before = pool.threads_spawned();
+        for _ in 0..5 {
+            pool.note_hung();
+        }
+        assert_eq!(pool.state.hung.load(Ordering::Acquire), 5, "every one is counted hung");
+        assert_eq!(
+            pool.threads_spawned(),
+            spawned_before + 2,
+            "but only pool-size replacements are spawned"
+        );
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the threads");
     }
 }

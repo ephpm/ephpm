@@ -366,9 +366,23 @@ impl WorkerPool {
     /// and a replacement is spawned to keep the pool at `worker_count` serving
     /// workers (design §5.4). Pair every call with
     /// [`WorkerPool::note_recovered`] once the worker answers.
+    ///
+    /// Replacements are capped at `worker_count` outstanding hung workers (at
+    /// most twice the configured workers alive), so requests that outlast the
+    /// deadline cannot grow the pool — one framework boot each — without
+    /// bound. Past the cap the worker is counted hung but not replaced.
     pub fn note_hung(self: &Arc<Self>) {
-        self.state.hung.fetch_add(1, Ordering::AcqRel);
+        let hung = self.state.hung.fetch_add(1, Ordering::AcqRel) + 1;
         counter!("ephpm_worker_recycles_total", "reason" => "hung").increment(1);
+        if hung > self.worker_count {
+            tracing::error!(
+                hung,
+                cap = self.worker_count,
+                "worker appeared hung, but as many hung workers as the pool size are already \
+                 outstanding — not spawning a replacement"
+            );
+            return;
+        }
         // The stuck thread still holds its dispatch-receiver clone and may
         // eventually finish; we simply add capacity. A brief over-provision is
         // preferable to a wedged pool.
@@ -689,17 +703,28 @@ fn worker_main(
 
 /// Spawn a replacement worker unless the pool is draining or already at target.
 ///
-/// Gating on `live < worker_count` keeps hung-worker replacement from
-/// compounding: `note_hung` spawns a replacement (live -> count+1) while the
-/// stuck thread is abandoned. When that stuck thread eventually exits it finds
-/// `live == count` and does NOT respawn; when it instead goes back to serving,
+/// The gate counts *serving* workers: `live` minus workers marked hung (alive
+/// but stuck). Gating on plain `live` would let a hung worker stand in for a
+/// serving one, so a routine `max_requests` recycle after a hung worker's
+/// replacement would leave the pool a worker short. Replacement still cannot
+/// compound: `note_hung` spawns a replacement while the stuck thread is
+/// abandoned. When that stuck thread eventually exits, its reply or dropped
+/// sender came first, so `note_recovered` has normally run and it finds
+/// serving == count and does NOT respawn (if the watcher has not caught up,
+/// one extra worker spawns and later retires as surplus); when it instead
+/// goes back to serving,
 /// `note_recovered` + `claim_surplus` retire one worker at its next
 /// `take_request()`. Either way the pool converges back to target.
 fn respawn_if_running(pool: &Arc<WorkerPool>) {
     if pool.state.draining.load(Ordering::Acquire) {
         return;
     }
-    if pool.state.live.load(Ordering::Acquire) >= pool.worker_count {
+    let serving = pool
+        .state
+        .live
+        .load(Ordering::Acquire)
+        .saturating_sub(pool.state.hung.load(Ordering::Acquire));
+    if serving >= pool.worker_count {
         return;
     }
     // Basic boot-storm backoff: if boots keep failing, pause before respawning

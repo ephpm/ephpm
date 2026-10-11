@@ -3084,8 +3084,15 @@ impl Router {
         } else {
             None
         };
+        // The cache answers its 304 ahead of `handle_php`, i.e. before the
+        // request phase (preview gate, `[[middleware]]` chain) runs. It must
+        // never answer where a gate would decide, so it is off for a site
+        // with a preview gate and whenever a middleware chain is mounted:
+        // request-phase middleware fails closed on both paths.
         let php_etag_cacheable = self.php_etag_cache_config.enabled
-            && (method_ref == hyper::Method::GET || method_ref == hyper::Method::HEAD);
+            && (method_ref == hyper::Method::GET || method_ref == hyper::Method::HEAD)
+            && site_roots.preview_gate.is_none()
+            && self.middleware_chain.is_none();
 
         let (mut response, handler) = match self.resolve_fallback(
             &uri_path,
@@ -11159,6 +11166,31 @@ mod tests {
         let resp =
             router.handle(conditional_get("/index.php", "W/\"v1\""), addr, false).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    /// The cache's 304 is decided ahead of the request phase, so with a
+    /// middleware chain mounted it must not answer: a `jwt`-protected page
+    /// must not hand an unauthenticated client a 304 for a known tag.
+    #[tokio::test]
+    async fn php_etag_cache_never_answers_ahead_of_request_middleware() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, store) = php_etag_router(dir.path(), true);
+        let jwt = MiddlewareMount {
+            library: "jwt".to_string(),
+            match_pattern: Some("/index.php".to_string()),
+            order: 10,
+            config: Some(serde_json::json!({ "secret": "s3cret" })),
+        };
+        let router = router.with_middleware_chain(Some(chain_with(vec![jwt])));
+        store.set(
+            php_etag_cache_key("etag:", None, "GET", "/index.php", ""),
+            b"\"v1\"".to_vec(),
+            None,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resp =
+            router.handle(conditional_get("/index.php", "\"v1\""), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the gate decides, not the cache");
     }
 
     /// Worker mode sends front-controller routes (no file on disk) straight
