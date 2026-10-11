@@ -38,7 +38,7 @@ succeeds. What `AUTH` checks depends on the configuration:
 | `[kv.redis_compat] password` set, single-site (no `sites_dir`) | `AUTH <password>`. Only the **first** argument is compared, so the two-argument form `AUTH <user> <password>` compares `<user>` and fails. Configure clients with a password and no username. |
 | `[kv] secret` set and `[server] sites_dir` set (multi-tenant) | `AUTH <site-key> <HMAC-SHA256(secret, site-key)>`, both arguments required. The connection is then bound to that site's own store for its lifetime. **`[kv.redis_compat] password` is ignored** in this mode. |
 | `[server] sites_dir` set, no `[kv] secret` | Startup error. The listener refuses to serve one shared, unauthenticated store to every tenant. |
-| `[kv] secret` set, single-site, no `password` | **Not access control.** Clients get `NOAUTH` until they send `AUTH`, but **any** `AUTH` succeeds, because there is no per-site derivation in single-site mode and no password to compare. To protect a single-site listener, set `[kv.redis_compat] password` (or keep it bound to loopback). |
+| `[kv] secret` set, single-site, no `password` | Startup error (an empty `password` counts as unset). There is no per-site derivation in single-site mode, so the secret cannot authenticate anyone. Set `[kv.redis_compat] password` to protect a single-site listener, or remove `[kv] secret` to run it unauthenticated (keep it bound to loopback). Before this was fixed, such a listener answered `NOAUTH` and then accepted **any** `AUTH`. |
 | `[kv] secret` set, single-site, `password` set | `AUTH <password>`, as in the second row. |
 
 Passwords are compared in constant time.

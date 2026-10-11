@@ -774,6 +774,83 @@ async fn auth_no_password_configured_accepts_anything() {
     assert_eq!(resp, "OK");
 }
 
+// ── `secret` without a multi-tenant store ────────────────────────────────────
+//
+// Regression: a listener handed a `secret` but no `MultiTenantStore` (a
+// single-site server with `[kv] secret` set and no `[kv.redis_compat]
+// password`) demanded AUTH and then accepted *any* password — the secret only
+// drives per-site HMAC auth, which needs a multi-tenant store, so the legacy
+// password branch ran with no password configured and treated AUTH as a no-op.
+
+/// Start a server with an optional password and an optional `secret`, but no
+/// multi-tenant store.
+async fn start_single_site_server(
+    password: Option<&str>,
+    secret: Option<&str>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+    let addr = listener.local_addr().expect("failed to get local addr").to_string();
+    let store = Store::new(StoreConfig::default());
+    let password = password.map(str::to_string);
+    let secret = secret.map(str::to_string);
+    let handle = tokio::spawn(async move {
+        server::serve_on(
+            store,
+            listener,
+            server::ServerConfig { password, secret, ..Default::default() },
+            None,
+        )
+        .await
+        .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn secret_without_multi_tenant_rejects_arbitrary_auth() {
+    let (addr, handle) = start_single_site_server(None, Some("test-secret")).await;
+    let client = redis::Client::open(format!("redis://{addr}/")).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // Neither a one-argument nor a two-argument AUTH may succeed: there is no
+    // credential configured that either could be checked against.
+    let one = redis::cmd("AUTH").arg("anything").query_async::<String>(&mut con).await;
+    let msg = one.expect_err("AUTH <anything> must be rejected").to_string();
+    assert!(msg.contains("no password is configured"), "unexpected error: {msg}");
+    let two =
+        redis::cmd("AUTH").arg("example.com").arg("anything").query_async::<String>(&mut con).await;
+    assert!(two.is_err(), "AUTH <user> <anything> must be rejected, got {two:?}");
+    // Not even the secret itself is a password.
+    let raw = redis::cmd("AUTH").arg("test-secret").query_async::<String>(&mut con).await;
+    assert!(raw.is_err(), "the raw secret must not be accepted as a password, got {raw:?}");
+
+    // And the connection is still unauthenticated.
+    let err = redis::cmd("PING").query_async::<String>(&mut con).await;
+    let msg = err.expect_err("PING must stay blocked").to_string();
+    assert!(msg.contains("NOAUTH"), "expected NOAUTH, got: {msg}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn secret_without_multi_tenant_still_honours_password() {
+    // A configured password keeps working alongside a secret on a single-site
+    // listener: correct accepted, wrong rejected.
+    let (addr, handle) = start_single_site_server(Some("pw-123"), Some("test-secret")).await;
+
+    let ok = redis::Client::open(format!("redis://:pw-123@{addr}/")).unwrap();
+    let mut con = ok.get_multiplexed_async_connection().await.unwrap();
+    let pong: String = redis::cmd("PING").query_async(&mut con).await.unwrap();
+    assert_eq!(pong, "PONG");
+
+    let bad = redis::Client::open(format!("redis://:wrong@{addr}/")).unwrap();
+    assert!(
+        bad.get_multiplexed_async_connection().await.is_err(),
+        "wrong password must be rejected"
+    );
+    handle.abort();
+}
+
 // ── HMAC multi-tenant AUTH tests ────────────────────────────────────────────
 
 /// Start a server with HMAC-derived per-site authentication.

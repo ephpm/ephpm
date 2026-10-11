@@ -273,7 +273,7 @@ $redis->set('cache:page:home', $html);
 
 If `[kv] secret` is unset, no variables are injected. In single-site mode the listener then serves the global store. With `sites_dir` set, that combination is refused at startup, because it would hand every tenant one shared, unauthenticated store.
 
-**Single-site authentication.** With a plain `[kv.redis_compat] password`, configure clients with the password only and **no username**: the listener compares the first `AUTH` argument, so `AUTH <user> <pass>` fails. `[kv] secret` on its own does not protect a single-site listener (any `AUTH` succeeds); set `password` for that. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
+**Single-site authentication.** With a plain `[kv.redis_compat] password`, configure clients with the password only and **no username**: the listener compares the first `AUTH` argument, so `AUTH <user> <pass>` fails. `[kv] secret` cannot protect a single-site listener, so the RESP listener on with `[kv] secret` set and no `password` is a startup error; set `password` instead. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ### Automatic value compression
 

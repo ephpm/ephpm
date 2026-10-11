@@ -2936,6 +2936,13 @@ pub struct KvConfig {
     /// `[kv.redis_compat] password` any `AUTH` argument is accepted. Only
     /// `[kv.redis_compat] password` authenticates a single-site listener.
     ///
+    /// The secret does **not** authenticate a single-site RESP listener —
+    /// there are no per-site passwords to derive. A single-site config with
+    /// `[kv.redis_compat] enabled = true`, a `[kv] secret`, and no (or an
+    /// empty) `[kv.redis_compat] password` is therefore **refused at startup**:
+    /// such a listener used to demand AUTH and then accept any password. Set
+    /// `[kv.redis_compat] password` to protect a single-site listener.
+    ///
     /// **Also seeds the per-site MySQL wire-auth secret (#471).** When set, the
     /// multi-tenant MySQL listener (`site_wire_auth.rs`) derives each vhost's
     /// `pdo_mysql` password from *this* secret rather than a per-process random
@@ -2971,6 +2978,35 @@ impl Default for KvConfig {
 }
 
 impl KvConfig {
+    /// Why a single-site RESP listener must refuse to start, if it must.
+    ///
+    /// Returns `Some(reason)` when the RESP listener is enabled on a
+    /// single-site server (`multi_tenant == false`) with a `[kv] secret`
+    /// present (any value, blank included — the operator asked for
+    /// protection) but no non-empty `[kv.redis_compat] password`. In that
+    /// state nothing could authenticate a client: the secret only derives
+    /// per-site passwords, which need `[server] sites_dir`. Shared by
+    /// [`Config::validate`] and the server's own startup guard so the two
+    /// can never disagree.
+    #[must_use]
+    pub fn single_site_resp_secret_without_password(&self, multi_tenant: bool) -> Option<String> {
+        let password_set = self.redis_compat.password.as_deref().is_some_and(|p| !p.is_empty());
+        if multi_tenant || !self.redis_compat.enabled || self.secret.is_none() || password_set {
+            return None;
+        }
+        Some(
+            "[kv.redis_compat] enabled = true with [kv] secret set but no \
+             [kv.redis_compat] password on a single-site server (no [server] \
+             sites_dir): [kv] secret only derives per-site RESP passwords for \
+             multi-tenant vhosting, so it cannot authenticate clients here — \
+             the listener would demand AUTH with no credential to check it \
+             against. Set [kv.redis_compat] password to protect the listener, \
+             or remove [kv] secret to run it without authentication (keep \
+             [kv.redis_compat] listen on loopback if you do)."
+                .to_string(),
+        )
+    }
+
     /// Whether a usable `[kv] secret` is configured.
     ///
     /// A secret that is absent, empty, or whitespace-only cannot derive
@@ -4361,6 +4397,19 @@ impl Config {
                  deployments (no [server] sites_dir) are unaffected."
                     .to_string(),
             ));
+        }
+
+        // Fail closed, single-site counterpart: `[kv] secret` only derives
+        // *per-site* RESP passwords, which need `sites_dir`. On a single-site
+        // server it authenticates nobody, yet its presence makes the listener
+        // demand AUTH — so an operator who set it reasonably believes the
+        // listener is protected. It used to accept any AUTH; the listener now
+        // rejects every AUTH in that state, which would leave it unusable.
+        // Refuse to start and say which knob does protect it.
+        if let Some(reason) =
+            self.kv.single_site_resp_secret_without_password(self.server.sites_dir.is_some())
+        {
+            return Err(ConfigError::Validation(reason));
         }
 
         // [kv] eviction_policy: `EvictionPolicy::from_str_lossy` maps every
@@ -10765,6 +10814,38 @@ enabled = true
         let cfg = Config::load(&file).unwrap();
         assert!(cfg.kv.secret_is_set());
         cfg.validate().expect("multi-tenant + RESP + secret is the secure config");
+    }
+
+    #[test]
+    fn kv_single_site_resp_secret_without_password_fails_closed() {
+        // Regression: single-site + RESP + secret + no password used to
+        // demand AUTH and accept any password. Must refuse to start — for a
+        // blank secret too (the operator asked for protection) and for an
+        // empty password (it protects nothing).
+        for secret in ["s3cret-value", ""] {
+            for password in [None, Some("")] {
+                let mut cfg = kv_matrix_config(false, true, Some(secret));
+                cfg.kv.redis_compat.password = password.map(str::to_string);
+                let err = cfg.validate().expect_err("must fail closed");
+                assert!(matches!(err, ConfigError::Validation(_)));
+                let msg = err.to_string();
+                assert!(msg.contains("[kv.redis_compat] password"), "should name the fix: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn kv_single_site_resp_secret_with_password_starts() {
+        let mut cfg = kv_matrix_config(false, true, Some("s3cret-value"));
+        cfg.kv.redis_compat.password = Some("pw".to_string());
+        assert!(cfg.validate().is_ok(), "a configured password protects the listener");
+    }
+
+    #[test]
+    fn kv_single_site_secret_with_resp_disabled_starts() {
+        // No listener, nothing to protect.
+        let cfg = kv_matrix_config(false, false, Some("s3cret-value"));
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
