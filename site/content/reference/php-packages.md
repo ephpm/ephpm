@@ -5,7 +5,9 @@ weight = 5
 
 ePHPm exposes native SAPI functions — `ephpm_kv_*` for the embedded KV store,
 `ephpm_db_*` for the embedded database, and the `\Ephpm\Worker\*` primitives
-for worker mode. You *can* call them directly. Most applications shouldn't:
+for worker mode, among others (the full list, including `ephpm_ws_*` and
+`ephpm_middleware_config()`, is in the [PHP API reference](/reference/php-api/)).
+You *can* call them directly. Most applications shouldn't:
 the packages below wrap them in the API your framework already speaks, so you
 keep writing ordinary framework code.
 
@@ -94,7 +96,8 @@ ePHPm; check the individual repository's README for its own minimum ePHPm
 version.
 
 > ePHPm also has a **native** session save handler built into the SAPI
-> (`session.save_handler = ephpm`), which needs no Composer package at all.
+> (`session.save_handler = ephpm`), which needs no Composer package at all;
+> see [Sessions](/guides/sessions/). It is not enabled by default.
 > `ephpm/session-handler` is the userland alternative for cases where you
 > want the handler under your own control.
 

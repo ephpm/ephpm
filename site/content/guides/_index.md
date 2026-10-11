@@ -15,6 +15,7 @@ Task-oriented walkthroughs for common deployments.
 - **[Clustering Setup](clustering-setup/)** — gossip-based HA with clustered SQLite.
 - **[Database from PHP](db-from-php/)** — the in-process `ephpm_db_*` bridge, and how it relates to the `pdo_mysql` wire path.
 - **[KV from PHP](kv-from-php/)** — the `ephpm_kv_*` SAPI functions.
+- **[Sessions](sessions/)** — the native `ephpm` session save handler: `$_SESSION` in the KV store, opt-in.
 - **[WebSockets](websockets/)** — *experimental*: Rust owns the sockets, PHP runs per event via `websocket.php`, and any HTTP request can push a frame.
 - **[Query Stats with Prometheus](query-stats-prometheus/)** — observability for your database queries.
 - **[Distributed Tracing with OTLP](otlp-tracing/)** — export request spans to Jaeger or an OpenTelemetry Collector, and what PhpStorm and VS Code can actually do for the loop.

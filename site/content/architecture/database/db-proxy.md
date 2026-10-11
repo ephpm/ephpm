@@ -645,15 +645,15 @@ max_connections = 50
 inject_env = true   # auto-set DB env vars for the PHP app
 ```
 
-When `inject_env = true`, ePHPm injects environment variables into the PHP runtime:
+When `inject_env = true`, ePHPm injects these variables into every PHP request's `$_SERVER` (they are **not** process environment variables, so `getenv()` does not return them):
 
 | Variable | Value | Consumed by |
 |----------|-------|-------------|
 | `DB_CONNECTION` | `mysql` | Laravel |
 | `DB_HOST` | `127.0.0.1` | Laravel, Symfony, generic |
 | `DB_PORT` | `3306` | Laravel, Symfony, generic |
-| `DB_DATABASE` | `myapp` | Laravel |
-| `DB_USERNAME` | `appuser` | Laravel |
+| `DB_NAME` | `myapp` | generic (Laravel reads `DB_DATABASE`, which proxy mode does not set) |
+| `DB_USER` | `appuser` | generic (Laravel reads `DB_USERNAME`, which proxy mode does not set) |
 | `DB_PASSWORD` | `secret` | Laravel |
 | `DATABASE_URL` | `mysql://appuser:secret@127.0.0.1:3306/myapp` | Symfony, Doctrine |
 

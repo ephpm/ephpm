@@ -1289,19 +1289,19 @@ max_connections = 50
 inject_env = true   # auto-set DB env vars for the PHP app
 ```
 
-When `inject_env = true`, ePHPm injects environment variables into the PHP runtime before the app boots:
+When `inject_env = true`, ePHPm injects these variables into every PHP request's `$_SERVER` (they are **not** process environment variables, so `getenv()` does not return them):
 
 | Variable | Value | Consumed by |
 |---|---|---|
 | `DB_CONNECTION` | `mysql` | Laravel |
 | `DB_HOST` | `127.0.0.1` | Laravel, Symfony, generic |
 | `DB_PORT` | `3306` | Laravel, Symfony, generic |
-| `DB_DATABASE` | `myapp` | Laravel |
-| `DB_USERNAME` | `appuser` | Laravel |
+| `DB_NAME` | `myapp` | generic (Laravel reads `DB_DATABASE`, which proxy mode does not set) |
+| `DB_USER` | `appuser` | generic (Laravel reads `DB_USERNAME`, which proxy mode does not set) |
 | `DB_PASSWORD` | `secret` | Laravel |
 | `DATABASE_URL` | `mysql://appuser:secret@127.0.0.1:3306/myapp` | Symfony, Doctrine |
 
-Laravel reads `DB_HOST` from `.env` with a fallback to actual environment variables. Symfony reads `DATABASE_URL`. Both frameworks pick up ePHPm's injected values automatically — the connection goes through the proxy without any `.env` file changes or application code changes.
+Laravel's `env()` falls back to `$_SERVER`, so it picks up the injected `DB_CONNECTION`, `DB_HOST`, `DB_PORT` and `DB_PASSWORD` (its Dotenv loader does not overwrite values already present, so these win over `.env`), but it reads `DB_DATABASE`/`DB_USERNAME`, which proxy mode does not inject — set those in `.env`. Symfony reads `DATABASE_URL`, which is injected in full.
 
 The PHP app thinks it's talking to `127.0.0.1:3306`. ePHPm's proxy is listening there, pooling connections, analyzing queries, splitting reads/writes, and forwarding to the real database. Fully transparent.
 

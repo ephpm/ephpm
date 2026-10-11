@@ -60,7 +60,7 @@ These tests run against a single ephpm instance in Kind. They should all be impl
 |------|--------|-----------|
 | `php_hello_world` | GET `/index.php` | 200, response body contains greeting |
 | `php_version` | GET `/index.php` | Response contains expected PHP version |
-| `php_sapi_name` | GET `/index.php` | SAPI is `embed` |
+| `php_sapi_name` | GET `/index.php` | SAPI is `ephpm` |
 | `phpinfo_renders` | GET `/info.php` | 200, body contains `<html`, `phpinfo()` output |
 | `php_get_params` | GET `/test.php?foo=bar&baz=123` | `$_GET['foo'] == 'bar'`, `$_GET['baz'] == '123'` |
 | `php_post_form` | POST `/test.php` (form-urlencoded) | `$_POST` contains submitted values |

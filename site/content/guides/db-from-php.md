@@ -444,7 +444,7 @@ end-of-request cleanup there, do it explicitly (a `finally` block, or your
 framework's terminate hook, which runs while the request is still live)
 rather than relying on PHP's shutdown handlers.
 
-The same applies to [`ephpm_kv_*`](/guides/kv-from-php/) (reads miss and
+The same applies to [`ephpm_kv_*`](/guides/kv-from-php/#shutdown-functions-and-destructors) (reads miss and
 writes are refused) and [`ephpm_ws_*`](/guides/websockets/) (the site scope
 is gone, so sends report no capability).
 

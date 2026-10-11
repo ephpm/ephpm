@@ -188,7 +188,7 @@ Each operation has an **implicit** form (acts on the current event's connection)
 | `ephpm_ws_close(int $code = 1000)` | `bool` | Close the current connection. Throws outside a WebSocket event. |
 | `ephpm_ws_connection_close(string $connection_id, int $code = 1000)` | `bool` | |
 
-**`false` versus an exception.** A `false` return means the connection could not be reached — it is unknown to this site, it has gone, or its outbound queue is full. Those are ordinary runtime outcomes; check the return value if you care. An **exception** means the call could never have worked: WebSockets are disabled server-wide, the request has no virtual host, or the implicit form was used with no current connection. Those are bugs or misconfiguration, so they are not silently swallowed.
+**`false` versus an exception.** A `false` return means the connection could not be reached — it is unknown to this site, it has gone, or its outbound queue is full. Those are ordinary runtime outcomes; check the return value if you care. An **exception** means the call could never have worked: WebSockets are disabled server-wide, the request has no virtual host, or the implicit form was used with no current connection. Those are bugs or misconfiguration, so they are not silently swallowed. The exception is a plain `\Exception` with code `0` (unlike `ephpm_db_*`, there are no reserved error codes), with a message beginning `ephpm_ws:` that names the cause.
 
 Closing is asynchronous. `ephpm_ws_close()` asks the connection's session task to close, so frames already queued ahead of it are still delivered.
 
