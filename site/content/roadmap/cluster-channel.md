@@ -129,7 +129,7 @@ UTF-8 stream-type string:
 
 | Prefix | Status | Purpose |
 |---|---|---|
-| `cdc/<vhost>` | Implemented | CDC replication (Turso engine) — see [`turso-engine`](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default) |
+| `cdc/<vhost>` | Implemented | CDC replication (Turso engine) — see [`turso-engine`](/roadmap/turso-engine/#phase-2--cdc-native-replication-shipped-became-the-only-clustered-path-in-v070) |
 | `snapshot/<vhost>` | Implemented | Cold-replica base snapshot before CDC catch-up. Served only while the local node is the elected primary. |
 
 The stream-type string is what drives dispatch on the accepting side.

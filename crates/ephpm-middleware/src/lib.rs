@@ -97,7 +97,7 @@ pub trait Middleware: Sized + Send + Sync + 'static {
     /// has not told the host its key set, so nothing can be checked" — the
     /// pre-#473 behaviour. That default exists for third-party modules, which
     /// are built against their own copy of this crate and cannot be assumed to
-    /// have been updated. **All ten in-tree builtins declare their keys**:
+    /// have been updated. **All twelve in-tree builtins declare their keys**:
     /// they ship inside the same binary as this check, so there is no
     /// cross-version skew to tolerate.
     ///

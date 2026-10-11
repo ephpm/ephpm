@@ -1252,8 +1252,11 @@ pub struct TenantNetworkConfig {
 
     /// Dedicated range of **real** sidecar ports ePHPm hands out (inclusive,
     /// `"low-high"`). `bind4` pops a free port from this range when a vhost binds
-    /// a virtual loopback port; `sock_release` returns it. Range size is the
-    /// box-wide sidecar concurrency cap.
+    /// a virtual loopback port. Ports are **not** returned on socket close
+    /// (close-time reclaim via `sock_release` is not implemented); they come
+    /// back only on an ePHPm restart, and a vhost re-binding the same virtual
+    /// port reuses its existing real port. Range size is the box-wide sidecar
+    /// concurrency cap.
     ///
     /// **HARD CONSTRAINT — must NOT overlap the kernel ephemeral range**
     /// (`net.ipv4.ip_local_port_range`, default `32768-60999`): otherwise a
@@ -4748,9 +4751,10 @@ impl PhpConfig {
     /// (timestamp validation on, assertions on, loose realpath) so the
     /// edit-refresh loop stays tight. Explicit config still wins in either mode.
     ///
-    /// `multi_tenant` is `true` when `[server] sites_dir` is set — it shapes
-    /// the `opcache.jit` default (JIT off in multi-tenant mode, because
-    /// per-vhost invalidation never reclaims JIT buffer; see
+    /// `multi_tenant` is `true` when `[server] sites_dir` is set. The
+    /// `opcache.jit` default is off in every mode; `multi_tenant` only selects
+    /// the reported reason and whether an explicitly enabled JIT is warned
+    /// about (per-vhost invalidation never reclaims JIT buffer; see
     /// [`Self::opcache_jit`]).
     #[must_use]
     pub fn autotune(&self, dev_mode: bool, multi_tenant: bool) -> AutoTune {

@@ -451,7 +451,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Execute the SET command with options: SET key value [EX|PX|EXAT|PXAT seconds|ms] [NX|XX] [GET]
+/// Execute the SET command with options: SET key value [EX seconds|PX ms] [NX|XX] [GET].
+/// `EXAT`/`PXAT` are not implemented (they return `ERR syntax error`), and a
+/// non-positive or non-integer `EX`/`PX` value is accepted and stores the key
+/// with no expiry.
 fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     if argv.len() < 2 {
         return Frame::error("ERR wrong number of arguments for 'set' command");

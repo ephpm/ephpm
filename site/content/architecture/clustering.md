@@ -573,7 +573,7 @@ Lock has a TTL (default 5 minutes) to prevent deadlock if a node crashes mid-iss
 
 In a multi-node setup behind a load balancer, Let's Encrypt's challenge request may hit any node — not the one that initiated the ACME order.
 
-**Solution: Challenge token propagation via KV store.**
+**Solution (Planned — not yet implemented): challenge token propagation via KV store.** Today nothing writes `acme:challenge:*` and TLS-ALPN-01 material stays on the ordering node, so a challenge request that lands on another node fails; see the banner above.
 
 ```
 Node A initiates ACME order for example.com
@@ -594,7 +594,7 @@ LE requests: GET http://example.com/.well-known/acme-challenge/abc123
    Node B: responds 200 OK → challenge passed ✓
 ```
 
-Works for both HTTP-01 and TLS-ALPN-01 challenges. Gossip replication (~100-200ms) completes well within the ACME protocol's built-in polling delay.
+As designed, this would work for both HTTP-01 and TLS-ALPN-01 challenges. Gossip replication (~100-200ms) completes well within the ACME protocol's built-in polling delay.
 
 #### Problem 3: Renewal Stampede
 

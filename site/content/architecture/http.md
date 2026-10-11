@@ -91,7 +91,7 @@ The flip was measured, not asserted. In the v0.9.0 A/B (PR #460), an open-loop C
 In front of every pool sits a bounded dispatch queue whose depth is `[php] queue_depth` (defaulting to `concurrency`). What happens when it fills is `[php] overload`:
 
 - `overload = "wait"` (the historical behaviour) applies **backpressure** — the dispatcher suspends until a slot frees. A queue that never frees becomes a **504** when the outer `[server.timeouts] request` deadline fires; there is no unbounded wait.
-- `overload = "shed"` refuses to queue behind a full backlog and answers **`503` + `Retry-After`** once a request has waited `shed_after_ms` (0 = shed immediately). Overload then costs one cheap error instead of a request that ties up a client until its own timeout (issue #301).
+- `overload = "shed"` refuses to queue behind a full backlog and answers **`503` + `Retry-After`** once a request has waited `shed_after_ms` (0 = shed immediately). Overload then costs one cheap error instead of a request that ties up a client until its own timeout (issue #301). **Per-request mode only:** worker mode ignores `overload = "shed"` and `shed_after_ms` (startup logs a WARN when shed is configured there); a starved worker queue becomes a 504 at the request deadline.
 
 Admission order is `[php] admission`. The default, `"fifo"`, admits waiters in strict arrival order through a fair semaphore. This is not cosmetic: the bounded channel's own `send().await` lets a fresh dispatcher barge past parked waiters and re-queues the lapped waiter at the back, producing a multi-lap starvation tail under saturation — removing it took worker-mode P99 from 280 ms to 58 ms at unchanged throughput (issue #442). `"barge"` restores the old racing admission as an operator escape hatch.
 
