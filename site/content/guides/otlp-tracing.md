@@ -497,4 +497,7 @@ span durations themselves are correct (a span records create→close), and
   timing and error rates, which tracing deliberately does not cover
 - `GET /_ephpm/requests` — the last 256 requests as JSON, with the same
   total/queue-wait/PHP split, and no collector required
-  ([`request_log`](/reference/config/#serverdiagnostics))
+  ([`request_log`](/reference/config/#serverdiagnostics)). On a multi-site node it
+  requires `[server.diagnostics] token`; with `[server.metrics] listen` set
+  it is served on that listener instead
+  ([access to internal endpoints](/reference/config/#access-to-internal-endpoints))

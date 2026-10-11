@@ -485,6 +485,9 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
 | `server.metrics.enabled` | bool | `false` | Prometheus metrics endpoint |
 | `server.metrics.path` | string | `"/metrics"` | Metrics endpoint path |
+| `server.metrics.allow` / `deny` | string[] | `[]` | IP ACL for the metrics endpoint (empty allow = allow all; deny wins) — see [access to internal endpoints](/reference/config/#access-to-internal-endpoints) |
+| `server.metrics.token` | string | (none) | Bearer token; required on multi-site nodes |
+| `server.metrics.listen` | string | (none) | Separate metrics listener (`tls_cert`, `tls_key`, `client_ca` for TLS/mTLS) |
 | `server.limits.max_connections` | int | `0` | Max total concurrent connections (0 = unlimited) |
 | `server.limits.per_ip_max_connections` | int | `0` | Max concurrent connections per client IP |
 | `server.limits.per_ip_rate` | float | `0.0` | Max requests/second per client IP (token bucket) |

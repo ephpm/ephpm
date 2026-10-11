@@ -31,7 +31,7 @@ async fn bridge_action(action: &str, params: &str) -> BridgeResponse {
     let base_url = required_env("EPHPM_URL");
     let sep = if params.is_empty() { "" } else { "&" };
     let url = format!("{base_url}/db_bridge_test.php?action={action}{sep}{params}");
-    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    let resp = ephpm_e2e::get_metrics(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     assert_eq!(status, 200, "action={action}&{params} returned HTTP {status}: {body}");
@@ -72,7 +72,7 @@ async fn pool_serves_php_and_db_bridge_roundtrip() {
 async fn pool_engine_is_active_per_metrics() {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/metrics");
-    let body = reqwest::get(&url)
+    let body = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))
         .text()
@@ -106,7 +106,7 @@ async fn pool_handles_concurrent_requests() {
     for _ in 0..40 {
         let url = url.clone();
         handles.push(tokio::spawn(async move {
-            reqwest::get(&url).await.map(|r| r.status().as_u16()).unwrap_or(0)
+            ephpm_e2e::get_metrics(&url).await.map(|r| r.status().as_u16()).unwrap_or(0)
         }));
     }
 

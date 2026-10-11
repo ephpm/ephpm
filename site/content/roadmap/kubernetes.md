@@ -300,6 +300,45 @@ metadata:
     prometheus.io/path: "/metrics"
 ```
 
+**Multi-site pods need a credential.** With `[server] sites_dir` set, `/metrics`
+answers `403` until `[server.metrics] token` is configured (or an mTLS metrics
+listener), because every tenant's PHP can reach the endpoint. The annotation
+form above cannot send a token. Use a Prometheus Operator `ServiceMonitor` that
+reads the token from a Secret, and mount the same Secret into the pod's config.
+Do not pass the token as an `EPHPM_*` environment variable, because tenant PHP
+can read the environment.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ephpm-metrics-token
+stringData:
+  token: "<long random string>"   # same value as [server.metrics] token in ephpm.toml
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ephpm
+spec:
+  selector:
+    matchLabels:
+      app: ephpm
+  endpoints:
+    - port: http
+      path: /metrics
+      authorization:
+        type: Bearer
+        credentials:
+          name: ephpm-metrics-token
+          key: token
+```
+
+(Older Prometheus Operator versions use `bearerTokenSecret: {name, key}` instead
+of `authorization`.) For the mTLS variant, configure `scheme: https` and
+`tlsConfig` (`ca`, `cert`, `keySecret`) against the `[server.metrics] listen`
+port. See [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
+
 ---
 
 ## Helm Chart

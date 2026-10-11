@@ -514,6 +514,20 @@ impl Response {
 
 // ── Host services for authoring code ──────────────────────────────────────
 
+/// A KV read that could not establish whether the key exists — returned by
+/// [`Host::kv_lookup`] so a security decision never mistakes "the store is
+/// unreachable" for "the key is absent".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvUnavailable;
+
+impl std::fmt::Display for KvUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the host KV store could not be read")
+    }
+}
+
+impl std::error::Error for KvUnavailable {}
+
 /// Access to host services (KV store, logging) from middleware code.
 /// Obtained via [`Request::host`] inside `invoke`, or from the table stashed
 /// by [`declare!`]'s generated `init`.
@@ -562,6 +576,45 @@ impl<'a> Host<'a> {
         // SAFETY: `ptr`/`len` came from kv_get above.
         unsafe { (self.table.kv_free)(ptr, len) };
         Some(out)
+    }
+
+    /// Get a key from **this request's** KV keyspace, keeping "absent" and
+    /// "could not read" apart.
+    ///
+    /// [`kv_get`](Self::kv_get) folds both into `None`, which is fine for a
+    /// cache but wrong for a **security** lookup: a deny-list read that fails
+    /// must not look like "not on the deny-list". Use this whenever the
+    /// absence of a key *grants* something (a revocation list, a kill
+    /// switch), and treat `Err` as a denial.
+    ///
+    /// Same keyspace as [`kv_get`](Self::kv_get).
+    ///
+    /// # Errors
+    ///
+    /// [`KvUnavailable`] when the host reports an error (no KV store wired,
+    /// a key it cannot address, or any other non-"absent" failure) or breaks
+    /// the return contract.
+    pub fn kv_lookup(&self, key: &str) -> Result<Option<Vec<u8>>, KvUnavailable> {
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        // SAFETY: valid key slice for the call; out-params point at locals.
+        let rc =
+            unsafe { (self.table.kv_get)(key.as_ptr(), key.len(), &raw mut ptr, &raw mut len) };
+        match rc {
+            // ABI: 1 = the key is absent. The only "no value" that is a fact.
+            1 => Ok(None),
+            0 if !ptr.is_null() => {
+                // SAFETY: rc==0 means the host allocated `len` bytes at `ptr`;
+                // we copy then hand the buffer back to the host allocator.
+                let out = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+                // SAFETY: `ptr`/`len` came from kv_get above.
+                unsafe { (self.table.kv_free)(ptr, len) };
+                Ok(Some(out))
+            }
+            // Negative = host error; 0 with a null buffer, or any other code,
+            // is a contract violation. Neither proves the key is absent.
+            _ => Err(KvUnavailable),
+        }
     }
 
     /// Set a key (TTL in seconds; `0` = no expiry). Returns false on error.

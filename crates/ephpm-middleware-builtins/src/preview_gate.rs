@@ -43,7 +43,10 @@
 //! * **Revocable** — a per-`jti` KV deny-list kills one link, and a per-site
 //!   epoch (`preview:share:epoch`, or the static `share_epoch` config floor)
 //!   kills every outstanding link at once, which is what a preview teardown
-//!   writes.
+//!   writes. Revocation **fails closed**: if either KV read errors, or the
+//!   stored epoch is not an integer, the share token is refused (a one-time
+//!   warning is logged). A revocation the gate cannot read counts as a
+//!   revocation. Plain OAuth sessions never consult KV and are unaffected.
 //!
 //! What it explicitly does **not** defend: someone the link was shared with
 //! forwarding it within its lifetime, or a compromised holder. Those are
@@ -59,7 +62,7 @@
 //! | `exempt_paths` (array of string) | `[]` | request paths that bypass the gate entirely — the issuer's `login_path`/`callback_path` go here so the OAuth round trip can complete without a redirect loop |
 //! | `share_param` (string) | `"ephpm_share"` | query parameter carrying a share capability token |
 //! | `share_epoch` (integer) | `0` | static floor: a share token whose `iat` is below this is refused (a config-time revoke-all) |
-//! | `share_revocation` (bool) | `true` | consult the per-`jti` KV deny-list and per-site KV epoch for `via:"share"` tokens (a plain session pays nothing) |
+//! | `share_revocation` (bool) | `true` | consult the per-`jti` KV deny-list and per-site KV epoch for `via:"share"` tokens (a plain session pays nothing); a failed or unparseable read refuses the share token |
 //! | `return_to_param` (string) | unset | query parameter on `login_url` carrying the validated same-origin return path |
 //! | `site_param` (string) | unset | query parameter carrying this request's canonical site key |
 //! | `issuer` (string) | unset | required `iss` claim |
@@ -67,7 +70,10 @@
 //! | `require_https` (bool) | `true` | refuse a credential presented over cleartext (loopback exempt) |
 //! | `require_site` (bool) | `true` | require the token's `site` claim to equal the request's canonical site key (issue #396) |
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use base64ct::{Base64UrlUnpadded, Encoding as _};
+use ephpm_middleware::abi::LOG_WARN;
 use ephpm_middleware::{Middleware, Request, Response};
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
@@ -179,17 +185,33 @@ impl PreviewGate {
     /// the epoch, which still kills it on teardown). A token with no `iat` is
     /// treated as `iat = 0`, so any non-zero epoch refuses it — the fail-closed
     /// direction.
+    ///
+    /// **Fails closed when revocation cannot be checked.** Both lookups use
+    /// [`Host::kv_lookup`](ephpm_middleware::Host::kv_lookup), which keeps
+    /// "absent" apart from "could not read". A deny-list or epoch read that
+    /// errors refuses the share token (the browser is sent to login), as does
+    /// a stored epoch that does not parse — a revocation the gate cannot read
+    /// is treated as a revocation, never as "not revoked". A plain OAuth
+    /// session never reaches this function, so a KV outage costs share-link
+    /// holders their access and nobody else.
     fn share_admitted(&self, req: &Request<'_>, claims: &serde_json::Value, _now: u64) -> bool {
         if !self.share_revocation {
             return true;
         }
         if let Some(jti) = claims.get("jti").and_then(serde_json::Value::as_str) {
             let key = format!("{REVOKED_KEY_PREFIX}{jti}");
-            if req.host().kv_get(&key).is_some() {
-                return false;
+            match req.host().kv_lookup(&key) {
+                Ok(None) => {}
+                Ok(Some(_)) => return false,
+                Err(_) => {
+                    warn_revocation_unchecked(req, "the share-link deny-list could not be read");
+                    return false;
+                }
             }
         }
-        let effective_epoch = self.effective_epoch(req);
+        let Some(effective_epoch) = self.effective_epoch(req) else {
+            return false;
+        };
         if effective_epoch == 0 {
             return true;
         }
@@ -199,16 +221,33 @@ impl PreviewGate {
 
     /// The greater of the static `share_epoch` config floor and the dynamic
     /// per-site epoch stored in KV (`preview:share:epoch`), so either channel
-    /// can revoke every outstanding link. A malformed KV value is ignored (the
-    /// static floor still applies).
-    fn effective_epoch(&self, req: &Request<'_>) -> u64 {
-        let kv_epoch = req
-            .host()
-            .kv_get(EPOCH_KEY)
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        self.share_epoch.max(kv_epoch)
+    /// can revoke every outstanding link.
+    ///
+    /// `None` — meaning "refuse every share token" — when the KV epoch cannot
+    /// be read or holds a value that is not a non-negative integer. The epoch
+    /// is the revoke-*all* channel a teardown writes, so a value the gate
+    /// cannot interpret must not be read as "no epoch set".
+    fn effective_epoch(&self, req: &Request<'_>) -> Option<u64> {
+        let kv_epoch = match req.host().kv_lookup(EPOCH_KEY) {
+            Ok(None) => 0,
+            Ok(Some(bytes)) => {
+                let parsed =
+                    std::str::from_utf8(&bytes).ok().and_then(|s| s.trim().parse::<u64>().ok());
+                let Some(epoch) = parsed else {
+                    warn_revocation_unchecked(
+                        req,
+                        "the stored share epoch (`preview:share:epoch`) is not an integer",
+                    );
+                    return None;
+                };
+                epoch
+            }
+            Err(_) => {
+                warn_revocation_unchecked(req, "the share epoch could not be read");
+                return None;
+            }
+        };
+        Some(self.share_epoch.max(kv_epoch))
     }
 
     /// Handle a share token presented in the query string: on success, redirect
@@ -405,6 +444,23 @@ impl Middleware for PreviewGate {
     }
 }
 
+/// Log, once per process, that a share token was refused because revocation
+/// could not be checked. Once, not per request: the condition is an operator
+/// misconfiguration or outage that every share-link request would otherwise
+/// repeat into the log, and the refusal itself is already the safe outcome.
+fn warn_revocation_unchecked(req: &Request<'_>, why: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        req.host().log(
+            LOG_WARN,
+            &format!(
+                "preview-gate: refusing share-link tokens because {why}; plain OAuth sessions are \
+                 unaffected (further occurrences are not logged)"
+            ),
+        );
+    }
+}
+
 /// Read the first value of query parameter `name` from a raw query string
 /// (`a=1&b=2`), percent-decoding nothing — a capability token is
 /// base64url and carries no reserved characters. Values are compared on the
@@ -471,8 +527,8 @@ pub fn mint_share_token(secret: &[u8], site: &str, jti: &str, iat: u64, exp: u64
 mod tests {
     #![allow(unsafe_code)] // tests build the FFI Request view by hand.
 
-    use ephpm_middleware::abi::{ACTION_CONTINUE, ACTION_RESPOND};
-    use ephpm_middleware::host::{RequestCtx, host_table};
+    use ephpm_middleware::abi::{ACTION_CONTINUE, ACTION_RESPOND, EphpmHostV1};
+    use ephpm_middleware::host::{RequestCtx, SiteKvScope, enter_site_kv, host_table};
 
     use super::*;
 
@@ -657,6 +713,7 @@ mod tests {
 
     #[test]
     fn a_valid_share_query_plants_the_cookie_and_redirects_clean() {
+        let _kv = fresh_kv();
         let mw = gate(serde_json::json!({}));
         let tok = share_token(SITE, "jti-1");
         let resp = invoke(&mw, "/dashboard.php", &format!("ephpm_share={tok}&tab=1"), &[]);
@@ -672,6 +729,7 @@ mod tests {
 
     #[test]
     fn a_share_token_presented_as_a_cookie_is_admitted() {
+        let _kv = fresh_kv();
         let mw = gate(serde_json::json!({}));
         let tok = share_token(SITE, "jti-1");
         let resp = invoke(&mw, "/index.php", "", &cookie(&format!("ephpm_session={tok}")));
@@ -699,6 +757,7 @@ mod tests {
 
     #[test]
     fn a_share_token_below_the_static_epoch_is_rejected() {
+        let _kv = fresh_kv();
         // `share_epoch` in config is a revoke-all floor: a token issued before
         // it is refused even though its signature and exp are fine.
         let future_epoch = now_unix() + 100;
@@ -715,17 +774,17 @@ mod tests {
         );
     }
 
-    /// Wire the process-global KV store so `req.kv_get`/`kv_set` reach a real
-    /// map (first call in the test binary wins; every test then shares it).
-    fn wire_kv() {
-        let store = std::sync::Arc::new(ephpm_kv::store::Store::new(
-            ephpm_kv::store::StoreConfig::default(),
-        ));
-        ephpm_middleware::host::set_kv_store(&store);
+    /// Give this test thread its own fresh KV store for as long as the guard
+    /// lives — the same per-request site scope the server installs. Per
+    /// thread, not process-global, so one test's revocation or epoch write can
+    /// never leak into a sibling test running in parallel (the process-global
+    /// store is a first-call-wins `OnceLock` shared by the whole binary).
+    fn fresh_kv() -> SiteKvScope {
+        enter_site_kv(Some(ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default())))
     }
 
-    /// Write a KV key through the same path the gate reads it, independent of
-    /// which store won the process-global `set_kv_store` race.
+    /// Write a KV key through the same path the gate reads it (this thread's
+    /// scoped store — call [`fresh_kv`] first).
     fn kv_put(key: &str, value: &[u8]) {
         let ctx = RequestCtx::new("GET", "/", "", "203.0.113.9", SITE, &[]);
         // SAFETY: `ctx` outlives the view; `host_table()` is 'static.
@@ -737,7 +796,7 @@ mod tests {
     /// as a cookie and in the query string — the individual-revoke path.
     #[test]
     fn a_revoked_share_token_is_rejected() {
-        wire_kv();
+        let _kv = fresh_kv();
         let mw = gate(serde_json::json!({}));
         let tok = share_token(SITE, "jti-revoked");
 
@@ -759,7 +818,7 @@ mod tests {
     /// before the epoch is refused; a plain session is untouched.
     #[test]
     fn the_kv_epoch_revokes_all_outstanding_share_links() {
-        wire_kv();
+        let _kv = fresh_kv();
         let mw = gate(serde_json::json!({}));
         let tok = share_token(SITE, "jti-epoch"); // iat = now
 
@@ -788,13 +847,123 @@ mod tests {
 
     #[test]
     fn share_revocation_false_skips_the_kv_lookups() {
-        wire_kv();
+        let _kv = fresh_kv();
         let mw = gate(serde_json::json!({ "share_revocation": false }));
         let tok = share_token(SITE, "jti-norev");
         kv_put("preview:share:revoked:jti-norev", b"1");
         // With revocation disabled the deny-list is not consulted at all.
         assert_eq!(
             invoke(&mw, "/index.php", "", &cookie(&format!("ephpm_session={tok}"))).__action(),
+            ACTION_CONTINUE
+        );
+    }
+
+    /// A host whose KV `get` errors (no store wired, or any other failure the
+    /// ABI reports as negative) — distinct from "absent" (`1`).
+    unsafe extern "C" fn kv_get_errors(
+        _key: *const u8,
+        _key_len: usize,
+        _out: *mut *mut u8,
+        _out_len: *mut usize,
+    ) -> std::os::raw::c_int {
+        -1
+    }
+
+    /// Invoke over HTTPS for [`SITE`] against an arbitrary host table.
+    fn invoke_with_host(
+        mw: &PreviewGate,
+        host: &EphpmHostV1,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Response {
+        let ctx = RequestCtx::new("GET", "/index.php", query, "203.0.113.9", SITE, headers)
+            .with_scheme(true);
+        // SAFETY: `ctx` and `host` both outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host) };
+        mw.invoke(&req)
+    }
+
+    /// THE fail-closed property: when the revocation lookups cannot be
+    /// performed, a share token is REFUSED — before the fix the error was
+    /// folded into "not on the deny-list" and a revoked link was admitted.
+    /// A plain OAuth session (which never consults revocation) is unaffected.
+    #[test]
+    fn a_share_token_is_refused_when_revocation_cannot_be_checked() {
+        let failing = EphpmHostV1 { kv_get: kv_get_errors, ..*host_table() };
+        let mw = gate(serde_json::json!({}));
+        let tok = share_token(SITE, "jti-kv-down");
+
+        // As a cookie: redirected to login, not admitted.
+        let resp = invoke_with_host(&mw, &failing, "", &cookie(&format!("ephpm_session={tok}")));
+        assert_redirect(&resp);
+        assert_eq!(header_of(&resp, "Location").map(|l| l.starts_with(LOGIN)), Some(true));
+
+        // In the query string: NOT exchanged for a cookie.
+        let resp = invoke_with_host(&mw, &failing, &format!("ephpm_share={tok}"), &[]);
+        assert_redirect(&resp);
+        assert!(header_of(&resp, "Set-Cookie").is_none(), "an unverifiable share must not plant");
+
+        // A share token with no `jti` skips the deny-list but still hits the
+        // epoch read, which fails the same way.
+        let no_jti = {
+            let claims = serde_json::json!({
+                "site": SITE, "via": "share", "iat": now_unix(), "exp": future_exp()
+            });
+            let h = Base64UrlUnpadded::encode_string(br#"{"alg":"HS256","typ":"JWT"}"#);
+            let p = Base64UrlUnpadded::encode_string(&serde_json::to_vec(&claims).unwrap());
+            let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+            mac.update(h.as_bytes());
+            mac.update(b".");
+            mac.update(p.as_bytes());
+            let s = Base64UrlUnpadded::encode_string(&mac.finalize().into_bytes());
+            format!("{h}.{p}.{s}")
+        };
+        assert_redirect(&invoke_with_host(
+            &mw,
+            &failing,
+            "",
+            &cookie(&format!("ephpm_session={no_jti}")),
+        ));
+
+        // A plain OAuth session is unaffected by the KV outage.
+        let session = cookie(&format!("ephpm_session={}", session_token(SITE)));
+        assert_eq!(invoke_with_host(&mw, &failing, "", &session).__action(), ACTION_CONTINUE);
+
+        // An operator who opted out of revocation keeps share links working
+        // without KV — the lookups are never made.
+        let no_rev = gate(serde_json::json!({ "share_revocation": false }));
+        assert_eq!(
+            invoke_with_host(&no_rev, &failing, "", &cookie(&format!("ephpm_session={tok}")))
+                .__action(),
+            ACTION_CONTINUE
+        );
+    }
+
+    /// The KV epoch is the revoke-ALL channel a teardown writes. A value the
+    /// gate cannot parse must refuse share links, not read as "no epoch".
+    #[test]
+    fn an_unparseable_kv_epoch_refuses_share_links() {
+        let _kv = fresh_kv();
+        let mw = gate(serde_json::json!({}));
+        let tok = share_token(SITE, "jti-bad-epoch");
+        assert_eq!(
+            invoke(&mw, "/index.php", "", &cookie(&format!("ephpm_session={tok}"))).__action(),
+            ACTION_CONTINUE,
+            "control: admitted with no epoch"
+        );
+
+        kv_put("preview:share:epoch", b"not-a-number");
+        assert_redirect(&invoke(&mw, "/index.php", "", &cookie(&format!("ephpm_session={tok}"))));
+        assert_redirect(&invoke(&mw, "/index.php", &format!("ephpm_share={tok}"), &[]));
+        // Sessions do not read the epoch at all.
+        assert_eq!(
+            invoke(
+                &mw,
+                "/index.php",
+                "",
+                &cookie(&format!("ephpm_session={}", session_token(SITE)))
+            )
+            .__action(),
             ACTION_CONTINUE
         );
     }

@@ -36,6 +36,7 @@ async fn metric(name: &str) -> f64 {
     let url = format!("{base_url}/metrics");
     let body = client()
         .get(&url)
+        .bearer_auth(ephpm_e2e::E2E_METRICS_TOKEN)
         .send()
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))
@@ -58,6 +59,7 @@ async fn poisoned_recycles() -> f64 {
     let url = format!("{base_url}/metrics");
     let body = client()
         .get(&url)
+        .bearer_auth(ephpm_e2e::E2E_METRICS_TOKEN)
         .send()
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))

@@ -843,6 +843,7 @@ pub fn host_table() -> &'static EphpmHostV1 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::raw::c_int;
     use std::sync::Arc;
 
     use ephpm_kv::store::{Store, StoreConfig};
@@ -1017,6 +1018,40 @@ mod tests {
             let _scope = enter_site_kv(Some(Arc::clone(store)));
             assert_eq!(host.kv_incr_ttl("counter", 1, 60), Some(1), "each site counts from zero");
         }
+    }
+
+    /// `kv_lookup` keeps "absent" (`Ok(None)`) apart from "could not read"
+    /// (`Err`), which `kv_get` folds together. A security lookup (a
+    /// revocation deny-list) depends on that distinction to fail closed.
+    #[test]
+    fn kv_lookup_distinguishes_absent_from_unavailable() {
+        unsafe extern "C" fn kv_get_errors(
+            _key: *const u8,
+            _key_len: usize,
+            _out: *mut *mut u8,
+            _out_len: *mut usize,
+        ) -> c_int {
+            -1
+        }
+
+        let site = site_store();
+        let host = Host::new(host_table());
+        {
+            let _scope = enter_site_kv(Some(Arc::clone(&site)));
+            assert_eq!(host.kv_lookup("lookup-key"), Ok(None), "absent is a fact, not an error");
+            assert!(host.kv_set("lookup-key", b"v", 0));
+            assert_eq!(host.kv_lookup("lookup-key"), Ok(Some(b"v".to_vec())));
+            // An empty value is present, not absent.
+            assert!(host.kv_set("empty-key", b"", 0));
+            assert_eq!(host.kv_lookup("empty-key"), Ok(Some(Vec::new())));
+        }
+
+        let failing = EphpmHostV1 { kv_get: kv_get_errors, ..*host_table() };
+        let host = Host::new(&failing);
+        assert_eq!(host.kv_lookup("lookup-key"), Err(crate::KvUnavailable));
+        // The lossy accessor cannot tell the difference — which is why
+        // security lookups must not use it.
+        assert_eq!(host.kv_get("lookup-key"), None);
     }
 
     /// The scope is per-request state on a pooled thread, so it must not

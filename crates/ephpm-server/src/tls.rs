@@ -62,6 +62,56 @@ pub fn build_server_config(
     Ok(config)
 }
 
+/// Build the TLS acceptor for the separate metrics listener
+/// (`[server.metrics] listen` + `tls_cert`/`tls_key`), optionally requiring
+/// **mutual TLS**.
+///
+/// With `client_ca` set, every client must present a certificate chaining to
+/// one of the CAs in that PEM bundle; a client with no certificate, or one
+/// signed by anyone else, fails the handshake and never reaches HTTP. That is
+/// what lets a verified connection count as the credential a multi-site node
+/// requires (see `crate::internal_access`). Same crypto provider as every
+/// other listener ([`crypto_provider`]). ALPN is `http/1.1` only — a scrape
+/// endpoint gains nothing from h2.
+///
+/// # Errors
+///
+/// Returns an error if any file cannot be read or parsed, the CA bundle holds
+/// no usable certificate, or the cert/key pair is invalid.
+pub fn build_metrics_tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<TlsAcceptor> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let builder = ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("crypto provider does not support the default TLS versions")?;
+    let builder = match client_ca {
+        None => builder.with_no_client_auth(),
+        Some(ca_path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for ca in load_certs(ca_path)? {
+                roots
+                    .add(ca)
+                    .with_context(|| format!("invalid CA certificate in {}", ca_path.display()))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                crypto_provider(),
+            )
+            .build()
+            .with_context(|| format!("cannot build client verifier from {}", ca_path.display()))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut config =
+        builder.with_single_cert(certs, key).context("invalid TLS certificate/key pair")?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Install this process's rustls crypto provider, exactly once.
 ///
 /// Call this once at startup, before anything can build a rustls config.

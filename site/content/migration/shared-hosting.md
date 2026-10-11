@@ -179,7 +179,7 @@ Visit `https://yourdomain.com` — your site should load. The first request will
 - **Price stability** — VPS prices don't increase after a promo period. $3.69/mo is $3.69/mo forever.
 - **No noisy neighbors** — your site isn't affected by other people's traffic spikes.
 - **Git-based deployment** — push code, site updates. No FTP uploading.
-- **Built-in monitoring** — Prometheus metrics at `/metrics` without installing anything.
+- **Built-in monitoring** — Prometheus metrics at `/metrics` without installing anything (with several sites on one server, set `[server.metrics] token` — see [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus)).
 - **Multiple sites** — host all your sites on one VPS using virtual hosts. No per-site fees.
 
 ## What You Lose

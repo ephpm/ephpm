@@ -1518,7 +1518,19 @@ pub struct LoggingConfig {
 }
 
 /// Metrics / observability configuration (`[server.metrics]`).
-#[derive(Debug, Deserialize)]
+///
+/// Access control for the metrics endpoint (and, on the separate listener,
+/// the request timeline) has two independent halves:
+///
+/// * **Network exposure** — [`Self::allow`] / [`Self::deny`] (a makeshift IP
+///   firewall, open by default) and [`Self::listen`] (serve it on its own
+///   address instead of the public one).
+/// * **Tenant isolation** — on a multi-site node every tenant's PHP can reach
+///   loopback, internal ports and unix sockets, so only a credential separates
+///   tenants from the scraper: [`Self::token`] or an mTLS
+///   [`Self::listen`] with [`Self::client_ca`]. Without one, a multi-site node
+///   answers the endpoint with `403`.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Enable the `/metrics` Prometheus endpoint.
@@ -1534,11 +1546,103 @@ pub struct MetricsConfig {
     /// Default: `"/metrics"`.
     #[serde(default = "default_metrics_path")]
     pub path: String,
+
+    /// IP ACL allowlist: client addresses (CIDR, or a bare IP for one host)
+    /// allowed to read the metrics endpoint. Matched against the TCP peer,
+    /// resolved through `[server.security] trusted_proxies` the same way
+    /// `REMOTE_ADDR` is. Empty means every address is allowed (subject to
+    /// [`Self::deny`]). An invalid entry is a startup error.
+    ///
+    /// This limits **network exposure only**; it cannot separate tenants on a
+    /// multi-site node (their PHP is on the same host).
+    ///
+    /// Default: `[]` (allow all).
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// IP ACL denylist (CIDR or bare IP). A match is refused with `403` even
+    /// when [`Self::allow`] also matches — deny wins. An invalid entry is a
+    /// startup error.
+    ///
+    /// Default: `[]`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Bearer token. When set, a request must send
+    /// `Authorization: Bearer <token>` or get `401`. On a multi-site node a
+    /// token (or an mTLS [`Self::listen`] with [`Self::client_ca`]) is
+    /// **required** for the endpoint to be served at all. Must not be empty.
+    ///
+    /// Env override: `EPHPM_SERVER__METRICS__TOKEN`.
+    ///
+    /// Default: unset (no token).
+    #[serde(default)]
+    pub token: Option<String>,
+
+    /// Serve the metrics endpoint — and `/_ephpm/requests` — on this separate
+    /// address (e.g. `"127.0.0.1:9100"`) instead of the main listener. When
+    /// set, neither is answered on the main listener (the metrics path falls
+    /// through to the application there; `/_ephpm/requests` answers `404`
+    /// naming this knob). Health, readiness and primary probes stay on the
+    /// main listener. The ACL and token still apply on this listener.
+    ///
+    /// Default: unset (served on the main listener).
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// PEM certificate chain for [`Self::listen`]. Set together with
+    /// [`Self::tls_key`] to serve the metrics listener over HTTPS. Requires
+    /// `listen`.
+    ///
+    /// Default: unset (plain HTTP).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key for [`Self::tls_cert`].
+    ///
+    /// Default: unset.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// PEM CA bundle for **mutual TLS** on [`Self::listen`]: every client
+    /// must present a certificate signed by one of these CAs, or the TLS
+    /// handshake fails. Requires `tls_cert`/`tls_key`. A verified client
+    /// certificate counts as the credential a multi-site node requires.
+    ///
+    /// Default: unset (no client certificates requested).
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("enabled", &self.enabled)
+            .field("path", &self.path)
+            .field("allow", &self.allow)
+            .field("deny", &self.deny)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("listen", &self.listen)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("client_ca", &self.client_ca)
+            .finish()
+    }
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self { enabled: false, path: default_metrics_path() }
+        Self {
+            enabled: false,
+            path: default_metrics_path(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            token: None,
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
+            client_ca: None,
+        }
     }
 }
 
@@ -1547,9 +1651,35 @@ fn default_metrics_path() -> String {
 }
 
 /// Per-request diagnostics configuration (`[server.diagnostics]`).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
+    /// IP ACL allowlist for `/_ephpm/requests` (and for the DB upstream
+    /// detail in a `503` `/_ephpm/ready` body). Same semantics as
+    /// [`MetricsConfig::allow`]: empty allows every address. Never restricts
+    /// the probe status itself.
+    ///
+    /// Default: `[]` (allow all).
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// IP ACL denylist for `/_ephpm/requests`; deny wins over allow. Same
+    /// semantics as [`MetricsConfig::deny`].
+    ///
+    /// Default: `[]`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Bearer token for `/_ephpm/requests`. Same semantics as
+    /// [`MetricsConfig::token`], including the multi-site requirement. Not
+    /// required for the probes.
+    ///
+    /// Env override: `EPHPM_SERVER__DIAGNOSTICS__TOKEN`.
+    ///
+    /// Default: unset (no token).
+    #[serde(default)]
+    pub token: Option<String>,
+
     /// Enable the in-memory request timeline and its `/_ephpm/requests`
     /// endpoint. The server keeps the last 256 completed requests (method,
     /// path, status, total duration, worker-queue wait, PHP execution time,
@@ -1611,6 +1741,74 @@ pub struct DiagnosticsConfig {
     /// ePHPm used before gRPC was supported.
     #[serde(default)]
     pub otlp_protocol: Option<String>,
+}
+
+impl std::fmt::Debug for DiagnosticsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiagnosticsConfig")
+            .field("allow", &self.allow)
+            .field("deny", &self.deny)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("request_log", &self.request_log)
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field("otlp_protocol", &self.otlp_protocol)
+            .finish()
+    }
+}
+
+/// Validate an internal-endpoint IP ACL and `token` (shared by
+/// `[server.metrics]` and `[server.diagnostics]`). Each `allow`/`deny` entry
+/// must be a CIDR or a bare IP address; a `token`, when set, must not be empty.
+fn validate_internal_access(
+    section: &str,
+    allow: &[String],
+    deny: &[String],
+    token: Option<&str>,
+) -> Result<(), ConfigError> {
+    for (key, list) in [("allow", allow), ("deny", deny)] {
+        for entry in list {
+            let e = entry.trim();
+            let ok = e.parse::<ipnet::IpNet>().is_ok() || e.parse::<std::net::IpAddr>().is_ok();
+            if !ok {
+                return Err(ConfigError::Validation(format!(
+                    "{section} {key}: {entry:?} is not a CIDR (e.g. \"10.0.0.0/8\") or IP address"
+                )));
+            }
+        }
+    }
+    if token.is_some_and(|t| t.trim().is_empty()) {
+        return Err(ConfigError::Validation(format!(
+            "{section} token is set but empty — remove it, or set a real token"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the separate metrics listener's address and TLS/mTLS settings:
+/// every TLS knob requires `listen`, cert and key come as a pair, and
+/// `client_ca` requires TLS. Anything else would be a silently ignored knob.
+fn validate_metrics_listener(m: &MetricsConfig) -> Result<(), ConfigError> {
+    let err = |msg: String| Err(ConfigError::Validation(format!("[server.metrics] {msg}")));
+    if let Some(listen) = &m.listen
+        && listen.parse::<std::net::SocketAddr>().is_err()
+    {
+        return err(format!("listen = {listen:?} is not an IP:port address"));
+    }
+    let tls_set = m.tls_cert.is_some() || m.tls_key.is_some() || m.client_ca.is_some();
+    if tls_set && m.listen.is_none() {
+        return err(
+            "tls_cert / tls_key / client_ca apply only to the separate metrics listener — set \
+             listen too"
+                .to_string(),
+        );
+    }
+    if m.tls_cert.is_some() != m.tls_key.is_some() {
+        return err("tls_cert and tls_key must be set together".to_string());
+    }
+    if m.client_ca.is_some() && m.tls_cert.is_none() {
+        return err("client_ca (mutual TLS) requires tls_cert and tls_key".to_string());
+    }
+    Ok(())
 }
 
 impl DiagnosticsConfig {
@@ -3981,6 +4179,22 @@ impl Config {
     ///
     /// Returns [`ConfigError::Validation`] if any invariant is violated.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Internal-endpoint access lists: a typo must fail startup, never
+        // silently shrink or (worse) be skipped into the default.
+        validate_internal_access(
+            "[server.metrics]",
+            &self.server.metrics.allow,
+            &self.server.metrics.deny,
+            self.server.metrics.token.as_deref(),
+        )?;
+        validate_internal_access(
+            "[server.diagnostics]",
+            &self.server.diagnostics.allow,
+            &self.server.diagnostics.deny,
+            self.server.diagnostics.token.as_deref(),
+        )?;
+        validate_metrics_listener(&self.server.metrics)?;
+
         // [server.tenant_network] ebpf_policy: fail closed, never a silent
         // no-op. The runtime-capability gate (kernel too old / no BTF / missing
         // CAP_BPF) can't be decided from config alone — that is a hard startup
@@ -7415,6 +7629,70 @@ idle_timeout_secs = 15
         std::fs::write(&file, "[server.diagnostics]\nrequest_log = false\n").unwrap();
         let config = Config::load(&file).unwrap();
         assert!(!config.server.diagnostics.effective_request_log(true));
+    }
+
+    /// Internal-endpoint access lists load, and a malformed entry or empty
+    /// token is a startup error rather than a silently different policy.
+    #[test]
+    fn internal_endpoint_access_knobs_load_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        let load = |toml: &str| {
+            std::fs::write(&file, toml).unwrap();
+            Config::load(&file).unwrap()
+        };
+
+        let config = load(
+            "[server.metrics]\nenabled = true\nallow = [\"10.0.0.0/8\", \"192.0.2.7\"]\n\
+             deny = [\"10.9.0.0/16\"]\ntoken = \"t0k3n\"\nlisten = \"127.0.0.1:9100\"\n\
+             tls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\nclient_ca = \"/ca.pem\"\n\
+             [server.diagnostics]\nallow = [\"::1\"]\ndeny = [\"::2\"]\ntoken = \"d1ag\"\n",
+        );
+        assert_eq!(
+            config.server.metrics.allow,
+            vec!["10.0.0.0/8".to_string(), "192.0.2.7".to_string()]
+        );
+        assert_eq!(config.server.metrics.deny, vec!["10.9.0.0/16".to_string()]);
+        assert_eq!(config.server.metrics.token.as_deref(), Some("t0k3n"));
+        assert_eq!(config.server.metrics.listen.as_deref(), Some("127.0.0.1:9100"));
+        assert_eq!(config.server.metrics.client_ca.as_deref(), Some(Path::new("/ca.pem")));
+        assert_eq!(config.server.diagnostics.token.as_deref(), Some("d1ag"));
+        assert_eq!(config.server.diagnostics.deny, vec!["::2".to_string()]);
+        config.validate().expect("valid access settings pass");
+        // Debug never prints the tokens.
+        let dbg = format!("{:?} {:?}", config.server.metrics, config.server.diagnostics);
+        assert!(!dbg.contains("t0k3n") && !dbg.contains("d1ag"), "{dbg}");
+
+        // Section absent: open ACL, no token, no separate listener.
+        let defaults = load("");
+        assert_eq!(defaults.server.metrics.allow, Vec::<String>::new());
+        assert_eq!(defaults.server.metrics.deny, Vec::<String>::new());
+        assert!(defaults.server.metrics.token.is_none());
+        assert!(defaults.server.metrics.listen.is_none());
+        assert_eq!(defaults.server.diagnostics.allow, Vec::<String>::new());
+        // Section present but empty: same defaults.
+        let present = load("[server.metrics]\nenabled = true\n[server.diagnostics]\n");
+        assert!(present.server.metrics.allow.is_empty() && present.server.metrics.deny.is_empty());
+        assert!(present.server.diagnostics.token.is_none());
+
+        let expect_err = |toml: &str, needle: &str| {
+            let err = load(toml).validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{toml:?} → {err}");
+        };
+        expect_err("[server.metrics]\nallow = [\"10.0.0.0/33\"]\n", "[server.metrics] allow");
+        expect_err("[server.metrics]\ndeny = [\"nope\"]\n", "[server.metrics] deny");
+        expect_err("[server.diagnostics]\nallow = [\"localhost\"]\n", "[server.diagnostics] allow");
+        expect_err("[server.metrics]\ntoken = \"  \"\n", "token");
+        expect_err("[server.metrics]\nlisten = \"not-an-addr\"\n", "listen");
+        expect_err("[server.metrics]\ntls_cert = \"/c\"\ntls_key = \"/k\"\n", "set listen too");
+        expect_err(
+            "[server.metrics]\nlisten = \"127.0.0.1:9100\"\ntls_cert = \"/c\"\n",
+            "set together",
+        );
+        expect_err(
+            "[server.metrics]\nlisten = \"127.0.0.1:9100\"\nclient_ca = \"/ca\"\n",
+            "requires tls_cert",
+        );
     }
 
     #[test]

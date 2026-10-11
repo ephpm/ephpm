@@ -9,7 +9,120 @@ Every metric ePHPm exposes at `/metrics`. Enable with:
 [server.metrics]
 enabled = true
 # path = "/metrics"          # default
+# allow = ["10.0.0.0/8"]     # optional IP ACL (default: allow all); deny = [...] wins
+# token = "..."              # optional bearer token; REQUIRED on multi-site nodes
+# listen = "127.0.0.1:9100"  # optional separate listener (tls_cert/tls_key/client_ca for mTLS)
 ```
+
+The output includes every tenant's SQL digests and upstream addresses. Restrict network exposure with `allow`/`deny` or a separate `listen`. On a multi-site node `/metrics` answers `403` until a `token` (or an mTLS listener) is configured. See [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
+
+## Scraping with Prometheus
+
+Pick one of the two setups below. Both satisfy the multi-site credential
+requirement, and both work on single-site nodes too.
+
+### Option A: bearer token on the main listener
+
+`ephpm.toml`:
+
+```toml
+[server.metrics]
+enabled = true
+token = "<long random string>"   # e.g. `openssl rand -hex 32`
+# allow = ["10.0.0.0/8"]         # optional: also restrict by client address
+```
+
+Put the token in the config file, not in `EPHPM_SERVER__METRICS__TOKEN`. On a
+multi-site node, tenant PHP shares the server's environment (`getenv()`), so a
+token in the environment is readable by every tenant, and startup warns about
+it.
+
+`prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: ephpm
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/ephpm-metrics-token  # file holds only the token
+    static_configs:
+      - targets: ["ephpm-1.internal:8080", "ephpm-2.internal:8080"]
+```
+
+`credentials_file` keeps the token out of `prometheus.yml`. An inline
+`credentials: <token>` also works. Prometheus re-reads the file on every
+scrape, so the token can be rotated without a reload. A scrape with no token or
+the wrong token gets `401`.
+
+### Option B: mTLS on a separate metrics listener
+
+This moves `/metrics` (and `/_ephpm/requests`) off the public port. Only
+clients holding a certificate signed by your CA can connect.
+
+`ephpm.toml`:
+
+```toml
+[server.metrics]
+enabled = true
+listen = "10.0.0.5:9100"                     # private address; probes stay on the main listener
+tls_cert = "/etc/ephpm/metrics/server.pem"   # chain: server cert, then CA
+tls_key = "/etc/ephpm/metrics/server.key"
+client_ca = "/etc/ephpm/metrics/ca.pem"      # clients must present a cert signed by this CA
+```
+
+`prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: ephpm
+    scheme: https
+    metrics_path: /metrics
+    tls_config:
+      ca_file: /etc/prometheus/ephpm/ca.pem          # verifies ePHPm's server cert
+      cert_file: /etc/prometheus/ephpm/prometheus.pem
+      key_file: /etc/prometheus/ephpm/prometheus.key
+      # server_name: metrics.internal               # only if the target address is not in the cert's SAN
+    static_configs:
+      - targets: ["10.0.0.5:9100"]
+```
+
+A client with no certificate, or with one from another CA, fails the TLS
+handshake and never reaches HTTP. You can combine this with `token`. Prometheus
+then needs both `tls_config` and `authorization`.
+
+**Creating the CA and certificates.** Any private CA works, for example
+[smallstep](https://smallstep.com/docs/step-cli/), [cfssl](https://github.com/cloudflare/cfssl),
+or cert-manager in Kubernetes. With plain OpenSSL 3:
+
+```bash
+# 1. A private CA (keep ca.key offline / secret).
+openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout ca.key -out ca.pem -days 3650 -subj "/CN=ephpm metrics CA"
+
+# 2. The metrics listener's server certificate. The SAN must match the address
+#    Prometheus scrapes (here an IP and a DNS name).
+openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout server.key -out server.csr -subj "/CN=metrics.internal"
+printf "subjectAltName=DNS:metrics.internal,IP:10.0.0.5\nextendedKeyUsage=serverAuth\n" > server.ext
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out server-leaf.pem -days 825 -extfile server.ext
+cat server-leaf.pem ca.pem > server.pem
+
+# 3. Prometheus's client certificate.
+openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout prometheus.key -out prometheus.csr -subj "/CN=prometheus"
+printf "extendedKeyUsage=clientAuth\n" > client.ext
+openssl x509 -req -in prometheus.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out prometheus.pem -days 825 -extfile client.ext
+```
+
+ePHPm needs `server.pem`, `server.key` and `ca.pem`. Prometheus needs `ca.pem`,
+`prometheus.pem` and `prometheus.key`. Check the setup by hand with
+`curl --cacert ca.pem --cert prometheus.pem --key prometheus.key https://10.0.0.5:9100/metrics`.
+
+For Kubernetes, see the `ServiceMonitor` example in
+[Kubernetes](/roadmap/kubernetes/#prometheus-metrics).
 
 When `enabled = false`, no Prometheus recorder is installed, so every `metrics` façade call dispatches to a no-op. A handful of call sites still construct their label values first (the query digest, middleware module name, vhost, and upstream labels are cloned before dispatch), so the cost is *near*-zero rather than exactly zero.
 

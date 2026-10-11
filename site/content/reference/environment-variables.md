@@ -17,6 +17,7 @@ Examples:
 |------|----------------------|
 | `[server] listen = "0.0.0.0:9090"` | `EPHPM_SERVER__LISTEN=0.0.0.0:9090` |
 | `[server.metrics] enabled = true` | `EPHPM_SERVER__METRICS__ENABLED=true` |
+| `[server.metrics] listen = "127.0.0.1:9100"` | `EPHPM_SERVER__METRICS__LISTEN=127.0.0.1:9100` |
 | `[php] memory_limit = "256M"` | `EPHPM_PHP__MEMORY_LIMIT=256M` |
 | `[db.sqlite] path = "/var/lib/app.db"` | `EPHPM_DB__SQLITE__PATH=/var/lib/app.db` |
 | `[db.sqlite.replication] role = "primary"` | `EPHPM_DB__SQLITE__REPLICATION__ROLE=primary` |

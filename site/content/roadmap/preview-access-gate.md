@@ -397,6 +397,10 @@ and is not in this stage.)
   or a rotation — invalidates every outstanding share link for that preview at
   once, without enumerating `jti`s. (A token with no `iat` is treated as `0`, so
   any non-zero epoch refuses it — fail-closed.)
+- **A revocation check that cannot run refuses the link.** If the deny-list or
+  epoch read errors, or the stored epoch is not an integer, the share token is
+  refused (one warning is logged per process). Plain OAuth sessions never read
+  KV and are unaffected.
 
 ### Threat model — say it plainly
 

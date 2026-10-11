@@ -11,7 +11,9 @@ pub mod file_cache;
 pub mod fpm_pool;
 pub mod http3;
 mod idle;
+pub mod internal_access;
 pub mod metrics;
+pub mod metrics_listener;
 pub mod middleware;
 pub mod opcache;
 #[cfg(feature = "otlp")]
@@ -101,7 +103,17 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
 
     // Install Prometheus recorder if metrics are enabled.
     let metrics_handle = if config.server.metrics.enabled {
-        Some(metrics::init().context("failed to initialize metrics")?)
+        let handle = metrics::init().context("failed to initialize metrics")?;
+        warn_internal_access_exposure(
+            &config,
+            "[server.metrics]",
+            &config.server.metrics.path,
+            &config.server.metrics.allow,
+            &config.server.metrics.deny,
+            config.server.metrics.token.as_deref(),
+            dev_mode,
+        );
+        Some(handle)
     } else {
         None
     };
@@ -403,6 +415,15 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             capacity = timeline::REQUEST_LOG_CAPACITY,
             "request timeline enabled — last requests served at /_ephpm/requests"
         );
+        warn_internal_access_exposure(
+            &config,
+            "[server.diagnostics]",
+            "/_ephpm/requests",
+            &config.server.diagnostics.allow,
+            &config.server.diagnostics.deny,
+            config.server.diagnostics.token.as_deref(),
+            dev_mode,
+        );
     }
 
     // Start the multi-tenant MySQL listener BEFORE the router, so the router
@@ -457,6 +478,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         request_log,
         per_site_db_wire,
         Arc::clone(&primary_view),
+        dev_mode,
     )
     .await?;
 
@@ -535,6 +557,8 @@ struct Listeners {
     /// `None` means HTTP/3 is off — the TCP listeners are unaffected either
     /// way, since HTTP/3 is additive (UDP) rather than a replacement.
     http3_endpoint: Option<quinn::Endpoint>,
+    /// The separate `[server.metrics] listen` listener, when configured.
+    metrics_listener: Option<metrics_listener::MetricsListener>,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -577,6 +601,9 @@ async fn bind_listeners(
     // (active-passive LB routing). Constant `true` for a standalone node; the
     // CDC election path flips it in clustered mode.
     primary_view: Arc<AtomicBool>,
+    // `ephpm dev`: lifts the multi-site credential requirement on the
+    // internal endpoints (see `Router::with_dev_mode_access`).
+    dev_mode: bool,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -866,6 +893,7 @@ async fn bind_listeners(
         .with_primary_view(primary_view)
         .with_websocket(websocket)
         .with_request_log(request_log)
+        .with_dev_mode_access(dev_mode)
         // Access logging is on whenever `[server.logging] access` names a
         // file; the file layer that consumes the records is built in `main`.
         .with_access_log(!config.server.logging.access.is_empty());
@@ -939,6 +967,10 @@ async fn bind_listeners(
     let eviction_secs = (inactive / 2).max(1).min(60);
     let file_cache_eviction_interval = Duration::from_secs(eviction_secs);
 
+    // The optional separate metrics listener (`[server.metrics] listen`).
+    // Bound here with the others so a bad address or TLS file fails startup.
+    let metrics_listener = metrics_listener::MetricsListener::bind(&config.server.metrics).await?;
+
     Ok(Listeners {
         main,
         tls_listener,
@@ -952,6 +984,7 @@ async fn bind_listeners(
         file_cache_eviction_interval,
         worker_pool,
         http3_endpoint,
+        metrics_listener,
     })
 }
 
@@ -1010,7 +1043,12 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         file_cache_eviction_interval,
         worker_pool,
         http3_endpoint,
+        metrics_listener,
     } = listeners;
+
+    // Separate metrics listener: its own task, aborted at shutdown (a
+    // half-finished scrape has nothing worth draining).
+    let metrics_task = metrics_listener.map(|l| l.spawn(Arc::clone(&router)));
 
     // Track in-flight connections for graceful shutdown.
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -1125,6 +1163,9 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // Stop accepting new QUIC connections. In-flight HTTP/3 requests keep
     // running and are covered by the `in_flight` drain below.
     let _ = http3_shutdown.0.send(true);
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
 
     // Worker mode: stop accepting new dispatch so in-flight worker iterations
     // finish and workers exit their loops cleanly (design §4.5).
@@ -1911,6 +1952,81 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
     });
 
     Ok((store, multi_tenant, Some(handle)))
+}
+
+/// Log how a data-bearing internal endpoint (`/metrics`, `/_ephpm/requests`)
+/// is protected, and say so loudly when it is either refused or exposed. See
+/// [`internal_access`] for the policy itself.
+///
+/// * **Multi-site with no credential** (no token, no mTLS metrics listener;
+///   `ephpm dev` excepted): logged at ERROR — the endpoint answers `403`
+///   naming the setting. The server still starts: refusing startup would take
+///   every tenant's site offline over an observability setting on upgrade,
+///   while the 403 already keeps the data in.
+/// * **Open to public addresses with no credential**: WARN. The IP ACL is
+///   open by default (so an upgrade changes nothing), which is exactly the case
+///   worth a line in the log. A separate listener bound to loopback is not
+///   network-exposed and does not warn.
+fn warn_internal_access_exposure(
+    config: &Config,
+    section: &'static str,
+    endpoint: &str,
+    allow: &[String],
+    deny: &[String],
+    token: Option<&str>,
+    dev_mode: bool,
+) {
+    let multi_site = config.server.sites_dir.is_some() && !dev_mode;
+    let policy = internal_access::InternalAccess::new(section, allow, deny, token, multi_site);
+    let m = &config.server.metrics;
+    let separate = m.listen.as_deref().and_then(|l| l.parse::<SocketAddr>().ok());
+    let mtls = separate.is_some() && m.client_ca.is_some();
+    let listener = separate.map_or_else(|| "main listener".to_owned(), |a| a.to_string());
+    tracing::info!(
+        endpoint,
+        %listener,
+        acl = policy.has_acl(),
+        token = policy.has_token(),
+        mtls,
+        credential_required = policy.requires_credential(),
+        "{section} access policy"
+    );
+    // The token is a credential only while tenants cannot read it. Tenant PHP
+    // shares this process's environment (`getenv()`), so on a multi-site node
+    // an env-sourced token is readable by every tenant.
+    let env_key = format!(
+        "EPHPM_SERVER__{}__TOKEN",
+        section.trim_start_matches("[server.").trim_end_matches(']').to_ascii_uppercase()
+    );
+    if multi_site && policy.has_token() && std::env::var_os(&env_key).is_some() {
+        tracing::warn!(
+            endpoint,
+            "{section} token comes from {env_key}: tenant PHP shares the process environment \
+             (getenv()), so every tenant can read it. Set it in the config file instead."
+        );
+    }
+    if policy.has_token() || mtls {
+        return;
+    }
+    if policy.requires_credential() {
+        tracing::error!(
+            endpoint,
+            "{section}: {endpoint} is REFUSED (403) on this multi-site node until a credential \
+             is configured — every tenant's PHP can reach loopback, internal ports and unix \
+             sockets, so an IP ACL or a separate address cannot keep tenants out. Set {section} \
+             token, or serve it on an mTLS [server.metrics] listen with client_ca."
+        );
+        return;
+    }
+    let loopback_only = separate.is_some_and(|a| a.ip().is_loopback());
+    if policy.admits_public() && !loopback_only {
+        tracing::warn!(
+            endpoint,
+            "{section}: {endpoint} is readable from public addresses with no token — anyone who \
+             can reach {listener} can read it. Set {section} token, restrict allow/deny, or move \
+             it to [server.metrics] listen on a private address."
+        );
+    }
 }
 
 /// Warn about every database listener bound to a non-loopback address.

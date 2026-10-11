@@ -11,6 +11,7 @@ description = "Configuration loading for ePHPm"
 serde.workspace = true
 serde_json.workspace = true
 figment.workspace = true
+ipnet.workspace = true
 thiserror.workspace = true
 
 # Serve-mode autotuning probes physical RAM (`GlobalMemoryStatusEx`) and the

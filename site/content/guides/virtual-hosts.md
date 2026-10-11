@@ -367,6 +367,38 @@ Single-site deployments (no `sites_dir`) are unchanged: `open_basedir` stays off
 
 > Note: `open_basedir` is an in-process boundary, not a kernel/container boundary. It is the right control for cooperating tenants and defence-in-depth; to host **untrusted** per-PR code you still want a real per-preview isolation boundary (container/VM or per-uid + namespace).
 
+## Metrics and the request timeline need a credential
+
+`/metrics` and `/_ephpm/requests` are node-wide. The first carries every
+tenant's SQL digests and vhost names; the second, every vhost's recent request
+paths. Every tenant's PHP runs on the node and can reach loopback, internal
+ports and unix sockets, so no IP rule can keep it away from these endpoints.
+**On a multi-site node both answer `403` until a credential is configured**,
+and startup logs an ERROR naming the missing setting:
+
+```toml
+[server.metrics]
+enabled = true
+token = "<long random string>"   # Prometheus sends Authorization: Bearer <token>
+
+[server.diagnostics]
+token = "<another random string>"  # only needed if request_log is on
+```
+
+The alternative to a token is an mTLS metrics listener (`[server.metrics]
+listen`, `tls_cert`, `tls_key`, `client_ca`). Set tokens in the config file, not
+in `EPHPM_*` environment variables, because tenant PHP can read the server's
+environment with `getenv()`.
+
+- Probes are unaffected: `/_ephpm/health`, `/_ephpm/ready` and
+  `/_ephpm/primary` stay open.
+- `ephpm dev --sites` is exempt.
+
+For the full model see
+[access to internal endpoints](/reference/config/#access-to-internal-endpoints).
+For copy-paste Prometheus configs see
+[Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
+
 ## Multi-tenant hardening preset
 
 `open_basedir` closes cross-tenant *filesystem* reads, but several other PHP userland channels can cross the tenant boundary inside one shared ZTS process. A hostile-PHP-userland pentest confirmed that, on top of the shell-exec baseline (`disable_shell_exec`), a specific denylist closes **every** cross-tenant confidentiality/integrity channel it found. That denylist is the `multi_tenant_hardening` preset, and it is **on by default in multi-tenant mode** (whenever `[server] sites_dir` is set — same defaulting as `open_basedir` / `disable_shell_exec`).

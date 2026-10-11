@@ -547,7 +547,9 @@ cookie, and strips from a `303` to the clean URL). Anything else redirects to
 never served to an unauthenticated visitor. Share tokens additionally clear a
 per-`jti` KV deny-list (`preview:share:revoked:<jti>`) and a per-site epoch
 (`preview:share:epoch`, or the static `share_epoch` floor); a plain session pays
-neither check. When activated per-site via `[preview_auth]`, the gate never sees
+neither check. Revocation fails closed: if either KV read errors, or the stored
+epoch is not an integer, the share token is refused (one warning is logged) —
+a revocation the gate cannot read counts as a revocation. When activated per-site via `[preview_auth]`, the gate never sees
 the issuer's own `/_ephpm/auth/…` endpoints (the router routes that
 sub-namespace straight to the chain), so the OAuth round trip is never
 redirected back to login; `exempt_paths` is only needed if the issuer is

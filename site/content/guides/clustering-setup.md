@@ -148,7 +148,7 @@ ephpm kv set probe hello --ttl 60   # small value → gossips to every node
 ephpm kv get probe                  # run on another node once it converges
 ```
 
-Prometheus metrics on `/metrics` cover HTTP, PHP, DB, and KV behaviour. Cluster-specific metrics are limited today — there is no dedicated gauge of live peers or replication lag yet; use the gossip log lines for membership. (See [Reference → Metrics](/reference/metrics/) for what exists.)
+Prometheus metrics on `/metrics` cover HTTP, PHP, DB, and KV behaviour. Cluster-specific metrics are limited today — there is no dedicated gauge of live peers or replication lag yet; use the gossip log lines for membership. (See [Reference → Metrics](/reference/metrics/) for what exists.) If the nodes are multi-site (`[server] sites_dir`), `/metrics` answers `403` until `[server.metrics] token` (or an mTLS metrics listener) is set. See [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
 
 ## Failure modes worth knowing
 

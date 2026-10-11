@@ -300,6 +300,19 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   off-box exfil. eBPF (§9) governs loopback/sidecar ownership, not public
   egress. Close it with a destination allow-list if your threat model requires
   it (trades off preview convenience).
+- **Cross-tenant observability endpoints (enforced, with one limit).**
+  `/metrics` (every tenant's normalized SQL digests, vhost names, upstream
+  addresses) and `/_ephpm/requests` (every vhost's recent request paths) are
+  node-wide. Tenant PHP can reach loopback, internal ports and unix sockets, so
+  an IP ACL or a separate metrics address cannot keep tenants out. On a
+  multi-site node both endpoints therefore answer `403` until a credential is
+  configured: `[server.metrics] token` / `[server.diagnostics] token`, or an
+  mTLS `[server.metrics] listen` with `client_ca`. Startup logs an ERROR while
+  either is unconfigured. The limit: the token is a shared secret. A tenant
+  that can read the config file, or the environment variable it came from, can
+  use it. Keep it out of anything tenant PHP can read; `open_basedir` (§1) is
+  what stops tenant PHP reading the config file. See
+  [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
 - **PostgreSQL/PDO persistence** — see §3.
 - **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`
   and OOM the shared process (another availability, not confidentiality, gap).

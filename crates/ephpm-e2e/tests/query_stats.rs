@@ -16,7 +16,7 @@ use ephpm_e2e::required_env;
 async fn fetch_metrics() -> String {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/metrics");
-    let resp = reqwest::get(&url)
+    let resp = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
 
@@ -34,7 +34,7 @@ async fn fetch_metrics() -> String {
 async fn run_sqlite_action(action: &str) {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/sqlite_test.php?action={action}");
-    let resp = reqwest::get(&url)
+    let resp = ephpm_e2e::get_metrics(&url)
         .await
         .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     assert!(

@@ -21,6 +21,12 @@ enabled = true
 path = "/metrics"     # default
 ```
 
+Access control (IP ACL, bearer token, separate mTLS listener, and the token
+requirement on multi-site nodes) is described under
+[access to internal endpoints](/reference/config/#access-to-internal-endpoints);
+Prometheus scrape configs are in
+[Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
+
 Or via environment variables:
 
 ```bash
