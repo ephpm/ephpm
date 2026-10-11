@@ -1638,13 +1638,13 @@ int ephpm_begin_request(void)
     /* An HTTP request has no argv (php-fpm/cgi leave it unset, so
      * php_build_argv() derives $argv from the query string). On the thread
      * that ran php_embed_init(), SG(request_info).argv still points at the
-     * argv array the host passed to it — a stack array that is long gone by
-     * now — and php_request_startup() -> php_hash_environment() ->
-     * php_build_argv() would dereference it. Only test harnesses execute
-     * requests on the init thread (the server's PHP threads are fresh TSRM
-     * threads with argv already NULL), but whether that read faults depends
-     * on whatever reused the old stack slot, so it is cleared for every
-     * request rather than left to luck. */
+     * argv array the host passed to it (`["ephpm"]`, which PhpRuntime::init
+     * now keeps alive for the process; it used to be a dead stack array, and
+     * ephpm_thread_init()'s php_request_startup() on that thread faulted in
+     * php_build_argv()). Only test harnesses execute requests on the init
+     * thread (the server's PHP threads are fresh TSRM threads with argv
+     * already NULL); an HTTP request must not see the host's argv either way,
+     * so it is cleared for every request. */
     SG(request_info).argc = 0;
     SG(request_info).argv = NULL;
 
@@ -5941,8 +5941,72 @@ void ephpm_cli_add_ini_define(const char *def)
  * GLOBAL_FUNCTION_TABLE at the end of zend_startup() — exactly where new
  * threads will pick them up.
  */
+
+/*
+ * SQLite tuning for a threaded SAPI.
+ *
+ * pdo_sqlite and ext/sqlite3 are compiled into the SDK and link the SDK's
+ * static libsqlite3. That library is built with SQLite's stock default
+ * SQLITE_DEFAULT_MEMSTATUS=1: every sqlite3_malloc()/sqlite3_free() takes one
+ * process-wide mutex (SQLITE_MUTEX_STATIC_MEM) to update the memory
+ * statistics. Under php-fpm or Apache prefork each worker is a process, so
+ * that mutex is never contended. Here every PHP request thread shares it,
+ * and a query that allocates a few hundred times serializes on it: measured
+ * on 32 threads opening a WAL database and running one FTS5 MATCH each,
+ * 541 queries/s with the statistics on and 7,549 queries/s with them off,
+ * against 1,149 queries/s for a single thread.
+ *
+ * SQLITE_CONFIG_MEMSTATUS = 0 turns the bookkeeping off. Nothing PHP exposes
+ * reads it: sqlite3_memory_used()/sqlite3_memory_highwater() would report 0
+ * and sqlite3_soft_heap_limit64() would stop being enforced, and neither
+ * extension calls them. sqlite3_config() only works before the library
+ * initializes (it returns SQLITE_MISUSE afterwards), which happens lazily on
+ * the first sqlite3_open*(). Module startup, before php_module_startup(), is
+ * the earliest point every ePHPm entry point (server, `ephpm php`, tests)
+ * passes through, and nothing in the process has opened a SQLite handle yet:
+ * the embedded database engine (Turso) is pure Rust and has no sqlite3_*
+ * symbols.
+ *
+ * Only declared when both SQLite extensions are statically compiled in,
+ * which is what makes the SDK's libsqlite3 part of the link. The SDK ships
+ * the library but not sqlite3.h, hence the hand-written prototype; the
+ * option value is SQLITE_CONFIG_MEMSTATUS from sqlite3.h (stable ABI, 9
+ * since SQLite 3.6).
+ */
+#if defined(HAVE_SQLITE3) && !defined(COMPILE_DL_SQLITE3) && !defined(COMPILE_DL_PDO_SQLITE)
+#define EPHPM_LINKS_SQLITE 1
+extern int sqlite3_config(int op, ...);
+#define EPHPM_SQLITE_CONFIG_MEMSTATUS 9
+#endif
+
+/* Result of the sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0) call made during
+ * module startup: 0 (SQLITE_OK) when the statistics were turned off, an
+ * SQLite error code when the call was refused (21 = SQLITE_MISUSE: something
+ * initialized SQLite first), -1 when it has not run or this build links no
+ * SQLite. */
+static int g_sqlite_memstatus_rc = -1;
+
+static void ephpm_tune_sqlite(void)
+{
+#ifdef EPHPM_LINKS_SQLITE
+    g_sqlite_memstatus_rc = sqlite3_config(EPHPM_SQLITE_CONFIG_MEMSTATUS, 0);
+#endif
+}
+
+/*
+ * Report how the module-startup SQLite tuning went (see ephpm_tune_sqlite).
+ * Read-only; safe to call at any time.
+ */
+int ephpm_sqlite_memstatus_result(void)
+{
+    return g_sqlite_memstatus_rc;
+}
+
 static int ephpm_module_startup(sapi_module_struct *sm)
 {
+    /* Before php_module_startup(): no extension has touched SQLite yet. */
+    ephpm_tune_sqlite();
+
     /* In CLI mode the table additionally carries the cli-SAPI-only functions
      * (cli_set_process_title / cli_get_process_title, issue #316) — the `cli`
      * SAPI identity promises them, but a web request must never see them

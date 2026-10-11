@@ -204,6 +204,35 @@ redis, igbinary, msgpack, yaml, uuid, apcu, ds) are ZTS-clean; a few
 assume NTS and misbehave under threads. Prefer extensions that publish
 ZTS support, and test before production.
 
+### `pdo_sqlite` and `sqlite3` under threads
+
+The built-in `pdo_sqlite` and `sqlite3` extensions (a file database opened
+with `new PDO('sqlite:/path/app.db')`, independent of the embedded Turso
+engine behind `[db.sqlite]`) run on the PHP SDK's own `libsqlite3`: a
+thread-safe build with FTS5 and foreign keys **off** by default, as in stock
+PHP. Which optional modules it has depends on the platform build: the Linux
+build also has R-Tree and the SQL math functions, the Windows build has
+neither. Check what yours has with
+`ephpm php -r "print_r((new PDO('sqlite::memory:'))->query('PRAGMA compile_options')->fetchAll());"`.
+
+All request threads share one copy of that library, where php-fpm gives each
+worker process its own. At startup ePHPm turns off SQLite's memory
+statistics (`SQLITE_CONFIG_MEMSTATUS`), because every SQLite allocation
+otherwise takes one process-wide mutex to update them and concurrent requests
+serialize on it. The side effect is that SQLite's own memory counters
+(`sqlite3_memory_used()`, the soft heap limit) are inert; neither extension
+exposes them to PHP.
+
+One SQLite behavior shows up more under load, on any server: a statement
+prepared while another connection changes the database schema can fail with
+`database schema has changed` or, for an FTS5 table, `vtable constructor
+failed`. SQLite retries such a prepare only once. If a library runs DDL on
+every connection (for example `CREATE`/`DROP` of a probe table to detect a
+feature), concurrent requests hit this at a low rate. Keep per-request DDL
+out of the hot path; a feature probe can use the connection-private `temp`
+schema (`CREATE VIRTUAL TABLE temp.probe USING rtree(...)`), which does not
+change the main database's schema.
+
 ### Crash isolation
 
 Same as vanilla PHP and native middleware: extensions run in-process. A

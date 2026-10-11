@@ -45,6 +45,17 @@ exceptions = [
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+# A second SQLite C library in the binary is a correctness and performance
+# bug, not just bloat. PHP's pdo_sqlite/sqlite3 link the PHP SDK's libsqlite3
+# by symbol name, so any crate that compiles its own SQLite (libsqlite3-sys
+# with `bundled`, i.e. rusqlite) silently takes over those sqlite3_* symbols.
+# That happened through litewire-backend's default `rusqlite` feature: PHP ran
+# on rusqlite's SQLite 3.46.0 with ENABLE_MEMORY_MANAGEMENT (a process-wide
+# page-cache mutex that serialized threaded PHP) and DEFAULT_FOREIGN_KEYS=1.
+# The embedded database engine is Turso (pure Rust) and needs neither.
+deny = [
+    { name = "libsqlite3-sys", reason = "a bundled SQLite shadows the PHP SDK's libsqlite3 that pdo_sqlite links against; see the comment above" },
+]
 
 [sources]
 unknown-registry = "warn"

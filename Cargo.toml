@@ -220,7 +220,21 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ ee6fc12771a4 — SECURITY (RUSTSEC-2026-0285): litewire patches
+# litewire @ b0c12bf1383f — PHP SQLITE: stop linking rusqlite's bundled SQLite
+# into the binary (litewire#45). litewire's workspace entry for
+# litewire-backend inherited that crate's default `rusqlite` feature, so every
+# sibling crate turned it back on and the `default-features = false` below did
+# not keep rusqlite out. Its bundled SQLite 3.46.0 then exported the sqlite3_*
+# symbols that PHP's pdo_sqlite/sqlite3 resolved against, shadowing the PHP
+# SDK's libsqlite3: ENABLE_MEMORY_MANAGEMENT (one process-wide page-cache
+# mutex, which serialized threaded PHP), DEFAULT_FOREIGN_KEYS=1 (foreign keys
+# on by default, unlike stock PHP) and no math functions. deny.toml now bans
+# libsqlite3-sys so it cannot come back unnoticed. This is litewire#45's
+# squash-merge commit on litewire main; it also carries litewire#43 (a clippy
+# allow), #41 (a CI pin-watch workflow) and #44 (litewire's own toolchain pin),
+# none of which changes code on the ePHPm-feature path.
+#
+# Previous pin ee6fc12771a4 — SECURITY (RUSTSEC-2026-0285): litewire patches
 # opensrv-mysql at the aws-lc-rs fork on rustls >= 0.23.45 (litewire#42). Because
 # a [patch] does not propagate through a git dependency, ePHPm ALSO declares that
 # patch in its own root (see [patch.crates-io] at the end of this file) — the
@@ -424,7 +438,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "07b13c050811eeb69e958233f3e395ca9b91489d", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b0c12bf1383f5368345dc93c41c40f4350a1218e", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.2)

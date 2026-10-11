@@ -2065,7 +2065,7 @@ pub static DB_OPS: EphpmDbOps = EphpmDbOps {
 mod tests {
     use std::sync::OnceLock;
 
-    use litewire::backend::Rusqlite;
+    use litewire::Turso;
     use serial_test::serial;
 
     use super::*;
@@ -2085,8 +2085,11 @@ mod tests {
                 .build()
                 .expect("test runtime")
         });
+        // The Turso engine ePHPm ships, not litewire's rusqlite backend:
+        // rusqlite compiles a second SQLite whose sqlite3_* symbols would
+        // shadow the PHP SDK's (deny.toml bans it).
         let backend: SharedBackend =
-            std::sync::Arc::new(Rusqlite::memory().expect("in-memory backend"));
+            std::sync::Arc::new(rt.block_on(Turso::memory()).expect("in-memory backend"));
         let _ = set_backend(backend, rt.handle().clone());
     }
 
@@ -2587,9 +2590,8 @@ mod recycle_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use litewire::backend::{
-        Backend, BackendConn, BackendError, ExecuteResult, ResultSet, Rusqlite,
-    };
+    use litewire::Turso;
+    use litewire::backend::{Backend, BackendConn, BackendError, ExecuteResult, ResultSet};
 
     use super::tests::init_bridge;
     use super::*;
@@ -2609,7 +2611,7 @@ mod recycle_tests {
     /// proving that dropping the session makes the next call reconnect.
     struct FlakyBackend {
         /// Real in-memory engine serving the non-failing calls.
-        inner: Rusqlite,
+        inner: Turso,
         flags: Arc<Flags>,
     }
 
@@ -2664,11 +2666,12 @@ mod recycle_tests {
     fn flaky_bridge() -> (DbBridge, Arc<Flags>) {
         init_bridge(); // ensures the shared test runtime exists
         let flags = Arc::new(Flags::default());
+        let rt = super::tests::TEST_RT.get().expect("runtime");
         let backend: SharedBackend = Arc::new(FlakyBackend {
-            inner: Rusqlite::memory().expect("in-memory backend"),
+            inner: rt.block_on(Turso::memory()).expect("in-memory backend"),
             flags: Arc::clone(&flags),
         });
-        let handle = super::tests::TEST_RT.get().expect("runtime").handle().clone();
+        let handle = rt.handle().clone();
         (
             DbBridge {
                 source: BackendSource::Single(backend),
@@ -3081,7 +3084,7 @@ mod per_site_tests {
     }
 
     /// The boundary of the has-rowset signal (#263), pinned against the
-    /// **production** backend rather than the rusqlite test one.
+    /// **production** (file-backed Turso) backend.
     ///
     /// `had_rowset` is authoritative for every statement litewire *runs*,
     /// because it reads the executed `SessionResult`. It cannot rescue a
