@@ -87,9 +87,11 @@ echo (new SQLite3(':memory:'))->querySingle('PRAGMA foreign_keys'), "\n";
     let opts: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
     assert!(opts.contains(&"THREADSAFE=1"), "PHP's SQLite must be thread-safe: {opts:?}");
     assert!(opts.contains(&"ENABLE_FTS5"), "the SDK's SQLite ships FTS5: {opts:?}");
+    // Prefix match: SQLite reports valued options as `NAME=value`
+    // (rusqlite's bundled build shows `DEFAULT_FOREIGN_KEYS=1`).
     for bundled_only in ["ENABLE_MEMORY_MANAGEMENT", "DEFAULT_FOREIGN_KEYS"] {
         assert!(
-            !opts.contains(&bundled_only),
+            !opts.iter().any(|o| *o == bundled_only || o.starts_with(&format!("{bundled_only}="))),
             "{bundled_only} is a rusqlite-bundled SQLite option: PHP is linked against a \
              second SQLite instead of the PHP SDK's libsqlite3 ({opts:?})"
         );
@@ -100,6 +102,7 @@ echo (new SQLite3(':memory:'))->querySingle('PRAGMA foreign_keys'), "\n";
 
 #[test]
 #[serial]
+#[allow(unsafe_code)]
 fn sqlite_memory_statistics_are_disabled_at_startup() {
     // Open a handle first so the assertion also covers "SQLite initialized
     // after the config call", which is the order a real server sees.
@@ -110,4 +113,25 @@ fn sqlite_memory_statistics_are_disabled_at_startup() {
         "sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0) must succeed during module startup \
          (21 = SQLITE_MISUSE: SQLite was initialized first; -1 = never ran)"
     );
+
+    // And the statistics really are off: with them on, an open connection
+    // makes sqlite3_memory_used() non-zero; with them off it stays 0. These
+    // are the same sqlite3_* symbols pdo_sqlite resolves (the SDK's
+    // libsqlite3, linked into this test binary through libphp).
+    unsafe extern "C" {
+        fn sqlite3_open(filename: *const std::ffi::c_char, db: *mut *mut std::ffi::c_void) -> i32;
+        fn sqlite3_close(db: *mut std::ffi::c_void) -> i32;
+        fn sqlite3_memory_used() -> i64;
+    }
+    let mut db = std::ptr::null_mut();
+    // SAFETY: plain SQLite C API calls on a private in-memory database; the
+    // handle is closed before returning and never shared.
+    let (open_rc, used) = unsafe {
+        let rc = sqlite3_open(c":memory:".as_ptr(), &raw mut db);
+        let used = sqlite3_memory_used();
+        sqlite3_close(db);
+        (rc, used)
+    };
+    assert_eq!(open_rc, 0, "sqlite3_open(:memory:)");
+    assert_eq!(used, 0, "SQLite memory statistics are still being tracked");
 }

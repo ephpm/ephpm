@@ -918,9 +918,19 @@ impl PhpRuntime {
             // Initialize PHP embed SAPI (module + initial request startup).
             // Safety: php_embed_init must be called exactly once before any PHP
             // execution. We guarantee this via the Mutex + Option guard.
-            let arg0 = CString::new("ephpm").unwrap();
-            let mut argv_ptrs = [arg0.as_ptr().cast_mut(), std::ptr::null_mut()];
-            // Safety: argv is valid, argc matches the number of non-null entries.
+            //
+            // argv must outlive this function. php_embed_init() stores it in
+            // this thread's SG(request_info), and every later
+            // php_request_startup() on this thread (ephpm_thread_init, a test
+            // that executes on its init thread) reads it again in
+            // php_build_argv(). A stack array here left that a dangling
+            // pointer: harmless while the stale stack happened to still hold
+            // it, a SIGSEGV in php_build_argv once init's frame layout
+            // changed. One leaked two-pointer array per process.
+            let argv_ptrs: &'static mut [*mut std::os::raw::c_char; 2] =
+                Box::leak(Box::new([c"ephpm".as_ptr().cast_mut(), std::ptr::null_mut()]));
+            // Safety: argv is valid for the life of the process, argc matches
+            // the number of non-null entries.
             let ret = unsafe { ffi::php_embed_init(1, argv_ptrs.as_mut_ptr()) };
             if ret != 0 {
                 return Err(PhpError::InitFailed);

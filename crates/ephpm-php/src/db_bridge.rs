@@ -3084,7 +3084,7 @@ mod per_site_tests {
     }
 
     /// The boundary of the has-rowset signal (#263), pinned against the
-    /// **production** backend rather than the rusqlite test one.
+    /// **production** (file-backed Turso) backend.
     ///
     /// `had_rowset` is authoritative for every statement litewire *runs*,
     /// because it reads the executed `SessionResult`. It cannot rescue a

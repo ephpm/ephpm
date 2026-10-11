@@ -209,8 +209,10 @@ ZTS support, and test before production.
 The built-in `pdo_sqlite` and `sqlite3` extensions (a file database opened
 with `new PDO('sqlite:/path/app.db')`, independent of the embedded Turso
 engine behind `[db.sqlite]`) run on the PHP SDK's own `libsqlite3`: a
-thread-safe build with FTS5, R-Tree and the math functions, and foreign keys
-**off** by default, as in stock PHP. Check it with
+thread-safe build with FTS5 and foreign keys **off** by default, as in stock
+PHP. Which optional modules it has depends on the platform build: the Linux
+build also has R-Tree and the SQL math functions, the Windows build has
+neither. Check what yours has with
 `ephpm php -r "print_r((new PDO('sqlite::memory:'))->query('PRAGMA compile_options')->fetchAll());"`.
 
 All request threads share one copy of that library, where php-fpm gives each

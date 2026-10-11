@@ -1638,13 +1638,13 @@ int ephpm_begin_request(void)
     /* An HTTP request has no argv (php-fpm/cgi leave it unset, so
      * php_build_argv() derives $argv from the query string). On the thread
      * that ran php_embed_init(), SG(request_info).argv still points at the
-     * argv array the host passed to it — a stack array that is long gone by
-     * now — and php_request_startup() -> php_hash_environment() ->
-     * php_build_argv() would dereference it. Only test harnesses execute
-     * requests on the init thread (the server's PHP threads are fresh TSRM
-     * threads with argv already NULL), but whether that read faults depends
-     * on whatever reused the old stack slot, so it is cleared for every
-     * request rather than left to luck. */
+     * argv array the host passed to it (`["ephpm"]`, which PhpRuntime::init
+     * now keeps alive for the process; it used to be a dead stack array, and
+     * ephpm_thread_init()'s php_request_startup() on that thread faulted in
+     * php_build_argv()). Only test harnesses execute requests on the init
+     * thread (the server's PHP threads are fresh TSRM threads with argv
+     * already NULL); an HTTP request must not see the host's argv either way,
+     * so it is cleared for every request. */
     SG(request_info).argc = 0;
     SG(request_info).argv = NULL;
 
