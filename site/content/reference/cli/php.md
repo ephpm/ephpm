@@ -65,7 +65,7 @@ before PHP runs, so `wp`, `artisan`, migrations, and seeders built on the
 | Option | Meaning |
 |--------|---------|
 | `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database. Validated fail-closed (an unknown or malformed key is rejected). |
-| `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. |
+| `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. On its own it does nothing: `ephpm php --config <path> …` without `--site` prints a warning on stderr that `--config` has no effect without `--site`, ignores it, and runs PHP normally. |
 
 Both are ePHPm's own options and must appear **before** the PHP program and its
 arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
@@ -98,9 +98,14 @@ At startup a strategy is chosen automatically:
   writes never replicate.
 
 `--site` requires multi-tenant per-site mode (`[server] sites_dir` + `[db.sqlite]`);
-a single-shared-database config is rejected rather than bound. On Linux, wrap the
-whole thing in [`ephpm exec --site …`](/guides/multi-tenant-hardening/) to run it
-inside the tenant's filesystem/uid sandbox.
+a single-shared-database config is rejected rather than bound.
+
+Wrapping this in [`ephpm exec --site …`](../exec/) to run it inside the tenant's
+Linux filesystem/uid sandbox **does not currently work** when the config lives
+in `/etc/ephpm`. The sandbox denies that directory on purpose, so the inner
+`ephpm php` cannot read its config. See
+[`ephpm exec` → Database access](../exec/#database-access). Run
+`ephpm php --site` as the operator instead.
 
 ## Drop-in for the stock `php` CLI
 
@@ -344,3 +349,4 @@ On Windows, PHP is statically linked into `ephpm.exe` (`php8embed.lib`, static C
 
 - [`ephpm serve`](../serve/) — the server command
 - [`ephpm kv`](../kv/) — KV store debugging
+- [`ephpm exec`](../exec/) — run a command in a vhost's tenant sandbox (Linux)

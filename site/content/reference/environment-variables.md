@@ -123,6 +123,8 @@ EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE=86400
 RUST_LOG=info,ephpm_query_stats=debug,ephpm_cluster=trace
 ```
 
+For `serve` and `dev`, the order is `RUST_LOG`, then `-v`/`-vv`, then `[server.logging] level`. The CLI subcommands `analyze`, `exec`, `php --site`, and the service lifecycle commands (`install`, `status`, …) also honour `RUST_LOG`, defaulting to `info`. They write their logs to **stderr**, so stdout stays clean for the command's output (for example `ephpm analyze --format sarif`).
+
 ## Crash-diagnostics env var
 
 `EPHPM_FATAL_HANDLER` controls the fatal-signal diagnostic handler. It is **not**
@@ -144,6 +146,17 @@ exceptions rather than signals, and that path is not implemented.
 
 See [Diagnosing crashes](/guides/diagnosing-crashes/) for how to read the
 report.
+
+## Other non-config environment variables
+
+These are read directly, not through the `EPHPM_` config mapping.
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `EPHPM_KV_PASSWORD` | `ephpm kv`, `ephpm deploy`, `ephpm cache` | Fallback for `--password`: sent as the RESP `AUTH` password when the flag is absent. An empty value counts as unset. See [`ephpm kv` → Authentication](/reference/cli/kv/#authentication). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT` | `serve`, `dev` | Enable OTLP trace export to this endpoint. **They take precedence over `[server.diagnostics] otlp_endpoint`** (the traces-specific one first). Release binaries include the exporter (`otlp` cargo feature). A binary built without it logs a startup warning and exports nothing. See [OTLP tracing](/guides/otlp-tracing/). |
+| `EPHPM_SERVICE_LOG_FILE` | `serve`, `dev` | Sends the main log output to this file (no ANSI colours) instead of stdout, creating its parent directory. The Windows service sets it to `C:\ProgramData\ephpm\logs\ephpm.log`, because a Windows service has no console. It is meant for that, but any `serve`/`dev` run honours it. It does not affect the separate `[server.logging] access` log. |
+| `MIMALLOC_PURGE_DELAY` | the mimalloc allocator (Linux/macOS builds) | Not an ePHPm setting: ePHPm uses [mimalloc](https://github.com/microsoft/mimalloc) as its allocator on Unix, and mimalloc reads its own `MIMALLOC_*` options from the environment. `MIMALLOC_PURGE_DELAY` (milliseconds) controls how long freed memory is kept before it is returned to the OS. That is the lever if resident memory looks high at steady state. Windows builds use the system allocator and ignore it. |
 
 ## See also
 
