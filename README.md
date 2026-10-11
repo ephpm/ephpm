@@ -62,7 +62,9 @@ Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releas
 sudo ./ephpm install
 ```
 
-This copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml`, registers a systemd service (Linux) or launchd plist (macOS), and starts it. The server listens on `http://localhost:8080` by default.
+This copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml` (only if none exists), registers a systemd service (Linux) or launchd plist (macOS), and starts it. The server listens on `http://localhost:8080` by default.
+
+The service runs as root by default. To run it as a dedicated, already-existing account, use `sudo ./ephpm install --user ephpm-web` (`--group` defaults to the same name). On Linux that also adds a systemd hardening profile (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `CAP_NET_BIND_SERVICE`). `--user` is not supported on Windows. See the [`ephpm install` reference](https://ephpm.dev/reference/cli/#ephpm-install).
 
 ### Windows
 
@@ -72,7 +74,7 @@ Download the Windows archive — `ephpm-v<version>+php<php-version>-windows-x86_
 .\ephpm.exe install
 ```
 
-Installs to `C:\Program Files\ephpm\`, adds to `PATH`, registers a Windows service, and starts it.
+Installs to `C:\Program Files\ephpm\`, adds to `PATH`, writes a default config to `C:\ProgramData\ephpm\ephpm.toml`, registers a Windows service, and starts it. Logs go to `C:\ProgramData\ephpm\logs\ephpm.log`.
 
 > **Note:** Single-node Turso and the DB proxy work fully on Windows. Clustered (Turso CDC replication) mode is experimental and not validated on Windows.
 
@@ -91,9 +93,11 @@ sudo ephpm logs           # tail the service log (--follow to follow)
 ### Uninstall
 
 ```bash
-sudo ephpm uninstall              # remove binary, service, and data dir
-sudo ephpm uninstall --keep-data  # keep config and SQLite databases
+sudo ephpm uninstall              # remove binary + service, and DELETE the config, data dir, and log dir
+sudo ephpm uninstall --keep-data  # remove binary + service only; keep config, data dir, and logs
 ```
+
+Without `--keep-data`, `uninstall` deletes `/etc/ephpm/ephpm.toml`, all of `/var/lib/ephpm/` and all of `/var/log/ephpm/` (the `C:\ProgramData\ephpm\` equivalents on Windows). Back up anything you keep there first.
 
 ## Configuration
 
@@ -265,7 +269,7 @@ ephpm_kv_expire('session:abc', 1800);
 ephpm_kv_del('cart:42');
 ```
 
-Available: `ephpm_kv_get`, `set`, `setnx`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`, `flush_all`, `wait`. These are the lowest-latency API — a direct FFI call, no socket. The RESP listener is also safe for multi-tenant use: set `[kv] secret` and each connection is scoped to a single site's keyspace by HMAC AUTH (see below).
+Available: `ephpm_kv_get`, `set`, `setnx`, `del`, `del_if_eq`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`, `flush_all`, `wait`. These are the lowest-latency API — a direct FFI call, no socket. The RESP listener is also safe for multi-tenant use: set `[kv] secret` and each connection is scoped to a single site's keyspace by HMAC AUTH (see below).
 
 ### 3. Need HA? Use the clustered KV tier
 
@@ -273,7 +277,7 @@ In a cluster, the KV store becomes a two-tier distributed store with no extra mo
 
 - **Small values** (< 512 bytes by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
 - **Large values** live on a **hashed data plane** — the owner is `hash(key)` modulo the sorted alive-node list (no consistent-hash ring), replicated to N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
-- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
+- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list, and reads fall back to the other replicas, so a large value survives up to `replication_factor - 1` node losses. Replication happens at write time only. There is no rebalancing or anti-entropy, so existing keys are **not** copied to new owners when membership changes, and a node that was down during a write lacks that key until it is rewritten. No primary, no election — every node can read and write.
 
 ```toml
 [cluster]
@@ -290,7 +294,7 @@ hot_key_max_memory = "64MB"
 
 ### Multi-tenant security
 
-When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint, ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
+When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint (when `[kv] secret` is set and `[kv.redis_compat] enabled = true`), ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so `phpredis` can `AUTH` without any per-site config in your code. It is set in `$_SERVER` only, so `getenv()` does not see it.
 
 ### How it works under the hood
 
