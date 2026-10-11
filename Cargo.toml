@@ -447,9 +447,14 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b0c12bf1383f5
 turso = { version = "=0.7.2", default-features = false }
 
 # vivacity: the pure-Rust Composer installer that backs `ephpm composer`. It
-# resolves and installs Composer dependencies with byte-parity to PHP Composer
-# and needs no PHP at runtime (it only shells out to a real `composer` for the
-# source-package fallback), so the subcommand works in stub mode too. Pinned to
+# resolves and installs Composer dependencies (byte-parity with PHP Composer is
+# its upstream's stated target). It links no PHP, so the subcommand works in
+# stub mode too. At runtime it shells out to a real `composer` for the
+# out-of-scope fallback and `--run-scripts`, and `update`/`require`/`remove`
+# run a `php` for the platform probe (`$VIVACITY_PHP`; a PHP-linked ephpm sets
+# it to its own executable, which answers as php-cli — see
+# crates/ephpm/src/php_personality.rs). User-facing docs, pinned to
+# this version: site/content/reference/cli/composer.md. Pinned to
 # the exact published version whose `vivacity::run()` embed entry point was
 # verified (argv[0] = program name; returns the process exit code as `i32`).
 # MIT-licensed. Published on crates.io. default-features=false + rustls-tls-no-provider so vivacity's reqwest uses ePHPm's aws-lc-rs process provider, not ring (exactly one rustls crypto provider linked).

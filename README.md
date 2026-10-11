@@ -38,13 +38,17 @@ session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`)
 plus whatever you load through `[php] extensions`. See
 [the `ephpm php` reference](https://ephpm.dev/reference/cli/php/).
 
-You don't need a separate Composer either — `ephpm composer install` runs
-[vivacity](https://github.com/Adelagric/vivacity), a pure-Rust, byte-parity
-Composer installer compiled into the binary. There's no PHP runtime to link and
-no `composer.phar` to download, so it works in **every** build (including stub
-mode) and on **Windows**. Every argument is forwarded verbatim and the process
-exits with Composer's own code, so it drops straight into CI. See
-[the `ephpm composer` reference](https://ephpm.dev/reference/cli/composer/).
+For the common Composer workflows there's `ephpm composer`. It runs
+[vivacity](https://github.com/Adelagric/vivacity), a Rust reimplementation of
+Composer's `install`, `update`, `require`, `remove` and `dump-autoload` that is
+compiled into the binary, so `ephpm composer install` from a lock file needs no
+PHP and no `composer.phar`, in every build (including stub mode) and on
+**Windows**. It is not full Composer: no other commands exist, scripts don't
+run by default, `update`/`require` need a `php` (a PHP-linked `ephpm` uses
+itself; a stub build needs one on `PATH`), and locks it can't
+install natively are handed to a real `composer`. Read
+[the `ephpm composer` reference](https://ephpm.dev/reference/cli/composer/)
+before you put it in CI.
 
 When you are ready to scale to production, you can deploy high-availability clusters using the exact same code paths running seamlessly from your local development machine, through CI, and straight into production. Need to use an external database just configure the SQL proxy and point your app to localhost:3306 to gain performance boosts from connection pooling.
 

@@ -970,6 +970,111 @@ fn php_binary_names_the_running_executable() {
     );
 }
 
+/// `PHP_BINARY` is the ephpm executable, so re-invoking it the way php-cli
+/// promises (spatie/async, Symfony Process, Composer `@php`, PHPUnit process
+/// isolation) must reach the embedded PHP, not `ephpm`'s own CLI. The bare form
+/// matters most: `ephpm` with no arguments is `ephpm dev`, so before the
+/// `EPHPM_PHP_CLI` marker a stdin-fed `PHP_BINARY` started a web server.
+#[test]
+fn php_binary_reinvokes_as_php_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let script = r#"
+        $run = function (array $args, string $stdin = '') {
+            $p = proc_open(array_merge([PHP_BINARY], $args),
+                [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+            fwrite($pipes[0], $stdin); fclose($pipes[0]);
+            $out = stream_get_contents($pipes[1]); stream_get_contents($pipes[2]);
+            fclose($pipes[1]); fclose($pipes[2]); proc_close($p);
+            return $out;
+        };
+        echo $run(['-r', 'echo "r=", 6 * 7;']), "\n";
+        echo $run([], '<?php echo "stdin=", PHP_SAPI;'), "\n";
+        echo substr($run(['--version']), 0, 4), "\n";
+        // A real ephpm subcommand still means ephpm: `help` prints ePHPm usage.
+        echo str_contains($run(['help']), 'ephpm') ? "help=ephpm" : "help=?", "\n";
+    "#;
+    let run = run_php(&bin, &["-n", "-r", script], "");
+    assert_eq!(
+        run.stdout, "r=42\nstdin=cli\nPHP \nhelp=ephpm\n",
+        "PHP_BINARY re-invocation must behave like php-cli\n--- stderr ---\n{}",
+        run.stderr
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// Installed as `php` (a symlink named `php`/`php8.x` to ephpm), the binary
+/// is php-cli outright: every argument is php's, with no `ephpm php` prefix.
+#[cfg(unix)]
+#[test]
+fn php_named_symlink_is_php_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("ephpm-php-symlink-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let link = dir.join("php8.5");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(std::fs::canonicalize(&bin).expect("canonicalize"), &link)
+        .expect("symlink");
+
+    let out = Command::new(&link)
+        .args(["-n", "-r", "echo PHP_SAPI, '|', $argv[1];", "--", "serve"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run php symlink");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "cli|serve",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+}
+
+/// `ephpm composer update` resolves platform requirements by running
+/// vivacity's platform probe on a php binary (`$VIVACITY_PHP`, else `php` on
+/// `PATH`). A PHP-linked ephpm points that at itself, so update/require/remove
+/// work with **no** php installed — before, this exited 1 with
+/// `cannot run php: No such file or directory`. `--offline` with only platform
+/// requirements keeps the test off the network.
+#[cfg(unix)]
+#[test]
+fn composer_update_needs_no_system_php() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("ephpm-composer-nophp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("composer.json"), r#"{"require":{"php":">=8.1","ext-json":"*"}}"#)
+        .expect("write composer.json");
+
+    let out = Command::new(std::fs::canonicalize(&bin).expect("canonicalize"))
+        .args(["composer", "update", "--offline"])
+        .current_dir(&dir)
+        .env_clear()
+        // No php anywhere: the probe can only succeed by re-running ephpm.
+        .env("PATH", "/nonexistent")
+        .env("HOME", &dir)
+        .env("COMPOSER_HOME", dir.join(".composer"))
+        .env("VIVACITY_NO_PLATFORM_CACHE", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ephpm composer");
+    let lock_written = dir.join("composer.lock").is_file();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success() && lock_written,
+        "`ephpm composer update` must probe the platform through ephpm itself \
+         (exit {:?}, lock written: {lock_written})\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `STDIN`/`STDOUT`/`STDERR` are opened through the `php://std*` wrappers by
 /// php-cli, so `stream_get_meta_data()` reports `wrapper_type = "PHP"` and a
 /// `php://…` uri. ePHPm built them from raw `FILE*`s, leaving both absent, so
