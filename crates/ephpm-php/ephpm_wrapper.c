@@ -3501,6 +3501,8 @@ typedef struct {
     int  (*get)(const char *key);
     void (*get_result)(const char **ptr, size_t *len);
     int  (*set)(const char *key, const char *val, size_t val_len, long long ttl_ms);
+    /* 1 inserted, 0 not inserted (exists / OOM), -1 clustered owner
+     * unreachable: outcome unknown (a timed-out request may have landed). */
     int  (*set_nx)(const char *key, const char *val, size_t val_len, long long ttl_ms);
     long (*del)(const char *key);
     int  (*exists)(const char *key);
@@ -3598,8 +3600,10 @@ PHP_FUNCTION(ephpm_kv_setnx)
     /* Returns true if the value was inserted, false if a live entry was
      * already present at this key. The check-and-set is atomic under the
      * KV store's per-shard lock — this is the primitive the PHP-side lock
-     * libraries (Cache::lock, Symfony LockFactory) build on. */
-    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms));
+     * libraries (Cache::lock, Symfony LockFactory) build on. The op returns
+     * -1 when a clustered owner was unreachable (outcome unknown) — only 1
+     * means inserted. */
+    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms) == 1);
 }
 
 PHP_FUNCTION(ephpm_kv_del)
@@ -5260,8 +5264,10 @@ static long long ephpm_session_ttl_ms(void)
  * Clustered: SETNX and del_if_eq are decided by the lock key's owner node
  * (ephpm-cluster routes them over the KV data plane), so two nodes cannot
  * both hold one session's lock while membership is stable. An unreachable
- * owner refuses the acquire, which this loop treats like contention: spin,
- * then proceed lockless with the warning below.
+ * owner (set_nx returns -1) is NOT treated like contention: the request
+ * proceeds at once without a confirmed lock and with a warning, still
+ * tracking its token so PS_CLOSE's compare-and-delete cleans up a grant that
+ * may have landed despite the timeout.
  *
  * Windows is ZTS like Linux/macOS (#326), so the same concurrent-request
  * locking applies there. On a hypothetical NTS build PHP execution is
@@ -5334,6 +5340,11 @@ static void ephpm_sleep_ms(unsigned int ms)
 {
     Sleep(ms);
 }
+/* Monotonic milliseconds, for the lock wait budget. */
+static unsigned long long ephpm_monotonic_ms(void)
+{
+    return (unsigned long long)GetTickCount64();
+}
 #else
 #include <time.h>
 static void ephpm_sleep_ms(unsigned int ms)
@@ -5342,6 +5353,14 @@ static void ephpm_sleep_ms(unsigned int ms)
     ts.tv_sec = ms / 1000u;
     ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
     nanosleep(&ts, NULL);
+}
+/* Monotonic milliseconds, for the lock wait budget. */
+static unsigned long long ephpm_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull
+        + (unsigned long long)(ts.tv_nsec / 1000000L);
 }
 #endif
 
@@ -5401,36 +5420,55 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
         EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
         sid, sid_len, stack, sizeof(stack), &used_heap);
 
-    unsigned int waited_ms = 0;
     unsigned int backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_START_MS;
     int acquired = 0;
+    /* Set when a clustered owner could not be reached: the acquire's outcome
+     * is unknown (a timed-out request may still have landed on the owner). */
+    int owner_unreachable = 0;
+    /* The wait budget is wall time on a monotonic clock, not summed sleeps:
+     * in a cluster each set_nx is an owner round trip (up to the 2s routing
+     * timeout), which summed sleeps would not count. */
+    const unsigned long long start_ms = ephpm_monotonic_ms();
+    unsigned long long waited_ms = 0;
 
     /* One token for this acquisition attempt; it becomes ours only on a
      * successful set_nx, and is what the release compares against. */
     ephpm_session_lock_new_token();
 
     for (;;) {
-        if (g_kv_ops.set_nx(lock_key, session_lock_token, EPHPM_SESSION_LOCK_TOKEN_LEN,
-                            EPHPM_SESSION_LOCK_TTL_MS)) {
+        int rc = g_kv_ops.set_nx(lock_key, session_lock_token, EPHPM_SESSION_LOCK_TOKEN_LEN,
+                                 EPHPM_SESSION_LOCK_TTL_MS);
+        if (rc == 1) {
             acquired = 1;
             break;
         }
+        if (rc < 0) {
+            /* No arbiter. This is not contention, so do not spin for 30s
+             * against it (a rolling upgrade or a dead owner would add that to
+             * every request). Stop now and go lockless — but because the
+             * request may have been applied, keep tracking our unique token
+             * so PS_CLOSE still issues a del_if_eq for it: if the grant did
+             * land, that releases it instead of orphaning it for the TTL; if
+             * it did not, the compare-and-delete deletes nothing. */
+            owner_unreachable = 1;
+            break;
+        }
+        waited_ms = ephpm_monotonic_ms() - start_ms;
         if (waited_ms >= EPHPM_SESSION_LOCK_MAX_WAIT_MS) {
             break;
         }
         unsigned int sleep_ms = backoff_ms;
         if (sleep_ms > EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms) {
-            sleep_ms = EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms;
+            sleep_ms = (unsigned int)(EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms);
         }
         ephpm_sleep_ms(sleep_ms);
-        waited_ms += sleep_ms;
         backoff_ms *= 2u;
         if (backoff_ms > EPHPM_SESSION_LOCK_BACKOFF_MAX_MS) {
             backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_MAX_MS;
         }
     }
 
-    if (acquired) {
+    if (acquired || owner_unreachable) {
         char *owned = (char *)malloc(sid_len + 1);
         if (owned) {
             memcpy(owned, sid, sid_len);
@@ -5447,11 +5485,17 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
                 "ephpm session handler: out of memory tracking session lock; "
                 "proceeding without lock");
         }
+        if (owner_unreachable) {
+            php_error_docref(NULL, E_WARNING,
+                "ephpm session handler: the cluster node that owns this "
+                "session's lock is unreachable; proceeding without a "
+                "confirmed lock");
+        }
     } else {
         php_error_docref(NULL, E_WARNING,
             "ephpm session handler: could not acquire session lock after "
             "%u ms; proceeding without lock (concurrent request may still "
-            "hold it)", waited_ms);
+            "hold it)", (unsigned int)waited_ms);
     }
 
     ephpm_session_key_free(lock_key, used_heap);

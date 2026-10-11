@@ -74,7 +74,7 @@ than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 | Strings | `GET key` | `nil` for a missing key, and also for a key that only exists as a hash. |
 | | `SET key value [EX s \| PX ms] [NX \| XX] [GET]` | `EXAT`/`PXAT`/`KEEPTTL` are `ERR syntax error`. An `EX`/`PX` value that is zero, negative or not a number is **silently ignored** and the key is stored with no TTL (Redis returns an error). `NX` with `XX` is an error. |
 | | `SETEX key seconds value` | `seconds` must be positive. |
-| | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` and writes nothing. The same applies to `SET … NX`. |
+| | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` (nothing written on this node; the owner may still have applied a request that timed out). The same applies to `SET … NX`. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
 | | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |

@@ -349,14 +349,12 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
 ///
 /// # This is not a true distributed lock
 ///
-/// [`Store::set_nx`] is a genuine atomic test-and-set *within one process*,
-/// which is why it replaces the previous get-then-set. Across the cluster
-/// there is no equivalent: the gossip KV tier
-/// (`ClusterHandle::gossip_set`/`gossip_get` in `ephpm-cluster`) offers only
-/// last-write-wins set / get / delete over eventually consistent chitchat
-/// state — it has no compare-and-swap primitive to build on. Two nodes
-/// starting together can therefore both win their local claim for the second
-/// or so it takes the write to propagate.
+/// [`Store::set_nx`] is an atomic test-and-set, and with clustering on it is
+/// decided by the key's owner node (owner-routed SETNX), so two nodes cannot
+/// both win the initial claim while membership is stable. That is not enough
+/// on its own: the renewal and takeover below use plain last-write-wins sets
+/// over the eventually consistent gossip tier, which are not arbitrated, and
+/// across a membership change two nodes can briefly name different owners.
 ///
 /// What makes it converge is the tie-break below: a node that sees a
 /// *different* holder yields unless its own id sorts lower, in which case it

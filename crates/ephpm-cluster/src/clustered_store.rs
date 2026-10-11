@@ -835,7 +835,8 @@ impl ClusteredStore {
     /// Returns [`Routed::Local`] when this node is the arbiter (the caller then
     /// decides on its own map), the owner's answer when it is another node, or
     /// [`Routed::OwnerUnreachable`] when the owner did not answer within
-    /// [`CONDITIONAL_ROUTE_TIMEOUT`] — in which case nothing was written.
+    /// [`CONDITIONAL_ROUTE_TIMEOUT`] — in which case the outcome is unknown: a
+    /// request that reached the owner before the timeout may have been applied.
     pub async fn route_set_nx(
         &self,
         transport_key: &str,

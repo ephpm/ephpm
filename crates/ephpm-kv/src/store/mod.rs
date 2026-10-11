@@ -82,8 +82,10 @@ pub enum SetNxOutcome {
     /// `memory_limit`. Surfaced on the wire as [`OOM_ERROR`].
     OutOfMemory,
     /// Clustered only: the node that arbitrates this key (its owner — see
-    /// [`Replicator::route_set_nx`]) could not be reached, so **nothing was
-    /// written anywhere**. Surfaced on the wire as [`OWNER_UNREACHABLE_ERROR`].
+    /// [`Replicator::route_set_nx`]) could not be reached or did not answer in
+    /// time. Nothing was written on this node, but the outcome on the owner is
+    /// **unknown**: a request that timed out may still have been applied there.
+    /// Surfaced on the wire as [`OWNER_UNREACHABLE_ERROR`].
     ///
     /// This is a deliberate fail-closed answer. Falling back to a node-local
     /// check would let two nodes both acquire the same lock — the bug owner
@@ -100,7 +102,7 @@ pub enum SetNxOutcome {
 /// right thing here too: the owner is recomputed from live membership on every
 /// attempt, and a dead owner stops being the owner once gossip notices.
 pub const OWNER_UNREACHABLE_ERROR: &str =
-    "CLUSTERDOWN the cluster node that owns this key is unreachable; nothing was written";
+    "CLUSTERDOWN the cluster node that owns this key is unreachable; the outcome is unknown";
 
 /// The cluster node that arbitrates a conditional write could not be reached.
 ///
@@ -132,7 +134,9 @@ pub enum Routed<T> {
     /// The owner decided; this is its answer. The owner has already applied
     /// and published the effect, so the caller must not apply it again.
     Owner(T),
-    /// The owner could not be reached. Nothing was applied anywhere.
+    /// The owner could not be reached, or did not answer in time. Nothing was
+    /// applied on this node; whether the owner applied it is **unknown** (a
+    /// request that timed out may still have landed).
     OwnerUnreachable,
 }
 

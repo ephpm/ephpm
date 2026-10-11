@@ -86,6 +86,9 @@ const OP_SET: u8 = 0x01;
 
 /// Op code for an owner-arbitrated SETNX.
 const OP_SET_NX: u8 = 0x02;
+/// Upper bound on a peer-supplied SETNX TTL (ten years), so `Instant + ttl`
+/// on the owner cannot overflow and panic.
+const MAX_REMOTE_TTL_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
 
 /// Op code for an owner-arbitrated compare-and-delete.
 const OP_DEL_IF_EQ: u8 = 0x03;
@@ -311,8 +314,11 @@ async fn handle_connection(
         }
         OP_SET_NX => {
             let value = request.value.expect("SETNX request always carries a value");
-            let ttl =
-                (request.ttl_ms > 0).then(|| std::time::Duration::from_millis(request.ttl_ms));
+            // Clamp a peer-supplied TTL: `Instant::now() + Duration` panics on
+            // overflow, so an absurd `ttl_ms` (u64::MAX) from a peer must not
+            // reach the store. Ten years is "effectively forever" for a lock.
+            let ttl = (request.ttl_ms > 0)
+                .then(|| std::time::Duration::from_millis(request.ttl_ms.min(MAX_REMOTE_TTL_MS)));
             // We are the key's owner, asked to arbitrate. Decide on OUR map and
             // do not re-route: two nodes that briefly disagree about ownership
             // would otherwise bounce the request between them. A win is
@@ -566,7 +572,9 @@ pub async fn store_remote(
 ///
 /// Returns an error on connection or I/O failure, a cipher mismatch, a peer
 /// that does not speak this op (an older node closes without answering), or a
-/// peer that cannot route the key. Every error means **nothing was written**.
+/// peer that cannot route the key. A connect/refused error means nothing was
+/// written; an error after the request was sent (timeout, reset) leaves the
+/// outcome **unknown**.
 pub async fn set_nx_remote(
     addr: SocketAddr,
     key: &str,
@@ -1113,6 +1121,26 @@ mod tests {
             set_nx_remote(addr, "lock", b"B", None, Some(&cipher)).await.unwrap(),
             SetNxOutcome::Inserted,
             "an expired grant must be vacant again"
+        );
+    }
+
+    /// A peer-supplied `ttl_ms = u64::MAX` is clamped, not an `Instant`
+    /// overflow panic on the owner.
+    #[tokio::test]
+    async fn set_nx_remote_clamps_an_absurd_ttl() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+        let huge = Some(std::time::Duration::MAX); // encodes as ttl_ms = u64::MAX
+        assert_eq!(
+            set_nx_remote(addr, "lock", b"A", huge, None).await.unwrap(),
+            SetNxOutcome::Inserted
+        );
+        let pttl = store.pttl("lock").expect("owner holds the lock");
+        assert!(pttl > 0 && pttl <= i64::try_from(MAX_REMOTE_TTL_MS).unwrap(), "pttl {pttl}");
+        // The handler task is still alive and answering.
+        assert_eq!(
+            set_nx_remote(addr, "lock", b"B", None, None).await.unwrap(),
+            SetNxOutcome::Exists
         );
     }
 

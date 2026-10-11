@@ -164,16 +164,23 @@ under that one node's shard lock, so concurrent requests for one session on
   from its own membership view, so across a membership change (a node
   joining or leaving, or the seconds before gossip declares a dead node
   dead) two nodes can briefly name different owners and both grant the lock.
+  During a network partition each side grants on its own until it heals.
 - A node that becomes the owner only knows about a lock its predecessor
-  granted once that grant has replicated to it (gossip, typically well under
-  a second).
-- If the owner cannot be reached (2-second timeout), the acquire is refused
-  rather than falling back to a node-local lock. The handler treats that like
-  contention and, after its 30-second wait, proceeds without the lock with
-  the usual warning.
-- During a rolling upgrade from a version without owner routing, an owner
-  still on the old version cannot answer the routed request, so locks it
-  owns are refused (the same contention path) until it is upgraded.
+  granted once that grant has replicated to it (gossip, typically 1–3
+  seconds). A grant lost with its owner (crash or restart before it
+  replicated) can be granted again.
+- If the owner cannot be reached (2-second timeout), the handler does not
+  fall back to a node-local lock and does not wait out the 30 seconds: it
+  proceeds at once without a confirmed lock and raises an `E_WARNING` ("the
+  cluster node that owns this session's lock is unreachable"). Because a
+  timed-out acquire may still have landed on the owner, it keeps its token
+  and its `close` still issues the compare-and-delete, so a grant that did
+  land is released rather than left to block the session for 30 seconds.
+- During a rolling upgrade, an owner still on the old version cannot answer
+  the routed request, so sessions whose lock it owns run without a confirmed
+  lock (with that warning) until it is upgraded, and old-version nodes still
+  decide their own locks locally. Session locking across nodes is only
+  effective once every node runs this version.
 
 This is single-arbiter routing, not consensus. Use session-affinity routing
 if your app cannot tolerate the membership-change window.
