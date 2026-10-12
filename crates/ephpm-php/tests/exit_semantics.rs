@@ -234,6 +234,23 @@ fn exit_in_an_output_buffer_callback_is_not_a_bailout() {
         "<?php ob_start(function ($buf) { exit; }); echo 'ob-callback-exit body';",
     );
     assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty(), "the exiting handler's buffer is discarded: {}", text(&resp));
+}
+
+/// All three phases: an exit() in a shutdown function, then another in the ob
+/// callback that the final flush runs. Both are exits; the request is not a
+/// bailout.
+#[test]
+#[serial]
+fn exit_in_shutdown_then_in_ob_callback_is_still_an_exit() {
+    let resp = ok(
+        "shutdown_then_ob_exit.php",
+        "<?php
+        header('X-Phases: 3');
+        register_shutdown_function(function () { ob_start(function ($b) { exit; }); echo 'x'; exit; });",
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(header(&resp, "X-Phases"), Some("3"));
 }
 
 /// An uncaught exception records a fatal; a shutdown function then renders a
@@ -279,6 +296,47 @@ fn real_bailout_after_an_exit_bailout_is_still_a_bailout() {
             register_shutdown_function(function () {{ {OOM} }});
             set_exception_handler(function ($e) {{ echo 'handled|'; exit(1); }});
             throw new Exception('boom');"
+        ),
+    );
+    assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");
+}
+
+/// Same, but the handler set a non-200 status first — so only the bailout
+/// classification (not the "fatal recorded and status still 200" rule) can
+/// turn this into a 500.
+#[test]
+#[serial]
+fn real_bailout_after_an_exit_bailout_with_a_status_is_still_a_bailout() {
+    let r = run(
+        "exc_404_exit_then_oom.php",
+        &format!(
+            "<?php
+            register_shutdown_function(function () {{ {OOM} }});
+            set_exception_handler(function ($e) {{
+                http_response_code(404); echo 'handled|'; exit(1);
+            }});
+            throw new Exception('boom');"
+        ),
+    );
+    assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");
+}
+
+/// An exit() that the engine swallows inside a frame — a destroyed fiber's
+/// `finally` calling exit() — lets the script carry on. It must not vouch for
+/// a real bailout later in the same phase.
+#[test]
+#[serial]
+fn swallowed_exit_does_not_mask_a_later_bailout() {
+    let r = run(
+        "fiber_exit_then_oom.php",
+        &format!(
+            "<?php
+            http_response_code(201);
+            $f = new Fiber(function () {{ try {{ Fiber::suspend(); }} finally {{ exit; }} }});
+            $f->start();
+            unset($f);
+            echo 'PARTIAL';
+            {OOM}"
         ),
     );
     assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");

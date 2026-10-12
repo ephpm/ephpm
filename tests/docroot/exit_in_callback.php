@@ -44,7 +44,13 @@ switch ($_GET['case'] ?? '') {
                 $a[] = str_repeat('x', 1024 * 1024);
             }
         });
-        set_exception_handler(function ($e) { echo 'EXIT-THEN-OOM-PARTIAL'; exit(1); });
+        // The handler sets a non-200 status, so only the bailout
+        // classification (not "fatal recorded and status still 200") can 500.
+        set_exception_handler(function ($e) {
+            http_response_code(404);
+            echo 'EXIT-THEN-OOM-PARTIAL';
+            exit(1);
+        });
         throw new Exception('boom');
 
     default:

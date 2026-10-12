@@ -759,8 +759,9 @@ static void capture_response_headers(void)
  * instance at init to find it, then point the class's default_object_handlers
  * at a copy of its own handler table whose free_obj also sets a thread-local
  * flag. Every later unwind exit is created with that table (zend_objects_new ->
- * _zend_object_std_init copies ce->default_object_handlers), so each exit()
- * that completes its unwind sets ephpm_exit_unwound on the thread that ran it.
+ * _zend_object_std_init copies ce->default_object_handlers), so an exit()
+ * whose unwind ends in that frameless bailout sets ephpm_exit_unwound on the
+ * thread that ran it (ephpm_unwind_exit_free_obj says which frees count).
  * The probe itself was created with the ORIGINAL table and is released with it.
  * Nothing else about the object changes: free_obj still runs the original
  * handler (zend_object_std_dtor) right after the flag is set.
@@ -778,30 +779,55 @@ static zend_object_free_obj_t ephpm_unwind_exit_orig_free = NULL;
  * ephpm_worker_run(). */
 static EPHPM_TLS int ephpm_exit_unwound = 0;
 
+/*
+ * Only the free that immediately precedes the frameless bailout counts:
+ *
+ *   - zend_throw_exception_internal(NULL) frees the exit with no execute frame
+ *     (EG(current_execute_data) == NULL) and BEFORE it bails out
+ *     (CG(unclean_shutdown) still clear for the span).
+ *   - An exit that is swallowed inside a frame — a destroyed fiber's `finally`
+ *     calling exit(), SPL's CATCH_GET_CHILD iterators — is freed with a frame
+ *     live and the script carries on; it must not vouch for a later bailout.
+ *   - An exit still pending when a REAL bailout (a timeout firing during the
+ *     unwind, an extension) jumps is freed afterwards by php_execute_script's
+ *     zend_exception_error(); unclean_shutdown is already set by then.
+ *
+ * The terminal frees of a top-level / middleware exit also pass the test, which
+ * is harmless: nothing runs after them in that span.
+ */
 static void ephpm_unwind_exit_free_obj(zend_object *object)
 {
-    ephpm_exit_unwound = 1;
+    if (!EG(current_execute_data) && !CG(unclean_shutdown)) {
+        ephpm_exit_unwound = 1;
+    }
     ephpm_unwind_exit_orig_free(object);
 }
 
 /* Needs a live request (an object store): call after php_embed_init(). */
 static void ephpm_install_exit_observer(void)
 {
-    if (ephpm_unwind_exit_orig_free) {
-        return; /* already installed */
-    }
     zend_object *probe = zend_create_unwind_exit();
     zend_class_entry *ce = probe->ce;
     const zend_object_handlers *orig = ce->default_object_handlers;
-    if (orig && orig->free_obj) {
+    if (orig == &ephpm_unwind_exit_handlers) {
+        /* Already installed (and still in place: a re-run of zend_startup
+         * would have reset default_object_handlers via INIT_CLASS_ENTRY). */
+    } else if (orig && orig->free_obj) {
         memcpy(&ephpm_unwind_exit_handlers, orig, sizeof(ephpm_unwind_exit_handlers));
         ephpm_unwind_exit_orig_free = orig->free_obj;
         ephpm_unwind_exit_handlers.free_obj = ephpm_unwind_exit_free_obj;
         ce->default_object_handlers = &ephpm_unwind_exit_handlers;
     }
-    /* probe->handlers still points at the original table, so releasing it
-     * does not touch the flag. */
+    /* probe->handlers is whatever table it was created with; a flag it may set
+     * on release is harmless — every span clears the flag when it starts. */
     OBJ_RELEASE(probe);
+}
+
+/* 1 if the exit() observer is in place, 0 if it could not be installed (exits
+ * from frameless callbacks then fall back to being reported as bailouts). */
+int ephpm_exit_observer_installed(void)
+{
+    return ephpm_unwind_exit_orig_free != NULL;
 }
 
 /*
@@ -1444,6 +1470,12 @@ void ephpm_request_set_ini(const char *key, const char *value)
  * already been recorded) and ends by OR-ing the earlier value back in, so
  * php_request_shutdown() in ephpm_finish_request() still sees exactly what it
  * would have seen without the spans.
+ *
+ * The only engine readers of the flag that run DURING a span (PHP 8.5 source
+ * checked) are user stream filters (user_filters.c) and generator destruction
+ * (zend_generators.c), which skip userland code on an unclean shutdown. After
+ * an exit()-bailout they now run it, exactly as after a top-level exit():
+ * a frameless bailout leaves no VM frame or generator mid-execution.
  */
 #define EPHPM_BAILOUT_NONE    0
 #define EPHPM_BAILOUT_EXIT    1

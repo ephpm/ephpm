@@ -78,6 +78,10 @@ mod ffi {
         /// start from a clean state.
         pub fn ephpm_finalize_init();
 
+        /// 1 if `ephpm_finalize_init()` installed the `exit()` observer that
+        /// tells an `exit()` from a frameless callback apart from a bailout.
+        pub fn ephpm_exit_observer_installed() -> ::std::os::raw::c_int;
+
         /// Set a PHP INI directive for the current request.
         pub fn ephpm_request_set_ini(
             key: *const ::std::os::raw::c_char,
@@ -1068,6 +1072,14 @@ impl PhpRuntime {
             // as active so ephpm_begin_request shuts it down on first call.
             unsafe { ffi::ephpm_finalize_init() };
             tracing::debug!("PHP embed initial request marked active (ready for HTTP)");
+            // Safety: reads a process-global set by ephpm_finalize_init above.
+            if unsafe { ffi::ephpm_exit_observer_installed() } == 0 {
+                tracing::warn!(
+                    "could not install the exit() observer: exit() from an exception \
+                     handler, shutdown function or output-buffer callback will be \
+                     reported as a Zend bailout (HTTP 500)"
+                );
+            }
         }
 
         Ok(())
@@ -1640,9 +1652,10 @@ impl PhpRuntime {
         let status = u16::try_from(status_code).unwrap_or(200);
 
         match ret {
-            // exit()/die() (SCRIPT_EXIT) — from the script, a PHP middleware
-            // mount, or a frameless callback (exception handler, shutdown
-            // function, ob callback) — is a normal end of the script, as in
+            // exit()/die() (SCRIPT_EXIT) — from a PHP middleware mount or a
+            // frameless callback (exception handler, shutdown function, ob
+            // callback); a plain exit() in the app script already comes back
+            // as OK — is a normal end of the script, as in
             // php-fpm: the captured response is complete and is returned
             // as-is with the status the script chose. An empty body is
             // legitimate there (`header('Location: …'); exit;`, a 403 or 204
