@@ -330,12 +330,11 @@ fn dynamic_init_failure_aborts_startup() {
 }
 
 /// A module that declares `CONFIG_KEYS` is strict on the **dlopen** lane too
-/// (issue #473). The check is compiled into the module by `declare!`, not
-/// performed by the host — the host cannot know a third-party module's schema
-/// — so this is the only place it can be proven: a real cdylib, loaded across
-/// the C boundary, refusing a mount whose `config` names a key it does not
-/// read. The `-3` is `declare!`'s "init returned an error" code, the same one
-/// a rejected config produces above.
+/// (issue #473) — and since #480 the **host** enforces it, before `init`, from
+/// the `ephpm_middleware_config_keys` symbol `declare!` exports. So the refusal
+/// now carries the same diagnostic a builtin gives (the key, a did-you-mean)
+/// rather than the module's opaque `init returned -3`, which is what this
+/// asserted before the host could read the declaration.
 #[test]
 fn a_declared_key_set_is_enforced_across_the_c_abi() {
     let lib = fixture("mw_probe_v1");
@@ -345,13 +344,142 @@ fn a_declared_key_set_is_enforced_across_the_c_abi() {
         Err(e) => format!("{e:#}"),
     };
     assert!(err.contains("mw_probe_v1"), "{err}");
-    assert!(err.contains("init returned -3"), "{err}");
+    assert!(err.contains("unknown config key `tagg`"), "the host must name the key: {err}");
+    assert!(err.contains("did you mean `tag`"), "{err}");
+    assert!(!err.contains("init returned"), "the host check runs before `init`: {err}");
 
     // Control: the same config without the typo loads. Without this the test
     // would pass for a fixture that had simply stopped loading at all.
     let lib = fixture("mw_probe_v1");
     let good = serde_json::json!({ "tag": "fixture-alpha" });
     MiddlewareChain::load(&[mount_path(lib.path(), Some(good))]).expect("control mount loads");
+}
+
+/// `declare!` exports the declaration as the #480 symbol, verbatim from
+/// `CONFIG_KEYS` — read here straight off the real cdylib, the way the host
+/// (or a future `ephpm middleware describe`) does.
+#[test]
+fn declare_exports_config_keys_from_the_trait_const() {
+    let lib_path = fixture("mw_probe_v1");
+    // SAFETY: loading a fixture built from this workspace; documented v1 trust
+    // model.
+    let lib = unsafe { libloading::Library::new(lib_path.path()) }.expect("dlopen probe fixture");
+    // SAFETY: `declare!` exports this symbol with exactly the `ConfigKeysFn`
+    // shape.
+    let config_keys: ephpm_middleware::abi::ConfigKeysFn =
+        *unsafe { lib.get(ephpm_middleware::abi::SYM_CONFIG_KEYS) }.expect("symbol exported");
+    // SAFETY: no arguments; the result is a static NUL-terminated string.
+    let ptr = unsafe { config_keys() };
+    assert!(!ptr.is_null(), "a module with CONFIG_KEYS = Some(..) must declare");
+    // SAFETY: non-null and NUL-terminated per the ABI contract.
+    let raw = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    assert_eq!(
+        ephpm_middleware::config::parse_declared_keys(raw.to_bytes()).expect("well-formed"),
+        ["tag"]
+    );
+}
+
+/// The #480 point: a module that does **not** use the Rust authoring kit — and
+/// does no key checking of its own — now gets typo protection from the host,
+/// just by exporting its key list. The fixture's `init` accepts anything, so
+/// the refusal can only be the host's.
+#[test]
+fn the_host_checks_a_non_rust_module_that_declares_its_keys() {
+    let lib = fixture("mw_probe_c_keys");
+    let typo = serde_json::json!({ "tag": "x", "moed": "strict" });
+    let err = match MiddlewareChain::load(&[mount_path(lib.path(), Some(typo))]) {
+        Ok(_) => panic!("the host must check a declared key set before `init`"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("mw_probe_c_keys"), "the mount must be named: {err}");
+    assert!(err.contains("unknown config key `moed`"), "{err}");
+    assert!(err.contains("did you mean `mode`"), "{err}");
+
+    // Control: the declared keys (and no config at all) load.
+    let lib = fixture("mw_probe_c_keys");
+    let good = serde_json::json!({ "tag": "x", "mode": "strict" });
+    MiddlewareChain::load(&[mount_path(lib.path(), Some(good))]).expect("declared keys load");
+    let lib = fixture("mw_probe_c_keys");
+    MiddlewareChain::load(&[mount_path(lib.path(), None)]).expect("no config loads");
+}
+
+/// A module that answers the #480 question wrongly is refused at startup with
+/// a message naming the symbol — never mounted unchecked, never mounted with a
+/// guessed key set.
+#[test]
+fn a_malformed_config_keys_declaration_refuses_the_mount() {
+    let lib = fixture("mw_probe_c_bad_keys");
+    let err = match MiddlewareChain::load(&[mount_path(lib.path(), None)]) {
+        Ok(_) => panic!("a malformed declaration must not mount"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("mw_probe_c_bad_keys"), "{err}");
+    assert!(err.contains("ephpm_middleware_config_keys"), "the symbol must be named: {err}");
+    assert!(err.contains("unusable"), "{err}");
+}
+
+/// Backwards compatibility for #469 and #480 together: a hand-rolled module in
+/// the pre-minor-5 shape — no `ephpm_middleware_config_keys`, an `init` that
+/// gates on the major only, reading only minor-3 slots — still mounts and runs
+/// against today's host table, and is not subjected to any key check (it has
+/// told the host nothing, so arbitrary keys must still load).
+#[test]
+fn a_module_without_the_new_symbol_built_for_an_older_minor_still_loads() {
+    let lib = fixture("mw_probe_legacy");
+    let config = serde_json::json!({ "anything": 1, "it_never_parses": "config" });
+    let chain = MiddlewareChain::load(&[mount_path(lib.path(), Some(config))])
+        .expect("an undeclared module must load exactly as before #480");
+
+    let ctx = RequestCtx::new("GET", "/x.php", "", "198.51.100.9", "legacy.example", &[]);
+    let ChainVerdict::Continue { response_headers, .. } = chain.evaluate(&ctx, "/x.php") else {
+        panic!("expected CONTINUE from the legacy fixture");
+    };
+    assert_eq!(find(&response_headers, "X-Legacy-Vhost"), Some("legacy.example"));
+
+    let ctx = RequestCtx::new("GET", "/x.php", "", "198.51.100.9", "", &[]);
+    let ChainVerdict::Continue { response_headers, .. } = chain.evaluate(&ctx, "/x.php") else {
+        panic!("expected CONTINUE from the legacy fixture");
+    };
+    assert_eq!(find(&response_headers, "X-Legacy-Vhost"), Some("<none>"));
+}
+
+// ── node tenancy (ABI minor 5, issue #469) ────────────────────────────────
+
+/// The node-level tenancy flag crosses the C boundary through the real host
+/// table, and is what lets a module tell the two `vhost_id() == None` cases
+/// apart. The only test in this binary that writes the flag, so it cannot race
+/// a sibling; it restores the default on exit.
+#[test]
+fn node_tenancy_reaches_a_dlopened_module() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ephpm_middleware::host::set_node_multi_tenant(false);
+        }
+    }
+    let _reset = Reset;
+
+    let lib = fixture("mw_probe_v1");
+    let chain = MiddlewareChain::load(&[mount_path(
+        lib.path(),
+        Some(serde_json::json!({ "tag": "tenancy" })),
+    )])
+    .expect("probe loads");
+    // An unmatched request — the one whose meaning depends on the flag.
+    let ctx = RequestCtx::new("GET", "/x.php", "", "198.51.100.9", "", &[]);
+
+    for (multi_tenant, expected) in [(false, "0"), (true, "1"), (false, "0")] {
+        ephpm_middleware::host::set_node_multi_tenant(multi_tenant);
+        let ChainVerdict::Continue { response_headers, .. } = chain.evaluate(&ctx, "/x.php") else {
+            panic!("expected CONTINUE from the probe");
+        };
+        assert_eq!(find(&response_headers, "X-Probe-Vhost"), Some("<none>"));
+        assert_eq!(
+            find(&response_headers, "X-Probe-Multi-Tenant"),
+            Some(expected),
+            "multi_tenant = {multi_tenant}"
+        );
+    }
 }
 
 // ── chain composition across both lanes ───────────────────────────────────

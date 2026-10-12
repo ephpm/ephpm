@@ -176,6 +176,10 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 # runs `cargo build --workspace --lib --examples` before its test step, and a
 # local `cargo test -p ephpm-server` needs the same command first or the dlopen
 # tests fail on a missing artifact.
+#
+# Adding or renaming an [[example]] here also means updating the stub list in
+# docker/Dockerfile's dependency stage, or the Docker build fails at
+# `cargo fetch` with "can't find `<name>` example".
 [[example]]
 name = "mw_probe_v1"
 crate-type = ["cdylib"]
@@ -186,6 +190,22 @@ crate-type = ["cdylib"]
 
 [[example]]
 name = "mw_probe_no_invoke"
+crate-type = ["cdylib"]
+
+# Hand-rolled (no `declare!`) fixtures for the optional config-key symbol and
+# ABI-minor compatibility (issues #469/#480): a pre-minor-5 module that exports
+# no key declaration, a C-style module that declares its keys but does not check
+# them itself, and one whose declaration is malformed.
+[[example]]
+name = "mw_probe_legacy"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_c_keys"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_c_bad_keys"
 crate-type = ["cdylib"]
 
 # Response-phase proof module (tests/middleware_response_phase.rs). Opts into

@@ -82,13 +82,21 @@ store on a single-site node or for a request whose `Host` matched no vhost. See
 | Level | When | Message (abridged) |
 |---|---|---|
 | `INFO` | each builtin mount initialised | `middleware initialised (builtin) module=<library> …` |
+| `INFO` | each dynamic (`dlopen`ed) mount initialised | `middleware initialised module=<library> … config_keys=declared` — or `config_keys=undeclared` when the module exports no key list, so ePHPm could not check its `config` |
 | `INFO` | chain built | `middleware chain loaded count=… modules=[…]` |
 | `INFO` | any `php:` mount configured | `PHP middleware mounted (EXPERIMENTAL) …` |
 | `WARN` | a mount whose `library` is literally `ratelimit`, with `[cluster].enabled = true` | `[middleware] ratelimit mounted with [cluster].enabled = true — …` — see [ratelimit](ratelimit/#the-cluster-startup-warning) for what it does and does not mean |
 | error (startup aborts) | unknown `config` key or bad value in a builtin mount | `… builtin middleware "<library>" init failed: …` |
 | error (startup aborts) | a non-builtin `library` that cannot be found | `failed to load native middleware chain: middleware library "<name>" not found; tried: …` |
+| error (startup aborts) | unknown `config` key in a dynamic mount whose module declares its keys | `… middleware "<library>": unknown config key … (did you mean …?)` |
+| error (startup aborts) | a dynamic module whose `ephpm_middleware_config_keys` answer is not a JSON array of strings | `… middleware "<library>" exports ephpm_middleware_config_keys but its answer is unusable: …` |
 
 ## ABI version
 
-Dynamic (`dlopen`ed) modules speak C ABI major **1**, minor **4**
-(`0x01_00_00_04`). See [The C ABI](/guides/native-middleware/#the-c-abi-for-non-rust-modules).
+Dynamic (`dlopen`ed) modules speak C ABI major **1**, minor **5**
+(`0x01_00_00_05`). Minor 5 added `node_is_multi_tenant` to the host table, so a
+module can tell an untenanted node from an unmatched host. The optional
+module-exported `ephpm_middleware_config_keys` symbol shipped in the same
+release; it lets the host check a module's `config` keys. Modules built against
+any earlier minor keep loading. See
+[The C ABI](/guides/native-middleware/#the-c-abi-for-non-rust-modules).

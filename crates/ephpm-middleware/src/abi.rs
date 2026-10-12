@@ -16,7 +16,19 @@
 //! int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
 //!                                          const ephpm_response_ctx_t* response,
 //!                                          ephpm_response_edit_t* edit_out);
+//!
+//! /* Optional — the module's accepted top-level `config` keys, as a static
+//!    NUL-terminated JSON array of strings. Absent symbol or NULL return =
+//!    "this module does not declare its keys" (no host-side check). */
+//! const char* ephpm_middleware_config_keys(void);
 //! ```
+//!
+//! The optional symbols are the only thing that flows **module → host** at
+//! load time; [`EphpmHostV1`] flows the other way. That is why a module's
+//! self-description ([`SYM_DESCRIBE`], [`SYM_CONFIG_KEYS`]) is an exported
+//! symbol rather than a host-table field: the host resolves it with `dlsym`,
+//! and its absence is simply "not declared", so adding one never needs an ABI
+//! bump on either side.
 //!
 //! The request phase ([`EphpmResponse`]) fails **closed** — a broken gate must
 //! not fail open — while the response phase ([`EphpmResponseEdit`]) fails
@@ -44,7 +56,7 @@ use std::os::raw::{c_char, c_int};
 /// Current ABI version (`0xMMmmmmmm`: major byte gates compatibility, the
 /// lower three bytes are an additive minor level).
 ///
-/// `0x0100_0004` = major **1**, minor **4**.
+/// `0x0100_0005` = major **1**, minor **5**.
 ///
 /// - Minor 1 added the optional response phase (the [`SYM_INVOKE_RESPONSE`]
 ///   symbol and the three appended `response_*` accessors on [`EphpmHostV1`]).
@@ -71,9 +83,19 @@ use std::os::raw::{c_char, c_int};
 ///   operator-owned per-site override and NULL when unset. Purely additive,
 ///   exactly like the minor-2 request accessors: an older module never reads
 ///   the slot and a newer module minor-gates it on [`ABI_MINOR_GATE_REPO`].
+/// - Minor 5 appends one node-level slot, [`node_is_multi_tenant`] — whether
+///   this node has virtual hosting configured — so a module can finally tell
+///   "untenanted node" from "multi-site node, unmatched host", which
+///   [`request_vhost_id`] alone reports identically as NULL (issue #469).
+///   Purely additive; gated on [`ABI_MINOR_NODE_TENANCY`].
 ///
 /// The major byte is unchanged across every minor, so **every** module built
 /// against major 1 still loads: growth is additive.
+///
+/// The optional module-exported [`SYM_CONFIG_KEYS`] symbol (issue #480) is
+/// **not** a minor bump: it flows module → host, so a host that predates it
+/// simply never looks it up, and a module that does not export it is
+/// unchanged. It landed alongside minor 5.
 ///
 /// [`request_scheme`]: EphpmHostV1::request_scheme
 /// [`request_is_secure`]: EphpmHostV1::request_is_secure
@@ -81,7 +103,8 @@ use std::os::raw::{c_char, c_int};
 /// [`request_body`]: EphpmHostV1::request_body
 /// [`request_vhost_id`]: EphpmHostV1::request_vhost_id
 /// [`request_gate_repo`]: EphpmHostV1::request_gate_repo
-pub const ABI_V1: u32 = 0x0100_0004;
+/// [`node_is_multi_tenant`]: EphpmHostV1::node_is_multi_tenant
+pub const ABI_V1: u32 = 0x0100_0005;
 
 /// Major version — the compatibility gate. A module refuses to init when the
 /// host's major (`host.abi_version >> 24`) is newer than its own.
@@ -94,7 +117,7 @@ pub const ABI_MAJOR: u32 = 1;
 /// those trailing fields, and reading past a shorter table is undefined
 /// behaviour. See [`ABI_MINOR_RESPONSE_PHASE`] and
 /// [`ABI_MINOR_REQUEST_ACCESSORS`].
-pub const ABI_MINOR: u32 = 4;
+pub const ABI_MINOR: u32 = 5;
 
 /// The minor version that introduced the response phase — the three
 /// `response_*` accessors on [`EphpmHostV1`] and the [`SYM_INVOKE_RESPONSE`]
@@ -126,8 +149,8 @@ pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
 /// **NULL** rather than a client-supplied string when no vhost matched.
 ///
 /// The NULL is not a rare edge case. The router's `resolve_site`
-/// short-circuits to its no-site branch whenever neither `sites_dir` nor any
-/// `[[site]]` is configured, so on a **single-site node — the most common
+/// short-circuits to its no-site branch whenever no `sites_dir` is
+/// configured, so on a **single-site node — the most common
 /// deployment shape — this slot returns NULL on every single request**, where
 /// in minor ≤ 2 it returned the `Host` and was never NULL.
 ///
@@ -163,6 +186,22 @@ pub const ABI_MINOR_GLOBAL_KV: u32 = 3;
 /// host the trailing table slot is absent and reading it is undefined
 /// behaviour. Purely additive — nothing pre-existing changed in minor 4.
 pub const ABI_MINOR_GATE_REPO: u32 = 4;
+
+/// The minor version that introduced the appended node-level slot
+/// [`EphpmHostV1::node_is_multi_tenant`] (issue #469). A module needs
+/// `host.abi_version & 0x00FF_FFFF >=` this before calling it: on an older host
+/// the trailing table slot is absent and reading it is undefined behaviour.
+///
+/// **The fallback on an older host must be "not multi-tenant"** (serve), never
+/// "multi-tenant" (deny). A module built for minor 5 that assumed tenancy
+/// against a minor-4 host would treat every request on a single-site node as an
+/// unknown tenant and deny 100% of traffic — issue #453 again, reintroduced
+/// through the compatibility path. The safe Rust accessors
+/// ([`Request::node_is_multi_tenant`](crate::Request::node_is_multi_tenant),
+/// [`Host::node_is_multi_tenant`](crate::Host::node_is_multi_tenant)) already
+/// return `false` there. Purely additive — nothing pre-existing changed in
+/// minor 5.
+pub const ABI_MINOR_NODE_TENANCY: u32 = 5;
 
 /// Middleware verdicts for one request.
 pub const ACTION_CONTINUE: c_int = 0;
@@ -524,6 +563,30 @@ pub struct EphpmHostV1 {
     /// `Option<&str>` from [`Request::gate_repo`](crate::Request::gate_repo),
     /// which already null-checks and empty-checks.
     pub request_gate_repo: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
+
+    // ── Node tenancy (minor 5) ────────────────────────────────────────────
+    //
+    // Appended after `request_gate_repo`. A module that reads this must first
+    // confirm `abi_version & 0x00FF_FFFF >= ABI_MINOR_NODE_TENANCY`, and must
+    // treat an older host as "not multi-tenant".
+    /// `1` when this node has virtual hosting configured (`[server] sites_dir`),
+    /// `0` when it does not.
+    ///
+    /// This is what lets a module tell apart the two situations in which
+    /// [`request_vhost_id`](Self::request_vhost_id) returns NULL:
+    ///
+    /// * `0` — the node has **no tenancy**. Every request is NULL there; treat
+    ///   it as the one untenanted bucket and serve it.
+    /// * `1` — the node **is** multi-tenant, so a NULL vhost id means this
+    ///   request's `Host` matched no site. A gate that wants "deny unknown
+    ///   tenants" can deny exactly this case.
+    ///
+    /// A **node-level** fact, not request state: it takes no request pointer,
+    /// is valid to call from `init` as well as from `invoke`/`invoke_response`,
+    /// and does not change for the life of the process (there is no runtime
+    /// config reload). It is a function rather than a plain field so it can
+    /// stay correct if that ever changes.
+    pub node_is_multi_tenant: unsafe extern "C" fn() -> c_int,
 }
 
 /// Symbol names the loader looks up.
@@ -537,6 +600,30 @@ pub const SYM_DESCRIBE: &[u8] = b"ephpm_middleware_describe";
 /// Optional response-phase entrypoint symbol (minor 1). A module that does
 /// not export it has no response phase and the host skips it in that phase.
 pub const SYM_INVOKE_RESPONSE: &[u8] = b"ephpm_middleware_invoke_response";
+/// Optional config-key declaration symbol (issue #480).
+///
+/// Returns a NUL-terminated, UTF-8 JSON **array of strings** naming every
+/// top-level `config` key the module accepts — e.g.
+/// `["burst","key_headers","per_ip_rps"]` — or NULL. The pointer must stay
+/// valid for the life of the library (a static string, or one the module
+/// allocates once and never frees), and the function must be callable before
+/// `ephpm_middleware_init`: the host reads it first.
+///
+/// | Module | Host behaviour |
+/// |---|---|
+/// | does not export the symbol | mounts as before — no check, no warning |
+/// | exports it, returns NULL | the same: "this module does not declare its keys" |
+/// | returns a valid array | rejects, **before `init`**, a mount whose `config` names any other top-level key — the same error, did-you-mean included, a builtin gives |
+/// | returns anything else | refuses the mount: a module that answers the question wrongly is a bug, not a compatibility case |
+///
+/// `[]` is a real declaration — "accepts no keys" — and is not the same as
+/// NULL. Only the top level is described; nested sections and free-form maps
+/// are the module's own business.
+///
+/// A Rust module gets this for free: [`declare!`](crate::declare) exports it
+/// from [`Middleware::CONFIG_KEYS`](crate::Middleware::CONFIG_KEYS) (NULL when
+/// that is `None`).
+pub const SYM_CONFIG_KEYS: &[u8] = b"ephpm_middleware_config_keys";
 
 /// `ephpm_middleware_init` signature.
 pub type InitFn = unsafe extern "C" fn(u32, *const c_char, *const EphpmHostV1) -> c_int;
@@ -555,3 +642,41 @@ pub type InvokeResponseFn = unsafe extern "C" fn(
 pub type ShutdownFn = unsafe extern "C" fn();
 /// `ephpm_middleware_describe` signature.
 pub type DescribeFn = unsafe extern "C" fn() -> *const c_char;
+/// `ephpm_middleware_config_keys` signature (optional; see [`SYM_CONFIG_KEYS`]).
+pub type ConfigKeysFn = unsafe extern "C" fn() -> *const c_char;
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{offset_of, size_of};
+
+    use super::*;
+
+    /// Minor 5 must be an **append**: every pre-existing slot keeps its
+    /// offset, so a module built against minor 4 (or older) reads exactly the
+    /// table it was compiled for, and the new slot sits past the end of what
+    /// it knows. A field inserted anywhere else would shift `request_gate_repo`
+    /// and break every older module silently — this pins it.
+    #[test]
+    fn node_tenancy_slot_is_appended_after_every_older_slot() {
+        let slot = size_of::<usize>();
+        assert_eq!(
+            offset_of!(EphpmHostV1, node_is_multi_tenant),
+            offset_of!(EphpmHostV1, request_gate_repo) + slot,
+            "the minor-5 slot must directly follow the minor-4 slot"
+        );
+        assert_eq!(
+            size_of::<EphpmHostV1>(),
+            offset_of!(EphpmHostV1, node_is_multi_tenant) + slot,
+            "the minor-5 slot must be the last field"
+        );
+    }
+
+    /// The advertised version, the minor constant and the newest gate agree —
+    /// a module gating on `ABI_MINOR_NODE_TENANCY` against this host passes.
+    #[test]
+    fn advertised_minor_matches_the_newest_gate() {
+        assert_eq!(ABI_V1 >> 24, ABI_MAJOR);
+        assert_eq!(ABI_V1 & 0x00FF_FFFF, ABI_MINOR);
+        assert_eq!(ABI_MINOR, ABI_MINOR_NODE_TENANCY);
+    }
+}

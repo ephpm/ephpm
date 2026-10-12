@@ -35,6 +35,9 @@ pub struct BuiltinModule {
     run_response: Option<ResponseRunner>,
     stop: Box<dyn Fn() + Send + Sync>,
     description: &'static str,
+    /// The module's declared top-level config keys
+    /// ([`Middleware::CONFIG_KEYS`]) — `None` when it does not declare.
+    config_keys: Option<&'static [&'static str]>,
 }
 
 impl std::fmt::Debug for BuiltinModule {
@@ -120,7 +123,7 @@ impl BuiltinModule {
             "" => std::any::type_name::<T>(),
             d => d,
         };
-        Ok(Self { run, run_response: None, stop, description })
+        Ok(Self { run, run_response: None, stop, description, config_keys: T::CONFIG_KEYS })
     }
 
     /// Construct a `T` that also implements [`ResponseMiddleware`], wiring up
@@ -170,7 +173,13 @@ impl BuiltinModule {
             "" => std::any::type_name::<T>(),
             d => d,
         };
-        Ok(Self { run, run_response: Some(run_response), stop, description })
+        Ok(Self {
+            run,
+            run_response: Some(run_response),
+            stop,
+            description,
+            config_keys: T::CONFIG_KEYS,
+        })
     }
 
     /// Run the module for one request. A panic fails closed as a 500 —
@@ -211,6 +220,16 @@ impl BuiltinModule {
     #[must_use]
     pub fn describe(&self) -> &'static str {
         self.description
+    }
+
+    /// The module's declared top-level config keys, or `None` when it does not
+    /// declare — the same answer a dlopened module gives the host through the
+    /// optional `ephpm_middleware_config_keys` symbol (issue #480), so the host
+    /// can describe a mount's accepted keys whichever lane it runs on. The
+    /// check itself already ran in [`BuiltinModule::init`].
+    #[must_use]
+    pub fn config_keys(&self) -> Option<&'static [&'static str]> {
+        self.config_keys
     }
 }
 
@@ -311,6 +330,76 @@ mod tests {
         // mount, unknown keys and all.
         BuiltinModule::init::<Probe>(&serde_json::json!({ "mode": "continue", "extra": 1 }))
             .expect("an undeclared module must not be made strict behind its back");
+    }
+
+    /// The builtin lane reports a module's declared key set the same way the
+    /// dlopen lane's `ephpm_middleware_config_keys` symbol does (#480): the
+    /// declared list for a declaring module, `None` for one that cannot say.
+    #[test]
+    fn the_declared_key_set_is_visible_to_the_host() {
+        let strict = BuiltinModule::init::<Strict>(&serde_json::json!({})).expect("init");
+        assert_eq!(strict.config_keys(), Some(&["mode"][..]));
+        assert_eq!(probe("continue").config_keys(), None);
+    }
+
+    /// Echoes the node-tenancy flag (ABI minor 5) and, for the request that
+    /// matters, applies the "deny unknown tenants" policy issue #469 made
+    /// implementable: deny `vhost_id() == None` only on a multi-tenant node.
+    struct TenantGate;
+
+    impl Middleware for TenantGate {
+        fn init(_config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self)
+        }
+
+        fn invoke(&self, req: &Request<'_>) -> Response {
+            match req.vhost_id() {
+                None if req.node_is_multi_tenant() => Response::respond(404, "unknown tenant"),
+                _ => Response::cont().response_header(
+                    "X-Multi-Tenant",
+                    if req.node_is_multi_tenant() { "1" } else { "0" },
+                ),
+            }
+        }
+    }
+
+    /// Issue #469 on the in-process lane, through the real process-wide host
+    /// table. This is the only test in this binary that writes the tenancy
+    /// flag, so it cannot race a sibling; it restores the default on exit.
+    #[test]
+    fn node_tenancy_reaches_a_builtin_module_through_the_real_table() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::host::set_node_multi_tenant(false);
+            }
+        }
+        let _reset = Reset;
+        let gate = BuiltinModule::init::<TenantGate>(&serde_json::Value::Null).expect("init");
+        let unmatched = RequestCtx::new("GET", "/x.php", "", "203.0.113.5", "", &[]);
+
+        // Untenanted node: "no vhost" is every request, so it is served.
+        crate::host::set_node_multi_tenant(false);
+        match gate.invoke(&unmatched) {
+            Verdict::Continue { response_headers } => {
+                assert_eq!(response_headers, vec![("X-Multi-Tenant".into(), "0".into())]);
+            }
+            _ => panic!("an untenanted node must be served, not denied (#453)"),
+        }
+
+        // Multi-tenant node: the same request is an unknown tenant…
+        crate::host::set_node_multi_tenant(true);
+        assert!(
+            matches!(gate.invoke(&unmatched), Verdict::Respond { status: 404, .. }),
+            "an unmatched host on a multi-tenant node is an unknown tenant"
+        );
+        // …while a matched one is served and sees the flag.
+        match gate.invoke(&ctx()) {
+            Verdict::Continue { response_headers } => {
+                assert_eq!(response_headers, vec![("X-Multi-Tenant".into(), "1".into())]);
+            }
+            _ => panic!("a matched tenant must be served"),
+        }
     }
 
     #[test]

@@ -98,6 +98,35 @@ pub fn reject_unknown_keys(
     Err(format!("unknown config {plural} {named}; {accepted_list}"))
 }
 
+/// Parse a module's answer from the optional
+/// [`ephpm_middleware_config_keys`](crate::abi::SYM_CONFIG_KEYS) symbol — the
+/// bytes of its NUL-terminated string, without the NUL — into the declared
+/// key set.
+///
+/// This is the host side of issue #480: it is how a module that does not use
+/// the Rust authoring kit (C, Zig, a hand-rolled ABI) gets the same unknown-key
+/// check a builtin gets. The format is deliberately the narrowest useful one —
+/// a flat JSON array of strings, top-level keys only.
+///
+/// # Errors
+///
+/// A message describing why the answer is unusable: not UTF-8, not JSON, or
+/// JSON that is not an array of strings. The host refuses the mount on any of
+/// these — a module that answers the question wrongly is a bug, and guessing
+/// would either reject valid keys or silently stop checking.
+///
+/// ```
+/// # use ephpm_middleware::config::parse_declared_keys;
+/// assert_eq!(parse_declared_keys(br#"["burst","per_ip_rps"]"#).unwrap(), ["burst", "per_ip_rps"]);
+/// assert!(parse_declared_keys(br#"{"burst":1}"#).is_err());
+/// ```
+pub fn parse_declared_keys(raw: &[u8]) -> Result<Vec<String>, String> {
+    let text = std::str::from_utf8(raw).map_err(|_| "it is not valid UTF-8".to_owned())?;
+    serde_json::from_str::<Vec<String>>(text).map_err(|e| {
+        format!("expected a JSON array of key-name strings like [\"a\",\"b\"], got `{text}` ({e})")
+    })
+}
+
 /// The closest accepted key to `key`, when one is close enough to be worth
 /// suggesting.
 ///
@@ -228,6 +257,32 @@ mod tests {
         assert_eq!(edit_distance("moed", "mode"), 1);
         assert_eq!(edit_distance("peripsr", "periprs"), 1);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    /// What `declare!` exports is exactly what the host parses back — the two
+    /// halves of the #480 symbol cannot drift. `None` exports nothing (NULL),
+    /// and `[]` survives as a real "accepts no keys" declaration.
+    #[test]
+    fn declared_keys_round_trip_between_declare_and_the_host() {
+        let exported = crate::__config_keys_json(Some(KEYS)).expect("declared");
+        assert_eq!(parse_declared_keys(exported.as_bytes()).unwrap(), KEYS);
+        let empty = crate::__config_keys_json(Some(&[])).expect("declared, empty");
+        assert_eq!(parse_declared_keys(empty.as_bytes()).unwrap(), Vec::<String>::new());
+        assert!(crate::__config_keys_json(None).is_none(), "undeclared exports NULL");
+    }
+
+    #[test]
+    fn an_unusable_declaration_is_an_error_not_a_guess() {
+        for bad in [
+            &b"burst,per_ip_rps"[..],
+            br#"{"burst":true}"#,
+            br#"["burst",1]"#,
+            br#""burst""#,
+            b"",
+            b"[\"\xff\"]",
+        ] {
+            assert!(parse_declared_keys(bad).is_err(), "{:?} must be refused", bad);
+        }
     }
 
     #[test]

@@ -249,8 +249,9 @@ impl MiddlewareChain {
     ///
     /// Fails fast when a builtin module's `init` returns an error, a library
     /// cannot be resolved on disk (the error names every path tried), a
-    /// required ABI symbol is missing, or a dynamic module's `init` returns
-    /// non-zero.
+    /// required ABI symbol is missing, a dynamic module's declared config keys
+    /// (`ephpm_middleware_config_keys`) are malformed or do not cover the
+    /// mount's `config`, or a dynamic module's `init` returns non-zero.
     pub fn load(mounts: &[MiddlewareMount]) -> anyhow::Result<Self> {
         let mut modules = Vec::with_capacity(mounts.len());
         let mut php = Vec::new();
@@ -858,7 +859,8 @@ fn load_builtin(mount: &MiddlewareMount, build: BuiltinBuilder) -> anyhow::Resul
     })
 }
 
-/// dlopen a module, resolve the four ABI symbols, and run `init`.
+/// dlopen a module, resolve its ABI symbols, check the mount's `config` against
+/// the module's declared keys (when it declares them), and run `init`.
 fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     // SAFETY: loading a middleware library runs its initialisers with the
     // host's privileges — that is the documented v1 trust model (middleware
@@ -884,6 +886,33 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     // there. This is the primary v1-module compatibility mechanism.
     let invoke_response: Option<abi::InvokeResponseFn> =
         unsafe { lib.get::<abi::InvokeResponseFn>(abi::SYM_INVOKE_RESPONSE) }.ok().map(|sym| *sym);
+    // SAFETY: as above. `config_keys` is optional (issue #480) — absence means
+    // "this module does not declare its keys", today's behaviour.
+    let config_keys: Option<abi::ConfigKeysFn> =
+        unsafe { lib.get::<abi::ConfigKeysFn>(abi::SYM_CONFIG_KEYS) }.ok().map(|sym| *sym);
+
+    // Host-side config-key check, BEFORE `init`: a module that declares its
+    // keys gets the same refusal (mount named, key named, did-you-mean) as a
+    // builtin, whatever language it is written in. A module built with
+    // `declare!` also checks inside its own `init`; the host check runs first
+    // and fails identically, so the double check costs nothing.
+    let declared = declared_config_keys(config_keys).map_err(|reason| {
+        anyhow::anyhow!(
+            "middleware \"{}\" exports ephpm_middleware_config_keys but its answer is unusable: \
+             {reason}",
+            mount.library
+        )
+    })?;
+    if let Some(keys) = &declared {
+        let accepted: Vec<&str> = keys.iter().map(String::as_str).collect();
+        ephpm_middleware::config::reject_unknown_keys(
+            mount.config.as_ref().unwrap_or(&serde_json::Value::Null),
+            "",
+            &accepted,
+        )
+        .map_err(|msg| anyhow::anyhow!("middleware \"{}\": {msg}", mount.library))?;
+    }
+    let config_check = if declared.is_some() { "declared" } else { "undeclared" };
 
     // Serialise the mount's config table to JSON for the module's init.
     let config_json: Option<CString> = mount
@@ -920,16 +949,22 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
             Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
         }
     });
+    // `config_keys` says whether the host could check this mount's `config`:
+    // `declared` (checked above) or `undeclared` (the module does not export a
+    // key set, so a typo there is invisible to ePHPm). Info, not warn — an
+    // undeclared module is a legitimate, older-ABI shape, not a fault.
     match &description {
         Some(desc) => tracing::info!(
             module = %mount.library,
             describe = %desc,
             path = %path.display(),
+            config_keys = %config_check,
             "middleware initialised"
         ),
         None => tracing::info!(
             module = %mount.library,
             path = %path.display(),
+            config_keys = %config_check,
             "middleware initialised"
         ),
     }
@@ -939,6 +974,30 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
         match_pattern: mount.match_pattern.clone(),
         backend: Backend::Dynamic { invoke, invoke_response, shutdown, _lib: lib },
     })
+}
+
+/// Read a dlopened module's config-key declaration (issue #480).
+///
+/// `Ok(None)` when the module does not declare — no symbol, or the symbol
+/// returned NULL. `Ok(Some(keys))` for a well-formed declaration. `Err` when
+/// the module answered with something that is not a JSON array of strings; the
+/// caller refuses the mount rather than guessing.
+fn declared_config_keys(
+    config_keys: Option<abi::ConfigKeysFn>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(config_keys) = config_keys else {
+        return Ok(None);
+    };
+    // SAFETY: takes no arguments and returns a nullable pointer to a
+    // NUL-terminated string valid for the life of the library (ABI contract of
+    // `SYM_CONFIG_KEYS`); the library is still loaded by our caller.
+    let ptr = unsafe { config_keys() };
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: non-null results are NUL-terminated and outlive this read.
+    let raw = unsafe { CStr::from_ptr(ptr) };
+    ephpm_middleware::config::parse_declared_keys(raw.to_bytes()).map(Some)
 }
 
 /// Copy a nullable module-owned C string into host memory.
@@ -1073,6 +1132,35 @@ mod tests {
                 "the key must be named: {err}"
             );
         }
+    }
+
+    /// The four answers `ephpm_middleware_config_keys` can give (issue #480).
+    /// Absent and NULL are both "not declared" — the compatibility path that
+    /// keeps every pre-#480 module loading — while a malformed answer is an
+    /// error, never silently treated as either of the others.
+    #[test]
+    fn declared_config_keys_distinguishes_absent_null_valid_and_malformed() {
+        unsafe extern "C" fn null() -> *const c_char {
+            std::ptr::null()
+        }
+        unsafe extern "C" fn valid() -> *const c_char {
+            c"[\"burst\",\"per_ip_rps\"]".as_ptr()
+        }
+        unsafe extern "C" fn empty() -> *const c_char {
+            c"[]".as_ptr()
+        }
+        unsafe extern "C" fn malformed() -> *const c_char {
+            c"burst,per_ip_rps".as_ptr()
+        }
+
+        assert_eq!(declared_config_keys(None), Ok(None));
+        assert_eq!(declared_config_keys(Some(null)), Ok(None));
+        assert_eq!(
+            declared_config_keys(Some(valid)),
+            Ok(Some(vec!["burst".to_owned(), "per_ip_rps".to_owned()]))
+        );
+        assert_eq!(declared_config_keys(Some(empty)), Ok(Some(Vec::new())), "[] declares nothing");
+        assert!(declared_config_keys(Some(malformed)).is_err());
     }
 
     #[test]

@@ -125,6 +125,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // middleware is mounted), then load the chain — fail fast at startup on
     // any unresolvable library, missing symbol, or failing init.
     ephpm_middleware::host::set_kv_store(&kv_store);
+    // ABI minor 5 (issue #469): tell modules whether this node is
+    // multi-tenant, so one can tell "untenanted node" from "unmatched host".
+    // Set before the chain loads, because a module may read it from `init`.
+    // `sites_dir` is exactly the router's `multi_site` condition — its other
+    // half (`!sites.is_empty()`) can only be true when `sites_dir` is set.
+    ephpm_middleware::host::set_node_multi_tenant(config.server.sites_dir.is_some());
     let middleware_chain = if config.middleware.is_empty() {
         None
     } else {
