@@ -55,6 +55,17 @@ wildcards = "allow"
 # The embedded database engine is Turso (pure Rust) and needs neither.
 deny = [
     { name = "libsqlite3-sys", reason = "a bundled SQLite shadows the PHP SDK's libsqlite3 that pdo_sqlite links against; see the comment above" },
+    # Same failure with zlib. PHP's zlib extension and libzip link the PHP
+    # SDK's libz.a by symbol name. libz-sys (flate2's `zlib` feature, which
+    # mysql_common's default features turn on) compiles its own zlib when the
+    # build host has no system zlib, with Z_SOLO: no default allocator, no gz*
+    # API. Its inflate*/deflate* won the link, so gzopen(), compress.zlib://
+    # and ZipArchive failed with Z_STREAM_ERROR in the v0.11.3 Docker image.
+    # Rust code that needs deflate uses flate2's pure-Rust backend, which
+    # exports no C symbols. crates/ephpm-php/tests/zlib_linkage.rs checks it.
+    { name = "libz-sys", reason = "a bundled Z_SOLO zlib shadows the PHP SDK's libz.a that PHP's zlib extension and libzip link against; see the comment above" },
+    { name = "libz-ng-sys", reason = "a bundled zlib-ng exports zlib symbols that shadow the PHP SDK's libz.a; see the libz-sys entry" },
+    { name = "libz-rs-sys", reason = "exports C zlib symbols that shadow the PHP SDK's libz.a; see the libz-sys entry" },
 ]
 
 [sources]

@@ -544,5 +544,12 @@ used_underscore_binding = "allow"
 # tokio-rustls 0.25 -> 0.26 (rustls >= 0.23.45) pinned to aws-lc-rs (#241: never
 # `ring`); the tls/auth feature (#32) is byte-for-byte upstream 0.7.0. Retire
 # this when a fixed opensrv-mysql ships on crates.io.
+#
+# The fork also turns off mysql_common's default features (opensrv-mysql#1).
+# Those defaults enable flate2's `zlib` feature, i.e. the C `libz-sys` crate,
+# whose bundled Z_SOLO zlib shadowed the PHP SDK's libz.a: gzopen(),
+# compress.zlib:// and ZipArchive returned Z_STREAM_ERROR in the v0.11.3
+# Docker image. Do not move this pin back past that change; deny.toml bans
+# libz-sys so it cannot return unnoticed.
 [patch.crates-io]
-opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
+opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "25b7ac8ac222955336de6fce1e44a00e556920ec" }
