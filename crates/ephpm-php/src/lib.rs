@@ -78,6 +78,10 @@ mod ffi {
         /// start from a clean state.
         pub fn ephpm_finalize_init();
 
+        /// 1 if `ephpm_finalize_init()` installed the `exit()` observer that
+        /// tells an `exit()` from a frameless callback apart from a bailout.
+        pub fn ephpm_exit_observer_installed() -> ::std::os::raw::c_int;
+
         /// Set a PHP INI directive for the current request.
         pub fn ephpm_request_set_ini(
             key: *const ::std::os::raw::c_char,
@@ -556,8 +560,12 @@ pub enum PhpError {
     /// completed as a success, so callers discard the partial body and answer
     /// 500 (`build_php_response`'s error arm) rather than returning it.
     ///
-    /// PHP 8's `exit()`/`die()` is NOT a bailout — it throws an unwind-exit
-    /// exception, which unwinds cleanly and yields a complete response.
+    /// PHP 8's `exit()`/`die()` never produces this variant. It throws an
+    /// unwind-exit exception, which unwinds cleanly and yields a complete
+    /// response. Called from a callback the engine runs with no calling frame
+    /// (exception handler, shutdown function, output-buffer callback) the
+    /// engine does follow the finished unwind with a `zend_bailout()`; the C
+    /// layer recognises that case and reports it as a script exit instead.
     #[error("PHP script bailed out (truncated response discarded): {0}")]
     Bailout(String),
 
@@ -1064,6 +1072,14 @@ impl PhpRuntime {
             // as active so ephpm_begin_request shuts it down on first call.
             unsafe { ffi::ephpm_finalize_init() };
             tracing::debug!("PHP embed initial request marked active (ready for HTTP)");
+            // Safety: reads a process-global set by ephpm_finalize_init above.
+            if unsafe { ffi::ephpm_exit_observer_installed() } == 0 {
+                tracing::warn!(
+                    "could not install the exit() observer: exit() from an exception \
+                     handler, shutdown function or output-buffer callback will be \
+                     reported as a Zend bailout (HTTP 500)"
+                );
+            }
         }
 
         Ok(())
@@ -1636,7 +1652,15 @@ impl PhpRuntime {
         let status = u16::try_from(status_code).unwrap_or(200);
 
         match ret {
-            exec_code::OK => Ok(PhpResponse { status, headers, body }),
+            // exit()/die() (SCRIPT_EXIT) — from a PHP middleware mount or a
+            // frameless callback (exception handler, shutdown function, ob
+            // callback); a plain exit() in the app script already comes back
+            // as OK — is a normal end of the script, as in
+            // php-fpm: the captured response is complete and is returned
+            // as-is with the status the script chose. An empty body is
+            // legitimate there (`header('Location: …'); exit;`, a 403 or 204
+            // with no content).
+            exec_code::OK | exec_code::SCRIPT_EXIT => Ok(PhpResponse { status, headers, body }),
             exec_code::STARTUP_FAIL => {
                 Err(PhpError::ExecutionFailed("php_request_startup failed".into()))
             }
@@ -1682,17 +1706,6 @@ impl PhpRuntime {
                     request.method,
                     request.uri
                 )))
-            }
-            // exit()/die() unwinds cleanly, so the captured response is
-            // complete and is returned as-is, keeping whatever status the
-            // script chose (an empty one is still an error — nothing was
-            // produced).
-            exec_code::SCRIPT_EXIT => {
-                if body.is_empty() {
-                    Err(PhpError::ExecutionFailed("PHP exited without output".into()))
-                } else {
-                    Ok(PhpResponse { status, headers, body })
-                }
             }
             other => Err(PhpError::ExecutionFailed(format!(
                 "ephpm_run_request returned an unknown code {other}"

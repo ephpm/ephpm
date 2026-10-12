@@ -736,17 +736,114 @@ static void capture_response_headers(void)
  * =================================================================== */
 
 /*
+ * exit() observation: telling an exit() apart from a real bailout.
+ *
+ * PHP 8 implements exit()/die() by throwing an internal "unwind exit"
+ * pseudo-exception. Raised inside a normal call stack it unwinds cleanly and
+ * never bails out. But when the engine invokes a userland callback with NO
+ * calling frame — a set_exception_handler() handler, a
+ * register_shutdown_function() callback, an output-buffer callback run while
+ * buffers are flushed at request end — zend_call_function() hands the pending
+ * unwind exit to zend_throw_exception_internal(NULL), which reports it (a no-op
+ * for an exit), frees it, and calls zend_bailout(). Stock PHP does exactly the
+ * same; php-fpm and mod_php simply absorb that bailout and send the response.
+ *
+ * ePHPm cannot absorb every bailout: a bare zend_bailout() from an extension or
+ * a resource limit truncates the response, and the request must 500 (#255).
+ * After the jump both cases look identical (CG(unclean_shutdown) set, nothing
+ * in PG(last_error_type), EG(exception) cleared), so the distinction has to be
+ * recorded while it still exists: the moment the unwind-exit object is freed.
+ *
+ * The unwind-exit class entry is a static, unregistered internal pseudo-class
+ * (zend_exceptions.c), reachable only through an instance. We create one probe
+ * instance at init to find it, then point the class's default_object_handlers
+ * at a copy of its own handler table whose free_obj also sets a thread-local
+ * flag. Every later unwind exit is created with that table (zend_objects_new ->
+ * _zend_object_std_init copies ce->default_object_handlers), so an exit()
+ * whose unwind ends in that frameless bailout sets ephpm_exit_unwound on the
+ * thread that ran it (ephpm_unwind_exit_free_obj says which frees count).
+ * The probe itself was created with the ORIGINAL table and is released with it.
+ * Nothing else about the object changes: free_obj still runs the original
+ * handler (zend_object_std_dtor) right after the flag is set.
+ *
+ * The class entry is process-global, so this is installed once, from
+ * ephpm_finalize_init() on the init thread, before any PHP thread serves a
+ * request. default_object_handlers exists from PHP 8.3, the oldest supported
+ * SDK.
+ */
+static zend_object_handlers ephpm_unwind_exit_handlers;
+static zend_object_free_obj_t ephpm_unwind_exit_orig_free = NULL;
+
+/* Set when an unwind-exit object is freed on this thread. Cleared by
+ * ephpm_bailout_span_begin(); read by ephpm_bailout_span_end() and by
+ * ephpm_worker_run(). */
+static EPHPM_TLS int ephpm_exit_unwound = 0;
+
+/*
+ * Only the free that immediately precedes the frameless bailout counts:
+ *
+ *   - zend_throw_exception_internal(NULL) frees the exit with no execute frame
+ *     (EG(current_execute_data) == NULL) and BEFORE it bails out
+ *     (CG(unclean_shutdown) still clear for the span).
+ *   - An exit that is swallowed inside a frame — a destroyed fiber's `finally`
+ *     calling exit(), SPL's CATCH_GET_CHILD iterators — is freed with a frame
+ *     live and the script carries on; it must not vouch for a later bailout.
+ *   - An exit still pending when a REAL bailout (a timeout firing during the
+ *     unwind, an extension) jumps is freed afterwards by php_execute_script's
+ *     zend_exception_error(); unclean_shutdown is already set by then.
+ *
+ * The terminal frees of a top-level / middleware exit also pass the test, which
+ * is harmless: nothing runs after them in that span.
+ */
+static void ephpm_unwind_exit_free_obj(zend_object *object)
+{
+    if (!EG(current_execute_data) && !CG(unclean_shutdown)) {
+        ephpm_exit_unwound = 1;
+    }
+    ephpm_unwind_exit_orig_free(object);
+}
+
+/* Needs a live request (an object store): call after php_embed_init(). */
+static void ephpm_install_exit_observer(void)
+{
+    zend_object *probe = zend_create_unwind_exit();
+    zend_class_entry *ce = probe->ce;
+    const zend_object_handlers *orig = ce->default_object_handlers;
+    if (orig == &ephpm_unwind_exit_handlers) {
+        /* Already installed (and still in place: a re-run of zend_startup
+         * would have reset default_object_handlers via INIT_CLASS_ENTRY). */
+    } else if (orig && orig->free_obj) {
+        memcpy(&ephpm_unwind_exit_handlers, orig, sizeof(ephpm_unwind_exit_handlers));
+        ephpm_unwind_exit_orig_free = orig->free_obj;
+        ephpm_unwind_exit_handlers.free_obj = ephpm_unwind_exit_free_obj;
+        ce->default_object_handlers = &ephpm_unwind_exit_handlers;
+    }
+    /* probe->handlers is whatever table it was created with; a flag it may set
+     * on release is harmless — every span clears the flag when it starts. */
+    OBJ_RELEASE(probe);
+}
+
+/* 1 if the exit() observer is in place, 0 if it could not be installed (exits
+ * from frameless callbacks then fall back to being reported as bailouts). */
+int ephpm_exit_observer_installed(void)
+{
+    return ephpm_unwind_exit_orig_free != NULL;
+}
+
+/*
  * Finalize PHP embed initialization for HTTP serve mode.
  *
  * Mark the embed SAPI's initial request as active so
  * ephpm_begin_request() properly shuts it down before starting
- * its own request lifecycle on the first HTTP request.
+ * its own request lifecycle on the first HTTP request, and install the
+ * exit() observer (see above).
  *
  * Must be called once after php_embed_init() and ephpm_install_sapi().
  */
 void ephpm_finalize_init(void)
 {
     request_active = 1;
+    ephpm_install_exit_observer();
 }
 
 /* ===================================================================
@@ -1355,6 +1452,57 @@ void ephpm_request_set_ini(const char *key, const char *value)
 #define ephpm_bailout_observed() (CG(unclean_shutdown) != 0)
 
 /*
+ * Bailout classification across the phases of one request.
+ *
+ * A request runs in three phases that can each bail out independently: the
+ * script (plus PHP middleware), the shutdown functions, and the final output
+ * buffer flush. Each phase is a "span". A bailout inside a span is either an
+ * exit() from a frameless callback (ephpm_exit_unwound was set by the
+ * unwind-exit free just before the jump — see ephpm_install_exit_observer)
+ * or a real one.
+ *
+ * The state only ever moves NONE -> EXIT -> GENUINE (or NONE -> GENUINE): once
+ * a real bailout is seen the response is lost, whatever happens later.
+ *
+ * CG(unclean_shutdown) is sticky, so after an exit()-bailout in one span a
+ * real bailout in a later span would be invisible. To keep the later spans
+ * observable, a span begins by clearing the flag (unless a real bailout has
+ * already been recorded) and ends by OR-ing the earlier value back in, so
+ * php_request_shutdown() in ephpm_finish_request() still sees exactly what it
+ * would have seen without the spans.
+ *
+ * The only engine readers of the flag that run DURING a span (PHP 8.5 source
+ * checked) are user stream filters (user_filters.c) and generator destruction
+ * (zend_generators.c), which skip userland code on an unclean shutdown. After
+ * an exit()-bailout they now run it, exactly as after a top-level exit():
+ * a frameless bailout leaves no VM frame or generator mid-execution.
+ */
+#define EPHPM_BAILOUT_NONE    0
+#define EPHPM_BAILOUT_EXIT    1
+#define EPHPM_BAILOUT_GENUINE 2
+
+static bool ephpm_bailout_span_begin(int state)
+{
+    bool saved = CG(unclean_shutdown);
+    if (state != EPHPM_BAILOUT_GENUINE) {
+        CG(unclean_shutdown) = 0;
+    }
+    ephpm_exit_unwound = 0;
+    return saved;
+}
+
+static int ephpm_bailout_span_end(int state, bool saved)
+{
+    if (state != EPHPM_BAILOUT_GENUINE && CG(unclean_shutdown)) {
+        state = ephpm_exit_unwound ? EPHPM_BAILOUT_EXIT : EPHPM_BAILOUT_GENUINE;
+    }
+    if (saved) {
+        CG(unclean_shutdown) = 1;
+    }
+    return state;
+}
+
+/*
  * Run one middleware script and classify how it ended.
  *
  * This is php-src's own `zend_execute_scripts()` loop body (Zend/zend.c),
@@ -1741,6 +1889,11 @@ int ephpm_run_request(const char *filename)
     int result = EPHPM_EXEC_OK;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
+    /* See ephpm_bailout_span_begin(): span 1 is the script + middleware. */
+    int bailout_state = EPHPM_BAILOUT_NONE;
+    bool span_saved = ephpm_bailout_span_begin(bailout_state);
+    int jumped = 0;
+    int jumped_mw_index = -1;
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
@@ -1783,15 +1936,30 @@ int ephpm_run_request(const char *filename)
          * rather than from anywhere else in the request, so the outcome is only
          * rewritten when it really belongs to the chain. Clearing the cursor
          * also stops a later ephpm_middleware_config() on this thread from
-         * reading a stale index. */
-        if (req_middleware_active >= 0) {
-            req_middleware_ran = req_middleware_active + 1;
-            req_middleware_outcome = EPHPM_MW_FATAL;
-            req_middleware_active = -1;
-        }
-        result = EPHPM_EXEC_BAILOUT;
+         * reading a stale index. The outcome itself is decided below, once the
+         * jump has been classified: an exit() from a mount's exception handler
+         * also lands here, and that is the lane's RESPOND, not a fatal. */
+        jumped = 1;
+        jumped_mw_index = req_middleware_active;
+        req_middleware_active = -1;
     }
     EG(bailout) = __orig_bailout;
+    bailout_state = ephpm_bailout_span_end(bailout_state, span_saved);
+
+    if (jumped) {
+        int exited = bailout_state == EPHPM_BAILOUT_EXIT;
+        if (jumped_mw_index >= 0) {
+            req_middleware_ran = jumped_mw_index + 1;
+            /* Either way the application script was skipped: fail closed. */
+            req_middleware_outcome = exited ? EPHPM_MW_EXIT : EPHPM_MW_FATAL;
+        }
+        result = exited ? EPHPM_EXEC_SCRIPT_EXIT : EPHPM_EXEC_BAILOUT;
+    } else if (bailout_state == EPHPM_BAILOUT_EXIT && result == EPHPM_EXEC_OK) {
+        /* exit() from a frameless callback inside the script — typically a
+         * set_exception_handler() handler that rendered an error page and
+         * exited. php_execute_script's zend_try absorbed the jump. */
+        result = EPHPM_EXEC_SCRIPT_EXIT;
+    }
 
     /* Run user shutdown functions and flush every open output buffer
      * BEFORE capturing the response. Request teardown (php_request_shutdown)
@@ -1808,26 +1976,38 @@ int ephpm_run_request(const char *filename)
      * Shutdown functions run even after exit()/fatals — that is php-fpm
      * behavior and WordPress' fatal handler depends on it. Both calls run
      * under a bailout guard (shutdown functions and ob handlers execute
-     * userland code that can exit()/fatal); a bailout forfeits whatever
-     * remained, and we deliver what the capture has — same policy as
-     * worker mode.
+     * userland code that can exit()/fatal). An exit() there bails out too —
+     * these callbacks have no calling frame (see ephpm_install_exit_observer)
+     * — and, as in php-fpm, stops the remaining shutdown functions; the
+     * response is complete and is delivered with the status the script set.
+     * A real bailout forfeits the response (the 500 decision below).
      *
      * php_free_shutdown_functions() empties the list afterwards so the
      * php_request_shutdown() in ephpm_finish_request() cannot run the same
      * shutdown functions a second time. (Object destructors are NOT run
      * here: php_request_shutdown() runs them after the response is out, in
      * php-fpm's order — shutdown functions, then destructors.) */
+    span_saved = ephpm_bailout_span_begin(bailout_state);
     zend_try {
         php_call_shutdown_functions();
     } zend_catch {
-        /* exit()/fatal inside a shutdown function — deliver what we have. */
+        /* Classified by ephpm_bailout_span_end() below. */
     } zend_end_try();
     php_free_shutdown_functions();
+    bailout_state = ephpm_bailout_span_end(bailout_state, span_saved);
+
+    span_saved = ephpm_bailout_span_begin(bailout_state);
     zend_try {
         php_output_end_all();
     } zend_catch {
-        /* A throwing ob handler forfeits its buffer. */
+        /* An exit() in an ob callback, or a real bailout — classified by
+         * ephpm_bailout_span_end() below. Either way the handler's buffer is
+         * forfeit, as in php-fpm. */
     } zend_end_try();
+    bailout_state = ephpm_bailout_span_end(bailout_state, span_saved);
+    if (bailout_state == EPHPM_BAILOUT_EXIT && result == EPHPM_EXEC_OK) {
+        result = EPHPM_EXEC_SCRIPT_EXIT;
+    }
 
     /* Capture response data while the request is still active */
     capture_response_headers();
@@ -1840,7 +2020,9 @@ int ephpm_run_request(const char *filename)
      *      CG(unclean_shutdown); see the ephpm_bailout_observed() comment for
      *      why the SETJMP above cannot see it. Checked AFTER the shutdown
      *      functions / ob flush so a bailout in either of those (which also
-     *      truncates the response) counts too.
+     *      truncates the response) counts too. A bailout that was an exit()
+     *      from a frameless callback (EPHPM_BAILOUT_EXIT) is NOT one of these:
+     *      it is a normal end of the script, as in php-fpm.
      *
      *   2. PHP 8.x uncaught Throwable: zend_exception_error() calls
      *      zend_error_va(... | E_DONT_BAIL ...) which prints the fatal
@@ -1852,15 +2034,16 @@ int ephpm_run_request(const char *filename)
      *   3. zend_error(E_ERROR, ...) — sets last_error_type AND bails out, so
      *      both signals fire. 500 either way.
      *
-     * A bailout forces 500 UNCONDITIONALLY: it is never something a script
-     * asks for (PHP 8's exit() throws an unwind-exit exception instead), so a
-     * status the script set earlier describes a response it never finished
-     * producing. The last_error_type path keeps its narrower rule — only
-     * override a default 200 — because a framework's own error handler
-     * legitimately sets its status before the engine records the fatal. */
+     * A real bailout forces 500 UNCONDITIONALLY: it is never something a
+     * script asks for (the exit()-bailouts that are have been classified as
+     * EPHPM_BAILOUT_EXIT above), so a status the script set earlier describes
+     * a response it never finished producing. The last_error_type path keeps
+     * its narrower rule — only override a default 200 — because a framework's
+     * own error handler legitimately sets its status before the engine
+     * records the fatal. */
     int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
                            | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
-    if (ephpm_bailout_observed()) {
+    if (bailout_state == EPHPM_BAILOUT_GENUINE) {
         response_status_code = 500;
         /* Distinguish a max_execution_time timeout from a memory/resource
          * bailout. zend_timeout() raises E_ERROR with a message that always
@@ -3340,6 +3523,9 @@ int ephpm_worker_run(const char *script)
      * every bailout raised inside the worker script, so this SETJMP fires only
      * for one raised outside it. CG(unclean_shutdown) catches both. */
     ephpm_bailout_reset();
+    /* See ephpm_install_exit_observer(): set if an exit() completes its
+     * unwind. The worker script is one span — an exit() anywhere ends it. */
+    ephpm_exit_unwound = 0;
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
@@ -3383,8 +3569,14 @@ int ephpm_worker_run(const char *script)
          * thread (which would turn every wp_die()/admin-ajax exit into a bogus
          * 500). That is safe only because unwind-exit is clean stack
          * unwinding, not a bailout, so SAPI globals and the capture buffers
-         * are intact — which is exactly why branch 1 has to come first. */
-        if (ephpm_bailout_observed()) {
+         * are intact — which is exactly why branch 1 has to come first.
+         *
+         * An exit() from a frameless callback (the framework's
+         * set_exception_handler() handler rendering an error page and
+         * exiting) also bails out, but it is the same deliberate exit as
+         * branch 2 — the unwind completed before the jump — so it takes
+         * branch 2. */
+        if (ephpm_bailout_observed() && !ephpm_exit_unwound) {
             result = -2;
         } else if (req_in_flight && g_worker_ops.send_response) {
             /* Unwind-exit skips the script's own ob_end_* calls, and worker

@@ -1384,9 +1384,9 @@ appear later, so startup warns instead and the per-request rule below applies.
 |---|---|
 | Missing file | 500; the application script does **not** run (startup error instead, in single-site mode) |
 | Parse error | 500; application script does not run |
-| Uncaught exception | 500; application script does not run |
+| Uncaught exception | 500; application script does not run. If the mount set its own `set_exception_handler()` and the handler calls `exit()`, that is the `exit()` row below |
 | Fatal (`E_ERROR`) | 500; application script does not run |
-| `exit()` | The mount's own status/headers/body are returned; remaining mounts and the application script are skipped |
+| `exit()` | The mount's own status/headers/body are returned (an empty body included, e.g. `http_response_code(401); exit;` answers 401); remaining mounts and the application script are skipped |
 | Infinite loop | `max_execution_time` (where natively enforced) then `[server.timeouts] request` — unchanged, because it is the same PHP request |
 
 The uncaught-exception row is the one that took work. PHP 8 reports an

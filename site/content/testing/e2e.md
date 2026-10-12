@@ -14,7 +14,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 |------|------:|----------|
 | `basic.rs` | 3 | 404 errors, PHP rendering, static file serving |
 | `http.rs` | 9 | HEAD no body, POST body, content-type static, ETag 304, gzip compression, 413 body too large, cache-control, X-Forwarded-For, fallback to index.php |
-| `php.rs` | 12 | `$_GET`, `$_SERVER` vars, `exit()` output, `http_response_code()`, `$_COOKIE`, `php://input`, custom response header, HTTP auth vars (`PHP_AUTH_USER`/`PW`, `AUTH_TYPE`, empty password, Bearer, no `REMOTE_USER`) |
+| `php.rs` | 14 | `$_GET`, `$_SERVER` vars, `exit()` output (incl. `exit()` from an exception handler or shutdown function), `http_response_code()`, `$_COOKIE`, `php://input`, custom response header, HTTP auth vars (`PHP_AUTH_USER`/`PW`, `AUTH_TYPE`, empty password, Bearer, no `REMOTE_USER`) |
 | `phpinfo.rs` | 2 | PHP version matching, health check |
 | `php_config.rs` | 1 | PHP configuration validation |
 | `php_extended.rs` | 6 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods, additional PHP behavior |
@@ -57,6 +57,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `test.php` | Echoes `$_SERVER`, GET/POST/COOKIE params, request headers |
 | `info.php` | `phpinfo()` — large output for compression testing |
 | `exit_test.php` | `echo "bye"; exit(0);` — output before exit |
+| `exit_in_callback.php` | `exit()` from an exception handler or shutdown function (`?case=`) — page delivered with its status; a later real bailout still 500s |
 | `status_201.php` | `http_response_code(201)` — custom status |
 | `server_test.php` | JSON dump of `$_SERVER` variables |
 | `server_vars.php` | JSON dump of key `$_SERVER` variables |

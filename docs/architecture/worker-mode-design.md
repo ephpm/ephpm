@@ -657,8 +657,13 @@ immediately before its `LONGJMP`, unconditionally and regardless of which
 `ephpm_worker_run` clears it before the boot and checks it after
 `php_execute_script` returns; when set it returns `-2` (`WorkerExit::Fatal`)
 **without synthesizing a response**, because the capture buffers hold a prefix of
-a response that was never finished. What the supervisor does then depends on
-whether anything is already on the wire:
+a response that was never finished. The one exception is an `exit()` from a
+callback the engine runs with no calling frame (a `set_exception_handler()`
+handler): the engine finishes the exit's unwind and then calls `zend_bailout()`.
+The wrapper records the unwind-exit object being freed just before that jump
+(`ephpm_install_exit_observer`), and such a "bailout" takes the exit-synthesis
+branch like any other `exit()`. What the supervisor does after a real bailout
+depends on whether anything is already on the wire:
 
 - **Nothing sent yet** (the usual case — the parked `oneshot` is still stashed):
   the request becomes a clean 500.

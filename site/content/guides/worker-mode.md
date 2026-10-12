@@ -144,7 +144,9 @@ synthesizes it from the SAPI status, any `header()`/`setcookie()` calls, and
 the captured output (including content still inside `ob_start()` buffers) —
 then **recycles the worker** (a fresh boot). It works, but you pay a full
 re-boot per request, so prefer `send_response()` in a loop. This is how the
-WordPress adapter tolerates `wp_die()`.
+WordPress adapter tolerates `wp_die()`. The same applies when the `exit()` is
+in a `set_exception_handler()` handler that renders an error page: the page is
+delivered with the status the handler set, not replaced by a `500`.
 
 ## Superglobals
 
