@@ -8,13 +8,15 @@ It is the counterpart to
 [`ephpm/elephc-middleware-example`](https://github.com/ephpm/elephc-middleware-example),
 which compiles PHP to a native module and needs ~180 lines of hand-written C
 shim to bridge elephc's output to the ABI. **This example needs no shim.** In
-Rust the ABI is used as designed: one `declare!` line generates the four
-exported C symbols, the version handshake, config parsing, panic containment
+Rust the ABI is used as designed: one `declare!` line generates the exported
+C symbols, the version handshake, config parsing, panic containment
 and the response marshaling. There is not a single `unsafe` block in
 [`src/lib.rs`](src/lib.rs) outside the unit tests.
 
 Everything below was verified end to end — see
-[Verified transcript](#verified-transcript).
+[Verified transcript](#verified-transcript) — except the multi-tenant
+unknown-host row, which the demo (a single-site node) cannot reach; that one is
+covered by the unit test `a_multi_tenant_node_denies_an_unknown_host_by_itself`.
 
 ---
 
@@ -205,8 +207,15 @@ On an untenanted node it treats every request as one untenanted bucket
 and `maintenance-mode` modules use. An ePHPm older than minor 5 cannot report
 tenancy, and the accessor then returns `false`, the answer that keeps traffic
 flowing. `require_vhost = true` forces the deny on such a host. Set it only
-when you know the node is multi-tenant. The three-way block that implements
-this is the one the
+when you know the node is multi-tenant.
+
+**This changes the example's behaviour.** Earlier versions never denied
+unless `require_vhost = true`. Now, on a `sites_dir` node, `/api/` requests
+from a `Host` that falls through to the default document root get `404`.
+There is deliberately no switch to restore the old pass-through: an API gate
+should not serve a tenant it cannot identify.
+
+The three-way block that implements this is the one the
 [native-middleware guide](https://ephpm.dev/guides/native-middleware/) quotes;
 `tests/guide_snippet.rs` fails the build if the guide and `src/lib.rs` drift
 apart, and `a_single_site_node_is_served_not_denied` in `src/lib.rs` asserts
@@ -362,8 +371,9 @@ against the same `api_gate.dll`:
 
 ```text
 module:  …\release\api_gate.dll
-symbols: init, invoke, shutdown, describe — all resolved
+symbols: init, invoke, shutdown, describe, config_keys — all resolved
 describe: api-gate 0.1.0 (rust middleware example)
+config_keys: ["keys", "prefix", "require_vhost", "requests_per_window", "strip_prefix"]
 handshake: host major 2 refused (rc = -1)
 handshake: null host table refused (rc = -1)
 handshake: config without `keys` refused (rc = -3)

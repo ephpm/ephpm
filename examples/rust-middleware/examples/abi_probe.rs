@@ -1,6 +1,7 @@
 //! Loads the built `api-gate` cdylib exactly the way ePHPm's loader does and
-//! exercises the parts of the C ABI a unit test cannot reach: the four
-//! exported symbols, the version handshake, and one `invoke` marshaled back
+//! exercises the parts of the C ABI a unit test cannot reach: the exported
+//! symbols (including the config-key declaration the host checks before
+//! `init`), the version handshake, and one `invoke` marshaled back
 //! out of module memory through the raw `EphpmResponse` struct.
 //!
 //! This is a debugging aid for module authors — point it at your own module
@@ -56,7 +57,7 @@ fn main() {
     // built from this workspace.
     let lib = unsafe { libloading::Library::new(&path) }.expect("dlopen the module");
 
-    // ── 1. all four symbols resolve ───────────────────────────────────────
+    // ── 1. every symbol `declare!` exports resolves ───────────────────────
     // SAFETY: each symbol is declared with the ABI signature `declare!` emits.
     let init: InitFn = *unsafe { lib.get(abi::SYM_INIT) }.expect("ephpm_middleware_init");
     // SAFETY: as above.
@@ -67,11 +68,24 @@ fn main() {
     // SAFETY: as above; `describe` is optional but this module exports it.
     let describe: abi::DescribeFn =
         *unsafe { lib.get(abi::SYM_DESCRIBE) }.expect("ephpm_middleware_describe");
-    println!("symbols: init, invoke, shutdown, describe — all resolved");
+    // SAFETY: as above; optional in the ABI, but `declare!` always exports it.
+    let config_keys: abi::ConfigKeysFn =
+        *unsafe { lib.get(abi::SYM_CONFIG_KEYS) }.expect("ephpm_middleware_config_keys");
+    println!("symbols: init, invoke, shutdown, describe, config_keys — all resolved");
 
     // SAFETY: the module returns a 'static NUL-terminated string.
     let name = unsafe { CStr::from_ptr(describe()) }.to_string_lossy().into_owned();
     println!("describe: {name}");
+
+    // The key list the host checks a mount's `config` against before `init`.
+    // SAFETY: no arguments; NULL or a static NUL-terminated string.
+    let keys_ptr = unsafe { config_keys() };
+    assert!(!keys_ptr.is_null(), "api-gate declares CONFIG_KEYS, so this must not be NULL");
+    // SAFETY: non-null and NUL-terminated per the ABI contract.
+    let raw = unsafe { CStr::from_ptr(keys_ptr) };
+    let keys = ephpm_middleware::config::parse_declared_keys(raw.to_bytes())
+        .expect("the declaration must be a JSON array of strings");
+    println!("config_keys: {keys:?}");
 
     let host = std::ptr::from_ref(host_table());
     let config = good_config();
