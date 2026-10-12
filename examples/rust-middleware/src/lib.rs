@@ -8,7 +8,7 @@
 //!
 //! It exists because the ABI is easier to use than the C-shim-based
 //! [elephc example][elephc] makes it look. A Rust module needs **no shim at
-//! all**: [`ephpm_middleware::declare!`] emits the four exported C symbols,
+//! all**: [`ephpm_middleware::declare!`] emits the exported C symbols,
 //! the ABI-version handshake, the config parse, panic containment and the
 //! response marshaling. Everything below the `declare!` line at the bottom of
 //! this file is ordinary safe Rust — there is not one `unsafe` block in the
@@ -368,7 +368,7 @@ impl Middleware for ApiGate {
     }
 }
 
-// The whole C ABI: four exported symbols, the version handshake, config
+// The whole C ABI: the exported symbols, the version handshake, config
 // parsing, panic containment and response marshaling. This one line is the
 // entire difference between a Rust module and the ~180-line hand-written C
 // shim the elephc example needs.
