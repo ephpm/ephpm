@@ -293,6 +293,38 @@ const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc", "bare_process_smoke", "pdo_m
 /// or gate them individually.
 const SKIP_SUITES: &[&str] = &[];
 
+/// Why `suite` cannot run on the host this harness is running on, if it can't.
+///
+/// Unlike [`SKIP_SUITES`] this is a statement about a **missing product
+/// capability**, not about the harness, so a skip is never silent: the harness
+/// prints it as a banner when the suite is dropped and again in the end-of-run
+/// summary, naming what is missing (issue #454).
+///
+/// `crash_containment` on Windows: `[php] crash_containment` is built on POSIX
+/// signal handling (`crates/ephpm-php/crash_guard.c`, `fatal_signal.rs`), and
+/// Windows delivers a stack overflow as an SEH exception that nothing in ePHPm
+/// catches, so the deliberately-crashing requests in that suite take the whole
+/// server down. Running it there can only ever report "the crash was not
+/// contained", which is a known, documented gap (the Windows guide's "No crash
+/// containment" note), not a regression. The day SEH containment exists, delete
+/// this arm and the suite runs on Windows again.
+fn platform_skip_reason(suite: &str) -> Option<&'static str> {
+    platform_skip_reason_for(suite, cfg!(windows))
+}
+
+/// [`platform_skip_reason`] with the host platform as a parameter, so both
+/// branches are unit-testable from any host.
+fn platform_skip_reason_for(suite: &str, windows: bool) -> Option<&'static str> {
+    match suite {
+        "crash_containment" if windows => Some(
+            "Windows has NO stack-overflow crash containment: [php] crash_containment is \
+             Unix-only (POSIX signals; Windows raises SEH exceptions, which ePHPm does not \
+             handle), so a PHP C-stack overflow kills the whole server on this platform",
+        ),
+        _ => None,
+    }
+}
+
 // Deliberately unclassified suites — i.e. ones where "runs against the
 // long-lived shared single node" is a decision rather than an oversight.
 // Nothing reads this note; it exists so a future reader does not "fix" the
@@ -395,6 +427,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Split binaries by whether they need cluster mode.
     let mut single_suites: Vec<(String, PathBuf)> = Vec::new();
     let mut cluster_suites: Vec<(String, PathBuf)> = Vec::new();
+    let mut platform_skipped: Vec<(String, &'static str)> = Vec::new();
     for (name, path) in binaries {
         if SKIP_SUITES.contains(&name.as_str()) {
             continue;
@@ -404,6 +437,11 @@ pub fn run(args: &[String]) -> ExitCode {
         {
             continue;
         }
+        if let Some(reason) = platform_skip_reason(&name) {
+            eprintln!("!!! SKIPPING suite `{name}` on this platform: {reason}");
+            platform_skipped.push((name, reason));
+            continue;
+        }
         if CLUSTER_SUITES.contains(&name.as_str()) {
             cluster_suites.push((name, path));
         } else {
@@ -411,6 +449,12 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
 
+    if single_suites.is_empty() && cluster_suites.is_empty() && !platform_skipped.is_empty() {
+        // `--tests <suite>` named only a suite this platform cannot run. Not a
+        // harness error, and not a pass either: say exactly that and stop.
+        print_platform_skips(&platform_skipped);
+        return ExitCode::SUCCESS;
+    }
     if single_suites.is_empty() && cluster_suites.is_empty() {
         eprintln!(
             "error: no test suites selected (--tests {:?} filtered everything out)",
@@ -576,8 +620,20 @@ pub fn run(args: &[String]) -> ExitCode {
         drop(fixture);
     }
 
+    // Repeated at the end so the skip cannot scroll away above thousands of
+    // lines of suite output.
+    print_platform_skips(&platform_skipped);
+
     if failed.is_empty() {
-        eprintln!("==> All bare-process E2E suites passed");
+        if platform_skipped.is_empty() {
+            eprintln!("==> All bare-process E2E suites passed");
+        } else {
+            eprintln!(
+                "==> All bare-process E2E suites that can run on this platform passed \
+                 ({} skipped — see above)",
+                platform_skipped.len()
+            );
+        }
         ExitCode::SUCCESS
     } else {
         eprintln!("==== FAILED E2E SUITES (bare-process) ====");
@@ -587,6 +643,19 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("==== end failed suites ====");
         ExitCode::FAILURE
     }
+}
+
+/// Print the suites dropped by [`platform_skip_reason`], loudly. No-op when
+/// nothing was skipped.
+fn print_platform_skips(skipped: &[(String, &'static str)]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!("==== SKIPPED E2E SUITES (capability missing on this platform) ====");
+    for (name, reason) in skipped {
+        eprintln!("  {name}: {reason}");
+    }
+    eprintln!("==== end skipped suites ====");
 }
 
 fn print_usage() {
@@ -2042,4 +2111,30 @@ fn escape_toml(path: &Path) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ISOLATED_CONFIG_SUITES, platform_skip_reason_for};
+
+    /// Issue #454: on Windows the `crash_containment` suite is dropped with a
+    /// reason that names the missing capability, never silently.
+    #[test]
+    fn crash_containment_is_skipped_on_windows_with_a_named_reason() {
+        let reason = platform_skip_reason_for("crash_containment", true)
+            .expect("crash_containment must be skipped on Windows");
+        assert!(reason.contains("crash containment"), "reason must name the capability: {reason}");
+        assert!(reason.contains("Windows"), "reason must name the platform: {reason}");
+    }
+
+    /// The skip is Windows-only: on Unix the suite runs, and no other suite is
+    /// skipped on either platform.
+    #[test]
+    fn nothing_else_is_platform_skipped() {
+        assert_eq!(platform_skip_reason_for("crash_containment", false), None);
+        for suite in ISOLATED_CONFIG_SUITES.iter().filter(|s| **s != "crash_containment") {
+            assert_eq!(platform_skip_reason_for(suite, true), None, "{suite} (windows)");
+            assert_eq!(platform_skip_reason_for(suite, false), None, "{suite} (unix)");
+        }
+    }
 }

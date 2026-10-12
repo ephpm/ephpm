@@ -12,6 +12,13 @@
 //! entries and skips PHP module shutdown at exit — which is why the suite gets
 //! its own node and runs single-threaded.
 //!
+//! **Not run on Windows.** Containment is Unix-only (POSIX signals; Windows
+//! raises SEH exceptions that ePHPm does not catch), so on Windows every test
+//! here would just watch the server die. `cargo xtask e2e` drops this suite on
+//! Windows with a loud, named skip (`platform_skip_reason` in
+//! `xtask/src/e2e_bare.rs`, issue #454) rather than reporting a known gap as a
+//! failure on every run.
+//!
 //! Environment variables:
 //! - `EPHPM_URL` — base URL of the containment-enabled ephpm instance. Read via
 //!   [`required_env`], so the suite FAILS (loudly) rather than skips when the

@@ -16,9 +16,10 @@
 # release profile — the expensive parts of the release leg that a type error
 # never reaches anyway.
 #
-# Cost note: the ephemerd Windows runners are ephemeral and bare, so the VS
-# Build Tools install alone can take up to 20 minutes (the same install block
-# release.yml uses). The `paths:` filter below keeps that tax off every PR
+# Cost note: on a runner image without VS Build Tools the install alone takes
+# up to ~20 minutes (.github/scripts/install-vs-buildtools.ps1, shared with
+# release.yml); the pre-baked runner-ci-windows-msvc image makes it a no-op.
+# The `paths:` filter below keeps that tax off every PR
 # that cannot introduce this bug class — only the FFI crate itself, the binary
 # crate's build.rs (it probes the same SDK), the SDK-download tooling, and
 # this workflow can.
@@ -42,6 +43,7 @@ on:
       - "crates/ephpm/build.rs"
       - "xtask/**"
       - ".github/workflows/windows-php-check.yml"
+      - ".github/scripts/install-vs-buildtools.ps1"
   # Manual escape hatch: exercise the job without opening a PR that touches a
   # filtered path — e.g. to validate this workflow itself or a change to the
   # Windows runner fleet.
@@ -93,37 +95,14 @@ jobs:
 
       - name: Install Visual Studio Build Tools
         shell: powershell
-        # Mirrors php-sdk's install block; runner image is bare so each
-        # job installs VS Build Tools fresh via the official bootstrapper.
+        # No-op on the pre-baked ephemerd runner-ci-windows-msvc image
+        # (MSBuild.exe already at C:\BuildTools); otherwise installs via the
+        # bootstrapper and fails fast with the installer's exit code and log
+        # tail instead of a silent 20-minute wait (#377). Logic lives in the
+        # shared script so every Windows job provisions identically.
         run: |
-          $installPath = "C:\BuildTools"
-          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
-          if (Test-Path $msbuild) {
-            Write-Host "VS Build Tools already present at $installPath"
-          } else {
-            Write-Host "Downloading VS Build Tools bootstrapper..."
-            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
-            $proc = Start-Process -FilePath .\vs_buildtools.exe `
-              -ArgumentList @(
-                '--quiet', '--wait', '--norestart', '--nocache',
-                '--installPath', $installPath,
-                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
-                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
-                '--includeRecommended'
-              ) -Wait -PassThru -NoNewWindow
-            Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
-            Remove-Item vs_buildtools.exe
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
-              Start-Sleep -Seconds 30
-              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
-            }
-            if (-not (Test-Path $msbuild)) {
-              Write-Host "::error::VS install timed out - $msbuild never appeared"
-              exit 1
-            }
-            Write-Host ("MSBuild.exe found after {0:F0}s" -f $sw.Elapsed.TotalSeconds)
-          }
+          & "$env:GITHUB_WORKSPACE\.github\scripts\install-vs-buildtools.ps1"
+          exit $LASTEXITCODE
 
       - name: Enter MSVC developer environment
         shell: powershell
