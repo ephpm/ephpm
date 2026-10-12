@@ -81,7 +81,9 @@ find them — the repo has to be declared as a Composer `vcs` repository first.
 ```
 
 `dev-main` rather than a `^0.1` constraint because the repo is not tagged yet;
-switch to a version constraint once it is. Then:
+switch to a version constraint once it is. Then run a real Composer. The
+embedded `ephpm composer update` cannot resolve `vcs` repositories (see
+[`ephpm composer`](/reference/cli/composer/#repository-types-update-require-remove)):
 
 ```bash
 cd wordpress
