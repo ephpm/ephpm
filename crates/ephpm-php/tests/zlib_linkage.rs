@@ -80,12 +80,12 @@ $last = static fn() => error_get_last()['message'] ?? '';
 echo 'gzdecode=', $r(gzdecode(gzencode($payload)) === $payload), "\n";
 
 file_put_contents("$dir/a.gz", gzencode($payload));
-$g = gzopen("$dir/a.gz", 'rb');
+$g = @gzopen("$dir/a.gz", 'rb');
 $got = $g ? gzread($g, 1 << 20) : false;
 if ($g) { gzclose($g); }
 echo 'gzopen_read=', $r($got === $payload, var_export(is_string($got) ? strlen($got) : $got, true)), "\n";
 
-$g = gzopen("$dir/b.gz", 'wb');
+$g = @gzopen("$dir/b.gz", 'wb');
 $wrote = $g && gzwrite($g, $payload) === strlen($payload);
 if ($g) { gzclose($g); }
 echo 'gzopen_write=', $r($wrote && gzdecode((string) file_get_contents("$dir/b.gz")) === $payload), "\n";

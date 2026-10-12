@@ -5,11 +5,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rustls-pemfile unmaintained — transitive dep, awaiting upstream migration
     "RUSTSEC-2025-0134",
-    # proc-macro-error2 unmaintained — pulled transitively by
-    # mysql-common-derive -> mysql_common -> mysql_async / opensrv-mysql.
-    # Compile-time-only (proc macro), no runtime exposure. Awaiting
-    # upstream migration to manyhow / proc-macro2-diagnostics.
-    "RUSTSEC-2026-0173",
+    # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
+    # unmaintained) left the graph with mysql-common-derive, once the
+    # opensrv-mysql fork stopped enabling mysql_common's default features.
     # RESOLVED (do not re-add): RUSTSEC-2026-0285 (rustls TLS 1.3 handshake at
     # the wrong encryption level) and the rustls-webpki advisories 0049 / 0098 /
     # 0099 / 0104 are now fixed at the source, not ignored. opensrv-mysql is
