@@ -251,6 +251,7 @@ fn exit_in_shutdown_then_in_ob_callback_is_still_an_exit() {
     );
     assert_eq!(resp.status, 200);
     assert_eq!(header(&resp, "X-Phases"), Some("3"));
+    assert!(resp.body.is_empty(), "the exiting ob handler's buffer is discarded: {}", text(&resp));
 }
 
 /// An uncaught exception records a fatal; a shutdown function then renders a
