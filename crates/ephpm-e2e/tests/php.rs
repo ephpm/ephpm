@@ -4,6 +4,7 @@
 //! - $_GET is populated from the query string
 //! - Critical $_SERVER variables are set and non-empty
 //! - echo before exit(0) is delivered to the client
+//! - exit() from an exception handler or shutdown function is delivered too
 //! - http_response_code() propagates to the HTTP status line
 //! - Cookie header populates $_COOKIE
 //! - php://input is readable for non-form POST bodies
@@ -322,5 +323,70 @@ async fn remote_user_is_never_derived_from_the_header() {
     assert!(
         body.contains("PHP_AUTH_USER = [admin]"),
         "sanity: the credential itself is still exposed:\n{body}"
+    );
+}
+
+/// `exit()` from a callback PHP runs with no calling frame (an exception
+/// handler, a shutdown function) ends the request normally, as in php-fpm:
+/// the page is delivered with the status and headers the script set.
+///
+/// The engine follows such an exit with a `zend_bailout()`, which ePHPm used to
+/// report as a truncated response: a bare 500 with the page discarded. That
+/// broke every Yii 2 error page (exit from the exception handler) and every
+/// phpMyAdmin page (exit from a shutdown function).
+#[tokio::test]
+async fn exit_from_a_frameless_callback_delivers_the_response() {
+    let base_url = required_env("EPHPM_URL");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client");
+
+    // (case, expected status, expected body, expected X-Exit-Case header)
+    let cases = [
+        ("exception_handler", 404, "handled: boom", Some("exception_handler")),
+        ("shutdown", 200, "main|shutdown-1", Some("shutdown")),
+        ("shutdown_redirect", 302, "", None),
+    ];
+    for (case, status, body, marker) in cases {
+        let url = format!("{base_url}/exit_in_callback.php?case={case}");
+        let resp = client.get(&url).send().await.unwrap_or_else(|e| panic!("GET {url}: {e}"));
+        let got_status = resp.status().as_u16();
+        let got_marker = resp
+            .headers()
+            .get("x-exit-case")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let got_location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let got_body = resp.text().await.unwrap_or_default();
+
+        assert_eq!(got_status, status, "{case}: status (body: {got_body})");
+        assert_eq!(got_body, body, "{case}: body");
+        assert_eq!(got_marker.as_deref(), marker, "{case}: X-Exit-Case header");
+        if case == "shutdown_redirect" {
+            assert_eq!(got_location.as_deref(), Some("/elsewhere"), "{case}: Location");
+        }
+    }
+}
+
+/// The other half: a real bailout (memory exhaustion in a shutdown function)
+/// that follows an exit()-bailout in the exception handler is still a bailout —
+/// 500, partial page discarded.
+#[tokio::test]
+async fn real_bailout_after_an_exit_from_a_callback_still_returns_500() {
+    let base_url = required_env("EPHPM_URL");
+    let url = format!("{base_url}/exit_in_callback.php?case=exit_then_oom");
+
+    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 500, "body: {body}");
+    assert!(
+        !body.contains("EXIT-THEN-OOM-PARTIAL"),
+        "the response of a request that bailed out must be discarded: {body}"
     );
 }

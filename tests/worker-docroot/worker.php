@@ -13,6 +13,8 @@
  *   ?__bailout=1   output, then a real zend_bailout (memory exhaustion), with
  *                  the response never sent (-> 500 + recycle, no partial body)
  *   ?__exit=1      output followed by exit() mid-request (exit synthesis)
+ *   ?__handler_exit=1  an uncaught exception whose set_exception_handler()
+ *                  handler sets 404, echoes, and exit()s (delivered, not 500)
  *   ?__blocks=<n>  a WordPress-`do_blocks()`-shaped render workload (issue #116)
  *   ?__deep=<n>    the same shape taken past the C-stack ceiling (issue #116);
  *                  add &catch=1 to handle the resulting Error in userland
@@ -200,6 +202,20 @@ while (($envelope = \Ephpm\Worker\take_request()) !== null) {
         ob_start();
         echo "exit-route buffered\n";
         exit;
+    }
+
+    // exit() from the exception handler: the framework's handler renders an
+    // error page with its own status and exits (Yii 2's ErrorHandler shape).
+    // The engine runs that handler with no calling frame, so the exit ends in
+    // a zend_bailout() — which must still deliver the page, not 500 it.
+    if (isset($query['__handler_exit'])) {
+        set_exception_handler(static function (\Throwable $e): void {
+            http_response_code(404);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'handler-exit: ', $e->getMessage(), "\n";
+            exit(1);
+        });
+        throw new \RuntimeException('not found here');
     }
 
     // Runaway-recursion trigger (issue #116). Two shapes:

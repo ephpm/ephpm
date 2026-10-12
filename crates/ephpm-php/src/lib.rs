@@ -556,8 +556,12 @@ pub enum PhpError {
     /// completed as a success, so callers discard the partial body and answer
     /// 500 (`build_php_response`'s error arm) rather than returning it.
     ///
-    /// PHP 8's `exit()`/`die()` is NOT a bailout — it throws an unwind-exit
-    /// exception, which unwinds cleanly and yields a complete response.
+    /// PHP 8's `exit()`/`die()` never produces this variant. It throws an
+    /// unwind-exit exception, which unwinds cleanly and yields a complete
+    /// response. Called from a callback the engine runs with no calling frame
+    /// (exception handler, shutdown function, output-buffer callback) the
+    /// engine does follow the finished unwind with a `zend_bailout()`; the C
+    /// layer recognises that case and reports it as a script exit instead.
     #[error("PHP script bailed out (truncated response discarded): {0}")]
     Bailout(String),
 
@@ -1636,7 +1640,14 @@ impl PhpRuntime {
         let status = u16::try_from(status_code).unwrap_or(200);
 
         match ret {
-            exec_code::OK => Ok(PhpResponse { status, headers, body }),
+            // exit()/die() (SCRIPT_EXIT) — from the script, a PHP middleware
+            // mount, or a frameless callback (exception handler, shutdown
+            // function, ob callback) — is a normal end of the script, as in
+            // php-fpm: the captured response is complete and is returned
+            // as-is with the status the script chose. An empty body is
+            // legitimate there (`header('Location: …'); exit;`, a 403 or 204
+            // with no content).
+            exec_code::OK | exec_code::SCRIPT_EXIT => Ok(PhpResponse { status, headers, body }),
             exec_code::STARTUP_FAIL => {
                 Err(PhpError::ExecutionFailed("php_request_startup failed".into()))
             }
@@ -1682,17 +1693,6 @@ impl PhpRuntime {
                     request.method,
                     request.uri
                 )))
-            }
-            // exit()/die() unwinds cleanly, so the captured response is
-            // complete and is returned as-is, keeping whatever status the
-            // script chose (an empty one is still an error — nothing was
-            // produced).
-            exec_code::SCRIPT_EXIT => {
-                if body.is_empty() {
-                    Err(PhpError::ExecutionFailed("PHP exited without output".into()))
-                } else {
-                    Ok(PhpResponse { status, headers, body })
-                }
             }
             other => Err(PhpError::ExecutionFailed(format!(
                 "ephpm_run_request returned an unknown code {other}"

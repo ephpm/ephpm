@@ -518,6 +518,33 @@ async fn exit_mid_request_delivers_output_and_server_keeps_serving() {
     }
 }
 
+/// `exit()` from a `set_exception_handler()` handler delivers the page the
+/// handler rendered, with its status.
+///
+/// The engine runs that handler with no calling frame, so the `exit()` is
+/// followed by a `zend_bailout()`. The worker used to report that as a fatal
+/// bailout (500, page discarded); it is the same deliberate exit as
+/// `?__exit=1` and takes the same path.
+#[tokio::test]
+async fn exit_from_exception_handler_delivers_the_page() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode handler-exit test");
+        return;
+    };
+
+    for round in 0..3 {
+        let (status, body) = get(&base, "/handler-exit?__handler_exit=1").await;
+        assert_eq!(status, 404, "handler-exit round {round} returned {status}: {body}");
+        assert!(
+            body.contains("handler-exit: not found here"),
+            "handler-exit round {round} lost the handler's page: {body}"
+        );
+
+        let (status, body) = get(&base, &format!("/after-handler-exit-{round}")).await;
+        assert_eq!(status, 200, "request after handler exit wedged the server: {status} {body}");
+    }
+}
+
 /// Streaming round-trip (Phase 3): upload a large body and get the same bytes
 /// back. Proves `Envelope::bodyStream()` + `send_response_stream()` move the
 /// body without the worker buffering it whole. Requires a worker docroot whose

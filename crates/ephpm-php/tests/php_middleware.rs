@@ -209,6 +209,29 @@ fn exit_skips_later_mounts() {
     assert_eq!(PhpRuntime::middleware_outcome(), (MiddlewareOutcome::Respond, 1));
 }
 
+/// An `exit()` from the mount's own exception handler is still a RESPOND.
+///
+/// The engine runs that handler with no calling frame, so the `exit()` ends in
+/// a `zend_bailout()` that unwinds out of the chain. It used to be reported as
+/// a fatal (500, page discarded); the app script must stay skipped either way.
+#[test]
+#[serial]
+fn exit_from_an_exception_handler_is_a_respond() {
+    let mw = write_script(
+        "mw_handler_exit.php",
+        "<?php set_exception_handler(function ($e) {
+            http_response_code(403); echo 'handler:', $e->getMessage(); exit;
+        });
+        throw new RuntimeException('denied');",
+    );
+    let app = app_marker("app_handler_exit.php");
+
+    let resp = run(app, vec![mount(mw, None)]).expect("request executed");
+    assert_eq!(resp.status, 403);
+    assert_eq!(body_of(&resp), "handler:denied");
+    assert_eq!(PhpRuntime::middleware_outcome(), (MiddlewareOutcome::Respond, 1));
+}
+
 // ── Failure semantics — all fail CLOSED ───────────────────────────────
 
 /// An uncaught exception is the fail-open trap: `zend_exception_error` reports
