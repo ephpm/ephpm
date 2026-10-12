@@ -289,5 +289,6 @@ the faulting `.so` and function before it dies — see
 - **Catalog expansion + Windows/macOS catalog variants** — today the
   catalog covers the common Linux set (igbinary, msgpack, apcu, redis,
   mongodb, xdebug); more extensions and a Windows variant are planned. macOS
-  arm64 tarballs (`ephpm-ext-<php>-macos-aarch64.tar.gz`) are being added to
-  the catalog; `ephpm dev --xdebug` already looks for them.
+  arm64 tarballs (`ephpm-ext-<php>-macos-aarch64.tar.gz`) are published for
+  the pinned releases (8.3.33, 8.4.23, 8.5.7) and used by
+  `ephpm dev --xdebug`; other releases do not have them yet.
