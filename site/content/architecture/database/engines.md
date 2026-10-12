@@ -75,6 +75,43 @@ Two honest caveats:
   `String`, so cells holding invalid UTF-8 may not survive the round trip.
   This is an upstream Turso limitation.
 
+## Turso 0.7.2 → 0.8.2 (the release after v0.11.3)
+
+The release after v0.11.3 moves the embedded engine from Turso 0.7.2 to
+0.8.2 ([ephpm#535](https://github.com/ephpm/ephpm/issues/535)). **No
+dump/reload is needed, and you can roll back.** The file format did not
+change, and neither did the CDC log schema: `turso_cdc` keeps its columns and
+`turso_cdc_version` still reads `v2`.
+
+What was tested, using one build on each engine version against the same
+files:
+
+- A database written and cleanly closed by 0.7.2 opens under 0.8.2.
+  `PRAGMA integrity_check` returns `ok`, every row is present, and the
+  table and its index agree. Writes continue, and `turso_cdc.change_id`
+  carries on from where 0.7.2 stopped.
+- A crash image taken while 0.7.2 still had the database open opens and
+  recovers under 0.8.2. The image is the main file plus a 3.9 MB `-wal`
+  that had never been checkpointed.
+- The CDC log written partly by 0.7.2 and partly by 0.8.2 replays through
+  the tail/apply path to an identical replica.
+- Downgrade works: 0.7.2 opens files written by 0.8.2, including one it
+  wrote before the upgrade, with `integrity_check` `ok`.
+
+For clusters, the batches nodes exchange use ePHPm's own wire format, and
+the `turso_cdc` rows those batches carry have the same shape on both engine
+versions. Even so, a cluster running both versions at once was **not**
+tested live. That is reasonable for a rolling upgrade, but do not leave a
+cluster on mixed versions for long. Clustered mode is still experimental.
+
+One behaviour changes for applications. On a session with CDC capture on,
+which means every write session in clustered mode, `PRAGMA journal_mode =
+mvcc` now fails with `cannot change journal_mode ... while CDC capture is
+active`. Turso 0.7.2 accepted it, and according to upstream, capture then
+stopped silently, so that node's later writes never replicated. Single-node
+mode does not capture, so the pragma still works there. Turso accepts only
+`wal` and `mvcc`; any other `journal_mode` value is still a silent no-op.
+
 ## Clustered mode (experimental)
 
 Clustered SQLite is **experimental** in v0.7.0. It uses the in-process Turso

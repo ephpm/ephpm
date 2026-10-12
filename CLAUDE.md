@@ -75,7 +75,7 @@ Workspace membership is `crates/*` + `examples/rust-middleware` + `xtask`, with 
 |-----------|----------|---------|
 | **litewire** | Git dep on `github.com/ephpm/litewire`, pinned by `rev` in the workspace `Cargo.toml` | MySQL/Hrana/PG/TDS wire protocol → SQLite (Turso) translation proxy |
 | **PHP SDK** | Downloaded by `cargo xtask php-sdk` from `github.com/ephpm/php-sdk` releases | Prebuilt `libphp.a` (Linux/macOS) or `php8embed.{dll,lib}` (Windows) plus PHP headers. Pinned per minor in `xtask/src/main.rs::PHP_SDK_VERSIONS` |
-| **turso** | Pure-Rust crate (`turso =0.7.2`), compiled into the binary via litewire | The embedded SQLite-compatible database engine — single-node and CDC-replicated clustered. No external process. |
+| **turso** | Pure-Rust crate (`turso =0.8.2`), compiled into the binary via litewire | The embedded SQLite-compatible database engine — single-node and CDC-replicated clustered. No external process. |
 
 litewire is a standalone project at `github.com/ephpm/litewire`. It's used as a library — ePHPm calls `LiteWire::new(backend).mysql(addr).serve()`. Bumping it means updating the `rev` in the workspace `Cargo.toml` and running `cargo update -p litewire`. To work against a sibling checkout without changing the pin, add a `[patch."https://github.com/ephpm/litewire.git"]` entry pointing at `../litewire/crates/litewire` in your local config — see the comment above the dependency in `Cargo.toml`.
 

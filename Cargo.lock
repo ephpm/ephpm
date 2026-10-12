@@ -173,9 +173,9 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.9"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08410fcac93669a476c006cd6c4512ac1e2b30fd117231a5d55d8a2c76599b82"
+checksum = "a8ed6751597568a284314fd9e2db420665898600109dedc7d8d9b588f00ae9c4"
 dependencies = [
  "libc 0.2.189",
  "libloading",
@@ -2198,11 +2198,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc 0.2.189",
  "r-efi 6.0.0",
  "rand_core 0.10.0",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2491,7 +2493,7 @@ dependencies = [
  "libc 0.2.189",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3051,7 +3053,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "anyhow",
  "futures",
@@ -3070,7 +3072,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -3082,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3097,7 +3099,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -3114,7 +3116,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "async-trait",
  "futures",
@@ -3129,7 +3131,7 @@ dependencies = [
 [[package]]
 name = "litewire-session"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "litewire-backend",
  "litewire-translate",
@@ -3140,7 +3142,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -3153,7 +3155,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "lru 0.18.2",
  "parking_lot",
@@ -3165,7 +3167,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b0c12bf1383f5368345dc93c41c40f4350a1218e#b0c12bf1383f5368345dc93c41c40f4350a1218e"
+source = "git+https://github.com/ephpm/litewire.git?rev=89b911b2a81fdcd4973230763fbd02f62cf0c8ea#89b911b2a81fdcd4973230763fbd02f62cf0c8ea"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -4207,7 +4209,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4245,7 +4247,7 @@ dependencies = [
  "cfg_aliases",
  "libc 0.2.189",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -5894,9 +5896,9 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9491d7a80312c5abe66a4409e4dce02065503a235453c94b9e4133877e39ffc"
+checksum = "a2ebd8a76c2b005a9f42de15e0fe232cd9c17d7c8acb571ddfa294e6c9fa1e44"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -5908,9 +5910,9 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a833cc3bf8d4e6c101c504fa470f8ab4270c2202ff2591b61b2e373b4f20d9b"
+checksum = "4fa832d4ab648bf139f1b18b29bef6d653b18fbd4a77b0e4846c57aaf28c215c"
 dependencies = [
  "aegis",
  "aes",
@@ -5933,6 +5935,8 @@ dependencies = [
  "either",
  "fallible-iterator 0.3.0",
  "fastbloom",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hex",
  "icu_collator",
  "icu_locale",
@@ -5959,6 +5963,7 @@ dependencies = [
  "ryu",
  "serde_json",
  "shuttle",
+ "simdutf8",
  "simsimd",
  "smallvec",
  "strum",
@@ -5978,9 +5983,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7452fe676450b6840e9eb80e512d14293265221154eba66aba3845dfc0d659f"
+checksum = "07d9b915ee3c37d552597b07c05c127702a926ca0eac8843f248d693f4368155"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -5989,9 +5994,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2825eaa6b7b893693636947f988e252c1196393fa54d4b85637c70d616d92fa"
+checksum = "476aa46d793a8aaae6d7a12f591d85eff039129264b1d441586528c88c3feacd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6000,9 +6005,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0e58d029f02e442df4be0b5036ce520b49c553505d9d52ef5a98fc4056e95b7"
+checksum = "7e03bf6489a80da2e9bf08f22d0b8af4eb391dfa5e6f71e787031cd61a921a3c"
 dependencies = [
  "bitflags",
  "memchr",
@@ -6015,9 +6020,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c1dc1c0304348c39b97bc6b27cdcb1d7292454ebd0de0f30b5ee3a4c61f9bb"
+checksum = "e7893b565a3405c8f44c97b6008bed55314535514c2536db1aaf2bb9b687705a"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -6032,9 +6037,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4708b5fe678b8730c85964e3d378f75e18c23c4409971360b2209f4e53e4956"
+checksum = "af97d8302c41404272bb6e3612abe61f604acd23a2062fde52249641007c59ff"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6043,9 +6048,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce8f03e430240d590d209ac874db52773b7382c627cd604a685affde77622b09"
+checksum = "f188ee2458899c017b95d1d100b87b2a22628a48b9a8e91e753006af6e8fd391"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6066,9 +6071,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.7.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d48cb47d056c3ec567745761fa6f832358ca30ef9eb0435fdcfb77c558e70089"
+checksum = "28e1232dce3a4e517db5ba5e9767b0703676a7f59270ed4f5d0118000120b9b0"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",

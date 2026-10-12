@@ -220,7 +220,17 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ b0c12bf1383f — PHP SQLITE: stop linking rusqlite's bundled SQLite
+# litewire @ 89b911b2a81f — turso 0.7.2 → 0.8.2 (litewire#46, ephpm#535). The
+# squash-merge commit of litewire#46 on litewire main, directly on top of
+# b0c12bf1383f below.
+# No litewire code change; the engine pin moves, and litewire gains a test that
+# a `PRAGMA journal_mode` change on a CDC-capturing connection is refused
+# (0.7.2 accepted WAL -> MVCC there and capture stopped silently). Database
+# files are compatible both ways and the `turso_cdc` schema is still "v2"; see
+# the `turso` entry below and "File-format compatibility" in
+# site/content/architecture/database/engines.md.
+#
+# Previous pin b0c12bf1383f — PHP SQLITE: stop linking rusqlite's bundled SQLite
 # into the binary (litewire#45). litewire's workspace entry for
 # litewire-backend inherited that crate's default `rusqlite` feature, so every
 # sibling crate turned it back on and the `default-features = false` below did
@@ -438,13 +448,20 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b0c12bf1383f5368345dc93c41c40f4350a1218e", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "89b911b2a81fdcd4973230763fbd02f62cf0c8ea", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
-# in its signatures. Pinned to the exact version litewire pins (=0.7.2)
+# in its signatures. Pinned to the exact version litewire pins (=0.8.2)
 # so the two resolve to a single crate instance and TursoConnection
 # (re-exported by litewire) is the same turso::Connection.
-turso = { version = "=0.7.2", default-features = false }
+#
+# 0.8.x adds a per-connection operation gate to the Rust binding:
+# `Connection::execute_batch` needs the connection exclusively and fails with
+# "connection is busy with another operation" (it does not wait) while a
+# `Rows` from that connection — or a clone of it — is still unfinished.
+# `apply_snapshot` in turso_cdc.rs is the one `execute_batch` caller; keep it on
+# a connection with no live result set.
+turso = { version = "=0.8.2", default-features = false }
 
 # vivacity: the pure-Rust Composer installer that backs `ephpm composer`. It
 # resolves and installs Composer dependencies (byte-parity with PHP Composer is
