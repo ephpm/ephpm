@@ -220,9 +220,9 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 28e2811 — turso 0.7.2 → 0.8.2 (litewire#46, ephpm#535). NOTE: this
-# rev is the head of the (unmerged) litewire bump branch, one commit on top of
-# b0c12bf1383f below — repin to the squash-merge commit once litewire#46 lands.
+# litewire @ 89b911b2a81f — turso 0.7.2 → 0.8.2 (litewire#46, ephpm#535). The
+# squash-merge commit of litewire#46 on litewire main, directly on top of
+# b0c12bf1383f below.
 # No litewire code change; the engine pin moves, and litewire gains a test that
 # a `PRAGMA journal_mode` change on a CDC-capturing connection is refused
 # (0.7.2 accepted WAL -> MVCC there and capture stopped silently). Database
@@ -448,7 +448,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "28e281142bc6d71cc95f8632796c8994ce350d79", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "89b911b2a81fdcd4973230763fbd02f62cf0c8ea", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.2)
