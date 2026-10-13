@@ -6382,6 +6382,10 @@ struct FsKindMemo {
 }
 
 impl FsKindMemo {
+    /// What the path names, with any trailing separator ignored. `Path`
+    /// equality already ignores one (`"x/" == "x"`), so entries are keyed and
+    /// stat'ed on the stripped form; [`FsKindMemo::is_file`] re-applies the
+    /// trailing-separator rule itself.
     fn kind(&mut self, path: &Path) -> FsKind {
         if let Some((_, kind)) = self.entries.iter().find(|(p, _)| p == path) {
             return *kind;
@@ -6390,22 +6394,35 @@ impl FsKindMemo {
         {
             self.stats += 1;
         }
-        let kind = match std::fs::metadata(path) {
+        let stripped: PathBuf = path.components().collect();
+        let kind = match std::fs::metadata(&stripped) {
             Ok(m) if m.is_file() => FsKind::File,
             Ok(m) if m.is_dir() => FsKind::Dir,
             _ => FsKind::Other,
         };
-        self.entries.push((path.to_path_buf(), kind));
+        self.entries.push((stripped, kind));
         kind
     }
 
+    /// `Path::is_file`. A path spelled with a trailing separator is never a
+    /// file — `stat("x/")` on a regular file fails with `ENOTDIR` — so that
+    /// answer must not come from (or poison) the shared entry for `x`.
     fn is_file(&mut self, path: &Path) -> bool {
-        self.kind(path) == FsKind::File
+        !has_trailing_separator(path) && self.kind(path) == FsKind::File
     }
 
+    /// `Path::is_dir`; a trailing separator does not change the answer.
     fn is_dir(&mut self, path: &Path) -> bool {
         self.kind(path) == FsKind::Dir
     }
+}
+
+/// Whether `path` is spelled with a trailing separator (`"dir/"`).
+fn has_trailing_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|b| std::path::is_separator(char::from(*b)))
 }
 
 /// Whether a worker-mode request body is streamed into the worker
@@ -6418,8 +6435,11 @@ impl FsKindMemo {
 /// own exact size hint.
 ///
 /// That second source is what keeps a request **without a body** off the
-/// streaming path. A GET carries no `Content-Length`, but the transport knows
-/// its body is empty (`exact == 0`). Treating it as unknown-length used to spawn
+/// streaming path. A GET carries no `Content-Length`, but over HTTP/1.1 and
+/// HTTP/2 the transport knows its body is empty (`exact == 0`). (HTTP/3's
+/// request body reports no size hint, so a bodiless HTTP/3 request without
+/// `Content-Length` still takes the streaming path — correct, just not
+/// optimised.) Treating it as unknown-length used to spawn
 /// a body-forwarding task and a channel for every bodiless request, and the
 /// worker thread then blocked in `Envelope::rawBody()` until that task had run
 /// on a tokio thread just to learn the body was empty: a cross-thread round
@@ -11670,6 +11690,36 @@ echo "post response";
         // Unknown path → the front controller.
         assert!(
             matches!(resolve("/nope"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+
+        // Directory probe FIRST (nginx-style `try_files $uri/ $uri`): probing
+        // `style.css/` fails (ENOTDIR) but must not make the following
+        // `$uri` probe miss the real file — `Path` equality ignores the
+        // trailing slash, so a naive memo would answer `style.css` from the
+        // `style.css/` lookup and route the asset to the front controller.
+        let dir_first: Vec<String> =
+            vec!["$uri/".into(), "$uri".into(), "/index.php?$query_string".into()];
+        let resolve_dir_first = |uri: &str| {
+            Router::resolve_fallback_in(
+                &mut FsKindMemo::default(),
+                uri,
+                "",
+                site.path(),
+                &index_files,
+                &dir_first,
+            )
+        };
+        assert!(
+            matches!(resolve_dir_first("/style.css"), Resolved::File(p) if p == site.path().join("style.css"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/index.php"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/docs"), Resolved::File(p) if p == site.path().join("docs").join("index.html"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/nope"), Resolved::File(p) if p == site.path().join("index.php"))
         );
     }
 

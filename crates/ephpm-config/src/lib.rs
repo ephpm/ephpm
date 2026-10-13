@@ -4170,9 +4170,11 @@ pub struct WorkerConfig {
     /// keeping worker RSS flat for multi-GB uploads.
     ///
     /// Smaller requests stay on the buffered Phase-1 path (one copy each way),
-    /// which is cheaper for the common small-body case. A request with no
-    /// body at all (a GET with neither `Content-Length` nor
-    /// `Transfer-Encoding`) is always buffered — as an empty body.
+    /// which is cheaper for the common small-body case. Over HTTP/1.1 and
+    /// HTTP/2 a request with no body at all (a GET with neither
+    /// `Content-Length` nor `Transfer-Encoding`) is buffered, as an empty
+    /// body. HTTP/3 request bodies carry no length hint, so there a request
+    /// without `Content-Length` follows the unknown-length (streaming) rule.
     ///
     /// (The per-request path always buffers the body today.)
     ///

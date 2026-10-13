@@ -711,7 +711,10 @@ thread_local! {
 /// 200 µs was chosen by measurement (Yii3 `/`, 20 workers, 32 vCPUs): it
 /// raised saturated throughput ~4% over parking immediately, more than 50 µs
 /// did. Most of the poll yields the CPU rather than burning it (see
-/// [`recv_spin_then_block`]).
+/// [`recv_spin_then_block`]) — but on an idle host `sched_yield` returns at
+/// once, so each request that leaves its worker idle costs up to this much
+/// CPU before the park. Under a tight cgroup CPU quota at low request rates
+/// that is the price of the lower wake latency under load.
 #[cfg_attr(not(php_linked), allow(dead_code))]
 const DISPATCH_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 
