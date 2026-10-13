@@ -20,7 +20,7 @@ name: Release
 #
 #   * EXPERIMENTAL, may be absent from a given release (its leg is
 #     non-gating -- see build-windows-tailcall):
-#       ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz
+#       ephpm-vX.Y.Z+php8.5.11-windows-x86_64-tailcall.tar.gz
 #         (PHP 8.5 built with clang-cl: the TAILCALL VM instead of MSVC's
 #          CALL VM -- 1.6-1.7x faster on CPU-bound PHP)
 #

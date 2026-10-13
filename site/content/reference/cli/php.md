@@ -345,7 +345,7 @@ The `phar` extension is compiled in, and `.phar` archives load and execute:
 The embedded PHP interpreter is the **same** runtime that serves HTTP requests. Running CLI commands through `ephpm php` means:
 
 - One PHP version to install — the one baked into the binary
-- Same compiled-in extensions: `bcmath, calendar, ctype, curl, dom, exif, fileinfo, filter, gd, hash, iconv, mbstring, mysqli, mysqlnd, openssl, pcntl, pcre, pdo, pdo_mysql, phar, posix, session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`
+- Same compiled-in extensions: `bcmath, bz2, calendar, ctype, curl, dom, exif, fileinfo, filter, ftp, gd, gettext, gmp, hash, iconv, intl, mbstring, mysqli, mysqlnd, opcache, openssl, pcntl, pcre, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, pgsql, phar, posix, session, simplexml, soap, sodium, sqlite3, sysvmsg, sysvsem, sysvshm, tokenizer, xml, xmlreader, xmlwriter, xsl, zip, zlib`, plus `sockets` and `shmop` on the PHP 8.3 and 8.5 builds for Linux/macOS. The Windows build omits `gmp, pcntl, pdo_pgsql, pgsql, posix, shmop, sysvmsg, sysvsem, sysvshm`, and includes `sockets` for PHP 8.5 only.
 - Same `php.ini` overrides as the server (from `[php] ini_overrides` in your config)
 - No drift between dev, CI, and production PHP versions
 

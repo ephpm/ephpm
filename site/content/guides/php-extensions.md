@@ -71,7 +71,7 @@ Download, extract, and point `[php] extensions` at the files:
 
 ```bash
 curl -fsSL -o ext.tgz \
-  https://github.com/ephpm/php-sdk/releases/download/ext-8.5.7/ephpm-ext-8.5.7-linux-x86_64-gnu.tar.gz
+  https://github.com/ephpm/php-sdk/releases/download/ext-8.5.11/ephpm-ext-8.5.11-linux-x86_64-gnu.tar.gz
 mkdir -p /opt/ephpm-ext && tar xzf ext.tgz -C /opt/ephpm-ext
 ```
 
