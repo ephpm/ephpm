@@ -33,8 +33,8 @@ the warm pool keeps serving everybody else; see
 
 | Platform | `ephpm dev --xdebug` | Notes |
 |---|---|---|
-| Linux, glibc, x86_64 / aarch64 | Supported | Xdebug fetched from the ePHPm extension catalog (see below), or `--xdebug-path`. Verified with Xdebug 3.5.3 on PHP 8.5.7 (ZTS). |
-| macOS, arm64 | Supported (untested live) | `--xdebug` downloads `ephpm-ext-<php>-macos-aarch64.tar.gz` from the catalog (published for 8.3.33, 8.4.23 and 8.5.7), or use `--xdebug-path`. Needs an ePHPm macOS binary newer than v0.11.3: earlier ones were linked without `-export_dynamic`, so `-dead_strip` removed PHP functions that ePHPm never calls but Xdebug imports, and loading fails with `symbol not found in flat namespace`. |
+| Linux, glibc, x86_64 / aarch64 | Supported | Xdebug fetched from the ePHPm extension catalog (see below), or `--xdebug-path`. Verified with Xdebug 3.5.3 on PHP 8.5.7 and 8.5.11 (ZTS). |
+| macOS, arm64 | Supported (untested live) | `--xdebug` downloads `ephpm-ext-<php>-macos-aarch64.tar.gz` from the catalog (published for PHP 8.3, 8.4 and 8.5), or use `--xdebug-path`. Needs an ePHPm macOS binary newer than v0.11.3: earlier ones were linked without `-export_dynamic`, so `-dead_strip` removed PHP functions that ePHPm never calls but Xdebug imports, and loading fails with `symbol not found in flat namespace`. |
 | Windows | Not available with the release binaries | The Windows release binaries link PHP statically (`php8embed.lib`), and a static PHP cannot load extension DLLs. Loading Xdebug needs a build against a shared `php8ts.dll`. Use ePHPm under WSL today. |
 
 Xdebug must be a **ZTS** build for the PHP minor your ePHPm binary embeds
@@ -115,11 +115,11 @@ download at a mirror; both must be `https://` URLs unless they point at a
 loopback address. The release listing uses the unauthenticated GitHub
 API (60 requests/hour); a rate-limited response is reported as such.
 
-> **Catalog status:** the Linux catalog ships Xdebug 3.5.3 for PHP 8.3, 8.4
-> and 8.5 — including the `ext-8.3.33`, `ext-8.4.23` and `ext-8.5.7`
-> releases the current binaries are built against — and 3.6.0alpha1 for the
-> 8.6 beta. macOS arm64 tarballs ship Xdebug 3.5.3 in those same three
-> releases. Where no release for your PHP minor has a tarball for your
+> **Catalog status:** the Linux (x86_64, aarch64) and macOS arm64 catalogs
+> ship Xdebug 3.5.3 for PHP 8.3, 8.4 and 8.5 — in the current patch
+> releases and in the ones the current binaries are built against
+> (`ext-8.3.33`, `ext-8.4.23`, `ext-8.5.7`) — and 3.6.0alpha1 for the 8.6
+> beta on Linux. Where no release for your PHP minor has a tarball for your
 > platform, `--xdebug` stops with "the ePHPm extension catalog does not
 > publish <platform> builds for PHP 8.x yet" — use `--xdebug-path` with your
 > own ZTS build then.
