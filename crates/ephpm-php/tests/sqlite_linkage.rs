@@ -17,13 +17,15 @@
 //!    turn it into `SQLITE_MISUSE`.
 //!
 //! Requires a real libphp link (`php_linked`); compiles to nothing in stub
-//! mode. Run with:
+//! mode and on the Windows shared-engine build (`php_shared`), where SQLite
+//! is the official `libsqlite3.dll` loaded with `php_pdo_sqlite.dll`, not part
+//! of this link, and the memory-statistics tuning does not apply. Run with:
 //!
 //! ```text
 //! cargo test -p ephpm-php --release --test sqlite_linkage -- --test-threads=1
 //! ```
 
-#![cfg(all(test, php_linked))]
+#![cfg(all(test, php_linked, not(php_shared)))]
 
 use std::sync::OnceLock;
 

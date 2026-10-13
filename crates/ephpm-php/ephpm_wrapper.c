@@ -6287,12 +6287,16 @@ void ephpm_cli_add_ini_define(const char *def)
  * symbols.
  *
  * Only declared when both SQLite extensions are statically compiled in,
- * which is what makes the SDK's libsqlite3 part of the link. The SDK ships
+ * which is what makes the SDK's libsqlite3 part of the link. Not on the
+ * Windows shared-engine build (EPHPM_PHP_SHARED): its config.w32.h defines
+ * HAVE_SQLITE3, but sqlite3/pdo_sqlite are DLLs there and SQLite is
+ * libsqlite3.dll, which this executable does not link. The SDK ships
  * the library but not sqlite3.h, hence the hand-written prototype; the
  * option value is SQLITE_CONFIG_MEMSTATUS from sqlite3.h (stable ABI, 9
  * since SQLite 3.6).
  */
-#if defined(HAVE_SQLITE3) && !defined(COMPILE_DL_SQLITE3) && !defined(COMPILE_DL_PDO_SQLITE)
+#if defined(HAVE_SQLITE3) && !defined(COMPILE_DL_SQLITE3) && !defined(COMPILE_DL_PDO_SQLITE) \
+    && !defined(EPHPM_PHP_SHARED)
 #define EPHPM_LINKS_SQLITE 1
 extern int sqlite3_config(int op, ...);
 #define EPHPM_SQLITE_CONFIG_MEMSTATUS 9

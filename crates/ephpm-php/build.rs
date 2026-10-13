@@ -548,7 +548,12 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool, s
     // built without the static cache does). The cost is a function call per
     // EG()/SG() access in the wrapper only; the engine keeps its own cache.
     build.define("ZTS", Some("1"));
-    if !shared {
+    if shared {
+        // Lets the wrapper tell the shared engine apart, e.g. SQLite lives in
+        // libsqlite3.dll beside php_pdo_sqlite.dll there, not in this link,
+        // even though the engine's config.w32.h defines HAVE_SQLITE3.
+        build.define("EPHPM_PHP_SHARED", Some("1"));
+    } else {
         build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
     }
     if target_os == "windows" {
