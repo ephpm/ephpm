@@ -4170,7 +4170,9 @@ pub struct WorkerConfig {
     /// keeping worker RSS flat for multi-GB uploads.
     ///
     /// Smaller requests stay on the buffered Phase-1 path (one copy each way),
-    /// which is cheaper for the common small-body case.
+    /// which is cheaper for the common small-body case. A request with no
+    /// body at all (a GET with neither `Content-Length` nor
+    /// `Transfer-Encoding`) is always buffered — as an empty body.
     ///
     /// (The per-request path always buffers the body today.)
     ///

@@ -294,7 +294,7 @@ These appear when `[php] mode = "worker"`.
 |--------|------|--------|-------------|
 | `ephpm_worker_pool_size` | gauge | — | Configured number of persistent worker threads, set at pool startup. |
 | `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. **Drifts upward** after a `stage="request"` timeout or a client disconnect while a request is waiting on its worker: the decrement is skipped when the waiting future is dropped. Long-run levels are unreliable. |
-| `ephpm_worker_idle` | gauge | — | Workers parked in `take_request()` waiting for work (recorded inside the dispatch recv; only moves in PHP-linked builds). |
+| `ephpm_worker_idle` | gauge | — | Workers waiting for work in `take_request()` (polling the dispatch queue for up to 200 µs, then parked; recorded inside the dispatch recv; only moves in PHP-linked builds). |
 | `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs sitting in the dispatch queue, sampled at each dispatch. |
 | `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to **enter** the dispatch queue (backpressure when the queue is full). Time spent inside the queue waiting for a free worker is not included. |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | Time from worker-thread start to the framework's first `take_request()` (i.e. framework boot time). |

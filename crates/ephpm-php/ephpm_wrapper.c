@@ -1005,6 +1005,13 @@ int ephpm_thread_init_preseeded(
     return ret == SUCCESS ? 0 : -1;
 }
 
+/* zend_hash_reverse_apply callback: remove every entry (running its dtor). */
+static int ephpm_remove_persistent_entry(zval *zv)
+{
+    (void)zv;
+    return ZEND_HASH_APPLY_REMOVE;
+}
+
 /*
  * Shut down PHP on the current thread.
  *
@@ -1017,6 +1024,27 @@ void ephpm_thread_shutdown(void)
         php_request_shutdown(NULL);
         request_active = 0;
     }
+
+    /* Release this thread's persistent resources (pfsockopen / persistent
+     * stream_socket_client sockets such as Predis 'persistent' => true,
+     * persistent PDO handles, ...) before retiring the thread.
+     *
+     * Since PHP 8.4, ts_free_thread() no longer destroys a thread's
+     * EG(persistent_list): executor_globals_dtor() lost that step and the
+     * per-thread lists are now destroyed only at zend_shutdown(), for the
+     * threads still registered then. A thread that retires earlier — every
+     * worker-mode recycle ([php.worker] max_requests), every exiting pool
+     * thread — would otherwise keep each persistent socket open, and its
+     * memory allocated, for the life of the process: one leaked connection
+     * per recycle until the process runs out of file descriptors.
+     *
+     * Emptying the list (reverse order, as zend_destroy_rsrc_list does) runs
+     * every resource's persistent destructor here, on its owning thread, after
+     * request shutdown and before the module globals are torn down — the same
+     * order zend_shutdown() uses. The table itself stays valid, so on PHP 8.3,
+     * whose executor_globals_dtor() still destroys the list inside
+     * ts_free_thread(), that destroy finds an empty table and is a no-op. */
+    zend_hash_reverse_apply(&EG(persistent_list), ephpm_remove_persistent_entry);
 
     /* Free thread-local buffers */
     if (output_buf) {

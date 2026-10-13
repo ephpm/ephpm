@@ -695,6 +695,66 @@ thread_local! {
         const { std::cell::Cell::new(std::time::Duration::from_secs(60)) };
 }
 
+/// How long an idle worker polls the dispatch queue before parking.
+///
+/// Under load the next job usually arrives within microseconds of a worker
+/// finishing the previous one. Parking straight away costs, per idle gap:
+/// registering a listener (a mutex every idle worker and every sender
+/// contends on), a futex sleep, the sender's futex wake, and then the
+/// scheduler latency until the woken thread runs again, which on a busy host
+/// is the dominant term. Profiling a saturated 20-worker pool showed ~22% of
+/// all PHP-thread context switches were sleeps on that listener mutex and
+/// another ~23% were parks on an empty queue. A short bounded poll catches
+/// the next job without any of that; an idle server pays at most this much
+/// CPU per request before the worker parks as before.
+///
+/// 200 µs was chosen by measurement (Yii3 `/`, 20 workers, 32 vCPUs): it
+/// raised saturated throughput ~4% over parking immediately, more than 50 µs
+/// did. Most of the poll yields the CPU rather than burning it (see
+/// [`recv_spin_then_block`]).
+#[cfg_attr(not(php_linked), allow(dead_code))]
+const DISPATCH_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// Receive the next dispatched job: poll `rx` for up to `spin`, then park in
+/// `recv_blocking`.
+///
+/// The first few polls are pure CPU spins; after that each poll yields the
+/// CPU (`sched_yield`), so on an oversubscribed host the wait hands the core
+/// to whichever thread (a tokio worker about to enqueue the next job,
+/// typically) is runnable. A closed channel returns immediately, exactly as
+/// `recv_blocking` does — drain is not delayed.
+///
+/// # Errors
+///
+/// [`async_channel::RecvError`] once the channel is closed and empty.
+#[cfg_attr(not(php_linked), allow(dead_code))]
+pub(crate) fn recv_spin_then_block<T>(
+    rx: &async_channel::Receiver<T>,
+    spin: std::time::Duration,
+) -> Result<T, async_channel::RecvError> {
+    const PURE_SPINS: u32 = 32;
+    let mut started: Option<std::time::Instant> = None;
+    let mut polls: u32 = 0;
+    loop {
+        match rx.try_recv() {
+            Ok(job) => return Ok(job),
+            Err(async_channel::TryRecvError::Closed) => return Err(async_channel::RecvError),
+            Err(async_channel::TryRecvError::Empty) => {}
+        }
+        // Only consult the clock once the fast path has missed.
+        let start = *started.get_or_insert_with(std::time::Instant::now);
+        if start.elapsed() >= spin {
+            return rx.recv_blocking();
+        }
+        if polls < PURE_SPINS {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+        polls = polls.saturating_add(1);
+    }
+}
+
 /// Install the dispatch receiver for the current worker thread. Called by the
 /// pool immediately before booting the worker.
 #[cfg(php_linked)]
@@ -911,10 +971,10 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         return 0;
     }
 
-    let Some(rx) = DISPATCH_RX.with(|cell| cell.borrow().clone()) else {
+    if DISPATCH_RX.with(|cell| cell.borrow().is_none()) {
         // No receiver installed — nothing can ever arrive; treat as shutdown.
         return 0;
-    };
+    }
 
     // Framework terminate hooks may run PHP (including ephpm_db_*) between
     // send_response and this call — after finish_iteration's per-request
@@ -931,9 +991,15 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
     // atomic load when it is not due.
     crate::jit_metrics::maybe_sample();
 
-    // The worker is idle exactly while it is parked in this recv.
+    // The worker is idle exactly while it waits in this recv. Borrowed, not
+    // cloned: a `Receiver` clone + drop per request is two atomic RMWs on the
+    // channel's shared receiver count from every worker thread.
     metrics::gauge!("ephpm_worker_idle").increment(1.0);
-    let recv = rx.recv_blocking();
+    let recv = DISPATCH_RX.with(|cell| {
+        let rx = cell.borrow();
+        let rx = rx.as_ref().expect("checked above; only replaced at thread start");
+        recv_spin_then_block(rx, DISPATCH_SPIN)
+    });
     metrics::gauge!("ephpm_worker_idle").decrement(1.0);
     let job = match recv {
         Ok(job) => job,
@@ -1376,5 +1442,82 @@ mod tests {
             }
             WorkerResponse::Streaming { .. } => panic!("internal_error must be buffered"),
         }
+    }
+}
+
+/// [`recv_spin_then_block`] — no PHP needed, so these run in stub mode too.
+#[cfg(test)]
+mod dispatch_recv_tests {
+    use std::time::{Duration, Instant};
+
+    use super::recv_spin_then_block;
+
+    #[test]
+    fn returns_a_queued_job_immediately() {
+        let (tx, rx) = async_channel::bounded(4);
+        tx.try_send(7u32).unwrap();
+        assert_eq!(recv_spin_then_block(&rx, Duration::from_secs(10)), Ok(7));
+    }
+
+    #[test]
+    fn picks_up_a_job_that_arrives_while_spinning() {
+        let (tx, rx) = async_channel::bounded(4);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            tx.send_blocking(1u32).unwrap();
+            tx // keep the channel open until the receiver is done
+        });
+        assert_eq!(recv_spin_then_block(&rx, Duration::from_secs(10)), Ok(1));
+        drop(sender.join().unwrap());
+    }
+
+    #[test]
+    fn parks_after_the_spin_and_still_receives() {
+        let (tx, rx) = async_channel::bounded(4);
+        let sender = std::thread::spawn(move || {
+            // Well past the 1 ms spin: the receiver is parked in recv_blocking.
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send_blocking(2u32).unwrap();
+            tx
+        });
+        assert_eq!(recv_spin_then_block(&rx, Duration::from_millis(1)), Ok(2));
+        drop(sender.join().unwrap());
+    }
+
+    #[test]
+    fn a_closed_channel_ends_the_wait_without_finishing_the_spin() {
+        let (tx, rx) = async_channel::bounded::<u32>(4);
+        tx.close();
+        let t = Instant::now();
+        assert_eq!(
+            recv_spin_then_block(&rx, Duration::from_secs(30)),
+            Err(async_channel::RecvError)
+        );
+        assert!(t.elapsed() < Duration::from_secs(5), "drain must not wait out the spin");
+
+        // Closed while already parked (past the spin) — recv_blocking's own
+        // close handling.
+        let (tx, rx) = async_channel::bounded::<u32>(4);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx.close();
+        });
+        assert_eq!(
+            recv_spin_then_block(&rx, Duration::from_millis(1)),
+            Err(async_channel::RecvError)
+        );
+        closer.join().unwrap();
+    }
+
+    #[test]
+    fn queued_jobs_still_drain_after_close() {
+        let (tx, rx) = async_channel::bounded(4);
+        tx.try_send(3u32).unwrap();
+        tx.close();
+        assert_eq!(recv_spin_then_block(&rx, Duration::from_millis(1)), Ok(3));
+        assert_eq!(
+            recv_spin_then_block(&rx, Duration::from_millis(1)),
+            Err(async_channel::RecvError)
+        );
     }
 }
