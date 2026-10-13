@@ -6417,12 +6417,18 @@ impl FsKindMemo {
     }
 }
 
-/// Whether `path` is spelled with a trailing separator (`"dir/"`).
+/// Whether `path` is spelled so that it can only name a directory: a trailing
+/// separator (`"dir/"`) or a final `.` segment (`"dir/."`). `stat` fails with
+/// `ENOTDIR` for either spelling of a regular file, but `Path` equality and
+/// `components()` drop both, so the memo has to re-apply the rule itself.
 fn has_trailing_separator(path: &Path) -> bool {
-    path.as_os_str()
-        .as_encoded_bytes()
-        .last()
-        .is_some_and(|b| std::path::is_separator(char::from(*b)))
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let is_sep = |b: u8| std::path::is_separator(char::from(b));
+    match bytes {
+        [.., last] if is_sep(*last) => true,
+        [.., sep, b'.'] => is_sep(*sep),
+        _ => false,
+    }
 }
 
 /// Whether a worker-mode request body is streamed into the worker
@@ -11720,6 +11726,13 @@ echo "post response";
         );
         assert!(
             matches!(resolve_dir_first("/nope"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+
+        // A trailing `.` segment can only name a directory, exactly as the
+        // uncached lookups saw it: `style.css/.` is not a file, so the request
+        // falls through to the front controller.
+        assert!(
+            matches!(resolve("/style.css/."), Resolved::File(p) if p == site.path().join("index.php"))
         );
     }
 
