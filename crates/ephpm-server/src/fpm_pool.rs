@@ -1354,6 +1354,40 @@ mod tests {
         assert!(wait_for(|| pool.live_count() == 0).await, "drain retires both threads");
     }
 
+    /// `admission = "barge"` with real threads: dispatchers waiting for queue
+    /// space are woken by threads going idle as well as by queue pops, so a
+    /// burst far larger than the backlog is fully served (none stranded
+    /// until its request timeout while threads sit idle).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn barge_burst_is_fully_served_by_idle_threads() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(2, 1, AdmissionPolicy::Barge);
+        assert!(wait_for(|| pool.ready_count() == 2).await, "threads should register");
+        for _ in 0..20 {
+            let mut tasks = Vec::new();
+            for _ in 0..16 {
+                let pool = Arc::clone(&pool);
+                tasks.push(tokio::spawn(async move {
+                    let task: FpmTask = Box::new(|| {
+                        std::thread::sleep(Duration::from_micros(300));
+                        Ok(PhpResponse { status: 200, headers: Vec::new(), body: Vec::new() })
+                    });
+                    let rx = pool.dispatch(task).await.expect("dispatch ok");
+                    reply(rx).await
+                }));
+            }
+            for t in tasks {
+                let status = tokio::time::timeout(Duration::from_secs(5), t)
+                    .await
+                    .expect("a barge dispatcher was stranded")
+                    .expect("join");
+                assert_eq!(status, 200);
+            }
+        }
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires every thread");
+    }
+
     /// Fairness under a slow/fast mix: queued requests are handed out in
     /// arrival order whatever their cost — a fast request is never overtaken
     /// (or starved) by later ones, and a slow one never jumps the queue. One

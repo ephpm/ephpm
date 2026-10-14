@@ -215,6 +215,7 @@ impl<T> Dispatcher<T> {
                 state: AtomicU8::new(READY),
                 thread: std::thread::current(),
             }),
+            _not_send: std::marker::PhantomData,
         }
     }
 
@@ -226,6 +227,12 @@ impl<T> Dispatcher<T> {
     /// [`TryPushError::Full`] when no thread is idle and the overflow queue is
     /// at capacity; [`TryPushError::Closed`] after [`Dispatcher::close`].
     pub fn try_push(&self, job: T) -> Result<(), TryPushError<T>> {
+        self.try_push_inner(job).map(|_space_left| ())
+    }
+
+    /// [`Dispatcher::try_push`], also reporting whether room for another job
+    /// (an idle thread or a free queue slot) is left afterwards.
+    fn try_push_inner(&self, job: T) -> Result<bool, TryPushError<T>> {
         let mut st = lock(&self.shared.state);
         if st.closed {
             return Err(TryPushError::Closed(job));
@@ -233,16 +240,17 @@ impl<T> Dispatcher<T> {
         if let Some(slot) = st.idle.pop() {
             // Popping the slot under the lock makes this caller its only
             // deliverer; the delivery itself (and any unpark) runs unlocked.
+            let space_left = !st.idle.is_empty() || st.queue.len() < self.shared.capacity;
             drop(st);
             slot.deliver(Some(job));
-            return Ok(());
+            return Ok(space_left);
         }
         if st.queue.len() >= self.shared.capacity {
             return Err(TryPushError::Full(job));
         }
         st.queue.push_back(job);
         self.shared.queued.store(st.queue.len(), Ordering::Relaxed);
-        Ok(())
+        Ok(st.queue.len() < self.shared.capacity)
     }
 
     /// Like [`Dispatcher::try_push`], but wait for space while the overflow
@@ -274,8 +282,18 @@ impl<T> Dispatcher<T> {
             // Register interest before re-checking, so a pop that frees space
             // between the check and the await cannot be missed.
             notified.as_mut().enable();
-            match self.try_push(job) {
-                Ok(()) => return Ok(()),
+            match self.try_push_inner(job) {
+                Ok(space_left) => {
+                    // A wake-up is one unit of room, but room can also open
+                    // without a pop (a thread going idle) or be more than
+                    // this waiter used (its job went to an idle thread,
+                    // leaving the freed queue slot). Pass the baton on so no
+                    // other waiter sleeps while there is room.
+                    if space_left && self.shared.push_waiters.load(Ordering::Acquire) > 1 {
+                        self.shared.space.notify_one();
+                    }
+                    return Ok(());
+                }
                 Err(TryPushError::Closed(j)) => return Err(j),
                 Err(TryPushError::Full(j)) => job = j,
             }
@@ -345,6 +363,8 @@ fn pop_queued<T>(shared: &Shared<T>, st: &mut State<T>) -> Option<T> {
 pub struct Worker<T> {
     shared: Arc<Shared<T>>,
     slot: Arc<Slot<T>>,
+    /// `!Send`: the mailbox wakes the thread that registered it.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl<T> std::fmt::Debug for Worker<T> {
@@ -380,6 +400,12 @@ impl<T> Worker<T> {
                 // dispatcher (or `close`) may touch it.
                 self.slot.state.store(WAITING, Ordering::Release);
                 st.idle.push(Arc::clone(&self.slot));
+                // An idle thread is room as well: a `push` waiter parked on a
+                // full queue must hear about it, or it can sleep while
+                // threads sit idle (otherwise only pops would wake it).
+                if self.shared.push_waiters.load(Ordering::Acquire) > 0 {
+                    self.shared.space.notify_one();
+                }
             }
             self.wait_ready(spin);
             if let Some(job) = self.slot.take() {
@@ -428,8 +454,8 @@ impl<T> Worker<T> {
     /// Put this thread on the idle stack without waiting, as `recv` does just
     /// before it blocks. Lets tests stage a delivery into a mailbox whose
     /// owner then retires.
-    #[doc(hidden)]
-    pub fn register_idle_for_test(&self) {
+    #[cfg(test)]
+    fn register_idle_for_test(&self) {
         let mut st = lock(&self.shared.state);
         self.slot.state.store(WAITING, Ordering::Release);
         st.idle.push(Arc::clone(&self.slot));
@@ -464,8 +490,10 @@ impl<T> Drop for Worker<T> {
             drop(st);
             other.deliver(Some(job));
         } else {
-            // Front: it was dispatched before anything still queued. This
-            // can exceed `capacity` by at most the one rerouted job.
+            // Front: it was dispatched before anything still queued. Under
+            // FIFO admission the job still holds its permit, so the bound
+            // holds; under barge admission each re-routed job can exceed
+            // `capacity` by one (a window `recv` never leaves open).
             st.queue.push_front(job);
             self.shared.queued.store(st.queue.len(), Ordering::Relaxed);
         }
@@ -801,6 +829,86 @@ mod tests {
         assert_eq!(d.try_pop_queued(), Some(3));
         waiter.await.unwrap().unwrap();
         assert_eq!(d.try_pop_queued(), Some(2));
+    }
+
+    /// Barge waiters must be woken by any new room, not just by queue pops:
+    /// here the first waiter's job goes to a thread that just went idle,
+    /// leaving the freed queue slot for the second waiter.
+    #[tokio::test]
+    async fn barge_waiter_not_stranded_when_space_frees_via_idle_handoff() {
+        let d: Dispatcher<u32> = Dispatcher::new(1);
+        d.try_push(1).unwrap();
+        let w1 = {
+            let d = d.clone();
+            tokio::spawn(async move { d.push(2).await })
+        };
+        let w2 = {
+            let d = d.clone();
+            tokio::spawn(async move { d.push(3).await })
+        };
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(d.try_pop_queued(), Some(1)); // wakes one waiter
+        let worker = d.register_worker();
+        worker.register_idle_for_test(); // the woken job bypasses the queue
+        assert!(tokio::time::timeout(Duration::from_secs(2), w1).await.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), w2).await.is_ok(),
+            "w2 stranded: the queue has a free slot but nobody woke it"
+        );
+    }
+
+    /// Barge `push` against real threads that keep going idle: every waiter
+    /// must get in, round after round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn barge_push_under_churn_never_strands() {
+        for round in 0..50 {
+            let d: Dispatcher<u32> = Dispatcher::new(1);
+            let done = Arc::new(AtomicUsize::new(0));
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let d = d.clone();
+                    let done = Arc::clone(&done);
+                    std::thread::spawn(move || {
+                        let w = d.register_worker();
+                        while w.recv(Duration::ZERO).is_ok() {
+                            std::thread::sleep(Duration::from_micros(300));
+                            done.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            let tasks: Vec<_> = (0..16u32)
+                .map(|i| {
+                    let d = d.clone();
+                    tokio::spawn(async move { d.push(i).await })
+                })
+                .collect();
+            for t in tasks {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), t).await.is_ok(),
+                    "round {round}: stranded (queued={}, idle={})",
+                    d.queued(),
+                    d.idle_count()
+                );
+            }
+            d.close();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(done.load(Ordering::SeqCst), 16);
+        }
+    }
+
+    /// A cancelled `push` (the request timeout) releases its waiter count.
+    #[tokio::test]
+    async fn cancelled_push_releases_its_waiter_slot() {
+        let d: Dispatcher<u32> = Dispatcher::new(1);
+        d.try_push(1).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), d.push(2)).await.is_err());
+        assert_eq!(d.shared.push_waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(d.queued(), 1, "the cancelled job was never queued");
     }
 
     #[tokio::test]
