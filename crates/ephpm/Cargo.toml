@@ -127,8 +127,20 @@ landlock = "0.4"
 #   and two-level-namespace dylibs, so it is kept off.
 # - Windows: the MSVC `/MD` vs PHP-SDK `/MT` LNK2038 mismatch (above), and
 #   mimalloc only supports overriding malloc there via its redirect DLL.
+#
+# `no_thp` (MI_NO_THP): mimalloc 3 otherwise `madvise(MADV_HUGEPAGE)`s every
+# arena it maps. With the override that covers PHP's persistent heap too, and
+# on hosts where THP is `madvise` it raised resident memory in testing. The
+# build flag only drops mimalloc's own hint; unlike `MIMALLOC_ALLOW_THP=0` it
+# does not `prctl(PR_SET_THP_DISABLE)` the whole process (which would also
+# switch off Zend MM / opcache huge pages and be inherited by child processes).
+#
+# Keep the version on the same semver line as the `mimalloc` crate's own
+# `libmimalloc-sys` dependency: a second copy would not get the features (it
+# fails the link loudly with duplicate `mi_*` symbols rather than silently).
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = [
     "override",
+    "no_thp",
 ], optional = true }
 
 [target.'cfg(windows)'.dependencies]
