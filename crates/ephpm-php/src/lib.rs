@@ -4,6 +4,7 @@
 
 pub mod crash_guard;
 pub mod db_bridge;
+pub mod handoff;
 pub mod jit_metrics;
 pub mod kv_bridge;
 pub mod opcode;

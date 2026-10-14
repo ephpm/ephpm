@@ -6,6 +6,12 @@
 > `[php] queue_depth`, and `fpm_engine = "pool"` as the (now only) per-request
 > execution pool; the `spawn_blocking`-engine caveats no longer apply.
 > Historical content is otherwise preserved as written.
+>
+> **Later change:** the shared `async_channel` was since replaced by a
+> per-thread handoff (`crates/ephpm-php/src/handoff.rs`): idle threads get
+> jobs directly and only the overflow waits in a shared bounded FIFO. The
+> FIFO admission semaphore this document motivates sits in front of it,
+> unchanged.
 
 Issue #442: in the third-party Laravel runtime comparison (wrk `-t10 -c100
 -d30s`, `worker_count = 2`, v0.8.7-php8.4, array sessions), ePHPm worker mode

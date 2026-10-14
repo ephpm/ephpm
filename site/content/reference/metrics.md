@@ -264,7 +264,7 @@ These appear in per-request mode (`[php] mode = "per_request"`, the default exec
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_fpm_pool_size` | gauge | — | Configured number of dedicated FPM pool threads, set at pool startup. Also the concurrency cap for this engine. |
-| `ephpm_fpm_pool_queue_depth` | gauge | — | Requests enqueued on the dispatch queue but not yet pulled by a thread. |
+| `ephpm_fpm_pool_queue_depth` | gauge | — | Requests waiting in the dispatch overflow queue because every pool thread was busy, sampled at each dispatch. A request that finds an idle thread is handed to it directly and never counts. |
 | `ephpm_fpm_pool_boot_failures_total` | counter | — | Pool threads that failed to start (thread spawn or TSRM registration failure). The pool respawns with exponential backoff. |
 | `ephpm_fpm_pool_panics_total` | counter | — | Rust panics escaping a PHP job. The request still gets a 500 and the thread is retired. A PHP bailout is *not* a panic and is not counted here. |
 | `ephpm_fpm_pool_contained_crashes_total` | counter | — | PHP C-stack overflows contained instead of aborting the process. Requires [`[php] crash_containment`](/reference/config/#php); always `0` without it. Any non-zero value means a request crashed PHP and a thread was poisoned. |
@@ -294,8 +294,8 @@ These appear when `[php] mode = "worker"`.
 |--------|------|--------|-------------|
 | `ephpm_worker_pool_size` | gauge | — | Configured number of persistent worker threads, set at pool startup. |
 | `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. **Drifts upward** after a `stage="request"` timeout or a client disconnect while a request is waiting on its worker: the decrement is skipped when the waiting future is dropped. Long-run levels are unreliable. |
-| `ephpm_worker_idle` | gauge | — | Workers waiting for work in `take_request()` (polling the dispatch queue for up to 200 µs, then parked; recorded inside the dispatch recv; only moves in PHP-linked builds). |
-| `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs sitting in the dispatch queue, sampled at each dispatch. |
+| `ephpm_worker_idle` | gauge | — | Workers waiting for work in `take_request()` (polling their own dispatch mailbox for up to 200 µs, then parked; recorded inside the dispatch recv; only moves in PHP-linked builds). |
+| `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs waiting in the dispatch overflow queue because every worker was busy, sampled at each dispatch. A job that finds an idle worker is handed to it directly and never counts. |
 | `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to **enter** the dispatch queue (backpressure when the queue is full). Time spent inside the queue waiting for a free worker is not included. |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | Time from worker-thread start to the framework's first `take_request()` (i.e. framework boot time). |
 | `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `[php.worker] boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |

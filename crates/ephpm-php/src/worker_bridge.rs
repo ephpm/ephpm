@@ -5,7 +5,9 @@
 //! `\Ephpm\Worker\take_request()` / `send_response()` native functions call
 //! into the [`EphpmWorkerOps`] table set via [`ephpm_set_worker_ops`]:
 //!
-//! - `take_request` blocks on the per-thread dispatch [`Receiver`], stashes the
+//! - `take_request` blocks on the thread's dispatch source (its
+//!   [`handoff::Worker`](crate::handoff::Worker) mailbox in the pool, a
+//!   one-job channel on the debug lane), stashes the
 //!   job's `oneshot::Sender` in a [`thread_local!`] cell, and fills a borrowed
 //!   [`EphpmWorkerRequest`] view for C to marshal into the `Envelope` object.
 //! - `send_response` takes the stashed sender back out and fulfils it.
@@ -640,18 +642,10 @@ type ResponseChunkTx = tokio::sync::mpsc::Sender<bytes::Bytes>;
 // are the only callers and both do exactly that.
 #[cfg(php_linked)]
 thread_local! {
-    /// The dispatch receiver for this worker thread. Installed by the pool via
-    /// [`set_dispatch_receiver`] before the worker boots.
-    static DISPATCH_RX: RefCell<Option<async_channel::Receiver<WorkerJob>>> =
-        const { RefCell::new(None) };
-
-    /// Shared counter of jobs currently sitting in the dispatch channel.
-    /// Incremented by the pool on enqueue, decremented here after each
-    /// successful `recv_blocking`. Lets the pool report queue depth from a
-    /// single `Relaxed` load instead of the SeqCst spin-loop in
-    /// `async_channel::Sender::len()` on every dispatch.
-    static DISPATCH_DEPTH: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
-        const { RefCell::new(None) };
+    /// Where this worker thread's jobs come from. Installed by the pool
+    /// ([`set_dispatch_worker`]) or the debug lane ([`set_dispatch_receiver`])
+    /// before the worker boots.
+    static DISPATCH: RefCell<Option<DispatchSource>> = const { RefCell::new(None) };
 
     /// The parked `oneshot::Sender` for the in-flight request. Stashed by
     /// `take_request`, taken by `send_response` (or by the supervisor on
@@ -695,28 +689,47 @@ thread_local! {
         const { std::cell::Cell::new(std::time::Duration::from_secs(60)) };
 }
 
-/// How long an idle worker polls the dispatch queue before parking.
+/// How long an idle worker polls its mailbox before parking.
 ///
 /// Under load the next job usually arrives within microseconds of a worker
-/// finishing the previous one. Parking straight away costs, per idle gap:
-/// registering a listener (a mutex every idle worker and every sender
-/// contends on), a futex sleep, the sender's futex wake, and then the
-/// scheduler latency until the woken thread runs again, which on a busy host
-/// is the dominant term. Profiling a saturated 20-worker pool showed ~22% of
-/// all PHP-thread context switches were sleeps on that listener mutex and
-/// another ~23% were parks on an empty queue. A short bounded poll catches
-/// the next job without any of that; an idle server pays at most this much
-/// CPU per request before the worker parks as before.
+/// finishing the previous one. Parking straight away costs, per idle gap, a
+/// futex sleep, the dispatcher's futex wake, and then the scheduler latency
+/// until the woken thread runs again, which on a busy host is the dominant
+/// term. A short bounded poll catches the next job without any of that; an
+/// idle server pays at most this much CPU per request before the worker parks.
+/// The poll reads only this worker's own mailbox
+/// ([`handoff::Worker::recv`](crate::handoff::Worker::recv)), so polling
+/// workers do not contend with each other or with the dispatcher.
 ///
 /// 200 µs was chosen by measurement (Yii3 `/`, 20 workers, 32 vCPUs): it
 /// raised saturated throughput ~4% over parking immediately, more than 50 µs
-/// did. Most of the poll yields the CPU rather than burning it (see
-/// [`recv_spin_then_block`]) — but on an idle host `sched_yield` returns at
-/// once, so each request that leaves its worker idle costs up to this much
-/// CPU before the park. Under a tight cgroup CPU quota at low request rates
-/// that is the price of the lower wake latency under load.
+/// did. Most of the poll yields the CPU rather than burning it — but on an
+/// idle host `sched_yield` returns at once, so each request that leaves its
+/// worker idle costs up to this much CPU before the park. Under a tight cgroup
+/// CPU quota at low request rates that is the price of the lower wake latency
+/// under load.
 #[cfg_attr(not(php_linked), allow(dead_code))]
 const DISPATCH_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// A worker thread's job source.
+#[cfg(php_linked)]
+enum DispatchSource {
+    /// A pool worker's mailbox on the pool's per-worker [`handoff`](crate::handoff)
+    /// dispatcher.
+    Handoff(crate::handoff::Worker<WorkerJob>),
+    /// The debug lane's one-job channel (closed right after its job is sent).
+    Channel(async_channel::Receiver<WorkerJob>),
+}
+
+#[cfg(php_linked)]
+impl DispatchSource {
+    fn recv(&self) -> Option<WorkerJob> {
+        match self {
+            Self::Handoff(worker) => worker.recv(DISPATCH_SPIN).ok(),
+            Self::Channel(rx) => recv_spin_then_block(rx, DISPATCH_SPIN).ok(),
+        }
+    }
+}
 
 /// Receive the next dispatched job: poll `rx` for up to `spin`, then park in
 /// `recv_blocking`.
@@ -758,29 +771,43 @@ pub(crate) fn recv_spin_then_block<T>(
     }
 }
 
-/// Install the dispatch receiver for the current worker thread. Called by the
-/// pool immediately before booting the worker.
+/// Install a one-job dispatch channel as the current worker thread's job
+/// source (the debug lane). Called immediately before booting the worker.
 #[cfg(php_linked)]
 pub fn set_dispatch_receiver(rx: async_channel::Receiver<WorkerJob>) {
-    DISPATCH_RX.with(|cell| *cell.borrow_mut() = Some(rx));
+    DISPATCH.with(|cell| *cell.borrow_mut() = Some(DispatchSource::Channel(rx)));
 }
 
 /// Stub: no dispatch channel without PHP linked.
 #[cfg(not(php_linked))]
 pub fn set_dispatch_receiver(_rx: async_channel::Receiver<WorkerJob>) {}
 
-/// Install the shared queue-depth counter for the current worker thread.
-/// Decremented on every successful `recv_blocking` so the pool can report
-/// dispatch-queue occupancy without calling `async_channel::len()` per
-/// dispatch (a SeqCst spin-loop) on the hot path.
+/// Install the current worker thread's mailbox on the pool's dispatcher as its
+/// job source. `worker` must have been registered on this thread
+/// ([`Dispatcher::register_worker`](crate::handoff::Dispatcher::register_worker)).
+/// Called by the pool immediately before booting the worker.
 #[cfg(php_linked)]
-pub fn set_dispatch_depth_counter(depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    DISPATCH_DEPTH.with(|cell| *cell.borrow_mut() = Some(depth));
+pub fn set_dispatch_worker(worker: crate::handoff::Worker<WorkerJob>) {
+    DISPATCH.with(|cell| *cell.borrow_mut() = Some(DispatchSource::Handoff(worker)));
 }
 
-/// Stub: no dispatch-depth accounting without PHP linked.
+/// Stub: no dispatch without PHP linked.
 #[cfg(not(php_linked))]
-pub fn set_dispatch_depth_counter(_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {}
+pub fn set_dispatch_worker(_worker: crate::handoff::Worker<WorkerJob>) {}
+
+/// Drop the current worker thread's job source. The pool calls this when the
+/// worker leaves its loop, so the thread's mailbox is unregistered (and
+/// anything left in it re-routed — see [`crate::handoff`]) before the thread
+/// spends time in PHP teardown.
+#[cfg(php_linked)]
+pub fn clear_dispatch_source() {
+    let source = DISPATCH.with(|cell| cell.borrow_mut().take());
+    drop(source);
+}
+
+/// Stub.
+#[cfg(not(php_linked))]
+pub fn clear_dispatch_source() {}
 
 /// Set the per-worker recycle threshold (`[php.worker] max_requests`; `0` disables).
 #[cfg(php_linked)]
@@ -974,8 +1001,8 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         return 0;
     }
 
-    if DISPATCH_RX.with(|cell| cell.borrow().is_none()) {
-        // No receiver installed — nothing can ever arrive; treat as shutdown.
+    if DISPATCH.with(|cell| cell.borrow().is_none()) {
+        // No job source installed — nothing can ever arrive; treat as shutdown.
         return 0;
     }
 
@@ -994,30 +1021,21 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
     // atomic load when it is not due.
     crate::jit_metrics::maybe_sample();
 
-    // The worker is idle exactly while it waits in this recv. Borrowed, not
-    // cloned: a `Receiver` clone + drop per request is two atomic RMWs on the
-    // channel's shared receiver count from every worker thread.
+    // The worker is idle exactly while it waits in this recv. The source is
+    // borrowed for the wait, not cloned or moved.
     metrics::gauge!("ephpm_worker_idle").increment(1.0);
-    let recv = DISPATCH_RX.with(|cell| {
-        let rx = cell.borrow();
-        let rx = rx.as_ref().expect("checked above; only replaced at thread start");
-        recv_spin_then_block(rx, DISPATCH_SPIN)
+    let recv = DISPATCH.with(|cell| {
+        let source = cell.borrow();
+        source.as_ref().expect("checked above; only replaced at thread start").recv()
     });
     metrics::gauge!("ephpm_worker_idle").decrement(1.0);
-    let job = match recv {
-        Ok(job) => job,
-        // Sender side closed (graceful drain) — end the loop.
-        Err(_) => return 0,
+    let Some(job) = recv else {
+        // Dispatch closed (graceful drain) — end the loop.
+        return 0;
     };
-    // The job just left the dispatch channel — reflect it in the shared
-    // depth counter the pool reports as `ephpm_worker_dispatch_queue_depth`,
-    // and release its admission permit so the pool's FIFO admission semaphore
-    // hands the freed queue slot to the longest-waiting dispatcher (#442).
-    DISPATCH_DEPTH.with(|cell| {
-        if let Some(depth) = cell.borrow().as_ref() {
-            depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
+    // Release the job's admission permit so the pool's FIFO admission
+    // semaphore hands the freed queue slot to the longest-waiting dispatcher
+    // (#442).
     drop(job.admission);
 
     // Stash the sender for send_response / crash recovery.
