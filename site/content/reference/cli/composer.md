@@ -16,11 +16,8 @@ it hands the work to a real `composer` on `PATH` or stops with an error. The
 differences are listed [below](#differences-from-composer), and you need to
 read them before you put it in CI.
 
-> **Pinned to vivacity 0.20.0, from the ePHPm fork.** ePHPm pins vivacity to
-> an exact version (`vivacity = "=0.20.0"` in the workspace `Cargo.toml`) and
-> builds it from [ephpm/vivace](https://github.com/ephpm/vivace) (a
-> `[patch.crates-io]` entry): upstream v0.20.0 plus one change that accepts
-> Composer's global `-n`/`-q`/`-v`/`--no-ansi` on every command. Flags and
+> **Pinned to vivacity 0.20.0.** ePHPm pins vivacity to an exact version
+> (`vivacity = "=0.20.0"` in the workspace `Cargo.toml`). Flags and
 > behavior can change when that pin moves, so this page describes that build
 > only. Released binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1
 > embeds 0.15.0, and v0.11.2 and v0.11.3 embed 0.17.0; this build ships in the
