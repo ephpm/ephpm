@@ -17,6 +17,23 @@ path = "src/main.rs"
 # stays inert until OTEL_EXPORTER_OTLP_ENDPOINT (or
 # [server.diagnostics] otlp_endpoint) is set.
 otlp = ["ephpm-server/otlp"]
+# Process-wide malloc override on Linux (default on). mimalloc's `malloc`,
+# `free`, `calloc`, `realloc`, `posix_memalign`, `malloc_usable_size`, ... are
+# defined in the executable, so the C side — libphp.a (persistent `pemalloc`
+# allocations, the ZTS per-thread globals), the SDK's static libs, libstdc++'s
+# `operator new`, glibc's own internal allocations (`realpath`, `getcwd`, ...)
+# and every `dlopen`ed shared PHP extension / native-middleware cdylib (whose
+# Rust `System` allocator is `malloc`) — uses the same allocator as Rust's
+# `#[global_allocator]`, instead of glibc malloc. Motivation: worker-mode
+# profiling showed glibc's per-thread arenas, created by PHP worker threads
+# that are later recycled, retained after those threads exit.
+#
+# No-op on other targets (the dependency below is glibc-Linux-only — see the
+# comment there). Escape hatch: `cargo build -p ephpm --no-default-features
+# [--features otlp]` builds a Linux binary that keeps glibc malloc for C code
+# (Rust still uses mimalloc via `#[global_allocator]`).
+default = ["malloc-override"]
+malloc-override = ["dep:libmimalloc-sys"]
 
 [dependencies]
 anyhow.workspace = true
@@ -43,24 +60,6 @@ litewire.workspace = true
 # forwards raw SQL (issue #471). `minimal-rust` (no TLS / no rsa) is fine: the
 # connection is loopback to a co-located server using mysql_native_password.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
-# mimalloc as the global allocator for the ephpm binary. Non-Windows only.
-#
-# Wins in workloads with many small, short-lived allocations (HTTP request
-# frames, RESP command payloads, MySQL packet vecs, litewire query buffers) —
-# the default system allocator has measurable contention under concurrent
-# tokio task load. Default features only (no `secure` — that adds tag
-# checks intended for adversarial-heap workloads at a real perf cost).
-#
-# Applied only at the binary crate level so downstream test/dev tooling
-# (unit tests, xtask, doc builds) uses the standard allocator and doesn't
-# introduce platform-specific surprises in CI.
-#
-# Not on Windows: mimalloc-sys builds its C with `/MD` (dynamic CRT) while
-# the PHP SDK's static objects are `/MT`, and MSVC refuses to link the
-# mismatch (LNK2038). The Windows allocator picture is also different —
-# SEG_HEAP already reduces the contention mimalloc addresses on glibc — so
-# Windows keeps the system allocator.
-#
 # tempfile is a runtime dependency, not just a test one: the generated
 # php.ini is materialised into a private mkdtemp directory (see
 # `run_with_config`), because a predictable path under a shared /tmp is
@@ -78,14 +77,59 @@ vivacity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# mimalloc as Rust's `#[global_allocator]` for the ephpm binary (src/main.rs).
+# Unix only.
+#
+# Wins in workloads with many small, short-lived allocations (HTTP request
+# frames, RESP command payloads, MySQL packet vecs, litewire query buffers) —
+# the default system allocator has measurable contention under concurrent
+# tokio task load. Default features only (no `secure` — that adds tag
+# checks intended for adversarial-heap workloads at a real perf cost).
+#
+# On Linux the `malloc-override` feature additionally makes it the C `malloc`
+# for the whole process — see `libmimalloc-sys` in the Linux section below.
+# On macOS only Rust allocations use mimalloc; C code (libphp, extensions)
+# keeps the system malloc.
+#
+# Not on Windows: mimalloc-sys builds its C with `/MD` (dynamic CRT) while
+# the PHP SDK's static objects are `/MT`, and MSVC refuses to link the
+# mismatch (LNK2038). The Windows allocator picture is also different —
+# SEG_HEAP already reduces the contention mimalloc addresses on glibc — so
+# Windows keeps the system allocator.
 mimalloc = { version = "0.1", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
 # Landlock filesystem sandbox for `ephpm exec` (see src/exec_sandbox.rs). Pure
 # Rust, ABI 1–4, no CAP_SYS_ADMIN, MSRV-compatible. Linux-only: the crate only
 # builds meaningfully on Linux and the sandboxed exec path is `cfg(target_os =
 # "linux")`. Other Unixes (macOS) refuse the subcommand at runtime.
-[target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# The C library under the `mimalloc` crate above (same package, so Cargo's
+# feature unification turns `override` on for the one copy that is linked).
+# `override` compiles mimalloc with MI_MALLOC_OVERRIDE: the executable then
+# *defines* `malloc`/`free`/`calloc`/`realloc`/`posix_memalign`/
+# `aligned_alloc`/`memalign`/`malloc_usable_size`/`__libc_*`, and because the
+# executable precedes libc.so in symbol lookup (and is linked with
+# `--export-dynamic` in PHP-linked builds — see build.rs) those definitions
+# preempt glibc's for libphp.a, glibc's own internal calls and every
+# `dlopen`ed `.so`. Pulled in only by the `malloc-override` feature.
+#
+# glibc Linux only, deliberately:
+# - musl: not a shipped target (releases are `-gnu`, see CLAUDE.md), and a
+#   static musl link resolving `malloc` against both mimalloc and libc.a's
+#   allocator objects is untested — kept off.
+# - macOS: mimalloc's override there is not a plain symbol definition but a
+#   malloc-zone swap plus dyld `__interpose` tuples (MI_OSX_ZONE /
+#   MI_OSX_INTERPOSE) — a mechanism designed for a preloaded dylib, not the
+#   static-archive symbol preemption used on Linux. Untested with the PHP SDK
+#   and two-level-namespace dylibs, so it is kept off.
+# - Windows: the MSVC `/MD` vs PHP-SDK `/MT` LNK2038 mismatch (above), and
+#   mimalloc only supports overriding malloc there via its redirect DLL.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = [
+    "override",
+], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

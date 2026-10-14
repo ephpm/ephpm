@@ -41,6 +41,15 @@ release notes.
 | Rust release build tuning: `lto = "fat"`, `codegen-units = 1`, and **mimalloc** as `#[global_allocator]` (non-Windows) | **~+2% cpu.php, ~+6% hello — measured** ([findings](/benchmarking/findings/)); real, kept, no regression. The modest size is itself the finding: the allocator was *not* the bottleneck, which retired the allocation-shaving micro-op backlog | [ephpm#171](https://github.com/ephpm/ephpm/pull/171) |
 | HTTP-listener `TCP_NODELAY` + wave-1 hot-path trims | **−13% hello c=16 p99, −8.6% c=1 p50** (v0.4.2-dev vs published v0.4.1, `--cpus 1`) — the nodelay tail signature | [results](/benchmarking/results/#v042-in-progress) |
 
+The #171 allocator swap covered **Rust allocations only**; PHP and its C
+libraries kept glibc `malloc`. Linux builds now override `malloc`/`free`
+process-wide with mimalloc, so PHP, glibc's internal allocations and
+`dlopen`ed extensions share Rust's allocator. That targets the glibc arenas
+that recycled worker threads leave behind (the `malloc-override` cargo
+feature, on by default on Linux; macOS and Windows unchanged; see
+[environment variables](/reference/environment-variables/) for the
+`MIMALLOC_*` tuning that now applies to PHP's memory too).
+
 `panic = "abort"` was evaluated as part of #171 and **deliberately not
 set**: the middleware runtime uses `std::panic::catch_unwind` to fail a
 panicking middleware `invoke` **closed** (500) and fail startup on a
