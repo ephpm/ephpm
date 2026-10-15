@@ -1996,12 +1996,23 @@ fn run_with_config(
     // size, so leaving tokio's 2 MiB default would make deep-but-legal PHP
     // (a nested template/block render) fail at a quarter of the depth php-fpm
     // allows. See `ephpm_php::PHP_THREAD_STACK` (issue #116).
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .enable_all()
         .thread_stack_size(ephpm_php::PHP_THREAD_STACK)
-        .on_thread_start(fatal_signal::install_thread_altstack)
-        .build()
-        .context("failed to create tokio runtime")?;
+        .on_thread_start(fatal_signal::install_thread_altstack);
+    // `[server] io_threads`: a non-zero value sizes tokio's async worker pool
+    // (and overrides TOKIO_WORKER_THREADS); `0` leaves tokio's own default.
+    // The blocking pool and the PHP execution pool are unaffected.
+    let io_threads = config.server.io_threads;
+    if io_threads > 0 {
+        builder.worker_threads(io_threads);
+    }
+    let rt = builder.build().context("failed to create tokio runtime")?;
+    {
+        let (effective, source) = effective_io_threads(io_threads);
+        tracing::info!(io_threads = effective, source, "tokio async I/O threads");
+    }
     let result = rt.block_on(async { ephpm_server::serve(config, dev_mode).await });
 
     // Drop the runtime BEFORE tearing down PHP (issue #266). Dropping joins
@@ -2020,6 +2031,28 @@ fn run_with_config(
     ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
 
     result.map(|()| ExitCode::SUCCESS)
+}
+
+/// Resolve the tokio worker-thread count the runtime was built with, and why,
+/// for the startup log line. Mirrors tokio's own resolution: an explicit
+/// `[server] io_threads` wins, else a valid `TOKIO_WORKER_THREADS`, else the
+/// host's available parallelism. (An *invalid* `TOKIO_WORKER_THREADS` makes
+/// tokio panic at build time, before this runs.)
+fn effective_io_threads(configured: usize) -> (usize, &'static str) {
+    if configured > 0 {
+        return (configured, "explicit");
+    }
+    if let Some(n) = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return (n, "TOKIO_WORKER_THREADS");
+    }
+    (
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        "host_parallelism",
+    )
 }
 
 /// Parse the Serve command and load configuration.
