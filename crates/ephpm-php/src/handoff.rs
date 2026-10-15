@@ -46,6 +46,27 @@
 //! spin-poll (see [`Worker::recv`]) and picks the job up without a futex wake,
 //! while threads at the bottom of the stack stay parked.
 //!
+//! ## Spinning before parking
+//!
+//! How long an idle thread polls its own mailbox before it parks is a
+//! [`SpinPolicy`]: a budget, how many of the polls are pure `spin_loop` hints
+//! before they become `sched_yield`s, and whether the budget adapts per thread.
+//! A thread that is polling marks its mailbox `SPINNING`, and a delivery into
+//! a mailbox that is not `PARKED` costs no syscall at all — the poller sees the
+//! job on its next read. Once any thread has spun, a dispatcher prefers a
+//! `SPINNING` mailbox near the top of the idle stack over a parked one above
+//! it, which matters once adaptive budgets let threads park at different times.
+//!
+//! With an **adaptive** policy, each delivery is time-stamped by the
+//! dispatcher and the thread compares that with when it went idle. A gap the
+//! full budget would have covered restores the full budget; a longer one
+//! halves the thread's current budget, down to zero. A thread that keeps
+//! waiting longer than the budget stops spinning, so a server at low request
+//! rates burns no CPU on polls that never pay off, and the first short gap
+//! turns spinning back on. The gap is measured from the dispatcher's side, so
+//! the scheduler latency of waking a parked thread does not count against
+//! spinning.
+//!
 //! ## Retirement
 //!
 //! A thread is on the idle stack only inside [`Worker::recv`], so a thread that
@@ -54,6 +75,7 @@
 //! and re-routes any job still sitting in its mailbox to another idle thread or
 //! the front of the overflow queue — a job is never lost with its thread.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -89,17 +111,151 @@ impl<T> TryPushError<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvClosed;
 
-/// Mailbox states. The worker moves `WAITING -> PARKED` before it sleeps; a
-/// dispatcher (or [`Dispatcher::close`]) moves either to `READY` and unparks
-/// only when it saw `PARKED`.
+/// Pure `spin_loop` polls before [`Worker::recv`] switches to `sched_yield`
+/// polls, unless a [`SpinPolicy`] says otherwise.
+pub const DEFAULT_PURE_SPINS: u32 = 32;
+
+/// An adaptive budget that halves below this collapses to zero (park at once).
+const ADAPTIVE_FLOOR: Duration = Duration::from_micros(2);
+
+/// How far down the idle stack a dispatcher looks for a spinning mailbox.
+const STEER_SCAN: usize = 8;
+
+/// How an idle pool thread waits for its next job (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpinPolicy {
+    /// Longest time to poll the mailbox before parking. `Duration::ZERO`
+    /// parks at once. With `adaptive`, the ceiling of each thread's budget.
+    pub budget: Duration,
+    /// Polls that are pure `spin_loop` hints before each further poll yields
+    /// the CPU (`sched_yield`). `u32::MAX` never yields; `0` always yields.
+    pub pure_spins: u32,
+    /// Adapt each thread's budget to the idle gaps it actually sees.
+    pub adaptive: bool,
+}
+
+impl SpinPolicy {
+    /// Park as soon as no job is waiting.
+    pub const PARK: Self = Self::fixed(Duration::ZERO);
+
+    /// Poll for up to `budget` ([`DEFAULT_PURE_SPINS`] pure spins, then
+    /// yields), never adapting.
+    #[must_use]
+    pub const fn fixed(budget: Duration) -> Self {
+        Self { budget, pure_spins: DEFAULT_PURE_SPINS, adaptive: false }
+    }
+
+    /// The worker-mode pool's policy: `default_budget` unless overridden by
+    /// `EPHPM_DISPATCH_SPIN_US`, `EPHPM_DISPATCH_SPIN_PURE` and
+    /// `EPHPM_DISPATCH_SPIN_ADAPTIVE`. These are experiment knobs, not
+    /// configuration: read once at startup, and an unparseable value is
+    /// warned about and ignored.
+    #[must_use]
+    pub fn worker_from_env(default_budget: Duration) -> Self {
+        Self::from_vars(
+            "worker",
+            default_budget,
+            std::env::var("EPHPM_DISPATCH_SPIN_US").ok().as_deref(),
+            std::env::var("EPHPM_DISPATCH_SPIN_PURE").ok().as_deref(),
+            std::env::var("EPHPM_DISPATCH_SPIN_ADAPTIVE").ok().as_deref(),
+        )
+    }
+
+    /// The per-request pool's policy: `default_budget` unless overridden by
+    /// `EPHPM_FPM_DISPATCH_SPIN_US`. The pure-spin and adaptive variables are
+    /// shared with [`SpinPolicy::worker_from_env`].
+    #[must_use]
+    pub fn fpm_from_env(default_budget: Duration) -> Self {
+        Self::from_vars(
+            "per_request",
+            default_budget,
+            std::env::var("EPHPM_FPM_DISPATCH_SPIN_US").ok().as_deref(),
+            std::env::var("EPHPM_DISPATCH_SPIN_PURE").ok().as_deref(),
+            std::env::var("EPHPM_DISPATCH_SPIN_ADAPTIVE").ok().as_deref(),
+        )
+    }
+
+    /// Build a policy from the raw variable values (`None` = unset).
+    fn from_vars(
+        pool: &str,
+        default_budget: Duration,
+        budget_us: Option<&str>,
+        pure_spins: Option<&str>,
+        adaptive: Option<&str>,
+    ) -> Self {
+        let mut policy = Self::fixed(default_budget);
+        let overridden = budget_us.is_some() || pure_spins.is_some() || adaptive.is_some();
+        if let Some(raw) = budget_us {
+            match raw.trim().parse::<u64>() {
+                Ok(us) => policy.budget = Duration::from_micros(us),
+                Err(_) => tracing::warn!(
+                    pool,
+                    value = raw,
+                    "ignoring unparseable dispatch spin budget (want microseconds)"
+                ),
+            }
+        }
+        if let Some(raw) = pure_spins {
+            match raw.trim() {
+                "max" => policy.pure_spins = u32::MAX,
+                v => match v.parse::<u32>() {
+                    Ok(n) => policy.pure_spins = n,
+                    Err(_) => tracing::warn!(
+                        pool,
+                        value = raw,
+                        "ignoring unparseable dispatch pure-spin count (want a number or \"max\")"
+                    ),
+                },
+            }
+        }
+        if let Some(raw) = adaptive {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => policy.adaptive = true,
+                "0" | "false" | "no" | "off" | "" => policy.adaptive = false,
+                _ => tracing::warn!(
+                    pool,
+                    value = raw,
+                    "ignoring unparseable dispatch spin adaptive flag (want 0 or 1)"
+                ),
+            }
+        }
+        if overridden {
+            tracing::info!(
+                pool,
+                budget_us = policy.budget.as_micros(),
+                pure_spins = policy.pure_spins,
+                adaptive = policy.adaptive,
+                "dispatch spin policy overridden from the environment"
+            );
+        }
+        policy
+    }
+}
+
+/// Mailbox states. The worker moves `WAITING` or `SPINNING` to `PARKED` before
+/// it sleeps; a dispatcher (or [`Dispatcher::close`]) moves any of them to
+/// `READY` and unparks only when it saw `PARKED`. `SPINNING` is `WAITING` plus
+/// a hint to dispatchers that this thread is polling and needs no wake-up.
 const WAITING: u8 = 0;
 const PARKED: u8 = 1;
 const READY: u8 = 2;
+const SPINNING: u8 = 3;
+
+/// A mailbox's content: the job, and when it was delivered (only when the
+/// owner asked for a time stamp — see [`Slot::stamp`]).
+struct Delivery<T> {
+    job: Option<T>,
+    at: Option<Instant>,
+}
 
 /// One pool thread's single-entry mailbox.
 struct Slot<T> {
-    job: Mutex<Option<T>>,
+    job: Mutex<Delivery<T>>,
     state: AtomicU8,
+    /// The owner wants deliveries time-stamped (adaptive spinning). Written by
+    /// the owner before it pushes the slot onto the idle stack and read by the
+    /// dispatcher that pops it, both under the dispatcher lock.
+    stamp: AtomicBool,
     thread: Thread,
 }
 
@@ -108,15 +264,34 @@ impl<T> Slot<T> {
     /// owner if it is parked. Called by exactly one party per idle period: the
     /// one that popped this slot off the idle stack.
     fn deliver(&self, job: Option<T>) {
-        *lock(&self.job) = job;
+        let at = self.stamp.load(Ordering::Relaxed).then(Instant::now);
+        *lock(&self.job) = Delivery { job, at };
         if self.state.swap(READY, Ordering::AcqRel) == PARKED {
             self.thread.unpark();
         }
     }
 
-    fn take(&self) -> Option<T> {
-        lock(&self.job).take()
+    fn take(&self) -> (Option<T>, Option<Instant>) {
+        let mut d = lock(&self.job);
+        (d.job.take(), d.at.take())
     }
+}
+
+/// Take a thread off the idle stack for a delivery: the top one, unless
+/// `steer` is set and the top one is not spinning — then the nearest spinning
+/// one among the top [`STEER_SCAN`], so the job needs no wake-up. The state
+/// read is only a hint: a thread that parks right after it is still woken by
+/// [`Slot::deliver`].
+fn take_idle<T>(idle: &mut Vec<Arc<Slot<T>>>, steer: bool) -> Option<Arc<Slot<T>>> {
+    if steer {
+        let n = idle.len();
+        for i in (n.saturating_sub(STEER_SCAN)..n).rev() {
+            if idle[i].state.load(Ordering::Relaxed) == SPINNING {
+                return Some(idle.remove(i));
+            }
+        }
+    }
+    idle.pop()
 }
 
 struct State<T> {
@@ -143,6 +318,11 @@ struct Shared<T> {
     /// pop path skip the `Notify` entirely in the common case (FIFO admission
     /// never waits here).
     push_waiters: AtomicUsize,
+    /// Set (once, never cleared) the first time a thread spins. Until then a
+    /// delivery takes the top of the idle stack without looking further, so a
+    /// pool that never spins hands out jobs exactly as it did before spinning
+    /// existed.
+    steer: AtomicBool,
 }
 
 /// Decrements [`Shared::push_waiters`] when a `push` ends, however it ends
@@ -200,6 +380,7 @@ impl<T> Dispatcher<T> {
                 closed: AtomicBool::new(false),
                 space: tokio::sync::Notify::new(),
                 push_waiters: AtomicUsize::new(0),
+                steer: AtomicBool::new(false),
             }),
         }
     }
@@ -211,10 +392,12 @@ impl<T> Dispatcher<T> {
         Worker {
             shared: Arc::clone(&self.shared),
             slot: Arc::new(Slot {
-                job: Mutex::new(None),
+                job: Mutex::new(Delivery { job: None, at: None }),
                 state: AtomicU8::new(READY),
+                stamp: AtomicBool::new(false),
                 thread: std::thread::current(),
             }),
+            budget: Cell::new(Duration::MAX),
             _not_send: std::marker::PhantomData,
         }
     }
@@ -237,7 +420,8 @@ impl<T> Dispatcher<T> {
         if st.closed {
             return Err(TryPushError::Closed(job));
         }
-        if let Some(slot) = st.idle.pop() {
+        let steer = self.shared.steer.load(Ordering::Relaxed);
+        if let Some(slot) = take_idle(&mut st.idle, steer) {
             // Popping the slot under the lock makes this caller its only
             // deliverer; the delivery itself (and any unpark) runs unlocked.
             let space_left = !st.idle.is_empty() || st.queue.len() < self.shared.capacity;
@@ -363,6 +547,9 @@ fn pop_queued<T>(shared: &Shared<T>, st: &mut State<T>) -> Option<T> {
 pub struct Worker<T> {
     shared: Arc<Shared<T>>,
     slot: Arc<Slot<T>>,
+    /// This thread's current spin budget under an adaptive [`SpinPolicy`]
+    /// (clamped to the policy's budget on use, so it starts at the ceiling).
+    budget: Cell<Duration>,
     /// `!Send`: the mailbox wakes the thread that registered it.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -374,28 +561,18 @@ impl<T> std::fmt::Debug for Worker<T> {
 }
 
 impl<T> Worker<T> {
-    /// Wait for the next job.
-    ///
-    /// Takes the oldest overflow job if there is one; otherwise registers this
-    /// thread as idle and waits on its own mailbox — polling it for up to
-    /// `spin` (32 pure spins, then `sched_yield` polls) before parking. The
-    /// poll touches only this thread's mailbox, so idle threads never contend
-    /// with each other or with the dispatcher. `Duration::ZERO` parks at once.
+    /// Wait for the next job, polling for up to `spin` before parking —
+    /// [`Worker::recv_with`] with [`SpinPolicy::fixed`].
     ///
     /// # Errors
     ///
     /// [`RecvClosed`] once the dispatcher is closed and its queue drained.
     pub fn recv(&self, spin: Duration) -> Result<T, RecvClosed> {
-        self.recv_with_park_hook(spin, || {})
+        self.recv_with(SpinPolicy::fixed(spin))
     }
 
     /// [`recv`](Self::recv), running `before_park` on this thread each time it
-    /// is about to park — after the spin found nothing, never when a queued job
-    /// or a delivery during the spin ends the wait. A worker uses it to release
-    /// per-request resources that must not be held across an unbounded idle
-    /// wait (the PHP execution timer) without paying for that on every request
-    /// when it never goes idle. A delivery that lands while the hook runs is
-    /// not lost: the park is then skipped.
+    /// is about to park — [`Worker::recv_with_hook`] with [`SpinPolicy::fixed`].
     ///
     /// # Errors
     ///
@@ -403,9 +580,48 @@ impl<T> Worker<T> {
     pub fn recv_with_park_hook(
         &self,
         spin: Duration,
+        before_park: impl FnMut(),
+    ) -> Result<T, RecvClosed> {
+        self.recv_with_hook(SpinPolicy::fixed(spin), before_park)
+    }
+
+    /// Wait for the next job — [`Worker::recv_with_hook`] with no park hook.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvClosed`] once the dispatcher is closed and its queue drained.
+    pub fn recv_with(&self, policy: SpinPolicy) -> Result<T, RecvClosed> {
+        self.recv_with_hook(policy, || {})
+    }
+
+    /// Wait for the next job.
+    ///
+    /// Takes the oldest overflow job if there is one; otherwise registers this
+    /// thread as idle and waits on its own mailbox — polling it for up to the
+    /// policy's budget (pure spins, then `sched_yield` polls) before parking.
+    /// The poll touches only this thread's mailbox, so idle threads never
+    /// contend with each other or with the dispatcher. A zero budget parks at
+    /// once.
+    ///
+    /// `before_park` runs on this thread each time it is about to park — after
+    /// the spin found nothing, never when a queued job or a delivery during the
+    /// spin ends the wait. A worker uses it to release per-request resources
+    /// that must not be held across an unbounded idle wait (the PHP execution
+    /// timer) without paying for that on every request when it never goes
+    /// idle. A delivery that lands while the hook runs is not lost: the park is
+    /// then skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvClosed`] once the dispatcher is closed and its queue drained.
+    pub fn recv_with_hook(
+        &self,
+        policy: SpinPolicy,
         mut before_park: impl FnMut(),
     ) -> Result<T, RecvClosed> {
         loop {
+            let spin =
+                if policy.adaptive { self.budget.get().min(policy.budget) } else { policy.budget };
             {
                 let mut st = lock(&self.shared.state);
                 if let Some(job) = pop_queued(&self.shared, &mut st) {
@@ -417,7 +633,15 @@ impl<T> Worker<T> {
                 // Reset the mailbox before it becomes visible to dispatchers:
                 // from the push below until a dispatcher pops it, only that
                 // dispatcher (or `close`) may touch it.
-                self.slot.state.store(WAITING, Ordering::Release);
+                self.slot.stamp.store(policy.adaptive, Ordering::Relaxed);
+                if spin.is_zero() {
+                    self.slot.state.store(WAITING, Ordering::Release);
+                } else {
+                    self.slot.state.store(SPINNING, Ordering::Release);
+                    if !self.shared.steer.load(Ordering::Relaxed) {
+                        self.shared.steer.store(true, Ordering::Relaxed);
+                    }
+                }
                 st.idle.push(Arc::clone(&self.slot));
                 // An idle thread is room as well: a `push` waiter parked on a
                 // full queue must hear about it, or it can sleep while
@@ -426,8 +650,15 @@ impl<T> Worker<T> {
                     self.shared.space.notify_one();
                 }
             }
-            self.wait_ready(spin, &mut before_park);
-            if let Some(job) = self.slot.take() {
+            // Taken after the lock is released, so a delivery can be stamped
+            // before it; the gap then saturates to zero (a hit), as it should.
+            let idle_since = policy.adaptive.then(Instant::now);
+            self.wait_ready(spin, policy.pure_spins, &mut before_park);
+            let (job, delivered_at) = self.slot.take();
+            if let (Some(since), Some(at)) = (idle_since, delivered_at) {
+                self.adapt(policy.budget, at.saturating_duration_since(since));
+            }
+            if let Some(job) = job {
                 return Ok(job);
             }
             // A bare wake-up: `close()` emptied the idle stack. Loop to drain
@@ -435,11 +666,24 @@ impl<T> Worker<T> {
         }
     }
 
+    /// Adaptive budget update after an idle period that lasted `gap` (from
+    /// going idle to the dispatcher's delivery): a gap the full budget `max`
+    /// would have covered restores it, a longer one halves the current budget.
+    fn adapt(&self, max: Duration, gap: Duration) {
+        let next = if gap <= max {
+            max
+        } else {
+            let half = self.budget.get().min(max) / 2;
+            if half < ADAPTIVE_FLOOR { Duration::ZERO } else { half }
+        };
+        self.budget.set(next);
+    }
+
     /// Block until the mailbox is `READY`: poll for up to `spin`, then run
     /// `before_park` and park.
-    fn wait_ready(&self, spin: Duration, before_park: &mut impl FnMut()) {
-        const PURE_SPINS: u32 = 32;
+    fn wait_ready(&self, spin: Duration, pure_spins: u32, before_park: &mut impl FnMut()) {
         let state = &self.slot.state;
+        let announced = if spin.is_zero() { WAITING } else { SPINNING };
         if !spin.is_zero() {
             let mut started: Option<Instant> = None;
             let mut polls: u32 = 0;
@@ -451,7 +695,7 @@ impl<T> Worker<T> {
                 if start.elapsed() >= spin {
                     break;
                 }
-                if polls < PURE_SPINS {
+                if polls < pure_spins {
                     std::hint::spin_loop();
                 } else {
                     std::thread::yield_now();
@@ -463,8 +707,11 @@ impl<T> Worker<T> {
         // below, so one arriving while the hook runs is never missed).
         before_park();
         // Announce the park. If a delivery won the race the CAS fails and the
-        // mailbox is already READY.
-        if state.compare_exchange(WAITING, PARKED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        // mailbox is already READY. Only this thread moves the mailbox out of
+        // `announced`, and every other party only ever stores READY, so the
+        // CAS fails exactly when a delivery has landed — the job is never
+        // stranded in a mailbox whose owner sleeps.
+        if state.compare_exchange(announced, PARKED, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return;
         }
         // `park` may wake spuriously; only READY ends the wait. An unpark
@@ -482,6 +729,13 @@ impl<T> Worker<T> {
         let mut st = lock(&self.shared.state);
         self.slot.state.store(WAITING, Ordering::Release);
         st.idle.push(Arc::clone(&self.slot));
+    }
+
+    /// This thread's current adaptive budget, as [`Worker::recv_with`] would
+    /// use it under `policy`.
+    #[cfg(test)]
+    fn current_budget(&self, policy: SpinPolicy) -> Duration {
+        self.budget.get().min(policy.budget)
     }
 }
 
@@ -505,11 +759,12 @@ impl<T> Drop for Worker<T> {
                 std::thread::yield_now();
             }
         }
-        let Some(job) = self.slot.take() else {
+        let (Some(job), _) = self.slot.take() else {
             return;
         };
         let mut st = lock(&self.shared.state);
-        if let Some(other) = st.idle.pop() {
+        let steer = self.shared.steer.load(Ordering::Relaxed);
+        if let Some(other) = take_idle(&mut st.idle, steer) {
             drop(st);
             other.deliver(Some(job));
         } else {
@@ -539,15 +794,47 @@ mod tests {
         spin: Duration,
         tx: mpsc::Sender<(usize, u32)>,
     ) -> std::thread::JoinHandle<()> {
+        spawn_forwarder_with(d, idx, SpinPolicy::fixed(spin), tx)
+    }
+
+    fn spawn_forwarder_with(
+        d: &Dispatcher<u32>,
+        idx: usize,
+        policy: SpinPolicy,
+        tx: mpsc::Sender<(usize, u32)>,
+    ) -> std::thread::JoinHandle<()> {
         let d = d.clone();
         std::thread::spawn(move || {
             let w = d.register_worker();
-            while let Ok(job) = w.recv(spin) {
+            while let Ok(job) = w.recv_with(policy) {
                 if tx.send((idx, job)).is_err() {
                     break;
                 }
             }
         })
+    }
+
+    const fn us(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
+    /// The policies every stress test runs under: today's two (park, fixed
+    /// 200 µs), tiny budgets that put most deliveries right at the
+    /// spin/park boundary, pure spinning, always-yield, and adaptive.
+    const STRESS_POLICIES: [SpinPolicy; 7] = [
+        SpinPolicy::PARK,
+        SpinPolicy::fixed(us(200)),
+        SpinPolicy::fixed(us(2)),
+        SpinPolicy { budget: us(5), pure_spins: 0, adaptive: false },
+        SpinPolicy { budget: us(50), pure_spins: u32::MAX, adaptive: false },
+        SpinPolicy { budget: us(200), pure_spins: DEFAULT_PURE_SPINS, adaptive: true },
+        SpinPolicy { budget: us(3), pure_spins: 0, adaptive: true },
+    ];
+
+    /// How many times the stress tests repeat each policy
+    /// (`EPHPM_TEST_SPIN_REPEAT`, default 1).
+    fn stress_repeat() -> usize {
+        std::env::var("EPHPM_TEST_SPIN_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     }
 
     fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -759,6 +1046,16 @@ mod tests {
 
     #[test]
     fn many_producers_many_workers_lose_nothing() {
+        for _ in 0..stress_repeat() {
+            for policy in STRESS_POLICIES {
+                // Half the threads park at once, so spinning and parked
+                // mailboxes mix on the idle stack and steering is exercised.
+                many_producers_many_workers_lose_nothing_with(policy);
+            }
+        }
+    }
+
+    fn many_producers_many_workers_lose_nothing_with(policy: SpinPolicy) {
         const WORKERS: usize = 8;
         const PRODUCERS: u32 = 4;
         const PER: u32 = 5_000;
@@ -766,8 +1063,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let workers: Vec<_> = (0..WORKERS)
             .map(|i| {
-                let spin = if i % 2 == 0 { Duration::ZERO } else { Duration::from_micros(200) };
-                spawn_forwarder(&d, i, spin, tx.clone())
+                let p = if i % 2 == 0 { SpinPolicy::PARK } else { policy };
+                spawn_forwarder_with(&d, i, p, tx.clone())
             })
             .collect();
         drop(tx);
@@ -796,7 +1093,8 @@ mod tests {
         }
         let mut seen = vec![false; (PRODUCERS * PER) as usize];
         for _ in 0..PRODUCERS * PER {
-            let (_, job) = rx.recv_timeout(LONG).expect("a job went missing");
+            let (_, job) =
+                rx.recv_timeout(LONG).unwrap_or_else(|_| panic!("a job went missing ({policy:?})"));
             assert!(!seen[job as usize], "job {job} delivered twice");
             seen[job as usize] = true;
         }
@@ -813,6 +1111,14 @@ mod tests {
     /// a retired thread's mailbox.
     #[test]
     fn recycling_workers_under_load_lose_nothing() {
+        for _ in 0..stress_repeat() {
+            for policy in STRESS_POLICIES {
+                recycling_workers_under_load_lose_nothing_with(policy);
+            }
+        }
+    }
+
+    fn recycling_workers_under_load_lose_nothing_with(policy: SpinPolicy) {
         const POOL: usize = 6;
         const MAX_REQUESTS: usize = 7;
         const TOTAL: u32 = 6_000;
@@ -822,13 +1128,14 @@ mod tests {
             tx: mpsc::Sender<u32>,
             live: Arc<AtomicUsize>,
             spawned: Arc<AtomicUsize>,
+            policy: SpinPolicy,
         ) {
             spawned.fetch_add(1, Ordering::SeqCst);
             std::thread::spawn(move || {
                 let w = d.register_worker();
                 let mut served = 0;
                 while served < MAX_REQUESTS {
-                    let Ok(job) = w.recv(Duration::from_micros(50)) else {
+                    let Ok(job) = w.recv_with(policy) else {
                         live.fetch_sub(1, Ordering::SeqCst);
                         return;
                     };
@@ -841,7 +1148,7 @@ mod tests {
                 if d.is_closed() {
                     live.fetch_sub(1, Ordering::SeqCst);
                 } else {
-                    spawn_recycling(d, tx, live, spawned);
+                    spawn_recycling(d, tx, live, spawned, policy);
                 }
             });
         }
@@ -851,7 +1158,7 @@ mod tests {
         let live = Arc::new(AtomicUsize::new(POOL));
         let spawned = Arc::new(AtomicUsize::new(0));
         for _ in 0..POOL {
-            spawn_recycling(d.clone(), tx.clone(), Arc::clone(&live), Arc::clone(&spawned));
+            spawn_recycling(d.clone(), tx.clone(), Arc::clone(&live), Arc::clone(&spawned), policy);
         }
         drop(tx);
         let producer = {
@@ -873,7 +1180,9 @@ mod tests {
         };
         let mut seen = vec![false; TOTAL as usize];
         for _ in 0..TOTAL {
-            let job = rx.recv_timeout(LONG).expect("a job went missing or was stranded");
+            let job = rx
+                .recv_timeout(LONG)
+                .unwrap_or_else(|_| panic!("a job went missing or was stranded ({policy:?})"));
             assert!(!seen[job as usize], "job {job} delivered twice");
             seen[job as usize] = true;
         }
@@ -936,7 +1245,9 @@ mod tests {
     /// must get in, round after round.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn barge_push_under_churn_never_strands() {
-        for round in 0..50 {
+        for (round, policy) in
+            (0..50 * stress_repeat()).flat_map(|r| STRESS_POLICIES.into_iter().map(move |p| (r, p)))
+        {
             let d: Dispatcher<u32> = Dispatcher::new(1);
             let done = Arc::new(AtomicUsize::new(0));
             let threads: Vec<_> = (0..2)
@@ -945,7 +1256,7 @@ mod tests {
                     let done = Arc::clone(&done);
                     std::thread::spawn(move || {
                         let w = d.register_worker();
-                        while w.recv(Duration::ZERO).is_ok() {
+                        while w.recv_with(policy).is_ok() {
                             std::thread::sleep(Duration::from_micros(300));
                             done.fetch_add(1, Ordering::SeqCst);
                         }
@@ -961,7 +1272,7 @@ mod tests {
             for t in tasks {
                 assert!(
                     tokio::time::timeout(Duration::from_secs(3), t).await.is_ok(),
-                    "round {round}: stranded (queued={}, idle={})",
+                    "round {round} ({policy:?}): stranded (queued={}, idle={})",
                     d.queued(),
                     d.idle_count()
                 );
@@ -995,5 +1306,346 @@ mod tests {
         tokio::task::yield_now().await;
         d.close();
         assert_eq!(waiter.await.unwrap(), Err(2));
+    }
+
+    /// Busy-wait `d` (no sleep: the point is landing deliveries at the
+    /// microsecond the receiver stops spinning).
+    fn busy_wait(d: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < d {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Lost wake-up hunt: one job at a time, each pushed after a delay that
+    /// sweeps across the spin budget, so many deliveries land just before,
+    /// at, or just after the moment the receiver gives up spinning and parks.
+    /// A lost wake-up shows up as a job that is never answered.
+    #[test]
+    fn deliveries_at_the_spin_boundary_are_never_lost() {
+        const ROUNDS: u32 = 4_000;
+        let policies = [
+            SpinPolicy::fixed(us(1)),
+            SpinPolicy::fixed(us(4)),
+            SpinPolicy { budget: us(8), pure_spins: u32::MAX, adaptive: false },
+            SpinPolicy { budget: us(6), pure_spins: 0, adaptive: true },
+        ];
+        for _ in 0..stress_repeat() {
+            for policy in policies {
+                let d = Dispatcher::new(4);
+                let (tx, rx) = mpsc::channel();
+                let h = spawn_forwarder_with(&d, 0, policy, tx);
+                for i in 0..ROUNDS {
+                    // Spin (not sleep) until the receiver is idle, then wait
+                    // 0..=16 µs: the sweep straddles every budget above.
+                    while d.idle_count() == 0 {
+                        std::hint::spin_loop();
+                    }
+                    busy_wait(us(u64::from(i % 17)));
+                    d.try_push(i).unwrap();
+                    let got = rx.recv_timeout(LONG).unwrap_or_else(|_| {
+                        panic!("job {i} lost at the spin boundary ({policy:?})")
+                    });
+                    assert_eq!(got, (0, i));
+                }
+                d.close();
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// The same hunt with several receivers and producers racing, so a
+    /// delivery can also land while the target is being steered past.
+    #[test]
+    fn concurrent_boundary_deliveries_are_never_lost() {
+        const WORKERS: usize = 4;
+        const PRODUCERS: u32 = 3;
+        const PER: u32 = 3_000;
+        for _ in 0..stress_repeat() {
+            for policy in [
+                SpinPolicy::fixed(us(3)),
+                SpinPolicy { adaptive: true, ..SpinPolicy::fixed(us(5)) },
+            ] {
+                let d = Dispatcher::new(64);
+                let (tx, rx) = mpsc::channel();
+                let workers: Vec<_> =
+                    (0..WORKERS).map(|i| spawn_forwarder_with(&d, i, policy, tx.clone())).collect();
+                drop(tx);
+                let producers: Vec<_> = (0..PRODUCERS)
+                    .map(|p| {
+                        let d = d.clone();
+                        std::thread::spawn(move || {
+                            for i in 0..PER {
+                                busy_wait(us(u64::from((i * 7 + p) % 11)));
+                                let mut job = p * PER + i;
+                                loop {
+                                    match d.try_push(job) {
+                                        Ok(()) => break,
+                                        Err(TryPushError::Full(j)) => {
+                                            job = j;
+                                            std::thread::yield_now();
+                                        }
+                                        Err(TryPushError::Closed(_)) => panic!("closed early"),
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for p in producers {
+                    p.join().unwrap();
+                }
+                let mut seen = vec![false; (PRODUCERS * PER) as usize];
+                for _ in 0..PRODUCERS * PER {
+                    let (_, job) = rx
+                        .recv_timeout(LONG)
+                        .unwrap_or_else(|_| panic!("a job went missing ({policy:?})"));
+                    assert!(!seen[job as usize], "job {job} delivered twice");
+                    seen[job as usize] = true;
+                }
+                d.close();
+                for w in workers {
+                    w.join().unwrap();
+                }
+            }
+        }
+    }
+
+    /// With a parked thread on top of the idle stack and a spinning one below
+    /// it, a delivery goes to the spinning one (no wake-up needed).
+    #[test]
+    fn delivery_prefers_a_spinning_thread_over_a_parked_one() {
+        let d = Dispatcher::new(4);
+        let (tx, rx) = mpsc::channel();
+        let spinner = spawn_forwarder(&d, 1, LONG, tx.clone());
+        wait_until(|| d.idle_count() == 1);
+        let parker = spawn_forwarder(&d, 2, Duration::ZERO, tx);
+        wait_until(|| d.idle_count() == 2);
+        // The parker is on top; give it time to actually park.
+        std::thread::sleep(Duration::from_millis(50));
+        d.try_push(5).unwrap();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), (1, 5), "the spinning thread must get the job");
+        d.close();
+        spinner.join().unwrap();
+        parker.join().unwrap();
+    }
+
+    /// Without any spinning thread, delivery is plain LIFO, exactly as before
+    /// spin policies existed.
+    #[test]
+    fn without_spinning_delivery_is_plain_lifo() {
+        let d = Dispatcher::new(4);
+        let (tx, rx) = mpsc::channel();
+        let first = spawn_forwarder(&d, 1, Duration::ZERO, tx.clone());
+        wait_until(|| d.idle_count() == 1);
+        let second = spawn_forwarder(&d, 2, Duration::ZERO, tx);
+        wait_until(|| d.idle_count() == 2);
+        d.try_push(5).unwrap();
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), (2, 5));
+        assert!(!d.shared.steer.load(Ordering::Relaxed), "nothing spun, so nothing steers");
+        d.close();
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn adaptive_budget_arithmetic() {
+        let d: Dispatcher<u32> = Dispatcher::new(1);
+        let w = d.register_worker();
+        let p = SpinPolicy { adaptive: true, ..SpinPolicy::fixed(us(200)) };
+        assert_eq!(w.current_budget(p), us(200), "starts at the ceiling");
+        let mut expect = us(200);
+        for _ in 0..6 {
+            w.adapt(p.budget, Duration::from_millis(5));
+            expect /= 2;
+            assert_eq!(w.current_budget(p), expect);
+        }
+        // 3.125 µs halves below the 2 µs floor: collapse to zero.
+        w.adapt(p.budget, Duration::from_millis(5));
+        assert_eq!(w.current_budget(p), Duration::ZERO);
+        w.adapt(p.budget, Duration::from_millis(5));
+        assert_eq!(w.current_budget(p), Duration::ZERO, "zero stays zero on long gaps");
+        // A gap the full budget would have covered restores it at once.
+        w.adapt(p.budget, us(150));
+        assert_eq!(w.current_budget(p), us(200));
+        // A smaller ceiling clamps the stored budget.
+        let small = SpinPolicy { budget: us(10), ..p };
+        assert_eq!(w.current_budget(small), us(10));
+    }
+
+    /// End to end: long idle gaps drive a thread's adaptive budget to zero; a
+    /// short one turns spinning back on.
+    #[test]
+    fn adaptive_budget_decays_when_idle_and_recovers_under_load() {
+        let d: Dispatcher<u32> = Dispatcher::new(4);
+        let w = d.register_worker();
+        let p = SpinPolicy { adaptive: true, ..SpinPolicy::fixed(Duration::from_millis(1)) };
+        let pusher = |delay: Duration, job: u32| {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                while d.idle_count() == 0 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(delay);
+                d.try_push(job).unwrap();
+            })
+        };
+        // 1 ms halves to below 2 µs in 10 steps.
+        for job in 0..12 {
+            let h = pusher(Duration::from_millis(15), job);
+            assert_eq!(w.recv_with(p), Ok(job));
+            h.join().unwrap();
+        }
+        assert_eq!(w.current_budget(p), Duration::ZERO, "long gaps must switch spinning off");
+        // A prompt delivery (well inside 1 ms) restores the budget. Allow a
+        // few tries in case the host deschedules the pusher.
+        let mut restored = false;
+        for job in 100..105 {
+            let h = pusher(Duration::ZERO, job);
+            assert_eq!(w.recv_with(p), Ok(job));
+            h.join().unwrap();
+            if w.current_budget(p) == p.budget {
+                restored = true;
+                break;
+            }
+        }
+        assert!(restored, "a short gap must turn spinning back on");
+    }
+
+    #[test]
+    fn spin_policy_from_vars() {
+        let def = us(200);
+        assert_eq!(SpinPolicy::from_vars("t", def, None, None, None), SpinPolicy::fixed(def));
+        assert_eq!(
+            SpinPolicy::from_vars("t", def, Some("0"), None, None),
+            SpinPolicy::PARK,
+            "budget 0 parks at once"
+        );
+        assert_eq!(
+            SpinPolicy::from_vars("t", def, Some(" 50 "), Some("max"), Some("1")),
+            SpinPolicy { budget: us(50), pure_spins: u32::MAX, adaptive: true }
+        );
+        assert_eq!(
+            SpinPolicy::from_vars("t", def, Some("7"), Some("0"), Some("off")),
+            SpinPolicy { budget: us(7), pure_spins: 0, adaptive: false }
+        );
+        // Garbage is ignored, keeping the default.
+        assert_eq!(
+            SpinPolicy::from_vars("t", def, Some("50us"), Some("-1"), Some("maybe")),
+            SpinPolicy::fixed(def)
+        );
+    }
+
+    /// On-CPU time of the calling thread, in nanoseconds (Linux schedstat).
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ns() -> u64 {
+        std::fs::read_to_string("/proc/thread-self/schedstat")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// Total on-CPU time of `WORKERS` pool threads over a 500 ms window in
+    /// which `traffic` jobs arrive evenly spaced. Each thread reports its own
+    /// schedstat on a sentinel job, then holds at a barrier so each thread
+    /// takes exactly one sentinel.
+    #[cfg(target_os = "linux")]
+    fn window_cpu_ms(policy: SpinPolicy, traffic: u32) -> f64 {
+        const WORKERS: usize = 8;
+        const REPORT: u32 = u32::MAX;
+        let d: Dispatcher<u32> = Dispatcher::new(64);
+        let (tx, rx) = mpsc::channel::<u64>();
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let d = d.clone();
+                let tx = tx.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let w = d.register_worker();
+                    while let Ok(job) = w.recv_with(policy) {
+                        if job == REPORT {
+                            tx.send(thread_cpu_ns()).unwrap();
+                            barrier.wait();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let report = || -> u64 {
+            wait_until(|| d.idle_count() == WORKERS);
+            for _ in 0..WORKERS {
+                d.try_push(REPORT).unwrap();
+            }
+            let total = (0..WORKERS).map(|_| rx.recv_timeout(LONG).unwrap()).sum();
+            barrier.wait();
+            total
+        };
+        // Let every thread finish its first idle period before measuring.
+        std::thread::sleep(Duration::from_millis(100));
+        let before = report();
+        let window = Duration::from_millis(500);
+        let start = Instant::now();
+        if traffic == 0 {
+            std::thread::sleep(window);
+        } else {
+            let step = window / traffic;
+            for i in 0..traffic {
+                let at = start + step * i;
+                if let Some(wait) = at.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                d.try_push(i).unwrap();
+            }
+            std::thread::sleep(window.saturating_sub(start.elapsed()));
+        }
+        let after = report();
+        d.close();
+        for w in workers {
+            w.join().unwrap();
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let ms = after.saturating_sub(before) as f64 / 1e6;
+        ms
+    }
+
+    /// With no traffic at all, idle threads cost ~nothing whatever the
+    /// policy: they spin once, then park.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_pool_burns_no_cpu_with_spinning_on() {
+        for policy in [
+            SpinPolicy::fixed(us(200)),
+            SpinPolicy { budget: us(200), pure_spins: u32::MAX, adaptive: false },
+            SpinPolicy { adaptive: true, ..SpinPolicy::fixed(us(200)) },
+        ] {
+            // The window includes the threads' one post-report spin (8 x
+            // 200 µs = 1.6 ms) and the report round itself.
+            let ms = window_cpu_ms(policy, 0);
+            assert!(ms < 10.0, "{policy:?}: {ms:.2} ms of CPU in a 500 ms idle window");
+        }
+    }
+
+    /// Measurement, not a check: CPU of an 8-thread pool over 500 ms, idle
+    /// and at low request rates, per policy. Run with `--ignored
+    /// --nocapture` on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "measurement; prints a table"]
+    fn measure_idle_and_low_rate_cpu() {
+        let policies = [
+            ("park", SpinPolicy::PARK),
+            ("fixed 50us", SpinPolicy::fixed(us(50))),
+            ("fixed 200us", SpinPolicy::fixed(us(200))),
+            ("fixed 200us pure", SpinPolicy { pure_spins: u32::MAX, ..SpinPolicy::fixed(us(200)) }),
+            ("adaptive 200us", SpinPolicy { adaptive: true, ..SpinPolicy::fixed(us(200)) }),
+        ];
+        println!("policy               | jobs/s | pool CPU ms per 500 ms | % of one core");
+        for traffic in [0u32, 50, 500, 2_500] {
+            for (name, policy) in policies {
+                let ms = window_cpu_ms(policy, traffic);
+                println!("{name:<20} | {:>6} | {ms:>22.2} | {:>5.1}", traffic * 2, ms / 5.0);
+            }
+        }
     }
 }

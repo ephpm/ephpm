@@ -708,8 +708,22 @@ thread_local! {
 /// worker idle costs up to this much CPU before the park. Under a tight cgroup
 /// CPU quota at low request rates that is the price of the lower wake latency
 /// under load.
+///
+/// This is the default. [`dispatch_spin`] lets the `EPHPM_DISPATCH_SPIN_*`
+/// experiment variables override it (and turn on adaptive budgets, which
+/// remove that low-rate cost) without a rebuild.
 #[cfg_attr(not(php_linked), allow(dead_code))]
 const DISPATCH_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// The worker pool's spin policy: [`DISPATCH_SPIN`] unless the environment
+/// overrides it (see
+/// [`SpinPolicy::worker_from_env`](crate::handoff::SpinPolicy::worker_from_env)).
+/// Read once per process.
+#[cfg_attr(not(php_linked), allow(dead_code))]
+fn dispatch_spin() -> crate::handoff::SpinPolicy {
+    static POLICY: std::sync::OnceLock<crate::handoff::SpinPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| crate::handoff::SpinPolicy::worker_from_env(DISPATCH_SPIN))
+}
 
 /// A worker thread's job source.
 #[cfg(php_linked)]
@@ -729,14 +743,15 @@ impl DispatchSource {
     fn recv(&self) -> Option<WorkerJob> {
         match self {
             Self::Handoff(worker) => {
-                worker.recv_with_park_hook(DISPATCH_SPIN, disarm_exec_timer_for_idle).ok()
+                worker.recv_with_hook(dispatch_spin(), disarm_exec_timer_for_idle).ok()
             }
             // The debug lane serves one request on a fresh thread and then
             // sits on a closed channel; it is not a hot path, so disarm
-            // unconditionally rather than threading the hook through.
+            // unconditionally rather than threading the hook through. The
+            // budget only, never adaptive.
             Self::Channel(rx) => {
                 disarm_exec_timer_for_idle();
-                recv_spin_then_block(rx, DISPATCH_SPIN).ok()
+                recv_spin_then_block(rx, dispatch_spin().budget).ok()
             }
         }
     }

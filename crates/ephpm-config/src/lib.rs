@@ -38,9 +38,16 @@ const TOP_LEVEL_SECTIONS: [&str; 7] =
 ///   `WP_PATH` (`ephpm/wordpress-worker`), `SEED_TOKEN`
 ///   (`ephpm/wordpress-sample`). These live in other repos, so the scan test
 ///   cannot see them; it does scan this repo's docs for `EPHPM_X=` exports.
+/// - Experiment knobs read directly by the PHP thread pools at startup
+///   (`ephpm_php::handoff::SpinPolicy`): `DISPATCH_SPIN_US`,
+///   `DISPATCH_SPIN_PURE`, `DISPATCH_SPIN_ADAPTIVE`, `FPM_DISPATCH_SPIN_US`.
 /// - Set by the e2e / integration harnesses, whose spawned servers inherit
 ///   them: the rest.
 const NON_CONFIG_ENV_VARS: &[&str] = &[
+    "DISPATCH_SPIN_US",
+    "DISPATCH_SPIN_PURE",
+    "DISPATCH_SPIN_ADAPTIVE",
+    "FPM_DISPATCH_SPIN_US",
     "SERVICE_LOG_FILE",
     "FATAL_HANDLER",
     "KV_PASSWORD",
