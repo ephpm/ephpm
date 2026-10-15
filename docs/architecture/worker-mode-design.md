@@ -220,6 +220,14 @@ until shutdown, because `worker.php` sits in `while (take_request()) { ... }`.
 Three channel decisions, each with the alternative stated:
 
 **(a) Runtime → worker pool dispatch: `async_channel` (MPMC), bounded.**
+
+> **Superseded:** the pools no longer share one MPMC channel. Each pool
+> thread has a single-job mailbox; an idle thread is handed its job
+> directly and only the overflow (every thread busy) waits in a shared
+> bounded FIFO — see `crates/ephpm-php/src/handoff.rs`. The admission
+> semaphore (#442) and `queue_depth` bound are unchanged. The text below
+> is the original design record.
+
 The hyper handler (async, on a tokio worker thread) needs to hand a request to
 *some* free worker. Workers are blocking OS threads pulling work. This is a
 classic async-producer / sync-consumer MPMC queue.
