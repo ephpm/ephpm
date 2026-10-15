@@ -125,8 +125,9 @@ class EphpmE2eBailoutStream
             return "STREAM-CHUNK-BEFORE-BAILOUT\n";
         }
         // Blow the memory limit from inside php_stream_read(), i.e. from
-        // inside the C pump loop of send_response_stream().
-        ini_set('memory_limit', '2M');
+        // inside the C pump loop of send_response_stream(). Relative to the
+        // current usage, like the ?__bailout trigger below.
+        ini_set('memory_limit', (string) (memory_get_usage(true) + 2 * 1024 * 1024));
         $chunks = [];
         for ($i = 0; $i < 100; $i++) {
             $chunks[] = str_repeat('x', 1024 * 1024);
@@ -169,7 +170,12 @@ while (($envelope = \Ephpm\Worker\take_request()) !== null) {
     if (isset($query['__bailout'])) {
         header('Content-Type: text/plain; charset=utf-8');
         echo "WORKER-BAILOUT-PARTIAL-OUTPUT\n";
-        ini_set('memory_limit', '2M');
+        // Relative to what this worker already holds: a fixed '2M' is
+        // refused (with only a warning, so no bailout) by a worker that has
+        // served earlier, heavier requests in this suite. Idle workers are
+        // reused most-recently-idle first, so one worker can serve most of a
+        // sequential test run.
+        ini_set('memory_limit', (string) (memory_get_usage(true) + 2 * 1024 * 1024));
         $chunks = [];
         for ($i = 0; $i < 100; $i++) {
             $chunks[] = str_repeat('x', 1024 * 1024);
