@@ -5,6 +5,13 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rustls-pemfile unmaintained — transitive dep, awaiting upstream migration
     "RUSTSEC-2025-0134",
+    # unsafe-libyaml unmaintained (repo archived; "no safe upgrade available").
+    # Pulled only by serde_yaml_ng in ephpm-analyze, which parses one file: the
+    # operator's own `.ephpm-analyze.yml`. It is an unmaintained notice, not a
+    # vulnerability. The suggested replacement (serde-saphyr) needs Rust 1.89,
+    # above our 1.88 MSRV, so migrating is a separate change. Remove this entry
+    # when ephpm-analyze moves off serde_yaml_ng.
+    "RUSTSEC-2024-0449",
     # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
     # unmaintained) left the graph with mysql-common-derive, once the
     # opensrv-mysql fork stopped enabling mysql_common's default features.
