@@ -723,12 +723,40 @@ enum DispatchSource {
 
 #[cfg(php_linked)]
 impl DispatchSource {
+    /// Wait for the next job. The PHP execution timer the previous request
+    /// armed is disarmed only if this worker actually parks — see
+    /// [`disarm_exec_timer_for_idle`].
     fn recv(&self) -> Option<WorkerJob> {
         match self {
-            Self::Handoff(worker) => worker.recv(DISPATCH_SPIN).ok(),
-            Self::Channel(rx) => recv_spin_then_block(rx, DISPATCH_SPIN).ok(),
+            Self::Handoff(worker) => {
+                worker.recv_with_park_hook(DISPATCH_SPIN, disarm_exec_timer_for_idle).ok()
+            }
+            // The debug lane serves one request on a fresh thread and then
+            // sits on a closed channel; it is not a hot path, so disarm
+            // unconditionally rather than threading the hook through.
+            Self::Channel(rx) => {
+                disarm_exec_timer_for_idle();
+                recv_spin_then_block(rx, DISPATCH_SPIN).ok()
+            }
         }
     }
+}
+
+/// Disarm this worker thread's PHP execution timer before it parks.
+///
+/// The timer is wall-clock and one-shot, re-armed by `take_request` for each
+/// request. Under load the next job arrives during the spin and the re-arm
+/// simply replaces the running countdown, so the disarm is skipped — one
+/// `timer_settime` per request instead of two. Before an unbounded idle wait
+/// it must be disarmed so it cannot expire (and signal the thread) mid-wait.
+#[cfg(php_linked)]
+fn disarm_exec_timer_for_idle() {
+    // SAFETY: called on a PHP worker thread from inside its worker request
+    // (take_request's Rust callback), the context ephpm_worker_exec_timer_idle
+    // requires. The C side wraps its only PHP call in zend_try, so no PHP
+    // bailout can longjmp across this Rust frame, and it touches only this
+    // thread's executor globals.
+    unsafe { crate::ffi::ephpm_worker_exec_timer_idle() };
 }
 
 /// Receive the next dispatched job: poll `rx` for up to `spin`, then park in
