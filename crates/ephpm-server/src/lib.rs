@@ -18,6 +18,7 @@ pub mod middleware;
 pub mod opcache;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+mod php_wait;
 pub mod privdrop;
 pub mod proxy;
 pub mod rate_limit;
@@ -68,6 +69,20 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 /// debug log line — and so the default `info`-level stack leaves the span
 /// callsites disabled (a single static check per request).
 pub const OTEL_TRACE_TARGET: &str = "ephpm_otel";
+
+/// Startup warning for the built-in `ratelimit` module mounted on a clustered
+/// node. Points at the published reference section that documents the cluster
+/// scope (`site/content/reference/middleware/ratelimit.md`, `## In a cluster`).
+///
+/// Since #416 `INCR` replicates, but as a last-arrival-wins write of the
+/// resulting value, not a cluster-wide atomic add — so the shared count can
+/// undercount under concurrent cross-node traffic.
+const CLUSTER_RATELIMIT_WARNING: &str = "[middleware] ratelimit mounted with [cluster].enabled = \
+     true — the counter replicates across nodes as a last-arrival-wins value, not a cluster-wide \
+     atomic add, so concurrent increments on different nodes can overwrite each other. The \
+     limit is approximate: up to N × the configured allowance in the worst case for a client \
+     spread across N nodes. See \
+     https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster for details.";
 
 /// Start the HTTP server with the given configuration.
 ///
@@ -158,23 +173,21 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
                 config.server.sites_dir.is_some(),
             )?;
         }
-        // In cluster mode, the built-in ratelimit middleware uses local KV
-        // INCR to track the request count per window. SET/DEL and EXPIRE
-        // now replicate across the cluster (KV replication v1.1), but
-        // INCR is still local-only — read-modify-write ops need owner
-        // routing to be cluster-correct (see
-        // site/content/roadmap/clustered-kv-v2.md, "Replicated counters"),
-        // so the rate limit is still enforced PER NODE, not across the
-        // whole fleet. Surface the gap at startup instead of leaving
-        // operators to find it in prod.
-        if config.cluster.enabled && chain.module_names().contains(&"ratelimit") {
-            tracing::warn!(
-                "[middleware] ratelimit mounted with [cluster].enabled = true — KV INCR is \
-                 not yet replicated across nodes (SET/DEL/EXPIRE now do), so rate limits are \
-                 enforced PER NODE. A client hitting N nodes gets up to N × the configured \
-                 allowance. See site/content/reference/middleware/ratelimit.md for the current \
-                 status."
-            );
+        // In cluster mode, the built-in ratelimit middleware counts each
+        // window with KV INCR. Since #416 the resulting value replicates as
+        // a last-arrival-wins write, not an atomic cluster-wide add, so
+        // concurrent increments on different nodes can overwrite one another
+        // and the limit is approximate (see
+        // site/content/roadmap/clustered-kv-v2.md, "Replicated counters").
+        // Surface that at startup instead of leaving operators to find it in
+        // prod.
+        //
+        // Matched through `builtin_short_name`, not the raw `library` string:
+        // the module answers to `ratelimit`, `rate-limit`, `rate_limit`, the
+        // `ephpm-middleware-ratelimit` crate forms, and a path to its cdylib
+        // shell, and the warning must fire for every one of them.
+        if config.cluster.enabled && chain.mounts_builtin("ratelimit") {
+            tracing::warn!("{CLUSTER_RATELIMIT_WARNING}");
         }
         Some(Arc::new(chain))
     };
@@ -2997,6 +3010,31 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
 #[cfg(test)]
 mod lib_tests {
     use super::*;
+
+    /// The cluster rate-limit warning must point at a published page that
+    /// exists (it used to name a repo source path), and its section anchor
+    /// must exist: `## In a cluster` renders as `#in-a-cluster`.
+    #[test]
+    fn cluster_ratelimit_warning_links_to_the_real_reference_section() {
+        assert!(
+            CLUSTER_RATELIMIT_WARNING
+                .contains("https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster"),
+            "{CLUSTER_RATELIMIT_WARNING}"
+        );
+        // Since #416 INCR replicates; the warning must not claim otherwise.
+        let lower = CLUSTER_RATELIMIT_WARNING.to_ascii_lowercase();
+        assert!(!lower.contains("per node"), "{CLUSTER_RATELIMIT_WARNING}");
+        assert!(!lower.contains("not yet replicated"), "{CLUSTER_RATELIMIT_WARNING}");
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../site/content/reference/middleware/ratelimit.md"
+        ))
+        .expect("the page the warning links to exists");
+        assert!(
+            page.lines().any(|line| line.trim() == "## In a cluster"),
+            "the page must keep the section the warning's anchor names"
+        );
+    }
 
     /// `share_backend_with_php` must register the erased backend with the
     /// PHP bridge AND hand back a wrapper whose `connect()` reaches the

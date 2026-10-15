@@ -95,7 +95,7 @@ The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub
 |-----|------|---------|-------------|
 | `header_read` | u64 | `30` | Time to receive complete request headers after connect. |
 | `idle` | u64 | `60` | Idle connection timeout: a connection with no read or write activity for this long is shut down gracefully. `0` disables it. |
-| `request` | u64 | `300` | Total request timeout including PHP execution. `0` disables the per-request deadline (the router skips arming a tokio timer per request); a stuck request then relies on the idle/header-read timeouts instead of a hard cutoff. |
+| `request` | u64 | `300` | Total request timeout including PHP execution, measured from when the request arrives. A request still waiting on PHP at the deadline gets a 504, and the PHP thread running it (if it had started) is abandoned and replaced; see `ephpm_http_timeouts_total` in [Metrics](/reference/metrics/#http). `0` disables the per-request deadline (the router skips arming a tokio timer per request); a stuck request then relies on the idle/header-read timeouts instead of a hard cutoff. |
 | `shutdown` | u64 | `30` | Grace period for in-flight connections during shutdown. |
 
 ### `[server.response]`
@@ -115,13 +115,13 @@ The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub
 | `cache_control` | string | `""` | Cache-Control header value for static files. Empty = no header. |
 | `hidden_files` | string | `"deny"` | How to handle dot-files: `"deny"` (403), `"ignore"` (404), `"allow"`. |
 | `deploy_manifests` | string | `"deny"` | How to handle a path with a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json` — an application deploy manifest, which is deployment metadata, never web content. `"deny"` (403), `"ignore"` (404), `"allow"`. Unknown values warn at startup and act as `"deny"`. Independent of `hidden_files`: `hidden_files = "allow"` does **not** re-open manifests. |
-| `etag` | bool | `true` | Emit `ETag` headers and serve `304 Not Modified` on conditional requests. |
+| `etag` | bool | `true` | Emit weak `ETag` headers on static files and answer a matching `If-None-Match` (GET/HEAD only, weak comparison per RFC 9110) with `304 Not Modified`. Files up to 1 MiB read from disk get a content-hash tag; larger (streamed) files and `[server.file_cache]` hits get an mtime+size tag. `false` turns both off on every static path. Does not affect `[server.php_etag_cache]`. |
 
 ### `[server.php_etag_cache]`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Cache PHP-emitted ETags in the KV store; serve 304s without re-running PHP. |
+| `enabled` | bool | `false` | Cache PHP-emitted ETags in the KV store; answer a GET/HEAD whose `If-None-Match` matches the stored tag (weak comparison) with 304 without running PHP. Only a `200` with an `ETag`, no `Set-Cookie` and no `Cache-Control: no-store`/`private` is stored; any other non-304 response to the same URL removes the stored tag. Applies to worker-mode front-controller routes too. Independent of `[server.static] etag`. **Inactive** (no lookup, no store) while any `[[middleware]]` chain is mounted, and for a site with a `[preview_auth]` gate: the 304 would otherwise be answered before the gate runs. |
 | `ttl_secs` | i64 | `300` | TTL for cached entries. `<=0` means cache indefinitely. |
 | `key_prefix` | string | `"etag:"` | KV key prefix for cached entries. Full key is `{prefix}{site}:{method}:{path}?{query}`, where `{site}` is the request's canonical site key (empty for a host matching no vhost — i.e. always empty on a single-site node). |
 

@@ -22,8 +22,12 @@ use crate::body::{self, ServerBody};
 /// hit. The per-request file path is still canonicalized here: that is
 /// the traversal/symlink check and doubles as the existence probe.
 ///
-/// When `etag` is enabled, computes a hash-based `ETag` for the content.
-/// If `if_none_match` contains a matching `ETag`, returns 304 Not Modified.
+/// `etag` (`[server.static] etag`) governs every static path alike: when it
+/// is on, each response carries a weak `ETag` and a matching `if_none_match`
+/// answers `304 Not Modified`; when it is off, no path sends an `ETag` or
+/// answers `304`. Files up to 1 MiB read from disk get a content-hash tag;
+/// streamed files and file-cache entries get an mtime+size tag. The caller
+/// passes `if_none_match` only for GET/HEAD.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_file(
     canonical_root: &Path,
@@ -48,11 +52,16 @@ pub async fn serve_file(
         return forbidden();
     }
 
+    // `etag = false` turns conditional requests off on every path below, not
+    // just the content-hash one.
+    let if_none_match = if_none_match.filter(|_| etag);
+
     // Try the file cache first. Returns `None` for metadata-only entries
     // (large files without inlined content) so we fall through to streaming.
     if let Some(cache) = file_cache
         && let Some(entry) = cache.lookup(&canonical_file).await
-        && let Some(resp) = serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
+        && let Some(resp) =
+            serve_cached_entry(entry, accepts_gzip, cache_control, etag, if_none_match)
     {
         return resp;
     }
@@ -70,8 +79,15 @@ pub async fn serve_file(
     const STREAM_THRESHOLD: u64 = 1_048_576;
 
     if metadata.len() > STREAM_THRESHOLD {
-        return serve_streamed(&canonical_file, &metadata, mime, cache_control, if_none_match)
-            .await;
+        return serve_streamed(
+            &canonical_file,
+            &metadata,
+            mime,
+            cache_control,
+            etag,
+            if_none_match,
+        )
+        .await;
     }
 
     let Ok(content) = tokio::fs::read(&canonical_file).await else {
@@ -84,7 +100,9 @@ pub async fn serve_file(
         && let Ok(mtime) = metadata.modified()
     {
         let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
-        if let Some(resp) = serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match) {
+        if let Some(resp) =
+            serve_cached_entry(entry, accepts_gzip, cache_control, etag, if_none_match)
+        {
             return resp;
         }
     }
@@ -93,7 +111,7 @@ pub async fn serve_file(
     let etag_value = if etag { Some(compute_etag(&content)) } else { None };
 
     if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match)
-        && etag_matches(tag, client_tag)
+        && if_none_match_matches(tag, client_tag)
     {
         let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
         builder = builder.header("ETag", tag.as_str());
@@ -170,11 +188,13 @@ fn serve_cached_entry(
     entry: crate::file_cache::CacheEntry,
     accepts_gzip: bool,
     cache_control: &str,
+    etag: bool,
     if_none_match: Option<&str>,
 ) -> Option<Response<ServerBody>> {
     // ETag check — works even for metadata-only entries.
-    if let Some(client_tag) = if_none_match
-        && etag_matches(&entry.etag, client_tag)
+    if etag
+        && let Some(client_tag) = if_none_match
+        && if_none_match_matches(&entry.etag, client_tag)
     {
         let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
         builder = builder.header("ETag", entry.etag.as_str());
@@ -195,8 +215,10 @@ fn serve_cached_entry(
             .header("Content-Type", entry.mime.as_str())
             .header("Content-Length", gzip.len())
             .header("Content-Encoding", "gzip")
-            .header("Vary", "Accept-Encoding")
-            .header("ETag", entry.etag.as_str());
+            .header("Vary", "Accept-Encoding");
+        if etag {
+            builder = builder.header("ETag", entry.etag.as_str());
+        }
         if !cache_control.is_empty() {
             builder = builder.header("Cache-Control", cache_control);
         }
@@ -212,8 +234,10 @@ fn serve_cached_entry(
         let mut builder = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", entry.mime.as_str())
-            .header("Content-Length", content.len())
-            .header("ETag", entry.etag.as_str());
+            .header("Content-Length", content.len());
+        if etag {
+            builder = builder.header("ETag", entry.etag.as_str());
+        }
         if !cache_control.is_empty() {
             builder = builder.header("Cache-Control", cache_control);
         }
@@ -240,12 +264,13 @@ async fn serve_streamed(
     metadata: &std::fs::Metadata,
     content_type: &str,
     cache_control: &str,
+    etag: bool,
     if_none_match: Option<&str>,
 ) -> Response<ServerBody> {
     let size = metadata.len();
-    let modified_time = metadata.modified().ok();
+    let modified_time = metadata.modified().ok().filter(|_| etag);
 
-    // Compute metadata-based ETag.
+    // Compute metadata-based ETag (none when `etag` is off).
     let etag_value = modified_time.map(|mt| {
         let secs =
             mt.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -254,7 +279,7 @@ async fn serve_streamed(
 
     // ETag check.
     if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match)
-        && etag_matches(tag, client_tag)
+        && if_none_match_matches(tag, client_tag)
     {
         let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
         builder = builder.header("ETag", tag.as_str());
@@ -290,15 +315,51 @@ fn compute_etag(content: &[u8]) -> String {
     format!("W/\"{:016x}\"", hasher.finish())
 }
 
-/// Check if a client's `If-None-Match` value matches our `ETag`.
+/// Whether an `If-None-Match` header value matches `etag`, per RFC 9110
+/// §13.1.2: `*` matches any current representation, otherwise the header is a
+/// comma-separated list of entity tags compared with the **weak** comparison
+/// function — `W/"x"` and `"x"` match each other. Commas inside a quoted tag
+/// are part of the tag, not separators.
 ///
-/// Handles `*` and comma-separated lists of tags per HTTP spec.
-fn etag_matches(etag: &str, if_none_match: &str) -> bool {
-    let trimmed = if_none_match.trim();
-    if trimmed == "*" {
+/// One rule for the static-file 304s and the PHP ETag cache. Exact string
+/// comparison (what both did before) missed the weak/strong pairing: a client
+/// or CDN that strips or adds the `W/` prefix never got a 304.
+pub(crate) fn if_none_match_matches(etag: &str, if_none_match: &str) -> bool {
+    let header = if_none_match.trim();
+    if header == "*" {
         return true;
     }
-    trimmed.split(',').any(|tag| tag.trim() == etag)
+    let ours = opaque_tag(etag.trim());
+    if ours.is_empty() {
+        return false;
+    }
+    entity_tags(header).into_iter().any(|tag| opaque_tag(tag) == ours)
+}
+
+/// The opaque part of an entity tag: the tag without its `W/` weakness
+/// indicator, which is all weak comparison looks at.
+fn opaque_tag(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
+/// Split an `If-None-Match` list into its entity tags, honouring quotes.
+fn entity_tags(header: &str) -> Vec<&str> {
+    let mut tags = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (i, c) in header.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                tags.push(header[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    tags.push(header[start..].trim());
+    tags.retain(|tag| !tag.is_empty());
+    tags
 }
 
 fn not_found() -> Response<ServerBody> {
@@ -500,21 +561,134 @@ mod tests {
 
     #[tokio::test]
     async fn test_etag_matches_wildcard() {
-        assert!(etag_matches("W/\"abc\"", "*"));
+        assert!(if_none_match_matches("W/\"abc\"", "*"));
     }
 
     #[tokio::test]
     async fn test_etag_matches_exact() {
-        assert!(etag_matches("W/\"abc\"", "W/\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "W/\"abc\""));
     }
 
     #[tokio::test]
     async fn test_etag_matches_list() {
-        assert!(etag_matches("W/\"b\"", "W/\"a\", W/\"b\", W/\"c\""));
+        assert!(if_none_match_matches("W/\"b\"", "W/\"a\", W/\"b\", W/\"c\""));
     }
 
     #[tokio::test]
     async fn test_etag_no_match() {
-        assert!(!etag_matches("W/\"x\"", "W/\"a\", W/\"b\""));
+        assert!(!if_none_match_matches("W/\"x\"", "W/\"a\", W/\"b\""));
+    }
+
+    /// RFC 9110 §13.1.2: If-None-Match uses WEAK comparison, so the `W/`
+    /// prefix is ignored on either side.
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        assert!(if_none_match_matches("W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("\"abc\"", "W/\"abc\""));
+        assert!(if_none_match_matches("\"abc\"", " \"x\" , W/\"abc\" "));
+        assert!(!if_none_match_matches("W/\"abc\"", "\"abd\""));
+    }
+
+    /// A comma inside a quoted tag is part of the tag (`etagc` allows it).
+    #[test]
+    fn if_none_match_does_not_split_inside_quotes() {
+        assert!(if_none_match_matches("\"a,b\"", "\"x\", \"a,b\""));
+        assert!(!if_none_match_matches("\"a\"", "\"a,b\""));
+        assert!(!if_none_match_matches("\"b\"", "\"a,b\""));
+    }
+
+    #[test]
+    fn if_none_match_never_matches_an_empty_tag() {
+        assert!(!if_none_match_matches("", "\"a\""));
+        assert!(!if_none_match_matches("\"a\"", ""));
+        assert!(!if_none_match_matches("\"a\"", " , "));
+    }
+
+    /// Serve `name` with explicit `etag` / `If-None-Match` and an optional
+    /// file cache.
+    async fn serve_conditional(
+        docroot: &Path,
+        name: &str,
+        etag: bool,
+        if_none_match: Option<&str>,
+        file_cache: Option<&crate::file_cache::FileCache>,
+    ) -> Response<ServerBody> {
+        let canonical_root = docroot.canonicalize().expect("canonicalize test docroot");
+        serve_file(
+            &canonical_root,
+            &docroot.join(name),
+            false,
+            false,
+            "",
+            no_compression(),
+            etag,
+            if_none_match,
+            file_cache,
+        )
+        .await
+    }
+
+    fn file_cache() -> crate::file_cache::FileCache {
+        crate::file_cache::FileCache::new(&ephpm_config::FileCacheConfig {
+            enabled: true,
+            ..ephpm_config::FileCacheConfig::default()
+        })
+    }
+
+    /// Every static path — small file, streamed large file, file-cache hit —
+    /// sends an `ETag` and answers a matching `If-None-Match` with 304 when
+    /// `etag` is on.
+    #[tokio::test]
+    async fn every_static_path_honours_if_none_match_when_etag_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("small.txt"), "small").unwrap();
+        fs::write(dir.path().join("large.bin"), vec![7u8; 1_048_577]).unwrap();
+        let cache = file_cache();
+
+        for (name, cache) in [("small.txt", None), ("large.bin", None), ("small.txt", Some(&cache))]
+        {
+            let first = serve_conditional(dir.path(), name, true, None, cache).await;
+            assert_eq!(first.status(), StatusCode::OK, "{name}");
+            let tag = first.headers()["etag"].to_str().unwrap().to_owned();
+            let again = serve_conditional(dir.path(), name, true, Some(&tag), cache).await;
+            assert_eq!(
+                again.status(),
+                StatusCode::NOT_MODIFIED,
+                "{name} (cache: {})",
+                cache.is_some()
+            );
+            // The strong spelling of the same weak tag matches too.
+            let strong = tag.trim_start_matches("W/").to_owned();
+            let again = serve_conditional(dir.path(), name, true, Some(&strong), cache).await;
+            assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{name} strong form");
+        }
+    }
+
+    /// `etag = false` used to drop the `ETag` only on small uncached files:
+    /// streamed files and file-cache hits still sent one, while the router no
+    /// longer passed `If-None-Match`, so they advertised a validator they
+    /// would never honour. Now no static path sends an `ETag` or a 304.
+    #[tokio::test]
+    async fn etag_off_disables_etags_and_304s_on_every_static_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("small.txt"), "small").unwrap();
+        fs::write(dir.path().join("large.bin"), vec![7u8; 1_048_577]).unwrap();
+        let cache = file_cache();
+
+        for (name, cache) in [("small.txt", None), ("large.bin", None), ("small.txt", Some(&cache))]
+        {
+            for inm in [None, Some("*")] {
+                // Twice, so the second file-cache request is a cache hit.
+                for _ in 0..2 {
+                    let resp = serve_conditional(dir.path(), name, false, inm, cache).await;
+                    assert_eq!(resp.status(), StatusCode::OK, "{name} {inm:?}");
+                    assert!(
+                        resp.headers().get("etag").is_none(),
+                        "{name} must not send an ETag with etag = false (cache: {})",
+                        cache.is_some()
+                    );
+                }
+            }
+        }
     }
 }

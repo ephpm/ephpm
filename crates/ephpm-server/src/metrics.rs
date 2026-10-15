@@ -153,3 +153,97 @@ pub fn render(handle: &PrometheusHandle) -> Response<crate::body::ServerBody> {
         .body(crate::body::buffered(Full::new(Bytes::from(body))))
         .expect("static metrics response builder is always valid")
 }
+
+/// Holds a gauge at +1 for exactly as long as it lives.
+///
+/// For "currently doing X" gauges whose X spans `.await` points
+/// (`ephpm_http_requests_in_flight`, `ephpm_worker_busy`). A bare
+/// increment/decrement pair around an await leaks the increment whenever the
+/// future is dropped in between — the request timeout firing, or hyper
+/// dropping the service future when the client disconnects — and the gauge
+/// then drifts upward forever. The decrement lives in `Drop`, which runs on
+/// cancellation too.
+#[must_use = "the gauge is decremented as soon as the guard is dropped"]
+pub(crate) struct GaugeGuard(&'static str);
+
+impl GaugeGuard {
+    /// Increment `name` and return the guard that decrements it.
+    pub(crate) fn enter(name: &'static str) -> Self {
+        gauge!(name).increment(1.0);
+        Self(name)
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        gauge!(self.0).decrement(1.0);
+    }
+}
+
+/// Render what `f` records into a private Prometheus recorder, for tests that
+/// assert on metric values without touching the process-global recorder.
+///
+/// `f` runs on a fresh current-thread runtime on this thread (with a paused
+/// clock), so everything it records — including from tasks it spawns — lands
+/// in the local recorder. Records made on other OS threads (pool threads) go to
+/// the global recorder and are not seen.
+#[cfg(test)]
+pub(crate) fn record_locally<F, Fut>(f: F) -> (Fut::Output, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future,
+{
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let out = ::metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("test runtime")
+            .block_on(f())
+    });
+    (out, handle.render())
+}
+
+/// The value of the series `series` (name plus any `{labels}`, exactly as
+/// rendered) in a Prometheus text payload, if present.
+#[cfg(test)]
+pub(crate) fn rendered_value(payload: &str, series: &str) -> Option<f64> {
+    payload.lines().find_map(|line| {
+        let rest = line.strip_prefix(series)?;
+        rest.strip_prefix(' ')?.trim().parse().ok()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The gauge comes back down when the future holding the guard is dropped
+    /// mid-await — the cancellation a bare increment/decrement pair leaked.
+    #[test]
+    fn gauge_guard_survives_cancellation() {
+        let ((), payload) = record_locally(|| async {
+            let pending = async {
+                let _guard = GaugeGuard::enter("ephpm_test_in_flight");
+                std::future::pending::<()>().await;
+            };
+            assert!(tokio::time::timeout(Duration::from_millis(10), pending).await.is_err());
+        });
+        assert_eq!(rendered_value(&payload, "ephpm_test_in_flight"), Some(0.0), "{payload}");
+    }
+
+    #[test]
+    fn gauge_guard_counts_while_held() {
+        let ((), payload) = record_locally(|| async {
+            let a = GaugeGuard::enter("ephpm_test_busy");
+            let b = GaugeGuard::enter("ephpm_test_busy");
+            drop(a);
+            std::mem::forget(b);
+        });
+        assert_eq!(rendered_value(&payload, "ephpm_test_busy"), Some(1.0), "{payload}");
+    }
+}

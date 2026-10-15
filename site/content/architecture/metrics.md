@@ -52,8 +52,8 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 |--------|------|--------|-------------|
 | `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests processed. `handler` is one of `php`, `static`, `middleware`, `error`, `health`, `metrics`, `diagnostics`, `acme`, `proxy`, `websocket`, `auth`, `site_override_unusable` ([value table](/reference/metrics/#handler-label-values)). |
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | End-to-end request duration (includes PHP execution for PHP requests). |
-| `ephpm_http_requests_in_flight` | gauge | — | Number of requests currently being processed. Drifts upward on client disconnects (no drop guard on the decrement). |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests that hit the request timeout. `stage` is `request`, `fpm_pool` or `worker`; most record as `request` ([why](/reference/metrics/#timeouts-and-the-fpm_pool--worker-stages)). |
+| `ephpm_http_requests_in_flight` | gauge | — | Number of requests currently being processed. |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests that hit the request deadline. `stage` is `"fpm_pool"` or `"worker"` (waiting on PHP; a thread that had started the request is also marked hung and replaced) or `"request"` (waiting on anything else). See [Metrics reference](/reference/metrics/#http). |
 | `ephpm_http_body_overflow_total` | counter | — | `413`s raised while reading an over-limit request body. |
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size in bytes. `method` is a standard verb or `OTHER`, never the client's raw verb. |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size in bytes (before compression). |

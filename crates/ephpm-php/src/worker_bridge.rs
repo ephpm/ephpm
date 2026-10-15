@@ -207,6 +207,11 @@ pub struct WorkerJob {
     /// whichever sender happens to race a bounded-channel `send()` first.
     /// `None` only for jobs that never passed admission (tests).
     pub admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Raised by the worker the moment it pulls this job. Lets the server
+    /// tell a request that was *running* at its deadline (the worker may be
+    /// hung) from one still queued behind busy workers (nothing is hung).
+    /// `None` when nobody is watching.
+    pub started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl WorkerBody {
@@ -693,6 +698,16 @@ thread_local! {
     /// such clients wedge the whole pool undetected.
     static STREAM_SEND_TIMEOUT: std::cell::Cell<std::time::Duration> =
         const { std::cell::Cell::new(std::time::Duration::from_secs(60)) };
+
+    /// Asked between requests: should this worker retire because the pool is
+    /// over target? (A hung worker's replacement is still running after the
+    /// hung worker came back.) Installed by the pool via [`set_retire_check`].
+    static RETIRE_CHECK: RefCell<Option<Box<dyn Fn() -> bool + Send>>> =
+        const { RefCell::new(None) };
+
+    /// Set when `take_request` ended the loop because [`RETIRE_CHECK`] said
+    /// so, so the pool can account the exit as a retirement, not a recycle.
+    static RETIRED_SURPLUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install the dispatch receiver for the current worker thread. Called by the
@@ -771,6 +786,34 @@ pub fn set_stream_send_timeout(timeout: std::time::Duration) {
 /// Stub.
 #[cfg(not(php_linked))]
 pub fn set_stream_send_timeout(_timeout: std::time::Duration) {}
+
+/// Install this worker thread's surplus check: consulted at every
+/// `take_request()` (between requests); when it returns `true` the worker ends
+/// its loop cleanly, and [`retired_as_surplus`] reports it. Install before
+/// `run_worker`.
+#[cfg(php_linked)]
+pub fn set_retire_check(check: Box<dyn Fn() -> bool + Send>) {
+    RETIRE_CHECK.with(|cell| *cell.borrow_mut() = Some(check));
+    RETIRED_SURPLUS.with(|c| c.set(false));
+}
+
+/// Stub.
+#[cfg(not(php_linked))]
+pub fn set_retire_check(_check: Box<dyn Fn() -> bool + Send>) {}
+
+/// Whether this worker's loop ended because its surplus check fired.
+#[cfg(php_linked)]
+#[must_use]
+pub fn retired_as_surplus() -> bool {
+    RETIRED_SURPLUS.with(std::cell::Cell::get)
+}
+
+/// Stub: no worker loop runs without PHP linked.
+#[cfg(not(php_linked))]
+#[must_use]
+pub fn retired_as_surplus() -> bool {
+    false
+}
 
 /// Take the parked `oneshot::Sender` for the in-flight request, if one is
 /// still stashed. Used by the pool's crash-recovery path: after
@@ -911,6 +954,14 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         return 0;
     }
 
+    // Surplus retirement: the pool is over target (a hung worker came back
+    // while its replacement runs), and this worker is the one that claimed
+    // the slot. End the loop cleanly; the pool does not respawn.
+    if RETIRE_CHECK.with(|cell| cell.borrow().as_ref().is_some_and(|check| check())) {
+        RETIRED_SURPLUS.with(|c| c.set(true));
+        return 0;
+    }
+
     let Some(rx) = DISPATCH_RX.with(|cell| cell.borrow().clone()) else {
         // No receiver installed — nothing can ever arrive; treat as shutdown.
         return 0;
@@ -950,6 +1001,9 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         }
     });
     drop(job.admission);
+    if let Some(started) = &job.started {
+        started.store(true, std::sync::atomic::Ordering::Release);
+    }
 
     // Stash the sender for send_response / crash recovery.
     PENDING_SENDER.with(|cell| *cell.borrow_mut() = Some(job.respond_to));

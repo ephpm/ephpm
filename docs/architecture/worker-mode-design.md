@@ -713,6 +713,13 @@ that bailed out.**
   metric surfaces the bad script. This matches how every persistent-PHP server
   (FrankenPHP, RoadRunner) handles a genuinely-wedged worker: replace, don't
   kill.
+  *As implemented* (`crates/ephpm-server/src/php_wait.rs`): the request has one
+  deadline, and the oneshot wait uses it while the outer guard fires 50 ms later,
+  so the worker-aware arm always answers. Only a job the worker had already
+  pulled marks it hung (a job still queued at the deadline is overload). The
+  abandoned worker is not excluded from the queue; if it comes back, one
+  surplus worker retires at its next `take_request()` so the pool returns to
+  `worker_count`.
 - **Dead worker (thread panicked / boot-failed).** `WorkerPool` holds
   `JoinHandle`s; a supervision task (`tokio::spawn` a monitor, or a
   `on_thread_stop`-style hook) notices a terminated worker and respawns to
@@ -900,7 +907,7 @@ thread (not a request worker — `laravel-octane-driver.md:240-243`).
 |---|---|---|
 | **State leakage between requests** | The framework or the SAPI leaks per-request state into the next request on the same booted kernel (stale `$_SERVER`, leftover response headers, an unclosed session). | Minimal-but-complete per-iteration reset (§3.5) built from the *exact* lines the fpm hardening already proved (`:823-825`, `:844`); adapters own app-state reset; an integration test that asserts request N+1 sees none of request N's superglobals/headers/status. |
 | **Memory growth** | Long-lived framework accumulates references (event listeners, static caches, DI singletons) → OOM over hours. | `worker_max_requests` recycle (§5.2) + `ephpm_worker_recycles_total` telemetry; document tuning; recommend adapters flush their own caches (Octane does this via listeners). |
-| **Fatal kills the kernel / wedges server** | A `zend_bailout` unwinds past the response send; a hung script parks a worker forever. | Two-net response guarantee (TLS sender check + dropped-sender→500, §5.3); mandatory worker recycle after any bailout; hung-worker → replace-not-kill + 504 via existing outer timeout (§5.4). |
+| **Fatal kills the kernel / wedges server** | A `zend_bailout` unwinds past the response send; a hung script parks a worker forever. | Two-net response guarantee (TLS sender check + dropped-sender→500, §5.3); mandatory worker recycle after any bailout; hung-worker → replace-not-kill + 504 when the reply wait hits the request deadline (§5.4; replacements capped at the pool size). |
 | **TSRM correctness** | Worker registers TSRM once and keeps the request open for its life; a mistake here corrupts per-thread globals across workers. | `ephpm_thread_init` is the *only* TSRM entry, guarded by the existing `thread_local!` bool (`lib.rs:482-502`); the long request is never shut down mid-life; `ts_free_thread` only at drain (§5.4); every shipped platform is ZTS, Windows included (§6.1, #326). |
 | **`--wrap` / signal reinit** | Worker relies on signal no-ops for its single boot-time `php_request_startup`. | Fewer calls than fpm (once vs per-request) → strictly less exposure; verify link map on macOS as a Phase-1 exit check (§6.3). |
 | **Superglobal UAF re-introduction** | If WordPress mode hand-rebuilds superglobals it can re-trigger the `php_default_treat_data` UAF (`:773-789`). | Default off; when on, drive population through the normal treat_data path at a quiescent point, never hand-rebuild `PG(http_globals)`; fuzz the WordPress path before shipping the WP adapter (Phase 5). |

@@ -54,10 +54,14 @@
 //!   rather than a request that occupies a client until its own timeout
 //!   (issue #301).
 //! - **Draining / no live threads → 503:** [`DispatchClosed`] from `dispatch`.
-//! - **Wedged thread → 504 + replace:** the router bounds the `oneshot` wait; a
-//!   timeout calls [`FpmPool::note_hung`], which spawns a replacement and
+//! - **Wedged thread → 504 + replace:** the router bounds the `oneshot` wait by
+//!   the request deadline; a request that was *running* (not merely queued)
+//!   when it passed calls [`FpmPool::note_hung`], which spawns a replacement and
 //!   abandons the stuck thread (a wedged PHP thread cannot be killed without
-//!   corrupting the ZMM — replace, don't kill).
+//!   corrupting the ZMM — replace, don't kill). When the stuck thread answers
+//!   after all, [`FpmPool::note_recovered`] lets one surplus thread retire
+//!   between jobs, so a slow-but-alive thread does not grow the pool for good
+//!   (see `crate::php_wait`).
 //! - **Graceful drain:** [`FpmPool::drain`] closes the dispatch sender; each
 //!   thread's `recv_blocking` then returns `Err`, the loop ends, and the thread
 //!   releases its TSRM slot ([`PhpRuntime::worker_thread_shutdown`]) before
@@ -280,6 +284,13 @@ struct PoolState {
     draining: AtomicBool,
     /// Monotonic id source for threads (logging / metric context).
     next_id: AtomicUsize,
+    /// Threads marked hung ([`FpmPool::note_hung`]) that have not answered
+    /// yet. Each one is still counted in `live` but is not serving, so the
+    /// pool's serving strength is `live - hung`.
+    hung: AtomicUsize,
+    /// Surplus threads that have claimed retirement
+    /// ([`FpmPool::claim_surplus`]) but not yet left `live`.
+    retiring: AtomicUsize,
 }
 
 impl FpmPool {
@@ -304,6 +315,8 @@ impl FpmPool {
             last_poison_ms: AtomicU64::new(0),
             draining: AtomicBool::new(false),
             next_id: AtomicUsize::new(0),
+            hung: AtomicUsize::new(0),
+            retiring: AtomicUsize::new(0),
         });
 
         #[allow(clippy::cast_precision_loss)]
@@ -546,11 +559,29 @@ impl FpmPool {
         })
     }
 
-    /// Record that a thread appears hung (its `oneshot` timed out). The stuck
-    /// thread is abandoned and a replacement is spawned to keep the pool at
-    /// `thread_count` live pullers.
+    /// Record that a thread appears hung (its request was running at the
+    /// request deadline and had not answered). The stuck thread is abandoned
+    /// and a replacement is spawned to keep the pool at `thread_count` serving
+    /// threads. Pair every call with [`FpmPool::note_recovered`] once the
+    /// thread answers, or the pool stays one thread larger for good.
+    ///
+    /// Replacements are capped at `thread_count` outstanding hung threads
+    /// (at most twice the configured threads alive): every request that
+    /// outlasts the deadline — a slow endpoint, a client that sends and
+    /// disconnects — would otherwise add a full ZTS context without bound.
+    /// Past the cap the thread is still counted hung but not replaced.
     pub fn note_hung(self: &Arc<Self>) {
+        let hung = self.state.hung.fetch_add(1, Ordering::AcqRel) + 1;
         counter!("ephpm_fpm_pool_recycles_total", "reason" => "hung").increment(1);
+        if hung > self.thread_count {
+            tracing::error!(
+                hung,
+                cap = self.thread_count,
+                "fpm pool thread appeared hung, but as many hung threads as the pool size are \
+                 already outstanding — not spawning a replacement"
+            );
+            return;
+        }
         // The stuck thread still holds its dispatch-receiver clone and may
         // eventually finish; we simply add capacity. A brief over-provision is
         // preferable to a wedged pool.
@@ -560,6 +591,31 @@ impl FpmPool {
                 "fpm pool thread appeared hung — spawned replacement, abandoned stuck thread"
             );
         }
+    }
+
+    /// A thread passed to [`FpmPool::note_hung`] answered (or dropped) its
+    /// request at last and is pulling work again. The pool is now one serving
+    /// thread over target, and the next thread to finish a job retires
+    /// ([`FpmPool::claim_surplus`]).
+    pub fn note_recovered(&self) {
+        crate::php_wait::release_hung(&self.state.hung);
+    }
+
+    /// Claim retirement for the calling thread if the pool is over target.
+    ///
+    /// Over target means more threads are live than `thread_count` once hung
+    /// threads (live but not serving) and threads already retiring are
+    /// discounted — the state after a hung thread came back and its
+    /// replacement is still running. At most one thread claims each surplus
+    /// slot.
+    fn claim_surplus(&self) -> bool {
+        !self.state.draining.load(Ordering::Acquire)
+            && crate::php_wait::claim_surplus(
+                &self.state.live,
+                &self.state.hung,
+                &self.state.retiring,
+                self.thread_count,
+            )
     }
 
     /// Record a contained-crash retirement and return how long the retiring
@@ -646,6 +702,10 @@ impl FpmPool {
 enum ThreadExit {
     /// Dispatch closed — graceful drain. Normal PHP teardown.
     Drain,
+    /// The pool was over target after a hung thread came back
+    /// ([`FpmPool::claim_surplus`]); this thread retires between jobs. Normal
+    /// PHP teardown, and no replacement.
+    Surplus,
     /// A Rust panic escaped the job. The Zend context is in an unknown but not
     /// known-corrupt state, so normal PHP teardown still runs.
     Panicked,
@@ -681,6 +741,12 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
 
     let mut exit = ThreadExit::Drain;
     loop {
+        // Between jobs: shed one surplus thread left over from a hung-thread
+        // replacement whose "hung" thread came back.
+        if pool.claim_surplus() {
+            exit = ThreadExit::Surplus;
+            break;
+        }
         let job = match rx.recv_blocking() {
             Ok(job) => job,
             // Dispatch closed — graceful drain. Exit the loop cleanly.
@@ -780,6 +846,10 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
     // needed any more.
     release_held_scope();
     pool.state.live.fetch_sub(1, Ordering::AcqRel);
+    if exit == ThreadExit::Surplus {
+        pool.state.retiring.fetch_sub(1, Ordering::AcqRel);
+        tracing::debug!(thread_id, "fpm pool back to target after a hung thread recovered");
+    }
 
     if exit == ThreadExit::Poisoned {
         // Rate-limit the replacement so a crash-looping client cannot spin
@@ -800,15 +870,27 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
 
 /// Spawn a replacement thread unless the pool is draining or already at target.
 ///
-/// Gating on `live < thread_count` makes hung-thread replacement
-/// self-balancing: `note_hung` spawns a replacement (live -> count+1) while the
-/// stuck thread is abandoned; the extra puller is harmless and the pool holds
-/// `thread_count` healthy pullers.
+/// The gate counts *serving* threads: `live` minus threads marked hung (alive
+/// but stuck). Gating on plain `live` would let a hung thread stand in for a
+/// serving one, so after a hung thread's replacement any routine exit
+/// (panic, poisoned context) would leave the pool a thread short. Hung-thread
+/// replacement still cannot compound: `note_hung` spawns a replacement while
+/// the stuck thread is abandoned; if the stuck thread comes back,
+/// `note_recovered` and `claim_surplus` retire one thread between jobs; if it
+/// exits instead, its reply or dropped sender came first, so `note_recovered`
+/// has normally run and this gate sees serving == count and spawns nothing.
+/// (If the watcher task has not processed that reply yet, one extra thread is
+/// spawned and later retires through `claim_surplus`.)
 fn respawn_if_running(pool: &Arc<FpmPool>) {
     if pool.state.draining.load(Ordering::Acquire) {
         return;
     }
-    if pool.state.live.load(Ordering::Acquire) >= pool.thread_count {
+    let serving = pool
+        .state
+        .live
+        .load(Ordering::Acquire)
+        .saturating_sub(pool.state.hung.load(Ordering::Acquire));
+    if serving >= pool.thread_count {
         return;
     }
     // Basic boot-storm backoff: if TSRM init keeps failing, pause before
@@ -1222,5 +1304,103 @@ mod tests {
         );
         assert!(pool.dispatch(ok_task(200)).await.is_err(), "dispatch after drain must error");
         assert_eq!(pool.queue_depth(), 1, "failed barge enqueues must roll back their increments");
+    }
+
+    // ── Hung threads: replace, then shrink back ─────────────────────────
+
+    /// A request that is still running at its deadline marks its thread hung:
+    /// the pool spawns a replacement so it keeps serving at full strength.
+    /// When the "hung" thread finally answers, the pool sheds the surplus
+    /// thread instead of staying one larger for good.
+    #[tokio::test]
+    async fn hung_thread_is_replaced_and_the_pool_shrinks_back_when_it_returns() {
+        use crate::php_wait::{PendingReply, ReplyOutcome, StartFlag, track_start};
+
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(1, 4, AdmissionPolicy::Fifo);
+        assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
+        let spawned_before = pool.threads_spawned();
+
+        // A job that blocks until released — a script stuck past its deadline.
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let started = StartFlag::default();
+        let task = track_start(
+            Box::new(move || {
+                let _ = blocked.recv();
+                Ok(PhpResponse { status: 200, headers: Vec::new(), body: Vec::new() })
+            }),
+            &started,
+        );
+        let rx = pool.dispatch(task).await.expect("dispatch ok");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+        let outcome =
+            PendingReply::new(rx, started, Some(deadline), Arc::clone(&pool)).wait().await;
+        assert!(matches!(outcome, ReplyOutcome::TimedOut { hung: true }));
+
+        // Replaced: a second thread now serves while the first is stuck.
+        assert_eq!(pool.threads_spawned(), spawned_before + 1, "one replacement spawned");
+        assert!(wait_for(|| pool.ready_count() == 2).await, "replacement registers");
+        let rx = pool.dispatch(ok_task(201)).await.expect("dispatch ok");
+        let resp = rx.await.expect("the replacement serves").expect("ok");
+        assert_eq!(resp.status, 201);
+        assert_eq!(pool.live_count(), 2, "nothing retires while the stuck thread is still out");
+
+        // The stuck thread comes back. The next thread to finish a job sees
+        // the pool over target and retires.
+        release.send(()).expect("release the stuck job");
+        assert!(
+            wait_for(|| pool.state.hung.load(Ordering::Acquire) == 0).await,
+            "the recovery must be reported"
+        );
+        let rx = pool.dispatch(ok_task(202)).await.expect("dispatch ok");
+        rx.await.expect("served").expect("ok");
+        assert!(wait_for(|| pool.live_count() == 1).await, "the surplus thread must retire");
+        assert_eq!(pool.threads_spawned(), spawned_before + 1, "retiring spawns nothing");
+
+        // Still serving at full strength afterwards.
+        let rx = pool.dispatch(ok_task(203)).await.expect("dispatch ok");
+        assert_eq!(rx.await.expect("served").expect("ok").status, 203);
+
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the thread");
+    }
+
+    /// A job still queued at its deadline (every thread busy) is overload,
+    /// not a hung thread: no replacement is spawned.
+    #[tokio::test]
+    async fn queued_job_past_its_deadline_spawns_no_replacement() {
+        use crate::php_wait::{PendingReply, ReplyOutcome, StartFlag, track_start};
+
+        // Zero threads: the job is accepted into the queue and never starts.
+        let pool = FpmPool::spawn(0, 4, AdmissionPolicy::Fifo);
+        let started = StartFlag::default();
+        let rx = pool.dispatch(track_start(ok_task(200), &started)).await.expect("queued");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let outcome =
+            PendingReply::new(rx, started, Some(deadline), Arc::clone(&pool)).wait().await;
+        assert!(matches!(outcome, ReplyOutcome::TimedOut { hung: false }));
+        assert_eq!(pool.threads_spawned(), 0, "overload must not grow the pool");
+        assert_eq!(pool.state.hung.load(Ordering::Acquire), 0);
+    }
+
+    /// Hung-thread replacement is capped at the pool size: requests that
+    /// keep outlasting the deadline cannot grow the pool without bound.
+    #[tokio::test]
+    async fn hung_thread_replacement_is_capped_at_the_pool_size() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(2, 4, AdmissionPolicy::Fifo);
+        assert!(wait_for(|| pool.ready_count() == 2).await, "threads should register");
+        let spawned_before = pool.threads_spawned();
+        for _ in 0..5 {
+            pool.note_hung();
+        }
+        assert_eq!(pool.state.hung.load(Ordering::Acquire), 5, "every one is counted hung");
+        assert_eq!(
+            pool.threads_spawned(),
+            spawned_before + 2,
+            "but only pool-size replacements are spawned"
+        );
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the threads");
     }
 }
