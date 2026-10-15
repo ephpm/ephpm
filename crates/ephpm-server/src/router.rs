@@ -3266,6 +3266,33 @@ impl Router {
         index_files: &[String],
         fallback_chain: &[String],
     ) -> Resolved {
+        // One resolution often asks about the same path more than once: with
+        // the default chain, `/` probes the document root and its index files
+        // for `$uri` and again for `$uri/` (which expands to `//`, the same
+        // directory), then the rewrite target `/index.php` that was already
+        // probed as an index file. Each lookup is a `statx` (through overlayfs
+        // and the LSM in a container), so they are memoised for the duration
+        // of this call only — never across requests, so a file that appears
+        // or disappears is seen by the very next request.
+        Self::resolve_fallback_in(
+            &mut FsKindMemo::default(),
+            uri_path,
+            query_string,
+            doc_root,
+            index_files,
+            fallback_chain,
+        )
+    }
+
+    /// [`Router::resolve_fallback`] against a caller-owned lookup memo.
+    fn resolve_fallback_in(
+        memo: &mut FsKindMemo,
+        uri_path: &str,
+        query_string: &str,
+        doc_root: &Path,
+        index_files: &[String],
+        fallback_chain: &[String],
+    ) -> Resolved {
         if fallback_chain.is_empty() {
             return Resolved::Status(404);
         }
@@ -3274,7 +3301,7 @@ impl Router {
 
         for entry in probes {
             let expanded = expand_variables(entry, uri_path, query_string);
-            if let Some(path) = self.probe_path(&expanded, doc_root, index_files) {
+            if let Some(path) = Self::probe_path(memo, &expanded, doc_root, index_files) {
                 return Resolved::File(path);
             }
         }
@@ -3287,17 +3314,13 @@ impl Router {
             let expanded = expand_variables(last, uri_path, query_string);
             let (rewrite_path, _) = split_path_query(&expanded);
             let fs_path = doc_root.join(rewrite_path.trim_start_matches('/'));
-            if fs_path.exists() && fs_path.is_file() {
-                Resolved::File(fs_path)
-            } else {
-                Resolved::Status(404)
-            }
+            if memo.is_file(&fs_path) { Resolved::File(fs_path) } else { Resolved::Status(404) }
         }
     }
 
     /// Probe a single `fallback` entry against the filesystem.
     fn probe_path(
-        &self,
+        memo: &mut FsKindMemo,
         expanded: &str,
         doc_root: &Path,
         index_files: &[String],
@@ -3306,10 +3329,10 @@ impl Router {
 
         if path_part.ends_with('/') {
             let dir = doc_root.join(path_part.trim_start_matches('/'));
-            if dir.is_dir() {
+            if memo.is_dir(&dir) {
                 for index in index_files {
                     let candidate = dir.join(index);
-                    if candidate.is_file() {
+                    if memo.is_file(&candidate) {
                         return Some(candidate);
                     }
                 }
@@ -3317,7 +3340,7 @@ impl Router {
             None
         } else {
             let fs_path = doc_root.join(path_part.trim_start_matches('/'));
-            if fs_path.is_file() { Some(fs_path) } else { None }
+            if memo.is_file(&fs_path) { Some(fs_path) } else { None }
         }
     }
 
@@ -3651,6 +3674,11 @@ impl Router {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
+        // The body's own exact length, when the transport knows it without a
+        // Content-Length header — notably `0` for a request that carries no
+        // body at all (an HTTP/1 GET with neither Content-Length nor
+        // Transfer-Encoding). Read before the body may be consumed.
+        let body_exact_len: Option<u64> = hyper::body::Body::size_hint(req.body()).exact();
 
         // Optional request-body buffering for middleware (`[server.request]
         // middleware_body_limit`). When enabled AND a chain is mounted, buffer
@@ -3802,48 +3830,48 @@ impl Router {
         if let Some(pool) = self.worker_pool.clone() {
             let (worker_body, body_overflow) = if let Some(bytes) = prebuffered.take() {
                 (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
+            } else if worker_body_should_stream(
+                self.worker_stream_threshold,
+                content_length,
+                body_exact_len,
+            ) {
+                let (body, overflow) = stream_request_body(
+                    req.take().expect("request present for streaming"),
+                    content_length,
+                    self.max_body_size,
+                );
+                (body, Some(overflow))
             } else {
-                let should_stream = self.worker_stream_threshold > 0
-                    && content_length.is_none_or(|len| len >= self.worker_stream_threshold);
-                if should_stream {
-                    let (body, overflow) = stream_request_body(
-                        req.take().expect("request present for streaming"),
-                        content_length,
-                        self.max_body_size,
-                    );
-                    (body, Some(overflow))
+                // The Content-Length pre-check already 413'd declared-large
+                // bodies; `Limited` catches chunked / lying clients on the
+                // buffered path (`Err` on exceeding the cap).
+                let bytes = if self.max_body_size > 0 {
+                    let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+                    let taken = req.take().expect("request present for buffered worker body");
+                    match http_body_util::Limited::new(taken, cap).collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(_) => {
+                            counter!("ephpm_http_body_overflow_total").increment(1);
+                            return apply_response_headers(
+                                error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "413 Payload Too Large",
+                                ),
+                                &mw_response_headers,
+                            );
+                        }
+                    }
                 } else {
-                    // The Content-Length pre-check already 413'd declared-large
-                    // bodies; `Limited` catches chunked / lying clients on the
-                    // buffered path (`Err` on exceeding the cap).
-                    let bytes = if self.max_body_size > 0 {
-                        let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
-                        let taken = req.take().expect("request present for buffered worker body");
-                        match http_body_util::Limited::new(taken, cap).collect().await {
-                            Ok(collected) => collected.to_bytes().to_vec(),
-                            Err(_) => {
-                                counter!("ephpm_http_body_overflow_total").increment(1);
-                                return apply_response_headers(
-                                    error_response(
-                                        StatusCode::PAYLOAD_TOO_LARGE,
-                                        "413 Payload Too Large",
-                                    ),
-                                    &mw_response_headers,
-                                );
-                            }
-                        }
-                    } else {
-                        let taken = req.take().expect("request present for buffered worker body");
-                        match taken.collect().await {
-                            Ok(collected) => collected.to_bytes().to_vec(),
-                            Err(_) => Vec::new(),
-                        }
-                    };
-                    #[allow(clippy::cast_precision_loss)]
-                    histogram!("ephpm_http_request_body_bytes", "method" => method_label)
-                        .record(bytes.len() as f64);
-                    (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
-                }
+                    let taken = req.take().expect("request present for buffered worker body");
+                    match taken.collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(_) => Vec::new(),
+                    }
+                };
+                #[allow(clippy::cast_precision_loss)]
+                histogram!("ephpm_http_request_body_bytes", "method" => method_label)
+                    .record(bytes.len() as f64);
+                (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
             };
 
             let resp = self
@@ -6328,9 +6356,108 @@ fn error_response_owned(status: StatusCode, body: String) -> Response<ServerBody
         .expect("owned-body error response")
 }
 
-/// Build an HTTP response from a PHP execution result, optionally compressing.
+/// What one filesystem lookup found, as `Path::is_file` / `Path::is_dir` see
+/// it (symlinks followed; any error counts as "not there").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FsKind {
+    File,
+    Dir,
+    Other,
+}
+
+/// Memo of filesystem lookups for ONE `fallback` resolution.
 ///
-/// Prefers Brotli (`br`) over gzip when the client supports it.
+/// Each distinct path is `stat`ed at most once per resolution, answering
+/// `is_file` and `is_dir` exactly as the uncached `Path` methods would. It
+/// lives on the stack of `resolve_fallback` and is dropped with it — it is
+/// never shared between requests, so nothing about a file's existence is ever
+/// served stale.
+#[derive(Default)]
+struct FsKindMemo {
+    /// Linear: a resolution touches a handful of paths at most.
+    entries: Vec<(PathBuf, FsKind)>,
+    /// Lookups that reached the filesystem (test observability).
+    #[cfg(test)]
+    stats: usize,
+}
+
+impl FsKindMemo {
+    /// What the path names, with any trailing separator ignored. `Path`
+    /// equality already ignores one (`"x/" == "x"`), so entries are keyed and
+    /// stat'ed on the stripped form; [`FsKindMemo::is_file`] re-applies the
+    /// trailing-separator rule itself.
+    fn kind(&mut self, path: &Path) -> FsKind {
+        if let Some((_, kind)) = self.entries.iter().find(|(p, _)| p == path) {
+            return *kind;
+        }
+        #[cfg(test)]
+        {
+            self.stats += 1;
+        }
+        let stripped: PathBuf = path.components().collect();
+        let kind = match std::fs::metadata(&stripped) {
+            Ok(m) if m.is_file() => FsKind::File,
+            Ok(m) if m.is_dir() => FsKind::Dir,
+            _ => FsKind::Other,
+        };
+        self.entries.push((stripped, kind));
+        kind
+    }
+
+    /// `Path::is_file`. A path spelled with a trailing separator is never a
+    /// file — `stat("x/")` on a regular file fails with `ENOTDIR` — so that
+    /// answer must not come from (or poison) the shared entry for `x`.
+    fn is_file(&mut self, path: &Path) -> bool {
+        !has_trailing_separator(path) && self.kind(path) == FsKind::File
+    }
+
+    /// `Path::is_dir`; a trailing separator does not change the answer.
+    fn is_dir(&mut self, path: &Path) -> bool {
+        self.kind(path) == FsKind::Dir
+    }
+}
+
+/// Whether `path` is spelled so that it can only name a directory: a trailing
+/// separator (`"dir/"`) or a final `.` segment (`"dir/."`). `stat` fails with
+/// `ENOTDIR` for either spelling of a regular file, but `Path` equality and
+/// `components()` drop both, so the memo has to re-apply the rule itself.
+fn has_trailing_separator(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let is_sep = |b: u8| std::path::is_separator(char::from(b));
+    match bytes {
+        [.., last] if is_sep(*last) => true,
+        [.., sep, b'.'] => is_sep(*sep),
+        _ => false,
+    }
+}
+
+/// Whether a worker-mode request body is streamed into the worker
+/// ([`stream_request_body`]) rather than buffered up front.
+///
+/// Bodies at or above `threshold` (`[php.worker] stream_threshold`; `0`
+/// disables streaming) stream, and so do bodies of unknown length (chunked
+/// uploads), because their size cannot be bounded before reading them. The
+/// length is the declared `Content-Length` or, when there is none, the body's
+/// own exact size hint.
+///
+/// That second source is what keeps a request **without a body** off the
+/// streaming path. A GET carries no `Content-Length`, but over HTTP/1.1 and
+/// HTTP/2 the transport knows its body is empty (`exact == 0`). (HTTP/3's
+/// request body reports no size hint, so a bodiless HTTP/3 request without
+/// `Content-Length` still takes the streaming path — correct, just not
+/// optimised.) Treating it as unknown-length used to spawn
+/// a body-forwarding task and a channel for every bodiless request, and the
+/// worker thread then blocked in `Envelope::rawBody()` until that task had run
+/// on a tokio thread just to learn the body was empty: a cross-thread round
+/// trip on the PHP thread's critical path for the most common request shape.
+fn worker_body_should_stream(
+    threshold: u64,
+    content_length: Option<u64>,
+    body_exact_len: Option<u64>,
+) -> bool {
+    threshold > 0 && content_length.or(body_exact_len).is_none_or(|len| len >= threshold)
+}
+
 /// Stream a hyper request body into a [`WorkerBody::Streaming`] (Phase 3).
 ///
 /// Spawns a task that reads the `Incoming` body frame-by-frame and forwards
@@ -8213,6 +8340,124 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "untriggered → warm pool");
 
         // Every lane thread retires once it has answered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lane.live_count() != 0 {
+            assert!(std::time::Instant::now() < deadline, "debug threads never retired");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The worker-mode buffer-vs-stream decision for request bodies.
+    #[test]
+    fn worker_body_stream_decision() {
+        const T: u64 = 1024 * 1024;
+        // A bodiless request (GET: no Content-Length, transport knows it is
+        // empty) is buffered. It used to stream, which cost every GET a body
+        // task plus a cross-thread wait inside `Envelope::rawBody()`.
+        assert!(!worker_body_should_stream(T, None, Some(0)));
+        // Declared lengths decide on their own, below and at the threshold.
+        assert!(!worker_body_should_stream(T, Some(10), None));
+        assert!(worker_body_should_stream(T, Some(T), None));
+        // Content-Length wins over the transport's hint when both exist.
+        assert!(worker_body_should_stream(T, Some(T), Some(0)));
+        // A small exact hint without a header (e.g. an in-memory body) buffers.
+        assert!(!worker_body_should_stream(T, None, Some(10)));
+        // Unknown length (chunked upload) cannot be bounded up front: stream.
+        assert!(worker_body_should_stream(T, None, None));
+        // threshold 0 turns streaming off entirely.
+        assert!(!worker_body_should_stream(0, None, None));
+        assert!(!worker_body_should_stream(0, Some(u64::MAX), None));
+    }
+
+    /// End to end through `Router::handle`: which body shape a worker receives.
+    /// A bodiless GET arrives `Buffered` (empty), a chunked upload of unknown
+    /// length still arrives `Streaming`. Uses the debug lane's fake worker
+    /// thread (no PHP in stub mode) to observe the dispatched job.
+    #[tokio::test]
+    async fn worker_mode_bodiless_get_is_buffered_and_chunked_upload_streams() {
+        use ephpm_php::worker_bridge::{WorkerBody, WorkerResponse};
+        use hyper::body::Frame;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = 5;
+        assert!(config.php.worker.stream_threshold > 0, "streaming must be enabled for this test");
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
+        );
+        let policy =
+            crate::xdebug_trigger::TriggerPolicy::from_ini(&ephpm_php::xdebug::XdebugIni {
+                mode: "debug".into(),
+                start_with_request: "trigger".into(),
+                ..ephpm_php::xdebug::XdebugIni::default()
+            })
+            .unwrap();
+        // Fake worker: answer with the body shape it was handed.
+        let runner: crate::debug_lane::Runner = Arc::new(|_id, _seed, rx| {
+            let job = rx.recv_blocking().expect("job queued for the debug thread");
+            let shape: &[u8] = match job.request.body {
+                WorkerBody::Buffered(ref b) if b.is_empty() => b"buffered-empty",
+                WorkerBody::Buffered(_) => b"buffered",
+                WorkerBody::Streaming { .. } => b"streaming",
+            };
+            let _ = job.respond_to.send(WorkerResponse::Buffered {
+                status: 200,
+                headers: Vec::new(),
+                body: shape.to_vec(),
+            });
+        });
+        let lane = crate::debug_lane::DebugLane::with_runner(1, policy, runner);
+        let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
+            .with_debug_lane(Some(Arc::clone(&lane)));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // GET with no body: the transport's size hint is exactly 0.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/index.php?XDEBUG_TRIGGER=1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"buffered-empty", "a bodiless GET must not stream");
+
+        // Chunked upload: no Content-Length and no exact size hint.
+        let chunks = futures::stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(
+            Bytes::from_static(b"chunk"),
+        ))]);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/index.php?XDEBUG_TRIGGER=1")
+            .header("content-type", "application/octet-stream")
+            .body(http_body_util::StreamBody::new(chunks))
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"streaming", "an unknown-length upload still streams");
+
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while lane.live_count() != 0 {
             assert!(std::time::Instant::now() < deadline, "debug threads never retired");
@@ -11378,6 +11623,116 @@ echo "post response";
         assert!(
             matches!(resolved, Resolved::File(p) if p == site_dir.join("index.php")),
             "fallback should resolve index.php from site directory"
+        );
+    }
+
+    /// The default `fallback` chain hits the filesystem once per distinct path
+    /// within a resolution, with the same outcome as uncached lookups.
+    #[test]
+    fn fallback_resolution_stats_each_path_once() {
+        let default_chain: Vec<String> =
+            vec!["$uri".into(), "$uri/".into(), "/index.php?$query_string".into()];
+        let index_files: Vec<String> = vec!["index.php".into(), "index.html".into()];
+
+        // Worker-mode shape: the document root has no front controller, so
+        // `/` probes root + both index files for `$uri`, the same again for
+        // `$uri/` (`//`), then `/index.php`. Seven lookups before; three now.
+        let empty = tempfile::tempdir().unwrap();
+        let mut memo = FsKindMemo::default();
+        let resolved = Router::resolve_fallback_in(
+            &mut memo,
+            "/",
+            "",
+            empty.path(),
+            &index_files,
+            &default_chain,
+        );
+        assert!(matches!(resolved, Resolved::Status(404)));
+        assert_eq!(memo.stats, 3, "docroot, index.php, index.html — each once");
+
+        // A route that is not a file: `$uri` and `$uri/` name the same path
+        // (one lookup answers both is_file and is_dir), then the front
+        // controller. Three lookups before; two now.
+        let mut memo = FsKindMemo::default();
+        let resolved = Router::resolve_fallback_in(
+            &mut memo,
+            "/postgres/orders",
+            "a=1",
+            empty.path(),
+            &index_files,
+            &default_chain,
+        );
+        assert!(matches!(resolved, Resolved::Status(404)));
+        assert_eq!(memo.stats, 2);
+
+        // Outcomes are unchanged where the files exist.
+        let site = tempfile::tempdir().unwrap();
+        fs::write(site.path().join("index.php"), "<?php").unwrap();
+        fs::create_dir(site.path().join("docs")).unwrap();
+        fs::write(site.path().join("docs").join("index.html"), "<p>").unwrap();
+        fs::write(site.path().join("style.css"), "a{}").unwrap();
+        let resolve = |uri: &str| {
+            Router::resolve_fallback_in(
+                &mut FsKindMemo::default(),
+                uri,
+                "",
+                site.path(),
+                &index_files,
+                &default_chain,
+            )
+        };
+        assert!(matches!(resolve("/"), Resolved::File(p) if p == site.path().join("index.php")));
+        assert!(
+            matches!(resolve("/docs/"), Resolved::File(p) if p == site.path().join("docs").join("index.html"))
+        );
+        assert!(
+            matches!(resolve("/style.css"), Resolved::File(p) if p == site.path().join("style.css"))
+        );
+        // A directory requested without the slash falls through `$uri` (not a
+        // file) to `$uri/` and finds its index.
+        assert!(
+            matches!(resolve("/docs"), Resolved::File(p) if p == site.path().join("docs").join("index.html"))
+        );
+        // Unknown path → the front controller.
+        assert!(
+            matches!(resolve("/nope"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+
+        // Directory probe FIRST (nginx-style `try_files $uri/ $uri`): probing
+        // `style.css/` fails (ENOTDIR) but must not make the following
+        // `$uri` probe miss the real file — `Path` equality ignores the
+        // trailing slash, so a naive memo would answer `style.css` from the
+        // `style.css/` lookup and route the asset to the front controller.
+        let dir_first: Vec<String> =
+            vec!["$uri/".into(), "$uri".into(), "/index.php?$query_string".into()];
+        let resolve_dir_first = |uri: &str| {
+            Router::resolve_fallback_in(
+                &mut FsKindMemo::default(),
+                uri,
+                "",
+                site.path(),
+                &index_files,
+                &dir_first,
+            )
+        };
+        assert!(
+            matches!(resolve_dir_first("/style.css"), Resolved::File(p) if p == site.path().join("style.css"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/index.php"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/docs"), Resolved::File(p) if p == site.path().join("docs").join("index.html"))
+        );
+        assert!(
+            matches!(resolve_dir_first("/nope"), Resolved::File(p) if p == site.path().join("index.php"))
+        );
+
+        // A trailing `.` segment can only name a directory, exactly as the
+        // uncached lookups saw it: `style.css/.` is not a file, so the request
+        // falls through to the front controller.
+        assert!(
+            matches!(resolve("/style.css/."), Resolved::File(p) if p == site.path().join("index.php"))
         );
     }
 
