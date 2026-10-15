@@ -11,18 +11,26 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-/// Global allocator override for the ephpm binary (Unix only).
+/// Rust's global allocator for the ephpm binary (Unix only).
 ///
 /// mimalloc gives lower allocator contention and better locality than the
 /// default system allocator under the ePHPm workload profile (many small,
 /// short-lived allocs from HTTP frames, RESP payloads, and query buffers).
-/// Applied only in the binary so unit tests and other tooling stay on the
-/// standard allocator.
+/// Applied only in the binary (and its own unit tests); library crates' tests
+/// and other tooling stay on the standard allocator.
 ///
-/// Memory-footprint watch item: mimalloc is more aggressive about
-/// retaining freed pages for reuse than the default allocator, so RSS
-/// looks larger at steady state. This is normal — track it against the
-/// 320 MiB target and adjust with `MIMALLOC_PURGE_DELAY` if needed.
+/// This attribute covers **Rust** allocations only. On glibc Linux the
+/// `malloc-override` cargo feature (default on) also makes mimalloc the C
+/// `malloc`/`free` for the whole process — libphp, the SDK's static libs,
+/// glibc's internal allocations and `dlopen`ed extensions/middleware — so both
+/// sides share one allocator and recycled PHP worker threads do not leave
+/// glibc malloc arenas behind (`malloc_override_tests` below proves it is
+/// live). On macOS C code keeps the system malloc; see `crates/ephpm/Cargo.toml`
+/// for why each platform is gated the way it is.
+///
+/// Tuning: mimalloc reads `MIMALLOC_*` environment variables (e.g.
+/// `MIMALLOC_PURGE_DELAY`, the delay before freed memory is returned to the
+/// OS) — with the override they apply to PHP's C allocations as well.
 ///
 /// Windows uses the system allocator — see the Cargo.toml comment on the
 /// mimalloc dep for the MSVC `/MD` vs PHP-SDK `/MT` link mismatch.
@@ -3270,5 +3278,115 @@ mod cli_tests {
     #[test]
     fn resolve_target_rejects_mutex() {
         assert!(resolve_target(Some("blog"), true).is_err());
+    }
+}
+
+/// Proof that the Linux `malloc-override` feature is live in this binary's
+/// link: the C `malloc` the rest of the process sees is mimalloc's, not
+/// glibc's. These unit tests are linked exactly like the `ephpm` binary (same
+/// crate, same `libmimalloc-sys` features, same build.rs link args), so a
+/// pass here means libphp.a and `dlopen`ed extensions get mimalloc too.
+#[cfg(all(test, target_os = "linux", target_env = "gnu", feature = "malloc-override"))]
+#[allow(unsafe_code)] // Raw libc allocation calls are the whole point.
+mod malloc_override_tests {
+    use std::ffi::{CStr, c_void};
+
+    // Declared by hand rather than via `libmimalloc_sys` because the binding
+    // lives behind that crate's `extended` feature (an extra `cty` dep). The
+    // symbol itself is always in the linked mimalloc object.
+    unsafe extern "C" {
+        /// `true` when `p` lies in memory mimalloc manages.
+        fn mi_is_in_heap_region(p: *const c_void) -> bool;
+    }
+
+    fn owned_by_mimalloc(p: *const c_void) -> bool {
+        // SAFETY: mi_is_in_heap_region only inspects the address (a page-map
+        // lookup); it never dereferences `p`, so any value is sound.
+        unsafe { mi_is_in_heap_region(p) }
+    }
+
+    /// The check must be able to say "no", or the positive assertions below
+    /// prove nothing.
+    #[test]
+    fn mimalloc_ownership_check_discriminates() {
+        let on_stack = 0u64;
+        assert!(!owned_by_mimalloc(std::ptr::from_ref(&on_stack).cast()));
+
+        // SAFETY: anonymous private mapping of one page; checked for
+        // MAP_FAILED and unmapped below with the same length.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        assert!(!owned_by_mimalloc(mapped));
+        // SAFETY: `mapped` is the live 4096-byte mapping created above.
+        assert_eq!(unsafe { libc::munmap(mapped, 4096) }, 0);
+    }
+
+    /// A direct `malloc`/`calloc`/`realloc`/`posix_memalign` from this
+    /// executable resolves to mimalloc.
+    #[test]
+    fn libc_malloc_family_is_mimalloc() {
+        // SAFETY: plain C allocation calls; every pointer is null-checked and
+        // released exactly once with `free` (the same, overridden, allocator).
+        unsafe {
+            let p = libc::malloc(64);
+            assert!(!p.is_null());
+            assert!(owned_by_mimalloc(p), "malloc() did not return mimalloc memory");
+
+            let p = libc::realloc(p, 1 << 20);
+            assert!(!p.is_null());
+            assert!(owned_by_mimalloc(p), "realloc() did not return mimalloc memory");
+            libc::free(p);
+
+            let c = libc::calloc(16, 16);
+            assert!(!c.is_null());
+            assert!(owned_by_mimalloc(c), "calloc() did not return mimalloc memory");
+            libc::free(c);
+
+            let mut a: *mut c_void = std::ptr::null_mut();
+            assert_eq!(libc::posix_memalign(&raw mut a, 4096, 100), 0);
+            assert!(owned_by_mimalloc(a), "posix_memalign() did not return mimalloc memory");
+            assert_eq!(a as usize % 4096, 0);
+            libc::free(a);
+        }
+    }
+
+    /// Allocations glibc makes *internally* — `realpath(.., NULL)` and
+    /// `getcwd(NULL, 0)` are implemented inside libc.so and call `malloc`
+    /// from there — also come from mimalloc, i.e. the executable's
+    /// definitions preempt libc.so's own. That is what makes a pointer glibc
+    /// hands to PHP or to an extension safe to `free` from either side.
+    /// (`strdup` is checked too, but mimalloc's override defines `strdup`
+    /// itself, so on its own it would not prove libc.so is interposed.)
+    #[test]
+    fn glibc_internal_allocations_are_mimalloc() {
+        // SAFETY: each call returns a fresh malloc'd C string (null-checked)
+        // that the caller owns and releases exactly once with `free`.
+        unsafe {
+            let r = libc::realpath(c"/".as_ptr(), std::ptr::null_mut());
+            assert!(!r.is_null());
+            assert!(owned_by_mimalloc(r.cast()), "glibc realpath() bypassed the override");
+            assert_eq!(CStr::from_ptr(r).to_bytes(), b"/");
+            libc::free(r.cast());
+
+            let cwd = libc::getcwd(std::ptr::null_mut(), 0);
+            assert!(!cwd.is_null());
+            assert!(owned_by_mimalloc(cwd.cast()), "glibc getcwd() bypassed the override");
+            libc::free(cwd.cast());
+
+            let s = libc::strdup(c"mimalloc-override".as_ptr());
+            assert!(!s.is_null());
+            assert!(owned_by_mimalloc(s.cast()), "strdup() did not return mimalloc memory");
+            assert_eq!(CStr::from_ptr(s).to_bytes(), b"mimalloc-override");
+            libc::free(s.cast());
+        }
     }
 }

@@ -101,6 +101,14 @@ backlog of allocation-shaving micro-optimizations**: if a whole new
 allocator buys 2%, hand-trimming individual `String` clones buys less. A
 profile would have to justify that work now.
 
+Scope of that measurement: `#[global_allocator]` only covers ePHPm's Rust
+allocations. PHP's own C-side allocations (persistent `pemalloc`, per-thread
+globals, bundled libraries, `dlopen`ed extensions) stayed on glibc `malloc`.
+Linux builds now also replace the C `malloc` with mimalloc process-wide
+(the `malloc-override` cargo feature, on by default). That change is about
+memory retained after recycled worker threads exit, not throughput, and the
+numbers above predate it.
+
 ### The Swoole cpu gap is the ZTS tax, not JIT or allocation
 
 Swoole leads ePHPm worker-mode on `cpu.php` (~206 vs ~149 RPS in the lab).

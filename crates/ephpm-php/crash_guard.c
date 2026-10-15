@@ -23,8 +23,9 @@
  * every write is into thread-local Zend state (the per-thread ZMM heap and
  * `EG(objects_store)`). No other thread's memory and no process-global
  * allocator lock is touched at the fault instant (the Zend MM manager mmaps its
- * own 2 MiB chunks; it does not go through glibc `malloc`, so the arena lock is
- * not held). The rest of the process is therefore intact, and abandoning the
+ * own 2 MiB chunks; it does not go through the C `malloc` — glibc's, or on
+ * Linux release builds the process-wide mimalloc — so no allocator lock is
+ * held). The rest of the process is therefore intact, and abandoning the
  * poisoned thread contains the blast.
  *
  * A wild write / heap corruption produces the SAME SIGSEGV but may already have

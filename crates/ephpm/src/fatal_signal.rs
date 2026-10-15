@@ -283,8 +283,12 @@ mod unix {
     /// What the owning thread is doing — see [`phase`].
     static PHASE: AtomicU32 = AtomicU32::new(phase::IDLE);
 
-    /// Installed exactly once.
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    /// Installed exactly once. A `Once` rather than a flag so a concurrent
+    /// caller *waits* until the handlers are actually in place: with a swapped
+    /// `AtomicBool`, a second caller returned while the first was still in
+    /// `warm_up()` and could fault before `sigaction` had run — a race the
+    /// parallel unit tests below hit (empty fault report, default disposition).
+    static INSTALL: std::sync::Once = std::sync::Once::new();
 
     /// Stack-overflow crash-containment hook, as a raw
     /// `unsafe extern "C" fn(usize) -> i32` address (`0` = none, the default).
@@ -323,10 +327,10 @@ mod unix {
         if !enabled() {
             return;
         }
-        if INSTALLED.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        INSTALL.call_once(install_handlers);
+    }
 
+    fn install_handlers() {
         warm_up();
         install_thread_altstack();
 
