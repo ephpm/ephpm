@@ -22,7 +22,7 @@ The `v*` push triggers `.github/workflows/release.yml`. `EPHPM_RELEASE_VERSION` 
 
 ## 3. What the matrix produces
 
-- Binaries: `ephpm-vX.Y.Z+php<FULL>-<os>-<arch>.tar.gz` for linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64 x PHP pins (see `matrix.php` in release.yml; keep in sync with `xtask::PHP_SDK_VERSIONS`). Plus `SHA256SUMS`. Optionally `ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz` from the experimental non-gating `build-windows-tailcall` leg — its absence never blocks or fails a release, and when its leg finishes after Create Release it self-attaches (and updates SHA256SUMS) best-effort.
+- Binaries: `ephpm-vX.Y.Z+php<FULL>-<os>-<arch>.tar.gz` for linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64 x PHP pins (see `matrix.php` in release.yml; keep in sync with `xtask::PHP_SDK_VERSIONS`). Plus `SHA256SUMS`. Optionally `ephpm-vX.Y.Z+php8.5.11-windows-x86_64-tailcall.tar.gz` from the experimental non-gating `build-windows-tailcall` leg — its absence never blocks or fails a release, and when its leg finishes after Create Release it self-attaches (and updates SHA256SUMS) best-effort.
 - Docker: `ephpm/ephpm:vX.Y.Z-php<FULL>`, `:vX.Y.Z-php<MINOR>`, `:<MINOR>`, `:vX.Y.Z`, `:latest` (rolling tags skip pre-releases; a `-` in the tag = prerelease, marked so on GitHub).
 - `Create Release` publishes ONLY after build-linux + build-linux-arm64 + build-macos + build-windows + docker-image all succeed. (arm64 is the leg that historically parks a release — OOM on the self-hosted runner — so when publish never fires, check it first.)
 

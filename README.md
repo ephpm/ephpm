@@ -32,10 +32,14 @@ The documented exceptions: `php -a` (interactive shell) and `php -S` (built-in
 server) are separate SAPIs that are not linked into the embed build and print a
 clear error, `-z` (Zend extension loading) is rejected exactly as php-cli
 rejects it, and the extension set is what was compiled into the binary
-(`bcmath, calendar, ctype, curl, dom, exif, fileinfo, filter, gd, hash, iconv,
-mbstring, mysqli, mysqlnd, openssl, pcntl, pcre, pdo, pdo_mysql, phar, posix,
-session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`)
-plus whatever you load through `[php] extensions`. See
+(`bcmath, bz2, calendar, ctype, curl, dom, exif, fileinfo, filter, ftp, gd,
+gettext, gmp, hash, iconv, intl, mbstring, mysqli, mysqlnd, opcache, openssl,
+pcntl, pcre, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, pgsql, phar, posix, session,
+simplexml, soap, sodium, sqlite3, sysvmsg, sysvsem, sysvshm, tokenizer, xml,
+xmlreader, xmlwriter, xsl, zip, zlib`; plus `sockets` and `shmop` on the PHP 8.3
+and 8.5 builds for Linux/macOS. The Windows build omits `gmp, pcntl, pdo_pgsql,
+pgsql, posix, shmop, sysvmsg, sysvsem, sysvshm`, and has `sockets` for PHP 8.5
+only) plus whatever you load through `[php] extensions`. See
 [the `ephpm php` reference](https://ephpm.dev/reference/cli/php/).
 
 For the common Composer workflows there's `ephpm composer`. It runs
@@ -151,7 +155,7 @@ ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mys
 
 If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` (or `localhost:5432` for Postgres) — the proxy handles the rest. The PostgreSQL proxy supports trust, md5, and SCRAM-SHA-256 authentication. SQL Server (TDS) proxying is not implemented.
 
-> **Postgres caveat.** `pdo_pgsql` is **not** among the extensions compiled into the released binary, so "no code changes" holds for MySQL apps out of the box but not for a stock Postgres app on a stock build. The PostgreSQL frontend is exercised today by non-PHP clients and by the `ephpm_db_*` bridge; to drive it from `pdo_pgsql` you need a build that includes the extension, or you can load it as a shared extension via `[php] extensions`.
+> **Postgres caveat.** `pdo_pgsql` and `pgsql` are compiled into the released Linux and macOS binaries, but **not** into the Windows binary, so on Windows "no code changes" holds for MySQL apps out of the box but not for a stock Postgres app. The PostgreSQL frontend is exercised today by non-PHP clients and by the `ephpm_db_*` bridge; there is no PHP-driven `pdo_pgsql` end-to-end test yet. On Windows, driving it from `pdo_pgsql` needs a build that includes the extension (loading shared extensions via `[php] extensions` is not validated on Windows).
 
 ```toml
 [db.mysql]

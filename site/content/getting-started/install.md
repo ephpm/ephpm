@@ -35,9 +35,9 @@ docker run -p 8080:8080 \
 | `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` / `ephpm/ephpm:8.3` | Rolling latest stable release pinned to a PHP minor |
 | `ephpm/ephpm:vX.Y.Z` | Pinned ePHPm release with the default PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5` | Pinned release × rolling PHP minor |
-| `ephpm/ephpm:vX.Y.Z-php8.5.7` | Pinned release × pinned PHP patch (fully reproducible) |
+| `ephpm/ephpm:vX.Y.Z-php8.5.11` | Pinned release × pinned PHP patch (fully reproducible) |
 
-Real SemVer build metadata uses `+` (`v0.2.0+php8.5.7`), but OCI tags reject `+`, so Docker tags substitute `-` while the upstream `+` form is preserved on each image's `org.opencontainers.image.version` label — the same trade-off k3s and rke2 make.
+Real SemVer build metadata uses `+` (`v0.2.0+php8.5.11`), but OCI tags reject `+`, so Docker tags substitute `-` while the upstream `+` form is preserved on each image's `org.opencontainers.image.version` label — the same trade-off k3s and rke2 make.
 
 For the standalone binary install path (single-binary, self-installing, no container runtime needed), grab an archive from [Releases](https://github.com/ephpm/ephpm/releases) and continue with the Linux / macOS or Windows section below.
 
@@ -78,7 +78,7 @@ Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, 
 A release may additionally carry a second Windows archive:
 
 ```text
-ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz
+ephpm-vX.Y.Z+php8.5.11-windows-x86_64-tailcall.tar.gz
 ```
 
 Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux (GCC) builds get. macOS is a clang build, not GCC, so it never gets HYBRID: PHP 8.5 there runs the TAILCALL VM, while 8.3/8.4 fall back to the same slow `CALL` VM.

@@ -693,7 +693,7 @@ docker compose exec mysql mysql -uwordpress -pwordpress wordpress -e 'SHOW TABLE
 ## What runs inside the single binary
 
 ```
-HTTP :8080  ──► WordPress PHP 8.5.7 (ePHPm Embedded Server SAPI, ZTS)
+HTTP :8080  ──► WordPress PHP 8.5 (ePHPm Embedded Server SAPI, ZTS)
                     │
                     ├── pdo_mysql       ──► litewire ──► SQLite (MySQL wire on :3306)
                     │

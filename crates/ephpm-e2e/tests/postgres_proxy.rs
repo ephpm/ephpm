@@ -4,12 +4,11 @@
 //! alongside the MySQL frontend when `postgres_listen` is configured under
 //! `[db.sqlite.proxy]`.
 //!
-//! **Limitation:** Full end-to-end testing through PHP requires the `pdo_pgsql`
-//! extension, which is not currently included in the static PHP build (see
-//! `PHP_EXTENSIONS` in `xtask/src/main.rs`). These tests verify that enabling
-//! the PostgreSQL frontend does not interfere with normal server operation.
-//! Once `pdo_pgsql` is added to the extensions list, a PHP-based test should
-//! be added that connects via `pdo_pgsql` to `127.0.0.1:5432` and runs queries.
+//! **Limitation:** These tests do not yet drive the frontend from PHP. They
+//! verify that enabling the PostgreSQL frontend does not interfere with normal
+//! server operation. `pdo_pgsql` is compiled into the Linux and macOS PHP SDKs
+//! (not the Windows one), so a PHP-based test that connects via `pdo_pgsql` to
+//! `127.0.0.1:5432` and runs queries should be added.
 //!
 //! Environment variables:
 //! - `EPHPM_URL` — base URL of the ephpm instance (e.g. `http://ephpm:8080`)
