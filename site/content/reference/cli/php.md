@@ -357,6 +357,8 @@ The embedded PHP interpreter is the **same** runtime that serves HTTP requests. 
 
 On Windows, PHP is statically linked into `ephpm.exe` (`php8embed.lib`, static CRT) — no DLL is embedded, extracted, or written to disk at runtime. There's nothing to install; `ephpm php` works out of the box.
 
+The opt-in shared-engine build (`cargo xtask release --target windows --variant shared`, see [Install](/getting-started/install/)) is the exception: it needs `php8ts.dll`, its dependency DLLs and `ext\` beside `ephpm.exe`, loads the bundled extension DLLs at startup (also under `-n`, so the extension set matches the static build), and can load extension DLLs such as Xdebug: `ephpm php -d zend_extension=C:/path/php_xdebug.dll -v`.
+
 ## See also
 
 - [`ephpm serve`](../serve/) — the server command

@@ -1740,7 +1740,9 @@ fn run_with_config(
         || vhost_disable_shell
         || vhost_hardening
         || worker_mode
-        || cfg!(php_max_exec_timers);
+        || cfg!(php_max_exec_timers)
+        // The shared engine's extension preload rides the generated ini.
+        || ephpm_php::shared::SharedRuntime::is_shared_build();
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<tempfile::TempDir>) =
         if want_generated_ini {
@@ -1757,6 +1759,19 @@ fn run_with_config(
             for (k, v) in error_display_ini_defaults(dev_mode) {
                 let _ = writeln!(content, "{k}={v}");
             }
+            // Windows shared-engine build: extension_dir + the extensions the
+            // static build compiles in but the official php8ts.dll ships as
+            // DLLs (mbstring, openssl, intl, ...). First, so `[php]
+            // extensions` that depend on them load after them and every
+            // operator setting below can still override. No-op elsewhere.
+            if let Some(shared) = ephpm_php::shared::SharedRuntime::detect() {
+                for line in shared
+                    .ini_lines()
+                    .context("the shared PHP engine's runtime files are incomplete")?
+                {
+                    let _ = writeln!(content, "{line}");
+                }
+            }
             // Shared extensions ([php] extensions) go first, before
             // ini_file/ini_overrides, so any extension ini settings that
             // follow apply to an already-declared extension. A bare name
@@ -1769,8 +1784,23 @@ fn run_with_config(
             // / libc) are rejected by PHP at startup with an explicit
             // API-version error.
             if !config.php.extensions.is_empty() {
-                let cwd = std::env::current_dir().context("failed to read current directory")?;
                 let abi = ephpm_php::PhpRuntime::abi();
+                // The default Windows build links PHP statically: it cannot
+                // load extension DLLs (they import php8ts.dll), and when some
+                // php8ts.dll is reachable the load attaches a second PHP
+                // engine and crashes the process. Refuse instead.
+                if cfg!(windows)
+                    && abi.is_some()
+                    && !ephpm_php::shared::SharedRuntime::is_shared_build()
+                {
+                    anyhow::bail!(
+                        "[php] extensions is not supported by this Windows build: it links PHP \
+                         statically and cannot load extension DLLs. Use the shared-engine build \
+                         (`cargo xtask release --target windows --variant shared`), or remove \
+                         [php] extensions"
+                    );
+                }
+                let cwd = std::env::current_dir().context("failed to read current directory")?;
                 let ext_dir = ext_ini::effective_extension_dir(
                     &config.php.ini_overrides,
                     abi.as_ref().and_then(|a| a.default_extension_dir.as_deref()),

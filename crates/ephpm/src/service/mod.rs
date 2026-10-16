@@ -482,6 +482,18 @@ fn write_default_config(path: &Path, document_root: &Path) -> Result<bool> {
 /// [`ServiceError::Other`] if `owner` is `Some` — the SCM backend does not
 /// yet support installing under a specific account (see `windows::register`).
 pub fn install(owner: Option<&ServiceOwner>) -> Result<()> {
+    // `install` copies only the executable. A shared-engine Windows build
+    // also needs php8ts.dll, its dependency DLLs and ext\ beside it; an
+    // installed copy without them would fail to start with no ePHPm log.
+    if ephpm_php::shared::SharedRuntime::is_shared_build() {
+        return Err(ServiceError::Other(
+            "`ephpm install` is not supported for the shared-engine Windows build: it copies \
+             only ephpm.exe, and this build also needs php8ts.dll, its dependency DLLs and ext\\ \
+             beside it. Install the default (static) build, or register the service from the \
+             shared build's own directory yourself."
+                .into(),
+        ));
+    }
     require_elevation()?;
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut paths = Paths::for_current_platform();

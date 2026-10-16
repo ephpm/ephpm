@@ -34,6 +34,8 @@ metrics.workspace = true
 [build-dependencies]
 bindgen = "0.72"
 cc = "1"
+# Reads the Windows shared-engine SDK's ephpm-sdk.json (extension preload list).
+serde_json.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true

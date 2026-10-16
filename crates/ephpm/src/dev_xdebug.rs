@@ -53,9 +53,14 @@
 //! A macOS bundle resolves its PHP imports against the ephpm executable at
 //! load time, so it needs a binary linked with `-export_dynamic`
 //! (`crates/ephpm/build.rs`); older macOS binaries fail with "symbol not found
-//! in flat namespace". Windows release binaries link PHP statically
-//! (`php8embed.lib`), which cannot load extension DLLs at all, so `--xdebug`
-//! is refused there.
+//! in flat namespace". On Windows it depends
+//! on the build: the default binary links PHP statically (`php8embed.lib`),
+//! which cannot load extension DLLs at all, so `--xdebug` is refused there; a
+//! **shared-engine** build (`cargo xtask release --target windows --variant
+//! shared`, `php8ts.dll` beside `ephpm.exe` — see `ephpm_php::shared`) loads
+//! `php_xdebug.dll` from the catalog's `ephpm-ext-<php>-windows-x86_64.tar.gz`
+//! (manifest `libc` = `msvc`), the official xdebug.org ZTS build for that PHP
+//! minor.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -115,7 +120,8 @@ pub(crate) struct XdebugArgs {
     /// Load Xdebug for step debugging. On Linux and macOS an ABI-matched ZTS
     /// build is downloaded from the ePHPm extension catalog
     /// (github.com/ephpm/php-sdk) on first use and cached; later runs work
-    /// offline. Not available on Windows.
+    /// offline. On Windows this needs the shared-engine build (php8ts.dll
+    /// beside ephpm.exe).
     #[arg(long)]
     pub xdebug: bool,
 
@@ -189,12 +195,12 @@ pub(crate) fn prepare(args: &XdebugArgs, config: &mut ephpm_config::Config) -> a
         return Ok(());
     }
 
-    if cfg!(windows) {
+    if cfg!(windows) && !ephpm_php::shared::SharedRuntime::is_shared_build() {
         bail!(
-            "--xdebug is not available on Windows yet: ePHPm's Windows binaries link PHP \
-             statically (php8embed.lib), and a static PHP cannot load extension DLLs such as \
-             php_xdebug.dll. Planned: a build against a shared php8ts.dll. Use ePHPm under WSL \
-             (Linux) for step debugging today."
+            "--xdebug is not available on Windows with this build: it links PHP statically \
+             (php8embed.lib), and a static PHP cannot load extension DLLs such as \
+             php_xdebug.dll. Use the shared-engine Windows build (php8ts.dll beside ephpm.exe; \
+             `cargo xtask release --target windows --variant shared`), or ePHPm under WSL."
         );
     }
 
@@ -217,8 +223,8 @@ pub(crate) fn prepare(args: &XdebugArgs, config: &mut ephpm_config::Config) -> a
     } else {
         let Some(os) = CatalogOs::current() else {
             bail!(
-                "--xdebug: the ePHPm extension catalog only publishes glibc Linux and macOS \
-                 builds. Pass --xdebug-path <xdebug.so> with a ZTS build for PHP {}.",
+                "--xdebug: the ePHPm extension catalog only publishes glibc Linux, macOS and \
+                 Windows builds. Pass --xdebug-path <xdebug.so> with a ZTS build for PHP {}.",
                 abi.php_version
             );
         };
@@ -236,8 +242,8 @@ pub(crate) fn prepare(args: &XdebugArgs, config: &mut ephpm_config::Config) -> a
             os,
         };
         let cache_root = user_cache_root().context(
-            "--xdebug: cannot determine a cache directory (set XDG_CACHE_HOME or HOME), or pass \
-             --xdebug-path",
+            "--xdebug: cannot determine a cache directory (set XDG_CACHE_HOME or HOME; \
+             LOCALAPPDATA on Windows), or pass --xdebug-path",
         )?;
         let cache = ExtCache::new(&cache_root, &target);
         // Scope the client so its runtime thread is joined before PHP starts.
@@ -348,7 +354,13 @@ pub(crate) fn apply_to_config(
     client_host: &str,
     client_port: u16,
 ) -> anyhow::Result<()> {
-    let path = so_path.to_string_lossy();
+    let mut path = so_path.to_string_lossy().into_owned();
+    // php.ini unescapes `\\` (and `\"`, `\$`) inside double quotes, which
+    // would mangle a UNC path; Windows accepts `/`, so use it there. (On Unix
+    // a backslash is an ordinary file-name byte and is left alone.)
+    if cfg!(windows) {
+        path = path.replace('\\', "/");
+    }
     // Inside a double-quoted ini value `${...}` is expanded and `"` ends it;
     // a line break would start a second directive.
     if !so_path.is_absolute() || path.contains(['"', '\n', '\r', '\0']) || path.contains("${") {
@@ -440,19 +452,26 @@ pub(crate) struct Target {
     pub zts: bool,
     /// `std::env::consts::ARCH` — `x86_64` / `aarch64`, the catalog's spelling.
     pub arch: String,
-    /// Which catalog flavor (asset name, manifest `os` / `libc`).
+    /// Which catalog flavor (asset name, manifest `os` / `libc`, library
+    /// suffix).
     pub os: CatalogOs,
 }
 
 /// The platforms the extension catalog publishes for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogOs {
-    /// glibc Linux: `ephpm-ext-<php>-linux-<arch>-gnu.tar.gz`, manifest
-    /// `libc` = `gnu` and no `os` key (php-sdk `extensions.yml`).
+    /// glibc Linux: `ephpm-ext-<php>-linux-<arch>-gnu.tar.gz`, `.so` files,
+    /// manifest `libc` = `gnu` and no `os` key (php-sdk `extensions.yml`).
     LinuxGnu,
-    /// macOS: `ephpm-ext-<php>-macos-<arch>.tar.gz`, manifest `os` = `macos`
-    /// and no `libc` key (php-sdk `extensions.yml`, `build-extensions-macos`).
+    /// macOS: `ephpm-ext-<php>-macos-<arch>.tar.gz`, `.so` files, manifest
+    /// `os` = `macos` and no `libc` key (php-sdk `extensions.yml`,
+    /// `build-extensions-macos`).
     Macos,
+    /// Windows (official windows.php.net ABI):
+    /// `ephpm-ext-<php>-windows-<arch>.tar.gz`, `.dll` files, manifest `libc`
+    /// `msvc` (php-sdk `windows-shared.yml`). Loadable only by a shared-engine
+    /// build.
+    Windows,
 }
 
 impl CatalogOs {
@@ -462,17 +481,19 @@ impl CatalogOs {
             Some(Self::LinuxGnu)
         } else if cfg!(target_os = "macos") {
             Some(Self::Macos)
+        } else if cfg!(windows) {
+            Some(Self::Windows)
         } else {
             None
         }
     }
 
-    /// The manifest `os` value this flavor requires (`None` = the key may be
-    /// absent, as in every Linux manifest published so far).
+    /// The manifest `os` value this flavor matches.
     fn manifest_os(self) -> &'static str {
         match self {
             Self::LinuxGnu => "linux",
             Self::Macos => "macos",
+            Self::Windows => "windows",
         }
     }
 
@@ -481,12 +502,15 @@ impl CatalogOs {
     /// Linux manifests predate the `os` key, so on Linux it may be absent but
     /// must say `linux` if present, and `libc` must be `gnu` if present. A
     /// macOS manifest must say `os: macos` — which is also what rejects a
-    /// Linux catalog on macOS — and must not name a libc.
+    /// Linux catalog on macOS — and must not name a libc. A Windows manifest
+    /// must say `libc: msvc` (a .dll's C runtime is not something to assume),
+    /// and `os` must be `windows` if present.
     fn check(self, manifest: &Manifest) -> Result<(), CatalogError> {
         let os = manifest.os.as_deref().map(str::trim);
         let os_ok = match self {
             Self::LinuxGnu => os.is_none_or(|o| o == "linux"),
             Self::Macos => os == Some("macos"),
+            Self::Windows => os.is_none_or(|o| o == "windows"),
         };
         if !os_ok {
             return Err(CatalogError::OsMismatch {
@@ -498,14 +522,23 @@ impl CatalogOs {
         let (libc_ok, expected) = match self {
             Self::LinuxGnu => (libc.is_none_or(|l| l == "gnu"), "gnu"),
             Self::Macos => (libc.is_none(), "(none)"),
+            Self::Windows => (libc == Some("msvc"), "msvc"),
         };
         if !libc_ok {
             return Err(CatalogError::LibcMismatch {
-                found: libc.unwrap_or_default().to_string(),
+                found: libc.unwrap_or("(unset)").to_string(),
                 expected,
             });
         }
         Ok(())
+    }
+
+    /// Shared-library file extension, for the cached file's name.
+    fn lib_suffix(self) -> &'static str {
+        match self {
+            Self::LinuxGnu | Self::Macos => "so",
+            Self::Windows => "dll",
+        }
     }
 }
 
@@ -515,6 +548,7 @@ impl Target {
         match self.os {
             CatalogOs::LinuxGnu => format!("ephpm-ext-{version}-linux-{}-gnu.tar.gz", self.arch),
             CatalogOs::Macos => format!("ephpm-ext-{version}-macos-{}.tar.gz", self.arch),
+            CatalogOs::Windows => format!("ephpm-ext-{version}-windows-{}.tar.gz", self.arch),
         }
     }
 
@@ -523,6 +557,7 @@ impl Target {
         match self.os {
             CatalogOs::LinuxGnu => format!("Linux {} (glibc)", self.arch),
             CatalogOs::Macos => format!("macOS {}", self.arch),
+            CatalogOs::Windows => format!("Windows {}", self.arch),
         }
     }
 
@@ -560,10 +595,10 @@ pub(crate) struct Manifest {
     /// ZTS build (`1`/`true`).
     #[serde(deserialize_with = "de_flag")]
     pub zts: bool,
-    /// `macos` on macOS catalogs; absent on Linux ones.
+    /// `macos` / `windows` on those catalogs; absent on Linux ones.
     #[serde(default)]
     pub os: Option<String>,
-    /// `gnu` (glibc) on Linux catalogs; absent on macOS ones.
+    /// `gnu` (glibc) on Linux catalogs, `msvc` on Windows; absent on macOS.
     #[serde(default)]
     pub libc: Option<String>,
     /// `x86_64` / `aarch64`.
@@ -659,17 +694,17 @@ pub(crate) enum CatalogError {
     /// Built for another operating system.
     #[error("catalog is built for os {found:?}, but this ephpm needs {expected:?}")]
     OsMismatch {
-        /// What this binary needs (`linux`, `macos`).
+        /// What this binary needs (`linux`, `macos`, `windows`).
         expected: &'static str,
         /// The manifest's `os`.
         found: String,
     },
-    /// Built against another libc.
+    /// Built against another libc / C runtime.
     #[error("catalog is built for libc {found:?}, but this ephpm needs {expected:?}")]
     LibcMismatch {
         /// The manifest's libc.
         found: String,
-        /// What this binary needs (`gnu`, or none on macOS).
+        /// What this binary needs (`gnu`, `msvc`, or none on macOS).
         expected: &'static str,
     },
     /// One file's manifest entry disagrees with the binary.
@@ -1245,7 +1280,11 @@ fn install_from(
     let bytes = &archive.files[&entry.file];
     let version = entry.known_version().map(str::to_string);
     let record = CacheRecord {
-        file: format!("{XDEBUG}-{}.so", file_safe(version.as_deref().unwrap_or(release_version))),
+        file: format!(
+            "{XDEBUG}-{}.{}",
+            file_safe(version.as_deref().unwrap_or(release_version)),
+            target.os.lib_suffix()
+        ),
         sha256: sha256_hex(bytes),
         version: version.clone(),
         release: tag.clone(),
@@ -1372,7 +1411,7 @@ pub(crate) fn resolve_from_catalog(
 
     bail!(
         "--xdebug: no ePHPm extension catalog release ships Xdebug for PHP {} (API {}, {}) yet \
-         (tried: {}). Pass --xdebug-path <xdebug.so> with a ZTS build for this PHP minor.",
+         (tried: {}). Pass --xdebug-path <xdebug.so / php_xdebug.dll> with a ZTS build for this PHP minor.",
         target.php_version,
         target.api_no,
         target.arch,
@@ -1406,6 +1445,10 @@ mod tests {
             os: CatalogOs::Macos,
             ..target()
         }
+    }
+
+    fn windows_target() -> Target {
+        Target { os: CatalogOs::Windows, ..target() }
     }
 
     fn xdebug_so() -> Vec<u8> {
@@ -1507,7 +1550,8 @@ mod tests {
             self.fetched.borrow_mut().push(tag.to_string());
             assert!(
                 asset.ends_with("-linux-x86_64-gnu.tar.gz")
-                    || asset.ends_with("-macos-aarch64.tar.gz"),
+                    || asset.ends_with("-macos-aarch64.tar.gz")
+                    || asset.ends_with("-windows-x86_64.tar.gz"),
                 "{asset}"
             );
             Ok(self.assets.get(tag).cloned())
@@ -1634,6 +1678,83 @@ mod tests {
             validate_catalog(&entry_api, &target()).unwrap_err(),
             CatalogError::EntryAbiMismatch { .. }
         ));
+    }
+
+    /// A Windows catalog tarball laid out like php-sdk `windows-shared.yml`
+    /// publishes it: `php_xdebug.dll` + `manifest.json` (PowerShell's
+    /// `ConvertTo-Json` spacing, `libc` = `msvc`, extra `os`/`crt`/`source`
+    /// keys) + `LICENSE-xdebug.txt`, which is not in the manifest.
+    fn windows_tarball(php_version: &str, libc: Option<&str>, dll: &[u8]) -> Vec<u8> {
+        let libc = libc.map_or_else(String::new, |l| format!("\"libc\":  \"{l}\",\n"));
+        let manifest = format!(
+            "{{\n    \"php_version\":  \"{php_version}\",\n    \"php_api_no\":  \"20250925\",\n    \
+             \"zts\":  1,\n    {libc}    \"os\":  \"windows\",\n    \"arch\":  \"x86_64\",\n    \
+             \"crt\":  \"vs17\",\n    \"extensions\":  [\n        {{\n            \"name\":  \
+             \"xdebug\",\n            \"file\":  \"php_xdebug.dll\",\n            \"version\":  \
+             \"3.5.3\",\n            \"php_api_no\":  \"20250925\",\n            \"zts\":  1,\n            \
+             \"zend_extension\":  true,\n            \"sha256\":  \"{}\",\n            \"source\":  \
+             \"https://xdebug.org/files/php_xdebug-3.5.3-8.5-ts-vs17-x86_64.dll\"\n        }}\n    \
+             ]\n}}",
+            sha256_hex(dll)
+        );
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for (name, bytes) in [
+            ("./manifest.json", manifest.as_bytes()),
+            ("./php_xdebug.dll", dll),
+            ("./LICENSE-xdebug.txt", b"The Xdebug License".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn windows_catalog_names_and_libc() {
+        let t = windows_target();
+        assert_eq!(t.asset_name("8.5.7"), "ephpm-ext-8.5.7-windows-x86_64.tar.gz");
+        assert_eq!(target().asset_name("8.5.7"), "ephpm-ext-8.5.7-linux-x86_64-gnu.tar.gz");
+
+        let dll = b"MZ fake xdebug".to_vec();
+        let good = unpack_catalog(&windows_tarball("8.5.7", Some("msvc"), &dll)).unwrap();
+        validate_catalog(&good, &t).unwrap();
+        assert_eq!(good.xdebug().unwrap().file, "php_xdebug.dll");
+        assert!(good.xdebug().unwrap().zend_extension);
+
+        // A Linux catalog can never satisfy a Windows binary, nor vice versa.
+        let gnu = unpack_catalog(&windows_tarball("8.5.7", Some("gnu"), &dll)).unwrap();
+        assert!(matches!(
+            validate_catalog(&gnu, &t).unwrap_err(),
+            CatalogError::LibcMismatch { expected: "msvc", .. }
+        ));
+        assert!(matches!(
+            validate_catalog(&good, &target()).unwrap_err(),
+            CatalogError::OsMismatch { expected: "linux", .. }
+        ));
+        // A Windows manifest must say which C runtime it is built for.
+        let unset = unpack_catalog(&windows_tarball("8.5.7", None, &dll)).unwrap();
+        assert!(matches!(
+            validate_catalog(&unset, &t).unwrap_err(),
+            CatalogError::LibcMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn windows_catalog_resolves_to_a_cached_dll() {
+        let root = tempfile::tempdir().unwrap();
+        let t = windows_target();
+        let cache = ExtCache::new(root.path(), &t);
+        let dll = b"MZ fake xdebug".to_vec();
+        let source =
+            MockSource::default().with("8.5.7", windows_tarball("8.5.7", Some("msvc"), &dll));
+        let resolved = resolve_from_catalog(&source, &t, &cache, &mut |_| {}).unwrap();
+        assert_eq!(resolved.path, cache.dir().join("xdebug-3.5.3.dll"));
+        assert_eq!(std::fs::read(&resolved.path).unwrap(), dll);
+        assert!(resolved.zend_extension);
     }
 
     #[test]
@@ -1993,7 +2114,11 @@ mod tests {
         let so = std::env::temp_dir().join("xdebug.so");
         apply_to_config(&mut config, &so, "172.20.0.1", 9100).unwrap();
         let o = &config.php.ini_overrides;
-        let quoted = crate::ext_ini::ini_quote(&so.to_string_lossy()).unwrap();
+        let mut expected = so.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            expected = expected.replace('\\', "/");
+        }
+        let quoted = crate::ext_ini::ini_quote(&expected).unwrap();
         assert_eq!(o[0], ["zend_extension".to_string(), quoted]);
         assert!(o.contains(&["xdebug.mode".into(), "debug,develop".into()]));
         assert!(o.contains(&["xdebug.start_with_request".into(), "trigger".into()]));
@@ -2091,8 +2216,10 @@ mod tests {
 
     #[test]
     fn xdebug_refuses_clearly_where_it_cannot_work() {
-        if ephpm_php::PhpRuntime::abi().is_some() && !cfg!(windows) {
-            return; // PHP-linked: would really resolve; covered by the E2E.
+        if ephpm_php::PhpRuntime::abi().is_some()
+            && (!cfg!(windows) || ephpm_php::shared::SharedRuntime::is_shared_build())
+        {
+            return; // PHP-linked where it works: would really resolve; covered by the E2E.
         }
         let mut config = ephpm_config::Config::default_config().unwrap();
         let args = XdebugArgs { xdebug: true, ..XdebugArgs::default() };

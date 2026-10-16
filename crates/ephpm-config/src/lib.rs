@@ -3949,8 +3949,13 @@ pub struct PhpConfig {
     /// shared extension must currently be compiled for ZTS — e.g. `phpize`
     /// against a ZTS PHP of the same minor, or `gcc -shared` against the
     /// matching php-sdk headers. macOS (ZTS `.dylib`) works the same way;
-    /// Windows `.dll` loading is not yet validated (a DLL would also need
-    /// to be a ZTS build).
+    /// on Windows only the shared-engine build (`cargo xtask release --target
+    /// windows --variant shared`, `php8ts.dll` beside `ephpm.exe`) can load a
+    /// `.dll` at all — a ZTS x64 build for the same PHP minor and VS toolset as
+    /// windows.php.net; a bare name resolves to `ext\php_<name>.dll` beside the
+    /// executable. The default static Windows build cannot load extension DLLs
+    /// and refuses a non-empty `extensions` at startup (loading one while a
+    /// `php8ts.dll` is reachable would crash the process).
     ///
     /// Empty entries fail validation (`validate()`): PHP would silently
     /// ignore a bare `extension=` line, which would make the knob a silent

@@ -192,6 +192,7 @@ don't:
 | PHP minor version | The release you downloaded (8.3 / 8.4 / 8.5 — one binary per minor) |
 | Thread safety | **ZTS** on every platform (Linux, macOS and Windows) |
 | libc (Linux) | **glibc** — release binaries are glibc-dynamic (`<arch>-unknown-linux-gnu`) |
+| Windows | Only the **shared-engine** build (`cargo xtask release --target windows --variant shared`) can load extension DLLs; the default static `ephpm.exe` cannot. DLLs must be ZTS x64 builds for the official windows.php.net PHP of the same minor and VS toolset (`vs16` for 8.3, `vs17` for 8.4+) |
 
 In practice on Linux that means: a **ZTS** glibc build for the matching
 PHP minor works; musl (Alpine) builds and NTS builds don't. Beware that
@@ -207,16 +208,22 @@ the ones it depends on (`igbinary` and `msgpack` before `redis`).
 
 ### Windows
 
-Loading shared extensions on Windows is **not validated, and stock
-extension DLLs are not expected to work.** ePHPm's Windows build is ZTS (not
-NTS), and PHP is **statically linked** into `ephpm.exe`: there is no
-`php8ts.dll` beside it. The DLLs published on windows.php.net and by PECL
-are linked against `php8ts.dll` (or `php8.dll` for NTS builds), so they
-need a separate PHP runtime DLL that ePHPm does not ship, and loading one
-would not attach the extension to ePHPm's embedded PHP anyway. NTS DLLs are
-ruled out regardless, since the thread-safety mode does not match. Treat
-`[php] extensions` as Linux and macOS only for now, and rely on the
-statically linked set on Windows.
+The default Windows build links PHP **statically** into `ephpm.exe` — there
+is no `php8ts.dll` beside it — so stock extension DLLs, which import
+`php8ts.dll`, cannot attach to it; rely on the statically linked set there.
+That build refuses `[php] extensions` at startup. Do not load extension DLLs
+into it any other way (`ephpm php -d extension=`, `extension=` /
+`zend_extension=` in `ini_file` or `ini_overrides`) either: with no
+`php8ts.dll` reachable PHP only reports `Failed loading …`, but when one is
+reachable — in the exe's directory, the working directory, or on `PATH`
+(a local PHP install) — Windows binds the DLL to that second PHP engine and
+ePHPm crashes (`0xC0000005`).
+The opt-in **shared-engine** build (`cargo xtask release --target windows
+--variant shared`, `php8ts.dll` beside `ephpm.exe`) can load them: use the
+`-ts-` x64 DLLs for the matching PHP minor — e.g. PECL's
+`php_redis-…-8.5-ts-vs17-x64` — and either list a bare name
+(`extensions = ["redis"]` finds `ext\php_redis.dll` beside `ephpm.exe`) or
+an absolute path. NTS DLLs never load (thread-safety mismatch).
 
 If you build a fully static musl ePHPm yourself, `dlopen()` is
 unavailable there — `[php] extensions` (and shared middleware) cannot
@@ -286,8 +293,10 @@ the faulting `.so` and function before it dies — see
   SDK) for out-of-catalog extensions.
 - **`ephpm_loaded_extensions()`** SAPI builtin (use PHP's own
   `get_loaded_extensions()` today).
-- **Catalog expansion + Windows/macOS catalog variants** — today the
-  catalog covers the common Linux set (igbinary, msgpack, apcu, redis,
-  mongodb, xdebug); more extensions and a Windows variant are planned. macOS
-  arm64 tarballs (`ephpm-ext-<php>-macos-aarch64.tar.gz`) are published for
-  the current 8.3, 8.4 and 8.5 releases and used by `ephpm dev --xdebug`.
+- **Catalog expansion** — today the Linux catalog covers igbinary, msgpack,
+  apcu, redis, mongodb and xdebug; the Windows catalog
+  (`ephpm-ext-<ver>-windows-x86_64.tar.gz`, for the shared-engine build)
+  carries only Xdebug. macOS arm64 tarballs
+  (`ephpm-ext-<php>-macos-aarch64.tar.gz`) are published for the current 8.3,
+  8.4 and 8.5 releases and used by `ephpm dev --xdebug`. More extensions are
+  planned.

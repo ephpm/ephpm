@@ -11,6 +11,7 @@ pub mod opcode;
 pub mod request;
 pub mod response;
 pub mod sapi;
+pub mod shared;
 pub mod worker_bridge;
 pub mod ws_bridge;
 pub mod xdebug;
@@ -583,6 +584,11 @@ pub enum PhpError {
     /// PHP module initialization (`php_embed_init`) failed.
     #[error("PHP runtime failed to initialize")]
     InitFailed,
+
+    /// A shared-engine build's runtime files (the `ext` directory beside the
+    /// executable) are missing or unusable. See [`shared`].
+    #[error(transparent)]
+    SharedRuntime(#[from] shared::SharedError),
 
     /// A PHP script execution error (bailout, fatal, etc.).
     #[error("PHP script execution failed: {0}")]
@@ -1216,7 +1222,13 @@ impl PhpRuntime {
                     ffi::ephpm_default_extension_dir(),
                 )
             };
-            let default_extension_dir = if ext_dir.is_null() {
+            // A shared-engine build loads its extensions from the `ext`
+            // directory beside the executable (the generated php.ini points
+            // extension_dir there), not the compiled-in `C:\php\ext` of the
+            // official build.
+            let default_extension_dir = if let Some(rt) = shared::SharedRuntime::detect() {
+                Some(rt.ext_dir.to_string_lossy().into_owned())
+            } else if ext_dir.is_null() {
                 None
             } else {
                 // SAFETY: non-NULL means a pointer to the static
@@ -1365,7 +1377,16 @@ impl PhpRuntime {
 
             let (ini_override, no_ini, ini_defines) = precscan_cli_ini_flags(args);
 
-            for define in &ini_defines {
+            // Shared-engine build: queue the extension preload ahead of the
+            // user's own `-d` flags, so they apply under `-n` too (the static
+            // build has these extensions compiled in regardless of `-n`) and
+            // a user `-d extension_dir=` still wins. See `shared`.
+            let preload = match shared::SharedRuntime::detect() {
+                Some(rt) => rt.ini_lines()?,
+                None => Vec::new(),
+            };
+
+            for define in preload.iter().chain(&ini_defines) {
                 // A `-d` value containing a NUL cannot be a valid ini
                 // directive; skip it rather than truncate it silently.
                 if let Ok(cstr) = CString::new(define.as_str()) {

@@ -26,6 +26,19 @@ cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/r
 # xtask hard-gates on the SDK's VM kind (disassembles zend_vm_kind, requires
 # ZEND_VM_KIND_TAILCALL) before linking. Same output path as the MSVC exe.
 cargo xtask release --target windows --variant clang
+
+# Opt-in shared-engine Windows build (8.3/8.4/8.5): links the official
+# windows.php.net php8ts.dll (php-sdk-<ver>-windows-x86_64-shared.tar.gz,
+# repackaged by php-sdk's windows-shared.yml) and copies the SDK's bin\
+# (php8ts.dll, dependency DLLs, ext\) next to ephpm.exe. The only Windows
+# build that can load extension DLLs (Xdebug: `ephpm dev --xdebug`). Detected
+# by build.rs from lib/php8ts.lib (cfg `php_shared`); the extension preload
+# list comes from the SDK's ephpm-sdk.json (crates/ephpm-php/src/shared.rs).
+# Never run the STATIC exe beside a php8ts.dll: loading an extension DLL then
+# binds a second PHP engine and crashes (0xC0000005). The static build refuses
+# [php] extensions, and a static xtask release removes a stale php8ts.dll/ext\
+# from the output dir.
+cargo xtask release --target windows --variant shared
 ```
 
 Prerequisites for `cargo xtask release`: git, curl, tar, `build-essential`, `pkg-config`, and `libclang-dev` (for bindgen). On Linux the build targets the host-default `<arch>-unknown-linux-gnu` triple against the glibc-linked (`-gnu`) `libphp.a` — the resulting binary is a single glibc-dynamic file that can `dlopen()` shared PHP extensions and middleware; no musl toolchain is involved. The xtask downloads only the PHP SDK from `github.com/ephpm/php-sdk` releases — no PHP CLI, Composer, static-php-cli, or sqld binary needed (the Turso engine is a pure-Rust crate compiled into the binary).

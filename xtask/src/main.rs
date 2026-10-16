@@ -150,7 +150,13 @@ Windows builds:
                       interpreter is the TAILCALL VM — 1.6-1.7x faster on CPU-bound PHP than the
                       default MSVC build's CALL VM. Experimental. The SDK asset is
                       php-sdk-<ver>-windows-x86_64-clang.tar.gz, cached side-by-side with the
-                      default; the produced ephpm.exe is verified to contain the TAILCALL VM."
+                      default; the produced ephpm.exe is verified to contain the TAILCALL VM.
+  --variant shared    (with --target windows) Link the official windows.php.net engine
+                      (php8ts.dll) instead of the static php8embed.lib, so ephpm.exe can load
+                      PHP extension DLLs (Xdebug: `ephpm dev --xdebug`). The SDK asset is
+                      php-sdk-<ver>-windows-x86_64-shared.tar.gz; its bin\\ payload (php8ts.dll,
+                      dependency DLLs, ext\\) is copied next to ephpm.exe, which needs it at run
+                      time. Opt-in: the default stays the single-file static build."
     );
 }
 
@@ -209,17 +215,38 @@ fn parse_variant(args: &[String]) -> Option<&str> {
 
 /// Validate a `--variant` request against the SDK platform and PHP version.
 ///
-/// The only SDK build variant besides the default toolchain is `clang`: PHP
-/// built with clang-cl (MSVC-ABI-compatible) so the interpreter is the TAILCALL
-/// VM (`[[clang::musttail]]` + `preserve_none`) instead of the slow
-/// `ZEND_VM_KIND_CALL` interpreter every MSVC-built PHP falls back to. The
-/// artifact only exists for windows-x86_64 and TAILCALL-capable minors
-/// (`TAILCALL_MINORS`, 8.5+) — the TAILCALL VM does not exist in PHP 8.3/8.4, so
-/// those minors hard-error here with an explanation instead of a confusing 404
-/// at download time (issue #329).
+/// Two Windows-only SDK variants exist besides the default static build:
+///
+/// - `clang`: PHP built with clang-cl (MSVC-ABI-compatible) so the interpreter
+///   is the TAILCALL VM (`[[clang::musttail]]` + `preserve_none`) instead of
+///   the slow `ZEND_VM_KIND_CALL` interpreter every MSVC-built PHP falls back
+///   to. The artifact only exists for TAILCALL-capable minors
+///   (`TAILCALL_MINORS`, 8.5+) — the TAILCALL VM does not exist in PHP
+///   8.3/8.4, so those minors hard-error here with an explanation instead of a
+///   confusing 404 at download time (issue #329).
+/// - `shared`: the official windows.php.net engine as `php8ts.dll` (php-sdk
+///   `windows-shared.yml`), which lets `ephpm.exe` load extension DLLs. Built
+///   from GA releases only (windows.php.net publishes no beta builds).
 fn validate_variant(variant: &str, version: &str, os: &str, arch: &str) -> Result<(), ()> {
+    if variant == "shared" {
+        if os != "windows" || arch != "x86_64" {
+            eprintln!("error: --variant shared is only published for windows-x86_64");
+            eprintln!("       Linux and macOS builds already load shared extensions (the");
+            eprintln!("       release binary exports the Zend API to dlopen()ed .so files).");
+            return Err(());
+        }
+        let ga = version.split('.').count() == 3
+            && version.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        if !ga {
+            eprintln!("error: --variant shared needs a GA PHP release (got {version})");
+            eprintln!("       It repackages the official windows.php.net build, which has no");
+            eprintln!("       pre-release builds.");
+            return Err(());
+        }
+        return Ok(());
+    }
     if variant != "clang" {
-        eprintln!("error: unsupported --variant '{variant}' (supported: clang)");
+        eprintln!("error: unsupported --variant '{variant}' (supported: clang, shared)");
         eprintln!("       omit --variant for the default-toolchain SDK");
         return Err(());
     }
@@ -256,7 +283,7 @@ fn release(args: &[String]) -> ExitCode {
         None => {
             if parse_variant(args).is_some() {
                 eprintln!("error: --variant is only supported with --target windows");
-                eprintln!("       (the clang/TAILCALL SDK variant is a Windows-only artifact)");
+                eprintln!("       (the clang and shared SDK variants are Windows-only artifacts)");
                 return ExitCode::FAILURE;
             }
             require_unix(|| release_native(args))
@@ -375,6 +402,15 @@ fn require_macos_arm64() -> Result<(), ExitCode> {
 /// The resulting `ephpm.exe` is a single self-contained binary, same as on
 /// Linux/macOS — there is no DLL to ship, extract, or delay-load.
 ///
+/// `--variant shared` is the exception, and opt-in: it links the php-sdk
+/// `-windows-x86_64-shared` SDK (the official windows.php.net engine,
+/// `php8ts.dll`), the only way a Windows ephpm can load PHP extension DLLs
+/// such as Xdebug. The SDK's `bin\` payload — `php8ts.dll`, the DLLs it and
+/// the extensions import, and `ext\` — is copied next to `ephpm.exe`, and the
+/// exe does not start without it. Static stays the default because it is one
+/// file with nothing to keep in step; the shared build is what `ephpm dev
+/// --xdebug` needs on Windows.
+///
 /// History: this used to cross-compile from Linux via `cargo-xwin`. That path
 /// was removed because every Windows SDK case-sensitivity / transitive-include
 /// gap (Ws2tcpip.h, intsafe.h, dllimport vs static linkage, etc.) ate hours of
@@ -417,7 +453,7 @@ fn release_windows(args: &[String]) -> ExitCode {
     // contains the TAILCALL interpreter BEFORE linking it into ephpm.exe. An
     // artifact advertised as TAILCALL that silently ships the CALL VM is the
     // exact failure this build path exists to prevent.
-    if variant.is_some() && verify_tailcall_vm(&sdk_dir).is_err() {
+    if variant == Some("clang") && verify_tailcall_vm(&sdk_dir).is_err() {
         return ExitCode::FAILURE;
     }
 
@@ -468,12 +504,43 @@ fn release_windows(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // No DLL to ship. The php-sdk Windows tarball ships a *static*
+    // Default: no DLL to ship. The php-sdk Windows tarball ships a *static*
     // php8embed.lib (static-php-cli `--build-embed` is a static build — a fat
     // lib of PHP's objects), which crates/ephpm-php/build.rs links with
     // `rustc-link-lib=static=php8embed`. ephpm.exe is a single self-contained
     // binary on Windows, same as on Linux/macOS.
-    let exe_dir = workspace_root().join("target").join(target).join("release");
+    let exe_dir = cargo_target_dir().join(target).join("release");
+
+    if variant == Some("shared") {
+        let runtime = sdk_dir.join("bin");
+        if let Err(e) = copy_dir_contents(&runtime, &exe_dir) {
+            eprintln!(
+                "error: failed to copy the PHP runtime from {} to {}: {e}",
+                runtime.display(),
+                exe_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!();
+        eprintln!("==> Windows binary ready (shared PHP engine):");
+        eprintln!("    {}", exe_dir.join("ephpm.exe").display());
+        eprintln!();
+        eprintln!("    ephpm.exe needs the files copied beside it from {}:", runtime.display());
+        eprintln!(
+            "    php8ts.dll, the dependency DLLs, and ext\\. Ship the directory, not the exe."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // A previous `--variant shared` build into the same directory left
+    // php8ts.dll and ext\ here. The static exe must never sit beside a
+    // php8ts.dll: asked to load an extension DLL, Windows would resolve its
+    // php8ts.dll import to that file — a second, separate PHP engine — and
+    // the process crashes (0xC0000005) instead of failing to load.
+    if let Err(e) = remove_stale_shared_runtime(&exe_dir) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
 
     eprintln!();
     eprintln!("==> Windows binary ready:");
@@ -481,6 +548,52 @@ fn release_windows(args: &[String]) -> ExitCode {
     eprintln!();
     eprintln!("    Single static binary — no DLL to deploy alongside it.");
     ExitCode::SUCCESS
+}
+
+/// Cargo's target directory: `CARGO_TARGET_DIR` when set (a shared cache),
+/// else `<workspace>/target`.
+fn cargo_target_dir() -> PathBuf {
+    env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|p| if p.is_absolute() { p } else { workspace_root().join(p) })
+        .unwrap_or_else(|| workspace_root().join("target"))
+}
+
+/// Recursively copy every file under `src` into `dest` (created as needed),
+/// overwriting what is there. Used to stage the shared PHP runtime beside
+/// `ephpm.exe`.
+fn copy_dir_contents(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove `php8ts.dll` and `ext\` that a `--variant shared` build left in
+/// `exe_dir`, so a static `ephpm.exe` written there never runs beside a
+/// foreign PHP engine. The other runtime DLLs (OpenSSL, ICU, …) are inert
+/// without `php8ts.dll` and are left alone.
+fn remove_stale_shared_runtime(exe_dir: &Path) -> Result<(), String> {
+    let engine = exe_dir.join("php8ts.dll");
+    if engine.exists() {
+        fs::remove_file(&engine)
+            .map_err(|e| format!("failed to remove stale {}: {e}", engine.display()))?;
+        eprintln!("==> removed {} left by a shared-engine build", engine.display());
+    }
+    let ext = exe_dir.join("ext");
+    if ext.is_dir() {
+        fs::remove_dir_all(&ext)
+            .map_err(|e| format!("failed to remove stale {}: {e}", ext.display()))?;
+        eprintln!("==> removed {} left by a shared-engine build", ext.display());
+    }
+    Ok(())
 }
 
 /// Resolve a user-supplied PHP version into a full pinned version string.
@@ -526,7 +639,8 @@ fn resolve_php_version(input: &str) -> Option<String> {
 /// `--target windows` overrides host detection so any host with curl + tar
 /// can prefetch the Windows SDK (the download itself is platform-neutral).
 /// `--variant clang` selects the clang-cl / TAILCALL Windows SDK
-/// (PHP 8.5 only — see `validate_variant`).
+/// (PHP 8.5 only), `--variant shared` the shared-engine Windows SDK
+/// (`php8ts.dll`) — see `validate_variant`.
 fn php_sdk(args: &[String]) -> ExitCode {
     let Some(version) = resolve_php_version(parse_release_php_version(args)) else {
         return ExitCode::FAILURE;
@@ -630,7 +744,13 @@ fn ensure_php_sdk_variant(
     //   lib/libphp.a            (Linux + macOS)
     //   lib/php8embed.{dll,lib} (Windows)
     //   include/php/{main,Zend,TSRM,sapi,ext}/...
-    let already_present = if os == "windows" {
+    //   bin/php8ts.dll + lib/php8ts.lib (Windows --variant shared)
+    let already_present = if variant == Some("shared") {
+        dest.join("lib").join("php8embed.lib").exists()
+            && dest.join("lib").join("php8ts.lib").exists()
+            && dest.join("bin").join("php8ts.dll").exists()
+            && dest.join("ephpm-sdk.json").exists()
+    } else if os == "windows" {
         dest.join("lib").join("php8embed.lib").exists()
     } else {
         dest.join("lib").join("libphp.a").exists()
@@ -674,13 +794,17 @@ fn ensure_php_sdk_variant(
         eprintln!("error: failed to download or extract PHP SDK from {url}");
         eprintln!("       Verify that release v{version} exists at:");
         eprintln!("         https://github.com/ephpm/php-sdk/releases/tag/v{version}");
-        if variant.is_some() {
+        if variant == Some("clang") {
             eprintln!(
                 "       The -clang (TAILCALL) asset is experimental and may not be attached to"
             );
             eprintln!(
                 "       every SDK release yet — the default MSVC SDK (omit --variant) always is."
             );
+        } else if variant == Some("shared") {
+            eprintln!("       The -shared asset is attached by php-sdk's windows-shared.yml");
+            eprintln!("       (`gh workflow run windows-shared.yml -R ephpm/php-sdk -f");
+            eprintln!("       php_version={version}`), separately from the default SDK build.");
         }
         return Err(());
     }
@@ -745,11 +869,13 @@ fn php_sdk_libc_suffix(os: &str) -> &'static str {
 /// Toolchain-variant suffix used in SDK release-asset and cache-directory
 /// names. The default toolchain (MSVC on Windows, gcc/clang elsewhere) has no
 /// suffix; the clang-cl / TAILCALL Windows SDK is published as `-clang` and
-/// cached under its own directory so the two variants never trample each
-/// other (the cache-hit check is just "does `lib/php8embed.lib` exist").
+/// the shared-engine Windows SDK as `-shared`, each cached under its own
+/// directory so the variants never trample each other (the default cache-hit
+/// check is just "does `lib/php8embed.lib` exist", which all three ship).
 fn php_sdk_variant_suffix(variant: Option<&str>) -> &'static str {
     match variant {
         Some("clang") => "-clang",
+        Some("shared") => "-shared",
         _ => "",
     }
 }
@@ -2021,6 +2147,27 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
 mod tests {
     use super::*;
 
+    #[test]
+    fn static_release_removes_a_stale_shared_runtime() {
+        let dir = env::temp_dir().join(format!("xtask-stale-runtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ext")).unwrap();
+        fs::write(dir.join("php8ts.dll"), b"").unwrap();
+        fs::write(dir.join("ext").join("php_xdebug.dll"), b"").unwrap();
+        fs::write(dir.join("libssl-3-x64.dll"), b"").unwrap();
+        fs::write(dir.join("ephpm.exe"), b"").unwrap();
+
+        remove_stale_shared_runtime(&dir).unwrap();
+        assert!(!dir.join("php8ts.dll").exists());
+        assert!(!dir.join("ext").exists());
+        // Inert without php8ts.dll, and the exe itself: left alone.
+        assert!(dir.join("libssl-3-x64.dll").exists());
+        assert!(dir.join("ephpm.exe").exists());
+        // Idempotent on a clean directory.
+        remove_stale_shared_runtime(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Split a Dockerfile into `(stage name, parent, body lines)`, one entry per
     /// `FROM`. Line continuations are not joined; the checks below only look at
     /// `FROM` and `COPY`, which in docker/Dockerfile are single-line.
@@ -2195,5 +2342,50 @@ mod tests {
             strip_verbatim_prefix(PathBuf::from(r"C:\Users\ci")),
             PathBuf::from(r"C:\Users\ci")
         );
+    }
+
+    #[test]
+    fn shared_variant_is_windows_ga_only() {
+        for minor in ["8.3.33", "8.4.23", "8.5.7"] {
+            assert!(validate_variant("shared", minor, "windows", "x86_64").is_ok(), "{minor}");
+        }
+        assert!(validate_variant("shared", "8.5.7", "linux", "x86_64").is_err());
+        assert!(validate_variant("shared", "8.6.0beta1", "windows", "x86_64").is_err());
+        assert!(validate_variant("dynamic", "8.5.7", "windows", "x86_64").is_err());
+        // clang keeps its own rules.
+        assert!(validate_variant("clang", "8.4.23", "windows", "x86_64").is_err());
+        assert!(validate_variant("clang", "8.5.7", "windows", "x86_64").is_ok());
+    }
+
+    #[test]
+    fn shared_variant_has_its_own_asset_and_cache_dir() {
+        assert_eq!(php_sdk_variant_suffix(Some("shared")), "-shared");
+        let dir = php_sdk_dir_variant("8.5.7", "windows", "x86_64", Some("shared"));
+        assert!(dir.ends_with("8.5.7-windows-x86_64-shared"), "{}", dir.display());
+        assert_ne!(dir, php_sdk_dir_variant("8.5.7", "windows", "x86_64", None));
+    }
+
+    #[test]
+    fn copy_dir_contents_copies_nested_runtime() {
+        let src = tempfile_dir("src");
+        let dest = tempfile_dir("dest");
+        fs::create_dir_all(src.join("ext")).unwrap();
+        fs::write(src.join("php8ts.dll"), b"engine").unwrap();
+        fs::write(src.join("ext").join("php_mbstring.dll"), b"mb").unwrap();
+        fs::write(dest.join("php8ts.dll"), b"stale").unwrap();
+        copy_dir_contents(&src, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("php8ts.dll")).unwrap(), b"engine");
+        assert_eq!(fs::read(dest.join("ext").join("php_mbstring.dll")).unwrap(), b"mb");
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+    }
+
+    /// A fresh per-test directory under the system temp dir (xtask has no
+    /// tempfile dependency).
+    fn tempfile_dir(name: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!("xtask-copy-test-{}", std::process::id()));
+        let dir = root.join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -126,11 +126,12 @@ pub(crate) fn ini_quote(value: &str) -> Option<String> {
 ///
 /// `Some(true)` when it exports — as *defined, global* symbols —
 /// both `zend_extension_entry` and `extension_version_info` (ELF `.dynsym`,
-/// or the Mach-O symbol table where names carry a leading underscore),
-/// `Some(false)` when it is a parseable object without them, and `None` when
-/// it cannot be read or is not a recognised object format — the caller then
-/// falls back to `extension=` and lets PHP report the problem. A local
-/// (non-exported) definition does not count: PHP's `dlsym` cannot see it.
+/// the Mach-O symbol table where names carry a leading underscore, or a
+/// PE/DLL export table), `Some(false)` when it is a parseable object without
+/// them, and `None` when it cannot be read or is not a recognised object
+/// format — the caller then falls back to `extension=` and lets PHP report
+/// the problem. A local (non-exported) definition does not count: PHP's
+/// `dlsym` cannot see it.
 pub(crate) fn is_zend_extension(path: &Path) -> Option<bool> {
     use object::{Object, ObjectSymbol};
 
@@ -138,6 +139,14 @@ pub(crate) fn is_zend_extension(path: &Path) -> Option<bool> {
     let mut data = Vec::new();
     file.take(MAX_INSPECT_BYTES).read_to_end(&mut data).ok()?;
     let obj = object::File::parse(&*data).ok()?;
+    // A DLL's symbol table is stripped; what PHP's GetProcAddress lookup
+    // sees is the export table (php_xdebug.dll exports `get_module`,
+    // `zend_extension_entry` and `extension_version_info` there).
+    if obj.format() == object::BinaryFormat::Pe {
+        let table = obj.exports().ok()?;
+        let exports = |wanted: &str| table.iter().any(|e| e.name() == wanted.as_bytes());
+        return Some(exports(ZEND_EXTENSION_SYMBOL) && exports(ZEND_EXTENSION_VERSION_SYMBOL));
+    }
     let exports = |wanted: &str| {
         obj.dynamic_symbols().chain(obj.symbols()).any(|sym| {
             sym.is_definition()
@@ -310,6 +319,126 @@ pub(crate) mod tests {
         w.write_dynstr_section_header(0);
         w.write_shstrtab_section_header();
         out
+    }
+
+    /// Build a minimal, valid PE32+ DLL whose export table names each entry
+    /// of `exports` (all pointing at one `ret` in `.text`). The DLL's COFF
+    /// symbol table is empty — like a real stripped release DLL, only the
+    /// export table says what it provides. Never loaded, only parsed.
+    pub(crate) fn fake_pe_dll(exports: &[&str]) -> Vec<u8> {
+        use object::pe;
+        use object::write::pe::{NtHeaders, Writer};
+
+        let mut names: Vec<&str> = exports.to_vec();
+        names.sort_unstable(); // AddressOfNames must be sorted for lookups
+        let n = u32::try_from(names.len()).unwrap();
+        let dll_name = b"fake.dll\0";
+        let strings_off = 40 + 4 * n + 4 * n + 2 * n;
+        let strings_len: u32 =
+            u32::try_from(dll_name.len() + names.iter().map(|s| s.len() + 1).sum::<usize>())
+                .unwrap();
+
+        let mut out = Vec::new();
+        let mut w = Writer::new(true, 0x1000, 0x200, &mut out);
+        w.reserve_dos_header_and_stub();
+        w.reserve_nt_headers(16);
+        w.reserve_section_headers(2);
+        let text = w.reserve_text_section(16);
+        let edata = w.reserve_edata_section(strings_off + strings_len);
+
+        w.write_dos_header_and_stub().unwrap();
+        w.write_nt_headers(NtHeaders {
+            machine: pe::IMAGE_FILE_MACHINE_AMD64,
+            time_date_stamp: 0,
+            characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE
+                | pe::IMAGE_FILE_LARGE_ADDRESS_AWARE
+                | pe::IMAGE_FILE_DLL,
+            major_linker_version: 14,
+            minor_linker_version: 0,
+            address_of_entry_point: 0,
+            image_base: 0x1_8000_0000,
+            major_operating_system_version: 6,
+            minor_operating_system_version: 0,
+            major_image_version: 0,
+            minor_image_version: 0,
+            major_subsystem_version: 6,
+            minor_subsystem_version: 0,
+            subsystem: pe::IMAGE_SUBSYSTEM_WINDOWS_CUI,
+            dll_characteristics: 0,
+            size_of_stack_reserve: 0x10_0000,
+            size_of_stack_commit: 0x1000,
+            size_of_heap_reserve: 0x10_0000,
+            size_of_heap_commit: 0x1000,
+        });
+        w.write_section_headers();
+        w.write_section(text.file_offset, &[0xC3; 16]);
+
+        // IMAGE_EXPORT_DIRECTORY, then functions, name RVAs, ordinals,
+        // strings — all RVAs relative to the image base.
+        let va = edata.virtual_address;
+        let funcs_rva = va + 40;
+        let names_rva = funcs_rva + 4 * n;
+        let ords_rva = names_rva + 4 * n;
+        let strings_rva = va + strings_off;
+        let mut e: Vec<u8> = Vec::new();
+        let u32le = |e: &mut Vec<u8>, v: u32| e.extend_from_slice(&v.to_le_bytes());
+        u32le(&mut e, 0); // Characteristics
+        u32le(&mut e, 0); // TimeDateStamp
+        e.extend_from_slice(&[0; 4]); // Major/MinorVersion
+        u32le(&mut e, strings_rva); // Name
+        u32le(&mut e, 1); // Base
+        u32le(&mut e, n); // NumberOfFunctions
+        u32le(&mut e, n); // NumberOfNames
+        u32le(&mut e, funcs_rva);
+        u32le(&mut e, names_rva);
+        u32le(&mut e, ords_rva);
+        for _ in 0..n {
+            u32le(&mut e, text.virtual_address);
+        }
+        let mut next = strings_rva + u32::try_from(dll_name.len()).unwrap();
+        for name in &names {
+            u32le(&mut e, next);
+            next += u32::try_from(name.len() + 1).unwrap();
+        }
+        for i in 0..n {
+            e.extend_from_slice(&u16::try_from(i).unwrap().to_le_bytes());
+        }
+        e.extend_from_slice(dll_name);
+        for name in &names {
+            e.extend_from_slice(name.as_bytes());
+            e.push(0);
+        }
+        w.write_section(edata.file_offset, &e);
+        out
+    }
+
+    #[test]
+    fn detects_zend_extension_in_a_dll_export_table() {
+        let dir = tempfile::tempdir().unwrap();
+        // php_xdebug.dll's export set; a plain extension DLL exports only
+        // get_module.
+        let xdebug = write(
+            dir.path(),
+            "php_xdebug.dll",
+            &fake_pe_dll(&["get_module", "zend_extension_entry", "extension_version_info"]),
+        );
+        let redis = write(dir.path(), "php_redis.dll", &fake_pe_dll(&["get_module"]));
+        // zend_load_extension also needs extension_version_info.
+        let no_version = write(
+            dir.path(),
+            "php_nover.dll",
+            &fake_pe_dll(&["get_module", "zend_extension_entry"]),
+        );
+        assert_eq!(is_zend_extension(&xdebug), Some(true));
+        assert_eq!(is_zend_extension(&redis), Some(false));
+        assert_eq!(is_zend_extension(&no_version), Some(false));
+
+        // Windows bare-name lookup finds php_<name>.dll in extension_dir.
+        if cfg!(windows) {
+            let line = resolve_extension_line("xdebug", Path::new("C:\\"), Some(dir.path()));
+            assert_eq!(line.ini_line().unwrap(), "zend_extension=\"xdebug\"");
+            assert_eq!(line.inspected, Some(xdebug));
+        }
     }
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
