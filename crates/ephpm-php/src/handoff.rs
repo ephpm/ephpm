@@ -386,6 +386,25 @@ impl<T> Worker<T> {
     ///
     /// [`RecvClosed`] once the dispatcher is closed and its queue drained.
     pub fn recv(&self, spin: Duration) -> Result<T, RecvClosed> {
+        self.recv_with_park_hook(spin, || {})
+    }
+
+    /// [`recv`](Self::recv), running `before_park` on this thread each time it
+    /// is about to park — after the spin found nothing, never when a queued job
+    /// or a delivery during the spin ends the wait. A worker uses it to release
+    /// per-request resources that must not be held across an unbounded idle
+    /// wait (the PHP execution timer) without paying for that on every request
+    /// when it never goes idle. A delivery that lands while the hook runs is
+    /// not lost: the park is then skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`RecvClosed`] once the dispatcher is closed and its queue drained.
+    pub fn recv_with_park_hook(
+        &self,
+        spin: Duration,
+        mut before_park: impl FnMut(),
+    ) -> Result<T, RecvClosed> {
         loop {
             {
                 let mut st = lock(&self.shared.state);
@@ -407,7 +426,7 @@ impl<T> Worker<T> {
                     self.shared.space.notify_one();
                 }
             }
-            self.wait_ready(spin);
+            self.wait_ready(spin, &mut before_park);
             if let Some(job) = self.slot.take() {
                 return Ok(job);
             }
@@ -416,8 +435,9 @@ impl<T> Worker<T> {
         }
     }
 
-    /// Block until the mailbox is `READY`: poll for up to `spin`, then park.
-    fn wait_ready(&self, spin: Duration) {
+    /// Block until the mailbox is `READY`: poll for up to `spin`, then run
+    /// `before_park` and park.
+    fn wait_ready(&self, spin: Duration, before_park: &mut impl FnMut()) {
         const PURE_SPINS: u32 = 32;
         let state = &self.slot.state;
         if !spin.is_zero() {
@@ -439,6 +459,9 @@ impl<T> Worker<T> {
                 polls = polls.saturating_add(1);
             }
         }
+        // About to park (unless a delivery lands first — checked by the CAS
+        // below, so one arriving while the hook runs is never missed).
+        before_park();
         // Announce the park. If a delivery won the race the CAS fails and the
         // mailbox is already READY.
         if state.compare_exchange(WAITING, PARKED, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -578,6 +601,56 @@ mod tests {
             d.close();
             h.join().unwrap();
         }
+    }
+
+    /// The park hook (the worker's PHP execution-timer disarm) runs only when
+    /// the worker really parks: not for a queued job, not for a delivery that
+    /// lands during the spin — and it does run before a park.
+    #[test]
+    fn park_hook_runs_only_when_the_worker_parks() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Queued job: taken without waiting, hook never runs.
+        let d = Dispatcher::new(4);
+        d.try_push(1).unwrap();
+        let w = d.register_worker();
+        let mut hooks = 0;
+        assert_eq!(w.recv_with_park_hook(LONG, || hooks += 1), Ok(1));
+        assert_eq!(hooks, 0, "a queued job must not run the park hook");
+
+        // Delivered during a long spin: hook never runs.
+        let d = Dispatcher::new(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = {
+            let (d, calls) = (d.clone(), Arc::clone(&calls));
+            std::thread::spawn(move || {
+                let w = d.register_worker();
+                w.recv_with_park_hook(LONG, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        wait_until(|| d.idle_count() == 1);
+        d.try_push(2).unwrap();
+        assert_eq!(h.join().unwrap(), Ok(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a delivery during the spin must not park");
+
+        // No spin: the hook runs before the park, and the delivery still lands.
+        let d = Dispatcher::new(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = {
+            let (d, calls) = (d.clone(), Arc::clone(&calls));
+            std::thread::spawn(move || {
+                let w = d.register_worker();
+                w.recv_with_park_hook(Duration::ZERO, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        wait_until(|| calls.load(Ordering::SeqCst) == 1);
+        d.try_push(3).unwrap();
+        assert_eq!(h.join().unwrap(), Ok(3));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

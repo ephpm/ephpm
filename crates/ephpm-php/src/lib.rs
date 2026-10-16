@@ -279,6 +279,15 @@ mod ffi {
         /// per-thread timers this is a no-op. Call after `php_embed_init()`.
         pub fn ephpm_set_max_execution_time(secs: ::std::os::raw::c_long);
 
+        /// Disarm the calling thread's PHP execution timer because its worker
+        /// is about to park waiting for the next request. Called by the worker
+        /// dispatch loop only when it actually parks, so a saturated worker
+        /// skips the disarm and the next request's arm replaces the running
+        /// countdown in place. Runs under `zend_try` (safe from Rust frames);
+        /// a no-op on builds without per-thread execution timers. Must be
+        /// called on a PHP worker thread inside its worker request.
+        pub fn ephpm_worker_exec_timer_idle();
+
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);

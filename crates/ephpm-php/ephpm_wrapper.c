@@ -227,53 +227,126 @@ void ephpm_set_max_execution_time(long secs)
 }
 
 #ifdef EPHPM_NATIVE_EXEC_TIMER
+/* Whether this thread has had the SIGRTMIN disposition installed and the
+ * signal unblocked by an ephpm arm (zend_set_timeout's reset_signals). Both are
+ * set-once facts: the disposition is process-wide and nothing in ePHPm or PHP
+ * ever removes it (zend_max_execution_timer_init only QUERIES the old action,
+ * zend_max_execution_timer_shutdown only deletes the timer), and the signal
+ * mask is per-thread and never re-blocked. php_request_startup() already
+ * installs both on every thread (ephpm_thread_init runs it), so this is
+ * belt-and-braces; doing it once per thread instead of once per request saves
+ * an rt_sigaction + rt_sigprocmask pair on every request. */
+static EPHPM_TLS int exec_timer_signals_installed = 0;
+
 /* Arm PHP's per-thread execution timer for a request AND mirror the effective
  * limit into the max_execution_time ini entry, so userland ini_get() reports
  * the value that is actually being enforced instead of the 0 the embed SAPI
  * leaves behind (#279). Called at the start of every request on both the fpm
  * and worker paths.
  *
- * Two steps, order-sensitive:
+ * Hot path (worker mode): costs exactly ONE timer_settime. It used to cost
+ * four plus two signal syscalls — zend_set_timeout(secs, 1) (timer_settime +
+ * rt_sigaction + rt_sigprocmask), then an unconditional ini alteration whose
+ * OnUpdateTimeout handler runs zend_unset_timeout() + zend_set_timeout(secs, 0)
+ * (two more timer_settime), on top of the idle disarm in take_request (now
+ * deferred to the moment the worker actually parks — see
+ * ephpm_worker_exec_timer_idle()).
  *
- *   1. zend_set_timeout(secs, reset_signals=1) is the AUTHORITATIVE arm: it
- *      (re)installs the SIGRTMIN disposition and starts the countdown from the
- *      configured baseline. Doing this first means the timer state does not
- *      depend on what step 2's ini handler does.
+ *   1. Mirror into the ini entry ONLY when it does not already read `secs`.
+ *      In worker mode it already does on every request except the first on a
+ *      thread and the one after a set_time_limit()/ini_set() changed it; in
+ *      fpm mode php_request_shutdown() restored it, so it is altered on every
+ *      request. Altering at RUNTIME stage is exactly how PHP's own
+ *      set_time_limit() writes the value, and its OnUpdateTimeout handler
+ *      sets EG(timeout_seconds) from it and re-arms via
+ *      zend_set_timeout(secs, 0) — a complete arm, so when it took effect
+ *      (EG(timeout_seconds) == secs afterwards) no second arm is needed.
  *
- *   2. zend_alter_ini_entry_chars(...STAGE_RUNTIME) updates the ini entry so
- *      ini_get('max_execution_time') reflects reality. This is exactly how PHP's
- *      own set_time_limit() writes the value. Altering the entry at RUNTIME
- *      stage re-enters max_execution_time's OnUpdateTimeout handler, which sets
- *      EG(timeout_seconds) and re-arms via zend_set_timeout(secs, 0). That
- *      re-entrant re-arm is harmless and does NOT fight step 1 or leak a timer:
- *      it targets the same per-thread POSIX timer with the same value
- *      (timer_settime replaces the setting in place — no new timer_create), the
- *      SIGRTMIN handler is already installed by step 1, and it merely restarts
- *      the identical countdown microseconds later. secs==0 leaves the entry at
- *      "0" (genuinely unlimited) and OnUpdateTimeout disarms — preserving #277's
- *      "0 means only the server backstop applies" semantics.
+ *   2. Otherwise (ini already current, or the alteration did not land), arm
+ *      directly from the configured baseline. secs > 0: zend_set_timeout
+ *      calls timer_settime, which REPLACES whatever countdown is running —
+ *      including one left over from the previous request, which is why the
+ *      idle disarm can be skipped when the worker never parks between two
+ *      requests. secs == 0: zend_set_timeout(0) never touches the timer, so
+ *      zend_unset_timeout() first disarms anything still counting (it is a
+ *      no-op, no syscall, when EG(timeout_seconds) is already 0 — and the
+ *      timer can only be armed while EG(timeout_seconds) != 0). #277's
+ *      "0 means only the server backstop applies" holds either way.
+ *
+ * Either path ends with EG(timed_out) cleared and a fresh countdown of `secs`
+ * started now, so no time and no pending timeout carries over from the
+ * previous request. PG(connection_status)'s TIMEOUT bit is cleared too: a
+ * previous request's countdown that expired after its response was sent but
+ * before this re-arm (possible now that the idle disarm only happens on park)
+ * ran php_on_timeout(), which sets it; the expiry signal itself is delivered
+ * no later than the return of the timer_settime that replaces the countdown,
+ * so nothing stale can land after this function returns.
  *
  * A subsequent userland set_time_limit(N) during the request still overrides
- * both the timer and ini_get, live, on top of this baseline (its own
- * zend_alter_ini_entry_chars call runs after this one returns).
+ * both the timer and ini_get, live, on top of this baseline.
  *
- * No zend_try guard: zend_set_timeout and ini alteration do not zend_bailout
- * (they return FAILURE on error rather than longjmp'ing), matching the bare
- * zend_set_timeout calls this replaces and the request_ini replay above. */
+ * No zend_try guard: this runs only inside a PHP request context (directly
+ * under ephpm_run_request / the take_request PHP_FUNCTION, with no Rust frames
+ * between it and the enclosing zend_try), matching the bare zend_set_timeout
+ * calls it replaces. */
 static void ephpm_arm_exec_timer(void)
 {
-    zend_set_timeout(g_configured_max_exec_secs, 1);
+    const long secs = g_configured_max_exec_secs;
+    const bool reset_signals = !exec_timer_signals_installed;
+    bool armed = false;
 
     char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%ld", g_configured_max_exec_secs);
+    int n = snprintf(buf, sizeof(buf), "%ld", secs);
     if (n > 0 && (size_t)n < sizeof(buf)) {
-        zend_string *key = zend_string_init(ZEND_STRL("max_execution_time"), 0);
-        zend_alter_ini_entry_chars(key, buf, (size_t)n, ZEND_INI_USER,
-                                   ZEND_INI_STAGE_RUNTIME);
-        zend_string_release(key);
+        zend_ini_entry *entry = zend_hash_str_find_ptr(
+            EG(ini_directives), ZEND_STRL("max_execution_time"));
+        bool ini_current = entry && entry->value
+            && zend_string_equals_cstr(entry->value, buf, (size_t)n);
+        if (!ini_current) {
+            zend_string *key = zend_string_init(ZEND_STRL("max_execution_time"), 0);
+            zend_result rc = zend_alter_ini_entry_chars(
+                key, buf, (size_t)n, ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
+            zend_string_release(key);
+            armed = rc == SUCCESS && EG(timeout_seconds) == secs;
+        }
     }
+
+    if (!armed || reset_signals) {
+        if (secs <= 0) {
+            zend_unset_timeout();
+        }
+        zend_set_timeout(secs, reset_signals);
+    }
+    exec_timer_signals_installed = 1;
+    PG(connection_status) &= ~PHP_CONNECTION_TIMEOUT;
 }
 #endif
+
+/* Disarm this thread's execution timer because its worker is about to park
+ * (block indefinitely) waiting for the next request. Called by the Rust
+ * dispatch loop (worker_bridge.rs) only when the worker actually parks — never
+ * when the next job is already queued or arrives during the bounded spin — so
+ * a saturated worker pays no disarm at all; the next arm's timer_settime
+ * replaces the old countdown instead.
+ *
+ * Why disarm before parking at all: the timer is wall-clock (CLOCK_BOOTTIME),
+ * so a countdown left armed would expire during an idle wait of any length.
+ * The expiry would be harmless to PHP state (the next arm clears it) but its
+ * signal interrupts whatever the thread is blocked in, so an idle worker is
+ * kept signal-free exactly as before.
+ *
+ * zend_unset_timeout() costs no syscall when EG(timeout_seconds) is 0. It
+ * runs under zend_try because this is reached from Rust frames (take_request's
+ * Rust callback): zend_max_execution_timer_settime raises E_ERROR (a bailout)
+ * if timer_settime fails, and that longjmp must never cross a Rust frame. */
+void ephpm_worker_exec_timer_idle(void)
+{
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+    zend_try {
+        zend_unset_timeout();
+    } zend_end_try();
+#endif
+}
 
 /* Worker mode — lazy Envelope backing store (Phase 1 fast path).
  *
@@ -2861,14 +2934,13 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * the previous response's headers/status/output are already gone. */
     ephpm_worker_reset_request();
 
-#ifdef EPHPM_NATIVE_EXEC_TIMER
-    /* Disarm the per-thread execution timer while the worker is idle. The timer
-     * is wall-clock (CLOCK_BOOTTIME), so an armed timer would keep counting
-     * while we block waiting for the next request and could fire during the
-     * idle wait or the next request's early setup. It is re-armed below, once a
-     * request is actually in hand. */
-    zend_unset_timeout();
-#endif
+    /* The per-thread execution timer is NOT disarmed here any more. The timer
+     * is wall-clock (CLOCK_BOOTTIME), so it must not stay armed through an
+     * idle wait of unbounded length — but the Rust dispatch loop disarms it
+     * (ephpm_worker_exec_timer_idle) at the moment the worker actually parks.
+     * When the next job is already queued or arrives during the bounded spin,
+     * the re-arm below replaces the still-running countdown in place, so a
+     * saturated worker pays one timer_settime per request instead of two. */
 
     EphpmWorkerRequest req;
     memset(&req, 0, sizeof(req));
@@ -2876,6 +2948,16 @@ PHP_FUNCTION(ephpm_worker_take_request)
     if (!have) {
         /* Graceful shutdown — worker.php's while-loop ends, ephpm_worker_run
          * returns, the pool respawns or drains. */
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+        /* The loop is ending without a new request (drain, max_requests
+         * recycle, or the dispatch was closed before the worker ever parked):
+         * the previous request's countdown may still be running. Disarm it so
+         * the framework's post-loop shutdown is not time-limited — the same
+         * state the boot-once section runs in (ephpm_worker_run) and the state
+         * the old unconditional idle disarm left. zend_unset_timeout also
+         * clears EG(timed_out) in case that countdown already expired. */
+        zend_unset_timeout();
+#endif
         RETURN_NULL();
     }
 
@@ -2894,7 +2976,9 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * during this request still re-arms live on top of this baseline.
      * ephpm_arm_exec_timer() also mirrors the value back into the ini entry, so
      * a prior request's set_time_limit(0) does not leave ini_get() reporting 0
-     * on this fresh request either (#279). */
+     * on this fresh request either (#279). The arm replaces any countdown the
+     * previous request left running (no idle disarm happened if this worker
+     * did not park), so nothing from that request carries over. */
     ephpm_arm_exec_timer();
 #endif
 
