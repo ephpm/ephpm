@@ -3915,10 +3915,21 @@ pub struct PhpConfig {
     /// Each entry is either a bare extension name (`"redis"`, `"imagick"`)
     /// or an absolute/relative path to a shared object. Bare names are
     /// emitted as `extension=<name>` so PHP's own `extension_dir` search
-    /// resolves them; paths are emitted as `extension=<path>` verbatim.
-    /// The lines are written into the generated php.ini *before* `ini_file`
-    /// and `ini_overrides`, so those can still tune the extension's own ini
-    /// settings.
+    /// resolves them; paths are emitted as `extension=<path>` verbatim
+    /// (double-quoted, with `\`, `"` and `$` escaped, so PHP reads the path
+    /// back literally). The lines are written into the generated php.ini
+    /// *before* `ini_file` and `ini_overrides`, so those can still tune the
+    /// extension's own ini settings.
+    ///
+    /// **Zend extensions** (Xdebug, OPcache-style libraries that export
+    /// `zend_extension_entry` and `extension_version_info`) are detected by
+    /// inspecting the shared object
+    /// and emitted as `zend_extension=` instead of `extension=`; a relative
+    /// path is made absolute against the working directory, because PHP
+    /// resolves a relative `zend_extension` against `extension_dir`. A bare
+    /// name is inspected only when `extension_dir` is known (an
+    /// `ini_overrides` entry, else the compiled-in default); otherwise it is
+    /// emitted as `extension=`.
     ///
     /// The extension binary must match the embedded PHP's ABI: same PHP
     /// minor version, ZTS thread-safety mode (every ePHPm platform is ZTS,

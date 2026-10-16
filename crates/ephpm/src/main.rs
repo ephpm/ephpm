@@ -38,7 +38,9 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod dev_xdebug;
 mod exec_sandbox;
+mod ext_ini;
 mod fatal_signal;
 mod service;
 mod site_db;
@@ -99,6 +101,9 @@ enum Commands {
         /// Increase log verbosity (-v = debug, -vv = trace)
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
+
+        #[command(flatten)]
+        xdebug: dev_xdebug::XdebugArgs,
     },
 
     /// Statically analyze a PHP application and gate on the verdict
@@ -555,13 +560,13 @@ fn run() -> anyhow::Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
                 .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))
         }
-        Some(Commands::Dev { listen, document_root, port, sites, verbose }) => {
-            run_dev(listen, document_root, port, sites, verbose)
+        Some(Commands::Dev { listen, document_root, port, sites, verbose, xdebug }) => {
+            run_dev(listen, document_root, port, sites, verbose, &xdebug)
         }
         // Bare `ephpm` (no subcommand) is the dev-mode entry point. Service
         // backends always invoke the binary with explicit `serve --config`
         // arguments, so this default never executes under SCM/systemd/launchd.
-        None => run_dev(None, None, 8080, None, 0),
+        None => run_dev(None, None, 8080, None, 0, &dev_xdebug::XdebugArgs::default()),
         other @ Some(Commands::Serve { .. }) => run_serve_sync(other),
     }
 }
@@ -739,12 +744,16 @@ pub(crate) fn run_serve_with_config(config: PathBuf) -> anyhow::Result<()> {
 /// - Prints a banner with the URL and PHP runtime status
 /// - Ignores any `ephpm.toml` in CWD — dev mode is intentionally
 ///   configuration-free so that `cd && ephpm` "just works"
+/// - `--xdebug` / `--xdebug-path` load Xdebug for step debugging (see
+///   [`dev_xdebug`]); the library is resolved here, before PHP starts, and
+///   verified right after PHP starts
 fn run_dev(
     listen: Option<String>,
     document_root: Option<PathBuf>,
     port: u16,
     sites: Option<PathBuf>,
     verbose: u8,
+    xdebug: &dev_xdebug::XdebugArgs,
 ) -> anyhow::Result<ExitCode> {
     let mut config = ephpm_config::Config::default_config()
         .context("failed to build default dev-mode configuration")?;
@@ -774,6 +783,11 @@ fn run_dev(
         config.server.sites_domain_suffix = Some(".localhost".into());
     }
     config.resolve_relative_roots(&cwd);
+
+    // Resolve + wire Xdebug (no-op without --xdebug). Needs the final listen
+    // address for its banner, and must finish — network client included —
+    // before PHP initializes.
+    dev_xdebug::prepare(xdebug, &mut config)?;
 
     print_dev_banner(&config);
     run_with_config(config, verbose, true)
@@ -1747,11 +1761,33 @@ fn run_with_config(
             // ini_file/ini_overrides, so any extension ini settings that
             // follow apply to an already-declared extension. A bare name
             // rides PHP's extension_dir search (`extension=redis`); a path
-            // loads verbatim (`extension=/path/to/imagick.so`). ABI
-            // mismatches (PHP minor / ZTS / libc) are rejected by PHP at
-            // startup with an explicit API-version error.
-            for ext in &config.php.extensions {
-                let _ = writeln!(content, "extension={ext}");
+            // loads verbatim (`extension=/path/to/imagick.so`). A library
+            // that exports `zend_extension_entry` (Xdebug, OPcache-style) is
+            // emitted as `zend_extension=` instead — with an absolute path,
+            // since PHP resolves a relative zend_extension against
+            // extension_dir (see `ext_ini`). ABI mismatches (PHP minor / ZTS
+            // / libc) are rejected by PHP at startup with an explicit
+            // API-version error.
+            if !config.php.extensions.is_empty() {
+                let cwd = std::env::current_dir().context("failed to read current directory")?;
+                let abi = ephpm_php::PhpRuntime::abi();
+                let ext_dir = ext_ini::effective_extension_dir(
+                    &config.php.ini_overrides,
+                    abi.as_ref().and_then(|a| a.default_extension_dir.as_deref()),
+                );
+                for ext in &config.php.extensions {
+                    let line = ext_ini::resolve_extension_line(ext, &cwd, ext_dir.as_deref());
+                    let ini_line = line.ini_line()?;
+                    if line.directive == ext_ini::LoadDirective::ZendExtension {
+                        tracing::info!(
+                            entry = %ext,
+                            line = %ini_line,
+                            "[php] extensions: loading as a Zend extension (exports \
+                             zend_extension_entry)"
+                        );
+                    }
+                    let _ = writeln!(content, "{ini_line}");
+                }
             }
             if let Some(base) = &config.php.ini_file {
                 let base_content = std::fs::read_to_string(base).with_context(|| {
@@ -1931,6 +1967,9 @@ fn run_with_config(
         .context("failed to initialize PHP runtime")?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
+    // `ephpm dev --xdebug`: prove Xdebug registered as a Zend extension (PHP
+    // only warns on a failed load) and print its banner. No-op otherwise.
+    dev_xdebug::verify_after_init()?;
     // Arm value for PHP's per-thread execution timer. The request paths call
     // zend_set_timeout() with this each request because the embed SAPI zeroes
     // the max_execution_time ini entry at runtime. No-op on builds without

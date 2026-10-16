@@ -1464,14 +1464,20 @@ dependencies = [
  "ephpm-kv",
  "ephpm-php",
  "ephpm-server",
+ "flate2",
  "landlock",
  "libc 0.2.189",
  "libmimalloc-sys",
  "litewire",
  "mimalloc",
  "mysql_async",
+ "object 0.37.3",
  "reqwest",
+ "rustls",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1479,6 +1485,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "vivacity",
+ "webpki-roots 0.26.11",
  "windows-service",
  "windows-sys 0.59.0",
 ]
@@ -3507,6 +3514,9 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
+ "crc32fast",
+ "hashbrown 0.15.5",
+ "indexmap",
  "memchr",
 ]
 

@@ -5,8 +5,9 @@
 #    the `(built: ...)` timestamp, are build facts, not CLI behavior.
 #  - strip-zts-marker: the embedded Linux libphp is ZTS, distro cli is NTS —
 #    a permanent build-flavor difference (see CLAUDE.md, PHP threading).
-#  - strip-distro-banner: distro builds append "with Zend OPcache ..." and
-#    "Built by Ubuntu" lines; the embedded build prints neither. Packaging
+#  - strip-distro-banner: drops the "with Zend OPcache ..." line (both sides
+#    print it when OPcache is registered; whether it is depends on the
+#    build's ini) and the distro-only "Built by Ubuntu" line. Packaging
 #    facts, not CLI behavior.
 # What the case still proves: the 3-line banner SHAPE (PHP line, copyright
 # line, Zend Engine line) and exit 0 match.

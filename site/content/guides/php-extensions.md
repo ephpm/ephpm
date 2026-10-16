@@ -117,17 +117,40 @@ startup (MINIT) exactly as vanilla PHP would:
   `extension=/opt/exts/mongodb.so` and is loaded verbatim. Explicit paths
   are the most robust option.
 
-Because the `extension=` lines precede `ini_file`/`ini_overrides` in the
+- A **Zend extension** — a library that exports `zend_extension_entry`,
+  such as Xdebug — must be loaded with `zend_extension=`, not
+  `extension=`. ePHPm inspects each entry's shared object and emits
+  `zend_extension=` when it exports both `zend_extension_entry` and
+  `extension_version_info` (logged at startup). To load such a library
+  with `extension=` anyway, leave it out of `extensions` and write the line
+  yourself in `ini_overrides`. A
+  relative path is made **absolute** against the working directory, because
+  PHP resolves a relative `zend_extension` against `extension_dir`, not the
+  current directory. A bare name is inspected only when `extension_dir` is
+  known (an `extension_dir` entry in `ini_overrides`, else the compiled-in
+  default); if the file cannot be found there it is emitted as
+  `extension=`, so prefer an explicit path for Zend extensions:
+
+  ```toml
+  [php]
+  extensions = ["/opt/ephpm-ext/xdebug.so"]   # → zend_extension=/opt/ephpm-ext/xdebug.so
+  ```
+
+  For step debugging there is a shortcut: `ephpm dev --xdebug` — see
+  [Debugging with Xdebug](/guides/xdebug/).
+
+Because the load lines precede `ini_file`/`ini_overrides` in the
 generated ini, you can configure an extension's own ini settings in the
 same config file.
 
 ### Zend extensions (Xdebug, PCOV, profilers)
 
-`[php] extensions` only writes `extension=` lines. **Zend extensions** —
-Xdebug, PCOV, and loaders/profilers such as ionCube and Blackfire's probe —
-must be loaded with `zend_extension=` instead; PHP refuses a Zend extension
-given to `extension=` ("appears to be a Zend Extension"). Load them through
-`ini_overrides`, with an **absolute path**:
+**Zend extensions** — Xdebug, PCOV, and loaders/profilers such as ionCube
+and Blackfire's probe — must be loaded with `zend_extension=`; PHP refuses a
+Zend extension given to `extension=` ("appears to be a Zend Extension").
+Listing one in `[php] extensions` by path does that for you (see above).
+You can also write the line yourself through `ini_overrides`, with an
+**absolute path**:
 
 ```toml
 [php]
@@ -138,12 +161,15 @@ ini_overrides = [
 ]
 ```
 
-This has been verified with Xdebug on a Linux release build (v0.11.2). Use
-an absolute path: a bare name relies on `extension_dir`, which defaults to a
-baked-in placeholder (see above). The same ABI contract applies: the `.so`
-must be a ZTS build for the matching PHP minor. For one-off CLI use,
+There a bare name or relative path is resolved against `extension_dir`,
+which defaults to a baked-in placeholder (see above), so it fails to load.
+The same ABI contract applies: the `.so` must be a ZTS build for the
+matching PHP minor. For one-off CLI use,
 `ephpm php -d zend_extension=/path/to/xdebug.so` works too (see
 [`ephpm php`](/reference/cli/php/)).
+
+For step debugging — `ephpm dev --xdebug`, IDE setup, and how debugging
+works in worker mode — see [Debugging with Xdebug](/guides/xdebug/).
 
 An **empty string** entry fails validation at startup (it could never
 load anything, and PHP would silently ignore it). A `.so` that doesn't
@@ -262,4 +288,6 @@ the faulting `.so` and function before it dies — see
   `get_loaded_extensions()` today).
 - **Catalog expansion + Windows/macOS catalog variants** — today the
   catalog covers the common Linux set (igbinary, msgpack, apcu, redis,
-  mongodb); more extensions and per-OS variants are planned.
+  mongodb, xdebug); more extensions and a Windows variant are planned. macOS
+  arm64 tarballs (`ephpm-ext-<php>-macos-aarch64.tar.gz`) are published for
+  the current 8.3, 8.4 and 8.5 releases and used by `ephpm dev --xdebug`.

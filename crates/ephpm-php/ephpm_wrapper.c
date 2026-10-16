@@ -6504,6 +6504,95 @@ const char *ephpm_get_php_version(void)
     return PHP_VERSION;
 }
 
+/* ===================================================================
+ * Build/ABI identity + loaded-extension lookups
+ *
+ * Used by `ephpm dev --xdebug` to pick an ABI-matched Xdebug build from the
+ * php-sdk extension catalog (api number, ZTS) and to prove after startup that
+ * the Zend extension actually loaded. The first three are compile-time
+ * constants and are safe before php_embed_init(). The two lookups read the
+ * process-global module_registry / zend_extensions list (populated during
+ * php_embed_init(), not per-TSRM-thread), are plain list/hash walks with no
+ * bailout path, and therefore need no zend_try guard.
+ * =================================================================== */
+
+/* PHP_EXTENSION_DIR (the compiled-in default extension_dir) lives in
+ * build-defs.h on Unix builds, which php.h does not pull in. Windows defines
+ * it in config.w32.h (already included via php_config.h). */
+#if !defined(PHP_WIN32) && defined(__has_include)
+# if __has_include("main/build-defs.h")
+#  include "main/build-defs.h"
+# endif
+#endif
+
+/* ZEND_MODULE_API_NO the linked libphp was built with (e.g. 20250925). */
+unsigned long ephpm_zend_module_api_no(void)
+{
+    return (unsigned long)ZEND_MODULE_API_NO;
+}
+
+/* 1 on a ZTS build, 0 on NTS. */
+int ephpm_is_zts(void)
+{
+#ifdef ZTS
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* The compiled-in default extension_dir, or NULL if the headers do not say. */
+const char *ephpm_default_extension_dir(void)
+{
+#ifdef PHP_EXTENSION_DIR
+    return PHP_EXTENSION_DIR;
+#else
+    return NULL;
+#endif
+}
+
+/*
+ * Version of a loaded PHP module by lower-case registry name ("xdebug"), ""
+ * when the module declares no version, NULL when it is not loaded. The
+ * pointer borrows the module entry's static string (valid until module
+ * shutdown).
+ */
+const char *ephpm_loaded_module_version(const char *lcname)
+{
+    if (!lcname) {
+        return NULL;
+    }
+    zend_module_entry *module =
+        zend_hash_str_find_ptr(&module_registry, lcname, strlen(lcname));
+    if (!module) {
+        return NULL;
+    }
+    return module->version ? module->version : "";
+}
+
+/*
+ * Version of a loaded Zend extension by name, compared case-insensitively
+ * ("xdebug" finds Xdebug's "Xdebug"); "" when it declares none, NULL when no
+ * such Zend extension is registered. Unlike ephpm_loaded_module_version this
+ * proves the library went through zend_extension= (zend_load_extension), not
+ * merely extension= — Xdebug refuses to work when loaded the latter way.
+ */
+const char *ephpm_zend_extension_version(const char *name)
+{
+    if (!name) {
+        return NULL;
+    }
+    size_t name_len = strlen(name);
+    for (zend_llist_element *el = zend_extensions.head; el; el = el->next) {
+        zend_extension *ext = (zend_extension *)el->data;
+        if (ext && ext->name
+                && zend_binary_strcasecmp(ext->name, strlen(ext->name), name, name_len) == 0) {
+            return ext->version ? ext->version : "";
+        }
+    }
+    return NULL;
+}
+
 /*
  * Helper: switch to CLI-mode output (stdout).
  * Saves the current ub_write and swaps in stdout mode. Also sets
@@ -7343,17 +7432,25 @@ int ephpm_cli_main(int argc, char **argv)
             sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
             /* Match stock php-cli's shape: `PHP x.y.z (cli) (built: …) (NTS)`.
              * The SAPI token is "cli" in `ephpm php` (g_cli_mode) so scripts
-             * and tooling that scrape `php -v` see the CLI they expect. */
+             * and tooling that scrape `php -v` see the CLI they expect.
+             *
+             * The engine block comes from get_zend_version(), exactly as
+             * php-cli prints it: "Zend Engine vX.Y.Z, Copyright ..." followed
+             * by one "    with <ext> v..." line per loaded Zend extension
+             * (zend_append_version_info, called when OPcache/Xdebug register).
+             * Formatting ZEND_VERSION by hand here dropped those lines, so
+             * `ephpm php -d zend_extension=xdebug.so -v` never said
+             * "with Xdebug v3.x" even though Xdebug was loaded. */
             php_printf("PHP %s (%s) (built: %s %s) (%s)\n"
                        "Copyright (c) The PHP Group\n"
-                       "Zend Engine v%s, Copyright (c) Zend Technologies\n",
+                       "%s",
                        PHP_VERSION, EPHPM_SAPI_NAME, __DATE__, __TIME__,
 #ifdef ZTS
                        "ZTS",
 #else
                        "NTS",
 #endif
-                       ZEND_VERSION);
+                       get_zend_version());
             fflush(stdout);
             return 0;
 
