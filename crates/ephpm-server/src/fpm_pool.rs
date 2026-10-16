@@ -112,7 +112,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ephpm_config::AdmissionPolicy;
-use ephpm_php::handoff::{Dispatcher, TryPushError};
+use ephpm_php::handoff::{Dispatcher, SpinPolicy, TryPushError};
 use ephpm_php::response::PhpResponse;
 use ephpm_php::{PhpError, PhpRuntime};
 use metrics::{counter, gauge};
@@ -134,6 +134,14 @@ pub type FpmTask = Box<dyn FnOnce() -> FpmExecOutput + Send + 'static>;
 /// with no request attached — invisible to the request timeout, which has
 /// already answered the client — so it gets a line of its own.
 const SLOW_FINISH: Duration = Duration::from_secs(5);
+
+/// The per-request pool's idle spin policy: park at once unless the
+/// environment overrides it (see [`SpinPolicy::fpm_from_env`]). Read once per
+/// process.
+fn fpm_dispatch_spin() -> SpinPolicy {
+    static POLICY: std::sync::OnceLock<SpinPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| SpinPolicy::fpm_from_env(Duration::ZERO))
+}
 
 thread_local! {
     /// Per-request scope parked by [`hold_until_finished`] on this pool
@@ -670,10 +678,11 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize) {
 
     let mut exit = ThreadExit::Drain;
     loop {
-        // Park straight away when idle (no spin-poll): a per-request job costs
-        // milliseconds, so the wake latency a poll would save is noise here,
-        // and an idle per-request pool should not burn CPU.
-        let job = match mailbox.recv(Duration::ZERO) {
+        // Park straight away when idle (no spin-poll) by default: a
+        // per-request job costs milliseconds, so the wake latency a poll would
+        // save is noise here, and an idle per-request pool should not burn
+        // CPU. `EPHPM_FPM_DISPATCH_SPIN_US` overrides it for experiments.
+        let job = match mailbox.recv_with(fpm_dispatch_spin()) {
             Ok(job) => job,
             // Dispatch closed — graceful drain. Exit the loop cleanly.
             Err(_) => break,
