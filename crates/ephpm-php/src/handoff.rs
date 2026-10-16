@@ -145,16 +145,19 @@ impl SpinPolicy {
         Self { budget, pure_spins: DEFAULT_PURE_SPINS, adaptive: false }
     }
 
-    /// The worker-mode pool's policy: `default_budget` unless overridden by
-    /// `EPHPM_DISPATCH_SPIN_US`, `EPHPM_DISPATCH_SPIN_PURE` and
-    /// `EPHPM_DISPATCH_SPIN_ADAPTIVE`. These are experiment knobs, not
-    /// configuration: read once at startup, and an unparseable value is
-    /// warned about and ignored.
+    /// The worker-mode pool's policy: an adaptive budget capped at
+    /// `default_budget` unless overridden by `EPHPM_DISPATCH_SPIN_US`,
+    /// `EPHPM_DISPATCH_SPIN_PURE` and `EPHPM_DISPATCH_SPIN_ADAPTIVE`. These
+    /// are experiment knobs, not configuration: read once at startup, and an
+    /// unparseable value is warned about and ignored.
+    ///
+    /// Adaptive is the default because it matched a fixed budget at
+    /// saturation while spending 18-19% less CPU per request at 1k-5k req/s.
     #[must_use]
     pub fn worker_from_env(default_budget: Duration) -> Self {
         Self::from_vars(
             "worker",
-            default_budget,
+            Self { adaptive: true, ..Self::fixed(default_budget) },
             std::env::var("EPHPM_DISPATCH_SPIN_US").ok().as_deref(),
             std::env::var("EPHPM_DISPATCH_SPIN_PURE").ok().as_deref(),
             std::env::var("EPHPM_DISPATCH_SPIN_ADAPTIVE").ok().as_deref(),
@@ -168,22 +171,22 @@ impl SpinPolicy {
     pub fn fpm_from_env(default_budget: Duration) -> Self {
         Self::from_vars(
             "per_request",
-            default_budget,
+            Self::fixed(default_budget),
             std::env::var("EPHPM_FPM_DISPATCH_SPIN_US").ok().as_deref(),
             std::env::var("EPHPM_DISPATCH_SPIN_PURE").ok().as_deref(),
             std::env::var("EPHPM_DISPATCH_SPIN_ADAPTIVE").ok().as_deref(),
         )
     }
 
-    /// Build a policy from the raw variable values (`None` = unset).
+    /// Override `default` with the raw variable values (`None` = unset).
     fn from_vars(
         pool: &str,
-        default_budget: Duration,
+        default: Self,
         budget_us: Option<&str>,
         pure_spins: Option<&str>,
         adaptive: Option<&str>,
     ) -> Self {
-        let mut policy = Self::fixed(default_budget);
+        let mut policy = default;
         let overridden = budget_us.is_some() || pure_spins.is_some() || adaptive.is_some();
         if let Some(raw) = budget_us {
             match raw.trim().parse::<u64>() {
@@ -1514,8 +1517,8 @@ mod tests {
 
     #[test]
     fn spin_policy_from_vars() {
-        let def = us(200);
-        assert_eq!(SpinPolicy::from_vars("t", def, None, None, None), SpinPolicy::fixed(def));
+        let def = SpinPolicy::fixed(us(200));
+        assert_eq!(SpinPolicy::from_vars("t", def, None, None, None), def);
         assert_eq!(
             SpinPolicy::from_vars("t", def, Some("0"), None, None),
             SpinPolicy::PARK,
@@ -1530,10 +1533,11 @@ mod tests {
             SpinPolicy { budget: us(7), pure_spins: 0, adaptive: false }
         );
         // Garbage is ignored, keeping the default.
-        assert_eq!(
-            SpinPolicy::from_vars("t", def, Some("50us"), Some("-1"), Some("maybe")),
-            SpinPolicy::fixed(def)
-        );
+        assert_eq!(SpinPolicy::from_vars("t", def, Some("50us"), Some("-1"), Some("maybe")), def);
+        // An adaptive default (the worker pool's) can be switched off.
+        let adaptive = SpinPolicy { adaptive: true, ..def };
+        assert_eq!(SpinPolicy::from_vars("t", adaptive, None, None, None), adaptive);
+        assert_eq!(SpinPolicy::from_vars("t", adaptive, None, None, Some("0")), def);
     }
 
     /// On-CPU time of the calling thread, in nanoseconds (Linux schedstat).

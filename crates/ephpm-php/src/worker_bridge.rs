@@ -704,18 +704,18 @@ thread_local! {
 /// 200 µs was chosen by measurement (Yii3 `/`, 20 workers, 32 vCPUs): it
 /// raised saturated throughput ~4% over parking immediately, more than 50 µs
 /// did. Most of the poll yields the CPU rather than burning it — but on an
-/// idle host `sched_yield` returns at once, so each request that leaves its
-/// worker idle costs up to this much CPU before the park. Under a tight cgroup
-/// CPU quota at low request rates that is the price of the lower wake latency
-/// under load.
+/// idle host `sched_yield` returns at once, so a fixed budget would cost up to
+/// this much CPU each time a request leaves its worker idle. The default
+/// policy is therefore adaptive with this as its ceiling: a thread whose waits
+/// outlast the budget shrinks it, which removes that low-rate cost (18-19%
+/// less CPU per request at 1k-5k req/s, unchanged at saturation).
 ///
-/// This is the default. [`dispatch_spin`] lets the `EPHPM_DISPATCH_SPIN_*`
-/// experiment variables override it (and turn on adaptive budgets, which
-/// remove that low-rate cost) without a rebuild.
+/// [`dispatch_spin`] lets the `EPHPM_DISPATCH_SPIN_*` experiment variables
+/// override it without a rebuild.
 #[cfg_attr(not(php_linked), allow(dead_code))]
 const DISPATCH_SPIN: std::time::Duration = std::time::Duration::from_micros(200);
 
-/// The worker pool's spin policy: [`DISPATCH_SPIN`] unless the environment
+/// The worker pool's spin policy: adaptive up to [`DISPATCH_SPIN`] unless the environment
 /// overrides it (see
 /// [`SpinPolicy::worker_from_env`](crate::handoff::SpinPolicy::worker_from_env)).
 /// Read once per process.
