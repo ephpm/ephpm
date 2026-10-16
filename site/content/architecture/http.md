@@ -458,6 +458,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.document_root` | path | `"."` | Document root directory |
 | `server.index_files` | string[] | `["index.php", "index.html"]` | Index file names |
 | `server.fallback` | string[] | `["$uri", "$uri/", "/index.php?$query_string"]` | URL resolution chain |
+| `server.io_threads` | int | `0` | Tokio async worker threads (`0` = tokio default: `TOKIO_WORKER_THREADS`, else logical CPUs). Does not size PHP execution. |
 | `server.request.max_body_size` | int | `10485760` (10 MiB) | Max request body (0=unlimited) |
 | `server.request.max_header_size` | int | `8192` (8 KiB) | Max header buffer size |
 | `server.timeouts.header_read` | int | `30` | Seconds to receive headers |
@@ -537,7 +538,6 @@ Rate limiting (`[server.limits]`), Prometheus metrics (`[server.metrics]`), and 
 | `server.static.index_fallback` | Serve `index.html` for SPA routes (distinct from PHP fallback) | Medium |
 | `server.response.server_header` | Custom or disabled `Server:` header (fingerprinting prevention) | Low |
 | `server.request.max_uri_length` | Reject abnormally long URIs (defense in depth) | Low |
-| `server.worker_threads` | Tokio worker thread count (auto-detect by default) | Low |
 | `server.rewrites` | Regex-based URL rewriting | Low |
 | `server.logging.format` | Text vs JSON structured logging | Low |
 | `server.logging.access_format` | Common/combined access log format | Low |

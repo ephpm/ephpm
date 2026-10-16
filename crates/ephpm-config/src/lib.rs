@@ -634,6 +634,27 @@ pub struct ServerConfig {
     #[serde(default)]
     pub preview: bool,
 
+    /// Number of async I/O threads — the tokio runtime's worker threads, which
+    /// accept connections, parse HTTP, run middleware and serve static files.
+    ///
+    /// This does **not** size PHP execution: PHP runs on ePHPm's own dedicated
+    /// pool sized by `[php] concurrency`, and blocking work (file I/O) runs on
+    /// tokio's separate blocking pool, which this knob leaves alone. Lowering
+    /// it trades HTTP-side parallelism for fewer runnable threads competing
+    /// with PHP for CPU.
+    ///
+    /// `0` (**default**) keeps tokio's own choice: the `TOKIO_WORKER_THREADS`
+    /// environment variable when set, otherwise the host's available
+    /// parallelism (logical CPUs, cgroup- and affinity-aware). A non-zero value
+    /// is used as-is and takes precedence over `TOKIO_WORKER_THREADS`. Startup
+    /// logs the effective value and its source at INFO.
+    ///
+    /// Env override: `EPHPM_SERVER__IO_THREADS=8`.
+    ///
+    /// Default: `0` (tokio default).
+    #[serde(default)]
+    pub io_threads: usize,
+
     /// Request limits.
     #[serde(default)]
     pub request: RequestConfig,
@@ -5018,6 +5039,7 @@ impl Default for ServerConfig {
             websocket_files: default_websocket_files(),
             fallback: default_fallback(),
             preview: false,
+            io_threads: 0,
             request: RequestConfig::default(),
             timeouts: TimeoutsConfig::default(),
             response: ResponseConfig::default(),
@@ -11439,6 +11461,18 @@ debug_workers = 3
         assert!(config.php.worker.populate_superglobals);
         assert_eq!(config.php.worker.stream_threshold, 262_144);
         assert_eq!(config.php.worker.debug_workers, 3);
+    }
+
+    #[test]
+    fn server_io_threads_defaults_to_zero_and_parses() {
+        // 0 = keep tokio's own default; absent section and absent key agree.
+        assert_eq!(Config::default().server.io_threads, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"127.0.0.1:8080\"\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().server.io_threads, 0);
+        std::fs::write(&file, "[server]\nio_threads = 6\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().server.io_threads, 6);
     }
 
     #[test]
