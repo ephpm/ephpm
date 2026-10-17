@@ -75,9 +75,9 @@ Two honest caveats:
   `String`, so cells holding invalid UTF-8 may not survive the round trip.
   This is an upstream Turso limitation.
 
-## Turso 0.7.2 → 0.8.2 (the release after v0.11.3)
+## Turso 0.7.2 → 0.8.2 (v0.12.0)
 
-The release after v0.11.3 moves the embedded engine from Turso 0.7.2 to
+v0.12.0 moves the embedded engine from Turso 0.7.2 to
 0.8.2 ([ephpm#535](https://github.com/ephpm/ephpm/issues/535)). **No
 dump/reload is needed, and you can roll back.** The file format did not
 change, and neither did the CDC log schema: `turso_cdc` keeps its columns and
