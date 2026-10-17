@@ -488,7 +488,17 @@ turso = { version = "=0.8.2", default-features = false }
 # `remove` over to real Composer when an installed plugin changes resolution.
 # All keep byte-identical output. The only linking-side delta across the range
 # is memchr → 2.8.3 (pure Rust, no C symbols); no version adds a new C dep.
-vivacity = { version = "=0.17.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# 0.18–0.21: `update --with` / `a/b:^1` temporary constraints, and
+# symfony/flex + composer/package-versions-deprecated emulated at install (0.18);
+# `install --prefer-dist/--prefer-source/--prefer-install` and `--no-progress`
+# accepted (0.19); transport failures exit 100 with Composer's retry policy,
+# hardened dist extraction (symlink-chain escape, decompressed-size limit,
+# Windows reserved names) (0.19.1/0.20); Composer's global -n/-q/-v/--no-ansi
+# accepted on every command (0.21, Adelagric/vivacity#7), so the usual CI line
+# `composer install --no-dev --no-interaction --prefer-dist -o` runs.
+# vivacity-core 0.21.0 still pins `zip =2.4.2`; see the RUSTSEC ignores in
+# deny.toml.
+vivacity = { version = "=0.21.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

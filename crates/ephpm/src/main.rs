@@ -207,7 +207,9 @@ enum Commands {
     /// `dump-autoload` need no PHP, so they work in every build, including
     /// stub mode, and on Windows. `update`, `require` and `remove` run an
     /// external `php` (`VIVACITY_PHP` or `php` on `PATH`) to probe platform
-    /// requirements. The process exits with vivacity's exit code.
+    /// requirements. `-vv`/`-vvv`, and `-v` on a project with an active
+    /// plugin, hand the whole command to a real `composer` (exit 3 without
+    /// one). The process exits with vivacity's exit code.
     ///
     /// Examples: `ephpm composer install --no-dev --optimize-autoloader`,
     /// `ephpm composer dump-autoload -o`, `ephpm composer --version`.
