@@ -2809,20 +2809,11 @@ async fn start_per_site_wire(
     // Validate before spawning. `LiteWire::mysql` does `addr.parse().ok()`, so
     // a typo becomes a listener that never exists and a "no frontends
     // configured" error buried in a detached task.
-    let addr: std::net::SocketAddr = proxy.mysql_listen.parse().with_context(|| {
-        format!(
-            "[db.sqlite.proxy] mysql_listen is not a valid socket address: {:?}. In multi-site \
-             mode this is the endpoint every tenant's pdo_mysql connects to.",
-            proxy.mysql_listen
-        )
-    })?;
-    // Probe the bind so a busy port fails startup rather than at first query.
-    // Dropped immediately; litewire binds it for real a moment later. The
-    // window between the two is a race in theory, but the failure it catches
-    // (a port already owned by another process for the whole run) is not.
-    drop(tokio::net::TcpListener::bind(addr).await.with_context(|| {
-        format!("failed to bind the multi-tenant MySQL wire listener on {addr}")
-    })?);
+    // In multi-site mode this is the endpoint every tenant's pdo_mysql connects
+    // to; the other frontends are not started (below), so only it is probed.
+    probe_sqlite_listeners(&[("[db.sqlite.proxy] mysql_listen", &proxy.mysql_listen)])
+        .await
+        .context("cannot start the multi-tenant MySQL wire listener")?;
 
     if proxy.hrana_listen.is_some() || proxy.postgres_listen.is_some() || proxy.tds_listen.is_some()
     {
@@ -2860,6 +2851,68 @@ async fn start_per_site_wire(
     Ok(proxy.mysql_listen.clone())
 }
 
+/// Every wire frontend `[db.sqlite.proxy]` configures for the shared-backend
+/// (single-node / whole-database clustered) paths, as `(config key, address)`
+/// pairs: `mysql_listen` always, plus each optional frontend that is set.
+pub(crate) fn sqlite_frontend_addrs(
+    proxy: &ephpm_config::SqliteProxyConfig,
+) -> Vec<(&'static str, &str)> {
+    let mut addrs = vec![("[db.sqlite.proxy] mysql_listen", proxy.mysql_listen.as_str())];
+    for (key, addr) in [
+        ("[db.sqlite.proxy] hrana_listen", &proxy.hrana_listen),
+        ("[db.sqlite.proxy] postgres_listen", &proxy.postgres_listen),
+        ("[db.sqlite.proxy] tds_listen", &proxy.tds_listen),
+    ] {
+        if let Some(addr) = addr {
+            addrs.push((key, addr.as_str()));
+        }
+    }
+    addrs
+}
+
+/// Parse and probe-bind the embedded database's wire listeners, so a listener
+/// that cannot exist fails **startup** with an error naming its key and
+/// address.
+///
+/// # Why a probe
+///
+/// litewire's builder takes addresses as strings and binds inside
+/// `LiteWire::serve()`, which ePHPm runs in a spawned task. Without this, an
+/// unparseable address is silently dropped (`addr.parse().ok()` — no frontend
+/// at all), and a port already in use surfaces only as one ERROR line from that
+/// detached task while the server keeps serving HTTP with no database behind
+/// `pdo_mysql`: every query fails with connection-refused at runtime, and every
+/// health check is green. Refusing to start is the same contract the DB proxies
+/// (`[db.mysql]` / `[db.postgres]`) already have.
+///
+/// All probe sockets are held until every address has bound, so two frontends
+/// configured on the same address are caught too. They are then dropped and
+/// litewire binds the addresses for real a moment later. The window between
+/// the two is a race in theory, but the failure this catches — a port owned by
+/// another process (or another ePHPm) for the whole run — is not.
+///
+/// # Errors
+///
+/// Fails on the first address that does not parse as a socket address or
+/// cannot be bound.
+pub(crate) async fn probe_sqlite_listeners(frontends: &[(&str, &str)]) -> anyhow::Result<()> {
+    let mut held = Vec::with_capacity(frontends.len());
+    for &(key, addr) in frontends {
+        let sock: std::net::SocketAddr = addr
+            .parse()
+            .with_context(|| format!("{key} is not a valid socket address: {addr:?}"))?;
+        let listener = TcpListener::bind(sock).await.with_context(|| {
+            format!(
+                "failed to bind the embedded database listener {key} on {sock} — is another \
+                 process (or another ephpm instance) already listening there?"
+            )
+        })?;
+        held.push(listener);
+    }
+    drop(held);
+    Ok(())
+}
+
 /// Start single-node SQLite via the in-process Turso engine.
 ///
 /// As of v0.7.0 Turso is the only embedded SQLite-family engine
@@ -2867,11 +2920,19 @@ async fn start_per_site_wire(
 /// factory — one `turso::Database` per file, a `turso::Connection` per
 /// session — so there is no `sqlite3_open`-per-connect cost and no
 /// handle-reuse pool to tune.
+///
+/// # Errors
+///
+/// Fails if a wire listener cannot be bound (see [`probe_sqlite_listeners`])
+/// or the database file cannot be opened.
 async fn start_single_node_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
+    probe_sqlite_listeners(&sqlite_frontend_addrs(&sqlite_config.proxy))
+        .await
+        .context("cannot start the embedded database's wire listeners")?;
     let db_path = &sqlite_config.path;
     let backend = litewire::Turso::open(db_path)
         .await
@@ -3769,6 +3830,92 @@ mod lib_tests {
         assert_eq!(
             handle_accept_error(&err, "HTTP"),
             Some(Duration::from_millis(ACCEPT_BACKOFF_MS))
+        );
+    }
+
+    /// An embedded-database wire listener whose port is taken must stop
+    /// startup with an error naming the key and the address — it used to log
+    /// one `litewire error` from a detached task and keep serving HTTP with no
+    /// database behind `pdo_mysql`.
+    #[tokio::test]
+    async fn sqlite_listener_bind_failure_is_fatal_and_names_the_address() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.expect("occupy a port");
+        let addr = occupied.local_addr().expect("addr").to_string();
+
+        let err = probe_sqlite_listeners(&[("[db.sqlite.proxy] mysql_listen", &addr)])
+            .await
+            .expect_err("an occupied port must fail the probe");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[db.sqlite.proxy] mysql_listen"), "must name the key: {msg}");
+        assert!(msg.contains(&addr), "must name the address: {msg}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_listener_probe_rejects_unparseable_and_duplicate_addresses() {
+        let err = probe_sqlite_listeners(&[("[db.sqlite.proxy] hrana_listen", "localhost:8080")])
+            .await
+            .expect_err("litewire would silently drop a non-IP address");
+        assert!(format!("{err:#}").contains("not a valid socket address"), "got: {err:#}");
+
+        // Two frontends on one address: the probe holds every socket until all
+        // have bound, so the second one fails.
+        let free = TcpListener::bind("127.0.0.1:0").await.expect("pick").local_addr().unwrap();
+        let free = free.to_string();
+        let err = probe_sqlite_listeners(&[
+            ("[db.sqlite.proxy] mysql_listen", &free),
+            ("[db.sqlite.proxy] postgres_listen", &free),
+        ])
+        .await
+        .expect_err("two frontends on one address must fail");
+        assert!(format!("{err:#}").contains("postgres_listen"), "got: {err:#}");
+
+        // A free address passes, and is released again for litewire.
+        probe_sqlite_listeners(&[("[db.sqlite.proxy] mysql_listen", &free)])
+            .await
+            .expect("a free address must pass");
+        drop(TcpListener::bind(&free).await.expect("the probe must release the port"));
+    }
+
+    /// The single-node startup path itself refuses to come up — before it
+    /// opens (or creates) the database file.
+    #[tokio::test]
+    async fn single_node_sqlite_startup_fails_on_an_occupied_mysql_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.expect("occupy a port");
+        let addr = occupied.local_addr().expect("addr").to_string();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("never-opened.db");
+
+        let mut cfg = make_sqlite_config("single");
+        cfg.path = db.to_str().expect("utf-8").to_string();
+        cfg.proxy.mysql_listen.clone_from(&addr);
+        let stats = ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        let mut handles = Vec::new();
+
+        let err = start_single_node_sqlite(&cfg, &stats, &mut handles)
+            .await
+            .expect_err("an occupied mysql_listen must fail startup");
+        assert!(format!("{err:#}").contains(&addr), "got: {err:#}");
+        assert!(handles.is_empty(), "no litewire task may be spawned");
+        assert!(!db.exists(), "the database must not be opened before the listener check");
+    }
+
+    /// The optional frontends are probed too, not only `mysql_listen`.
+    #[test]
+    fn sqlite_frontend_addrs_lists_every_configured_frontend() {
+        let mut proxy = ephpm_config::SqliteProxyConfig::default();
+        assert_eq!(sqlite_frontend_addrs(&proxy).len(), 1);
+        proxy.hrana_listen = Some("127.0.0.1:1".into());
+        proxy.postgres_listen = Some("127.0.0.1:2".into());
+        proxy.tds_listen = Some("127.0.0.1:3".into());
+        let keys: Vec<&str> = sqlite_frontend_addrs(&proxy).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            [
+                "[db.sqlite.proxy] mysql_listen",
+                "[db.sqlite.proxy] hrana_listen",
+                "[db.sqlite.proxy] postgres_listen",
+                "[db.sqlite.proxy] tds_listen",
+            ]
         );
     }
 }

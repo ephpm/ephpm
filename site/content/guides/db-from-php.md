@@ -319,6 +319,14 @@ Familiar codes come through mapped: `1062` duplicate key, `1064` parse
 error, `1205` lock timeout, `1290` read-only, `1452` foreign key. Anything
 the mapper cannot classify arrives as `1105` with SQLSTATE `HY000`.
 
+An internal failure (a panic) inside the embedded database engine also arrives
+as `1105` / `HY000`, with a message starting `internal error: the embedded
+database engine panicked`. It affects only that statement, which may or may not
+have been applied. The thread's database session is discarded, so any open
+transaction on it is abandoned, and the next statement opens a fresh session.
+The details go to the server log. Before this was handled, such a panic
+aborted the whole ePHPm process.
+
 Catch `\Exception` (or `\Throwable`); do not catch `PDOException`.
 
 ### Telling a bridge problem from a SQL problem
@@ -490,7 +498,10 @@ swaps its session to B's database — it never runs B's query on A's connection.
 Two extra guarantees apply on this path:
 
 - **`ATTACH` / `DETACH` / `VACUUM`, and path-bearing `PRAGMA`s, are rejected**
-  before reaching the engine (they would be a cross-database escape). This
+  before reaching the engine (they would be a cross-database escape). So is
+  any **assignment** to `PRAGMA journal_mode` (`= …` or `(…)`): switching a
+  database to Turso's experimental MVCC mode inside a transaction destroyed the
+  file on Turso 0.8.2. Reading it with `PRAGMA journal_mode` still works. This
   screening is on regardless of mode.
 - **`pdo_mysql` works here too**, against each site's own database — see
   [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/). The bridge is
