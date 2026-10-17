@@ -66,7 +66,10 @@
 //! property if a future engine bump ever flips that default. A leading
 //! `EXPLAIN` / `EXPLAIN QUERY PLAN` diagnostic wrapper is seen through before
 //! the check, so `EXPLAIN ATTACH …` is refused just like `ATTACH …` rather
-//! than sliding under a leading-keyword match.
+//! than sliding under a leading-keyword match. Assigning `PRAGMA journal_mode`
+//! (`= …` or `(…)`) is refused too — switching a tenant's file to Turso's
+//! experimental MVCC mode bricked it on Turso 0.8.2 — while reading it stays
+//! allowed.
 //!
 //! # Transactions end with the request
 //!
@@ -653,8 +656,12 @@ pub fn drain_parked_sessions() {
     );
     // Dropped outside the lock: a session's drop reaches into the storage
     // engine, and holding the graveyard mutex across that would serialize
-    // retiring threads behind it for no reason.
-    drop(parked);
+    // retiring threads behind it for no reason. One at a time and
+    // panic-guarded (see "Engine panic containment"): this runs from
+    // `on_request_end`, which worker mode reaches from an `extern "C"` native.
+    for held in parked {
+        discard_after_panic(Some(held));
+    }
 }
 
 /// Sessions ever parked / ever drained. Monotonic, so a test can assert
@@ -1030,86 +1037,41 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     // server screens again. Staging is safe — the gate just proved both result
     // cells are live on this (live) thread.
     if let BackendSource::Remote(remote) = &bridge.source {
-        return match bridge.handle.block_on(remote.run(sql, &params)) {
-            Ok(result) => stage_result(result),
-            Err(e) => stage_error(BridgeError::from(e)),
+        // Panic-guarded like the session path below: this runs under an
+        // `extern "C"` PHP native, where an unwinding panic aborts the process.
+        let outcome = catch_engine_panic(|| bridge.handle.block_on(remote.run(sql, &params)));
+        return match outcome {
+            Ok(Ok(result)) => stage_result(result),
+            Ok(Err(e)) => stage_error(BridgeError::from(e)),
+            Err(panic) => {
+                tracing::error!(
+                    panic = %panic,
+                    "remote database backend panicked while executing a statement"
+                );
+                stage_error(engine_panic_error())
+            }
         };
     }
 
     let Ok(outcome) = DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
-
-        // Swap the held session if it belongs to a different site (or none):
-        // a thread that served site A must never run site B's query on A's
-        // connection. Within one request the site is fixed, so this only ever
-        // fires between requests. The registry lookup happens only here — a
-        // same-site consecutive query reuses the held session untouched, and
-        // does not even copy the site key.
-        let swap_to = site_swap_target(&bridge.source, slot.as_ref().map(|h| h.site.as_ref()))?;
-        if let Some(site) = swap_to {
-            let backend = backend_for(&bridge.source, &site)?;
-            if let Some(old) = slot.as_mut() {
-                // Defensive: the previous site's session should not be
-                // mid-transaction here (on_request_end rolls abandoned
-                // transactions back between requests, and the site never
-                // changes within a request). Roll back before dropping it so
-                // a stray open transaction can't linger on a dropped session.
-                if old.session.in_transaction {
-                    tracing::warn!(
-                        old_site = %old.site,
-                        new_site = %site,
-                        "swapping bridge session to a new site while a transaction was open on \
-                         the previous site — rolling it back"
-                    );
-                    let _ = bridge.handle.block_on(old.session.query("ROLLBACK", &[]));
-                }
-            }
-            // Lazily open this thread's session against the site's backend.
-            // block_on is legal here — see the module docs (`Async boundary`):
-            // FFI callbacks never run on async tasks.
-            match bridge.handle.block_on(backend.connect()) {
-                Ok(conn) => {
-                    *slot = Some(HeldSession {
-                        site,
-                        session: Session::with_cache(
-                            conn,
-                            Dialect::MySQL,
-                            Arc::clone(&bridge.cache),
-                        ),
-                        _backend: backend,
-                    });
-                }
-                Err(e) => {
-                    return Err(RunFailure::Error(infra_error(
-                        ERR_CONNECT,
-                        format!("failed to open embedded database session: {e}"),
-                    )));
-                }
-            }
-        }
-
-        // `slot` is Some here: either it already matched, or we just set it.
-        let held = slot.as_mut().expect("held session was just ensured");
-        let result = bridge.handle.block_on(held.session.query(sql, &params));
-        if let Err(e) = &result {
-            // Recycle a session whose connection looks dead so the NEXT
-            // call reconnects — but never mid-transaction: recycling
-            // there would silently discard the transaction state a
-            // misclassified SQL error (the match is substring-based, see
-            // is_connection_error) may still legitimately own. A
-            // mid-transaction connection death is instead cleaned up at
-            // request end: on_request_end's ROLLBACK fails over the same
-            // dead connection and drops the session then.
-            if !held.session.in_transaction && is_connection_error(e) {
-                tracing::warn!(
-                    error = %e,
-                    "embedded db session hit a connection-class error — dropping it so the \
-                     next call reconnects"
+        // Engine panics stop HERE (see `catch_engine_panic`). The session that
+        // was executing is in an unknown state — the engine may have been
+        // mid-write, holding locks, or with a half-applied transaction — so it
+        // is discarded, never reused: the next statement on this thread opens a
+        // fresh connection. Whatever transaction it held is abandoned with it.
+        match catch_engine_panic(|| run_held(bridge, &mut slot, sql, &params)) {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                tracing::error!(
+                    panic = %panic,
+                    "embedded database engine panicked while executing a statement — \
+                     discarding this thread's session; the next statement reconnects"
                 );
-                *slot = None;
+                discard_after_panic(slot.take());
+                Err(RunFailure::Error(engine_panic_error()))
             }
         }
-        result.map_err(|e| RunFailure::Error(BridgeError::from(e)))
     }) else {
         return RunStatus::Gone;
     };
@@ -1118,6 +1080,149 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         Ok(result) => stage_result(result),
         Err(RunFailure::Error(e)) => stage_error(e),
         Err(RunFailure::Gone) => RunStatus::Gone,
+    }
+}
+
+/// The per-thread session half of [`run_on`]: (re)open this thread's session
+/// for the request's site if needed, then run `sql` on it.
+///
+/// Split out so [`run_on`] can run it under [`catch_engine_panic`] and discard
+/// `slot` if it panics.
+fn run_held(
+    bridge: &DbBridge,
+    slot: &mut Option<HeldSession>,
+    sql: &str,
+    params: &[Value],
+) -> Result<SessionResult, RunFailure> {
+    // Swap the held session if it belongs to a different site (or none):
+    // a thread that served site A must never run site B's query on A's
+    // connection. Within one request the site is fixed, so this only ever
+    // fires between requests. The registry lookup happens only here — a
+    // same-site consecutive query reuses the held session untouched, and
+    // does not even copy the site key.
+    let swap_to = site_swap_target(&bridge.source, slot.as_ref().map(|h| h.site.as_ref()))?;
+    if let Some(site) = swap_to {
+        let backend = backend_for(&bridge.source, &site)?;
+        if let Some(old) = slot.as_mut() {
+            // Defensive: the previous site's session should not be
+            // mid-transaction here (on_request_end rolls abandoned
+            // transactions back between requests, and the site never
+            // changes within a request). Roll back before dropping it so
+            // a stray open transaction can't linger on a dropped session.
+            if old.session.in_transaction {
+                tracing::warn!(
+                    old_site = %old.site,
+                    new_site = %site,
+                    "swapping bridge session to a new site while a transaction was open on \
+                     the previous site — rolling it back"
+                );
+                let _ = bridge.handle.block_on(old.session.query("ROLLBACK", &[]));
+            }
+        }
+        // Lazily open this thread's session against the site's backend.
+        // block_on is legal here — see the module docs (`Async boundary`):
+        // FFI callbacks never run on async tasks.
+        match bridge.handle.block_on(backend.connect()) {
+            Ok(conn) => {
+                *slot = Some(HeldSession {
+                    site,
+                    session: Session::with_cache(conn, Dialect::MySQL, Arc::clone(&bridge.cache)),
+                    _backend: backend,
+                });
+            }
+            Err(e) => {
+                return Err(RunFailure::Error(infra_error(
+                    ERR_CONNECT,
+                    format!("failed to open embedded database session: {e}"),
+                )));
+            }
+        }
+    }
+
+    // `slot` is Some here: either it already matched, or we just set it.
+    let held = slot.as_mut().expect("held session was just ensured");
+    let result = bridge.handle.block_on(held.session.query(sql, params));
+    if let Err(e) = &result {
+        // Recycle a session whose connection looks dead so the NEXT
+        // call reconnects — but never mid-transaction: recycling
+        // there would silently discard the transaction state a
+        // misclassified SQL error (the match is substring-based, see
+        // is_connection_error) may still legitimately own. A
+        // mid-transaction connection death is instead cleaned up at
+        // request end: on_request_end's ROLLBACK fails over the same
+        // dead connection and drops the session then.
+        if !held.session.in_transaction && is_connection_error(e) {
+            tracing::warn!(
+                error = %e,
+                "embedded db session hit a connection-class error — dropping it so the \
+                 next call reconnects"
+            );
+            *slot = None;
+        }
+    }
+    result.map_err(|e| RunFailure::Error(BridgeError::from(e)))
+}
+
+// ── Engine panic containment ────────────────────────────────────────────
+//
+// Every bridge call that reaches the storage engine runs under a PHP native,
+// i.e. beneath an `extern "C"` function the C wrapper calls through
+// `EphpmDbOps`. A Rust panic cannot unwind out of an `extern "C"` function:
+// since Rust 1.81 that aborts the process. So an engine panic — e.g. Turso's
+// `turso_assert!(!self.db_initialized())` in `Pager::maybe_allocate_page1`,
+// which concurrent first writes on a brand-new database file can reach — used
+// to kill every request in the process, not just the one that hit it.
+//
+// It is caught at the bridge instead and becomes an ordinary SQL error for
+// that statement. Unwinding is available because the workspace deliberately
+// does not set `panic = "abort"` (see `[profile.release]` in the workspace
+// `Cargo.toml`). Catching here never lets a panic cross PHP's own frames: the
+// engine call is entirely inside Rust, below the native's `extern "C"` entry,
+// so there is no `zend_try` / `longjmp` frame between the panic and the catch.
+
+/// Run `f`, converting a panic into `Err(<panic message>)`.
+///
+/// `AssertUnwindSafe` is sound here because every caller discards the state
+/// the panic may have left inconsistent (the thread's held session) rather than
+/// reusing it — see [`discard_after_panic`].
+fn catch_engine_panic<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string())
+    })
+}
+
+/// Drop a session whose engine panicked. The drop itself reaches the engine
+/// (closing the connection releases its locks and abandons any open
+/// transaction), and an engine in a broken state may panic again there, so
+/// it is guarded too. If it does panic, whatever was not yet dropped is
+/// leaked — strictly better than aborting the process.
+fn discard_after_panic(held: Option<HeldSession>) {
+    if let Err(panic) = catch_engine_panic(move || drop(held)) {
+        tracing::error!(
+            panic = %panic,
+            "dropping a database session after an engine panic panicked again — leaking it"
+        );
+    }
+}
+
+/// The error a statement reports when the engine panicked under it.
+///
+/// `ER_UNKNOWN_ERROR` (1105) / `HY000`, a server-range "general error", not
+/// one of the reserved infrastructure codes: the database was reachable and
+/// the statement was handed to it. The panic text goes to the server log, not
+/// to PHP.
+fn engine_panic_error() -> BridgeError {
+    BridgeError {
+        code: ER_UNKNOWN_ERROR,
+        sqlstate: *b"HY000",
+        message: "internal error: the embedded database engine panicked while executing this \
+                  statement; it may or may not have been applied, and this connection's session \
+                  was discarded (any open transaction on it was abandoned)"
+            .to_string(),
     }
 }
 
@@ -1169,14 +1274,31 @@ const FORBIDDEN_KEYWORDS: [&str; 3] = ["ATTACH", "DETACH", "VACUUM"];
 
 /// `PRAGMA` names rejected because they name or move a filesystem path (or
 /// re-open the schema for arbitrary edits). Ordinary tuning pragmas
-/// (`foreign_keys`, `journal_mode`, ...) are unaffected.
+/// (`foreign_keys`, `synchronous`, ...) are unaffected; `journal_mode` is
+/// handled separately by [`ASSIGN_ONLY_FORBIDDEN_PRAGMAS`].
 ///
 /// Matched against every dot-separated component of the pragma's target (see
-/// [`pragma_name_parts`]), so the schema-qualified and quoted spellings —
+/// [`pragma_target`]), so the schema-qualified and quoted spellings —
 /// `PRAGMA main.data_store_directory`, `PRAGMA "writable_schema"` — are refused
 /// the same way as the bare form.
 const FORBIDDEN_PRAGMAS: [&str; 3] =
     ["writable_schema", "temp_store_directory", "data_store_directory"];
+
+/// `PRAGMA` names whose *assignment* is rejected on the tenant path while a
+/// plain read (`PRAGMA journal_mode`) stays allowed.
+///
+/// `journal_mode` because its only effective non-default value in Turso is the
+/// experimental MVCC mode. Turso 0.8.2 accepted `PRAGMA journal_mode = 'mvcc'`
+/// inside a transaction, committed "successfully", and left a file that could
+/// never be opened again ("Missing MVCC metadata table while logical log state
+/// exists") — reproduced over both `pdo_mysql` and this bridge, which bricked a
+/// single-node server and a per-site tenant's database. 0.8.3 refuses the switch
+/// inside a transaction, but still lets a tenant move its database onto the
+/// experimental MVCC engine outside one. The journal mode is an operator
+/// decision about the file, not a tenant's, so every assignment form —
+/// `= value` and `(value)`, any schema qualifier or quoting — is refused, even
+/// the harmless `= WAL`.
+const ASSIGN_ONLY_FORBIDDEN_PRAGMAS: [&str; 1] = ["journal_mode"];
 
 /// Screen a (possibly multi-statement) SQL string for statements that are
 /// forbidden on the tenant path. Quote- and comment-aware so a `;` or keyword
@@ -1260,7 +1382,7 @@ pub fn screen_sql(sql: &str) -> Result<(), String> {
 /// screen is that the refusal is ePHPm's own — not whatever the pinned engine
 /// happens to do with the wrapped verb today.
 ///
-/// The `PRAGMA` name is read through [`pragma_name_parts`], which sees through a
+/// The `PRAGMA` name is read through [`pragma_target`], which sees through a
 /// schema qualifier and identifier quoting for the same reason.
 fn check_statement(stmt: &str) -> Result<(), String> {
     let trimmed = strip_explain_prefixes(stmt)?;
@@ -1273,9 +1395,25 @@ fn check_statement(stmt: &str) -> Result<(), String> {
         return Err(keyword);
     }
     if keyword == "PRAGMA" {
-        for part in pragma_name_parts(rest) {
+        let (parts, after_name) = pragma_target(rest);
+        for part in &parts {
             if FORBIDDEN_PRAGMAS.contains(&part.as_str()) {
                 return Err(format!("PRAGMA {part}"));
+            }
+        }
+        // A read is the bare name and nothing after it (whitespace and
+        // comments are already skipped). SQLite's grammar gives a value two
+        // introducers, `= value` and `(value)`, but anything else trailing the
+        // name is treated as an assignment too: it is not a valid read, and
+        // the bridge screens MySQL-dialect text *before* translation, where a
+        // `#` comment this scanner does not model could otherwise sit between
+        // the name and the `=`.
+        let assigns = !after_name.is_empty();
+        if assigns {
+            for part in &parts {
+                if ASSIGN_ONLY_FORBIDDEN_PRAGMAS.contains(&part.as_str()) {
+                    return Err(format!("PRAGMA {part} assignment"));
+                }
             }
         }
     }
@@ -1312,14 +1450,19 @@ fn check_statement(stmt: &str) -> Result<(), String> {
 /// An unterminated quoted identifier stops the scan: the statement is not valid
 /// SQL, and the outer [`screen_sql`] scanner has already rejected the quote
 /// styles it tracks.
-fn pragma_name_parts(rest: &str) -> Vec<String> {
+///
+/// Also returns the text after the name with leading whitespace and comments
+/// already skipped, so the caller can tell a read (`PRAGMA journal_mode`) from
+/// an assignment (`PRAGMA journal_mode /* c */ = mvcc`,
+/// `PRAGMA journal_mode('mvcc')`).
+fn pragma_target(rest: &str) -> (Vec<String>, &str) {
     let mut parts = Vec::new();
     let mut s = strip_leading_noise(rest);
     loop {
-        let Some((ident, after)) = take_identifier(s) else { return parts };
+        let Some((ident, after)) = take_identifier(s) else { return (parts, s) };
         parts.push(ident.to_ascii_lowercase());
         let after = strip_leading_noise(after);
-        let Some(next) = after.strip_prefix('.') else { return parts };
+        let Some(next) = after.strip_prefix('.') else { return (parts, after) };
         s = strip_leading_noise(next);
     }
 }
@@ -1509,7 +1652,14 @@ pub fn on_request_end() {
     // #300). Unconditional — parked sessions exist whether or not this process
     // has a bridge registered, and it costs one relaxed load when empty.
     drain_parked_sessions();
-    let Some(bridge) = DB_BRIDGE.get() else {
+    rollback_abandoned_on(DB_BRIDGE.get());
+}
+
+/// The rollback half of [`on_request_end`] against an explicit bridge. Split
+/// out for the same reason as [`run_on`]: unit tests drive a locally-built
+/// [`DbBridge`] rather than the process-wide, set-once [`DB_BRIDGE`].
+fn rollback_abandoned_on(bridge: Option<&DbBridge>) {
+    let Some(bridge) = bridge else {
         return;
     };
     // `try_with` (issue #269): worker mode reaches this from inside the
@@ -1534,13 +1684,27 @@ pub fn on_request_end() {
         // execution pool, never on an async task (module docs,
         // `Async boundary`). On success Session::query clears
         // `in_transaction` itself.
-        if let Err(e) = bridge.handle.block_on(held.session.query("ROLLBACK", &[])) {
-            tracing::warn!(
-                error = %e,
-                "rollback of the abandoned transaction failed — dropping the session so \
-                 the next request reconnects with clean state"
-            );
-            *slot = None;
+        //
+        // Panic-guarded: worker mode reaches this from inside an `extern "C"`
+        // PHP native (see "Engine panic containment").
+        match catch_engine_panic(|| bridge.handle.block_on(held.session.query("ROLLBACK", &[]))) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "rollback of the abandoned transaction failed — dropping the session so \
+                     the next request reconnects with clean state"
+                );
+                *slot = None;
+            }
+            Err(panic) => {
+                tracing::error!(
+                    panic = %panic,
+                    "embedded database engine panicked rolling back an abandoned transaction — \
+                     discarding this thread's session"
+                );
+                discard_after_panic(slot.take());
+            }
         }
     });
 }
@@ -1863,7 +2027,14 @@ unsafe extern "C" fn db_run(
     // SAFETY: `sql` points to `sql_len` bytes of a PHP string obtained via
     // zend_parse_parameters, valid for the duration of this call.
     let bytes = unsafe { std::slice::from_raw_parts(sql.cast::<u8>(), sql_len) };
-    match run_sql_bytes(bytes) {
+    // `run_on` already contains engine panics; this is the backstop for any
+    // other panic on the way (a panic must never unwind out of this
+    // `extern "C"` fn — that aborts the process).
+    let status = catch_engine_panic(|| run_sql_bytes(bytes)).unwrap_or_else(|panic| {
+        tracing::error!(panic = %panic, "ephpm_db_* run panicked");
+        catch_engine_panic(|| stage_error(engine_panic_error())).unwrap_or(RunStatus::Gone)
+    });
+    match status {
         RunStatus::Rows => 1,
         RunStatus::Ok => 2,
         RunStatus::Err => -1,
@@ -2205,6 +2376,35 @@ mod tests {
             assert_eq!(sqlstate, b"23000");
             assert!(msg.to_ascii_lowercase().contains("unique"), "got: {msg}");
         });
+        finish();
+    }
+
+    /// The stress-run reproduction through the bridge: on Turso 0.8.2 this
+    /// sequence committed and left a file that could never be reopened. The
+    /// screen refuses the switch before the engine sees it; the rest of the
+    /// transaction proceeds normally, and reading the mode still works.
+    #[test]
+    #[serial]
+    fn journal_mode_switch_is_refused_through_the_bridge() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_jm (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert_eq!(run("PRAGMA journal_mode='mvcc'"), RunStatus::Err);
+        with_error(|e| {
+            let (code, sqlstate, msg) = e.expect("error must be staged");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert_eq!(sqlstate, b"HY000");
+            assert!(
+                msg.contains("`PRAGMA journal_mode assignment` is not permitted"),
+                "the refusal must be ePHPm's own: {msg}"
+            );
+        });
+        assert_eq!(run("INSERT INTO bridge_jm (id) VALUES (1)"), RunStatus::Ok);
+        assert_eq!(run("COMMIT"), RunStatus::Ok);
+        assert_eq!(run("PRAGMA journal_mode(mvcc)"), RunStatus::Err);
+        assert_eq!(run("PRAGMA journal_mode"), RunStatus::Rows);
+        assert_eq!(run("SELECT COUNT(*) FROM bridge_jm"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
         finish();
     }
 
@@ -2792,6 +2992,195 @@ mod recycle_tests {
     }
 }
 
+// ── Engine panic containment tests ──────────────────────────────────────
+//
+// Drive the real `run_on` / `rollback_abandoned_on` over a backend whose
+// connections panic on demand — the shape of Turso's
+// `turso_assert!(!self.db_initialized())` in `maybe_allocate_page1`, which the
+// stress run hit with concurrent first writes on a brand-new file.
+#[cfg(test)]
+mod panic_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use litewire::Turso;
+    use litewire::backend::{Backend, BackendConn, BackendError, ExecuteResult, ResultSet};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Flags {
+        connects: AtomicUsize,
+        panic_on_connect: AtomicBool,
+        panic_on_query: AtomicBool,
+    }
+
+    struct PanickyBackend {
+        inner: Turso,
+        flags: Arc<Flags>,
+    }
+
+    struct PanickyConn {
+        inner: Box<dyn BackendConn>,
+        flags: Arc<Flags>,
+    }
+
+    const ASSERT_TEXT: &str = "assertion failed: !self.db_initialized()";
+
+    #[async_trait::async_trait]
+    impl Backend for PanickyBackend {
+        async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
+            assert!(!self.flags.panic_on_connect.load(Ordering::SeqCst), "{ASSERT_TEXT}");
+            let inner = self.inner.connect().await?;
+            self.flags.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(PanickyConn { inner, flags: Arc::clone(&self.flags) }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BackendConn for PanickyConn {
+        async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
+            assert!(!self.flags.panic_on_query.load(Ordering::SeqCst), "{ASSERT_TEXT}");
+            self.inner.query(sql, params).await
+        }
+
+        async fn execute(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<ExecuteResult, BackendError> {
+            assert!(!self.flags.panic_on_query.load(Ordering::SeqCst), "{ASSERT_TEXT}");
+            self.inner.execute(sql, params).await
+        }
+    }
+
+    /// A local bridge over a file-backed [`PanickyBackend`], so a fresh
+    /// connection after a discarded one sees the same database.
+    fn panicky_bridge() -> (DbBridge, Arc<Flags>, tempfile::TempDir) {
+        super::tests::init_bridge(); // ensures the shared test runtime exists
+        let rt = super::tests::TEST_RT.get().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("panic.db");
+        let flags = Arc::new(Flags::default());
+        let backend: SharedBackend = Arc::new(PanickyBackend {
+            inner: rt.block_on(Turso::open(path.to_str().expect("utf-8 path"))).expect("open"),
+            flags: Arc::clone(&flags),
+        });
+        let bridge = DbBridge {
+            source: BackendSource::Single(backend),
+            handle: rt.handle().clone(),
+            cache: Arc::new(TranslateCache::default()),
+        };
+        (bridge, flags, dir)
+    }
+
+    fn run(bridge: &DbBridge, sql: &str) -> RunStatus {
+        run_on(Some(bridge), sql.as_bytes())
+    }
+
+    #[track_caller]
+    fn assert_panic_error_staged() {
+        with_error(|e| {
+            let (code, sqlstate, msg) = e.expect("an error must be staged");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert_eq!(sqlstate, b"HY000");
+            assert!(msg.contains("engine panicked"), "got: {msg}");
+            // The panic text is for the server log, not for PHP.
+            assert!(!msg.contains(ASSERT_TEXT), "panic payload leaked to PHP: {msg}");
+        });
+    }
+
+    fn held_session_exists() -> bool {
+        DB_HELD.with(|cell| cell.0.borrow().is_some())
+    }
+
+    #[test]
+    fn engine_panic_becomes_a_sql_error_and_the_session_is_discarded() {
+        let (bridge, flags, _dir) = panicky_bridge();
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+
+        // Reaching this assertion at all is the point: before the guard the
+        // panic unwound through `run_on` (and, from PHP, out of the
+        // `extern "C"` native — a process abort).
+        flags.panic_on_query.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        assert_panic_error_staged();
+        assert!(!held_session_exists(), "the panicked session must not be kept");
+
+        // The next statement opens a fresh connection rather than reusing
+        // the one the engine panicked under.
+        flags.panic_on_query.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 2);
+        finish();
+    }
+
+    #[test]
+    fn engine_panic_mid_transaction_abandons_the_transaction() {
+        let (bridge, flags, _dir) = panicky_bridge();
+        assert_eq!(run(&bridge, "CREATE TABLE pt (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "BEGIN"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "INSERT INTO pt (id) VALUES (1)"), RunStatus::Ok);
+        assert!(in_transaction());
+
+        flags.panic_on_query.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "INSERT INTO pt (id) VALUES (2)"), RunStatus::Err);
+        assert_panic_error_staged();
+        // The session — and the transaction it held — is gone, so PHP must
+        // not be told a transaction is still open.
+        assert!(!in_transaction());
+
+        flags.panic_on_query.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT COUNT(*) FROM pt"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(0)), "uncommitted row survived"));
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 2);
+        finish();
+    }
+
+    #[test]
+    fn engine_panic_while_connecting_is_contained() {
+        let (bridge, flags, _dir) = panicky_bridge();
+        flags.panic_on_connect.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        assert_panic_error_staged();
+        assert!(!held_session_exists());
+
+        flags.panic_on_connect.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+        finish();
+    }
+
+    #[test]
+    fn engine_panic_in_the_request_end_rollback_discards_the_session() {
+        let (bridge, flags, _dir) = panicky_bridge();
+        assert_eq!(run(&bridge, "BEGIN"), RunStatus::Ok);
+        assert!(in_transaction());
+
+        flags.panic_on_query.store(true, Ordering::SeqCst);
+        rollback_abandoned_on(Some(&bridge));
+        assert!(!held_session_exists(), "the panicked session must not be kept");
+        assert!(!in_transaction());
+
+        flags.panic_on_query.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 2);
+        finish();
+    }
+
+    #[test]
+    fn catch_engine_panic_reports_the_payload() {
+        assert_eq!(catch_engine_panic(|| 7), Ok(7));
+        assert_eq!(catch_engine_panic(|| panic!("static str")), Err::<(), _>("static str".into()));
+        let n = 3;
+        assert_eq!(
+            catch_engine_panic(|| panic!("formatted {n}")),
+            Err::<(), _>("formatted 3".into())
+        );
+    }
+}
+
 // ── SQL screening (denylist) tests ──────────────────────────────────────
 //
 // Pure, no bridge/runtime needed: `screen_sql` is a stub-safe string scan.
@@ -2820,7 +3209,9 @@ mod screen_tests {
         allowed("CREATE TABLE t (id INTEGER PRIMARY KEY)");
         // Ordinary tuning pragmas are fine.
         allowed("PRAGMA foreign_keys = ON");
-        allowed("PRAGMA journal_mode = WAL");
+        // Reading the journal mode is fine; changing it is not (see
+        // `journal_mode_assignment_is_rejected`).
+        allowed("PRAGMA journal_mode");
         // The forbidden keywords appearing only inside a string/identifier or
         // a comment must NOT trip the screen.
         allowed("SELECT 'ATTACH DATABASE' AS note");
@@ -2915,12 +3306,69 @@ mod screen_tests {
     }
 
     #[test]
+    fn journal_mode_assignment_is_rejected() {
+        // Turso 0.8.2 bricked the file on `BEGIN; PRAGMA journal_mode='mvcc';
+        // …; COMMIT`, and 0.8.3 still lets a tenant switch to the experimental
+        // MVCC engine outside a transaction. Every assignment spelling is
+        // refused — including the no-op `= WAL` — with ePHPm's own error.
+        for sql in [
+            "PRAGMA journal_mode = mvcc",
+            "PRAGMA journal_mode='mvcc'",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA journal_mode = DELETE",
+            "PRAGMA journal_mode(mvcc)",
+            "PRAGMA journal_mode ('mvcc')",
+            "pragma JOURNAL_MODE = MVCC",
+            "PRAGMA main.journal_mode = mvcc",
+            "PRAGMA temp.journal_mode = mvcc",
+            "PRAGMA \"main\".\"journal_mode\" = mvcc",
+            "PRAGMA `journal_mode` = mvcc",
+            "PRAGMA [journal_mode](mvcc)",
+            "PRAGMA 'journal_mode' = mvcc",
+            "PRAGMA main . journal_mode = mvcc",
+            "PRAGMA journal_mode /* c */ = mvcc",
+            "PRAGMA journal_mode -- c\n = mvcc",
+            "PRAGMA\njournal_mode\n=\nmvcc",
+            "  /* c */ PRAGMA journal_mode = mvcc",
+            "EXPLAIN PRAGMA journal_mode = mvcc",
+            "EXPLAIN QUERY PLAN PRAGMA journal_mode = mvcc",
+            // The stress-run reproduction, as one multi-statement string.
+            "BEGIN; PRAGMA journal_mode='mvcc'; INSERT INTO t VALUES (1); COMMIT;",
+            "SELECT 1; PRAGMA journal_mode = mvcc",
+            // MySQL-dialect `#` comment between name and value: not modelled
+            // by the scanner, so anything trailing the name counts as an
+            // assignment rather than a read.
+            "PRAGMA journal_mode # c\n = mvcc",
+        ] {
+            assert_eq!(
+                screen_sql(sql),
+                Err("PRAGMA journal_mode assignment".to_string()),
+                "expected `{sql}` to be refused as a journal_mode assignment"
+            );
+        }
+    }
+
+    #[test]
+    fn journal_mode_read_still_passes() {
+        allowed("PRAGMA journal_mode");
+        allowed("PRAGMA journal_mode;");
+        allowed("pragma JOURNAL_MODE");
+        allowed("PRAGMA main.journal_mode");
+        allowed("PRAGMA \"main\".`journal_mode`");
+        allowed("PRAGMA journal_mode /* trailing comment */");
+        allowed("PRAGMA journal_mode -- trailing comment");
+        allowed("EXPLAIN PRAGMA journal_mode");
+        allowed("SELECT * FROM pragma_journal_mode()");
+        allowed("SELECT 'PRAGMA journal_mode = mvcc' AS note");
+    }
+
+    #[test]
     fn schema_qualified_ordinary_pragmas_still_pass() {
         // The qualifier must not turn every pragma into a refusal.
-        allowed("PRAGMA main.journal_mode = WAL");
+        allowed("PRAGMA main.journal_mode");
         allowed("PRAGMA main.foreign_keys = ON");
         allowed("PRAGMA temp.synchronous = NORMAL");
-        allowed("PRAGMA \"main\".journal_mode = WAL");
+        allowed("PRAGMA \"main\".journal_mode");
         allowed("PRAGMA main.table_info(t)");
         allowed("PRAGMA table_info(t)");
         allowed("PRAGMA main.user_version");
@@ -4023,6 +4471,54 @@ mod remote_tests {
         with_error(|e| {
             let (_, _, msg) = e.expect("error staged");
             assert!(msg.to_ascii_lowercase().contains("attach"), "got: {msg}");
+        });
+        reset_staged();
+    }
+
+    /// The CLI wire path (`ephpm php --site`) refuses a `journal_mode`
+    /// assignment before forwarding it, and still forwards a plain read.
+    #[test]
+    fn remote_screens_journal_mode_assignment() {
+        let remote = RecordingRemote::new();
+        let bridge = remote_bridge(Arc::clone(&remote));
+
+        assert_eq!(run_on(Some(&bridge), b"PRAGMA journal_mode = 'mvcc'"), RunStatus::Err);
+        assert!(remote.seen().is_empty(), "a screened statement must not be forwarded");
+        with_error(|e| {
+            let (_, _, msg) = e.expect("error staged");
+            assert!(msg.contains("PRAGMA journal_mode assignment"), "got: {msg}");
+        });
+
+        // (The recording mock answers non-SELECTs with an OK.)
+        assert_eq!(run_on(Some(&bridge), b"PRAGMA journal_mode"), RunStatus::Ok);
+        assert_eq!(remote.seen().as_slice(), &["PRAGMA journal_mode".to_string()]);
+        reset_staged();
+    }
+
+    /// A remote backend that panics is contained like the engine path.
+    #[test]
+    fn remote_panic_is_contained() {
+        struct PanickingRemote;
+        #[litewire::async_trait]
+        impl RemoteBackend for PanickingRemote {
+            async fn run(
+                &self,
+                _sql: &str,
+                _params: &[Value],
+            ) -> Result<SessionResult, SessionError> {
+                panic!("remote blew up")
+            }
+        }
+        let bridge = DbBridge {
+            source: BackendSource::Remote(Arc::new(PanickingRemote)),
+            handle: remote_bridge(RecordingRemote::new()).handle,
+            cache: Arc::new(TranslateCache::default()),
+        };
+        assert_eq!(run_on(Some(&bridge), b"SELECT 1"), RunStatus::Err);
+        with_error(|e| {
+            let (code, _, msg) = e.expect("error staged");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert!(msg.contains("engine panicked"), "got: {msg}");
         });
         reset_staged();
     }

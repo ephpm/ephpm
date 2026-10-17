@@ -218,3 +218,55 @@ async fn a_refused_connection_does_not_open_the_targets_database() {
         "a refused connection created the target's database file"
     );
 }
+
+/// A tenant cannot switch its database's journal mode over the wire.
+///
+/// On Turso 0.8.2, `BEGIN; PRAGMA journal_mode='mvcc'; INSERT ...; COMMIT;`
+/// through `pdo_mysql` committed "successfully" and left a file that could
+/// never be opened again — the tenant's database refused every later
+/// connection. 0.8.3 refuses the in-transaction switch, but still lets a tenant
+/// move its file onto the experimental MVCC engine outside one, so ePHPm's
+/// tenant screen refuses every `journal_mode` assignment itself. Reading the
+/// mode keeps working.
+#[tokio::test]
+async fn tenant_cannot_switch_journal_mode_over_the_wire() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (auth, port) = start(tmp.path().to_path_buf()).await;
+
+    let mut a = connect(port, SITE_A, &auth.password_for(SITE_A)).await.expect("site-a");
+    a.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY)").await.expect("create");
+
+    // The stress-run reproduction, statement by statement.
+    a.query_drop("BEGIN").await.expect("begin");
+    for sql in [
+        "PRAGMA journal_mode='mvcc'",
+        "PRAGMA journal_mode = 'WAL'",
+        "PRAGMA main.journal_mode = 'mvcc'",
+    ] {
+        let err = a.query_drop(sql).await.expect_err("a journal_mode assignment must be refused");
+        assert!(
+            err.to_string().contains("not permitted on the tenant database path"),
+            "expected ePHPm's own refusal for {sql:?}, got: {err}"
+        );
+    }
+    // Spellings litewire's MySQL parser cannot read (an unquoted value, the
+    // call form) never reach the engine either; they fail at translation.
+    for sql in ["PRAGMA journal_mode = mvcc", "PRAGMA journal_mode('mvcc')"] {
+        a.query_drop(sql).await.expect_err("must not reach the engine");
+    }
+    a.query_drop("INSERT INTO t (id) VALUES (1)").await.expect("insert");
+    a.query_drop("COMMIT").await.expect("commit");
+
+    // Outside a transaction too.
+    let err = a.query_drop("PRAGMA journal_mode = 'mvcc'").await.expect_err("refused");
+    assert!(err.to_string().contains("not permitted"), "got: {err}");
+
+    // Reading the mode is allowed, and the database is still in WAL mode and
+    // still opens for a fresh connection with its rows intact.
+    let mode: Vec<String> = a.query("PRAGMA journal_mode").await.expect("read journal_mode");
+    assert_eq!(mode, vec!["wal".to_string()]);
+    drop(a);
+    let mut a2 = connect(port, SITE_A, &auth.password_for(SITE_A)).await.expect("site-a again");
+    let rows: Vec<i64> = a2.query("SELECT id FROM t").await.expect("select");
+    assert_eq!(rows, vec![1]);
+}

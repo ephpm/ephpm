@@ -493,6 +493,12 @@ pub async fn start_clustered_turso_cdc(
          active (startup ordering bug: resolve_channel_features should have enabled \
          the cdc channel feature)",
     )?;
+    // Fail startup now if a wire listener cannot exist, rather than from the
+    // detached litewire task spawned after election and bootstrap (see
+    // `probe_sqlite_listeners`).
+    crate::probe_sqlite_listeners(&crate::sqlite_frontend_addrs(&sqlite_config.proxy))
+        .await
+        .context("cannot start the embedded database's wire listeners")?;
 
     tracing::warn!(
         engine = "turso",
@@ -3775,7 +3781,10 @@ mod tests {
     /// A tenant on a capturing session (every clustered write session) cannot
     /// switch the database to MVCC, and its writes keep reaching `turso_cdc`.
     ///
-    /// `PRAGMA journal_mode` passes the tenant SQL screen, and turso 0.7.2
+    /// ePHPm's tenant SQL screen now refuses `journal_mode` assignments on the
+    /// bridge and per-site paths, but the shared clustered `pdo_mysql` listener
+    /// is not screened, so this engine-level refusal is what holds there.
+    /// Turso 0.7.2
     /// accepted WAL -> MVCC on a capturing connection, after which upstream
     /// documents capture stopping silently: writes committed locally and
     /// never replicated. Turso 0.8 refuses the change (ephpm#535). This pins

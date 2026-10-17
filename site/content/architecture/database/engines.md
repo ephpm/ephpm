@@ -75,6 +75,45 @@ Two honest caveats:
   `String`, so cells holding invalid UTF-8 may not survive the round trip.
   This is an upstream Turso limitation.
 
+## Turso 0.8.2 → 0.8.3
+
+The release after v0.12.0 moves the engine to Turso 0.8.3
+([litewire#47](https://github.com/ephpm/litewire/pull/47)). This fixes a
+whole-database-loss bug, so **upgrade off 0.8.2**. The file format and the CDC
+log schema (`turso_cdc_version` = `v2`) did not change, so no dump/reload is
+needed.
+
+Turso 0.8.2 accepted `PRAGMA journal_mode = 'mvcc'` **inside a transaction**.
+In this sequence:
+
+```sql
+BEGIN;
+PRAGMA journal_mode = 'mvcc';
+INSERT INTO t VALUES (1);
+COMMIT;
+```
+
+`COMMIT` reported success. The file then could never be opened again
+(`Missing MVCC metadata table while logical log state exists`), and every row in
+it was lost. We reproduced this through ePHPm over both `pdo_mysql` and the
+`ephpm_db_*` bridge. Afterwards a single-node server would not restart, and a
+per-site tenant's database refused every connection. Turso 0.8.3 refuses the
+switch inside a transaction (`cannot change into mvcc mode from within a
+transaction`).
+
+0.8.3 still lets a connection switch the file to the experimental MVCC mode
+*outside* a transaction. So ePHPm's tenant SQL screen now refuses every
+`PRAGMA journal_mode` **assignment**, in both the `= value` and `(value)` forms,
+with any schema prefix or quoting, and including the harmless `= 'wal'`.
+Reading the mode with `PRAGMA journal_mode` still works. The screen covers
+every path that already refused `ATTACH`/`VACUUM`/path-`PRAGMA`s: the
+`ephpm_db_*` bridge in every mode, the per-site `pdo_mysql` listener, and
+`ephpm php --site`. The shared `pdo_mysql` listener of single-node and
+whole-database clustered mode is **not** screened by ePHPm. In clustered mode
+Turso itself refuses the switch while CDC capture is on (see below). On a
+single-node `pdo_mysql` connection the switch outside a transaction is still
+possible.
+
 ## Turso 0.7.2 → 0.8.2 (v0.12.0)
 
 v0.12.0 moves the embedded engine from Turso 0.7.2 to
@@ -109,8 +148,10 @@ which means every write session in clustered mode, `PRAGMA journal_mode =
 mvcc` now fails with `cannot change journal_mode ... while CDC capture is
 active`. Turso 0.7.2 accepted it, and according to upstream, capture then
 stopped silently, so that node's later writes never replicated. Single-node
-mode does not capture, so the pragma still works there. Turso accepts only
-`wal` and `mvcc`; any other `journal_mode` value is still a silent no-op.
+mode does not capture, so Turso itself still accepts the pragma there. Since
+the 0.8.3 upgrade, ePHPm's tenant screen refuses it first on the bridge and
+per-site paths (see above). Turso accepts only `wal` and `mvcc`; any other
+`journal_mode` value is still a silent no-op.
 
 ## Clustered mode (experimental)
 

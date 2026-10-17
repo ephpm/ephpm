@@ -7,6 +7,9 @@
 //! statement and a tenant is reading — or writing a PHP shell into — its
 //! neighbour's data. `DETACH`, `VACUUM INTO`, and the path-bearing `PRAGMA`s
 //! (`data_store_directory`, `temp_store_directory`) are variations on it.
+//! The same screen also refuses `PRAGMA journal_mode` assignments, which are a
+//! different hazard: switching a tenant's file to Turso's experimental MVCC
+//! mode inside a transaction destroyed the database on Turso 0.8.2.
 //!
 //! The `ephpm_db_*` bridge already screens for these before a statement reaches
 //! the engine, deliberately: Turso refuses `ATTACH` today, but making the
@@ -161,6 +164,31 @@ mod tests {
                 "expected our refusal for {sql:?}, got: {err}"
             );
         }
+    }
+
+    /// A tenant cannot change the journal mode of its database (Turso 0.8.2
+    /// bricked the file on an in-transaction switch to MVCC; 0.8.3 still allows
+    /// the switch outside a transaction). Reading it stays allowed.
+    #[tokio::test]
+    async fn journal_mode_assignment_is_refused_but_read_passes() {
+        let conn = screened().await.connect().await.expect("connect");
+        for sql in [
+            "PRAGMA journal_mode = mvcc",
+            "PRAGMA journal_mode='mvcc'",
+            "PRAGMA main.journal_mode(mvcc)",
+            "PRAGMA \"journal_mode\" = WAL",
+        ] {
+            let err = conn.execute(sql, &[]).await.expect_err("must be refused");
+            assert!(
+                format!("{err}").contains("`PRAGMA journal_mode assignment` is not permitted"),
+                "expected our refusal for {sql:?}, got: {err}"
+            );
+            let err = conn.query(sql, &[]).await.expect_err("must be refused on query too");
+            assert!(format!("{err}").contains("not permitted"), "got: {err}");
+        }
+        let rs = conn.query("PRAGMA journal_mode", &[]).await.expect("a read must pass");
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], Value::Text("wal".to_string()));
     }
 
     /// An `EXPLAIN`-wrapped `ATTACH` must not execute on the wire path either.

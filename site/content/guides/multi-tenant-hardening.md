@@ -145,7 +145,9 @@ file *is* the tenant boundary. The `ephpm_db_*` bridge resolves each request's
 own database via a per-thread session that swaps when the request's site
 changes; a tenant's queries reach only its own `.db`. `ATTACH`/`DETACH`/`VACUUM`
 and path-`PRAGMA`s are rejected on the tenant path, so a tenant cannot `ATTACH`
-another tenant's file. Stock `pdo_mysql` also works per-site: one MySQL wire
+another tenant's file. Assignments to `PRAGMA journal_mode` are rejected too, so
+a tenant cannot move its file onto Turso's experimental MVCC mode. On Turso 0.8.2
+doing that inside a transaction destroyed the database. Stock `pdo_mysql` also works per-site: one MySQL wire
 listener serves everyone, but a connection's database is fixed by the credential
 it authenticates with — `DB_USER` = the site key, `DB_PASSWORD` =
 `HMAC-SHA256(per-process master secret, site_key)`, injected per request.

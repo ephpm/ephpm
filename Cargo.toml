@@ -220,7 +220,21 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 89b911b2a81f — turso 0.7.2 → 0.8.2 (litewire#46, ephpm#535). The
+# litewire @ bd88f92579ed — turso 0.8.2 → 0.8.3 (litewire#47). SECURITY /
+# DATA LOSS: do not move this pin backwards. 0.8.2 accepted
+# `PRAGMA journal_mode = 'mvcc'` INSIDE a transaction; the switch wrote the
+# MVCC logical log before the MVCC metadata table existed, COMMIT reported
+# success, and the file could never be opened again ("Missing MVCC metadata
+# table while logical log state exists") — every row lost. Reproduced through
+# ePHPm over both pdo_mysql and the `ephpm_db_*` bridge: a single-node server
+# refuses to restart and a per-site tenant's database refuses every
+# connection. 0.8.3 refuses the switch inside a transaction. ePHPm's own tenant
+# screen additionally refuses every `PRAGMA journal_mode` ASSIGNMENT
+# (`ephpm_php::db_bridge::screen_sql`), since 0.8.3 still allows the MVCC switch
+# outside a transaction. No litewire code change; file format and the
+# `turso_cdc` schema ("v2") are unchanged.
+#
+# Previous pin 89b911b2a81f — turso 0.7.2 → 0.8.2 (litewire#46, ephpm#535). The
 # squash-merge commit of litewire#46 on litewire main, directly on top of
 # b0c12bf1383f below.
 # No litewire code change; the engine pin moves, and litewire gains a test that
@@ -448,10 +462,10 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "89b911b2a81fdcd4973230763fbd02f62cf0c8ea", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "bd88f92579edfe28778d60f887d4007b9aad6e0b", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
-# in its signatures. Pinned to the exact version litewire pins (=0.8.2)
+# in its signatures. Pinned to the exact version litewire pins (=0.8.3)
 # so the two resolve to a single crate instance and TursoConnection
 # (re-exported by litewire) is the same turso::Connection.
 #
@@ -461,7 +475,7 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "89b911b2a81fd
 # `Rows` from that connection — or a clone of it — is still unfinished.
 # `apply_snapshot` in turso_cdc.rs is the one `execute_batch` caller; keep it on
 # a connection with no live result set.
-turso = { version = "=0.8.2", default-features = false }
+turso = { version = "=0.8.3", default-features = false }
 
 # vivacity: the pure-Rust Composer installer that backs `ephpm composer`. It
 # resolves and installs Composer dependencies (byte-parity with PHP Composer is
