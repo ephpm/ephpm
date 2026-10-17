@@ -12,6 +12,18 @@ ignore = [
     # above our 1.88 MSRV, so migrating is a separate change. Remove this entry
     # when ephpm-analyze moves off serde_yaml_ng.
     "RUSTSEC-2024-0449",
+    # zip 2.4.2 (pulled only by vivacity-core 0.17.0, the `ephpm composer`
+    # installer): SUID/SGID bits kept on extraction (0367), symlink targets
+    # outside the destination (0368), permissions applied through symlinks
+    # (0369). All three are in zip's own `ZipArchive::extract` /
+    # `ZipStreamReader::extract`, which vivacity never calls: its
+    # `extract::extract_zip` walks entries with `by_index`, rejects absolute
+    # and escaping symlink targets, and only ever sets mode 0o755. The fix is
+    # zip >= 9.0.0, which needs a vivacity release; remove these entries when
+    # vivacity moves to it.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
     # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
     # unmaintained) left the graph with mysql-common-derive, once the
     # opensrv-mysql fork stopped enabling mysql_common's default features.
