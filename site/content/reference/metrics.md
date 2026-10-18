@@ -372,6 +372,39 @@ These series are emitted by both the embedded SQLite paths and the MySQL/Postgre
 
 `ephpm_query_rows_total` is likewise narrower on the proxy paths, which report `0` where they cannot count rows rather than estimating: the default MySQL path has no row visibility at all, and the PostgreSQL path counts rows *returned* but not rows *affected* by a mutation. Statement coverage per path — including what the proxies deliberately do not record, such as prepared-statement executes and PostgreSQL extended-protocol traffic — is tabulated under [`[db.analysis]`](/reference/config/#dbanalysis) in the config reference.
 
+## Embedded database (WAL checkpoint gate)
+
+These appear whenever `[db.sqlite]` is configured, in every embedded-Turso mode. A sampler republishes them every 2 seconds for each **open** database: the counters mirror litewire's gate atomics (`Counter::absolute`, so a series is a faithful copy rather than a re-count), and the gauges are read at the same tick. See [`[db.sqlite.wal_checkpoint]`](/reference/config/#dbsqlitewal_checkpoint) for what the gate does and why it is on by default.
+
+Every series carries one label, `site`: the vhost's canonical site key in the per-site modes, or `default` in the single-database modes (single-node and whole-database clustered — the same name the clustered path uses for its `cdc/default` stream). `ephpm_sqlite_wal_bytes` is published whether or not the gate is enabled; the `ephpm_sqlite_wal_gate_*` series exist only for databases whose factory has a gate (`enabled = true`). Nothing is pre-seeded — a series appears when its database is first open, and stops updating (but is not removed) when a per-site database is evicted.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_sqlite_wal_bytes` | gauge | `site` | Current size of the database's `-wal` file. **The headline number**: with the gate on it should saw-tooth below `threshold_bytes`; a steady climb means the gate cannot win — check `timeouts_total` and `busy_total` below. |
+| `ephpm_sqlite_wal_gate_attempts_total` | counter | `site` | Checkpoint attempts (the file was over the threshold at a tick). |
+| `ephpm_sqlite_wal_gate_truncations_total` | counter | `site` | Attempts that truncated the log. |
+| `ephpm_sqlite_wal_gate_bytes_truncated_total` | counter | `site` | Bytes the `-wal` file held just before each successful truncate, summed. |
+| `ephpm_sqlite_wal_gate_frames_backfilled_total` | counter | `site` | Frames the passive backfill phase (outside the gate, blocks nobody) moved into the main file. |
+| `ephpm_sqlite_wal_gate_timeouts_total` | counter | `site` | Attempts abandoned because in-flight statements and open transactions did not drain within `max_wait_ms`. **Climbing while `truncations_total` stays flat means a long-lived transaction is keeping the log open** — the gate backs off (up to `max_backoff_secs`) rather than stall it. |
+| `ephpm_sqlite_wal_gate_busy_total` | counter | `site` | Attempts where the engine still reported the checkpoint busy after the gate was held: a reader outside the gate (a raw connection without a permit) was active. Retried. |
+| `ephpm_sqlite_wal_gate_errors_total` | counter | `site` | Attempts that failed with an engine error (also logged at WARN). |
+| `ephpm_sqlite_wal_gate_skipped_journal_mode_total` | counter | `site` | Attempts skipped because the database is not in `wal` journal mode (Turso's experimental MVCC mode keeps its own log; the gate makes no claim about it). Logged once at WARN. |
+| `ephpm_sqlite_wal_gate_last_exclusive_seconds` | gauge | `site` | Duration of the most recent exclusive window — the truncating checkpoint itself, during which new statements wait. Milliseconds on a backfilled log. |
+| `ephpm_sqlite_wal_gate_max_exclusive_seconds` | gauge | `site` | Longest exclusive window seen since the database was opened. |
+| `ephpm_sqlite_wal_gate_last_backfill_seconds` | gauge | `site` | Duration of the most recent passive backfill phase (outside the gate). |
+| `ephpm_sqlite_wal_gate_max_backfill_seconds` | gauge | `site` | Longest passive backfill phase seen. If this is large while `max_exclusive_seconds` stays small, the backfill is doing its job of keeping the stall out of the exclusive window. |
+
+```promql
+# A database whose WAL the gate cannot keep down (long transactions, or a
+# raw reader outside the gate).
+ephpm_sqlite_wal_bytes > 2 * 67108864
+
+# Attempts giving up on an open transaction, per site.
+rate(ephpm_sqlite_wal_gate_timeouts_total[5m]) > 0
+```
+
+**Cardinality.** One series per open database. In the per-site modes the serving registry's open set is capped by `[db.sqlite] max_open_dbs`, and the per-site clustered replication registry holds one entry per vhost directory on disk — the same bound the `vhost` label on `ephpm_opcache_invalidations_total` has. An owned site in per-site clustered mode is open in both registries, but the gate is per *file*, so it is reported once. There are no per-peer or per-connection labels.
+
 ## CDC-native Turso replication
 
 These appear only when `[db.sqlite]` runs with clustering enabled (the

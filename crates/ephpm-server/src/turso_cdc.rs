@@ -225,11 +225,12 @@ use anyhow::Context;
 use dashmap::DashMap;
 use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream, NodeInfo};
 use ephpm_config::SqliteConfig;
-use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
+use litewire::litewire_turso::{Turso, WalGateConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::wal_gate::{self, WalGateSample, WalGateStatsSource};
 use crate::{tracked_backend, turso_cdc_metrics as cdc_metrics};
 
 /// Logical database name used by the **single-database** clustered path.
@@ -538,11 +539,25 @@ pub async fn start_clustered_turso_cdc(
     // log identity is available to the election: the primary claim carries
     // that identity, and the fast-restart reclaim must match on it (issue
     // #344).
+    //
+    // WAL checkpoint gate: installed on BOTH factories on this file. The
+    // gate itself is per file (litewire keys it by canonical path), so the
+    // two share one lock and one set of counters; what each factory needs
+    // its own opt-in for is (a) the wire factory's sessions taking permits —
+    // without that the gate could never reach a reader-free instant — and
+    // (b) `wal_gate_permit()` answering on the mgmt factory, which is what
+    // the raw-connection apply/snapshot/head-sampler paths below hold. Two
+    // maintenance tasks on one file are harmless by litewire's contract (the
+    // attempt is serialized on the exclusive side).
+    let gate = wal_gate::gate_config(&sqlite_config.wal_checkpoint);
+    wal_gate::log_mode(gate.as_ref());
     let mgmt_factory = Arc::new(
-        Turso::open(db_path)
+        wal_gate::builder_with_gate(Turso::builder(db_path), gate.as_ref())
+            .build()
             .await
             .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
     );
+    wal_gate::DatabaseProbe::register(wal_gate::DEFAULT_SITE_LABEL, db_path, &mgmt_factory);
 
     // Establish this database's persistent CDC log identity (issue #315)
     // BEFORE the election runs. Done on EVERY node, not just the primary:
@@ -599,7 +614,7 @@ pub async fn start_clustered_turso_cdc(
     // write it served after promotion would be invisible to replicas.
     // Capturing everywhere costs a `turso_cdc` row per local write on
     // replicas; shipping is gated by role at serve time instead.
-    let wire_factory = Turso::builder(db_path)
+    let wire_factory = wal_gate::builder_with_gate(Turso::builder(db_path), gate.as_ref())
         .enable_cdc_on_connect(true)
         .build()
         .await
@@ -961,7 +976,15 @@ fn spawn_head_sampler(
             if !is_primary.load(Ordering::Relaxed) {
                 continue;
             }
-            match current_max_change_id(&conn).await {
+            // Raw connections get no busy timeout, so a read that lands
+            // inside the gate's exclusive window would fail outright;
+            // holding the shared side for the one statement makes that
+            // collision impossible (and costs a reader slot for microseconds).
+            let head = {
+                let _permit = mgmt.wal_gate_permit().await;
+                current_max_change_id(&conn).await
+            };
+            match head {
                 Ok(head) => cdc_metrics::observe_head(head),
                 Err(e) => tracing::debug!("CDC head sampler: MAX(change_id) failed: {e:#}"),
             }
@@ -1131,7 +1154,9 @@ pub async fn run_replica(
     channel: ephpm_cluster::ChannelHandle,
 ) -> anyhow::Result<()> {
     // The replica's local Turso engine serves reads via litewire; writes
-    // arrive only through apply_batch, keyed by monotonic watermark.
+    // arrive only through apply_batch, keyed by monotonic watermark. The
+    // factory stays in scope alongside the connection: every apply takes
+    // its WAL-gate permit (see `consume_frames`).
     let apply_conn = mgmt.raw_connection()?;
 
     tracing::warn!(
@@ -1149,7 +1174,7 @@ pub async fn run_replica(
                 // after the primary's Hello: the cursor is only meaningful
                 // against the specific log the Hello names (issue #315), so
                 // it cannot be read up front any more.
-                match subscribe_and_consume(&mut stream, &apply_conn).await {
+                match subscribe_and_consume(&mut stream, &mgmt, &apply_conn).await {
                     Ok(()) => {
                         cdc_metrics::record_connect_outcome("closed");
                         tracing::info!("CDC replica: primary closed stream cleanly");
@@ -1185,6 +1210,14 @@ pub async fn run_replica(
 /// function so the replica-side metrics under test are the production
 /// ones. Not part of a stable API.
 ///
+/// `factory` is the Turso factory `apply_conn` came from. `apply_conn` is a
+/// raw connection — no busy timeout — so every statement run on it here is
+/// wrapped in the factory's WAL-gate permit (`Turso::wal_gate_permit`,
+/// `None` when the gate is off): a `BEGIN IMMEDIATE` colliding with a
+/// truncating checkpoint would otherwise fail the stream and cost a
+/// reconnect. The permit is held for one batch at a time and never across
+/// an await that waits on another permit holder.
+///
 /// # Errors
 ///
 /// Returns an error if the Hello does not arrive within
@@ -1194,6 +1227,7 @@ pub async fn run_replica(
 /// malformed or wrong-direction frame, or if `apply_batch` fails.
 pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
+    factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
@@ -1208,10 +1242,13 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     };
     anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
 
-    let watermark = resolve_subscribe_watermark(apply_conn, &source_log_id)
-        .await
-        .with_context(|| format!("resolve watermark for source log {source_log_id}"))
-        .context(WatermarkResolution)?;
+    let watermark = {
+        let _permit = factory.wal_gate_permit().await;
+        resolve_subscribe_watermark(apply_conn, &source_log_id)
+            .await
+            .with_context(|| format!("resolve watermark for source log {source_log_id}"))
+            .context(WatermarkResolution)?
+    };
 
     write_frame(stream, &Frame::Subscribe { from_change_id: watermark })
         .await
@@ -1225,11 +1262,12 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         source_log = %source_log_id,
         "CDC replica: subscribed"
     );
-    consume_frames(stream, apply_conn).await
+    consume_frames(stream, factory, apply_conn).await
 }
 
 async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
+    factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
     loop {
@@ -1260,7 +1298,14 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 // Fail the stream; the replica reconnects and resumes
                 // from the watermark, which has not moved.
                 let started = std::time::Instant::now();
-                match apply_batch(apply_conn, &batch).await {
+                // Permit scoped to the one apply: taken after the frame is
+                // fully read (never held across the stream read) and
+                // released before the next frame is awaited.
+                let applied = {
+                    let _permit = factory.wal_gate_permit().await;
+                    apply_batch(apply_conn, &batch).await
+                };
+                match applied {
                     Ok(()) => {
                         // Advances the watermark gauge to `change_id`,
                         // which is exactly what the local watermark table
@@ -1647,7 +1692,15 @@ async fn serve_snapshot_inner(
     local_log_id: &str,
 ) -> anyhow::Result<(i64, u64)> {
     let conn = mgmt.raw_connection().context("snapshot: open mgmt connection")?;
-    let (watermark, dump) = produce_snapshot(&conn).await.context("snapshot: produce dump")?;
+    // The dump is one long read transaction on a raw connection. Holding the
+    // gate's shared side for its duration means a truncate attempt during a
+    // bootstrap simply times out and retries (the documented long-transaction
+    // behaviour) instead of a raw `BEGIN` failing against the exclusive
+    // window. Released before the dump is written to the stream.
+    let (watermark, dump) = {
+        let _permit = mgmt.wal_gate_permit().await;
+        produce_snapshot(&conn).await.context("snapshot: produce dump")?
+    };
 
     let header = SnapshotHeader {
         watermark,
@@ -2138,7 +2191,11 @@ async fn maybe_bootstrap_cold_replica(
 ) -> anyhow::Result<()> {
     let conn = mgmt.raw_connection().context("snapshot bootstrap: open local connection")?;
 
-    if !local_db_is_cold(&conn).await.context("snapshot bootstrap: cold-start check")? {
+    let cold = {
+        let _permit = mgmt.wal_gate_permit().await;
+        local_db_is_cold(&conn).await.context("snapshot bootstrap: cold-start check")?
+    };
+    if !cold {
         cdc_metrics::record_bootstrap("skipped");
         // A warm replica already has a watermark; publish it so the gauge
         // is populated before the first batch rather than reading 0 until
@@ -2160,7 +2217,8 @@ async fn maybe_bootstrap_cold_replica(
     const MAX_ATTEMPTS: u32 = 30;
     let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match fetch_and_apply_snapshot(&conn, primary_addr, channel, max_snapshot_bytes).await {
+        match fetch_and_apply_snapshot(mgmt, &conn, primary_addr, channel, max_snapshot_bytes).await
+        {
             Ok(n) => {
                 cdc_metrics::record_bootstrap("ok");
                 tracing::info!(
@@ -2232,6 +2290,11 @@ async fn local_db_is_cold(conn: &turso::Connection) -> anyhow::Result<bool> {
 /// `max_snapshot_bytes` bounds how much body this call will accept
 /// before giving up — see `[db.sqlite.replication] max_snapshot_bytes`.
 ///
+/// `factory` is the Turso factory `conn` came from; the apply step holds
+/// its WAL-gate permit (a raw connection has no busy timeout to ride out a
+/// checkpoint's exclusive window). The fetch — a network wait — runs
+/// outside the permit.
+///
 /// # Errors
 ///
 /// Returns an error if the dial, header/chunk read, or dump application
@@ -2239,12 +2302,14 @@ async fn local_db_is_cold(conn: &turso::Connection) -> anyhow::Result<bool> {
 /// `max_snapshot_bytes`, or if the dump contains a statement outside
 /// the `CREATE`/`INSERT` allowlist.
 pub async fn fetch_and_apply_snapshot(
+    factory: &Turso,
     conn: &turso::Connection,
     primary_addr: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
     max_snapshot_bytes: u64,
 ) -> anyhow::Result<i64> {
     fetch_and_apply_snapshot_on(
+        factory,
         conn,
         primary_addr,
         channel,
@@ -2260,6 +2325,7 @@ pub async fn fetch_and_apply_snapshot(
 /// else — the size bounds, the allocation-hint clamp, the statement
 /// allowlist, the watermark seed — is identical.
 async fn fetch_and_apply_snapshot_on(
+    factory: &Turso,
     conn: &turso::Connection,
     primary_addr: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
@@ -2269,7 +2335,10 @@ async fn fetch_and_apply_snapshot_on(
     let started = std::time::Instant::now();
     let (header, dump, received) =
         fetch_snapshot(primary_addr, channel, max_snapshot_bytes, snapshot_stream).await?;
-    apply_snapshot(conn, &header, &dump).await?;
+    {
+        let _permit = factory.wal_gate_permit().await;
+        apply_snapshot(conn, &header, &dump).await?;
+    }
     // Only counted once the dump is durably applied: bytes received into
     // a buffer that then failed validation are not a bootstrap.
     cdc_metrics::record_snapshot_received(received, started.elapsed());
@@ -2656,11 +2725,34 @@ type SiteMgmtSlot = Arc<tokio::sync::Mutex<Option<Arc<SiteMgmt>>>>;
 struct SiteMgmtRegistry {
     dir: Arc<PathBuf>,
     slots: Arc<DashMap<String, SiteMgmtSlot>>,
+    /// WAL checkpoint gate for every mgmt factory (`None` = disabled). On a
+    /// node that does not own a site, the mgmt factory is the **only**
+    /// factory open on that file — the apply loop's writes grow its WAL —
+    /// so the gate has to live here too, not just on the serving registry.
+    wal_gate: Option<WalGateConfig>,
+}
+
+impl WalGateStatsSource for SiteMgmtRegistry {
+    /// One sample per opened mgmt factory. `try_lock` skips a site mid-open.
+    /// The sampler dedups by site against the serving registry, which on an
+    /// owner reports the same file (and, the gate being per file, the same
+    /// counters).
+    fn wal_gate_samples(&self, out: &mut Vec<WalGateSample>) {
+        for entry in self.slots.iter() {
+            let Ok(guard) = entry.value().try_lock() else { continue };
+            let Some(mgmt) = guard.as_ref() else { continue };
+            out.push(WalGateSample {
+                site: entry.key().clone(),
+                db_path: self.dir.join(format!("{}.db", entry.key())),
+                stats: mgmt.factory.wal_gate_stats(),
+            });
+        }
+    }
 }
 
 impl SiteMgmtRegistry {
-    fn new(dir: PathBuf) -> Self {
-        Self { dir: Arc::new(dir), slots: Arc::new(DashMap::new()) }
+    fn new(dir: PathBuf, wal_gate: Option<WalGateConfig>) -> Self {
+        Self { dir: Arc::new(dir), slots: Arc::new(DashMap::new()), wal_gate }
     }
 
     /// The per-site lock guarding that site's opened-or-not [`SiteMgmt`].
@@ -2686,7 +2778,8 @@ impl SiteMgmtRegistry {
             .to_str()
             .with_context(|| format!("per-site db path is not valid UTF-8: {}", path.display()))?;
         let factory = Arc::new(
-            Turso::open(path_str)
+            wal_gate::builder_with_gate(Turso::builder(path_str), self.wal_gate.as_ref())
+                .build()
                 .await
                 .with_context(|| format!("open mgmt Turso factory for site {site}"))?,
         );
@@ -2917,7 +3010,11 @@ pub async fn start_clustered_per_site_turso(
          discarded when that replica re-bootstraps. Turso is Beta upstream."
     );
 
-    let mgmt = SiteMgmtRegistry::new(dir.clone());
+    // The same `[db.sqlite.wal_checkpoint]` config the serving registry got
+    // in `wire_per_site_clustered_db` (which already logged the mode).
+    let mgmt =
+        SiteMgmtRegistry::new(dir.clone(), wal_gate::gate_config(&sqlite_config.wal_checkpoint));
+    wal_gate::register_source(Arc::new(mgmt.clone()));
 
     // Owner-side handlers (reactive; registered up front so a promotion is
     // served immediately).
@@ -3303,7 +3400,11 @@ async fn take_ownership_handoff(
             return;
         }
     };
-    match local_db_is_cold(&conn).await {
+    let cold = {
+        let _permit = factory.wal_gate_permit().await;
+        local_db_is_cold(&conn).await
+    };
+    match cold {
         // Not cold: we already hold this site's data, nothing to pull.
         Ok(false) => return,
         Ok(true) => {}
@@ -3337,6 +3438,7 @@ async fn take_ownership_handoff(
          snapshot from the previous owner before serving it"
     );
     match bootstrap_site_from(
+        factory,
         &conn,
         site,
         addr,
@@ -3477,13 +3579,17 @@ async fn replicate_site_once(
 ) -> anyhow::Result<()> {
     let conn = factory.raw_connection().context("per-site replica: open apply connection")?;
 
-    let lineage = site_data_lineage(&conn, own_log_id).await?;
+    let lineage = {
+        let _permit = factory.wal_gate_permit().await;
+        site_data_lineage(&conn, own_log_id).await?
+    };
     if let ReplicaAction::Bootstrap { discard_local } =
         plan_replica_attempt(force_reset, lineage.as_deref())
     {
         let bconn =
             factory.raw_connection().context("per-site replica: open snapshot connection")?;
         bootstrap_site_from(
+            factory,
             &bconn,
             site,
             owner,
@@ -3500,7 +3606,7 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    subscribe_and_consume(&mut stream, &conn).await
+    subscribe_and_consume(&mut stream, factory, &conn).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
@@ -3509,7 +3615,9 @@ async fn replicate_site_once(
 /// Fetch-then-swap: the dump is on hand and vetted *before* anything local is
 /// touched, so a peer that turns out to hold nothing costs a retry rather than
 /// a tenant's data.
+#[allow(clippy::too_many_arguments)]
 async fn bootstrap_site_from(
+    factory: &Turso,
     conn: &turso::Connection,
     site: &str,
     source: SocketAddr,
@@ -3521,9 +3629,14 @@ async fn bootstrap_site_from(
     let started = std::time::Instant::now();
     let (header, dump, received) =
         fetch_snapshot(source, channel, max_snapshot_bytes, snapshot_stream).await?;
-    install_snapshot(conn, &header, &dump, discard_local)
-        .await
-        .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
+    // Fetched outside the permit (a network wait); installed inside it (raw
+    // connection, no busy timeout — see `subscribe_and_consume`).
+    {
+        let _permit = factory.wal_gate_permit().await;
+        install_snapshot(conn, &header, &dump, discard_local)
+            .await
+            .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
+    }
     cdc_metrics::record_snapshot_received(received, started.elapsed());
     cdc_metrics::record_applied_watermark(header.watermark);
     Ok(header.watermark)

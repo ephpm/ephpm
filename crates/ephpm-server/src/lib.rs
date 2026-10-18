@@ -35,6 +35,7 @@ pub mod tls;
 pub mod tracked_backend;
 pub mod turso_cdc;
 pub mod turso_cdc_metrics;
+pub mod wal_gate;
 pub mod websocket;
 pub mod worker_pool;
 pub mod xdebug_trigger;
@@ -2350,6 +2351,12 @@ async fn start_db_proxies(
         } else {
             start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
+
+        // One sampler for every embedded-database mode: publishes each open
+        // database's -wal size and, where the gate is on, its counters.
+        // Sources registered by the paths above (and by the per-site mgmt
+        // registry, lazily) are walked on every tick.
+        wal_gate::spawn_sampler(&mut handles);
     }
 
     Ok(handles)
@@ -2597,12 +2604,16 @@ fn wire_per_site_db(
         )
     })?;
 
-    let registry = site_backends::SiteBackends::new(
+    let gate = wal_gate::gate_config(&sqlite.wal_checkpoint);
+    wal_gate::log_mode(gate.as_ref());
+    let registry = site_backends::SiteBackends::new_with_gate(
         dir,
         sqlite.max_open_dbs,
         query_stats.clone(),
         tokio::runtime::Handle::current(),
+        gate,
     )?;
+    registry.register_wal_gate_metrics();
     ephpm_php::PhpRuntime::set_db_backend_resolver(
         registry.as_resolver(),
         tokio::runtime::Handle::current(),
@@ -2698,13 +2709,22 @@ fn wire_per_site_clustered_db(
         let _ = site_tx.send(site.to_string());
     });
 
+    // The gate is installed on every per-site factory (serving and mgmt alike;
+    // the per-site clustered mgmt registry reads the same config in
+    // `start_clustered_per_site_turso`). A per-site clustered owner's WAL
+    // was the worst case measured — 6.5 GB in ten minutes, since its CDC
+    // tailers are continuous readers.
+    let gate = wal_gate::gate_config(&sqlite.wal_checkpoint);
+    wal_gate::log_mode(gate.as_ref());
     let registry = site_backends::SiteBackends::new_clustered(
         dir.clone(),
         sqlite.max_open_dbs,
         query_stats.clone(),
         tokio::runtime::Handle::current(),
         Arc::clone(&note_active),
+        gate,
     )?;
+    registry.register_wal_gate_metrics();
 
     // ONE resolver, shared by both tenant routes: local when this node is the
     // site's HRW owner, a remote proxy to the owner otherwise. This is what
@@ -2934,19 +2954,24 @@ async fn start_single_node_sqlite(
         .await
         .context("cannot start the embedded database's wire listeners")?;
     let db_path = &sqlite_config.path;
-    let backend = litewire::Turso::open(db_path)
+    let gate = wal_gate::gate_config(&sqlite_config.wal_checkpoint);
+    wal_gate::log_mode(gate.as_ref());
+    let backend = wal_gate::builder_with_gate(litewire::Turso::builder(db_path), gate.as_ref())
+        .build()
         .await
         .with_context(|| format!("failed to open database with Turso engine: {db_path}"))?;
     tracing::info!(
         path = %db_path,
         engine = "turso",
+        wal_gate = gate.is_some(),
         "opened embedded database (single-node, Turso engine)"
     );
-    spawn_single_node_litewire(
-        sqlite_config,
-        share_backend_with_php(tracked_backend::TrackedBackend::new(backend, query_stats.clone())),
-        handles,
-    );
+    // Held as a concrete `Arc` first so the WAL-gate sampler can read the
+    // factory's counters through the decorator; the same allocation is then
+    // erased for litewire and the PHP bridge.
+    let tracked = Arc::new(tracked_backend::TrackedBackend::new(backend, query_stats.clone()));
+    wal_gate::DatabaseProbe::register(wal_gate::DEFAULT_SITE_LABEL, db_path, &tracked);
+    spawn_single_node_litewire(sqlite_config, share_shared_backend_with_php(tracked), handles);
     Ok(())
 }
 
@@ -2965,7 +2990,16 @@ async fn start_single_node_sqlite(
 /// [`tokio::runtime::Handle::current`] for the bridge's sync-to-async
 /// boundary).
 pub(crate) fn share_backend_with_php(backend: impl litewire::backend::Backend) -> PhpSharedBackend {
-    let shared: litewire::backend::SharedBackend = std::sync::Arc::new(backend);
+    share_shared_backend_with_php(std::sync::Arc::new(backend))
+}
+
+/// [`share_backend_with_php`] for a backend the caller already holds in an
+/// `Arc` — so it can keep a concrete handle for observability (the WAL-gate
+/// sampler) while litewire and the bridge share that same allocation.
+pub(crate) fn share_shared_backend_with_php(
+    shared: std::sync::Arc<impl litewire::backend::Backend + 'static>,
+) -> PhpSharedBackend {
+    let shared: litewire::backend::SharedBackend = shared;
     ephpm_php::PhpRuntime::set_db_backend(
         std::sync::Arc::clone(&shared),
         tokio::runtime::Handle::current(),
@@ -3374,6 +3408,7 @@ mod lib_tests {
                 primary_grpc_url: String::new(),
                 ..ephpm_config::ReplicationConfig::default()
             },
+            wal_checkpoint: ephpm_config::WalCheckpointConfig::default(),
         }
     }
 

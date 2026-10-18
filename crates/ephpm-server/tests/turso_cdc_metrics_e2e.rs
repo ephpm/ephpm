@@ -206,7 +206,7 @@ fn spawn_replica(
             if let Ok(mut stream) = channel.dial(primary_addr, CDC_STREAM_TYPE).await {
                 // Watermark resolution happens inside subscribe_and_consume,
                 // scoped to the log the primary's Hello names (issue #315).
-                if let Err(e) = subscribe_and_consume(&mut stream, &apply_conn).await {
+                if let Err(e) = subscribe_and_consume(&mut stream, &mgmt, &apply_conn).await {
                     eprintln!("replica stream ended: {e:#}");
                 }
             }
@@ -469,7 +469,7 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
     // Production consume loop under test.
     let consumer = tokio::spawn(async move {
         let conn = apply_conn;
-        subscribe_and_consume(&mut replica_side, &conn).await
+        subscribe_and_consume(&mut replica_side, &replica, &conn).await
     });
 
     // The primary speaks first (issue #315): a Hello naming its log, so
@@ -678,6 +678,7 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
     let replica_mgmt = Turso::open(replica_file.path().to_str().unwrap()).await.unwrap();
     let replica_conn = replica_mgmt.raw_connection().unwrap();
     let watermark = fetch_and_apply_snapshot(
+        &replica_mgmt,
         &replica_conn,
         primary_channel.listen_addr(),
         &replica_channel,

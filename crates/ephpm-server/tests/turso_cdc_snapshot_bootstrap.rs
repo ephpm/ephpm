@@ -348,6 +348,7 @@ async fn cold_replica_bootstraps_snapshot_then_tails_cdc() {
     let mut bootstrapped_wm = None;
     for _ in 0..30 {
         match fetch_and_apply_snapshot(
+            &replica_mgmt,
             &replica_conn,
             primary_addr,
             &replica_channel,

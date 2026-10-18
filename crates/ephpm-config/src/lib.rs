@@ -2786,6 +2786,123 @@ pub struct SqliteConfig {
     /// Replication settings (clustered mode only).
     #[serde(default)]
     pub replication: ReplicationConfig,
+
+    /// WAL checkpoint gate (`[db.sqlite.wal_checkpoint]`): keeps every
+    /// embedded database's `-wal` file bounded under constant load. On by
+    /// default — see [`WalCheckpointConfig`].
+    #[serde(default)]
+    pub wal_checkpoint: WalCheckpointConfig,
+}
+
+/// WAL checkpoint gate settings (`[db.sqlite.wal_checkpoint]`).
+///
+/// # Why this exists
+///
+/// The Turso engine (0.8.3) checkpoints like `SQLite`: a passive
+/// auto-checkpoint copies write-ahead-log frames into the main file, but the
+/// log is only *rewound* when no reader is active at all, and
+/// `PRAGMA wal_checkpoint(RESTART|TRUNCATE)` reports `busy` the instant a
+/// reader holds a slot instead of waiting for it. Under constant concurrent
+/// load some connection is always inside a statement, so the `-wal` file grows
+/// by one frame per write forever — measured at 1.3 GB in eight minutes on a
+/// 0.7 MB single-node database, and 6.5 GB on a per-site clustered owner whose
+/// CDC tailers are continuous readers — and throughput falls with it.
+///
+/// The gate (litewire's `wal_checkpoint_gate`) gives every session statement
+/// and every CDC tailer poll the shared side of a per-file lock. A maintenance
+/// task samples the `-wal` size every [`interval_secs`](Self::interval_secs)
+/// and, once it is at least [`threshold_bytes`](Self::threshold_bytes), first
+/// backfills the log with `PRAGMA wal_checkpoint(PASSIVE)` rounds (outside the
+/// lock, blocks nobody), then takes the exclusive side for at most
+/// [`max_wait_ms`](Self::max_wait_ms) — new statements queue behind it — and
+/// runs `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction that outlives
+/// the wait makes the attempt give up and retry with exponential backoff
+/// (capped at [`max_backoff_secs`](Self::max_backoff_secs)), so the gate never
+/// deadlocks and never stalls a long transaction. The exclusive window is the
+/// checkpoint itself: milliseconds on a backfilled log.
+///
+/// # Default: on
+///
+/// Measured against the same stress harness that found the growth (single
+/// node, 48 clients, 8 minutes): the peak `-wal` went from 1,286 MiB to
+/// 68 MiB, requests served rose 7.9%, and the p99 was unchanged. On a 3-node
+/// per-site clustered run the owner's peak `-wal` went from 6,482 MiB to
+/// 363 MiB with zero errors; the cost there was roughly +100 ms at p999, from
+/// forwarded statements queueing behind an exclusive attempt for up to
+/// `max_wait_ms`. Unbounded disk growth is the worse failure, so the gate is
+/// on unless you turn it off. The knobs below are read and enforced on every
+/// embedded-Turso path (single-node, per-site, clustered, per-site clustered);
+/// the `ephpm php --site` CLI's offline direct-open deliberately runs without
+/// it (a short-lived process whose last connection close truncates the log).
+///
+/// Unknown keys are rejected — see [`ReplicationConfig`] for the reasoning.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WalCheckpointConfig {
+    /// Run the gate at all. Default: `true`.
+    ///
+    /// `false` restores the pre-gate behaviour: nothing but the engine's own
+    /// passive auto-checkpoint touches the log, and under constant readers the
+    /// `-wal` file grows without bound until the last connection closes.
+    #[serde(default = "default_wal_checkpoint_enabled")]
+    pub enabled: bool,
+
+    /// Run a truncating checkpoint once the `-wal` file is at least this many
+    /// bytes. Default: `67108864` (64 MiB) — large enough that the engine's
+    /// passive checkpoint has long since backfilled everything but the tail,
+    /// so the exclusive window has almost nothing left to copy.
+    #[serde(default = "default_wal_checkpoint_threshold_bytes")]
+    pub threshold_bytes: u64,
+
+    /// Seconds between size samples (one `stat` of the `-wal` file per tick,
+    /// per open database). Also the base of the retry backoff. Default: `2`.
+    #[serde(default = "default_wal_checkpoint_interval_secs")]
+    pub interval_secs: u64,
+
+    /// Longest an attempt waits, in milliseconds, for in-flight statements and
+    /// open transactions to drain before giving up. While it waits, **new
+    /// statements queue behind it**, so this is also the worst-case stall one
+    /// attempt can add to a request. Default: `250`.
+    #[serde(default = "default_wal_checkpoint_max_wait_ms")]
+    pub max_wait_ms: u64,
+
+    /// Cap, in seconds, on the exponential retry backoff after an attempt that
+    /// timed out, found the checkpoint busy, or hit an engine error.
+    /// Default: `60`.
+    #[serde(default = "default_wal_checkpoint_max_backoff_secs")]
+    pub max_backoff_secs: u64,
+}
+
+impl Default for WalCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_wal_checkpoint_enabled(),
+            threshold_bytes: default_wal_checkpoint_threshold_bytes(),
+            interval_secs: default_wal_checkpoint_interval_secs(),
+            max_wait_ms: default_wal_checkpoint_max_wait_ms(),
+            max_backoff_secs: default_wal_checkpoint_max_backoff_secs(),
+        }
+    }
+}
+
+fn default_wal_checkpoint_enabled() -> bool {
+    true
+}
+
+fn default_wal_checkpoint_threshold_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_wal_checkpoint_interval_secs() -> u64 {
+    2
+}
+
+fn default_wal_checkpoint_max_wait_ms() -> u64 {
+    250
+}
+
+fn default_wal_checkpoint_max_backoff_secs() -> u64 {
+    60
 }
 
 /// Wire protocol frontend addresses for the `SQLite` proxy (`[db.sqlite.proxy]`).
@@ -4934,6 +5051,37 @@ impl Config {
                 SQLITE_REPLICATION_ROLES.join(", "),
                 sqlite.replication.role,
             )));
+        }
+
+        // [db.sqlite.wal_checkpoint]: a zero here is never what an operator
+        // meant (a zero interval would spin, a zero threshold would attempt on
+        // every tick, a zero wait could never drain anything) and a backoff
+        // cap below the interval is contradictory. Checked whether or not the
+        // gate is enabled, so a bad value is caught before someone flips it on.
+        if let Some(sqlite) = self.db.sqlite.as_ref() {
+            let w = &sqlite.wal_checkpoint;
+            if w.threshold_bytes == 0 {
+                return Err(ConfigError::Validation(
+                    "[db.sqlite.wal_checkpoint] threshold_bytes must be greater than 0".into(),
+                ));
+            }
+            if w.interval_secs == 0 {
+                return Err(ConfigError::Validation(
+                    "[db.sqlite.wal_checkpoint] interval_secs must be greater than 0".into(),
+                ));
+            }
+            if w.max_wait_ms == 0 {
+                return Err(ConfigError::Validation(
+                    "[db.sqlite.wal_checkpoint] max_wait_ms must be greater than 0".into(),
+                ));
+            }
+            if w.max_backoff_secs < w.interval_secs {
+                return Err(ConfigError::Validation(format!(
+                    "[db.sqlite.wal_checkpoint] max_backoff_secs ({}) must be at least \
+                     interval_secs ({})",
+                    w.max_backoff_secs, w.interval_secs
+                )));
+            }
         }
 
         // [[server.proxy]]: validate every rule at startup so a bad upstream,
@@ -8590,11 +8738,23 @@ listen = "0.0.0.0:8080"
              role = \"auto\"\n\
              per_site = true\n\
              cdc_experimental = true\n\
-             max_snapshot_bytes = 2048\n",
+             max_snapshot_bytes = 2048\n\
+             \n\
+             [db.sqlite.wal_checkpoint]\n\
+             enabled = false\n\
+             threshold_bytes = 1048576\n\
+             interval_secs = 5\n\
+             max_wait_ms = 100\n\
+             max_backoff_secs = 30\n",
         );
         let sqlite = config.db.sqlite.expect("sqlite section present");
         assert!(sqlite.replication.per_site);
         assert_eq!(sqlite.replication.max_snapshot_bytes, 2048);
+        assert!(!sqlite.wal_checkpoint.enabled);
+        assert_eq!(sqlite.wal_checkpoint.threshold_bytes, 1_048_576);
+        assert_eq!(sqlite.wal_checkpoint.interval_secs, 5);
+        assert_eq!(sqlite.wal_checkpoint.max_wait_ms, 100);
+        assert_eq!(sqlite.wal_checkpoint.max_backoff_secs, 30);
         // Removed-but-declared knobs parse (and warn at startup) rather than
         // hard-failing an upgrading config with "unknown field".
         assert!(sqlite.replication.cdc_experimental);
@@ -8676,6 +8836,11 @@ listen = "0.0.0.0:8080"
                 "[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\n\
                  \n[db.mysql.replicas]\nurls = []\nbogus_key = 1\n",
                 "bogus_key",
+            ),
+            (
+                "[db.sqlite.wal_checkpoint]",
+                "[db.sqlite]\n[db.sqlite.wal_checkpoint]\nthreshold = 1\n",
+                "threshold",
             ),
             ("[db.read_write_split]", "[db.read_write_split]\nbogus_key = 1\n", "bogus_key"),
             ("[db.analysis]", "[db.analysis]\nbogus_key = 1\n", "bogus_key"),
@@ -9356,6 +9521,46 @@ path = "app.db"
             sqlite.max_open_dbs, 256,
             "max_open_dbs must default to 256 open per-site databases"
         );
+        // The WAL checkpoint gate is ON by default: an absent section must not
+        // leave the `-wal` file unbounded (the 1.3 GB-in-8-minutes failure).
+        let wal = &sqlite.wal_checkpoint;
+        assert!(wal.enabled, "the WAL checkpoint gate must default to enabled");
+        assert_eq!(wal.threshold_bytes, 64 * 1024 * 1024, "threshold must default to 64 MiB");
+        assert_eq!(wal.interval_secs, 2);
+        assert_eq!(wal.max_wait_ms, 250);
+        assert_eq!(wal.max_backoff_secs, 60);
+        assert_eq!(
+            WalCheckpointConfig::default().threshold_bytes,
+            wal.threshold_bytes,
+            "the struct Default and the serde defaults must agree"
+        );
+    }
+
+    /// `[db.sqlite.wal_checkpoint]` is read and enforced; a value that could
+    /// never be meant (zero) or is contradictory (backoff cap below the sample
+    /// interval) fails startup naming the key, whether or not the gate is on.
+    #[test]
+    fn wal_checkpoint_rejects_zero_and_contradictory_values() {
+        let cases = [
+            ("threshold_bytes = 0\n", "threshold_bytes"),
+            ("interval_secs = 0\n", "interval_secs"),
+            ("max_wait_ms = 0\n", "max_wait_ms"),
+            ("interval_secs = 10\nmax_backoff_secs = 5\n", "max_backoff_secs"),
+            ("enabled = false\nmax_wait_ms = 0\n", "max_wait_ms"),
+        ];
+        for (body, key) in cases {
+            let err = validate_toml(&format!("[db.sqlite]\n[db.sqlite.wal_checkpoint]\n{body}"))
+                .expect_err("a zero or contradictory WAL gate value must fail validation");
+            let msg = err.to_string();
+            assert!(msg.contains(key), "the error must name {key}: {msg}");
+        }
+        // Defaults and a sane override validate.
+        validate_toml("[db.sqlite]\n").expect("defaults must validate");
+        validate_toml(
+            "[db.sqlite]\n[db.sqlite.wal_checkpoint]\nthreshold_bytes = 16777216\n\
+             interval_secs = 1\nmax_wait_ms = 50\nmax_backoff_secs = 1\n",
+        )
+        .expect("a sane override must validate");
     }
 
     #[test]

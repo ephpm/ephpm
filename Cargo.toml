@@ -220,7 +220,30 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 5dbdbf6589aa — CDC: ship transactions larger than one poll window
+# litewire @ 36ff34b0e5e9 — WAL checkpoint gate for the Turso backend
+# (litewire#49). OPERABILITY: do not move this pin backwards. Turso 0.8.3
+# never rewinds its write-ahead log while any reader is active: the passive
+# auto-checkpoint backfills frames, but `PRAGMA wal_checkpoint(TRUNCATE)`
+# returns busy=1 the instant a read-mark slot is held (CheckpointGuard tries
+# each lock once; the busy handler is never consulted), and under constant load
+# some session is always inside a statement. The -wal file therefore grew by a
+# frame per write for the life of the process — 1.3 GB in eight minutes on a
+# 0.7 MB single-node database, 6.5 GB in ten on a per-site clustered owner
+# whose CDC tailers are continuous readers — with throughput falling as it
+# grew (ePHPm WAL-growth stress runs, 2026-10-17/18). This pin adds
+# `TursoBuilder::wal_checkpoint_gate` (module `litewire_turso::wal_gate`, OFF
+# by default in litewire): every session statement and every
+# `CdcTailer::poll_batch` holds the shared side of a per-file lock, and a
+# per-factory task backfills with PASSIVE checkpoints outside the lock, then
+# takes the exclusive side for a bounded wait and runs TRUNCATE. Plus
+# `Turso::wal_gate_stats`, `Turso::wal_gate_permit` (for raw-connection
+# callers, which get no busy timeout) and `Turso::wal_gate_task_finished`.
+# ePHPm turns the gate ON by default on every file-backed factory
+# (`[db.sqlite.wal_checkpoint]`, ephpm-server/src/wal_gate.rs). Single commit
+# on top of 5dbdbf6589aa; no dependency moves (turso stays =0.8.3); the
+# lockfile changes only the litewire crates' source rev.
+#
+# Previous pin 5dbdbf6589aa — CDC: ship transactions larger than one poll window
 # (litewire#48). DATA DURABILITY: do not move this pin backwards.
 # `CdcTailer::poll_batch` read `turso_cdc` in a 1024-row window and answered
 # `Ok(None)` ("nothing pending") when that window held no COMMIT row. A
@@ -483,7 +506,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "5dbdbf6589aa86cf743c6dfd0bd25e73ef7517a4", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "36ff34b0e5e98a4c68aa4deae9d864237eb83fdc", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)

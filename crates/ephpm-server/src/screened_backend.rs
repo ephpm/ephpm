@@ -73,6 +73,14 @@ impl<B: Backend> ScreenedBackend<B> {
     }
 }
 
+impl<B> ScreenedBackend<B> {
+    /// The wrapped backend (for observability that lives on the inner
+    /// factory, such as the WAL checkpoint gate's counters).
+    pub const fn inner(&self) -> &B {
+        &self.inner
+    }
+}
+
 /// Turn a rejected statement into the error the caller sees.
 ///
 /// [`BackendError::Sqlite`] rather than `Other` so the MySQL frontend's error
