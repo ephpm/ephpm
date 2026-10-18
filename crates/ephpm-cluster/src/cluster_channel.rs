@@ -106,6 +106,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -115,7 +116,7 @@ use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::ClusterHandle;
@@ -178,6 +179,13 @@ const MAX_SEALED_PLAINTEXT_LEN: usize = 64 * 1024;
 
 /// Length of the sealed-frame length prefix, in bytes.
 const SEALED_LEN_PREFIX: usize = 4;
+
+/// Wall-clock budget for the graceful close of a dialed connection once
+/// its stream has ended (flush the frames the stream queued, send
+/// `GoAway`, shut the socket down). A peer that stops reading could
+/// otherwise pin the driver task on a full send buffer forever; past the
+/// budget the connection is dropped, which closes the socket regardless.
+const DIALED_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Feature registry — the "lazy bind" contract.
@@ -310,6 +318,11 @@ struct HandleInner {
     /// task and the public API so registrations are visible on both
     /// sides.
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
+    /// Connections this handle dialed whose driver task is still running.
+    live_dialed: Arc<AtomicUsize>,
+    /// Connections the listener accepted whose driver task is still
+    /// running.
+    live_accepted: Arc<AtomicUsize>,
 }
 
 struct HandlerEntry {
@@ -332,12 +345,60 @@ pub struct IncomingStream {
     pub peer: SocketAddr,
 }
 
-/// Alias for the yamux stream type used on the wire.
+/// One multiplexed stream on a cluster channel connection.
 ///
-/// Wrapped in [`Compat`] so callers can use tokio's `AsyncRead`/
-/// `AsyncWrite` traits everywhere else in the codebase and only touch
-/// the `futures::io` traits inside this module.
-pub type ChannelStream = Compat<yamux::Stream>;
+/// Wraps the yamux stream in [`Compat`] so callers can use tokio's
+/// `AsyncRead`/`AsyncWrite` traits everywhere else in the codebase and
+/// only touch the `futures::io` traits inside this module.
+///
+/// A stream returned by [`Handle::dial`] additionally owns its
+/// connection's lifetime: every dial opens a fresh TCP connection that
+/// carries exactly this one stream, so dropping the stream tells the
+/// connection driver to close the connection (flush, `GoAway`, socket
+/// shutdown — see [`drive_connection`]). An accepted stream
+/// ([`IncomingStream::stream`]) carries no such signal; the accepting
+/// side's connection ends when the dialer closes it.
+pub struct ChannelStream {
+    inner: Compat<yamux::Stream>,
+    /// `Some` on a dialed stream. Dropped together with `inner` (field
+    /// order matters: the yamux stream goes first so its close is queued
+    /// before the driver is told to shut the connection down).
+    _close: Option<oneshot::Sender<()>>,
+}
+
+impl ChannelStream {
+    fn new(stream: yamux::Stream, close: Option<oneshot::Sender<()>>) -> Self {
+        Self { inner: stream.compat(), _close: close }
+    }
+}
+
+impl AsyncRead for ChannelStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ChannelStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 impl Handle {
     /// The address the channel listener is bound on.
@@ -398,8 +459,28 @@ impl Handle {
         rx
     }
 
+    /// Number of connections this handle has dialed whose driver task is
+    /// still running. Each dial is one connection; it is released when
+    /// the returned [`ChannelStream`] is dropped (or the peer closes).
+    #[must_use]
+    pub fn live_dialed_connections(&self) -> usize {
+        self.inner.live_dialed.load(Ordering::SeqCst)
+    }
+
+    /// Number of connections the listener has accepted whose driver task
+    /// is still running. Released when the dialer closes the connection.
+    #[must_use]
+    pub fn live_accepted_connections(&self) -> usize {
+        self.inner.live_accepted.load(Ordering::SeqCst)
+    }
+
     /// Dial `peer_addr`, complete the handshake, open a yamux stream,
     /// send the `stream_type` header, and return the stream.
+    ///
+    /// The connection carries only this stream and lives exactly as long
+    /// as it: dropping the returned [`ChannelStream`] closes the
+    /// connection (after flushing anything written to it), so a caller
+    /// that dials per session/request does not accumulate connections.
     ///
     /// # Errors
     ///
@@ -431,14 +512,39 @@ impl Handle {
         // Dialer connections don't accept inbound streams for us, but
         // yamux is symmetric — control frames (WindowUpdate, Ping,
         // GoAway) still arrive and must be driven. We spawn a drain
-        // task with an empty handler set; the connection will run
-        // until either side closes.
+        // task with an empty handler set; it runs until the peer closes
+        // or — since this connection exists only to carry the one
+        // stream — until the returned stream is dropped, at which point
+        // it closes the connection. Without that signal the acceptor
+        // waits for us and we wait for the acceptor: one leaked TCP
+        // connection and driver task per dial, on both ends.
         let drain_handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(drive_connection(conn, drain_handlers, peer_addr));
+        let (close_tx, close_rx) = oneshot::channel();
+        let live = LiveConnection::new(&self.inner.live_dialed);
+        tokio::spawn(drive_connection(conn, drain_handlers, peer_addr, Some(close_rx), live));
 
-        let mut compat = stream.compat();
-        write_stream_type(&mut compat, stream_type).await?;
-        Ok(compat)
+        let mut stream = ChannelStream::new(stream, Some(close_tx));
+        write_stream_type(&mut stream, stream_type).await?;
+        Ok(stream)
+    }
+}
+
+/// Holds a slot in a live-connection gauge for as long as a connection's
+/// driver task runs. The gauges exist so the connection lifetime is
+/// observable without parsing socket tables — a dial whose connection
+/// outlives its stream shows up as a count that never returns to zero.
+struct LiveConnection(Arc<AtomicUsize>);
+
+impl LiveConnection {
+    fn new(gauge: &Arc<AtomicUsize>) -> Self {
+        gauge.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(gauge))
+    }
+}
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -505,6 +611,7 @@ pub async fn maybe_start(
 
     let keys = Arc::new(ChannelKeys::new(effective_secret));
     let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let live_accepted = Arc::new(AtomicUsize::new(0));
 
     let gossip_advertise_ip = cluster.gossip_socket_addr().ip();
 
@@ -514,11 +621,13 @@ pub async fn maybe_start(
             gossip_advertise_ip,
             keys: Arc::clone(&keys),
             handlers: Arc::clone(&handlers),
+            live_dialed: Arc::new(AtomicUsize::new(0)),
+            live_accepted: Arc::clone(&live_accepted),
         }),
     };
 
     let peers = Some(Arc::clone(cluster));
-    tokio::spawn(accept_loop(listener, keys, Arc::clone(&handlers), peers));
+    tokio::spawn(accept_loop(listener, keys, Arc::clone(&handlers), peers, live_accepted));
 
     tracing::info!(
         %listen_addr,
@@ -595,11 +704,15 @@ fn resolve_advertise_addr(listen: SocketAddr, gossip_ip: std::net::IpAddr) -> Op
 /// unit tests, which drive the accept loop directly against a loopback
 /// pair with no gossip mesh to consult; passing `None` disables the
 /// membership check and nothing else.
+///
+/// `live` counts accepted connections whose driver is running (see
+/// [`LiveConnection`]).
 async fn accept_loop(
     listener: TcpListener,
     keys: Arc<ChannelKeys>,
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
     cluster: Option<Arc<ClusterHandle>>,
+    live: Arc<AtomicUsize>,
 ) {
     // Bounds concurrent *pre-authentication* work. Permits are released
     // as soon as the handshake resolves, so long-lived authenticated
@@ -629,6 +742,7 @@ async fn accept_loop(
         let keys = Arc::clone(&keys);
         let handlers = Arc::clone(&handlers);
         let cluster = cluster.clone();
+        let live = Arc::clone(&live);
         tokio::spawn(async move {
             let admitted = if let Some(cluster) = &cluster {
                 peer_is_cluster_member(cluster, peer.ip()).await
@@ -673,7 +787,8 @@ async fn accept_loop(
             let sealed = SealedStream::new(tcp, session);
             let cfg = yamux_config();
             let conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Server);
-            drive_connection(conn, handlers, peer).await;
+            let live = LiveConnection::new(&live);
+            drive_connection(conn, handlers, peer, None, live).await;
         });
     }
 }
@@ -1116,41 +1231,113 @@ where
     Fut(conn).await
 }
 
+async fn poll_close<T>(conn: &mut yamux::Connection<T>) -> yamux::Result<()>
+where
+    T: FuturesAsyncRead + FuturesAsyncWrite + Unpin,
+{
+    struct Fut<'a, T>(&'a mut yamux::Connection<T>);
+    impl<T: FuturesAsyncRead + FuturesAsyncWrite + Unpin> Future for Fut<'_, T> {
+        type Output = yamux::Result<()>;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.poll_close(cx)
+        }
+    }
+    Fut(conn).await
+}
+
 // ---------------------------------------------------------------------------
 // Connection driver.
 // ---------------------------------------------------------------------------
 
+/// Drive one yamux connection until it ends, dispatching inbound streams
+/// to `handlers`.
+///
+/// `stream_gone` is `Some` on a dialed connection: it resolves when the
+/// dialer's one [`ChannelStream`] is dropped, and the driver then closes
+/// the connection gracefully — yamux first drains the data/close frames
+/// the stream queued before it was dropped, then sends `GoAway` and
+/// shuts the socket down — so a caller that writes and immediately drops
+/// loses nothing. On the accepting side it is `None`: that connection
+/// ends when the dialer closes it (or the socket dies).
+///
+/// `_live` keeps the endpoint's live-connection gauge accurate for
+/// exactly as long as this task runs.
 async fn drive_connection<T>(
     mut conn: yamux::Connection<T>,
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
     peer: SocketAddr,
+    mut stream_gone: Option<oneshot::Receiver<()>>,
+    _live: LiveConnection,
 ) where
     T: FuturesAsyncRead + FuturesAsyncWrite + Unpin + Send + 'static,
 {
     loop {
-        match poll_next_inbound(&mut conn).await {
-            Some(Ok(stream)) => {
+        // `None` = the dialer's stream ended; `Some(ev)` = the connection
+        // produced an event. Scoped so the borrow of `conn` ends before
+        // the close path takes it by value.
+        let event = {
+            let next = poll_next_inbound(&mut conn);
+            match stream_gone.as_mut() {
+                Some(gone) => tokio::select! {
+                    ev = next => Some(ev),
+                    _ = gone => None,
+                },
+                None => Some(next.await),
+            }
+        };
+        match event {
+            None => {
+                close_dialed_connection(conn, peer).await;
+                return;
+            }
+            Some(Some(Ok(stream))) => {
                 let handlers = Arc::clone(&handlers);
                 tokio::spawn(async move {
-                    let mut compat = stream.compat();
-                    let stream_type = match read_stream_type(&mut compat).await {
+                    let mut stream = ChannelStream::new(stream, None);
+                    let stream_type = match read_stream_type(&mut stream).await {
                         Ok(t) => t,
                         Err(e) => {
                             tracing::warn!(%peer, "cluster channel: stream-type read error: {e:#}");
                             return;
                         }
                     };
-                    dispatch_stream(&handlers, stream_type, compat, peer);
+                    dispatch_stream(&handlers, stream_type, stream, peer);
                 });
             }
-            Some(Err(e)) => {
+            Some(Some(Err(e))) => {
                 tracing::debug!(%peer, "cluster channel: yamux inbound error: {e}");
                 break;
             }
-            None => {
+            Some(None) => {
                 tracing::debug!(%peer, "cluster channel: yamux connection closed by peer");
                 break;
             }
+        }
+    }
+}
+
+/// Close a dialed connection whose stream has ended. `poll_close` keeps
+/// driving the connection while it flushes pending frames, `GoAway` and
+/// the socket shutdown; an error means the socket was already dead
+/// (nothing left to flush) and a timeout means the peer stopped reading.
+/// `conn` is dropped on every path, which closes the socket regardless.
+async fn close_dialed_connection<T>(mut conn: yamux::Connection<T>, peer: SocketAddr)
+where
+    T: FuturesAsyncRead + FuturesAsyncWrite + Unpin,
+{
+    match tokio::time::timeout(DIALED_CLOSE_TIMEOUT, poll_close(&mut conn)).await {
+        Ok(Ok(())) => {
+            tracing::debug!(%peer, "cluster channel: dialed connection closed (stream ended)");
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(%peer, "cluster channel: dialed connection close after stream end: {e}");
+        }
+        Err(_) => {
+            tracing::debug!(
+                %peer,
+                timeout_secs = DIALED_CLOSE_TIMEOUT.as_secs(),
+                "cluster channel: dialed connection close timed out; dropping the socket"
+            );
         }
     }
 }
@@ -1346,7 +1533,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         handlers.lock().push(HandlerEntry { pattern: "cdc/default".into(), prefix: false, tx });
 
-        tokio::spawn(accept_loop(listener, Arc::clone(&keys), Arc::clone(&handlers), None));
+        tokio::spawn(accept_loop(
+            listener,
+            Arc::clone(&keys),
+            Arc::clone(&handlers),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
 
         // Dial as a client.
         let mut tcp = TcpStream::connect(addr).await.unwrap();
@@ -1355,9 +1548,10 @@ mod tests {
         let cfg = yamux_config();
         let mut conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Client);
         let stream = poll_new_outbound(&mut conn).await.unwrap();
-        tokio::spawn(drive_connection(conn, Arc::new(Mutex::new(Vec::new())), addr));
+        let live = LiveConnection::new(&Arc::new(AtomicUsize::new(0)));
+        tokio::spawn(drive_connection(conn, Arc::new(Mutex::new(Vec::new())), addr, None, live));
 
-        let mut cs = stream.compat();
+        let mut cs = ChannelStream::new(stream, None);
         write_stream_type(&mut cs, "cdc/default").await.expect("write type");
         cs.write_all(b"hello").await.unwrap();
         cs.flush().await.unwrap();
@@ -1383,7 +1577,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         handlers.lock().push(HandlerEntry { pattern: "cdc/".into(), prefix: true, tx });
-        tokio::spawn(accept_loop(listener, Arc::clone(&good), Arc::clone(&handlers), None));
+        tokio::spawn(accept_loop(
+            listener,
+            Arc::clone(&good),
+            Arc::clone(&handlers),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
 
         let mut tcp = TcpStream::connect(addr).await.unwrap();
         let hs = handshake_initiate(&mut tcp, &bad).await;
@@ -1410,7 +1610,13 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(accept_loop(listener, Arc::clone(&keys), Arc::clone(&handlers), None));
+        tokio::spawn(accept_loop(
+            listener,
+            Arc::clone(&keys),
+            Arc::clone(&handlers),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        ));
 
         // 1. Capture what a legitimate initiator puts on the wire.
         let mut recorder = TcpStream::connect(addr).await.unwrap();
@@ -1481,6 +1687,129 @@ mod tests {
         assert!(
             !on_the_wire.windows(16).any(|w| w == b"plaintext-marker"),
             "channel payload must not appear in cleartext on the wire"
+        );
+    }
+
+    /// Bring up a real channel listener on loopback through
+    /// [`maybe_start`] (gossip on an OS-assigned UDP port, channel on an
+    /// OS-assigned TCP port) and return its handle. Dialing
+    /// `handle.listen_addr()` from the same process passes the membership
+    /// check because the dialer's IP is the gossip IP (self counts).
+    async fn start_loopback_channel() -> Handle {
+        let cfg = ephpm_config::ClusterConfig {
+            enabled: true,
+            bind: pick_free_port_addr(),
+            secret: "loopback-channel-secret".to_string(),
+            ..ephpm_config::ClusterConfig::default()
+        };
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
+        let channel_cfg = ephpm_config::ClusterChannelConfig {
+            listen: Some("127.0.0.1:0".to_string()),
+            ..ephpm_config::ClusterChannelConfig::default()
+        };
+        maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })
+            .await
+            .expect("maybe_start")
+            .expect("channel handle")
+    }
+
+    /// Poll `cond` until it holds or `deadline` elapses; `true` iff it held.
+    async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cond()
+    }
+
+    /// **Connection-leak regression.** A dialed connection carries exactly
+    /// one stream, so it must go away when that stream does. Before the
+    /// fix `dial` spawned a driver that ended only when the *peer* closed
+    /// the connection — and the accepting peer only closes when the
+    /// dialer does — so every dial pinned one TCP connection plus one
+    /// task on each end forever (`sql_forward` dials once per forwarding
+    /// session, i.e. per PHP request on a non-owner; the CDC replica
+    /// re-dials on every reconnect). Dial N times through a real
+    /// listener, drop each stream, and require both ends' live-connection
+    /// gauges to return to zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dialed_connection_closes_when_its_stream_is_dropped() {
+        const DIALS: usize = 100;
+        let handle = start_loopback_channel().await;
+        let mut rx = handle.register_exact("cdc/leak-check");
+
+        // Acceptor-side handler: read each inbound stream to EOF, drop it.
+        tokio::spawn(async move {
+            while let Some(mut incoming) = rx.recv().await {
+                tokio::spawn(async move {
+                    let mut sink = Vec::new();
+                    let _ = incoming.stream.read_to_end(&mut sink).await;
+                });
+            }
+        });
+
+        for _ in 0..DIALS {
+            let mut stream =
+                handle.dial(handle.listen_addr(), "cdc/leak-check").await.expect("dial");
+            stream.write_all(b"one request").await.expect("write");
+            drop(stream);
+        }
+
+        let drained = wait_until(Duration::from_secs(10), || {
+            handle.live_dialed_connections() == 0 && handle.live_accepted_connections() == 0
+        })
+        .await;
+        assert!(
+            drained,
+            "after {DIALS} dial+drop cycles the connections must be released on both ends; \
+             still live: dialed={} accepted={}",
+            handle.live_dialed_connections(),
+            handle.live_accepted_connections()
+        );
+    }
+
+    /// **Flush-before-close.** Closing the connection when the stream is
+    /// dropped must not race the data the caller wrote: a dialer that
+    /// `write_all`s a payload and drops the stream immediately — no
+    /// flush, no shutdown — still delivers every byte to the handler.
+    /// The payload spans several yamux data frames (more than the
+    /// stream's 10-command queue to the connection), so part of it is
+    /// still queued inside yamux when the driver is told to close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bytes_written_before_drop_reach_the_handler() {
+        let handle = start_loopback_channel().await;
+        let mut rx = handle.register_exact("snapshot/flush-check");
+
+        let payload: Vec<u8> =
+            (0..200 * 1024).map(|i: usize| u8::try_from(i % 251).expect("< 256")).collect();
+        let expected = payload.clone();
+
+        let (done_tx, done_rx) = oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let mut incoming = rx.recv().await.expect("dispatched stream");
+            let mut got = Vec::new();
+            incoming.stream.read_to_end(&mut got).await.expect("read to EOF");
+            let _ = done_tx.send(got);
+        });
+
+        let mut stream =
+            handle.dial(handle.listen_addr(), "snapshot/flush-check").await.expect("dial");
+        stream.write_all(&payload).await.expect("write");
+        drop(stream);
+
+        let got = tokio::time::timeout(Duration::from_secs(10), done_rx)
+            .await
+            .expect("handler must reach EOF after the dialer drops its stream")
+            .expect("handler task sent its bytes");
+        assert_eq!(got.len(), expected.len(), "tail bytes lost on close");
+        assert!(got == expected, "payload corrupted on close");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || handle.live_dialed_connections() == 0).await,
+            "the dialed connection must still be released after the flush"
         );
     }
 
