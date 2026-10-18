@@ -220,7 +220,28 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ bd88f92579ed — turso 0.8.2 → 0.8.3 (litewire#47). SECURITY /
+# litewire @ 5dbdbf6589aa — CDC: ship transactions larger than one poll window
+# (litewire#48). DATA DURABILITY: do not move this pin backwards.
+# `CdcTailer::poll_batch` read `turso_cdc` in a 1024-row window and answered
+# `Ok(None)` ("nothing pending") when that window held no COMMIT row. A
+# committed transaction with 1024+ row changes never has its COMMIT in the
+# first window, so every poll said nothing was pending, the cursor never moved,
+# and replication stopped there for good — along with every later transaction.
+# No error, no failed poll, every `ephpm_cdc_*` error counter stayed 0, and
+# replicas kept serving stale data; only the primary's lag gauge showed it.
+# Found by ePHPm's 3-node clustered Turso stress run: a 3000-row seed INSERT
+# froze both replicas at change_id 12 while the primary reached 705k. A
+# WordPress import, a framework migration or any bulk INSERT does the same.
+# poll_batch now reads window after window until the first COMMIT; a batch is
+# still exactly one transaction, applied atomically on the replica. Single
+# commit on top of bd88f92579ed; no dependency moves (turso stays =0.8.3).
+# Remaining known limit on the ePHPm side: one batch is one cluster-channel
+# frame, capped at MAX_FRAME_LEN (16 MiB, ephpm-server/src/turso_cdc.rs). A
+# single transaction whose rows exceed that is now refused loudly at the frame
+# cap instead of stalling silently — but the replica loops on reconnect at the
+# same batch. Frame chunking is a follow-up.
+#
+# Previous pin bd88f92579ed — turso 0.8.2 → 0.8.3 (litewire#47). SECURITY /
 # DATA LOSS: do not move this pin backwards. 0.8.2 accepted
 # `PRAGMA journal_mode = 'mvcc'` INSIDE a transaction; the switch wrote the
 # MVCC logical log before the MVCC metadata table existed, COMMIT reported
@@ -462,7 +483,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "bd88f92579edfe28778d60f887d4007b9aad6e0b", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "5dbdbf6589aa86cf743c6dfd0bd25e73ef7517a4", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
