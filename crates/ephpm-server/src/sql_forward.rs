@@ -328,10 +328,16 @@ impl RemoteProxyConn {
     async fn forward(&self, req: &SqlRequest) -> Result<SqlResponse, BackendError> {
         let mut guard = self.stream.lock().await;
         if guard.is_none() {
+            // "connection refused" is load-bearing: it is one of the
+            // bridge's connection-shaped markers (`is_connection_error`).
+            // `{e:#}` keeps the whole anyhow chain so the OS-level cause
+            // (EADDRNOTAVAIL from port exhaustion, ECONNREFUSED, a
+            // handshake timeout) is visible instead of just the outermost
+            // "connect to <addr>" context.
             let dialed =
                 self.channel.dial(self.owner_addr, &self.stream_type).await.map_err(|e| {
                     BackendError::Other(format!(
-                        "connection refused forwarding to site owner {}: {e}",
+                        "connection refused forwarding to site owner {}: {e:#}",
                         self.owner_addr
                     ))
                 })?;
