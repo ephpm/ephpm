@@ -238,6 +238,22 @@ path is a **single ordered stream** with no schema-sync side channel.
   identity refuses the reclaim and falls through to the normal grace +
   election; a genuine fast restart with unchanged data still reclaims
   immediately.
+- **Transactions larger than one poll window replicate (post-v0.12.0,
+  litewire#48).** litewire's `CdcTailer::poll_batch` read `turso_cdc` in
+  a 1024-row window and answered "nothing pending" when that window held
+  no COMMIT row. A committed transaction with 1024+ row changes never has
+  its COMMIT in the first window, so every poll said nothing was pending,
+  the cursor never moved, and replication stopped there for good — along
+  with every later transaction. Nothing reported it: no error, no failed
+  poll, every `ephpm_cdc_*` error counter stayed 0 and replicas kept
+  serving stale data; only the primary's `ephpm_cdc_replication_lag_changes`
+  gauge showed it. Found by the 3-node clustered stress run — a 3000-row
+  seed INSERT froze both replicas at change_id 12 while the primary's head
+  reached 705k. A WordPress import, a framework migration or any bulk
+  INSERT does the same. `poll_batch` now reads window after window until
+  the first COMMIT; a batch is still exactly one transaction and the
+  replica still applies it atomically. The remaining ceiling is ePHPm's
+  own 16 MiB per-frame cap on the cluster channel — see "still deferred".
 - Prometheus instrumentation for the whole path — batches and rows
   shipped and applied, subscriber count, the applied watermark, apply and
   tail-poll errors, reconnects by outcome, snapshot bytes and outcome,
@@ -249,6 +265,23 @@ path is a **single ordered stream** with no schema-sync side channel.
 
 **Still deferred:**
 
+- **Chunking a single CDC batch across cluster-channel frames.** One
+  batch (one transaction) is shipped as one frame, and both ends cap a
+  frame at 16 MiB (`MAX_FRAME_LEN` in `turso_cdc.rs`). With the
+  poll-window fix above, a transaction whose `turso_cdc` rows serialize
+  past that cap now fails **loudly** at the frame cap instead of
+  stalling silently — the primary's `write_frame` refuses it ("frame too
+  large"), that subscriber stream ends, the replica reconnects from the
+  identical cursor, meets the same batch, and loops. The signals are a
+  repeating `CDC subscriber disconnected: frame too large` line on the
+  primary (logged at INFO, like any disconnect) and `CDC replica stream
+  error` at WARN on the replica,
+  `ephpm_cdc_replica_connects_total{outcome="stream_error"}` climbing on
+  the replica, `ephpm_cdc_batches_shipped_total` standing still and
+  `ephpm_cdc_replication_lag_changes` growing; no `ephpm_cdc_*_errors_total`
+  counter moves, because neither the poll nor an apply failed. A bulk
+  load that large should be split into smaller transactions until the
+  batch is chunked across frames.
 - A **time-based** replication lag. `ephpm_cdc_replication_lag_changes`
   counts change-log rows, which answers "how far behind" but not "how
   many seconds behind". A seconds-valued lag needs a commit timestamp
