@@ -512,7 +512,7 @@ turso = { version = "=0.8.3", default-features = false }
 # `composer install --no-dev --no-interaction --prefer-dist -o` runs.
 # vivacity-core 0.21.0 still pins `zip =2.4.2`; see the RUSTSEC ignores in
 # deny.toml.
-vivacity = { version = "=0.21.0", default-features = false, features = ["rustls-tls-no-provider"] }
+vivacity = { version = "=0.22.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

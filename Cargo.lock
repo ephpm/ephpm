@@ -6117,11 +6117,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivacity"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85579c0f0f9c9b497460b42fb37839a407567e4318fbc9ff2b890a0698f7c200"
+checksum = "4e3091c524ec5e9eb34bd9ae1a4fd5c7f518e9645024334e129b8990ec4ccc4e"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "md-5 0.10.6",
  "serde_json",
@@ -6133,9 +6134,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-autoload"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a240e4b6fff6b542458e593daf2f73214d080b06538cb8b90ece6d07d98c17"
+checksum = "36bd1ed93c9f3cafe26d233dfb78c0f7c4387b5cb10fa918d6bf3115620c8388"
 dependencies = [
  "md-5 0.10.6",
  "memchr",
@@ -6150,9 +6151,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-core"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df84274c0042ace2c8defd481b23d504f339780b55c8415d717ae5ac0fb1b627"
+checksum = "a71fb0886f45932e9db7e92b20d647c3bf9f08dd54b6935d9722746a2c2cce6a"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6176,9 +6177,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "592e96e1760883885264af83dc197c72ae9dc28efda5900f723c0dc59ddab69e"
+checksum = "7d8fc6bbfcecf0a082a4970a70236dcc7b47244d565af808bffe76ce4b43ec8d"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6187,9 +6188,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2-sys"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dec9070d23d9d7cc4d7109ec0db734f00ee2c0f43b249f18da13f4c8e5d9490"
+checksum = "ece5ff6176af986603e184bc79ba63940548b40a3b6f48742fbdf9c51e29e842"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6197,9 +6198,9 @@ dependencies = [
 
 [[package]]
 name = "vivacity-resolver"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65717e38a99765385f776c829e21a2ef95eec3b293c060fa0d9d6a2bde6ab23c"
+checksum = "38f38a02b999793acd46638addacddb1af8e435d100a826bc6f7e6ec81ddfd39"
 dependencies = [
  "serde",
  "serde_json",
