@@ -52,7 +52,7 @@ sites_dir` is set, every PHP request gets four `$_SERVER` variables:
 |---|---|
 | `EPHPM_REDIS_HOST` | The host part of `[kv.redis_compat] listen`, verbatim. A wildcard listen address such as `0.0.0.0` is handed to PHP as `0.0.0.0`. |
 | `EPHPM_REDIS_PORT` | The port part of `listen`. |
-| `EPHPM_REDIS_USERNAME` | The request's **canonical site key**: the vhost directory name, with `sites_domain_suffix` already stripped (for example `blog`, not `blog.localhost`). For a host that matches no vhost it is the normalized `Host` (lowercased, port and trailing dot removed). |
+| `EPHPM_REDIS_USERNAME` | The request's **canonical site key**: the vhost directory name, with `sites_domain_suffix` already stripped (for example `blog`, not `blog.localhost`). A host that matches no vhost gets none of these variables: it is not a tenant and has no KV keyspace. |
 | `EPHPM_REDIS_PASSWORD` | `HMAC-SHA256([kv] secret, EPHPM_REDIS_USERNAME)`, lowercase hex. |
 
 With any of the three conditions missing, none of them are set.

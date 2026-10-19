@@ -312,7 +312,7 @@ EPHPM_REDIS_USERNAME   # the canonical site key (e.g. alice-blog.com; "alice-blo
 EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, site key) hex
 ```
 
-The site key is the vhost's canonical name: the `Host` header lowercased, with any port and trailing dot removed, and with `[server] sites_domain_suffix` stripped when one is configured. It matches the site's directory name under `sites_dir`. A `Host` that matches no site falls back to its own normalized name.
+The site key is the vhost's canonical name: the `Host` header lowercased, with any port and trailing dot removed, and with `[server] sites_domain_suffix` stripped when one is configured. It matches the site's directory name under `sites_dir`. A `Host` that matches no site is not a tenant: it gets no KV keyspace and no `EPHPM_REDIS_*` variables. On a multi-tenant node, `ephpm_kv_*` calls from such a request return their failure value (`null`, `false`, `0` or `-2`) and raise one warning per request: `no per-site KV context for this request`. This matches how `ephpm_db_*` behaves. Without it, every distinct `Host` header would create its own KV store, which is never freed, so unauthenticated clients could grow memory without bound. A PHP session using the `ephpm` save handler in such a request starts empty and cannot be saved. To give the fallback site a keyspace, serve it from its own directory under `sites_dir`. Single-site nodes (no `sites_dir`) are unaffected and always use the one global store.
 
 These are **`$_SERVER` entries, not process environment variables**: read `$_SERVER['EPHPM_REDIS_PASSWORD']`. `getenv()` returns `false` for them, because a process-wide environment would be shared by every tenant's threads.
 

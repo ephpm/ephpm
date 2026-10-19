@@ -418,11 +418,9 @@ unsafe extern "C" fn response_body(p: *const EphpmResponseCtx, out_ptr: *mut *co
 
 /// The process-wide store. Also the fallback for a request that matched no
 /// vhost: such a request has no tenant, so there is no per-site keyspace it
-/// could legitimately be given. (PHP's `kv` identity instead falls back to the
-/// normalized `Host`, which suits a catch-all document root serving many
-/// names. The middleware chain runs on *every* request — static files
-/// included — so minting a store per `Host` value here would be a cheap way to
-/// grow the site map without bound.)
+/// could legitimately be given. (Minting a store per `Host` value would be a
+/// cheap way to grow the site map without bound — PHP's `ephpm_kv_*` used to
+/// do exactly that and now gets no store at all for an unmatched host.)
 static KV_STORE: OnceLock<Arc<ephpm_kv::store::Store>> = OnceLock::new();
 
 thread_local! {
