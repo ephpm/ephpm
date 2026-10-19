@@ -402,7 +402,19 @@ async fn handle_connection(
                         continue;
                     }
 
-                    let response = command::dispatch(&active_store, &frame);
+                    let response = if cmd_name.as_deref() == Some("KEYS") {
+                        // KEYS walks the whole keyspace, O(keys). Run it on
+                        // the blocking pool so a big or slow scan never parks
+                        // a tokio worker that other connections (and the
+                        // HTTP server sharing this runtime) need. Awaiting it
+                        // here keeps pipelined replies in order.
+                        let store = Arc::clone(&active_store);
+                        tokio::task::spawn_blocking(move || command::dispatch(&store, &frame))
+                            .await
+                            .unwrap_or_else(|e| Frame::error(format!("ERR KEYS failed: {e}")))
+                    } else {
+                        command::dispatch(&active_store, &frame)
+                    };
                     write_buf.clear();
                     response.write_to(&mut write_buf);
                     stream.write_all(&write_buf).await?;
