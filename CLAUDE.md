@@ -8,6 +8,12 @@ An all-in-one PHP application server written in Rust that embeds PHP via FFI int
 # Stub mode (no PHP, fast iteration on HTTP/routing logic)
 cargo build
 
+# Dev/test builds carry trimmed debuginfo (workspace crates: line tables only;
+# dependencies: none) — see the comment above [profile.dev] in Cargo.toml. Panic
+# backtraces keep file:line for ephpm code. For a debugger with variable
+# inspection, pass the overrides on the command line (both are needed):
+cargo build --config 'profile.dev.debug=true' --config 'profile.dev.package."*".debug=true'
+
 # Preflight: check build prerequisites (exits non-zero if a required tool is missing)
 cargo xtask doctor            # add --target windows to check the Windows-build toolchain
 

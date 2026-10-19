@@ -69,6 +69,18 @@ cargo build
 
 The binary will serve static files and return a placeholder response for `.php` routes. This is the default development workflow — most HTTP/routing work doesn't need PHP linked.
 
+### Debug info in dev and test builds
+
+The `dev` profile (and `test`, which inherits it) is configured in the workspace `Cargo.toml` to emit **line tables only** for the ePHPm crates and **no debuginfo** for dependencies. Panic backtraces still show `file:line` for ePHPm code, and dependency frames still show function names; what you lose is variable inspection in a debugger. The reason is disk: with full debuginfo every one of the ~80 test binaries links its own copy of every dependency's debug data, and a single `cargo test --workspace --no-run` target directory was 21 GB (8.7 GB of it `.pdb` files on Windows). Trimmed, it is 7 GB.
+
+To step through code in a debugger with full debuginfo, pass both overrides on the command line — the second is required because a plain `profile.dev.debug` does not reach the per-dependency entry:
+
+```bash
+cargo build --config 'profile.dev.debug=true' --config 'profile.dev.package."*".debug=true'
+```
+
+`CARGO_PROFILE_DEV_DEBUG=true cargo build` restores full debuginfo for the ePHPm crates only, which is usually enough. Artifacts for each debuginfo level get their own hash, so switching back does not rebuild. The `release` profile is unchanged.
+
 ### Full build with PHP (xtask)
 
 The `cargo xtask release` command builds the static PHP SDK via [static-php-cli](https://github.com/crazywhalecc/static-php-cli) and then compiles the release binary with PHP linked. The first build takes ~15 minutes; subsequent builds are cached.

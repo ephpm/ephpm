@@ -548,6 +548,30 @@ vivacity = { version = "=0.21.0", default-features = false, features = ["rustls-
 # STARTUP on a panicking `init`. Under `panic = "abort"` those
 # `catch_unwind` calls become no-ops and any middleware panic terminates
 # the whole process — every request dies instead of one. Keep unwinding.
+# Dev/test debuginfo is trimmed: full DWARF/CodeView for every crate made a
+# single `cargo test --workspace --no-run` target 21 GB (8.7 GB of .pdb alone,
+# one copy of every dependency's debuginfo linked into each of ~80 test
+# binaries), and a shared target dir that many worktrees build into regrew to
+# hundreds of GB. Line tables for workspace crates keep file:line in panic
+# backtraces and let a debugger step ephpm code; dependencies get none (their
+# frames still show function names - symbols are not stripped). Measured:
+# 21.2 GB -> 7.0 GB, -67%. `[profile.test]` inherits this. Release is untouched.
+#
+# To get full debuginfo locally (variable inspection in a debugger) without
+# editing this file or the tracked `.cargo/config.toml`, pass both overrides
+# on the command line - a plain `profile.dev.debug` does not reach the
+# per-package `"*"` entry, so the dependency one is needed too:
+#   cargo build --config 'profile.dev.debug=true' \
+#               --config 'profile.dev.package."*".debug=true'
+# `CARGO_PROFILE_DEV_DEBUG=true cargo build` restores it for workspace crates only
+# (usually what stepping through ephpm code needs). Artifacts for each
+# debuginfo level get their own hash, so switching back does not rebuild.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
