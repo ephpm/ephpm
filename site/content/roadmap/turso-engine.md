@@ -262,6 +262,27 @@ path is a **single ordered stream** with no schema-sync side channel.
   The lag is measured in **change-log rows, not seconds**; a time-based
   lag is listed under "still deferred" below because it needs a wire
   change, not a calculation.
+- **Bounded WAL under constant readers (post-v0.12.0, litewire#49).**
+  Was a known issue from the 2026-10-17/18 stress runs: Turso 0.8.3 never
+  rewinds its write-ahead log while any reader is active, and under
+  constant load one always is, so the `-wal` file grew by a frame per
+  write for the life of the process — 1.3 GB in eight minutes on a
+  single node, 6.5 GB in ten on a per-site clustered owner whose CDC
+  tailers are continuous readers — and throughput fell with it. Fixed by
+  litewire's WAL checkpoint gate, on by default on every embedded-Turso
+  factory (`[db.sqlite.wal_checkpoint]`): session statements and tailer
+  polls hold a shared per-file permit, and a maintenance task backfills
+  with passive checkpoints and then truncates inside a bounded (250 ms)
+  exclusive window. ePHPm's raw-connection apply/snapshot/handoff work
+  takes the permit explicitly. Measured: single-node peak `-wal` 1,286 →
+  68 MiB with 7.9% more requests; clustered owner 6,482 → 363 MiB, zero
+  errors, about +100 ms at p999. Counters and the live `-wal` size per
+  database are exported — see
+  [Database engines → WAL growth](/architecture/database/engines/#wal-growth-under-load-and-the-checkpoint-gate).
+  What remains open: a genuinely long transaction still holds the log for
+  its duration (the gate times out and backs off by design), and
+  `turso_cdc` retention — the *table*, not the WAL — is still unbounded
+  (below).
 
 **Still deferred:**
 

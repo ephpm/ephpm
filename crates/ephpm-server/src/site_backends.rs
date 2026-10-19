@@ -111,9 +111,19 @@ use anyhow::Context as _;
 use dashmap::DashMap;
 use ephpm_php::db_bridge::SiteBackendResolver;
 use litewire::backend::SharedBackend;
+use litewire::litewire_turso::WalGateConfig;
 use tokio::sync::RwLock;
 
+use crate::screened_backend::ScreenedBackend;
 use crate::tracked_backend::TrackedBackend;
+use crate::wal_gate::{self, WalGateSample, WalGateStatsProvider, WalGateStatsSource};
+
+/// The concrete per-site backend: the Turso factory, screened (tenant SQL
+/// screen innermost, against the raw engine) and stats-tracked. Held by its
+/// concrete type in the slot so the WAL-gate sampler can read the factory's
+/// counters by reference; resolvers get it erased to [`SharedBackend`] (the
+/// same allocation, so the refcount-aware eviction still sees every clone).
+type SiteDb = TrackedBackend<ScreenedBackend<litewire::Turso>>;
 
 /// Announces that a site is now **active on this node** — per-site clustered
 /// mode's replication-working-set hook.
@@ -141,7 +151,7 @@ struct SiteSlot {
     /// refcount-aware: `1` means only this slot holds it (idle), `> 1` means at
     /// least one thread has a live [`Session`](litewire::Session) or wire
     /// connection into it.
-    current: RwLock<Option<SharedBackend>>,
+    current: RwLock<Option<Arc<SiteDb>>>,
     /// Lock-free hint for the eviction scan: roughly "is `current` populated".
     /// Written under the write lock alongside `current`, read with no lock at
     /// all, and only ever used to *skip* slots — the authoritative check
@@ -208,6 +218,32 @@ struct Inner {
     /// newly-active site into the replication working set. Idempotent
     /// downstream — it may fire again after an evict/re-open.
     on_open: Option<SiteOpenHook>,
+    /// WAL checkpoint gate installed on every site factory this registry
+    /// opens (`None` = `[db.sqlite.wal_checkpoint] enabled = false`). The
+    /// gate's maintenance task is owned by the factory, so evicting a site
+    /// stops its task — see `evicting_a_site_stops_its_wal_gate_task`.
+    wal_gate: Option<WalGateConfig>,
+}
+
+impl WalGateStatsSource for Inner {
+    /// One sample per **open** site, read by reference under the slot's read
+    /// lock. `try_read` so a slot mid-open or mid-evict is skipped this tick
+    /// rather than waited on; the `Arc` is never cloned, so the eviction
+    /// pass's `strong_count == 1` idle check is undisturbed.
+    fn wal_gate_samples(&self, out: &mut Vec<WalGateSample>) {
+        for entry in &self.slots {
+            if !entry.value().open.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Ok(current) = entry.value().current.try_read() else { continue };
+            let Some(backend) = current.as_ref() else { continue };
+            out.push(WalGateSample {
+                site: entry.key().to_string(),
+                db_path: self.dir.join(format!("{}.db", entry.key())),
+                stats: backend.wal_gate_stats(),
+            });
+        }
+    }
 }
 
 /// Per-site backend registry. Cheap to clone (shares one [`Inner`]).
@@ -217,7 +253,10 @@ pub struct SiteBackends {
 }
 
 impl SiteBackends {
-    /// Build a registry over `dir` (created if absent).
+    /// Build a registry over `dir` (created if absent) with **no** WAL
+    /// checkpoint gate. Test and tooling constructor: the production
+    /// single-node per-site path uses [`new_with_gate`](Self::new_with_gate)
+    /// so the `[db.sqlite.wal_checkpoint]` knob is honoured.
     ///
     /// # Errors
     ///
@@ -228,17 +267,33 @@ impl SiteBackends {
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
-        Self::build(dir, max_open, query_stats, handle, false, None)
+        Self::build(dir, max_open, query_stats, handle, false, None, None)
+    }
+
+    /// Build a registry over `dir` (created if absent), installing `wal_gate`
+    /// on every per-site factory it opens (`None` = gate disabled).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` cannot be created.
+    pub fn new_with_gate(
+        dir: PathBuf,
+        max_open: usize,
+        query_stats: ephpm_query_stats::QueryStats,
+        handle: tokio::runtime::Handle,
+        wal_gate: Option<WalGateConfig>,
+    ) -> anyhow::Result<Self> {
+        Self::build(dir, max_open, query_stats, handle, false, None, wal_gate)
     }
 
     /// Build a registry for per-site **clustered** replication.
     ///
-    /// Identical to [`new`](Self::new) except every site's wire factory is
-    /// opened with CDC capture on (`enable_cdc_on_connect`), so a site this
-    /// node owns captures the writes it must ship, and `on_open` is invoked
-    /// with each site key as its database is first opened — the hook the
-    /// replication driver uses to bring a newly-active site into its working
-    /// set.
+    /// Identical to [`new_with_gate`](Self::new_with_gate) except every site's
+    /// wire factory is opened with CDC capture on (`enable_cdc_on_connect`),
+    /// so a site this node owns captures the writes it must ship, and
+    /// `on_open` is invoked with each site key as its database is first
+    /// opened — the hook the replication driver uses to bring a newly-active
+    /// site into its working set.
     ///
     /// # Errors
     ///
@@ -249,8 +304,9 @@ impl SiteBackends {
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
         on_open: SiteOpenHook,
+        wal_gate: Option<WalGateConfig>,
     ) -> anyhow::Result<Self> {
-        Self::build(dir, max_open, query_stats, handle, true, Some(on_open))
+        Self::build(dir, max_open, query_stats, handle, true, Some(on_open), wal_gate)
     }
 
     fn build(
@@ -260,6 +316,7 @@ impl SiteBackends {
         handle: tokio::runtime::Handle,
         cdc_capture: bool,
         on_open: Option<SiteOpenHook>,
+        wal_gate: Option<WalGateConfig>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("failed to create per-site database directory: {}", dir.display())
@@ -285,6 +342,7 @@ impl SiteBackends {
                 last_cap_warn: AtomicU64::new(0),
                 cdc_capture,
                 on_open,
+                wal_gate,
             }),
         })
     }
@@ -293,6 +351,34 @@ impl SiteBackends {
     #[must_use]
     pub fn as_resolver(&self) -> Arc<dyn SiteBackendResolver> {
         Arc::new(self.clone())
+    }
+
+    /// Put this registry's open databases on the process-wide WAL-gate
+    /// metrics walk (`ephpm_sqlite_wal_bytes{site}` and the
+    /// `ephpm_sqlite_wal_gate_*` counters). Called once by the production
+    /// wiring; the sampler holds the registry weakly.
+    pub fn register_wal_gate_metrics(&self) {
+        let weak: std::sync::Weak<Inner> = Arc::downgrade(&self.inner);
+        wal_gate::register_source(Arc::new(WeakInner(weak)));
+    }
+
+    /// Current WAL-gate samples for this registry's open sites (test and
+    /// diagnostics helper; the sampler reaches the same data through
+    /// [`register_wal_gate_metrics`](Self::register_wal_gate_metrics)).
+    #[must_use]
+    pub fn wal_gate_samples(&self) -> Vec<WalGateSample> {
+        let mut out = Vec::new();
+        self.inner.wal_gate_samples(&mut out);
+        out
+    }
+
+    /// The gate-task completion watch of `site_key`'s **open** factory, if it
+    /// has a gate (test helper for proving eviction stops the task).
+    #[cfg(test)]
+    fn wal_gate_task_finished(&self, site_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let slot = self.inner.slots.get(site_key)?;
+        let current = slot.value().current.try_read().ok()?;
+        current.as_ref()?.inner().inner().wal_gate_task_finished()
     }
 
     /// Number of databases currently held open (test/observability helper).
@@ -342,33 +428,32 @@ impl SiteBackends {
 
     /// Open a fresh per-site backend (Turso engine) wrapped in the query-stats
     /// tracker.
-    async fn open_backend(&self, site_key: &str, path: &Path) -> anyhow::Result<SharedBackend> {
+    async fn open_backend(&self, site_key: &str, path: &Path) -> anyhow::Result<Arc<SiteDb>> {
         let path_str = path.to_str().with_context(|| {
             format!("per-site database path is not valid UTF-8: {}", path.display())
         })?;
         // Clustered per-site mode captures writes into `turso_cdc` on every
         // connection so an owned site can ship them; single-node per-site
-        // opens a plain factory (no capture overhead).
-        let turso = if self.inner.cdc_capture {
-            litewire::Turso::builder(path_str)
-                .enable_cdc_on_connect(true)
-                .build()
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to open per-site database (CDC capture) for {site_key}: {path_str}"
-                    )
-                })?
-        } else {
-            litewire::Turso::open(path_str).await.with_context(|| {
-                format!("failed to open per-site database for {site_key}: {path_str}")
-            })?
-        };
+        // opens a plain factory (no capture overhead). Either way the WAL
+        // checkpoint gate is installed when configured: the factory owns the
+        // gate's maintenance task, so LRU eviction (which drops the factory)
+        // stops it.
+        let builder = wal_gate::builder_with_gate(
+            litewire::Turso::builder(path_str).enable_cdc_on_connect(self.inner.cdc_capture),
+            self.inner.wal_gate.as_ref(),
+        );
+        let turso = builder.build().await.with_context(|| {
+            format!(
+                "failed to open per-site database (cdc_capture={}) for {site_key}: {path_str}",
+                self.inner.cdc_capture
+            )
+        })?;
         self.inner.opens_total.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             site = site_key,
             path = path_str,
             cdc_capture = self.inner.cdc_capture,
+            wal_gate = self.inner.wal_gate.is_some(),
             "opened per-site database (Turso engine)"
         );
         // Screening sits innermost, against the raw engine: it must see exactly
@@ -377,7 +462,7 @@ impl SiteBackends {
         // `pdo_mysql` and the `ephpm_db_*` bridge — go through this backend, so
         // both refuse `ATTACH` and friends for ePHPm's own reasons rather than
         // relying on the pinned engine's defaults. See `screened_backend`.
-        let screened = crate::screened_backend::ScreenedBackend::new(turso);
+        let screened = ScreenedBackend::new(turso);
         Ok(Arc::new(TrackedBackend::new(screened, self.inner.query_stats.clone())))
     }
 
@@ -435,7 +520,7 @@ impl SiteBackends {
             let current = slot.current.read().await;
             if let Some(backend) = current.as_ref() {
                 slot.touch(self.now_millis());
-                return Ok(Arc::clone(backend));
+                return Ok(erase(backend));
             }
         }
 
@@ -447,10 +532,13 @@ impl SiteBackends {
         if let Some(backend) = current.as_ref() {
             // Someone else opened it while we waited for the lock.
             slot.touch(self.now_millis());
-            return Ok(Arc::clone(backend));
+            return Ok(erase(backend));
         }
-        let backend = self.open_backend(site_key, &path).await?;
-        *current = Some(Arc::clone(&backend));
+        let opened = self.open_backend(site_key, &path).await?;
+        // The slot keeps the concrete type; the handle returned below is an
+        // unsized coercion of the same allocation, so both share one count.
+        let backend = erase(&opened);
+        *current = Some(opened);
         slot.open.store(true, Ordering::Relaxed);
         slot.touch(self.now_millis());
         let open_now = self.inner.open_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -565,6 +653,25 @@ impl SiteBackends {
     }
 }
 
+/// Weak handle a registered metrics source holds on a registry's state, so
+/// the sampler never keeps a registry (and its open files) alive.
+struct WeakInner(std::sync::Weak<Inner>);
+
+impl WalGateStatsSource for WeakInner {
+    fn wal_gate_samples(&self, out: &mut Vec<WalGateSample>) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.wal_gate_samples(out);
+        }
+    }
+}
+
+/// Erase a concrete per-site backend for the resolvers. An unsized coercion of
+/// the same `Arc` allocation: the strong count the eviction pass reads
+/// includes every erased clone.
+fn erase(backend: &Arc<SiteDb>) -> SharedBackend {
+    Arc::clone(backend) as SharedBackend
+}
+
 impl SiteBackendResolver for SiteBackends {
     fn resolve(&self, site_key: &str) -> Result<SharedBackend, String> {
         // block_on is legal: `resolve` is only ever called from the bridge on a
@@ -610,6 +717,7 @@ mod tests {
             stats(),
             tokio::runtime::Handle::current(),
             hook,
+            Some(WalGateConfig::default()),
         )
         .expect("build clustered registry");
 
@@ -629,6 +737,84 @@ mod tests {
             vec!["site-a.test".to_string(), "site-b.test".to_string()],
             "the open hook fires once per open (miss path), not on cache hits"
         );
+
+        // The clustered registry installs the gate on its capture-on
+        // factories too — both open sites report gate stats.
+        let mut samples = reg.wal_gate_samples();
+        samples.sort_by(|x, y| x.site.cmp(&y.site));
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|s| s.stats.is_some()), "clustered factories must be gated");
+    }
+
+    /// `[db.sqlite.wal_checkpoint]` reaches every per-site factory: a gated
+    /// registry reports stats for each open site (keyed by site, with the
+    /// site's own file), an ungated one reports the sites with no stats, and a
+    /// site that is not open is not reported at all.
+    #[tokio::test]
+    async fn gate_is_installed_per_site_factory_when_configured() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gated = SiteBackends::new_with_gate(
+            tmp.path().to_path_buf(),
+            8,
+            stats(),
+            tokio::runtime::Handle::current(),
+            Some(WalGateConfig::default()),
+        )
+        .expect("build gated registry");
+        let _a = gated.get_or_open("a.test").await.expect("open a");
+        let _b = gated.get_or_open("b.test").await.expect("open b");
+
+        let mut samples = gated.wal_gate_samples();
+        samples.sort_by(|x, y| x.site.cmp(&y.site));
+        assert_eq!(samples.len(), 2, "one sample per open site");
+        assert_eq!(samples[0].site, "a.test");
+        assert_eq!(samples[0].db_path, tmp.path().join("a.test.db"));
+        assert!(samples[0].stats.is_some(), "a gated factory exposes gate stats");
+        assert!(samples[1].stats.is_some());
+
+        let plain = registry(tmp.path().to_path_buf(), 8);
+        let _c = plain.get_or_open("c.test").await.expect("open c");
+        let samples = plain.wal_gate_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].site, "c.test");
+        assert!(samples[0].stats.is_none(), "`enabled = false` installs no gate");
+    }
+
+    /// Evicting a site drops its factory, and the factory owns the gate's
+    /// maintenance task: the task must exit rather than keep polling (and
+    /// keep the file open) for a database the registry has closed.
+    #[tokio::test]
+    async fn evicting_a_site_stops_its_wal_gate_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = SiteBackends::new_with_gate(
+            tmp.path().to_path_buf(),
+            1,
+            stats(),
+            tokio::runtime::Handle::current(),
+            Some(WalGateConfig::default()),
+        )
+        .expect("build gated registry");
+
+        // Open A and immediately drop the handle so it is idle (evictable).
+        drop(reg.get_or_open("a.test").await.expect("open a"));
+        let mut finished = reg.wal_gate_task_finished("a.test").expect("a is open and gated");
+        assert!(!*finished.borrow(), "the gate task runs while the site is open");
+
+        // Opening B pushes the registry over its cap of 1; idle A is evicted.
+        let _b = reg.get_or_open("b.test").await.expect("open b");
+        assert_eq!(reg.open_count(), 1, "A must have been evicted to meet the cap");
+        assert!(reg.wal_gate_task_finished("a.test").is_none(), "A's factory is gone");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !*finished.borrow_and_update() {
+                if finished.changed().await.is_err() {
+                    break; // sender dropped: the task exited
+                }
+            }
+        })
+        .await
+        .expect("the evicted site's gate task must exit promptly");
+        assert!(reg.wal_gate_samples().iter().all(|s| s.site != "a.test"));
     }
 
     /// Two sites get two distinct files and their data is isolated.

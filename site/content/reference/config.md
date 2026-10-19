@@ -910,6 +910,24 @@ A post-startup outage is reported instead of routed around:
 >
 > Either way, read the credentials from `$_SERVER` rather than hard-coding them. See [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/) for the threat model and the failure modes.
 
+#### `[db.sqlite.wal_checkpoint]`
+
+Keeps every embedded database's `-wal` file bounded under constant load. Applies to **every** embedded-Turso mode — single-node, per-site, clustered and per-site clustered (serving and replication factories alike). The `ephpm php --site` CLI's offline direct-open runs without it on purpose: a short-lived process with no concurrent readers, whose last connection close truncates the log anyway.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Run the gate. `false` restores the pre-gate behaviour: only the engine's passive auto-checkpoint touches the log, and under constant readers the `-wal` file grows without bound until the last connection closes. |
+| `threshold_bytes` | u64 (bytes) | `67108864` (64 MiB) | Run a truncating checkpoint once the `-wal` file is at least this large. Large enough that the engine's own passive checkpoint has long since backfilled everything but the tail, so the exclusive window has almost nothing left to copy. Must be > 0. |
+| `interval_secs` | integer (seconds) | `2` | How often the file size is sampled (one `stat` per open database per tick). Also the base of the retry backoff. Must be > 0. |
+| `max_wait_ms` | integer (milliseconds) | `250` | Longest an attempt waits for in-flight statements and open transactions to drain before giving up. **While it waits, new statements queue behind it**, so this is also the worst-case stall one attempt can add to a request. Must be > 0. |
+| `max_backoff_secs` | integer (seconds) | `60` | Cap on the exponential retry backoff after an attempt that timed out, found the checkpoint busy, or hit an engine error. Must be ≥ `interval_secs`. |
+
+**Why it exists.** The Turso engine (0.8.3) checkpoints like SQLite: a passive auto-checkpoint copies write-ahead-log frames into the main file, but the log is only *rewound* when no reader is active at all, and `PRAGMA wal_checkpoint(RESTART|TRUNCATE)` reports `busy` the instant a reader holds a slot instead of waiting. Under constant concurrent load some connection is always inside a statement, so the `-wal` file grows by one frame per write forever: 1.3 GB in eight minutes on a 0.7 MB single-node database, and 6.5 GB in ten minutes on a per-site clustered owner (whose CDC tailers are continuous readers), with throughput falling as it grew.
+
+**What it does.** Every session statement (the wire listeners and the in-process `ephpm_db_*` bridge) and every CDC tailer poll holds the shared side of a per-file lock. A maintenance task per open database samples the `-wal` size; over the threshold it first backfills the log with `PRAGMA wal_checkpoint(PASSIVE)` rounds (outside the lock — blocks nobody), then takes the exclusive side for at most `max_wait_ms` and runs `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction that outlives the wait makes the attempt give up and retry with exponential backoff, so the gate never deadlocks and never stalls a long transaction. The exclusive window is the checkpoint itself — milliseconds on a backfilled log. ePHPm's own raw-connection work (CDC apply on replicas, snapshot bootstrap and ownership handoff, the snapshot dump on the primary) takes the same permit, so a replica never fails a stream on a collision with a checkpoint.
+
+**Why it is on by default, and what it costs.** Measured against the stress harness that found the growth: single node, 48 clients, 8 minutes — peak `-wal` 1,286 MiB → 68 MiB, 7.9% more requests served, p99 unchanged, worst single request 30 s → 1.3 s. Per-site clustered, 3 nodes, 10 minutes — owner's peak `-wal` 6,482 MiB → 363 MiB (six sites × 64 MiB), zero errors, replicas converged; the cost was roughly **+100 ms at p999** on the cluster, from forwarded statements queueing behind an exclusive attempt for up to `max_wait_ms`. Unbounded disk growth is the worse failure, so the default is on. If a workload is dominated by long transactions, `ephpm_sqlite_wal_gate_timeouts_total` climbing while `ephpm_sqlite_wal_gate_truncations_total` stays flat is the signal — see [Metrics → Embedded database (WAL checkpoint gate)](/reference/metrics/#embedded-database-wal-checkpoint-gate). Zero values, and a `max_backoff_secs` below `interval_secs`, fail startup naming the key, whether or not the gate is enabled.
+
 > **Removed in v0.7.0:** the `[db.sqlite.sqld]` block (`http_listen`, `grpc_listen`, `write_permits`) is gone along with the sqld sidecar. Clustered SQLite now replicates in-process via the Turso CDC path (see `[db.sqlite.replication]` below) — there is no sqld child process, no gRPC listener, and no write-admission semaphore. A config that still sets these keys logs a deprecation warning at startup; they have no effect.
 
 #### `[db.sqlite.replication]` (clustered mode only)
@@ -933,7 +951,7 @@ Clustered SQLite is **experimental** in v0.7.0: it uses the in-process Turso CDC
 
 > **Removed in v0.7.0:** the `cdc_experimental` opt-in flag is gone. Clustered mode always uses CDC replication now — there is no per-node flag to set. A config that still sets `cdc_experimental` logs a deprecation warning; it has no effect.
 
-> **Unknown keys under `[db.sqlite]` are a startup error**, as they are in [every section](#unknown-keys-are-a-startup-error). It matters most here: every knob in these sections selects a *mode*, and a mis-typed or not-yet-supported mode knob is the one config error that passes every health check while running the wrong thing. Keys that were *removed* but are still honoured for upgrades (`[db.sqlite.sqld]`, `cdc_experimental`, `engine`) remain accepted and warn, as described above.
+> **Unknown keys under `[db.sqlite]` are a startup error**, as they are in [every section](#unknown-keys-are-a-startup-error). It matters most here: every knob in these sections selects a *mode*, and a mis-typed or not-yet-supported mode knob is the one config error that passes every health check while running the wrong thing. That includes `[db.sqlite.wal_checkpoint]`: a misspelt `threshold` would otherwise leave the gate at its default while the operator believed it was tuned. Keys that were *removed* but are still honoured for upgrades (`[db.sqlite.sqld]`, `cdc_experimental`, `engine`) remain accepted and warn, as described above.
 >
 > To confirm which mode a node actually chose, look for the single startup line `embedded SQLite mode selected` — its `mode` field is one of `per-site-clustered`, `clustered`, `per-site`, or `single-node`.
 

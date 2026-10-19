@@ -183,6 +183,7 @@ fn sqlite_config(dir: &Path) -> SqliteConfig {
             per_site: true,
             ..ephpm_config::ReplicationConfig::default()
         },
+        wal_checkpoint: ephpm_config::WalCheckpointConfig::default(),
     }
 }
 
@@ -233,6 +234,7 @@ async fn bring_up_node(node_id: &str, ip: &str, port: u16, join: Vec<String>) ->
         stats(),
         tokio::runtime::Handle::current(),
         Arc::clone(&note_active),
+        ephpm_server::wal_gate::gate_config(&sqlite.wal_checkpoint),
     )
     .expect("clustered per-site registry");
 

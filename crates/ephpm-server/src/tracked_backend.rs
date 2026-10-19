@@ -31,6 +31,12 @@ impl<B> TrackedBackend<B> {
     pub fn new(inner: B, stats: QueryStats) -> Self {
         Self { inner, stats }
     }
+
+    /// The wrapped backend (for observability that lives on the inner
+    /// factory, such as the WAL checkpoint gate's counters).
+    pub const fn inner(&self) -> &B {
+        &self.inner
+    }
 }
 
 /// A per-connection decorator that records query stats.

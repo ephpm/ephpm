@@ -213,6 +213,14 @@ pub fn bind_site_db(
 /// the bridge (single-backend mode). The bridge wraps it in a translating
 /// `Session` and screens every statement — the correct offline path.
 ///
+/// Deliberately opened **without** the server's WAL checkpoint gate
+/// (`[db.sqlite.wal_checkpoint]`). The gate exists for a long-running process
+/// whose readers never go idle; this is a short-lived CLI running one PHP
+/// request with no concurrent readers, and the engine itself runs a
+/// truncating checkpoint when the last connection closes at exit. A gate task
+/// here would add a 2 s timer to a process that is usually gone before it
+/// first ticks.
+///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened.

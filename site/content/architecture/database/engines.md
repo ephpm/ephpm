@@ -114,6 +114,77 @@ Turso itself refuses the switch while CDC capture is on (see below). On a
 single-node `pdo_mysql` connection the switch outside a transaction is still
 possible.
 
+## WAL growth under load, and the checkpoint gate
+
+Found by the WAL-growth stress runs of 2026-10-17/18 (ePHPm on Turso 0.8.3)
+and fixed in the release after v0.12.0 ([litewire#49](https://github.com/ephpm/litewire/pull/49)).
+
+Turso checkpoints like SQLite: a passive auto-checkpoint copies
+write-ahead-log frames into the main file once the log holds ~1000
+un-backfilled frames, but the log is only ever *rewound* when a writer can
+take every read-mark slot — that is, when there is no active reader at all.
+The blocking checkpoint modes do not help: `PRAGMA wal_checkpoint(RESTART)`
+and `(TRUNCATE)` report `busy` immediately when any reader holds a slot, and
+the connection's busy handler is never consulted (Turso tries each lock once).
+Under constant concurrent load some session is always inside a statement, so
+the log is backfilled but never rewound and the `-wal` file grows by one frame
+per write for as long as the process runs. Measured on the same harness:
+
+- single node, 48 clients, 8 minutes, a 0.7 MB database: `-wal` reached
+  **1.3 GB**, and the worst single request took 30 s;
+- per-site clustered, 3 nodes, 10 minutes: the owner's `-wal` reached
+  **6.5 GB**, growing linearly, because every CDC tailer is a continuous
+  reader.
+
+Idle connections hold no read slot; only the engine's close-of-last-connection
+checkpoint ever shrank the file, which is why per-site databases used to shrink
+only when the LRU evicted them.
+
+**The fix is litewire's WAL checkpoint gate**, which ePHPm turns on for every
+embedded-Turso factory by default (`[db.sqlite.wal_checkpoint]`). Every
+session statement — the wire listeners and the in-process `ephpm_db_*` bridge
+alike — and every CDC tailer poll holds the shared side of a per-file
+write-preferring lock; a statement that opens a transaction keeps its permit
+until the connection is back in autocommit. A maintenance task per open
+database samples the `-wal` size every 2 s and, once it is at least 64 MiB,
+first backfills the log with `PRAGMA wal_checkpoint(PASSIVE)` rounds — outside
+the lock, blocking nobody, reaching as far as the oldest live snapshot — and
+then takes the exclusive side for at most 250 ms (new statements queue behind
+it) and runs `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction that
+outlives the wait makes the attempt give up and retry with exponential backoff
+(capped at 60 s), so the gate never deadlocks and never stalls a long
+transaction; the only cost it can impose on traffic is a ≤ 250 ms delay for
+new statements per attempt. The exclusive window itself is the checkpoint,
+which is milliseconds once the passive phase has done the copying.
+
+The passive phase is not optional, and this is the detail that cost a run
+during validation: a bare `TRUNCATE` inside the exclusive window has to copy
+and fsync every frame the auto-checkpoint never reached (readers that
+permanently pin old snapshots make that most of the 64 MiB), which stalled a
+cluster owner for seconds — p999 of 4.6 s, forwarded statement streams dying
+with "owner connection closed", new sessions seeing "database is locked" from
+their setup pragma. Backfilling first made the window 5–7 ms and the clustered
+run clean.
+
+ePHPm's own raw-connection work — the replica's CDC `apply_batch`, snapshot
+bootstrap and per-site ownership handoff, the primary's snapshot dump and head
+sampler — takes the same permit explicitly (`Turso::wal_gate_permit`), because
+a raw connection gets no busy timeout and a collision with the exclusive
+window would otherwise fail the stream and cost a reconnect. The permit is
+never held across a network wait.
+
+**Measured with the gate on**, same harness, same commits: single node — peak
+`-wal` 1,286 MiB → 68 MiB, requests served +7.9%, p99 unchanged, worst request
+30 s → 1.3 s. Per-site clustered — owner's peak `-wal` 6,482 MiB → 363 MiB
+(six sites × 64 MiB), requests +1%, zero errors, replicas converged; the cost
+was about +100 ms at p999, from forwarded statements queueing behind an
+exclusive attempt. That trade is why the gate defaults to on. What it does
+**not** fix: a transaction that genuinely stays open keeps the WAL growing for
+its duration — `ephpm_sqlite_wal_gate_timeouts_total` climbing while
+`ephpm_sqlite_wal_gate_truncations_total` is flat is the operator signal. Every
+counter, plus the live `-wal` size per database, is in the
+[metrics reference](/reference/metrics/#embedded-database-wal-checkpoint-gate).
+
 ## Turso 0.7.2 → 0.8.2 (v0.12.0)
 
 v0.12.0 moves the embedded engine from Turso 0.7.2 to
