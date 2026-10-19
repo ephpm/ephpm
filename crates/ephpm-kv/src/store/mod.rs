@@ -5,6 +5,7 @@
 //! approximate memory tracking.
 
 mod entry;
+mod glob;
 mod watch;
 
 use std::collections::HashMap;
@@ -703,25 +704,20 @@ impl Store {
         self.mem_used.load(Ordering::Relaxed)
     }
 
-    /// Collect keys matching a glob pattern. `*` matches everything.
-    /// Returns both string and hash keys.
+    /// Collect keys matching a Redis glob pattern (`*`, `?`, `[...]`,
+    /// `[^...]`, ranges, `\` escapes — byte-for-byte Redis `stringmatchlen`
+    /// semantics, documented in the private `store::glob` module). The literal pattern `*` lists every key, including an
+    /// empty one, as Redis' `KEYS *` does. Returns both string and hash keys.
+    ///
+    /// Matching is `O(len(key) × len(pattern))` worst case per key and runs
+    /// with no lock held; each shard's read lock is held only while its live
+    /// keys are copied out (see `collect_keys`).
     #[must_use]
     pub fn keys(&self, pattern: &str) -> Vec<String> {
-        let match_all = pattern == "*";
-        let mut result: Vec<String> = self
-            .data
-            .iter()
-            .filter(|entry| !entry.value().is_expired())
-            .filter(|entry| match_all || glob_match(pattern, entry.key()))
-            .map(|entry| entry.key().clone())
-            .collect();
-        result.extend(
-            self.hashes
-                .iter()
-                .filter(|entry| !entry.value().is_expired())
-                .filter(|entry| match_all || glob_match(pattern, entry.key()))
-                .map(|entry| entry.key().clone()),
-        );
+        let pattern = (pattern != "*").then_some(pattern.as_bytes());
+        let mut result = Vec::new();
+        collect_keys(&self.data, |e| !e.is_expired(), pattern, &mut result);
+        collect_keys(&self.hashes, |h| !h.is_expired(), pattern, &mut result);
         result
     }
 
@@ -2314,24 +2310,44 @@ fn parse_int_value(data: &[u8]) -> Result<i64, String> {
     s.parse::<i64>().map_err(|_| "ERR value is not an integer or out of range".to_string())
 }
 
-/// Simple glob matching supporting `*` (any chars) and `?` (single char).
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let chars: Vec<char> = text.chars().collect();
-    glob_match_inner(&pat, &chars)
-}
-
-fn glob_match_inner(pat: &[char], chars: &[char]) -> bool {
-    match (pat.first(), chars.first()) {
-        (None, None) => true,
-        (Some('*'), _) => {
-            // '*' matches zero or more characters.
-            glob_match_inner(&pat[1..], chars)
-                || (!chars.is_empty() && glob_match_inner(pat, &chars[1..]))
+/// Append the keys of `map` that are live (per `is_live`) and match
+/// `pattern` (`None` = every key) to `out`.
+///
+/// Walks the map one shard at a time. Under each shard's read lock it only
+/// clones the live keys; the lock is released **before** any glob matching
+/// runs. A writer to a shard therefore waits at most for one shard's key
+/// copy, never for pattern evaluation — the old `data.iter().filter(glob)`
+/// held a shard's read lock for the whole match, so one slow `KEYS` blocked
+/// every `SET` to that shard (and with it the tokio worker running it).
+// The `raw-api` shard iterator is the only `unsafe` here; justified by the
+// SAFETY comment on the loop (buckets are read under the shard's own lock).
+#[allow(unsafe_code)]
+fn collect_keys<V>(
+    map: &DashMap<String, V>,
+    is_live: impl Fn(&V) -> bool,
+    pattern: Option<&[u8]>,
+    out: &mut Vec<String>,
+) {
+    let mut batch: Vec<String> = Vec::new();
+    for shard in map.shards() {
+        {
+            let guard = shard.read();
+            // SAFETY: `bucket.as_ref()` dereferences a live bucket into a
+            // shared reference. The bucket comes from this shard's own
+            // `iter()`, and `guard` holds the shard's read lock for the whole
+            // loop, so no writer can rehash or remove entries meanwhile. The
+            // references do not escape the block: only owned clones do.
+            for bucket in unsafe { guard.iter() } {
+                let (key, slot) = unsafe { bucket.as_ref() };
+                if is_live(slot.get()) {
+                    batch.push(key.clone());
+                }
+            }
         }
-        (Some('?'), Some(_)) => glob_match_inner(&pat[1..], &chars[1..]),
-        (Some(a), Some(b)) if a == b => glob_match_inner(&pat[1..], &chars[1..]),
-        _ => false,
+        match pattern {
+            None => out.append(&mut batch),
+            Some(p) => out.extend(batch.drain(..).filter(|k| glob::glob_match(p, k.as_bytes()))),
+        }
     }
 }
 
@@ -2992,12 +3008,44 @@ mod tests {
     }
 
     #[test]
-    fn glob_matching() {
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("user:*", "user:123"));
-        assert!(!glob_match("user:*", "post:1"));
-        assert!(glob_match("h?llo", "hello"));
-        assert!(!glob_match("h?llo", "hllo"));
+    fn keys_star_lists_the_empty_key() {
+        // Redis' `KEYS *` short-circuits to "all keys", so an empty key is
+        // listed even though no glob matches the empty string.
+        let s = test_store();
+        s.set(String::new(), b"a".to_vec(), None);
+        s.set("x".into(), b"b".to_vec(), None);
+        let mut keys = s.keys("*");
+        keys.sort();
+        assert_eq!(keys, vec!["", "x"]);
+        assert_eq!(s.keys("?"), vec!["x"]);
+    }
+
+    #[test]
+    fn keys_includes_hash_keys_and_skips_expired() {
+        let s = test_store();
+        s.set("str:1".into(), b"a".to_vec(), None);
+        s.set("str:gone".into(), b"a".to_vec(), Some(Duration::from_millis(1)));
+        s.hset("hash:1", "f", b"v".to_vec());
+        std::thread::sleep(Duration::from_millis(10));
+        let mut keys = s.keys("*:*");
+        keys.sort();
+        assert_eq!(keys, vec!["hash:1", "str:1"]);
+    }
+
+    /// Regression for KV stress report F-0: one `KEYS` with a pathological
+    /// pattern against a ~60-byte key used to run >30 s while holding a
+    /// shard read lock. It must now finish in well under a second, and
+    /// writers to the same store must not be blocked behind it.
+    #[test]
+    fn keys_pathological_pattern_is_fast_over_many_keys() {
+        let s = test_store();
+        for i in 0..2_000 {
+            s.set(format!("{}{i}", "a".repeat(60)), b"v".to_vec(), None);
+        }
+        let start = Instant::now();
+        assert_eq!(s.keys("*a*a*a*a*a*a*a*a*a*a*a*a*b"), Vec::<String>::new());
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "KEYS took {elapsed:?}");
     }
 
     #[test]
@@ -3685,32 +3733,7 @@ mod tests {
         assert_eq!(s.mem_used(), 0);
     }
 
-    // ── Glob matching ───────────────────────────────────────────────
-
-    #[test]
-    fn glob_match_question_mark() {
-        assert!(glob_match("h?llo", "hello"));
-        assert!(glob_match("h?llo", "hallo"));
-        assert!(!glob_match("h?llo", "hllo"));
-        assert!(!glob_match("h?llo", "heello"));
-    }
-
-    #[test]
-    fn glob_match_combined_wildcards() {
-        assert!(glob_match("h*o", "hello"));
-        assert!(glob_match("h*o", "ho"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*", ""));
-        assert!(glob_match("a*b*c", "abc"));
-        assert!(glob_match("a*b*c", "aXXbYYc"));
-        assert!(!glob_match("a*b*c", "aXXbYY"));
-    }
-
-    #[test]
-    fn glob_match_empty_pattern() {
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "nonempty"));
-    }
+    // Glob semantics are covered by the Redis table in `store::glob`.
 
     // ── Hash operations ─────────────────────────────────────────
 

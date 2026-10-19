@@ -86,7 +86,7 @@ than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 | | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. String keys only: a hash reports `-2`. |
 | | `TYPE key` | `hash`, `string` or `none`. A name that holds both reports `hash`. |
 | | `RENAME old new` | **Strings only.** Renaming a hash returns `ERR no such key`. Keeps the TTL. |
-| | `KEYS pattern` | Glob with `*` and `?` only; no `[...]` classes or `\` escapes. Walks the whole store. A name that is both a string and a hash is listed twice. |
+| | `KEYS pattern` | Redis glob syntax: `*`, `?`, `[abc]`, `[^abc]`, `[a-z]` and `\` escapes, matched on bytes as Redis does (`!` is not a negation marker, as in Redis). Matching takes time proportional to key length × pattern length at worst, with no exponential backtracking. Walks the whole store, but only holds each internal shard's lock long enough to copy its key names; matching runs with no lock held and off the async workers, so a slow `KEYS` does not block other clients' reads and writes. A name that is both a string and a hash is listed twice. |
 | | `DBSIZE` | Strings plus hashes (a dual name counts twice). |
 | | `FLUSHDB` / `FLUSHALL` | Identical. Empties the store this connection is bound to (in multi-tenant mode, that site's store). |
 | Hashes | `HSET key field value [field value...]` | Returns the number of new fields. (No separate `HMSET`.) |

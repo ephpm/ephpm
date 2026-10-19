@@ -564,6 +564,48 @@ async fn keys_prefix_pattern_filters() {
     assert_eq!(keys, vec!["user:1", "user:2"]);
 }
 
+/// Regression for KV stress report F-0: `KEYS *a*a*a*a*a*a*a*a*a*a*a*a*b`
+/// against a 60-byte key ran >30 s per call on the old exponential matcher,
+/// and ~40 concurrent calls froze the node. Many concurrent pathological
+/// KEYS must now all return promptly while another connection keeps
+/// writing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pathological_keys_pattern_does_not_stall_the_server() {
+    const PATTERN: &str = "*a*a*a*a*a*a*a*a*a*a*a*a*b";
+    let srv = TestServer::start().await;
+    let mut con = srv.con().await;
+    let long_key = "a".repeat(60);
+    let _: () = con.set(&long_key, "v").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let mut scans = Vec::new();
+    for _ in 0..16 {
+        let mut c = srv.con().await;
+        scans.push(tokio::spawn(async move {
+            let keys: Vec<String> = c.keys(PATTERN).await.unwrap();
+            keys
+        }));
+    }
+    // A writer on its own connection must keep making progress meanwhile.
+    for i in 0..50 {
+        let _: () = con.set(format!("w{i}"), i).await.unwrap();
+    }
+    for scan in scans {
+        let keys = tokio::time::timeout(Duration::from_secs(20), scan)
+            .await
+            .expect("KEYS stalled")
+            .unwrap();
+        assert!(keys.is_empty(), "pattern ends in `b`; nothing should match: {keys:?}");
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(10), "16 pathological KEYS + 50 SETs took {elapsed:?}");
+
+    // The same pattern still matches when it can.
+    let _: () = con.set(format!("{long_key}b"), "v").await.unwrap();
+    let keys: Vec<String> = con.keys(PATTERN).await.unwrap();
+    assert_eq!(keys, vec![format!("{long_key}b")]);
+}
+
 #[tokio::test]
 async fn dbsize_counts_all_keys() {
     let srv = TestServer::start().await;
