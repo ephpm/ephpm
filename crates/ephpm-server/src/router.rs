@@ -306,10 +306,18 @@ struct SiteIdentities {
     /// vhost — such a request gets no database context rather than a fresh
     /// `<host>.db` (issue #291).
     db: Option<String>,
-    /// Key for this request's KV keyspace and its RESP credential. Falls back to
-    /// the normalized host for an unknown site, which keeps a catch-all document
-    /// root's per-hostname keyspaces working.
-    kv: String,
+    /// Key for this request's per-site KV keyspace and its RESP credential:
+    /// the canonical site key, or `None` for a host that matched no vhost.
+    ///
+    /// It used to fall back to the normalized `Host` so a catch-all document
+    /// root got per-hostname keyspaces — but every PHP request then created a
+    /// never-freed site store (plus a RESP credential) for whatever `Host` the
+    /// client sent: 30,000 requests with unique hosts took one node from 90 MB
+    /// to 2 GB, unauthenticated. An unmatched host now gets no keyspace and no
+    /// credential; on a multi-tenant node `ephpm_kv_*` fails with "no per-site
+    /// KV context", like `ephpm_db_*`. (Single-site mode has no per-site
+    /// stores at all and is unaffected: it always uses the global store.)
+    kv: Option<String>,
     /// Key for cluster-wide OPcache invalidation (`opcache:version:<key>`).
     opcache: String,
     /// Scope for this request's WebSocket capability — which connections and
@@ -2130,27 +2138,30 @@ impl Router {
     /// Only produces variables when all conditions are met:
     /// - `kv.redis_compat.enabled` is true
     /// - `kv.secret` is set
-    /// - Multi-tenant mode is active (a site hostname is available)
-    fn build_kv_env_vars(&self, hostname: &str) -> Vec<(String, String)> {
+    /// - Multi-tenant mode is active and the request matched a vhost
+    ///   (`site_key` is its canonical key; `None` for an unmatched `Host`,
+    ///   which gets no credential — it has no keyspace to authenticate to)
+    fn build_kv_env_vars(&self, site_key: Option<&str>) -> Vec<(String, String)> {
         let is_multi_tenant = self.multi_tenant_kv.is_some();
         let Some(ref secret) = self.kv_secret else {
             return Vec::new();
         };
-        if !self.kv_redis_compat_enabled || !is_multi_tenant || hostname.is_empty() {
+        let Some(hostname) = site_key.filter(|k| !k.is_empty()) else {
+            return Vec::new();
+        };
+        if !self.kv_redis_compat_enabled || !is_multi_tenant {
             return Vec::new();
         }
 
-        // Per-hostname HMAC-SHA256 password is deterministic — cache
-        // it in a DashMap keyed by hostname so we compute the HMAC
-        // exactly once per host per process instead of on every
-        // request.
+        // Per-site HMAC-SHA256 password is deterministic — cache it in a
+        // DashMap keyed by site so we compute the HMAC exactly once per site
+        // per process instead of on every request.
         //
-        // The cap matters: for a *known* vhost this key is the canonical site
-        // key (bounded by the site fleet), but an unknown host that falls
-        // through to the default document root is keyed by its own name, and
-        // that is client-controlled. Past the cap the HMAC is simply recomputed
-        // per request — a few microseconds — rather than growing a map an
-        // unauthenticated caller can drive (the memory-growth half of #291).
+        // Keys are canonical site keys, so the map is bounded by the site
+        // fleet. The cap stays as defence in depth (it predates unmatched
+        // hosts losing their credential, when this key was client-controlled
+        // — the memory-growth half of #291): past it the HMAC is simply
+        // recomputed per request, a few microseconds.
         let password = if let Some(cached) = self.kv_site_password_cache.get(hostname) {
             cached.clone()
         } else {
@@ -2347,14 +2358,17 @@ impl Router {
     /// Both PHP dispatch paths (fpm and worker) go through this, so they cannot
     /// disagree with each other and neither can re-derive a tenant from the
     /// `Host` header behind the other's back. See [`ResolvedSite`].
-    fn site_identities(&self, site_key: Option<&str>, server_name: &str) -> SiteIdentities {
+    fn site_identities(&self, site_key: Option<&str>) -> SiteIdentities {
         SiteIdentities {
             // Fail closed twice over: no per-site mode, or no known site, means
             // no database identity at all (issues #290, #291).
             db: if self.per_site_db { site_key.map(str::to_owned) } else { None },
-            kv: site_key.map_or_else(|| normalize_host_key(server_name), str::to_owned),
+            // The canonical key or nothing — never the raw `Host` (KV stress
+            // report F-2: a per-`Host` fallback minted a site store per header
+            // value).
+            kv: site_key.map(str::to_owned),
             opcache: opcache_vhost_key(site_key),
-            // Unlike `kv`, this does NOT fall back to the request host. A
+            // Like `kv`, this does NOT fall back to the request host. A
             // client-controlled scope would let anyone mint a fresh WebSocket
             // namespace by varying `Host`, and — worse — two requests that
             // *should* be one tenant could end up in different scopes and lose
@@ -2380,13 +2394,14 @@ impl Router {
     ///
     /// * single-site mode, where there is one store and nothing to isolate;
     /// * a request that matched **no** vhost, which has no tenant identity to
-    ///   scope to. Note this is the one place the middleware lane deliberately
-    ///   differs from [`SiteIdentities::kv`], which falls back to the
-    ///   normalized `Host` so a catch-all document root keeps per-hostname
-    ///   keyspaces. The chain runs on *every* request, static files included,
-    ///   and site stores are created lazily and never evicted — so minting one
-    ///   per `Host` value here would be a cheap way to grow the site map
-    ///   without bound. A module that wants to bucket unmatched requests has
+    ///   scope to. Site stores are created lazily and never evicted, so minting
+    ///   one per `Host` value would be a cheap way to grow the site map without
+    ///   bound. (PHP's [`SiteIdentities::kv`] used to do exactly that — KV
+    ///   stress report F-2 — and now gets no store at all for an unmatched
+    ///   host; the middleware lane differs only in falling back to the global
+    ///   store, where operator state already lives, instead of to nothing,
+    ///   because modules are operator code, not tenant code.) A module that
+    ///   wants to bucket unmatched requests has
     ///   [`ephpm_middleware::UNMATCHED_VHOST`] for the key, in the global
     ///   store where operator state already lives.
     fn middleware_kv_store(
@@ -3454,7 +3469,7 @@ impl Router {
         // The registry scope comes from the SAME derivation as the database,
         // KV and OPcache identities — one canonical site key (issue #293),
         // pinned here and carried by the connection for its whole life.
-        let Some(site_scope) = self.site_identities(site_key.as_deref(), &server_name).ws else {
+        let Some(site_scope) = self.site_identities(site_key.as_deref()).ws else {
             tracing::debug!(
                 host = %server_name,
                 "websocket upgrade refused: host matched no virtual host, so the connection \
@@ -3960,7 +3975,7 @@ impl Router {
             kv: kv_site_key,
             opcache: vhost_name,
             ws: ws_site_scope,
-        } = self.site_identities(site_key.as_deref(), &server_name);
+        } = self.site_identities(site_key.as_deref());
 
         // Per-vhost eBPF tag input: `Some` only when the feature is on AND this
         // request matched a vhost (site_key is `None` for an unmatched Host,
@@ -4005,7 +4020,7 @@ impl Router {
 
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.
-        let mut env_vars = self.build_kv_env_vars(&kv_site_key);
+        let mut env_vars = self.build_kv_env_vars(kv_site_key.as_deref());
         env_vars.extend_from_slice(&self.db_env_vars);
         // Per-site DB credentials, when the multi-tenant wire listener is up.
         // Reuses the site key already derived for the bridge, so `pdo_mysql`
@@ -4106,9 +4121,10 @@ impl Router {
             // Keyed on the same identity the injected `EPHPM_REDIS_USERNAME`
             // names, so the in-process bridge and a RESP client reach one
             // keyspace.
-            ephpm_php::kv_bridge::set_site_store(
-                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&kv_site_key)),
-            );
+            ephpm_php::kv_bridge::set_site_scope(kv_scope(
+                multi_tenant_kv.as_ref(),
+                kv_site_key.as_deref(),
+            ));
 
             // Scope the embedded database to this virtual host: the bridge
             // resolves the tenant's own database from this key (per-site DB
@@ -4447,8 +4463,8 @@ impl Router {
         // content_type on the hot path for no reason.
         // Same identity derivation as the fpm path — one function, so the two
         // dispatch modes cannot name different tenants for one request.
-        let identities = self.site_identities(site_key, &server_name);
-        let mut env_vars = self.build_kv_env_vars(&identities.kv);
+        let identities = self.site_identities(site_key);
+        let mut env_vars = self.build_kv_env_vars(identities.kv.as_deref());
         env_vars.extend_from_slice(&self.db_env_vars);
         // Per-site DB credentials. Worth noting these work here even though the
         // `ephpm_db_*` bridge does not: the bridge needs a thread-local site key
@@ -5984,6 +6000,27 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
 /// land on the same key the router injected.
 pub(crate) fn normalize_host_key(host: &str) -> String {
     host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The KV scope `ephpm_kv_*` gets for one PHP request.
+///
+/// * No multi-tenant store (single-site mode): the global store.
+/// * A matched vhost: that site's store, keyed by its **canonical** site key
+///   ([`SiteIdentities::kv`]) — the only path that creates a site store.
+/// * A multi-tenant node and a `Host` that matched no vhost: no store at all.
+///   Every `ephpm_kv_*` call fails ("no per-site KV context"). Creating a store
+///   here, keyed by the raw `Host`, was KV stress report F-2: each unique header
+///   value minted a never-freed `Store` (30,000 requests: 90 MB → 2 GB).
+fn kv_scope(
+    multi_tenant: Option<&ephpm_kv::multi_tenant::MultiTenantStore>,
+    site_key: Option<&str>,
+) -> ephpm_php::kv_bridge::KvSiteScope {
+    use ephpm_php::kv_bridge::KvSiteScope;
+    match (multi_tenant, site_key) {
+        (None, _) => KvSiteScope::Global,
+        (Some(mt), Some(key)) if !key.is_empty() => KvSiteScope::Site(mt.get_site_store(key)),
+        (Some(_), _) => KvSiteScope::Unmatched,
+    }
 }
 
 /// Vhost key used for OPcache clustered invalidation (`opcache:version:<key>`).
@@ -13505,7 +13542,7 @@ echo "post response";
             wire_user: Option<String>,
             wire_password: Option<String>,
             /// The KV keyspace / RESP credential identity.
-            kv: String,
+            kv: Option<String>,
             /// The OPcache invalidation vhost.
             opcache: String,
             /// (5) the PHP response's `ETag` cache key for a fixed
@@ -13519,7 +13556,7 @@ echo "post response";
         /// Run every derivation for `host` exactly the way a request does.
         fn derive(router: &Router, backends: &SiteBackends, host: &str) -> Derivations {
             let resolved = router.resolve_site(host);
-            let ids = router.site_identities(resolved.key.as_deref(), host);
+            let ids = router.site_identities(resolved.key.as_deref());
             let env: HashMap<String, String> = ids
                 .db
                 .as_deref()
@@ -13585,7 +13622,7 @@ echo "post response";
             assert_eq!(expected.document_root, sites.join("shop"));
             assert_eq!(expected.db_path, Some(dbdir.join("shop.db")));
             assert_eq!(expected.wire_user.as_deref(), Some("shop"));
-            assert_eq!(expected.kv, "shop");
+            assert_eq!(expected.kv.as_deref(), Some("shop"));
             assert_eq!(expected.opcache, "shop");
             assert_eq!(expected.etag_cache_key, "etag:shop:GET:/index.php");
 
@@ -13673,9 +13710,9 @@ echo "post response";
                 assert_eq!(d.db_path, None, "`{host}` must not name a database — issue #291");
                 assert_eq!(d.wire_user, None, "`{host}` must get no DB credential");
                 assert_eq!(d.opcache, crate::opcache::DEFAULT_VHOST);
-                // The KV keyspace deliberately still follows the host: a
-                // catch-all document root may legitimately serve many names.
-                assert_eq!(d.kv, normalize_host_key(host));
+                // No KV keyspace either: a per-`Host` keyspace was a site
+                // store minted per header value, never freed (KV stress F-2).
+                assert_eq!(d.kv, None, "`{host}` must not name a KV keyspace");
             }
         }
 
@@ -13977,6 +14014,87 @@ echo "post response";
                 );
             }
             assert_eq!(mt.site_count(), 0, "no site store may be created by an unknown Host");
+        }
+
+        /// KV stress report F-2: the PHP lane used to key an unmatched request's
+        /// store on its raw `Host`, so N requests with N unique headers created
+        /// N never-freed site stores (30,000 → +1.9 GB) and handed each one a
+        /// RESP credential. Drive the exact derivation a PHP request runs —
+        /// `resolve_site` → `site_identities` → `kv_scope` / `build_kv_env_vars`
+        /// — for many unknown hosts and require zero stores and no credentials,
+        /// while a real vhost still gets both.
+        #[tokio::test]
+        async fn unknown_hosts_create_zero_php_kv_stores() {
+            use ephpm_php::kv_bridge::KvSiteScope;
+
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: dir.path().to_path_buf(),
+                    sites_dir: Some(sites.clone()),
+                    sites_domain_suffix: Some(".local".to_string()),
+                    ..ServerConfig::default()
+                },
+                php: test_php_config(),
+                db: DbConfig::default(),
+                // RESP + secret on, so credential injection is live and the
+                // test can see an unknown host being refused one.
+                kv: KvConfig {
+                    secret: Some("test-secret".to_string()),
+                    redis_compat: ephpm_config::KvRedisCompatConfig {
+                        enabled: true,
+                        ..ephpm_config::KvRedisCompatConfig::default()
+                    },
+                    ..KvConfig::default()
+                },
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            let global = test_store();
+            let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
+                Arc::clone(&global),
+                StoreConfig::default(),
+            );
+            let router =
+                Router::new(&config, Arc::clone(&global), Some(mt.clone()), None, None, None, None);
+
+            for i in 0..2_000 {
+                let host = format!("h{i}.flood");
+                let resolved = router.resolve_site(&host);
+                assert_eq!(resolved.key, None, "`{host}` names no vhost");
+                let ids = router.site_identities(resolved.key.as_deref());
+                assert_eq!(ids.kv, None, "`{host}` must not name a KV keyspace");
+                assert!(
+                    matches!(kv_scope(Some(&mt), ids.kv.as_deref()), KvSiteScope::Unmatched),
+                    "`{host}` must get no store — not a per-Host one, not the global one"
+                );
+                assert!(
+                    router.build_kv_env_vars(ids.kv.as_deref()).is_empty(),
+                    "`{host}` must get no RESP credential"
+                );
+            }
+            assert_eq!(mt.site_count(), 0, "2,000 unknown Hosts must create zero KV stores");
+
+            // A real vhost still gets its own store and credential, under its
+            // canonical key whatever the spelling.
+            let ids = router.site_identities(router.resolve_site("SHOP.local:8080").key.as_deref());
+            assert_eq!(ids.kv.as_deref(), Some("shop"));
+            let KvSiteScope::Site(shop) = kv_scope(Some(&mt), ids.kv.as_deref()) else {
+                panic!("a matched vhost must get its site store");
+            };
+            assert!(Arc::ptr_eq(&shop, &mt.get_site_store("shop")));
+            let env: HashMap<String, String> =
+                router.build_kv_env_vars(ids.kv.as_deref()).into_iter().collect();
+            assert_eq!(env.get("EPHPM_REDIS_USERNAME").map(String::as_str), Some("shop"));
+            assert_eq!(mt.site_count(), 1);
+
+            // Single-site mode (no multi-tenant store) is untouched: the global
+            // store, matched or not.
+            assert!(matches!(kv_scope(None, None), KvSiteScope::Global));
         }
 
         /// Single-site mode has one store and nothing to isolate, so the scope

@@ -43,53 +43,112 @@ static KV_STORE: OnceLock<Arc<Store>> = OnceLock::new();
 
 // ── Thread-local state ──────────────────────────────────────────────────
 
+/// Which KV keyspace `ephpm_kv_*` reaches for the current request.
+pub enum KvSiteScope {
+    /// The process-global store: single-site mode, where there is one store
+    /// and nothing to isolate.
+    Global,
+    /// This vhost's own store, resolved from its canonical site key.
+    Site(std::sync::Arc<ephpm_kv::store::Store>),
+    /// A multi-tenant node serving a `Host` that matched no vhost. There is no
+    /// tenant to scope to, so there is **no** store: every `ephpm_kv_*` call
+    /// fails with its documented failure value and a warning (once per
+    /// request). Neither a per-`Host` store (a client-controlled, never-freed
+    /// allocation per header value) nor the global store (operator state,
+    /// shared by every unmatched request) is acceptable here — the same
+    /// fail-closed rule `ephpm_db_*` applies ("no per-site database context").
+    Unmatched,
+}
+
+/// Per-thread state behind [`KvSiteScope`]. `Unmatched` carries whether this
+/// request has already been warned, so a script calling `ephpm_kv_get()` in a
+/// loop logs one line, not thousands. It resets on every [`set_site_scope`],
+/// i.e. once per request.
+#[cfg(php_linked)]
+enum ThreadScope {
+    Global,
+    Site(Arc<Store>),
+    Unmatched { warned: bool },
+}
+
 #[cfg(php_linked)]
 thread_local! {
     static KV_GET_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
-    /// Per-request site store for vhost KV isolation.
-    /// Points to the site-specific Store for the current request's hostname.
-    /// When None, falls back to the global store (single-site mode).
-    static KV_SITE_STORE: RefCell<Option<Arc<Store>>> = const { RefCell::new(None) };
+    /// Per-request KV scope for vhost isolation. Starts (and, for a
+    /// single-site request, stays) on the global store.
+    static KV_SITE_STORE: RefCell<ThreadScope> = const { RefCell::new(ThreadScope::Global) };
 }
 
-/// Set the KV store for the current thread/request.
+/// Set the KV scope for the current thread/request.
 ///
-/// Called by the request handler before PHP execution. In multi-tenant
-/// mode, this points to the site-specific store. In single-site mode,
-/// pass `None` to use the global store.
+/// Called by the request handler before PHP execution, for **every** request,
+/// so one request's scope can never leak into the next on a reused thread.
 #[cfg(php_linked)]
-pub fn set_site_store(store: Option<Arc<Store>>) {
+pub fn set_site_scope(scope: KvSiteScope) {
+    let scope = match scope {
+        KvSiteScope::Global => ThreadScope::Global,
+        KvSiteScope::Site(store) => ThreadScope::Site(store),
+        KvSiteScope::Unmatched => ThreadScope::Unmatched { warned: false },
+    };
     // Plain `with` on purpose (issue #269): Rust-side per-request setup on a
     // live thread, never reachable from a PHP shutdown function. The *read*
     // side ([`effective_store`]) is reachable and does use `try_with`.
     KV_SITE_STORE.with(|s| {
-        *s.borrow_mut() = store;
+        *s.borrow_mut() = scope;
     });
 }
 
 /// Stub when PHP is not linked.
 #[cfg(not(php_linked))]
-pub fn set_site_store(_store: Option<std::sync::Arc<ephpm_kv::store::Store>>) {}
+pub fn set_site_scope(_scope: KvSiteScope) {}
 
-/// Get the effective store for the current request.
-/// Returns the site-specific store if set, otherwise the global store.
+/// Set the KV store for the current thread/request: `Some` scopes to that
+/// site's store, `None` to the global store. Shorthand for
+/// [`set_site_scope`] with [`KvSiteScope::Site`] / [`KvSiteScope::Global`].
+pub fn set_site_store(store: Option<std::sync::Arc<ephpm_kv::store::Store>>) {
+    set_site_scope(store.map_or(KvSiteScope::Global, KvSiteScope::Site));
+}
+
+/// Get the effective store for the current request: the site store, the
+/// global store in single-site mode, or `None` for a request that matched no
+/// vhost on a multi-tenant node.
 ///
-/// Returns `None` when the per-thread site slot has already been destroyed
-/// (issue #269) — **fail closed**, not "fall back to the global store". In
-/// multi-tenant mode that fallback would let a tenant's shutdown function
-/// write into a keyspace that is not its own; a KV miss is the safe answer.
+/// Also returns `None` when the per-thread site slot has already been
+/// destroyed (issue #269) — **fail closed**, not "fall back to the global
+/// store". In multi-tenant mode that fallback would let a tenant's shutdown
+/// function write into a keyspace that is not its own; a KV miss is the safe
+/// answer.
 #[cfg(php_linked)]
 fn effective_store() -> Option<Arc<Store>> {
     KV_SITE_STORE
-        .try_with(|s| {
-            let site = s.borrow();
-            if let Some(ref store) = *site {
-                Some(Arc::clone(store))
-            } else {
-                KV_STORE.get().cloned()
-            }
+        .try_with(|s| match &*s.borrow() {
+            ThreadScope::Site(store) => Some(Arc::clone(store)),
+            ThreadScope::Global => KV_STORE.get().cloned(),
+            ThreadScope::Unmatched { .. } => None,
         })
         .unwrap_or(None)
+}
+
+/// `site_context` op: whether this request has a KV keyspace at all.
+///
+/// `0` = it does (site or global store). `1` = it matched no vhost on a
+/// multi-tenant node and has not been warned yet — the C side warns and fails
+/// the call; this call marks the request warned. `2` = no keyspace, already
+/// warned: fail the call silently. A destroyed slot (issue #269) reports `2`:
+/// the call must fail, and a warning from a dying thread has nowhere useful to
+/// go.
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_site_context() -> std::os::raw::c_int {
+    KV_SITE_STORE
+        .try_with(|s| match &mut *s.borrow_mut() {
+            ThreadScope::Global | ThreadScope::Site(_) => 0,
+            ThreadScope::Unmatched { warned } if !*warned => {
+                *warned = true;
+                1
+            }
+            ThreadScope::Unmatched { .. } => 2,
+        })
+        .unwrap_or(2)
 }
 
 // ── C-compatible ops struct ─────────────────────────────────────────────
@@ -197,9 +256,6 @@ pub struct EphpmKvOps {
     /// per-key shard lock, so a concurrent overwrite makes this a no-op rather
     /// than deleting a value it never observed — this is the safe-release
     /// primitive for KV locks (the delete-side companion to `set_nx`).
-    ///
-    /// Must stay LAST-appended: the layout mirrors `ephpm_wrapper.c`'s
-    /// `EphpmKvOps`.
     pub del_if_eq: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
@@ -207,6 +263,16 @@ pub struct EphpmKvOps {
             token_len: usize,
         ) -> std::os::raw::c_int,
     >,
+
+    /// Whether the current request has a KV keyspace: `0` yes, `1` no (a
+    /// multi-tenant request whose `Host` matched no vhost) and this is the
+    /// first call this request — warn, `2` no and already warned. The C side
+    /// checks it before every `ephpm_kv_*` op and fails the call on non-zero.
+    /// See `kv_site_context`.
+    ///
+    /// Must stay LAST-appended: the layout mirrors `ephpm_wrapper.c`'s
+    /// `EphpmKvOps`.
+    pub site_context: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -531,6 +597,7 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     flush_all: Some(kv_flush_all),
     wait: Some(kv_wait),
     del_if_eq: Some(kv_del_if_eq),
+    site_context: Some(kv_site_context),
 };
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -951,6 +1018,53 @@ mod tests {
         );
 
         // Reset thread-local state so it doesn't leak into other serial tests.
+        set_site_store(None);
+    }
+
+    // ── Unmatched host (KV stress report F-2) ───────────────────────────
+
+    /// A multi-tenant request whose `Host` matched no vhost has no keyspace:
+    /// every op fails, nothing falls back to the global store, and the
+    /// `site_context` op asks the C side to warn exactly once per request.
+    #[test]
+    #[serial]
+    fn unmatched_scope_fails_closed_and_warns_once_per_request() {
+        let global = init_store();
+        global.set("bridge_unmatched".into(), b"global".to_vec(), None);
+        let key = cstr("bridge_unmatched");
+        let val = b"from-an-unknown-host";
+
+        set_site_scope(KvSiteScope::Unmatched);
+        // Safety: key and val are valid for the duration of each call.
+        unsafe {
+            assert_eq!(kv_get(key.as_ptr()), 0, "must not read the global store");
+            assert_eq!(kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0), 0);
+            assert_eq!(kv_set_nx(key.as_ptr(), val.as_ptr().cast(), val.len(), 0), 0);
+            assert_eq!(kv_exists(key.as_ptr()), 0);
+            assert_eq!(kv_del(key.as_ptr()), 0);
+            assert_eq!(kv_pttl(key.as_ptr()), -2);
+            assert_eq!(kv_flush_all(), 0);
+        }
+        assert_eq!(
+            global.get("bridge_unmatched").as_deref(),
+            Some(&b"global"[..]),
+            "an unmatched request must not touch the global store"
+        );
+
+        // Safety: no arguments.
+        unsafe {
+            assert_eq!(kv_site_context(), 1, "first call this request: warn");
+            assert_eq!(kv_site_context(), 2, "then fail quietly");
+        }
+        // The next request re-arms the warning...
+        set_site_scope(KvSiteScope::Unmatched);
+        assert_eq!(unsafe { kv_site_context() }, 1);
+        // ...and a request with a keyspace reports one.
+        set_site_scope(KvSiteScope::Global);
+        assert_eq!(unsafe { kv_site_context() }, 0);
+        set_site_store(Some(Store::new(StoreConfig::default())));
+        assert_eq!(unsafe { kv_site_context() }, 0);
+
         set_site_store(None);
     }
 

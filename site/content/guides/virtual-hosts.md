@@ -20,8 +20,8 @@ Request: Host: alice-blog.com
            declares), with that site's own KV store,
            temp/session directory and (with [db.sqlite] dir) database
   → Not found? Fall back to server.document_root (or 404 if not configured).
-               An unmatched host is NOT a tenant: it gets no per-site database
-               and no per-site DB credentials.
+               An unmatched host is NOT a tenant: it gets no per-site database,
+               no per-site DB credentials and no KV keyspace.
 ```
 
 ### Directory Convention
@@ -262,7 +262,7 @@ The key that matched above is the tenant's **whole** identity, not just its docu
 Two consequences worth stating explicitly:
 
 - **Every name that reaches a site is the same tenant.** With `[server] sites_domain_suffix = ".localhost"`, `Host: blog.localhost`, `Host: blog` and `Host: BLOG.LOCALHOST:8080` all resolve to `blog` — one document root, one `blog.db`, one session directory, one set of credentials. (Until issue #290 the database key was derived separately and kept the suffix, so a tenant addressed both ways silently used two database files.)
-- **An unmatched host is not a tenant.** It serves `document_root`, but it has no site key, so it gets no per-site database and no `DB_*` credentials — a client cannot create `<anything>.db` by inventing a `Host` header (issue #291). `ephpm_db_*` on the fallback docroot reports `no per-site database context for this request`. If you want the fallback site to have a database, give it a real vhost directory.
+- **An unmatched host is not a tenant.** It serves `document_root`, but it has no site key, so it gets no per-site database and no `DB_*` credentials — a client cannot create `<anything>.db` by inventing a `Host` header (issue #291). `ephpm_db_*` on the fallback docroot reports `no per-site database context for this request`. The same applies to the KV store: an unmatched host gets no KV store and no `EPHPM_REDIS_*` credentials. Its `ephpm_kv_*` calls return their failure value with a `no per-site KV context for this request` warning, once per request. Previously each distinct `Host` header created its own KV store, which was never freed. If you want the fallback site to have a database or a KV keyspace, give it a real vhost directory.
 
 ### Host Sanitization
 

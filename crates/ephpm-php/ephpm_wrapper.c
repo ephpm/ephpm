@@ -3835,12 +3835,41 @@ typedef struct {
                  long long *new_version);
     /* Compare-and-delete: delete key only while its value equals the
      * token/token_len bytes. Returns 1 if deleted, 0 otherwise. The
-     * safe-release primitive for KV locks (delete-side companion to set_nx).
-     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+     * safe-release primitive for KV locks (delete-side companion to set_nx). */
     int  (*del_if_eq)(const char *key, const char *token, size_t token_len);
+    /* Whether this request has a KV keyspace: 0 yes; 1 no (a multi-tenant
+     * request whose Host matched no vhost), first call this request — warn;
+     * 2 no, already warned. Checked before every ephpm_kv_* op.
+     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+    int  (*site_context)(void);
 } EphpmKvOps;
 
 static EphpmKvOps g_kv_ops = {0};
+
+/* Non-zero when this request has no KV keyspace — a multi-tenant node serving
+ * a Host that matched no vhost. Such a request gets no per-site store (one per
+ * client-chosen Host header would be an unbounded, never-freed allocation an
+ * unauthenticated caller can drive) and not the global store either (operator
+ * state, shared by every unmatched request). Warns once per request, naming
+ * the calling function, then fails quietly. Mirrors ephpm_db_*'s "no per-site
+ * database context for this request". */
+static int ephpm_kv_no_site_context(void)
+{
+    if (!g_kv_ops.site_context) {
+        return 0;
+    }
+    int ctx = g_kv_ops.site_context();
+    if (ctx == 1) {
+        zend_error(E_WARNING,
+            "%s(): no per-site KV context for this request: the Host header matched "
+            "no virtual host, so there is no KV store to use and this call returned "
+            "its failure value. Serve the site from its own directory under "
+            "[server] sites_dir to give it a KV keyspace. Further ephpm_kv_* calls "
+            "in this request will not repeat this warning",
+            get_active_function_name());
+    }
+    return ctx != 0;
+}
 
 /* Called by every ephpm_kv_* function when no KV store is wired into this
  * process — which happens under `ephpm php` (the CLI runs PHP without
@@ -3878,6 +3907,7 @@ PHP_FUNCTION(ephpm_kv_get)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.get) { ephpm_kv_warn_unwired(); RETURN_NULL(); }
+    if (ephpm_kv_no_site_context()) { RETURN_NULL(); }
     if (!g_kv_ops.get(key)) { RETURN_NULL(); }
 
     const char *ptr; size_t len;
@@ -3898,6 +3928,7 @@ PHP_FUNCTION(ephpm_kv_set)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.set) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     RETURN_BOOL(g_kv_ops.set(key, val, val_len, ttl_ms));
 }
@@ -3915,6 +3946,7 @@ PHP_FUNCTION(ephpm_kv_setnx)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.set_nx) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     /* Returns true if the value was inserted, false if a live entry was
      * already present at this key. The check-and-set is atomic under the
@@ -3933,6 +3965,7 @@ PHP_FUNCTION(ephpm_kv_del)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.del) { ephpm_kv_warn_unwired(); RETURN_LONG(0); }
+    if (ephpm_kv_no_site_context()) { RETURN_LONG(0); }
     RETURN_LONG(g_kv_ops.del(key));
 }
 
@@ -3946,6 +3979,7 @@ PHP_FUNCTION(ephpm_kv_del_if_eq)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.del_if_eq) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     /* Deletes key only while its stored value still equals `token`; returns
      * true if this call removed it, false otherwise (mismatch, absent, or
      * expired). The compare-and-delete is atomic under the KV store's per-key
@@ -3963,6 +3997,7 @@ PHP_FUNCTION(ephpm_kv_exists)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.exists) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     RETURN_BOOL(g_kv_ops.exists(key));
 }
 
@@ -3974,6 +4009,7 @@ PHP_FUNCTION(ephpm_kv_incr)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, 1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -3987,6 +4023,7 @@ PHP_FUNCTION(ephpm_kv_decr)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, -1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -4002,6 +4039,7 @@ PHP_FUNCTION(ephpm_kv_incr_by)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long result = 0;
     if (!g_kv_ops.incr_by(key, (long long)delta, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
@@ -4017,6 +4055,7 @@ PHP_FUNCTION(ephpm_kv_expire)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.expire) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     RETURN_BOOL(g_kv_ops.expire(key, ttl_ms));
 }
@@ -4029,6 +4068,7 @@ PHP_FUNCTION(ephpm_kv_ttl)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
+    if (ephpm_kv_no_site_context()) { RETURN_LONG(-2); }
     long long pttl = g_kv_ops.pttl(key);
     if (pttl < 0) {
         /* -1 = no expiry, -2 = missing — pass through */
@@ -4047,6 +4087,7 @@ PHP_FUNCTION(ephpm_kv_pttl)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
+    if (ephpm_kv_no_site_context()) { RETURN_LONG(-2); }
     RETURN_LONG((zend_long)g_kv_ops.pttl(key));
 }
 
@@ -4060,6 +4101,7 @@ PHP_FUNCTION(ephpm_kv_flush_all)
     ZEND_PARSE_PARAMETERS_NONE();
 
     if (!g_kv_ops.flush_all) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
     RETURN_BOOL(g_kv_ops.flush_all());
 }
 
@@ -4097,6 +4139,7 @@ PHP_FUNCTION(ephpm_kv_wait)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!g_kv_ops.wait) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
 
     long long new_version = 0;
     int rc = g_kv_ops.wait(key, (long long)last_version, (long long)timeout_ms,
@@ -5868,6 +5911,16 @@ PS_READ_FUNC(ephpm)
 
     const char *sid_str = ZSTR_VAL(key);
     size_t sid_len = ZSTR_LEN(key);
+
+    /* No KV keyspace for this request (multi-tenant, Host matched no vhost):
+     * warn once and start an empty session. This must come BEFORE the lock:
+     * every set_nx would fail, which the lock loop reads as contention and
+     * would spin on for the full 30 s wait budget. PS_WRITE then fails, and
+     * PHP reports that itself. */
+    if (ephpm_kv_no_site_context()) {
+        *val = ZSTR_EMPTY_ALLOC();
+        return SUCCESS;
+    }
 
     /* Serialize concurrent requests on the same session id: take the
      * per-session lock BEFORE reading the blob so the read-modify-write
