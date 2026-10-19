@@ -46,14 +46,51 @@ fn session_cookie(resp: &reqwest::Response) -> String {
         .expect("the first response must set a PHPSESSID cookie")
 }
 
+/// The fixture, deployable into a vhost (see [`session_host`]).
+const SESSION_AUTOCLOSE_PHP: &str = include_str!("../../../tests/docroot/session_autoclose.php");
+
+/// Vhost the `ephpm` (KV-backed) session case runs under on a multi-tenant node.
+const SESSION_TENANT: &str = "teardown-session.test";
+
+/// The `Host` to send for `handler`, deploying the fixture into a vhost first
+/// when one is needed.
+///
+/// On a multi-tenant node (`EPHPM_SITES_DIR` set — the bare-process shared node
+/// is one) a request whose `Host` matches no vhost has no KV keyspace, so the
+/// KV-backed `ephpm` session handler cannot work on the default document root.
+/// That case therefore runs under a real vhost. The `files` handler needs no
+/// KV and keeps running on the default document root.
+fn session_host(handler: &str) -> Option<&'static str> {
+    if handler != "ephpm" {
+        return None;
+    }
+    let sites = std::env::var("EPHPM_SITES_DIR").ok()?;
+    let dir = std::path::Path::new(&sites).join(SESSION_TENANT);
+    std::fs::create_dir_all(&dir).expect("create session site dir");
+    std::fs::write(dir.join("session_autoclose.php"), SESSION_AUTOCLOSE_PHP)
+        .expect("write session fixture");
+    Some(SESSION_TENANT)
+}
+
 /// Sequential requests on one session (never explicitly closed) must each
 /// succeed and see the previous request's write.
 async fn sequential_session_requests(handler: &str) {
     let base_url = required_env("EPHPM_URL");
     let client = client();
     let url = format!("{base_url}/session_autoclose.php?handler={handler}");
+    let host = session_host(handler);
+    let get = |cookie: Option<&str>| {
+        let mut req = client.get(&url);
+        if let Some(host) = host {
+            req = req.header(reqwest::header::HOST, host);
+        }
+        if let Some(cookie) = cookie {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        req.send()
+    };
 
-    let first = client.get(&url).send().await.expect("request 1 failed");
+    let first = get(None).await.expect("request 1 failed");
     assert_eq!(first.status().as_u16(), 200, "[{handler}] request 1 status");
     let cookie = session_cookie(&first);
     assert_eq!(first.text().await.expect("body 1").trim(), "1", "[{handler}] request 1");
@@ -63,10 +100,7 @@ async fn sequential_session_requests(handler: &str) {
     // served its predecessor.
     for n in 2..=5 {
         let started = Instant::now();
-        let resp = client
-            .get(&url)
-            .header(reqwest::header::COOKIE, &cookie)
-            .send()
+        let resp = get(Some(&cookie))
             .await
             .unwrap_or_else(|e| panic!("[{handler}] request {n} failed: {e}"));
         let status = resp.status().as_u16();
@@ -83,6 +117,10 @@ async fn sequential_session_requests(handler: &str) {
             n.to_string(),
             "[{handler}] request {n} must see every previous request's session write"
         );
+    }
+
+    if let (Some(host), Ok(sites)) = (host, std::env::var("EPHPM_SITES_DIR")) {
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&sites).join(host));
     }
 }
 

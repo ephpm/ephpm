@@ -178,6 +178,23 @@ const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "load_shedding",
 ];
 
+/// Suites that exercise `ephpm_kv_*` (or the KV-backed `ephpm` session handler)
+/// from the **default document root**, so they need a single-site node.
+///
+/// The shared node runs multi-tenant (`sites_dir`, for `vhosts`/`security_p0`),
+/// and on a multi-tenant node a `Host` that matches no vhost — `127.0.0.1`,
+/// which is what these suites send — has no KV keyspace: every `ephpm_kv_*`
+/// call fails with "no per-site KV context". It used to get a store keyed by
+/// the raw `Host`, which let any client mint a never-freed store per header
+/// value (KV stress report F-2). These suites test the KV functions
+/// themselves, not tenancy, so each gets a fresh single-site node (the `_` arm
+/// of [`SingleNodeOptions::for_suite`]) where the default docroot uses the
+/// global store. Per-tenant KV isolation stays covered on multi-tenant nodes by
+/// `request_teardown` (which runs its KV-backed session case under a vhost) and
+/// `websockets`.
+const SINGLE_SITE_KV_SUITES: &[&str] =
+    &["concurrency", "kv", "kv_advanced", "kv_unix_socket", "session_locking"];
+
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
 ///
@@ -227,7 +244,9 @@ fn suite_is_serial(name: &str) -> bool {
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
 /// (rather than sharing the long-lived one).
 fn suite_needs_fresh_node(name: &str) -> bool {
-    ISOLATED_DB_SUITES.contains(&name) || ISOLATED_CONFIG_SUITES.contains(&name)
+    ISOLATED_DB_SUITES.contains(&name)
+        || ISOLATED_CONFIG_SUITES.contains(&name)
+        || SINGLE_SITE_KV_SUITES.contains(&name)
 }
 
 /// Suites that need **no ephpm server at all** — they exec the release binary
@@ -335,7 +354,9 @@ fn platform_skip_reason_for(suite: &str, windows: bool) -> Option<&'static str> 
 //   on that node is indifferent to `sites_dir`; nothing else on it touches the
 //   database, which is what makes multi-tenant mode (no SQLite wire listeners)
 //   viable there. If a future suite on the shared node needs `pdo_mysql`, it
-//   belongs in ISOLATED_DB_SUITES, not on this node.
+//   belongs in ISOLATED_DB_SUITES, not on this node. Likewise a suite that
+//   needs `ephpm_kv_*` on the default docroot belongs in SINGLE_SITE_KV_SUITES
+//   (an unmatched `Host` has no KV keyspace on a multi-tenant node).
 //
 // - `path_traversal` — drives hand-written request lines over a raw TcpStream
 //   (reqwest normalizes `../` client-side, so the attack is not expressible
@@ -983,6 +1004,9 @@ trusted_hosts = [
     # test (shared node, which runs multi-tenant). Inert elsewhere.
     "teardown-a.test",
     "teardown-b.test",
+    # The same suite's KV-backed (`ephpm`) session case: an unmatched Host has
+    # no KV keyspace on a multi-tenant node, so it runs under this vhost.
+    "teardown-session.test",
 ]
 
 [server.response]
@@ -1457,6 +1481,10 @@ impl SingleNodeOptions {
                 preview: false,
                 websocket: false,
             },
+            // SINGLE_SITE_KV_SUITES also land here: single-site is the whole
+            // point (the default docroot only has a KV keyspace without
+            // `sites_dir`).
+            //
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
             // which does not start the SQLite wire listeners at all, and every
