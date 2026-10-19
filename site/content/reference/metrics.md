@@ -385,7 +385,7 @@ Every series carries one label, `site`: the vhost's canonical site key in the pe
 | `ephpm_sqlite_wal_gate_truncations_total` | counter | `site` | Attempts that truncated the log. |
 | `ephpm_sqlite_wal_gate_bytes_truncated_total` | counter | `site` | Bytes the `-wal` file held just before each successful truncate, summed. |
 | `ephpm_sqlite_wal_gate_frames_backfilled_total` | counter | `site` | Frames the passive backfill phase (outside the gate, blocks nobody) moved into the main file. |
-| `ephpm_sqlite_wal_gate_timeouts_total` | counter | `site` | Attempts abandoned because in-flight statements and open transactions did not drain within `max_wait_ms`. **Climbing while `truncations_total` stays flat means a long-lived transaction is keeping the log open** — the gate backs off (up to `max_backoff_secs`) rather than stall it. |
+| `ephpm_sqlite_wal_gate_timeouts_total` | counter | `site` | Attempts abandoned because in-flight statements and open transactions did not drain within the attempt's wait (`max_wait_ms`, or the escalated wait). **Climbing while `truncations_total` stays flat means statements are outlasting the wait.** That can be slow reads, which escalation is meant to beat (watch `escalation_level`), or a long-lived transaction, which nothing can beat: at the `max_escalated_wait_ms` ceiling the gate backs off (up to `max_backoff_secs`) rather than keep stalling traffic. |
 | `ephpm_sqlite_wal_gate_busy_total` | counter | `site` | Attempts where the engine still reported the checkpoint busy after the gate was held: a reader outside the gate (a raw connection without a permit) was active. Retried. |
 | `ephpm_sqlite_wal_gate_errors_total` | counter | `site` | Attempts that failed with an engine error (also logged at WARN). |
 | `ephpm_sqlite_wal_gate_skipped_journal_mode_total` | counter | `site` | Attempts skipped because the database is not in `wal` journal mode (Turso's experimental MVCC mode keeps its own log; the gate makes no claim about it). Logged once at WARN. |
@@ -393,14 +393,28 @@ Every series carries one label, `site`: the vhost's canonical site key in the pe
 | `ephpm_sqlite_wal_gate_max_exclusive_seconds` | gauge | `site` | Longest exclusive window seen since the database was opened. |
 | `ephpm_sqlite_wal_gate_last_backfill_seconds` | gauge | `site` | Duration of the most recent passive backfill phase (outside the gate). |
 | `ephpm_sqlite_wal_gate_max_backfill_seconds` | gauge | `site` | Longest passive backfill phase seen. If this is large while `max_exclusive_seconds` stays small, the backfill is doing its job of keeping the stall out of the exclusive window. |
+| `ephpm_sqlite_wal_gate_escalation_level` | gauge | `site` | Where the gate's wait schedule is. `0` means attempts wait the plain `max_wait_ms`. `n` means the next attempt waits `max_wait_ms × 2ⁿ` (capped at `max_escalated_wait_ms`), because the log is at least 4 × `threshold_bytes` and earlier attempts timed out. **Non-zero means requests may be stalling** for up to `next_wait_seconds` while the gate drains. Resets to `0` on a truncate. |
+| `ephpm_sqlite_wal_gate_consecutive_timeouts` | gauge | `site` | Attempts in a row that timed out since the last truncate. Resets on a truncate, or once the log is back under `threshold_bytes`. A value that keeps rising means statements are outlasting even the escalated wait. |
+| `ephpm_sqlite_wal_gate_next_wait_seconds` | gauge | `site` | The exclusive wait the next attempt will use: `max_wait_ms` unless escalated. This is the worst-case stall that attempt can add to new statements. |
+
+The three schedule gauges (`escalation_level`, `consecutive_timeouts`, `next_wait_seconds`) describe one maintenance task. In the clustered modes one file can have two gated factories (serving and replication), and each runs its own task. The gauges show whichever task published last, while the counters are per file.
 
 ```promql
-# A database whose WAL the gate cannot keep down (long transactions, or a
-# raw reader outside the gate).
-ephpm_sqlite_wal_bytes > 2 * 67108864
-
-# Attempts giving up on an open transaction, per site.
+# The alert: the gate is losing. Attempts keep timing out AND the log is past
+# twice its threshold (2 × the 64 MiB default; adjust to your threshold_bytes).
+# Timeouts alone are normal (one long transaction makes an attempt give up);
+# timeouts while the WAL stays big are not.
 rate(ephpm_sqlite_wal_gate_timeouts_total[5m]) > 0
+  and on (site) ephpm_sqlite_wal_bytes > 2 * 67108864
+
+# The gate is escalating: requests on this site may be queueing for up to
+# next_wait_seconds while it drains. Brief blips are expected under heavy
+# reads; sustained escalation means reads routinely outlast max_wait_ms.
+max_over_time(ephpm_sqlite_wal_gate_escalation_level[10m]) > 0
+
+# Even the escalated wait is not enough: something (usually a transaction held
+# open for seconds) is pinning the log. Find and fix the long transaction.
+ephpm_sqlite_wal_gate_consecutive_timeouts > 10
 ```
 
 **Cardinality.** One series per open database. In the per-site modes the serving registry's open set is capped by `[db.sqlite] max_open_dbs`, and the per-site clustered replication registry holds one entry per vhost directory on disk — the same bound the `vhost` label on `ephpm_opcache_invalidations_total` has. An owned site in per-site clustered mode is open in both registries, but the gate is per *file*, so it is reported once. There are no per-peer or per-connection labels.
