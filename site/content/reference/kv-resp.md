@@ -62,6 +62,12 @@ With any of the three conditions missing, none of them are set.
 Arity is checked as a minimum: extra trailing arguments are ignored rather
 than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 
+**Keys, hash fields and `KEYS` patterns must be valid UTF-8** (a NUL byte is
+fine). Unlike Redis, the store cannot hold binary keys, so a command naming a
+non-UTF-8 key is refused with `-ERR invalid key: ePHPm KV keys and hash fields
+must be valid UTF-8` and changes nothing. That includes a multi-key `MSET`,
+`DEL` or `HSET` with one bad key. Values are binary-safe.
+
 | Group | Command | Notes |
 |---|---|---|
 | Connection | `PING [msg]` | `PONG`, or echoes `msg`. |

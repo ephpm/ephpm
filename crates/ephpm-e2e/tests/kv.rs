@@ -44,6 +44,22 @@ async fn kv_set_get_roundtrip() {
     assert_eq!(body, "hello_world", "get must return the value that was set");
 }
 
+/// KV stress report F-18: keys that differ only after a NUL byte used to be
+/// truncated to the same key, and a binary (non-UTF-8) key silently failed.
+/// F-14 (PHP side): a TTL overflowing milliseconds was signed-overflow UB.
+#[tokio::test]
+async fn kv_binary_keys_are_exact_or_refused_loudly() {
+    let base = required_env("EPHPM_URL");
+
+    let (s, body) = kv(&base, "op=binkeys&key=binkeys_").await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        body,
+        "nul_a='valueA'\nnul_b='valueB'\nnul_prefix=NULL\nraw_set=false\nraw_get=NULL\n\
+         raw_warned=yes\nhuge_ttl=false\nhuge_ttl_warned=yes"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn kv_ttl_expiry() {
     let base = required_env("EPHPM_URL");

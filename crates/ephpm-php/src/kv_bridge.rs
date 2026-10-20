@@ -27,8 +27,6 @@
 #[cfg(php_linked)]
 use std::cell::RefCell;
 #[cfg(php_linked)]
-use std::ffi::CStr;
-#[cfg(php_linked)]
 use std::sync::{Arc, OnceLock};
 #[cfg(php_linked)]
 use std::time::Duration;
@@ -151,17 +149,59 @@ unsafe extern "C" fn kv_site_context() -> std::os::raw::c_int {
         .unwrap_or(2)
 }
 
+/// Borrow a key that PHP passed as `(pointer, length)`.
+///
+/// Keys cross the FFI boundary with their length, never as NUL-terminated
+/// strings: `CStr::from_ptr` truncated `"nul\0A"` and `"nul\0B"` to the same
+/// key `"nul"` (KV stress report F-18). The store keys entries by UTF-8
+/// `String`, so a non-UTF-8 key is refused (`None`) rather than converted
+/// lossily — the C side has already warned about it, this is the backstop.
+///
+/// # Safety
+///
+/// `key` must point to `key_len` readable bytes that stay valid for `'a`.
+#[cfg(php_linked)]
+unsafe fn key_arg<'a>(key: *const std::os::raw::c_char, key_len: usize) -> Option<&'a str> {
+    if key.is_null() {
+        return None;
+    }
+    // Safety: the caller guarantees `key_len` readable bytes at `key`.
+    let bytes = unsafe { std::slice::from_raw_parts(key.cast::<u8>(), key_len) };
+    std::str::from_utf8(bytes).ok()
+}
+
+/// `ttl_ms` from PHP as an optional TTL: `<= 0` is "no expiry" (`Ok(None)`),
+/// and a value too large to represent is `Err(())` — the store would panic on
+/// `Instant + Duration` overflow (KV stress report F-14). The C side already
+/// bounds it; this is the backstop.
+#[cfg(php_linked)]
+fn optional_ttl(ttl_ms: std::os::raw::c_longlong) -> Result<Option<Duration>, ()> {
+    if ttl_ms <= 0 {
+        return Ok(None);
+    }
+    ephpm_kv::command::checked_ttl(ttl_ms, ephpm_kv::command::TtlUnit::Millis).map(Some).ok_or(())
+}
+
 // ── C-compatible ops struct ─────────────────────────────────────────────
 
 /// Function pointer table passed to C so PHP native functions can call
 /// into the Rust KV store without knowing about Rust types.
+///
+/// Every key is passed as `(key, key_len)` — PHP strings are binary and may
+/// contain NUL — and must be UTF-8 (see [`key_arg`]). The layout mirrors
+/// `ephpm_wrapper.c`'s `EphpmKvOps` field for field.
 #[cfg(php_linked)]
 #[repr(C)]
 pub struct EphpmKvOps {
     /// Get a value by key. Returns 1 if found, 0 if not.
     /// The result is stored in a thread-local buffer and retrieved
     /// via `get_result`.
-    pub get: Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_int>,
+    pub get: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
 
     /// Retrieve the pointer and length of the last `get` result.
     pub get_result:
@@ -172,6 +212,7 @@ pub struct EphpmKvOps {
     pub set: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             val: *const std::os::raw::c_char,
             val_len: usize,
             ttl_ms: std::os::raw::c_longlong,
@@ -187,6 +228,7 @@ pub struct EphpmKvOps {
     pub set_nx: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             val: *const std::os::raw::c_char,
             val_len: usize,
             ttl_ms: std::os::raw::c_longlong,
@@ -194,17 +236,27 @@ pub struct EphpmKvOps {
     >,
 
     /// Delete a key. Returns 1 if it existed, 0 if not.
-    pub del: Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_long>,
+    pub del: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_long,
+    >,
 
     /// Check if a key exists. Returns 1 if yes, 0 if no.
-    pub exists:
-        Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_int>,
+    pub exists: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
 
     /// Increment value by delta. Stores result in `*result`.
     /// Returns 1 on success, 0 on error (value not an integer).
     pub incr_by: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             delta: std::os::raw::c_longlong,
             result: *mut std::os::raw::c_longlong,
         ) -> std::os::raw::c_int,
@@ -215,14 +267,19 @@ pub struct EphpmKvOps {
     pub expire: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             ttl_ms: std::os::raw::c_longlong,
         ) -> std::os::raw::c_int,
     >,
 
     /// Get remaining TTL in milliseconds. Returns -1 for no expiry,
     /// -2 for missing key.
-    pub pttl:
-        Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong>,
+    pub pttl: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
 
     /// Remove all keys from the effective store (per-site if set, else
     /// global). Backs Redis-style `FLUSHDB` / `FLUSHALL` from PHP userland.
@@ -243,6 +300,7 @@ pub struct EphpmKvOps {
     pub wait: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             last_version: std::os::raw::c_longlong,
             timeout_ms: std::os::raw::c_longlong,
             new_version: *mut std::os::raw::c_longlong,
@@ -259,6 +317,7 @@ pub struct EphpmKvOps {
     pub del_if_eq: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,
+            key_len: usize,
             token: *const std::os::raw::c_char,
             token_len: usize,
         ) -> std::os::raw::c_int,
@@ -278,11 +337,13 @@ pub struct EphpmKvOps {
 // ── Callback implementations ────────────────────────────────────────────
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string provided by PHP's
-    // zend_parse_parameters. Valid for the duration of this call.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+unsafe extern "C" fn kv_get(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -337,14 +398,14 @@ unsafe extern "C" fn kv_get_result(ptr: *mut *const std::os::raw::c_char, len: *
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_set(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     val: *const std::os::raw::c_char,
     val_len: usize,
     ttl_ms: std::os::raw::c_longlong,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP. `val` is a
-    // pointer to `val_len` bytes from PHP's string parameter.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -353,11 +414,8 @@ unsafe extern "C" fn kv_set(
     // Safety: `val` points to `val_len` bytes of valid memory from PHP.
     let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
 
-    let ttl = if ttl_ms > 0 {
-        #[allow(clippy::cast_sign_loss)]
-        Some(Duration::from_millis(ttl_ms as u64))
-    } else {
-        None
+    let Ok(ttl) = optional_ttl(ttl_ms) else {
+        return 0;
     };
 
     i32::from(store.set(key_str.to_string(), val_bytes.to_vec(), ttl))
@@ -366,14 +424,14 @@ unsafe extern "C" fn kv_set(
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_set_nx(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     val: *const std::os::raw::c_char,
     val_len: usize,
     ttl_ms: std::os::raw::c_longlong,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP. `val` is a
-    // pointer to `val_len` bytes from PHP's string parameter.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -382,11 +440,8 @@ unsafe extern "C" fn kv_set_nx(
     // Safety: `val` points to `val_len` bytes of valid memory from PHP.
     let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
 
-    let ttl = if ttl_ms > 0 {
-        #[allow(clippy::cast_sign_loss)]
-        Some(Duration::from_millis(ttl_ms as u64))
-    } else {
-        None
+    let Ok(ttl) = optional_ttl(ttl_ms) else {
+        return 0;
     };
 
     set_nx_rc(store.set_nx_outcome(key_str.to_string(), val_bytes.to_vec(), ttl))
@@ -408,10 +463,13 @@ fn set_nx_rc(outcome: ephpm_kv::store::SetNxOutcome) -> std::os::raw::c_int {
 }
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_del(key: *const std::os::raw::c_char) -> std::os::raw::c_long {
-    // Safety: `key` is a null-terminated C string from PHP.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+unsafe extern "C" fn kv_del(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_long {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -424,13 +482,13 @@ unsafe extern "C" fn kv_del(key: *const std::os::raw::c_char) -> std::os::raw::c
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_del_if_eq(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     token: *const std::os::raw::c_char,
     token_len: usize,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP. `token` is a
-    // pointer to `token_len` bytes from PHP's (binary-safe) string parameter.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -443,10 +501,13 @@ unsafe extern "C" fn kv_del_if_eq(
 }
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_exists(key: *const std::os::raw::c_char) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+unsafe extern "C" fn kv_exists(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -459,13 +520,13 @@ unsafe extern "C" fn kv_exists(key: *const std::os::raw::c_char) -> std::os::raw
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_incr_by(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     delta: std::os::raw::c_longlong,
     result: *mut std::os::raw::c_longlong,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP. `result` is
-    // a valid pointer to a local variable in our C wrapper code.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -485,31 +546,35 @@ unsafe extern "C" fn kv_incr_by(
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_expire(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     ttl_ms: std::os::raw::c_longlong,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string from PHP.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
         return 0;
     };
 
-    if ttl_ms <= 0 {
+    // Non-positive or out-of-range: refuse (the C side warns about the
+    // latter). `checked_ttl` keeps `Instant + ttl` from overflowing.
+    let Some(ttl) = ephpm_kv::command::checked_ttl(ttl_ms, ephpm_kv::command::TtlUnit::Millis)
+    else {
         return 0;
-    }
-
-    #[allow(clippy::cast_sign_loss)]
-    let ttl = Duration::from_millis(ttl_ms as u64);
+    };
     i32::from(store.expire(&key_str, ttl))
 }
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_pttl(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong {
-    // Safety: `key` is a null-terminated C string from PHP.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+unsafe extern "C" fn kv_pttl(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return -2;
     };
     let Some(store) = effective_store() else {
@@ -534,14 +599,14 @@ unsafe extern "C" fn kv_flush_all() -> std::os::raw::c_int {
 #[cfg(php_linked)]
 unsafe extern "C" fn kv_wait(
     key: *const std::os::raw::c_char,
+    key_len: usize,
     last_version: std::os::raw::c_longlong,
     timeout_ms: std::os::raw::c_longlong,
     new_version: *mut std::os::raw::c_longlong,
 ) -> std::os::raw::c_int {
-    // Safety: `key` is a null-terminated C string provided by PHP's
-    // zend_parse_parameters. Valid for the duration of this call.
-    let key_str = unsafe { CStr::from_ptr(key) };
-    let Ok(key_str) = key_str.to_str() else {
+    // Safety: `key` points to `key_len` bytes of PHP's (binary-safe) string
+    // parameter, valid for the duration of this call.
+    let Some(key_str) = (unsafe { key_arg(key, key_len) }) else {
         return 0;
     };
     let Some(store) = effective_store() else {
@@ -668,7 +733,7 @@ mod tests {
         init_store();
         let key = cstr("bridge_get_missing");
         // Safety: key is a valid C string.
-        let found = unsafe { kv_get(key.as_ptr()) };
+        let found = unsafe { kv_get(key.as_ptr(), key.as_bytes().len()) };
         assert_eq!(found, 0);
     }
 
@@ -680,7 +745,7 @@ mod tests {
 
         let key = cstr("bridge_rtrip");
         // Safety: key is a valid C string.
-        let found = unsafe { kv_get(key.as_ptr()) };
+        let found = unsafe { kv_get(key.as_ptr(), key.as_bytes().len()) };
         assert_eq!(found, 1);
 
         let mut ptr: *const std::os::raw::c_char = std::ptr::null();
@@ -699,8 +764,8 @@ mod tests {
         store.set("bridge_tl_b".into(), b"bbb".to_vec(), None);
 
         // Get "a", then "b" — result buffer should reflect the last call.
-        unsafe { kv_get(cstr("bridge_tl_a").as_ptr()) };
-        unsafe { kv_get(cstr("bridge_tl_b").as_ptr()) };
+        unsafe { kv_get(cstr("bridge_tl_a").as_ptr(), "bridge_tl_a".len()) };
+        unsafe { kv_get(cstr("bridge_tl_b").as_ptr(), "bridge_tl_b".len()) };
 
         let mut ptr: *const std::os::raw::c_char = std::ptr::null();
         let mut len: usize = 0;
@@ -718,7 +783,9 @@ mod tests {
         let key = cstr("bridge_set_k");
         let val = b"value";
         // Safety: key and val are valid for the duration of the call.
-        let ok = unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        let ok = unsafe {
+            kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0)
+        };
         assert_eq!(ok, 1);
         assert_eq!(store.get("bridge_set_k").as_deref(), Some(&b"value"[..]));
     }
@@ -731,7 +798,9 @@ mod tests {
         let val = b"expiring";
         // 60 seconds in milliseconds.
         // Safety: key and val are valid pointers.
-        unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 60_000) };
+        unsafe {
+            kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 60_000)
+        };
         let pttl = store.pttl("bridge_set_ttl").unwrap();
         assert!(pttl > 0 && pttl <= 60_000, "expected TTL in (0, 60000], got {pttl}");
     }
@@ -743,7 +812,7 @@ mod tests {
         let key = cstr("bridge_set_nottl");
         let val = b"forever";
         // Safety: key and val are valid pointers.
-        unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        unsafe { kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0) };
         assert_eq!(store.pttl("bridge_set_nottl"), Some(-1));
     }
 
@@ -754,8 +823,81 @@ mod tests {
         let key = cstr("bridge_set_bin");
         let val: &[u8] = &[0x00, 0x01, 0xFF, 0xFE];
         // Safety: key is a valid C string; val is valid for val.len() bytes.
-        unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
+        unsafe { kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0) };
         assert_eq!(store.get("bridge_set_bin").as_deref(), Some(&val[..]));
+    }
+
+    // ── Binary keys and TTL bounds (KV stress report F-14/F-18) ─────────
+
+    /// `"nul\0A"` and `"nul\0B"` used to be read with `CStr::from_ptr`, which
+    /// stopped at the NUL: both wrote the key `"nul"`, so the second write
+    /// replaced the first. With `(ptr, len)` keys they are distinct entries.
+    #[test]
+    #[serial]
+    fn keys_containing_nul_are_distinct() {
+        let store = init_store();
+        let (a, b): (&[u8], &[u8]) = (b"bridge_nul\0A", b"bridge_nul\0B");
+        // Safety: keys and values are valid for their lengths.
+        unsafe {
+            assert_eq!(kv_set(a.as_ptr().cast(), a.len(), b"va".as_ptr().cast(), 2, 0), 1);
+            assert_eq!(kv_set(b.as_ptr().cast(), b.len(), b"vb".as_ptr().cast(), 2, 0), 1);
+        }
+        assert_eq!(store.get("bridge_nul\0A").as_deref(), Some(&b"va"[..]));
+        assert_eq!(store.get("bridge_nul\0B").as_deref(), Some(&b"vb"[..]));
+        assert_eq!(store.get("bridge_nul"), None, "the key must not be truncated at the NUL");
+
+        // Safety: `a` is valid for its length.
+        assert_eq!(unsafe { kv_get(a.as_ptr().cast(), a.len()) }, 1);
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        let mut len: usize = 0;
+        // Safety: ptr and len are valid stack variables.
+        unsafe { kv_get_result(&mut ptr, &mut len) };
+        let got = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        assert_eq!(got, b"va");
+        // Safety: `b` is valid for its length.
+        assert_eq!(unsafe { kv_del(b.as_ptr().cast(), b.len()) }, 1);
+        assert_eq!(store.get("bridge_nul\0A").as_deref(), Some(&b"va"[..]));
+    }
+
+    /// A non-UTF-8 key (raw `md5($x, true)` output) cannot be held by the
+    /// `String`-keyed store, so every op refuses it rather than storing it
+    /// under a lossy, colliding name.
+    #[test]
+    #[serial]
+    fn non_utf8_keys_are_refused() {
+        let store = init_store();
+        let before = store.len();
+        let key: &[u8] = b"bridge_bin\xff\xfe";
+        let k = key.as_ptr().cast();
+        let mut out: std::os::raw::c_longlong = 0;
+        // Safety: `key` and the values are valid for their lengths.
+        unsafe {
+            assert_eq!(kv_set(k, key.len(), b"v".as_ptr().cast(), 1, 0), 0);
+            assert_eq!(kv_set_nx(k, key.len(), b"v".as_ptr().cast(), 1, 0), 0);
+            assert_eq!(kv_incr_by(k, key.len(), 1, &mut out), 0);
+            assert_eq!(kv_get(k, key.len()), 0);
+            assert_eq!(kv_exists(k, key.len()), 0);
+            assert_eq!(kv_pttl(k, key.len()), -2);
+        }
+        assert_eq!(store.len(), before, "nothing may have been written");
+    }
+
+    /// A TTL too large for `Instant + Duration` is refused instead of
+    /// panicking inside the store (a panic in an `extern "C"` fn aborts).
+    #[test]
+    #[serial]
+    fn out_of_range_ttl_is_refused_not_a_panic() {
+        let store = init_store();
+        let key = cstr("bridge_huge_ttl");
+        let max = std::os::raw::c_longlong::MAX;
+        // Safety: key and value are valid for their lengths.
+        unsafe {
+            assert_eq!(kv_set(key.as_ptr(), key.as_bytes().len(), b"v".as_ptr().cast(), 1, max), 0);
+            assert_eq!(store.get("bridge_huge_ttl"), None);
+            assert_eq!(kv_set(key.as_ptr(), key.as_bytes().len(), b"v".as_ptr().cast(), 1, 0), 1);
+            assert_eq!(kv_expire(key.as_ptr(), key.as_bytes().len(), max), 0);
+        }
+        assert_eq!(store.pttl("bridge_huge_ttl"), Some(-1), "the refused expire changed nothing");
     }
 
     // ── kv_del ──────────────────────────────────────────────────────────
@@ -767,7 +909,7 @@ mod tests {
         store.set("bridge_del_k".into(), b"v".to_vec(), None);
         let key = cstr("bridge_del_k");
         // Safety: key is a valid C string.
-        let removed = unsafe { kv_del(key.as_ptr()) };
+        let removed = unsafe { kv_del(key.as_ptr(), key.as_bytes().len()) };
         assert_eq!(removed, 1);
         assert_eq!(store.get("bridge_del_k"), None);
     }
@@ -778,7 +920,7 @@ mod tests {
         init_store();
         let key = cstr("bridge_del_missing");
         // Safety: key is a valid C string.
-        let removed = unsafe { kv_del(key.as_ptr()) };
+        let removed = unsafe { kv_del(key.as_ptr(), key.as_bytes().len()) };
         assert_eq!(removed, 0);
     }
 
@@ -792,7 +934,9 @@ mod tests {
         let key = cstr("bridge_cad_match");
         let token = b"tok";
         // Safety: key is a valid C string; token is valid for token.len() bytes.
-        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        let rc = unsafe {
+            kv_del_if_eq(key.as_ptr(), key.as_bytes().len(), token.as_ptr().cast(), token.len())
+        };
         assert_eq!(rc, 1, "a matching token must delete");
         assert_eq!(store.get("bridge_cad_match"), None);
     }
@@ -805,7 +949,9 @@ mod tests {
         let key = cstr("bridge_cad_mismatch");
         let token = b"other";
         // Safety: key is a valid C string; token is valid for token.len() bytes.
-        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        let rc = unsafe {
+            kv_del_if_eq(key.as_ptr(), key.as_bytes().len(), token.as_ptr().cast(), token.len())
+        };
         assert_eq!(rc, 0, "a different token must not delete");
         assert_eq!(store.get("bridge_cad_mismatch").as_deref(), Some(&b"tok"[..]));
     }
@@ -817,7 +963,9 @@ mod tests {
         let key = cstr("bridge_cad_absent");
         let token = b"tok";
         // Safety: key is a valid C string; token is valid for token.len() bytes.
-        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        let rc = unsafe {
+            kv_del_if_eq(key.as_ptr(), key.as_bytes().len(), token.as_ptr().cast(), token.len())
+        };
         assert_eq!(rc, 0);
     }
 
@@ -829,7 +977,9 @@ mod tests {
         store.set("bridge_cad_bin".into(), token.to_vec(), None);
         let key = cstr("bridge_cad_bin");
         // Safety: key is a valid C string; token is valid for token.len() bytes.
-        let rc = unsafe { kv_del_if_eq(key.as_ptr(), token.as_ptr().cast(), token.len()) };
+        let rc = unsafe {
+            kv_del_if_eq(key.as_ptr(), key.as_bytes().len(), token.as_ptr().cast(), token.len())
+        };
         assert_eq!(rc, 1, "a binary token must compare byte-exactly and delete");
         assert_eq!(store.get("bridge_cad_bin"), None);
     }
@@ -843,7 +993,7 @@ mod tests {
         store.set("bridge_ex_k".into(), b"v".to_vec(), None);
         let key = cstr("bridge_ex_k");
         // Safety: key is a valid C string.
-        assert_eq!(unsafe { kv_exists(key.as_ptr()) }, 1);
+        assert_eq!(unsafe { kv_exists(key.as_ptr(), key.as_bytes().len()) }, 1);
     }
 
     #[test]
@@ -852,7 +1002,7 @@ mod tests {
         init_store();
         let key = cstr("bridge_ex_missing");
         // Safety: key is a valid C string.
-        assert_eq!(unsafe { kv_exists(key.as_ptr()) }, 0);
+        assert_eq!(unsafe { kv_exists(key.as_ptr(), key.as_bytes().len()) }, 0);
     }
 
     // ── kv_incr_by ──────────────────────────────────────────────────────
@@ -864,7 +1014,7 @@ mod tests {
         let key = cstr("bridge_incr_new");
         let mut result: std::os::raw::c_longlong = 0;
         // Safety: key and result are valid.
-        let ok = unsafe { kv_incr_by(key.as_ptr(), 1, &mut result) };
+        let ok = unsafe { kv_incr_by(key.as_ptr(), key.as_bytes().len(), 1, &mut result) };
         assert_eq!(ok, 1);
         assert_eq!(result, 1);
         assert_eq!(store.get("bridge_incr_new").as_deref(), Some(&b"1"[..]));
@@ -878,7 +1028,7 @@ mod tests {
         let key = cstr("bridge_incr_acc");
         let mut result: std::os::raw::c_longlong = 0;
         // Safety: key and result are valid.
-        unsafe { kv_incr_by(key.as_ptr(), 5, &mut result) };
+        unsafe { kv_incr_by(key.as_ptr(), key.as_bytes().len(), 5, &mut result) };
         assert_eq!(result, 15);
     }
 
@@ -890,7 +1040,7 @@ mod tests {
         let key = cstr("bridge_incr_neg");
         let mut result: std::os::raw::c_longlong = 0;
         // Safety: key and result are valid.
-        unsafe { kv_incr_by(key.as_ptr(), -3, &mut result) };
+        unsafe { kv_incr_by(key.as_ptr(), key.as_bytes().len(), -3, &mut result) };
         assert_eq!(result, 7);
     }
 
@@ -902,7 +1052,7 @@ mod tests {
         let key = cstr("bridge_incr_str");
         let mut result: std::os::raw::c_longlong = 0;
         // Safety: key and result are valid.
-        let ok = unsafe { kv_incr_by(key.as_ptr(), 1, &mut result) };
+        let ok = unsafe { kv_incr_by(key.as_ptr(), key.as_bytes().len(), 1, &mut result) };
         assert_eq!(ok, 0); // error — value is not an integer
     }
 
@@ -915,7 +1065,7 @@ mod tests {
         store.set("bridge_exp_k".into(), b"v".to_vec(), None);
         let key = cstr("bridge_exp_k");
         // Safety: key is a valid C string.
-        let ok = unsafe { kv_expire(key.as_ptr(), 30_000) };
+        let ok = unsafe { kv_expire(key.as_ptr(), key.as_bytes().len(), 30_000) };
         assert_eq!(ok, 1);
         let pttl = store.pttl("bridge_exp_k").unwrap();
         assert!(pttl > 0 && pttl <= 30_000, "expected PTTL in (0, 30000], got {pttl}");
@@ -927,7 +1077,7 @@ mod tests {
         init_store();
         let key = cstr("bridge_exp_missing");
         // Safety: key is a valid C string.
-        let ok = unsafe { kv_expire(key.as_ptr(), 10_000) };
+        let ok = unsafe { kv_expire(key.as_ptr(), key.as_bytes().len(), 10_000) };
         assert_eq!(ok, 0);
     }
 
@@ -938,8 +1088,8 @@ mod tests {
         store.set("bridge_exp_neg".into(), b"v".to_vec(), None);
         let key = cstr("bridge_exp_neg");
         // Safety: key is a valid C string.
-        assert_eq!(unsafe { kv_expire(key.as_ptr(), 0) }, 0);
-        assert_eq!(unsafe { kv_expire(key.as_ptr(), -1) }, 0);
+        assert_eq!(unsafe { kv_expire(key.as_ptr(), key.as_bytes().len(), 0) }, 0);
+        assert_eq!(unsafe { kv_expire(key.as_ptr(), key.as_bytes().len(), -1) }, 0);
         // Key should be unaffected.
         assert_eq!(store.pttl("bridge_exp_neg"), Some(-1));
     }
@@ -951,7 +1101,7 @@ mod tests {
         store.set("bridge_pttl_noexp".into(), b"v".to_vec(), None);
         let key = cstr("bridge_pttl_noexp");
         // Safety: key is a valid C string.
-        assert_eq!(unsafe { kv_pttl(key.as_ptr()) }, -1);
+        assert_eq!(unsafe { kv_pttl(key.as_ptr(), key.as_bytes().len()) }, -1);
     }
 
     #[test]
@@ -960,7 +1110,7 @@ mod tests {
         init_store();
         let key = cstr("bridge_pttl_missing");
         // Safety: key is a valid C string.
-        assert_eq!(unsafe { kv_pttl(key.as_ptr()) }, -2);
+        assert_eq!(unsafe { kv_pttl(key.as_ptr(), key.as_bytes().len()) }, -2);
     }
 
     #[test]
@@ -970,7 +1120,7 @@ mod tests {
         store.set("bridge_pttl_exp".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
         let key = cstr("bridge_pttl_exp");
         // Safety: key is a valid C string.
-        let ms = unsafe { kv_pttl(key.as_ptr()) };
+        let ms = unsafe { kv_pttl(key.as_ptr(), key.as_bytes().len()) };
         assert!(ms > 0 && ms <= 60_000, "expected PTTL in (0, 60000], got {ms}");
     }
 
@@ -1039,12 +1189,22 @@ mod tests {
         set_site_scope(KvSiteScope::Unmatched);
         // Safety: key and val are valid for the duration of each call.
         unsafe {
-            assert_eq!(kv_get(key.as_ptr()), 0, "must not read the global store");
-            assert_eq!(kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0), 0);
-            assert_eq!(kv_set_nx(key.as_ptr(), val.as_ptr().cast(), val.len(), 0), 0);
-            assert_eq!(kv_exists(key.as_ptr()), 0);
-            assert_eq!(kv_del(key.as_ptr()), 0);
-            assert_eq!(kv_pttl(key.as_ptr()), -2);
+            assert_eq!(
+                kv_get(key.as_ptr(), key.as_bytes().len()),
+                0,
+                "must not read the global store"
+            );
+            assert_eq!(
+                kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0),
+                0
+            );
+            assert_eq!(
+                kv_set_nx(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0),
+                0
+            );
+            assert_eq!(kv_exists(key.as_ptr(), key.as_bytes().len()), 0);
+            assert_eq!(kv_del(key.as_ptr(), key.as_bytes().len()), 0);
+            assert_eq!(kv_pttl(key.as_ptr(), key.as_bytes().len()), -2);
             assert_eq!(kv_flush_all(), 0);
         }
         assert_eq!(
@@ -1081,7 +1241,7 @@ mod tests {
         let key = cstr("bridge_wait_snap");
         let mut new_version: std::os::raw::c_longlong = 0;
         // Safety: key and new_version are valid for the duration of the call.
-        let rc = unsafe { kv_wait(key.as_ptr(), 0, 5_000, &mut new_version) };
+        let rc = unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), 0, 5_000, &mut new_version) };
         assert_eq!(rc, 1, "snapshot must report a present value");
         assert!(new_version >= 1);
 
@@ -1100,7 +1260,7 @@ mod tests {
         let key = cstr("bridge_wait_missing");
         let mut new_version: std::os::raw::c_longlong = 0;
         // Safety: key and new_version are valid.
-        let rc = unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut new_version) };
+        let rc = unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), 0, 1_000, &mut new_version) };
         assert_eq!(rc, 2, "missing key must report changed-but-absent");
         assert!(new_version >= 1);
     }
@@ -1115,13 +1275,13 @@ mod tests {
         // Snapshot to learn the current version.
         let mut ver: std::os::raw::c_longlong = 0;
         // Safety: key and ver are valid.
-        assert_eq!(unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut ver) }, 1);
+        assert_eq!(unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), 0, 1_000, &mut ver) }, 1);
 
         // Waiting past the current version with no writes must time out.
         let start = std::time::Instant::now();
         let mut unused: std::os::raw::c_longlong = 0;
         // Safety: key and unused are valid.
-        let rc = unsafe { kv_wait(key.as_ptr(), ver, 80, &mut unused) };
+        let rc = unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), ver, 80, &mut unused) };
         assert_eq!(rc, 0, "must time out");
         assert!(start.elapsed() >= Duration::from_millis(80));
     }
@@ -1135,7 +1295,7 @@ mod tests {
 
         let mut ver: std::os::raw::c_longlong = 0;
         // Safety: key and ver are valid.
-        assert_eq!(unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut ver) }, 1);
+        assert_eq!(unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), 0, 1_000, &mut ver) }, 1);
 
         let writer = {
             let store = Arc::clone(&store);
@@ -1147,7 +1307,7 @@ mod tests {
 
         let mut new_ver: std::os::raw::c_longlong = 0;
         // Safety: key and new_ver are valid.
-        let rc = unsafe { kv_wait(key.as_ptr(), ver, 10_000, &mut new_ver) };
+        let rc = unsafe { kv_wait(key.as_ptr(), key.as_bytes().len(), ver, 10_000, &mut new_ver) };
         writer.join().unwrap();
 
         assert_eq!(rc, 1, "waiter must wake with a value");
@@ -1174,7 +1334,7 @@ mod tests {
         let t1 = thread::spawn(|| {
             let key = cstr("bridge_tl_t1");
             // Safety: key is valid for this thread.
-            unsafe { kv_get(key.as_ptr()) };
+            unsafe { kv_get(key.as_ptr(), key.as_bytes().len()) };
             let mut ptr: *const std::os::raw::c_char = std::ptr::null();
             let mut len: usize = 0;
             unsafe { kv_get_result(&mut ptr, &mut len) };
@@ -1184,7 +1344,7 @@ mod tests {
         let t2 = thread::spawn(|| {
             let key = cstr("bridge_tl_t2");
             // Safety: key is valid for this thread.
-            unsafe { kv_get(key.as_ptr()) };
+            unsafe { kv_get(key.as_ptr(), key.as_bytes().len()) };
             let mut ptr: *const std::os::raw::c_char = std::ptr::null();
             let mut len: usize = 0;
             unsafe { kv_get_result(&mut ptr, &mut len) };
@@ -1222,9 +1382,9 @@ mod tests {
             let val = b"written-by-a-dying-thread";
             // Safety: `key` and `val` are valid for the duration of the calls.
             unsafe {
-                KV_HOOK_GET.store(kv_get(key.as_ptr()), Ordering::Release);
+                KV_HOOK_GET.store(kv_get(key.as_ptr(), key.as_bytes().len()), Ordering::Release);
                 KV_HOOK_SET.store(
-                    kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0),
+                    kv_set(key.as_ptr(), key.as_bytes().len(), val.as_ptr().cast(), val.len(), 0),
                     Ordering::Release,
                 );
                 let mut ptr: *const std::os::raw::c_char = std::ptr::null();
@@ -1261,7 +1421,7 @@ mod tests {
             set_site_store(None);
             let key = cstr("bridge_hook_teardown");
             // Safety: `key` is valid for the duration of the call.
-            assert_eq!(unsafe { kv_get(key.as_ptr()) }, 1);
+            assert_eq!(unsafe { kv_get(key.as_ptr(), key.as_bytes().len()) }, 1);
         })
         .join()
         .expect("worker thread must exit cleanly, not abort");

@@ -24,6 +24,39 @@ macro_rules! check_args {
     };
 }
 
+/// Reply for a key, hash field or `KEYS` pattern that is not valid UTF-8.
+///
+/// The store keys entries by `String`, so a non-UTF-8 name cannot be held
+/// faithfully. Converting it lossily (as this module once did) maps every
+/// invalid byte to U+FFFD, so distinct binary keys silently shared one entry
+/// (KV stress report F-18). Refusing them is the honest alternative to
+/// storing them wrong. Values stay binary-safe.
+pub const NON_UTF8_KEY_ERROR: &str =
+    "ERR invalid key: ePHPm KV keys and hash fields must be valid UTF-8";
+
+/// Convert a key argument, early-returning [`NON_UTF8_KEY_ERROR`] if it is
+/// not UTF-8.
+macro_rules! key {
+    ($arg:expr) => {
+        match std::str::from_utf8($arg) {
+            Ok(k) => k.to_owned(),
+            Err(_) => return Frame::error(NON_UTF8_KEY_ERROR),
+        }
+    };
+}
+
+/// Early-return [`NON_UTF8_KEY_ERROR`] if any of the given key arguments is
+/// not UTF-8. Checked before a multi-key command touches the store, so a bad
+/// key changes nothing.
+macro_rules! check_keys {
+    ($args:expr) => {
+        let mut args = $args;
+        if args.any(|k: &&[u8]| std::str::from_utf8(k).is_err()) {
+            return Frame::error(NON_UTF8_KEY_ERROR);
+        }
+    };
+}
+
 /// Execute a command frame against the store and return the response frame.
 pub fn dispatch(store: &Arc<Store>, frame: &Frame) -> Frame {
     let args = match frame {
@@ -102,7 +135,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         // ── String operations ────────────────────────────────────
         "GET" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             // Through the cluster: a large value held by other nodes only is
             // fetched from them rather than answered `nil`.
             match store.get_through(&key) {
@@ -113,7 +146,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "SET" => cmd_set(store, argv),
         "SETEX" => {
             check_args!(cmd, argv, 3);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let ttl = match expire_arg(argv[1], TtlUnit::Seconds, "setex") {
                 Ok(ttl) => ttl,
                 Err(f) => return f,
@@ -125,6 +158,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.is_empty() {
                 return Frame::error("ERR wrong number of arguments for 'mget' command");
             }
+            check_keys!(argv.iter());
             let results: Vec<Frame> = argv
                 .iter()
                 .map(|k| {
@@ -145,6 +179,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             // and stops, so earlier pairs may already be stored. Redis rejects
             // the whole MSET up front; we do not pre-check total size, and this
             // only bites under `noeviction` at the limit.
+            //
+            // Keys are checked up front, so a bad key writes nothing at all.
+            check_keys!(argv.iter().step_by(2));
             for pair in argv.chunks(2) {
                 let key = str_from(pair[0]);
                 if !store.set(key, pair[1].to_vec(), None) {
@@ -155,7 +192,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "SETNX" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             // Atomic check-and-set under the per-key shard lock — the
             // exists/set pair this used to do was racy under concurrent
             // callers. The outcome distinguishes "key exists" (`:0`) from a
@@ -171,7 +208,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "INCR" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.incr_by(&key, 1) {
                 Ok(v) => Frame::integer(v),
                 Err(e) => Frame::error(e),
@@ -179,7 +216,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "DECR" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.incr_by(&key, -1) {
                 Ok(v) => Frame::integer(v),
                 Err(e) => Frame::error(e),
@@ -187,7 +224,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "INCRBY" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let delta = match parse_i64(argv[1]) {
                 Ok(v) => v,
                 Err(f) => return f,
@@ -199,7 +236,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "DECRBY" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             // `-i64::MIN` does not exist: negating it would panic in a debug
             // build and wrap to `i64::MIN` (an *increment*) in release.
             let delta = match parse_i64(argv[1]).map(i64::checked_neg) {
@@ -214,7 +251,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "APPEND" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.append(&key, argv[1]) {
                 Some(new_len) => Frame::integer(i64::try_from(new_len).unwrap_or(i64::MAX)),
                 None => oom(),
@@ -222,7 +259,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "STRLEN" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.get(&key) {
                 Some(v) => Frame::integer(i64::try_from(v.len()).unwrap_or(i64::MAX)),
                 None => Frame::integer(0),
@@ -230,7 +267,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "GETSET" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let old = store.get(&key);
             if !store.set(key, argv[1].to_vec(), None) {
                 return oom();
@@ -246,6 +283,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.is_empty() {
                 return Frame::error("ERR wrong number of arguments for 'del' command");
             }
+            check_keys!(argv.iter());
             let removed: i64 = argv
                 .iter()
                 .filter(|k| store.remove(&str_from(k)))
@@ -263,7 +301,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             // is variadic over keys and a positional `IFEQ` marker would be
             // ambiguous with a key literally named "IFEQ".
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             // Clustered: decided by the key's owner node. An unreachable owner is
             // an error, not :0 — :0 would claim the token did not match.
             match store.try_del_if_eq(&key, argv[1]) {
@@ -275,6 +313,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.is_empty() {
                 return Frame::error("ERR wrong number of arguments for 'exists' command");
             }
+            check_keys!(argv.iter());
             let count: i64 = argv
                 .iter()
                 .filter(|k| store.exists(&str_from(k)))
@@ -285,7 +324,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "EXPIRE" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let ttl = match expire_arg(argv[1], TtlUnit::Seconds, "expire") {
                 Ok(ttl) => ttl,
                 Err(f) => return f,
@@ -295,7 +334,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "PEXPIRE" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let ttl = match expire_arg(argv[1], TtlUnit::Millis, "pexpire") {
                 Ok(ttl) => ttl,
                 Err(f) => return f,
@@ -305,7 +344,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "TTL" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.pttl(&key) {
                 Some(ms) if ms >= 0 => Frame::integer(ms / 1000),
                 Some(ms) => Frame::integer(ms), // -1 or -2
@@ -314,7 +353,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "PTTL" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             match store.pttl(&key) {
                 Some(ms) => Frame::integer(ms),
                 None => Frame::integer(-2),
@@ -322,12 +361,12 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "PERSIST" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             Frame::integer(i64::from(store.persist(&key)))
         }
         "TYPE" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             if store.is_hash(&key) {
                 Frame::Simple("hash".into())
             } else if store.exists(&key) {
@@ -338,8 +377,8 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "RENAME" => {
             check_args!(cmd, argv, 2);
-            let old_key = str_from(argv[0]);
-            let new_key = str_from(argv[1]);
+            let old_key = key!(argv[0]);
+            let new_key = key!(argv[1]);
             match store.get(&old_key) {
                 Some(val) => {
                     // Preserve TTL if present
@@ -366,7 +405,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "KEYS" => {
             check_args!(cmd, argv, 1);
-            let pattern = str_from(argv[0]);
+            let pattern = key!(argv[0]);
             let keys = store.keys(&pattern);
             Frame::Array(keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect())
         }
@@ -381,7 +420,8 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.len() < 3 || argv.len().is_multiple_of(2) {
                 return Frame::error("ERR wrong number of arguments for 'hset' command");
             }
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
+            check_keys!(argv[1..].iter().step_by(2));
             let mut added = 0i64;
             // Under memory pressure a refused field returns `-OOM` and stops,
             // so earlier fields may already be stored — the same best-effort
@@ -399,8 +439,8 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "HGET" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
-            let field = str_from(argv[1]);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
             match store.hget(&key, &field) {
                 Some(v) => Frame::bulk(v),
                 None => Frame::Null,
@@ -410,7 +450,8 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             if argv.len() < 2 {
                 return Frame::error("ERR wrong number of arguments for 'hdel' command");
             }
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
+            check_keys!(argv[1..].iter());
             let removed: i64 = argv[1..]
                 .iter()
                 .filter(|f| store.hdel(&key, &str_from(f)))
@@ -421,7 +462,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "HGETALL" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let pairs = store.hgetall(&key);
             let mut frames = Vec::with_capacity(pairs.len() * 2);
             for (field, value) in pairs {
@@ -432,25 +473,25 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
         "HKEYS" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let keys = store.hkeys(&key);
             Frame::Array(keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect())
         }
         "HVALS" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             let vals = store.hvals(&key);
             Frame::Array(vals.into_iter().map(Frame::bulk).collect())
         }
         "HLEN" => {
             check_args!(cmd, argv, 1);
-            let key = str_from(argv[0]);
+            let key = key!(argv[0]);
             Frame::integer(i64::try_from(store.hlen(&key)).unwrap_or(i64::MAX))
         }
         "HEXISTS" => {
             check_args!(cmd, argv, 2);
-            let key = str_from(argv[0]);
-            let field = str_from(argv[1]);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
             Frame::integer(i64::from(store.hexists(&key, &field)))
         }
 
@@ -479,7 +520,7 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         return Frame::error("ERR wrong number of arguments for 'set' command");
     }
 
-    let key = str_from(argv[0]);
+    let key = key!(argv[0]);
     let val = argv[1].to_vec();
     let mut ttl: Option<Duration> = None;
     let mut nx = false;
@@ -1319,6 +1360,72 @@ mod tests {
         cmd(&s, &["SET", "k", &i64::MAX.to_string()]);
         assert!(matches!(cmd(&s, &["INCRBY", "k", "1"]), Frame::Error(_)));
         assert!(matches!(cmd(&s, &["INCR", "k"]), Frame::Error(_)));
+    }
+
+    // ── Binary keys (KV stress report F-18) ──────────────────────────────
+
+    fn cmd_bytes(store: &Arc<Store>, args: &[&[u8]]) -> Frame {
+        let frame = Frame::Array(args.iter().map(|s| Frame::bulk(s.to_vec())).collect());
+        dispatch(store, &frame)
+    }
+
+    fn is_bad_key(f: &Frame) -> bool {
+        matches!(f, Frame::Error(e) if e == NON_UTF8_KEY_ERROR)
+    }
+
+    /// Two distinct non-UTF-8 keys used to be converted lossily to the same
+    /// `"\u{FFFD}"` string and silently share one entry. They are refused.
+    #[test]
+    fn non_utf8_keys_are_refused_not_collapsed() {
+        let s = store();
+        assert!(is_bad_key(&cmd_bytes(&s, &[b"SET", b"\xff", b"A"])));
+        assert!(is_bad_key(&cmd_bytes(&s, &[b"SET", b"\xfe", b"B"])));
+        assert!(is_bad_key(&cmd_bytes(&s, &[b"GET", b"\xff"])));
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(0), "nothing may have been written");
+    }
+
+    #[test]
+    fn every_key_position_is_checked() {
+        let s = store();
+        let bad: &[u8] = b"k\xc3";
+        let cases: &[&[&[u8]]] = &[
+            &[b"GET", bad],
+            &[b"SETEX", bad, b"10", b"v"],
+            &[b"SETNX", bad, b"v"],
+            &[b"INCR", bad],
+            &[b"DECRBY", bad, b"1"],
+            &[b"APPEND", bad, b"v"],
+            &[b"GETSET", bad, b"v"],
+            &[b"DELIFEQ", bad, b"t"],
+            &[b"EXPIRE", bad, b"10"],
+            &[b"PTTL", bad],
+            &[b"RENAME", b"ok", bad],
+            &[b"KEYS", bad],
+            &[b"MGET", b"ok", bad],
+            &[b"MSET", b"ok", b"1", bad, b"2"],
+            &[b"DEL", b"ok", bad],
+            &[b"EXISTS", bad],
+            &[b"HSET", b"h", b"f", b"v", bad, b"v"],
+            &[b"HGET", b"h", bad],
+            &[b"HDEL", b"h", bad],
+            &[b"HEXISTS", bad, b"f"],
+        ];
+        for args in cases {
+            assert!(is_bad_key(&cmd_bytes(&s, args)), "{args:?}");
+        }
+        // The partially valid MSET / HSET wrote nothing.
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(0));
+    }
+
+    /// Values stay binary-safe, and so do keys with a NUL in them.
+    #[test]
+    fn binary_values_and_nul_keys_round_trip() {
+        let s = store();
+        assert_eq!(cmd_bytes(&s, &[b"SET", b"nul\0A", b"\xff\x00a"]), Frame::ok());
+        assert_eq!(cmd_bytes(&s, &[b"SET", b"nul\0B", b"b"]), Frame::ok());
+        assert_eq!(cmd_bytes(&s, &[b"GET", b"nul\0A"]), Frame::bulk(b"\xff\x00a".to_vec()));
+        assert_eq!(cmd_bytes(&s, &[b"GET", b"nul\0B"]), Frame::bulk(b"b".to_vec()));
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(2));
     }
 
     #[test]

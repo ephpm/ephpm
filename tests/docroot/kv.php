@@ -74,6 +74,35 @@ switch ($op) {
         }
         echo implode("\n", $out);
         break;
+    case 'binkeys':
+        // KV stress report F-14/F-18. `key` is a per-test prefix. Prints one
+        // "name=result" line per check.
+        $warnings = [];
+        set_error_handler(function ($no, $msg) use (&$warnings) {
+            $warnings[] = $msg;
+            return true;
+        }, E_WARNING);
+        $a = $key . "nul\0A";
+        $b = $key . "nul\0B";
+        ephpm_kv_set($a, 'valueA');
+        ephpm_kv_set($b, 'valueB');
+        $out = [];
+        // Before the fix both keys were truncated at the NUL to "<prefix>nul".
+        $out[] = 'nul_a=' . var_export(ephpm_kv_get($a), true);
+        $out[] = 'nul_b=' . var_export(ephpm_kv_get($b), true);
+        $out[] = 'nul_prefix=' . var_export(ephpm_kv_get($key . 'nul'), true);
+        // A raw binary digest is not UTF-8: refused, with a warning.
+        $raw = $key . md5('x', true);
+        $out[] = 'raw_set=' . var_export(ephpm_kv_set($raw, 'v'), true);
+        $out[] = 'raw_get=' . var_export(ephpm_kv_get($raw), true);
+        $out[] = 'raw_warned=' . (count(array_filter($warnings, fn ($w) => str_contains($w, 'valid UTF-8'))) === 2 ? 'yes' : 'no');
+        // A TTL that overflows milliseconds is refused, with a warning.
+        $warnings = [];
+        $out[] = 'huge_ttl=' . var_export(ephpm_kv_set($key . 'huge', 'v', PHP_INT_MAX), true);
+        $out[] = 'huge_ttl_warned=' . (count($warnings) === 1 && str_contains($warnings[0], 'out of range') ? 'yes' : 'no');
+        restore_error_handler();
+        echo implode("\n", $out);
+        break;
     default:
         http_response_code(400);
         echo "unknown op: $op";
