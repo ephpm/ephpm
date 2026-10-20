@@ -87,6 +87,8 @@ use tokio::net::{TcpListener, TcpStream};
 // in tests exactly like the timeouts around it do.
 use tokio::time::Instant;
 
+use crate::clustered_store::{AppliedWriteMap, Apply, apply_if_newer};
+use crate::gossip_kv::Stamp;
 use crate::secure_transport::{ClusterCipher, SEAL_OVERHEAD};
 
 /// How long a client waits for a TCP connection to a peer to be established.
@@ -124,15 +126,28 @@ const MAX_KEY_LEN: u32 = 64 * 1024;
 const MAX_VALUE_LEN: u32 = 64 * 1024 * 1024;
 
 /// Maximum sealed frame length accepted in encrypted mode: the largest
-/// legal plaintext message (a SETNX request — a SET plus its 8-byte TTL) plus
-/// sealing overhead.
-const MAX_FRAME_LEN: u32 = 1 + 4 + MAX_KEY_LEN + 4 + MAX_VALUE_LEN + 8 + SEAL_OVERHEAD as u32;
+/// legal plaintext message (a stamped SET request — a SET plus its 8-byte TTL
+/// and 16-byte stamp) plus sealing overhead.
+const MAX_FRAME_LEN: u32 = 1 + 4 + MAX_KEY_LEN + 4 + MAX_VALUE_LEN + 8 + 16 + SEAL_OVERHEAD as u32;
 
 /// Op code for GET requests.
 const OP_GET: u8 = 0x00;
 
-/// Op code for SET requests.
+/// Op code for the original SET request: no TTL, no stamp. Still served for
+/// a sender predating [`OP_SET_V2`]; no longer sent.
 const OP_SET: u8 = 0x01;
+
+/// Op code for a stamped SET: `[key][value][ttl_ms u64][write u64][node_tag u64]`.
+///
+/// `ttl_ms` is the remaining lifetime (`0` = none) — relative, so a clock
+/// skew between nodes does not shift the expiry (stress finding F-9: the
+/// original SET carried no TTL at all, so a replica's copy never expired).
+/// `write`/`node_tag` are the origin's [`Stamp`]: the receiver applies the
+/// write only when it is strictly newer than the last one it applied for
+/// the key, through the same applied map the gossip applier uses, so a
+/// late replica write cannot regress a newer value and the companion gossip
+/// tombstone a large write carries orders correctly against it.
+const OP_SET_V2: u8 = 0x04;
 
 /// Op code for an owner-arbitrated SETNX.
 const OP_SET_NX: u8 = 0x02;
@@ -158,7 +173,12 @@ const COND_UNROUTABLE: u8 = 0x03;
 
 /// Whether `op` carries a value (or token) after the key.
 fn op_has_value(op: u8) -> bool {
-    matches!(op, OP_SET | OP_SET_NX | OP_DEL_IF_EQ)
+    matches!(op, OP_SET | OP_SET_V2 | OP_SET_NX | OP_DEL_IF_EQ)
+}
+
+/// Whether `op` carries a `ttl_ms` trailer after the value.
+fn op_has_ttl(op: u8) -> bool {
+    matches!(op, OP_SET_V2 | OP_SET_NX)
 }
 
 /// Start the TCP KV data plane listener on `addr`.
@@ -182,8 +202,9 @@ pub async fn serve(
     store: Arc<Store>,
     addr: SocketAddr,
     cipher: Option<Arc<ClusterCipher>>,
+    applied: AppliedWriteMap,
 ) -> anyhow::Result<()> {
-    serve_on(store, addr, cipher).await
+    serve_router(KvRouter::global(store).with_applied(applied), addr, cipher).await
 }
 
 /// [`serve`] with per-vhost routing for multi-tenant nodes.
@@ -201,8 +222,10 @@ pub async fn serve_multi_tenant(
     multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
     addr: SocketAddr,
     cipher: Option<Arc<ClusterCipher>>,
+    applied: AppliedWriteMap,
 ) -> anyhow::Result<()> {
-    serve_router(KvRouter::multi_tenant(store, multi_tenant), addr, cipher).await
+    serve_router(KvRouter::multi_tenant(store, multi_tenant).with_applied(applied), addr, cipher)
+        .await
 }
 
 /// Resolves a data-plane transport key to the [`Store`] that owns it.
@@ -216,13 +239,17 @@ pub async fn serve_multi_tenant(
 pub struct KvRouter {
     global: Arc<Store>,
     multi_tenant: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+    /// The node's last-applied-stamp map, shared with the gossip applier.
+    /// A stamped SET is applied only when strictly newer than the record.
+    /// `None` (tests, tools) applies every stamped SET unconditionally.
+    applied: Option<AppliedWriteMap>,
 }
 
 impl KvRouter {
     /// A router that sends every key to the process-wide store.
     #[must_use]
     pub fn global(store: Arc<Store>) -> Self {
-        Self { global: store, multi_tenant: None }
+        Self { global: store, multi_tenant: None, applied: None }
     }
 
     /// A router that honours the per-site envelope.
@@ -231,7 +258,16 @@ impl KvRouter {
         store: Arc<Store>,
         multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
     ) -> Self {
-        Self { global: store, multi_tenant: Some(multi_tenant) }
+        Self { global: store, multi_tenant: Some(multi_tenant), applied: None }
+    }
+
+    /// Gate stamped SETs through `applied` — the same map the gossip applier
+    /// and the replication hooks record into, so every path that lands a
+    /// value on this node agrees on which write is newest.
+    #[must_use]
+    pub fn with_applied(mut self, applied: AppliedWriteMap) -> Self {
+        self.applied = Some(applied);
+        self
     }
 
     /// Resolve `transport_key` to its store and the bare key within it.
@@ -316,8 +352,10 @@ struct Request {
     key: String,
     /// The value for SET / SETNX requests, or the token for DEL-IF-EQ.
     value: Option<Vec<u8>>,
-    /// SETNX only: TTL in milliseconds, `0` = no expiry.
+    /// SETNX and stamped SET: TTL in milliseconds, `0` = no expiry.
     ttl_ms: u64,
+    /// Stamped SET only: the origin's write stamp.
+    stamp: Option<Stamp>,
 }
 
 /// Serve one TCP connection: request/response exchanges until the client
@@ -401,8 +439,36 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
             // Replica-side write: we are the receiver of a fanned-out replica
             // copy, not the origin. Use `set_local` so we don't re-enter any
             // installed Replicator hook and re-fanout the same key back to
-            // our peers (infinite loop).
+            // our peers (infinite loop). A pre-stamp sender: no TTL, no
+            // ordering — applied as before.
             let ok = store.set_local(key.to_string(), value, None);
+            vec![if ok { SET_OK } else { SET_REJECTED }]
+        }
+        OP_SET_V2 => {
+            let value = request.value.expect("stamped SET always carries a value");
+            let stamp = request.stamp.expect("stamped SET always carries a stamp");
+            let ttl = (request.ttl_ms > 0)
+                .then(|| std::time::Duration::from_millis(request.ttl_ms.min(MAX_REMOTE_TTL_MS)));
+            // Order against everything else that lands values on this node:
+            // the record and the local write are one step under the key's
+            // slot (`apply_if_newer`). A stale replica write (older than what
+            // gossip or a later replica write already applied) is
+            // acknowledged but not applied: the sender's write succeeded, it
+            // was just overtaken.
+            let mut ok = true;
+            let verdict = match router.applied.as_ref() {
+                Some(applied) => apply_if_newer(applied, &request.key, stamp, || {
+                    ok = store.set_local(key.to_string(), value, ttl);
+                }),
+                None => {
+                    ok = store.set_local(key.to_string(), value, ttl);
+                    Apply::Newer
+                }
+            };
+            if verdict == Apply::Skip {
+                tracing::trace!(key = %request.key, ?stamp, "stamped SET skipped as stale");
+                return Ok(vec![SET_OK]);
+            }
             vec![if ok { SET_OK } else { SET_REJECTED }]
         }
         OP_SET_NX => {
@@ -486,9 +552,16 @@ async fn read_request(
     } else {
         None
     };
-    let ttl_ms = if op == OP_SET_NX { stream.read_u64().await? } else { 0 };
+    let ttl_ms = if op_has_ttl(op) { stream.read_u64().await? } else { 0 };
+    let stamp = if op == OP_SET_V2 {
+        let write = stream.read_u64().await?;
+        let node_tag = stream.read_u64().await?;
+        Some(Stamp { write, node_tag })
+    } else {
+        None
+    };
 
-    Ok(Request { op, key, value, ttl_ms })
+    Ok(Request { op, key, value, ttl_ms, stamp })
 }
 
 /// Parse a plaintext request message from a decrypted frame.
@@ -511,15 +584,21 @@ fn parse_request(mut buf: &[u8]) -> anyhow::Result<Request> {
     } else {
         None
     };
-    let ttl_ms = if op == OP_SET_NX {
-        let bytes: [u8; 8] =
-            take_bytes(&mut buf, 8)?.try_into().expect("take_bytes(8) returns exactly 8 bytes");
-        u64::from_be_bytes(bytes)
+    let ttl_ms = if op_has_ttl(op) { take_u64(&mut buf)? } else { 0 };
+    let stamp = if op == OP_SET_V2 {
+        Some(Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? })
     } else {
-        0
+        None
     };
 
-    Ok(Request { op, key, value, ttl_ms })
+    Ok(Request { op, key, value, ttl_ms, stamp })
+}
+
+/// Take a big-endian u64 from the front of `buf`.
+fn take_u64(buf: &mut &[u8]) -> anyhow::Result<u64> {
+    let bytes: [u8; 8] =
+        take_bytes(buf, 8)?.try_into().expect("take_bytes(8) returns exactly 8 bytes");
+    Ok(u64::from_be_bytes(bytes))
 }
 
 /// Write one protocol message, sealing it into a frame when encrypted.
@@ -826,6 +905,36 @@ impl DataPlaneClient {
         Ok(take_u8(&mut response.as_slice())? == SET_OK)
     }
 
+    /// Store `value` under `key` on the peer at `addr` with its remaining
+    /// TTL and the origin's stamp ([`OP_SET_V2`]), returning whether the peer
+    /// accepted it. An accepted-but-stale write (the peer already holds a
+    /// newer stamp) also answers `true`.
+    ///
+    /// A peer predating the stamped op drops the connection on it; that is
+    /// reported as an error and counted as a failed replica write.
+    ///
+    /// # Errors
+    ///
+    /// Connect/I-O failure, timeout, a cipher mismatch, or an old peer.
+    pub async fn store_stamped(
+        &self,
+        addr: SocketAddr,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+        stamp: Stamp,
+    ) -> anyhow::Result<bool> {
+        let ttl_ms = ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1));
+        let response = self
+            .exchange(
+                addr,
+                &encode_set_v2_request(key, value, ttl_ms, stamp)?,
+                ResponseKind::Status,
+            )
+            .await?;
+        Ok(take_u8(&mut response.as_slice())? == SET_OK)
+    }
+
     /// Owner-arbitrated `SETNX`; see [`set_nx_remote`] for the contract.
     ///
     /// # Errors
@@ -988,6 +1097,21 @@ fn encode_set_nx_request(key: &str, value: &[u8], ttl_ms: u64) -> anyhow::Result
     let mut message = encode_set_request(key, value)?;
     message[0] = OP_SET_NX;
     message.extend_from_slice(&ttl_ms.to_be_bytes());
+    Ok(message)
+}
+
+/// Encode a plaintext stamped SET request message ([`OP_SET_V2`]).
+fn encode_set_v2_request(
+    key: &str,
+    value: &[u8],
+    ttl_ms: u64,
+    stamp: Stamp,
+) -> anyhow::Result<Vec<u8>> {
+    let mut message = encode_set_request(key, value)?;
+    message[0] = OP_SET_V2;
+    message.extend_from_slice(&ttl_ms.to_be_bytes());
+    message.extend_from_slice(&stamp.write.to_be_bytes());
+    message.extend_from_slice(&stamp.node_tag.to_be_bytes());
     Ok(message)
 }
 
@@ -1558,6 +1682,92 @@ mod tests {
 
         // A SETNX missing its TTL trailer is truncated, not "no TTL".
         assert!(parse_request(&nx[..nx.len() - 1]).is_err());
+    }
+
+    // ── Stamped SET (OP_SET_V2) ───────────────────────────────────────
+
+    #[test]
+    fn parse_request_roundtrips_stamped_set() {
+        let stamp = Stamp { write: 0x1234_5678_9abc_def0, node_tag: 42 };
+        let msg = encode_set_v2_request("k", b"v", 1500, stamp).unwrap();
+        let parsed = parse_request(&msg).unwrap();
+        assert_eq!(parsed.op, OP_SET_V2);
+        assert_eq!(parsed.key, "k");
+        assert_eq!(parsed.value.as_deref(), Some(b"v".as_slice()));
+        assert_eq!(parsed.ttl_ms, 1500);
+        assert_eq!(parsed.stamp, Some(stamp));
+        // Missing any trailer byte is truncated, not "no stamp".
+        assert!(parse_request(&msg[..msg.len() - 1]).is_err());
+        // The largest stamped message still fits the sealed-frame cap.
+        assert!(MAX_FRAME_LEN as usize >= 1 + 4 + 4 + 8 + 16 + SEAL_OVERHEAD);
+    }
+
+    /// A stamped SET lands with its TTL (F-9: the original SET carried none,
+    /// so a replica's copy lived forever).
+    #[tokio::test]
+    async fn stamped_set_carries_the_ttl_and_stamp() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let applied = crate::clustered_store::new_applied_write_map();
+        let addr = spawn_router_handler(
+            KvRouter::global(Arc::clone(&store)).with_applied(Arc::clone(&applied)),
+            None,
+        )
+        .await;
+        let client = DataPlaneClient::new(None);
+        let clock = crate::gossip_kv::StampClock::new("origin");
+
+        let stamp = clock.next();
+        assert!(
+            client
+                .store_stamped(addr, "big", b"value", Some(Duration::from_millis(300)), stamp)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get("big").as_deref(), Some(b"value".as_slice()));
+        let pttl = store.pttl("big").expect("replica holds the key");
+        assert!((1..=300).contains(&pttl), "TTL applied on the replica, got {pttl}");
+        assert_eq!(*applied.get("big").unwrap(), stamp, "the replica records the stamp");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(store.get("big"), None, "the replica copy expires");
+    }
+
+    /// A replica applies stamped SETs in stamp order, not arrival order: a
+    /// late older write is acknowledged but does not regress the value.
+    #[tokio::test]
+    async fn stale_stamped_set_is_acknowledged_but_not_applied() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let applied = crate::clustered_store::new_applied_write_map();
+        let addr =
+            spawn_router_handler(KvRouter::global(Arc::clone(&store)).with_applied(applied), None)
+                .await;
+        let client = DataPlaneClient::new(None);
+        let clock = crate::gossip_kv::StampClock::new("origin");
+        let older = clock.next();
+        let newer = clock.next();
+
+        assert!(client.store_stamped(addr, "k", b"new", None, newer).await.unwrap());
+        assert!(client.store_stamped(addr, "k", b"old", None, older).await.unwrap());
+        assert_eq!(store.get("k").as_deref(), Some(b"new".as_slice()));
+        // The same stamp again (a retry) is a no-op too.
+        assert!(client.store_stamped(addr, "k", b"dup", None, newer).await.unwrap());
+        assert_eq!(store.get("k").as_deref(), Some(b"new".as_slice()));
+    }
+
+    /// Without an applied map (tools, tests) every stamped SET applies, and
+    /// the pre-stamp OP_SET is still served for an old sender.
+    #[tokio::test]
+    async fn stamped_set_without_applied_map_and_legacy_set_both_apply() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+        let client = DataPlaneClient::new(None);
+        let clock = crate::gossip_kv::StampClock::new("origin");
+        let newer = clock.next();
+        let older = Stamp { write: newer.write - 1, node_tag: newer.node_tag };
+        assert!(client.store_stamped(addr, "k", b"new", None, newer).await.unwrap());
+        assert!(client.store_stamped(addr, "k", b"old", None, older).await.unwrap());
+        assert_eq!(store.get("k").as_deref(), Some(b"old".as_slice()), "ungated: last arrival");
+        assert!(client.store(addr, "k", b"legacy").await.unwrap());
+        assert_eq!(store.get("k").as_deref(), Some(b"legacy".as_slice()));
     }
 
     #[test]
