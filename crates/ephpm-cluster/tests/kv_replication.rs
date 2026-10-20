@@ -8,11 +8,11 @@
 //!
 //! ## Loopback addressing
 //!
-//! The production replica addressing maps a peer's gossip IP to the
-//! *local* `data_port` (every real node shares one data port on a
+//! The production replica addressing maps a peer's gossip IP to the data
+//! port that peer advertises over gossip (every real node is on a
 //! different host). To reproduce that in-process, each node binds its
-//! gossip UDP and TCP data plane on a distinct `127.0.0.x` address while
-//! sharing the same `data_port`. Linux routes all of `127.0.0.0/8`, so
+//! gossip UDP and TCP data plane on a distinct `127.0.0.x` address, here
+//! sharing one `data_port`. Linux routes all of `127.0.0.0/8`, so
 //! CI exercises the full path. Some platforms (Windows, stock macOS)
 //! only bind `127.0.0.1`; there, [`loopback_aliases_available`] returns
 //! `false` and the multi-node tests skip with a logged notice rather

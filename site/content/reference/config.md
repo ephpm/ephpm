@@ -1058,7 +1058,7 @@ and the membership check is per-host and trusts the TCP source address.
 | `hot_key_window_secs` | u64 | `10` | Window for counting fetches. |
 | `hot_key_local_ttl_secs` | u64 | `30` | Max age of cached hot-key values. |
 | `hot_key_max_memory` | string | `"64MB"` | Memory budget for hot-key cache. |
-| `data_port` | u16 | `7947` | TCP listener for the KV data plane. Always binds **`0.0.0.0:<data_port>`** — it does not follow the IP in `[cluster] bind` — so on a multi-homed host firewall this port from untrusted networks. Peers dial it at the other node's gossip IP, so every node must use the same `data_port`. |
+| `data_port` | u16 | `7947` | TCP listener for the KV data plane. Binds the **IP of `[cluster] bind`** on this port (so `bind = "0.0.0.0:7946"` still exposes it on every interface — firewall it on multi-homed hosts, or bind a specific IP). Each node advertises its own `data_port` over gossip and peers dial it at `<gossip IP>:<advertised port>`, so nodes may use different ports. A peer running a build older than this advertisement is dialled on this node's own `data_port`. Every connection to a peer is bounded: 2 s to connect, 10 s per request, and a peer that refuses a connection is not redialled for 2 s. |
 
 ## `[[middleware]]`
 

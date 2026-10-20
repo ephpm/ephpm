@@ -26,11 +26,11 @@
 //!
 //! # Node addressing
 //!
-//! The two nodes use distinct loopback IPs (`127.0.0.1` / `127.0.0.2`) rather
-//! than distinct ports. `ClusteredStore` derives a peer's data-plane address as
-//! `peer_gossip_ip : data_port` — one port for the whole cluster — so two nodes
-//! sharing an IP would collide on that port. Distinct loopback IPs are the same
-//! trick `kv_data_plane::serve_on` documents for in-process multi-node tests.
+//! The two nodes use distinct loopback IPs (`127.0.0.1` / `127.0.0.2`) and
+//! share one `data_port`. `ClusteredStore` derives a peer's data-plane address
+//! as `peer_gossip_ip : <the port that peer advertises over gossip>`; distinct
+//! loopback IPs are the same trick `kv_data_plane::serve_on` documents for
+//! in-process multi-node tests.
 //!
 //! Gossip needs seconds to converge, so every assertion polls with a generous
 //! timeout instead of sleeping a fixed amount.

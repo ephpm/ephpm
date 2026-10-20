@@ -1126,11 +1126,11 @@ mod tests {
     // ----- Per-site HRW ownership (Phase 0 clustered per-site) -----
 
     fn alive(id: &str) -> NodeInfo {
-        NodeInfo { id: id.into(), gossip_addr: "10.0.0.1:7946".into(), state: NodeState::Alive }
+        NodeInfo::new(id, "10.0.0.1:7946", NodeState::Alive)
     }
 
     fn dead(id: &str) -> NodeInfo {
-        NodeInfo { id: id.into(), gossip_addr: "10.0.0.1:7946".into(), state: NodeState::Dead }
+        NodeInfo::new(id, "10.0.0.1:7946", NodeState::Dead)
     }
 
     #[test]
@@ -1242,7 +1242,7 @@ mod tests {
     // ----- Per-site claim address validation (PR #416 blocker 2) -----
 
     fn member_at(id: &str, gossip: &str) -> NodeInfo {
-        NodeInfo { id: id.into(), gossip_addr: gossip.into(), state: NodeState::Alive }
+        NodeInfo::new(id, gossip, NodeState::Alive)
     }
 
     /// `per_site_primary`'s address is dialed and every one of that tenant's
