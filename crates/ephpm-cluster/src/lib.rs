@@ -27,6 +27,7 @@ pub use cluster_channel::{
     maybe_start as maybe_start_cluster_channel, peer_is_cluster_member, stream_type,
 };
 pub use clustered_store::{ClusteredStore, KvReplicator, SiteKvReplicator};
+pub use gossip_kv::{Stamp, StampClock, node_tag};
 pub use kv_data_plane as data_plane;
 pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
 pub use secure_transport::{ClusterCipher, EncryptedUdpTransport};
