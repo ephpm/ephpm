@@ -9,6 +9,7 @@ mod glob;
 mod watch;
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -627,6 +628,27 @@ impl Store {
         u64::try_from(self.anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
+    /// Turn a value into the bytes the store keeps: compressed when
+    /// compression is configured, the value is at least `min_size`, and
+    /// compressing actually makes it smaller. Returns `(bytes, compressed)`.
+    ///
+    /// The stored buffer is always trimmed to its length. `Bytes::from(Vec)`
+    /// keeps the vector's whole allocation, so a value built in a growable
+    /// buffer — every compressor's output, an `APPEND` result — used to hold
+    /// its spare capacity for as long as it was stored, uncounted: gzip output
+    /// held ~2x the bytes the accounting charged.
+    fn encode_value(&self, value: Vec<u8>) -> (Bytes, bool) {
+        if self.config.compression.algo != CompressionAlgo::None
+            && value.len() >= self.config.compression.min_size
+        {
+            let compressed = compress_value(&value, self.config.compression);
+            if compressed.len() < value.len() {
+                return (exact_bytes(compressed), true);
+            }
+        }
+        (exact_bytes(value), false)
+    }
+
     // ── Read operations ──────────────────────────────────────────
 
     /// Get a value by key. Returns `None` if missing or expired.
@@ -957,18 +979,7 @@ impl Store {
     /// failure.
     pub fn set_local(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         // Try compression if configured and size is above threshold.
-        let (data, compressed) = if self.config.compression.algo != CompressionAlgo::None
-            && value.len() >= self.config.compression.min_size
-        {
-            let compressed_data = compress_value(&value, self.config.compression);
-            if compressed_data.len() < value.len() {
-                (Bytes::from(compressed_data), true)
-            } else {
-                (Bytes::from(value), false)
-            }
-        } else {
-            (Bytes::from(value), false)
-        };
+        let (data, compressed) = self.encode_value(value);
 
         let now = self.now_nanos();
         let entry = match ttl {
@@ -985,13 +996,17 @@ impl Store {
         // counts it, so only the growth needs reserving. The peek can race
         // with another writer; the reconcile after the insert is what makes
         // the accounting correct, not this number.
-        let old_size = self.data.get(&key).map_or(0, |old| old.mem_size);
+        let (old_size, old_had_ttl) =
+            self.data.get(&key).map_or((0, false), |old| (old.mem_size, old.expires_at.is_some()));
+        // A TTL'd write onto a key without one also adds a TTL-index hint.
+        let index_growth =
+            if deadline.is_some() && !old_had_ttl { ttl_index_cost(&key) } else { 0 };
 
         // Reserve the extra bytes with NO shard guard held: `ensure_memory` ->
-        // `evict_lru` takes write locks on arbitrary shards (possibly this
+        // `evict` takes write locks on arbitrary shards (possibly this
         // one) and would deadlock under a guard. `set_nx` and
         // `incr_by_with_ttl` make the same trade for the same reason.
-        if !self.reserve(&key, new_size.saturating_sub(old_size)) {
+        if !self.reserve(&key, (new_size + index_growth).saturating_sub(old_size)) {
             // Leave the existing entry — and its TTL hint — untouched.
             return false;
         }
@@ -1192,18 +1207,7 @@ impl Store {
 
         // Build the candidate entry first so we can compute its size
         // before reserving memory.
-        let (data, compressed) = if self.config.compression.algo != CompressionAlgo::None
-            && value.len() >= self.config.compression.min_size
-        {
-            let compressed_data = compress_value(&value, self.config.compression);
-            if compressed_data.len() < value.len() {
-                (Bytes::from(compressed_data), true)
-            } else {
-                (Bytes::from(value), false)
-            }
-        } else {
-            (Bytes::from(value), false)
-        };
+        let (data, compressed) = self.encode_value(value);
 
         let now = self.now_nanos();
         let new_entry = match ttl {
@@ -1216,7 +1220,8 @@ impl Store {
         // may need to remove entries from arbitrary shards (potentially
         // including this one) and would deadlock if called under the
         // entry guard. The `set()` method makes the same trade-off.
-        if !self.reserve(&key, new_size) {
+        let index = if new_entry.expires_at.is_some() { ttl_index_cost(&key) } else { 0 };
+        if !self.reserve(&key, new_size + index) {
             return SetNxOutcome::OutOfMemory;
         }
 
@@ -1474,17 +1479,24 @@ impl Store {
     /// Record `key`'s expiry in the TTL index, or drop its hint when the new
     /// value has none. Called by write paths that have just stored (or are
     /// about to store) an entry with expiry `deadline`.
+    ///
+    /// The index holds its own copy of the key, so a hint is charged to
+    /// `mem_used` ([`ttl_index_cost`]) when it is created and credited back
+    /// when it is removed. Uncounted, it was ~25% of a TTL'd store's real
+    /// footprint.
     fn ttl_index_put(&self, key: &str, deadline: Option<Instant>) {
         match deadline {
             Some(at) => {
                 if let Some(mut slot) = self.ttl_keys.get_mut(key) {
                     *slot = at;
-                } else {
-                    self.ttl_keys.insert(key.to_string(), at);
+                } else if self.ttl_keys.insert(key.to_string(), at).is_none() {
+                    self.mem_add(ttl_index_cost(key));
                 }
             }
             None => {
-                self.ttl_keys.remove(key);
+                if self.ttl_keys.remove(key).is_some() {
+                    self.mem_sub(ttl_index_cost(key));
+                }
             }
         }
     }
@@ -1494,8 +1506,10 @@ impl Store {
     /// deadline was written by a newer write and stays. `None` (the removed
     /// entry had no expiry) has no hint to drop.
     fn ttl_index_drop(&self, key: &str, deadline: Option<Instant>) {
-        if let Some(at) = deadline {
-            self.ttl_keys.remove_if(key, |_, hint| *hint == at);
+        if let Some(at) = deadline
+            && self.ttl_keys.remove_if(key, |_, hint| *hint == at).is_some()
+        {
+            self.mem_sub(ttl_index_cost(key));
         }
     }
 
@@ -1626,7 +1640,8 @@ impl Store {
             let create_size =
                 Entry::new(Bytes::from(delta.to_string().into_bytes()), key.len(), false, 0)
                     .mem_size;
-            if !self.reserve(key, create_size) {
+            let index = if ttl.is_some() { ttl_index_cost(key) } else { 0 };
+            if !self.reserve(key, create_size + index) {
                 // Redis-compatible `-OOM` so INCR fails the same way SET does
                 // when the store is parked at its limit (#477).
                 return Err(OOM_ERROR.to_string());
@@ -1657,19 +1672,7 @@ impl Store {
                 let new_bytes = new_val.to_string().into_bytes();
 
                 // Try compression again if configured.
-                let (stored_data, compressed) = if self.config.compression.algo
-                    != CompressionAlgo::None
-                    && new_bytes.len() >= self.config.compression.min_size
-                {
-                    let compressed_data = compress_value(&new_bytes, self.config.compression);
-                    if compressed_data.len() < new_bytes.len() {
-                        (Bytes::from(compressed_data), true)
-                    } else {
-                        (Bytes::from(new_bytes), false)
-                    }
-                } else {
-                    (Bytes::from(new_bytes), false)
-                };
+                let (stored_data, compressed) = self.encode_value(new_bytes);
 
                 let entry = occ.get_mut();
                 let old_mem = entry.mem_size;
@@ -1782,19 +1785,7 @@ impl Store {
                 let published_expiry = entry.expires_at;
 
                 // Try compression again if configured.
-                let (stored_data, compressed) = if self.config.compression.algo
-                    != CompressionAlgo::None
-                    && data.len() >= self.config.compression.min_size
-                {
-                    let compressed_data = compress_value(&data, self.config.compression);
-                    if compressed_data.len() < data.len() {
-                        (Bytes::from(compressed_data), true)
-                    } else {
-                        (Bytes::from(data), false)
-                    }
-                } else {
-                    (Bytes::from(data), false)
-                };
+                let (stored_data, compressed) = self.encode_value(data);
 
                 let old_mem = entry.mem_size;
                 entry.data = stored_data;
@@ -2117,6 +2108,39 @@ impl Store {
     /// Reaps are local only, like lazy expiry: replicas expire keys on their
     /// own clocks.
     pub fn active_expire_cycle(&self, budget: Duration) -> usize {
+        let reaped = self.active_expire_rounds(budget);
+        // Expiry is what empties a store, so this is where its tables give
+        // memory back (see `shrink_sparse_tables`).
+        self.shrink_sparse_tables();
+        reaped
+    }
+
+    /// Release the slot memory of hash tables that are now mostly empty.
+    ///
+    /// A `DashMap` shard never shrinks by itself: once a burst of 1.3M short
+    /// TTL keys had expired, the store held 0 accounted bytes but ~190 MB of
+    /// empty table (the data map plus the TTL index), which no later write
+    /// could reuse for anything but more keys. Per-entry slot cost is part of
+    /// what [`Entry`]'s size estimate charges, so leaving the slots allocated
+    /// after the entries are gone is memory the accounting has already given
+    /// back. Shrinking a shard once it is at least
+    /// [`SHRINK_SPARSENESS`]-times oversized keeps the two in step.
+    ///
+    /// A shrink rehashes the shard, so the expiry cursor's position in it no
+    /// longer means "where the sweep stopped"; that sweep resumes from an
+    /// arbitrary point and the next full sweep covers whatever it skipped.
+    /// Shrinks are rare (a shard must have lost three quarters of its slots),
+    /// so this costs little.
+    ///
+    /// Returns the number of shards shrunk.
+    pub fn shrink_sparse_tables(&self) -> usize {
+        shrink_sparse_shards(&self.data)
+            + shrink_sparse_shards(&self.ttl_keys)
+            + shrink_sparse_shards(&self.hashes)
+    }
+
+    /// The adaptive rounds of [`active_expire_cycle`](Self::active_expire_cycle).
+    fn active_expire_rounds(&self, budget: Duration) -> usize {
         let start = Instant::now();
         let mut reaped = 0;
         loop {
@@ -2641,6 +2665,65 @@ fn collect_keys<V>(
             Some(p) => out.extend(batch.drain(..).filter(|k| glob::glob_match(p, k.as_bytes()))),
         }
     }
+}
+
+/// A shard's table is only shrunk once it has at least this many slots…
+const SHRINK_MIN_CAPACITY: usize = 64;
+
+/// …and holds fewer than one entry per this many slots. The gap between this
+/// and the table's own growth threshold keeps a store whose size oscillates
+/// from shrinking and regrowing every cycle.
+const SHRINK_SPARSENESS: usize = 4;
+
+/// Shrink every shard of `map` whose table is mostly empty. Returns the
+/// number of shards shrunk.
+///
+/// Each shard is checked under its read lock and only write-locked when it
+/// will actually be shrunk; the rehash then costs `O(entries in that shard)`.
+fn shrink_sparse_shards<V>(map: &DashMap<String, V>) -> usize {
+    let hasher = map.hasher();
+    let sparse = |capacity: usize, len: usize| {
+        capacity >= SHRINK_MIN_CAPACITY && capacity > len.saturating_mul(SHRINK_SPARSENESS)
+    };
+    let mut shrunk = 0;
+    for shard in map.shards() {
+        {
+            let guard = shard.read();
+            if !sparse(guard.capacity(), guard.len()) {
+                continue;
+            }
+        }
+        let mut guard = shard.write();
+        let len = guard.len();
+        if sparse(guard.capacity(), len) {
+            // The same hash DashMap uses for both shard selection and the
+            // in-shard table (`hash_usize`), so every entry keeps its slot
+            // reachable after the rehash.
+            guard.shrink_to(len, |(key, _)| hasher.hash_one(key));
+            shrunk += 1;
+        }
+    }
+    shrunk
+}
+
+/// Bytes charged to `memory_limit` for one TTL-index hint on `key`: the key's
+/// own copy plus the map slot (`String` + `Instant`, sized up for the table's
+/// load factor — measured at ~54 bytes beyond the key in
+/// `tests/memory_accounting.rs`).
+const fn ttl_index_cost(key: &str) -> usize {
+    key.len() + TTL_INDEX_SLOT_OVERHEAD
+}
+
+/// Per-hint overhead of the TTL index beyond the key bytes; see
+/// [`ttl_index_cost`].
+const TTL_INDEX_SLOT_OVERHEAD: usize = 56;
+
+/// Wrap a buffer as stored bytes holding no spare capacity (see
+/// [`Store::encode_value`]). A no-op copy-free conversion when the vector is
+/// already exact, which is the common case for values from RESP and PHP.
+fn exact_bytes(mut v: Vec<u8>) -> Bytes {
+    v.shrink_to_fit();
+    Bytes::from(v)
 }
 
 /// Compress a value using the configured algorithm.
@@ -4893,6 +4976,45 @@ mod tests {
         assert!(!s.data.contains_key("expired"));
         for i in 0..100 {
             assert!(s.exists(&format!("perm{i}")), "perm{i} must survive active expiry");
+        }
+    }
+
+    #[test]
+    fn active_expiry_gives_empty_table_memory_back() {
+        // F-12: tables never shrank, so a store whose keys had all expired
+        // still held every slot of its peak size.
+        let s = test_store();
+        for i in 0..100_000 {
+            plant_expired(&s, &format!("t{i}"), b"v");
+        }
+        for i in 0..1_000 {
+            assert!(s.set(format!("live{i}"), b"v".to_vec(), Some(Duration::from_secs(600))));
+        }
+        let peak = s.data.capacity() + s.ttl_keys.capacity();
+        // An effectively unlimited budget: the result must not depend on how
+        // fast the machine is, only on the cursor sweep.
+        for _ in 0..200 {
+            s.active_expire_cycle(Duration::from_secs(3_600));
+        }
+        let after = s.data.capacity() + s.ttl_keys.capacity();
+        assert!(after * 10 < peak, "tables not shrunk: {peak} slots -> {after}");
+        // Every surviving key is still reachable after the rehash.
+        for i in 0..1_000 {
+            assert!(s.exists(&format!("live{i}")), "live{i} lost by the shrink");
+            assert!(s.ttl_keys.contains_key(&format!("live{i}")));
+        }
+        assert_eq!(s.len(), 1_000);
+    }
+
+    #[test]
+    fn shrinking_leaves_dense_tables_alone() {
+        let s = test_store();
+        for i in 0..50_000 {
+            s.set(format!("k{i}"), b"v".to_vec(), None);
+        }
+        assert_eq!(s.shrink_sparse_tables(), 0);
+        for i in 0..50_000 {
+            assert!(s.exists(&format!("k{i}")));
         }
     }
 

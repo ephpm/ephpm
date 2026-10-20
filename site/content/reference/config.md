@@ -985,7 +985,7 @@ Notable gaps, all deliberate:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory_limit` | string | `"256MB"` | Max memory for **stored key/value payloads**. Per-connection RESP protocol buffers are NOT counted here — bound those with `[kv.redis_compat]` `max_connections` / `max_input_buffer`. |
+| `memory_limit` | string | `"256MB"` | Max memory for **stored data**, per store (each per-site store has its own): keys, values as stored (compressed size when compressed), per-entry metadata, the TTL index and hash fields. Expired keys are reclaimed before anything is evicted or refused. Process RSS runs above this (allocator retention and fragmentation, compression scratch memory; about 1.3× uncompressed and up to ~4× with brotli in our measurements) — see [What `memory_limit` counts](/architecture/kv-store/#what-memory_limit-counts). Per-connection RESP protocol buffers are NOT counted here — bound those with `[kv.redis_compat]` `max_connections` / `max_input_buffer`. |
 | `eviction_policy` | string | `"allkeys-lru"` | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`. Case-sensitive; any other value is rejected at startup with an error listing the four valid options. |
 | `compression` | string | `"none"` | `none`, `gzip`, `brotli` (alias `br`), `zstd`; case-insensitive. Any other value fails startup naming the value (it used to mean `none` silently). |
 | `compression_level` | u32 | `6` | Passed unchanged to the chosen algorithm, so the range depends on it: gzip 0-9, brotli 0-11, zstd 1-22. Lower is faster; higher compresses more. |

@@ -80,6 +80,27 @@ Expired keys are reclaimed before any live key is evicted (see [Storage](#storag
 
 LRU isn't strict — maintaining a true global LRU over a sharded map would be expensive. It is Redis' approximated LRU instead: each eviction step samples 16 string keys (plus 4 hashes under `allkeys-lru`) from a random position in the map, merges them into a pool of the 16 best candidates kept across steps, and evicts the least recently used one. `volatile-lru` samples from the index of TTL'd keys, so persistent keys cost it nothing however many there are. `allkeys-random` takes the key at a random position (a string key, or a hash once no string keys remain). Each victim costs a few microseconds whatever the store size. The access clock has 100 ms granularity.
 
+## What `memory_limit` counts
+
+`memory_limit` caps the store's own accounting (`used_memory` in `INFO`). That counts, per key:
+
+- the key and the value **as stored** — a compressed value counts its compressed size,
+- a fixed per-entry estimate for the entry's metadata and its hash-table slot,
+- for a key with a TTL, its entry in the TTL index (a second copy of the key plus a slot),
+- for a hash, every field name and value plus a per-field and per-hash overhead.
+
+Each per-site store of a multi-tenant node has its own `memory_limit`; the limit is not shared across sites.
+
+That accounting tracks the heap the store actually holds to within about 10% (verified by `crates/ephpm-kv/tests/memory_accounting.rs` with a counting allocator, for small and large values, TTL'd keys, hashes and every compression algorithm). Stored buffers carry no spare capacity, and when expiry empties a store its hash tables are shrunk, so the slots of a burst of expired keys do not stay allocated.
+
+**Resident memory (RSS) is still higher than `memory_limit`,** and the difference is outside what a byte counter in the store can see:
+
+- **Allocator retention and fragmentation.** Freed memory (evicted, expired and overwritten values) is kept by the allocator for reuse and returned to the OS lazily, and values of many different sizes fragment it. This is most visible with compression, whose output sizes vary widely.
+- **Compression working memory.** Compressing allocates scratch space that is freed straight away but adds to what the allocator retains: brotli at level 6 allocates about 2.4 MB per compressed value, gzip about 0.4 MB, zstd about 64 KB.
+- **Everything else in the process:** the PHP runtime, connection buffers (see `[kv.redis_compat]` `max_input_buffer`) and so on.
+
+Measured on a Linux stub build (glibc, mimalloc), a 256 MB store under sustained mixed writes of 2–128 KB values ran at about 330 MB RSS uncompressed (1.3×), 360 MB with gzip (1.4×), 740 MB with zstd (2.9×) and 1.0–1.1 GB with brotli (4×). Size the container for those factors rather than for `memory_limit` alone, and prefer gzip or no compression where memory is the tight resource. A store that has been emptied keeps some of its peak RSS until the allocator reuses or returns it.
+
 ## RESP2 protocol
 
 The on-wire format is Redis RESP2. We don't fork a Redis-compatible parser — we have a tight implementation in [`crates/ephpm-kv/src/resp/`](https://github.com/ephpm/ephpm/tree/main/crates/ephpm-kv/src/resp). Connections are tokio tasks reading line-buffered RESP frames; one connection = one task, no thread pool.
