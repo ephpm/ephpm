@@ -136,6 +136,17 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
     Ok(handle)
 }
 
+/// Render the full scrape payload as text: everything recorded through the
+/// [`metrics`] facade, plus the per-site CDC gauges that live outside it so
+/// they can be removed when a site stops replicating here (see
+/// [`crate::turso_cdc_metrics::render_site_gauges`]).
+#[must_use]
+pub fn render_text(handle: &PrometheusHandle) -> String {
+    let mut body = handle.render();
+    crate::turso_cdc_metrics::render_site_gauges(&mut body);
+    body
+}
+
 /// Render the current scrape payload as an HTTP response.
 ///
 /// Returns `text/plain; version=0.0.4` — the standard Prometheus text format
@@ -146,7 +157,7 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
 /// Panics if the HTTP response builder fails (should never happen with static headers).
 #[must_use]
 pub fn render(handle: &PrometheusHandle) -> Response<crate::body::ServerBody> {
-    let body = handle.render();
+    let body = render_text(handle);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")

@@ -9,7 +9,7 @@
 //! the replica side runs
 //! [`ephpm_server::turso_cdc::subscribe_and_consume`], and the scrape is
 //! rendered by [`ephpm_server::metrics`] — the same `init()` the binary
-//! calls and the same `render()` that answers `/metrics`. A test that
+//! calls and the same `render_text()` that answers `/metrics`. A test that
 //! called `counter!` itself and then asserted the counter moved would
 //! prove only that the `metrics` crate works.
 //!
@@ -59,9 +59,19 @@ fn scrape_handle() -> &'static PrometheusHandle {
         // Seed the zero-valued CDC series exactly as
         // `start_clustered_turso_cdc` does at startup.
         cdc_metrics::init();
+        cdc_metrics::track_shipping(cdc_metrics::DEFAULT_SITE);
         handle
     })
 }
+
+/// The full `/metrics` payload — `render_text` is what the endpoint serves,
+/// and it is the only path that includes the per-site CDC gauges.
+fn render_scrape(handle: &PrometheusHandle) -> String {
+    ephpm_server::metrics::render_text(handle)
+}
+
+/// Label set of the whole-database mode's per-site gauges.
+const DEFAULT: &[(&str, &str)] = &[("site", "default")];
 
 // ---------------------------------------------------------------------------
 // Scrape parsing. Deliberately a dumb text parser over the rendered
@@ -245,7 +255,7 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
 
     // Counters are process-global and this binary may have run another
     // test first, so every counter assertion below is a delta.
-    let before = handle.render();
+    let before = render_scrape(handle);
     let shipped_before = require_metric(&before, cdc_metrics::METRIC_BATCHES_SHIPPED, &[]);
     let applied_before = require_metric(&before, cdc_metrics::METRIC_BATCHES_APPLIED, &[]);
     // The error counters too: another test in this binary deliberately
@@ -277,7 +287,8 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     // attach path — nothing in this test touches it.
     let attached = eventually(
         || async {
-            metric_value(&handle.render(), cdc_metrics::METRIC_SUBSCRIBERS, &[]).map(|v| v as i64)
+            metric_value(&render_scrape(handle), cdc_metrics::METRIC_SUBSCRIBERS, DEFAULT)
+                .map(|v| v as i64)
                 == Some(1)
         },
         Duration::from_secs(10),
@@ -322,10 +333,14 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
             let head = primary_head(&primary_conn).await;
             head > 0
                 && read_watermark(&replica_conn).await.unwrap_or(-1) == head
-                && metric_value(&handle.render(), cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[])
-                    .map(|v| v as i64)
+                && metric_value(
+                    &render_scrape(handle),
+                    cdc_metrics::METRIC_APPLIED_CHANGE_ID,
+                    DEFAULT,
+                )
+                .map(|v| v as i64)
                     == Some(head)
-                && metric_value(&handle.render(), cdc_metrics::METRIC_SUBSCRIBERS, &[])
+                && metric_value(&render_scrape(handle), cdc_metrics::METRIC_SUBSCRIBERS, DEFAULT)
                     .map(|v| v as i64)
                     == Some(1)
         },
@@ -338,22 +353,23 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
          applied_change_id gauge {:?}, subscribers {:?}",
         primary_head(&primary_conn).await,
         read_watermark(&replica_conn).await.unwrap_or(-1),
-        metric_value(&handle.render(), cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]),
-        metric_value(&handle.render(), cdc_metrics::METRIC_SUBSCRIBERS, &[]),
+        metric_value(&render_scrape(handle), cdc_metrics::METRIC_APPLIED_CHANGE_ID, DEFAULT),
+        metric_value(&render_scrape(handle), cdc_metrics::METRIC_SUBSCRIBERS, DEFAULT),
     );
 
     // Let the ship-side idle path run at least once so the head gauge is
     // published from a caught-up tailer.
     let lag_closed = eventually(
         || async {
-            metric_value(&handle.render(), cdc_metrics::METRIC_LAG_CHANGES, &[]).map(|v| v as i64)
+            metric_value(&render_scrape(handle), cdc_metrics::METRIC_LAG_CHANGES, DEFAULT)
+                .map(|v| v as i64)
                 == Some(0)
         },
         Duration::from_secs(15),
     )
     .await;
 
-    let scrape = handle.render();
+    let scrape = render_scrape(handle);
 
     // --- ship side ---------------------------------------------------
     let shipped = require_metric(&scrape, cdc_metrics::METRIC_BATCHES_SHIPPED, &[]);
@@ -363,7 +379,7 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     );
     let rows_shipped = require_metric(&scrape, cdc_metrics::METRIC_ROWS_SHIPPED, &[]);
     assert!(rows_shipped > 0.0, "no CDC rows recorded as shipped");
-    assert_eq!(require_metric_i64(&scrape, cdc_metrics::METRIC_SUBSCRIBERS, &[]), 1);
+    assert_eq!(require_metric_i64(&scrape, cdc_metrics::METRIC_SUBSCRIBERS, DEFAULT), 1);
     assert_eq!(
         require_metric_i64(&scrape, cdc_metrics::METRIC_TAIL_POLL_ERRORS, &[]),
         tail_errors_before,
@@ -399,7 +415,8 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     // replica actually finished the work the primary produced.
     let real_watermark = read_watermark(&replica_conn).await.unwrap();
     let expected_head = primary_head(&primary_conn).await;
-    let gauge_watermark = require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]);
+    let gauge_watermark =
+        require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, DEFAULT);
     assert_eq!(
         gauge_watermark, real_watermark,
         "applied_change_id gauge ({gauge_watermark}) disagrees with the watermark actually \
@@ -412,9 +429,10 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     );
 
     // --- lag ---------------------------------------------------------
-    let head = require_metric_i64(&scrape, cdc_metrics::METRIC_HEAD_CHANGE_ID, &[]);
-    let shipped_cursor = require_metric_i64(&scrape, cdc_metrics::METRIC_SHIPPED_CHANGE_ID, &[]);
-    let lag = require_metric_i64(&scrape, cdc_metrics::METRIC_LAG_CHANGES, &[]);
+    let head = require_metric_i64(&scrape, cdc_metrics::METRIC_HEAD_CHANGE_ID, DEFAULT);
+    let shipped_cursor =
+        require_metric_i64(&scrape, cdc_metrics::METRIC_SHIPPED_CHANGE_ID, DEFAULT);
+    let lag = require_metric_i64(&scrape, cdc_metrics::METRIC_LAG_CHANGES, DEFAULT);
     assert_eq!(
         head, expected_head,
         "head_change_id gauge ({head}) is not the primary's actual CDC head ({expected_head})"
@@ -456,7 +474,7 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
     let _serial = SERIAL.lock().await;
     let handle = scrape_handle();
 
-    let before = handle.render();
+    let before = render_scrape(handle);
     let errors_before = require_metric_i64(&before, cdc_metrics::METRIC_APPLY_ERRORS, &[]);
     let applied_before = require_metric_i64(&before, cdc_metrics::METRIC_BATCHES_APPLIED, &[]);
 
@@ -510,7 +528,7 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
         "error should name the failing change_id, got: {err:#}"
     );
 
-    let scrape = handle.render();
+    let scrape = render_scrape(handle);
     assert_eq!(
         require_metric_i64(&scrape, cdc_metrics::METRIC_APPLY_ERRORS, &[]),
         errors_before + 1,
@@ -524,7 +542,7 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
     // Subscribe published watermark 0; the failed apply must not have
     // advanced it to 4242.
     assert_eq!(
-        require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]),
+        require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, DEFAULT),
         0,
         "the watermark gauge advanced past a batch that failed to apply"
     );
@@ -536,7 +554,7 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
 #[tokio::test]
 async fn startup_seeds_every_zero_valued_series() {
     let _serial = SERIAL.lock().await;
-    let scrape = scrape_handle().render();
+    let scrape = render_scrape(scrape_handle());
 
     for name in [
         cdc_metrics::METRIC_BATCHES_SHIPPED,
@@ -581,7 +599,7 @@ async fn an_unreachable_primary_increments_the_dial_error_counter() {
     let handle = scrape_handle();
 
     let before = require_metric_i64(
-        &handle.render(),
+        &render_scrape(handle),
         cdc_metrics::METRIC_REPLICA_CONNECTS,
         &[("outcome", "dial_error")],
     );
@@ -602,7 +620,7 @@ async fn an_unreachable_primary_increments_the_dial_error_counter() {
     let observed = eventually(
         || async {
             metric_value(
-                &handle.render(),
+                &render_scrape(handle),
                 cdc_metrics::METRIC_REPLICA_CONNECTS,
                 &[("outcome", "dial_error")],
             )
@@ -629,7 +647,7 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
     let _serial = SERIAL.lock().await;
     let handle = scrape_handle();
 
-    let before = handle.render();
+    let before = render_scrape(handle);
     let served_before =
         require_metric_i64(&before, cdc_metrics::METRIC_SNAPSHOTS_SERVED, &[("status", "ok")]);
     let bytes_served_before =
@@ -687,7 +705,7 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
     .await
     .expect("snapshot bootstrap");
 
-    let scrape = handle.render();
+    let scrape = render_scrape(handle);
     assert_eq!(
         require_metric_i64(&scrape, cdc_metrics::METRIC_SNAPSHOTS_SERVED, &[("status", "ok")]),
         served_before + 1,
@@ -721,7 +739,7 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
     }
     // The gauge must reflect the seeded watermark, before CDC tails.
     assert_eq!(
-        require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]),
+        require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, DEFAULT),
         watermark,
         "watermark gauge does not match the watermark the snapshot seeded"
     );

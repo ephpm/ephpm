@@ -148,9 +148,8 @@ rcgen.workspace = true
 sha1.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
 tokio = { workspace = true, features = ["test-util"] }
-# Excludes the CDC-metrics tests from running alongside anything else that
-# mutates the process-global subscriber registry (turso_cdc_metrics::REGISTRY).
-# Already a workspace dependency (ephpm-php uses it), so this adds no new crate
+# Serializes tests that share process-global state (the router's `#[serial]`
+# tests). Already a workspace dependency (ephpm-php uses it), so this adds no new crate
 # to the tree. Works on `#[tokio::test]`, which a bare Mutex guard held across
 # an await does not.
 serial_test.workspace = true

@@ -98,9 +98,21 @@ PromQL to alert on — is in the
 The design decision worth knowing here is what "replication lag" means. Two
 positions are published: `ephpm_cdc_primary_head_change_id` (the primary's write
 head in its `turso_cdc` log) and `ephpm_cdc_applied_change_id` (the replica's
-applied watermark). `ephpm_cdc_replication_lag_changes` is the primary-local
-difference between the head and the slowest attached subscriber's shipped
+applied watermark). `ephpm_cdc_replication_lag_changes` is the shipping node's
+local difference between the head and the slowest attached subscriber's shipped
 cursor.
+
+All of these position gauges carry a `site` label, because a `change_id` is a
+position in **one** database's change log: `site="default"` in whole-database
+clustered mode, the vhost's site key in per-site clustered mode, where every
+site has its own log. Each is computed from that site's state alone and is
+published only by the node in the matching role for the site (head, shipped and
+lag by the owner; the applied watermark by a replica), and a site's series are
+removed — not zeroed — when this node stops shipping or applying it. An earlier
+unlabelled version mixed every site's log into one series and was meaningless in
+per-site mode. These five gauges are kept in a per-site registry and appended to
+the scrape by `turso_cdc_metrics::render_site_gauges`, because the `metrics`
+facade cannot unregister a series. Counters and histograms stay node-wide.
 
 All three are counted in **`change_id`s — change-log rows, not seconds**. That is
 what the data supports: a seconds-valued lag needs a commit timestamp on the
@@ -112,7 +124,7 @@ everywhere it appears.
 
 Two smaller consequences of that model:
 
-- The shipped cursor is the **minimum** across attached subscribers, so a single
+- The shipped cursor is the **minimum** across a site's attached subscribers, so a single
   caught-up replica cannot mask a lagging one, and it is **retained** after the
   last subscriber detaches, so a primary that keeps taking writes after its
   replica dies shows a growing lag rather than a frozen one.
