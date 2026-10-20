@@ -381,11 +381,16 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             }
             let key = str_from(argv[0]);
             let mut added = 0i64;
+            // Under memory pressure a refused field returns `-OOM` and stops,
+            // so earlier fields may already be stored — the same best-effort
+            // contract as MSET.
             for pair in argv[1..].chunks(2) {
                 let field = str_from(pair[0]);
                 let value = pair[1].to_vec();
-                if store.hset(&key, &field, value) {
-                    added += 1;
+                match store.hset(&key, &field, value) {
+                    Some(true) => added += 1,
+                    Some(false) => {}
+                    None => return oom(),
                 }
             }
             Frame::integer(added)
@@ -673,6 +678,22 @@ mod tests {
 
     fn int(f: &Frame) -> Option<i64> {
         if let Frame::Integer(n) = f { Some(*n) } else { None }
+    }
+
+    /// F-19: HSET bypassed the memory limit and always answered with a field
+    /// count. Over budget under `noeviction` it must answer `-OOM`, like SET.
+    #[test]
+    fn hset_over_the_memory_limit_is_oom() {
+        let store = Store::new(StoreConfig {
+            memory_limit: 4 * 1024,
+            eviction_policy: crate::store::EvictionPolicy::NoEviction,
+            ..StoreConfig::default()
+        });
+        let big = "x".repeat(8 * 1024);
+        let reply = cmd(&store, &["HSET", "h", "f", &big]);
+        assert_eq!(reply, Frame::error(OOM_ERROR));
+        assert_eq!(int(&cmd(&store, &["HLEN", "h"])), Some(0));
+        assert_eq!(int(&cmd(&store, &["HSET", "h", "f", "small"])), Some(1));
     }
 
     // ── Owner-routed conditional writes (clustered) ──────────────────────

@@ -181,6 +181,13 @@ impl MultiTenantStore {
         &self.default_store
     }
 
+    /// A weak handle on the site registry, for the active-expiry thread
+    /// ([`crate::expiry`]): it must see sites created after it started, but
+    /// must not keep the registry alive once every real owner has dropped it.
+    pub(crate) fn sites_weak(&self) -> std::sync::Weak<DashMap<String, Arc<Store>>> {
+        Arc::downgrade(&self.sites)
+    }
+
     /// Number of site stores currently active.
     #[must_use]
     pub fn site_count(&self) -> usize {

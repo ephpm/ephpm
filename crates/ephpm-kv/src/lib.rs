@@ -8,6 +8,8 @@
 //!
 //! - **[`store`]**: `DashMap`-backed concurrent store with TTL, LRU eviction,
 //!   and approximate memory tracking.
+//! - **[`expiry`]**: the background active-expiry thread that reclaims expired
+//!   keys in the default store and every per-site store.
 //! - **[`resp`]**: RESP2 wire protocol parser and serializer.
 //! - **[`command`]**: Redis command dispatch — translates RESP frames into
 //!   store operations.
@@ -28,6 +30,7 @@
 
 pub mod auth;
 pub mod command;
+pub mod expiry;
 pub mod multi_tenant;
 pub mod resp;
 pub mod server;

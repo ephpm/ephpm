@@ -1892,6 +1892,14 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
         None
     };
 
+    // Active expiry runs whatever the RESP setting: expired keys hold memory
+    // (and count against `memory_limit`) until reaped, and a PHP-only node
+    // used to have no reaper at all. Covers the default store and every
+    // per-site store, including ones created later. The thread exits once the
+    // stores are dropped.
+    ephpm_kv::expiry::spawn(&store, multi_tenant.as_ref())
+        .context("failed to start the KV active-expiry thread")?;
+
     if !config.kv.redis_compat.enabled {
         tracing::debug!("KV store initialized (RESP server disabled)");
         return Ok((store, multi_tenant, None));
@@ -3630,6 +3638,43 @@ mod lib_tests {
         let a = router_side.get_site_store("blog.example.com");
         let b = resp_side.get_site_store("blog.example.com");
         assert!(Arc::ptr_eq(&a, &b), "PHP and RESP must share one store per vhost");
+    }
+
+    #[test]
+    fn kv_service_expires_keys_without_the_resp_listener() {
+        // The only reaper used to live inside the RESP listener, so on a node
+        // with `[kv.redis_compat]` off (the default) expired keys were never
+        // reclaimed — in the default store or any per-site store. Expired keys
+        // are written and never read again, so only active expiry can remove
+        // them; `len()` counts not-yet-reaped keys.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            server: ephpm_config::ServerConfig {
+                sites_dir: Some(dir.path().to_path_buf()),
+                ..ephpm_config::ServerConfig::default()
+            },
+            ..Config::default()
+        };
+        let (store, multi_tenant, handle) = start_kv_service(&config).expect("start kv service");
+        assert!(handle.is_none(), "RESP listener is off");
+        // Keep the registry alive: the expiry thread follows it weakly.
+        let multi_tenant = multi_tenant.expect("sites_dir set");
+        let site = multi_tenant.get_site_store("blog.example.com");
+        for s in [&store, &site] {
+            for i in 0..200 {
+                assert!(s.set(format!("k{i}"), b"v".to_vec(), Some(Duration::from_millis(1))));
+            }
+        }
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while store.len() + site.len() > 0 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "expired keys not reclaimed: default={} site={}",
+                store.len(),
+                site.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Multi-tenant config with the RESP listener enabled, secret optional.
