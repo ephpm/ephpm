@@ -3,28 +3,38 @@
 //! Reads frames incrementally from a `BytesMut` buffer. Returns
 //! `Ok(None)` when more data is needed (incomplete frame).
 //!
-//! Parsing is two-phase. `scan_frame` walks the buffer by index and
-//! produces a `FrameSpec` tree in which bulk payloads are recorded as
-//! byte ranges, without copying or consuming anything. Only once a whole
-//! frame is known to be present does [`parse_frame`] split it off the
-//! buffer and materialise the [`Frame`], slicing bulk payloads out of the
-//! frozen `Bytes` (still zero-copy).
+//! Parsing is two-phase. Scanning walks the buffer by index and produces a
+//! `FrameSpec` tree in which bulk payloads are recorded as byte ranges,
+//! without copying or consuming anything. Only once a whole frame is known
+//! to be present does the [`Decoder`] split it off the buffer and
+//! materialise the [`Frame`], slicing bulk payloads out of the frozen
+//! `Bytes` (still zero-copy).
 //!
-//! Two properties fall out of that split, both of which the previous
-//! recursive-on-`BytesMut` parser got wrong:
+//! Three properties fall out of that design:
 //!
 //! - Array elements are scanned against an index, so an N-element array
-//!   costs O(N) work. The old parser copied the entire remaining buffer
-//!   into a fresh `BytesMut` per element — quadratic, and repeated on
-//!   every socket read while the array was still incomplete.
-//! - Nesting is capped at `MAX_ARRAY_DEPTH` (32). Without a cap, ~40 KiB of
-//!   repeated `*1\r\n` (far below `max_input_buffer`) recursed thousands
-//!   of frames deep and overflowed the tokio worker stack, taking down
-//!   the whole process rather than the one connection.
+//!   costs O(N) work. The parser before that copied the entire remaining
+//!   buffer into a fresh `BytesMut` per element.
+//! - Scanning is **resumable** (KV stress report F-17). A [`Decoder`] keeps
+//!   the elements it has already scanned, plus where to resume its `\r\n`
+//!   search, across calls. A frame that arrives in many small reads is
+//!   therefore scanned once in total, not once per read: restarting from
+//!   byte 0 on every read cost ~100x the CPU for a 980 KB `MGET` trickled in
+//!   100-byte writes.
+//! - Nesting is capped at `MAX_ARRAY_DEPTH` (32), and the scan is a loop
+//!   over an explicit stack rather than recursion, so ~40 KiB of repeated
+//!   `*1\r\n` is a protocol error on one connection instead of a stack
+//!   overflow that takes down the process.
+//!
+//! A request decoder ([`Decoder::request`]) also accepts Redis **inline
+//! commands** (KV stress report F-16): a top-level frame that does not start
+//! with `*` is one line of space-separated arguments, split with Redis's
+//! quoting rules (`sdssplitargs`) — so `PING` typed into `telnet` or `nc`
+//! works, as it does against Redis.
 
 use std::ops::Range;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use super::frame::Frame;
 
@@ -53,16 +63,19 @@ const MAX_ARRAY_PREALLOC: usize = 1024;
 
 /// Maximum nesting depth allowed for RESP arrays.
 ///
-/// Mirrors Redis's hardcoded `PROTO_NESTED_MULTIBULK_DEPTH` (32). Nesting
-/// is attacker-controlled and each level costs a stack frame in
-/// [`scan_frame`], so without a cap a small packet of repeated `*1\r\n`
-/// overflows the thread stack — which aborts the entire process, not just
-/// the offending connection. Real RESP2 client traffic is one level deep.
+/// Mirrors Redis's hardcoded `PROTO_NESTED_MULTIBULK_DEPTH` (32). Nesting is
+/// attacker-controlled; real RESP2 client traffic is one level deep.
 const MAX_ARRAY_DEPTH: usize = 32;
+
+/// Maximum length of an inline command line without its newline.
+///
+/// Mirrors Redis's `PROTO_INLINE_MAX_SIZE` (64 KiB): a client that sends a
+/// line this long with no `\n` is refused instead of buffered.
+const MAX_INLINE_LEN: usize = 64 * 1024;
 
 /// Errors that can occur while parsing RESP frames.
 ///
-/// An incomplete frame is not an error — [`parse_frame`] reports it as
+/// An incomplete frame is not an error — [`Decoder::decode`] reports it as
 /// `Ok(None)` so the caller reads more from the socket and retries.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -91,35 +104,314 @@ enum FrameSpec {
     Array(Vec<FrameSpec>),
 }
 
-/// Try to parse a complete RESP frame from `buf`.
+/// An array whose header has been scanned but whose elements have not all
+/// arrived yet.
+#[derive(Debug)]
+struct PartialArray {
+    items: Vec<FrameSpec>,
+    remaining: usize,
+}
+
+/// A scanned inline command: its arguments, and the index just past its `\n`.
+type InlineCommand = (Vec<Vec<u8>>, usize);
+
+/// What one scan step at `pos` produced.
+enum Step {
+    /// The buffer does not hold the whole element yet.
+    Incomplete,
+    /// A complete element ending just before the given index.
+    Element(FrameSpec, usize),
+    /// An array header for a non-empty array; elements start at the index.
+    ArrayStart(usize, usize),
+}
+
+/// Resumable RESP frame decoder.
 ///
-/// On success, the consumed bytes are drained from `buf` and the parsed
-/// [`Frame`] is returned. Returns `Ok(None)` when the buffer does not
-/// yet contain a complete frame.
+/// Keep one per connection and call [`decode`](Self::decode) after every
+/// read. Between calls the caller may only **append** to the buffer: the
+/// decoder remembers positions in it. It resets itself after each complete
+/// frame and after an error, so a caller that discards the buffer on an
+/// error (as the server does) needs nothing else.
+#[derive(Debug)]
+pub struct Decoder {
+    /// Accept inline commands at the top level (request side).
+    inline: bool,
+    /// Start of the next element to scan.
+    pos: usize,
+    /// Where to resume the line-terminator search for the element at `pos`
+    /// (always `>= pos`), so a long line arriving in pieces is searched once.
+    resume: usize,
+    /// Arrays still waiting for elements, outermost first.
+    stack: Vec<PartialArray>,
+    /// Bytes examined while scanning — lets tests assert that work is linear
+    /// in the input rather than timing it.
+    #[cfg(test)]
+    work: usize,
+}
+
+impl Decoder {
+    /// A decoder for client requests: RESP arrays plus inline commands.
+    #[must_use]
+    pub fn request() -> Self {
+        Self::new(true)
+    }
+
+    /// A decoder for any RESP2 frame (e.g. server replies). Inline commands
+    /// are not accepted: a frame must start with a RESP type byte.
+    #[must_use]
+    pub fn response() -> Self {
+        Self::new(false)
+    }
+
+    fn new(inline: bool) -> Self {
+        Self {
+            inline,
+            pos: 0,
+            resume: 0,
+            stack: Vec::new(),
+            #[cfg(test)]
+            work: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
+        self.resume = 0;
+        self.stack.clear();
+    }
+
+    /// Try to decode one complete frame from `buf`.
+    ///
+    /// On success the frame's bytes are drained from `buf` and the frame is
+    /// returned. Returns `Ok(None)` when `buf` does not hold a complete frame
+    /// yet; the partial scan is kept, so the next call only looks at what
+    /// was appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::Protocol`] for invalid RESP data, an array
+    /// nested deeper than 32 levels, or (request decoders) an inline command
+    /// longer than 64 KiB or with unbalanced quotes. The decoder is reset;
+    /// the caller should discard `buf`, since framing cannot be recovered.
+    pub fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
+        let result = self.decode_inner(buf);
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
+    fn decode_inner(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
+        loop {
+            if self.inline && self.stack.is_empty() && self.pos == 0 {
+                match buf.first() {
+                    None => return Ok(None),
+                    Some(b'*') => {}
+                    Some(_) => match self.scan_inline(buf)? {
+                        None => return Ok(None),
+                        Some((args, end)) => {
+                            buf.advance(end);
+                            self.reset();
+                            // An empty line is consumed silently, as Redis does.
+                            if args.is_empty() {
+                                continue;
+                            }
+                            return Ok(Some(Frame::Array(
+                                args.into_iter().map(|a| Frame::Bulk(Bytes::from(a))).collect(),
+                            )));
+                        }
+                    },
+                }
+            }
+
+            let (mut spec, mut end) = match self.scan_element(buf)? {
+                Step::Incomplete => return Ok(None),
+                Step::ArrayStart(count, start) => {
+                    self.stack.push(PartialArray {
+                        items: Vec::with_capacity(count.min(MAX_ARRAY_PREALLOC)),
+                        remaining: count,
+                    });
+                    self.pos = start;
+                    self.resume = start;
+                    continue;
+                }
+                Step::Element(spec, end) => (spec, end),
+            };
+
+            self.pos = end;
+            self.resume = end;
+            // Fold the finished element into its parent; a parent that is
+            // now full is itself a finished element of *its* parent.
+            loop {
+                let Some(top) = self.stack.last_mut() else {
+                    // Top level: the whole frame is present.
+                    let data = buf.split_to(end).freeze();
+                    self.reset();
+                    return Ok(Some(materialize(spec, &data)));
+                };
+                top.items.push(spec);
+                top.remaining -= 1;
+                if top.remaining > 0 {
+                    break;
+                }
+                let done = self.stack.pop().map(|a| a.items).unwrap_or_default();
+                spec = FrameSpec::Array(done);
+                end = self.pos;
+            }
+        }
+    }
+
+    /// Find the `\r\n` ending the line whose content starts at `start`,
+    /// resuming where the previous call for this element stopped. Returns
+    /// the index of the `\r`.
+    fn find_crlf(&mut self, buf: &[u8], start: usize) -> Option<usize> {
+        let from = self.resume.max(start);
+        let hit = buf[from.min(buf.len())..].windows(2).position(|w| w == b"\r\n");
+        #[cfg(test)]
+        {
+            self.work += hit.map_or(buf.len().saturating_sub(from), |i| i + 2);
+        }
+        match hit {
+            Some(i) => Some(from + i),
+            None => {
+                // Keep the last byte: it may be the `\r` of a split `\r\n`.
+                self.resume = buf.len().saturating_sub(1).max(start);
+                None
+            }
+        }
+    }
+
+    /// Scan the element starting at `self.pos`.
+    fn scan_element(&mut self, buf: &[u8]) -> Result<Step, ParseError> {
+        let start = self.pos;
+        let Some(&type_byte) = buf.get(start) else {
+            return Ok(Step::Incomplete);
+        };
+        #[cfg(test)]
+        {
+            self.work += 1;
+        }
+        if !matches!(type_byte, b'+' | b'-' | b':' | b'$' | b'*') {
+            return Err(ParseError::Protocol(format!("unexpected type byte: {type_byte:#04x}")));
+        }
+        // Reject before descending: an array header at the cap would be
+        // level 33. Checked for every array (null and empty included).
+        if type_byte == b'*' && self.stack.len() >= MAX_ARRAY_DEPTH {
+            return Err(ParseError::Protocol(format!(
+                "array nesting deeper than {MAX_ARRAY_DEPTH} levels"
+            )));
+        }
+        let Some(crlf) = self.find_crlf(buf, start + 1) else {
+            return Ok(Step::Incomplete);
+        };
+        let line = &buf[start + 1..crlf];
+        let after = crlf + 2;
+
+        match type_byte {
+            b'+' => Ok(Step::Element(
+                FrameSpec::Simple(String::from_utf8_lossy(line).into_owned()),
+                after,
+            )),
+            b'-' => Ok(Step::Element(
+                FrameSpec::Error(String::from_utf8_lossy(line).into_owned()),
+                after,
+            )),
+            b':' => Ok(Step::Element(FrameSpec::Integer(parse_line_int(line)?), after)),
+            b'$' => {
+                let len = parse_line_int(line)?;
+                // Null bulk string: $-1\r\n
+                if len < 0 {
+                    return Ok(Step::Element(FrameSpec::Null, after));
+                }
+                let len = usize::try_from(len)
+                    .map_err(|_| ParseError::Protocol("bulk string length out of range".into()))?;
+                if len > MAX_BULK_LEN {
+                    return Err(ParseError::Protocol("invalid bulk length".into()));
+                }
+                let data_end = after + len;
+                let end = data_end + 2; // data + \r\n
+                if buf.len() < end {
+                    // Resume at the header's `\r`: the next call re-reads
+                    // only the short length line, never the payload.
+                    self.resume = crlf;
+                    return Ok(Step::Incomplete);
+                }
+                Ok(Step::Element(FrameSpec::Bulk(after..data_end), end))
+            }
+            _ => {
+                // b'*'
+                let count = parse_line_int(line)?;
+                // Null array: *-1\r\n
+                if count < 0 {
+                    return Ok(Step::Element(FrameSpec::Null, after));
+                }
+                let count = usize::try_from(count)
+                    .map_err(|_| ParseError::Protocol("array count out of range".into()))?;
+                if count > MAX_ARRAY_LEN {
+                    return Err(ParseError::Protocol("invalid multibulk length".into()));
+                }
+                if count == 0 {
+                    return Ok(Step::Element(FrameSpec::Array(Vec::new()), after));
+                }
+                Ok(Step::ArrayStart(count, after))
+            }
+        }
+    }
+
+    /// Scan an inline command at the start of `buf`: one `\n`-terminated
+    /// line (an optional `\r` before it is dropped) split into arguments.
+    /// Returns the arguments and the index just past the `\n`.
+    fn scan_inline(&mut self, buf: &[u8]) -> Result<Option<InlineCommand>, ParseError> {
+        let from = self.resume.min(buf.len());
+        let hit = buf[from..].iter().position(|&b| b == b'\n');
+        #[cfg(test)]
+        {
+            self.work += hit.map_or(buf.len() - from, |i| i + 1);
+        }
+        let Some(i) = hit else {
+            if buf.len() > MAX_INLINE_LEN {
+                return Err(ParseError::Protocol("too big inline request".into()));
+            }
+            self.resume = buf.len();
+            return Ok(None);
+        };
+        let nl = from + i;
+        if nl > MAX_INLINE_LEN {
+            return Err(ParseError::Protocol("too big inline request".into()));
+        }
+        let line = buf[..nl].strip_suffix(b"\r").unwrap_or(&buf[..nl]);
+        let args = split_inline_args(line)
+            .ok_or_else(|| ParseError::Protocol("unbalanced quotes in request".into()))?;
+        Ok(Some((args, nl + 1)))
+    }
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::request()
+    }
+}
+
+/// Try to parse one complete RESP frame (no inline commands) from `buf`.
+///
+/// A one-shot [`Decoder::response`]: fine for a reply that is read whole,
+/// but it rescans from the start on every call — a connection that reads in
+/// a loop should keep a [`Decoder`] instead.
 ///
 /// # Errors
 ///
 /// Returns [`ParseError::Protocol`] when the buffer contains invalid RESP
 /// data, including an array nested deeper than `MAX_ARRAY_DEPTH` (32).
 pub fn parse_frame(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    // Phase 1: locate the frame without consuming or copying anything.
-    let Some((spec, end)) = scan_frame(&buf[..], 0, 0)? else {
-        return Ok(None);
-    };
-
-    // Phase 2: the frame is known-complete, so take exactly its bytes.
-    // `split_to().freeze()` reuses the existing allocation, and every
-    // bulk payload is a `Bytes` slice of it — no payload is ever copied.
-    let data = buf.split_to(end).freeze();
-    Ok(Some(materialize(spec, &data)))
+    Decoder::response().decode(buf)
 }
 
 /// Turn a scanned [`FrameSpec`] into a [`Frame`], slicing bulk payloads
 /// out of `data` (the frozen bytes the spec was scanned against).
 ///
 /// Recursion is bounded by [`MAX_ARRAY_DEPTH`], enforced during scanning.
-/// Every range came from [`scan_bulk`], which only emits ranges fully
-/// inside the scanned region, so the slices are always in bounds.
+/// Every range came from a bulk scan, which only emits ranges fully inside
+/// the scanned region, so the slices are always in bounds.
 fn materialize(spec: FrameSpec, data: &Bytes) -> Frame {
     match spec {
         FrameSpec::Simple(s) => Frame::Simple(s),
@@ -133,27 +425,6 @@ fn materialize(spec: FrameSpec, data: &Bytes) -> Frame {
     }
 }
 
-/// Find `\r\n` in `buf` starting at `offset`. Returns the index of `\r`.
-fn find_crlf(buf: &[u8], offset: usize) -> Option<usize> {
-    // memchr would be faster but we keep deps minimal.
-    let data = &buf[offset..];
-    for i in 0..data.len().saturating_sub(1) {
-        if data[i] == b'\r' && data[i + 1] == b'\n' {
-            return Some(offset + i);
-        }
-    }
-    None
-}
-
-/// Read a line ending in `\r\n`, returning the index just past the CRLF
-/// and the content between `start` and the `\r`.
-///
-/// Returns `None` when the buffer does not yet contain a full line.
-fn read_line(buf: &[u8], start: usize) -> Option<(usize, &[u8])> {
-    let crlf = find_crlf(buf, start)?;
-    Some((crlf + 2, &buf[start..crlf]))
-}
-
 /// Parse the integer in a RESP line (used for lengths and `:` frames).
 fn parse_line_int(line: &[u8]) -> Result<i64, ParseError> {
     let s = std::str::from_utf8(line)
@@ -161,120 +432,109 @@ fn parse_line_int(line: &[u8]) -> Result<i64, ParseError> {
     s.parse::<i64>().map_err(|_| ParseError::Protocol(format!("invalid integer: {s}")))
 }
 
-/// Locate one frame starting at `start`, without consuming `buf`.
+/// `isspace()` in the C locale, which is what Redis's `sdssplitargs` uses.
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Split an inline command line into arguments with Redis's `sdssplitargs`
+/// rules. Returns `None` for unbalanced quotes, or a closing quote that is
+/// not followed by whitespace or the end of the line.
 ///
-/// Returns the frame's spec and the index just past its last byte, or
-/// `None` when the buffer does not yet hold the whole frame. `depth` is
-/// the array nesting level of this frame (0 at the top level).
-fn scan_frame(
-    buf: &[u8],
-    start: usize,
-    depth: usize,
-) -> Result<Option<(FrameSpec, usize)>, ParseError> {
-    if start >= buf.len() {
-        return Ok(None);
+/// - Arguments are separated by whitespace.
+/// - `"..."` supports `\n \r \t \b \a`, `\xHH`, and `\<any>` for `<any>`.
+/// - `'...'` supports only `\'`.
+/// - A quote may start mid-argument (`a"b c"` is the one argument `ab c`).
+fn split_inline_args(line: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut args = Vec::new();
+    let mut p = 0;
+    loop {
+        while p < line.len() && is_space(line[p]) {
+            p += 1;
+        }
+        if p == line.len() {
+            return Some(args);
+        }
+        let mut current = Vec::new();
+        let mut in_double = false;
+        let mut in_single = false;
+        loop {
+            let c = line.get(p).copied();
+            if in_double {
+                match c {
+                    None => return None, // unterminated "
+                    Some(b'\\') if line.get(p + 1) == Some(&b'x') => {
+                        if let (Some(h), Some(l)) = (
+                            line.get(p + 2).copied().and_then(hex_val),
+                            line.get(p + 3).copied().and_then(hex_val),
+                        ) {
+                            current.push(h * 16 + l);
+                            p += 3;
+                        } else {
+                            // `\x` not followed by two hex digits: a plain `x`.
+                            current.push(b'x');
+                            p += 1;
+                        }
+                    }
+                    Some(b'\\') if p + 1 < line.len() => {
+                        p += 1;
+                        current.push(match line[p] {
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'b' => 0x08,
+                            b'a' => 0x07,
+                            other => other,
+                        });
+                    }
+                    Some(b'"') => {
+                        // The closing quote must end the argument.
+                        if line.get(p + 1).is_some_and(|&n| !is_space(n)) {
+                            return None;
+                        }
+                        p += 1;
+                        break;
+                    }
+                    Some(other) => current.push(other),
+                }
+            } else if in_single {
+                match c {
+                    None => return None, // unterminated '
+                    Some(b'\\') if line.get(p + 1) == Some(&b'\'') => {
+                        p += 1;
+                        current.push(b'\'');
+                    }
+                    Some(b'\'') => {
+                        if line.get(p + 1).is_some_and(|&n| !is_space(n)) {
+                            return None;
+                        }
+                        p += 1;
+                        break;
+                    }
+                    Some(other) => current.push(other),
+                }
+            } else {
+                match c {
+                    None => break,
+                    Some(b) if is_space(b) => break,
+                    Some(b'"') => in_double = true,
+                    Some(b'\'') => in_single = true,
+                    Some(other) => current.push(other),
+                }
+            }
+            p += 1;
+        }
+        args.push(current);
     }
-
-    match buf[start] {
-        b'+' => Ok(scan_line(buf, start).map(|(s, end)| (FrameSpec::Simple(s), end))),
-        b'-' => Ok(scan_line(buf, start).map(|(s, end)| (FrameSpec::Error(s), end))),
-        b':' => scan_integer(buf, start),
-        b'$' => scan_bulk(buf, start),
-        b'*' => scan_array(buf, start, depth),
-        byte => Err(ParseError::Protocol(format!("unexpected type byte: {byte:#04x}"))),
-    }
-}
-
-/// Scan a `\r\n`-terminated payload line (`+`/`-` frames).
-fn scan_line(buf: &[u8], start: usize) -> Option<(String, usize)> {
-    let (end, line) = read_line(buf, start + 1)?;
-    Some((String::from_utf8_lossy(line).into_owned(), end))
-}
-
-fn scan_integer(buf: &[u8], start: usize) -> Result<Option<(FrameSpec, usize)>, ParseError> {
-    let Some((end, line)) = read_line(buf, start + 1) else {
-        return Ok(None);
-    };
-    let n = parse_line_int(line)?;
-    Ok(Some((FrameSpec::Integer(n), end)))
-}
-
-fn scan_bulk(buf: &[u8], start: usize) -> Result<Option<(FrameSpec, usize)>, ParseError> {
-    let Some((after_len_line, len_line)) = read_line(buf, start + 1) else {
-        return Ok(None);
-    };
-
-    let len = parse_line_int(len_line)?;
-
-    // Null bulk string: $-1\r\n
-    if len < 0 {
-        return Ok(Some((FrameSpec::Null, after_len_line)));
-    }
-
-    let len = usize::try_from(len)
-        .map_err(|_| ParseError::Protocol("bulk string length out of range".into()))?;
-    if len > MAX_BULK_LEN {
-        return Err(ParseError::Protocol("invalid bulk length".into()));
-    }
-
-    let data_end = after_len_line + len;
-    let end = data_end + 2; // data + \r\n
-    if buf.len() < end {
-        return Ok(None);
-    }
-
-    Ok(Some((FrameSpec::Bulk(after_len_line..data_end), end)))
-}
-
-fn scan_array(
-    buf: &[u8],
-    start: usize,
-    depth: usize,
-) -> Result<Option<(FrameSpec, usize)>, ParseError> {
-    // Reject before recursing: this is the only thing standing between a
-    // few kilobytes of `*1\r\n` and a stack overflow that kills the
-    // process. See `MAX_ARRAY_DEPTH`.
-    if depth >= MAX_ARRAY_DEPTH {
-        return Err(ParseError::Protocol(format!(
-            "array nesting deeper than {MAX_ARRAY_DEPTH} levels"
-        )));
-    }
-
-    let Some((after_len_line, len_line)) = read_line(buf, start + 1) else {
-        return Ok(None);
-    };
-
-    let count = parse_line_int(len_line)?;
-
-    // Null array: *-1\r\n
-    if count < 0 {
-        return Ok(Some((FrameSpec::Null, after_len_line)));
-    }
-
-    let count = usize::try_from(count)
-        .map_err(|_| ParseError::Protocol("array count out of range".into()))?;
-    if count > MAX_ARRAY_LEN {
-        return Err(ParseError::Protocol("invalid multibulk length".into()));
-    }
-
-    // Reserve only a bounded amount up front: the advertised `count` is
-    // trusted only as far as `MAX_ARRAY_LEN`, and even then the array may
-    // be incomplete, so we let the vector grow rather than allocating
-    // `count` slots from an unverified header.
-    let mut cursor = after_len_line;
-    let mut items = Vec::with_capacity(count.min(MAX_ARRAY_PREALLOC));
-
-    for _ in 0..count {
-        // Elements are scanned in place against an index — no per-element
-        // copy of the remaining buffer.
-        let Some((item, end)) = scan_frame(buf, cursor, depth + 1)? else {
-            return Ok(None);
-        };
-        items.push(item);
-        cursor = end;
-    }
-
-    Ok(Some((FrameSpec::Array(items), cursor)))
 }
 
 #[cfg(test)]
@@ -498,5 +758,228 @@ mod tests {
         // Drain frames until the parser stops yielding complete ones; the
         // assertion under test is simply that none of these calls panics.
         while let Ok(Some(_)) = parse_frame(&mut buf) {}
+    }
+
+    // ── Inline commands (KV stress report F-16) ─────────────────────────
+
+    fn bulks(items: &[&[u8]]) -> Frame {
+        Frame::Array(items.iter().map(|b| Frame::Bulk(Bytes::copy_from_slice(b))).collect())
+    }
+
+    fn decode_all(input: &[u8]) -> Result<Vec<Frame>, ParseError> {
+        let mut dec = Decoder::request();
+        let mut buf = BytesMut::from(input);
+        let mut out = Vec::new();
+        while let Some(f) = dec.decode(&mut buf)? {
+            out.push(f);
+        }
+        Ok(out)
+    }
+
+    /// `PING` typed into telnet used to be `-ERR protocol error: unexpected
+    /// type byte: 0x50`.
+    #[test]
+    fn inline_ping_is_a_command() {
+        assert_eq!(decode_all(b"PING\r\n").unwrap(), vec![bulks(&[b"PING"])]);
+        // A bare `\n` (nc without -C) works too.
+        assert_eq!(decode_all(b"PING\n").unwrap(), vec![bulks(&[b"PING"])]);
+    }
+
+    #[test]
+    fn inline_splits_on_whitespace() {
+        assert_eq!(
+            decode_all(b"  SET\tkey   value \r\n").unwrap(),
+            vec![bulks(&[b"SET", b"key", b"value"])]
+        );
+    }
+
+    #[test]
+    fn inline_quoting_follows_redis_sdssplitargs() {
+        assert_eq!(
+            decode_all(b"SET \"a b\" 'c d'\r\n").unwrap(),
+            vec![bulks(&[b"SET", b"a b", b"c d"])]
+        );
+        // Double-quote escapes, including \xHH; single quotes only know \'.
+        assert_eq!(
+            decode_all(b"ECHO \"x\\n\\t\\x41\\\"\\\\\" 'it\\'s \\n'\r\n").unwrap(),
+            vec![bulks(&[b"ECHO", b"x\n\tA\"\\", b"it's \\n"])]
+        );
+        // A quote may start mid-argument; empty quotes are an empty argument.
+        assert_eq!(
+            decode_all(b"SET k\"e y\" \"\"\r\n").unwrap(),
+            vec![bulks(&[b"SET", b"ke y", b""])]
+        );
+    }
+
+    #[test]
+    fn inline_unbalanced_quotes_are_a_protocol_error() {
+        for bad in [&b"SET \"abc\r\n"[..], b"SET 'abc\r\n", b"SET \"a\"b\r\n", b"SET 'a'b\r\n"] {
+            let err = decode_all(bad).unwrap_err();
+            assert!(err.to_string().contains("unbalanced quotes"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn inline_empty_lines_are_skipped() {
+        assert_eq!(decode_all(b"\r\n\n   \r\nPING\r\n").unwrap(), vec![bulks(&[b"PING"])]);
+    }
+
+    /// Inline and multibulk requests can be pipelined on one connection.
+    #[test]
+    fn inline_and_multibulk_interleave() {
+        assert_eq!(
+            decode_all(b"PING\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\nECHO yo\r\n").unwrap(),
+            vec![bulks(&[b"PING"]), bulks(&[b"ECHO", b"hi"]), bulks(&[b"ECHO", b"yo"])]
+        );
+    }
+
+    #[test]
+    fn inline_split_across_reads() {
+        let mut dec = Decoder::request();
+        let mut buf = BytesMut::from(&b"SET k "[..]);
+        assert!(dec.decode(&mut buf).unwrap().is_none());
+        buf.extend_from_slice(b"v\r");
+        assert!(dec.decode(&mut buf).unwrap().is_none());
+        buf.extend_from_slice(b"\n");
+        assert_eq!(dec.decode(&mut buf).unwrap(), Some(bulks(&[b"SET", b"k", b"v"])));
+        assert!(buf.is_empty());
+    }
+
+    /// Redis's `PROTO_INLINE_MAX_SIZE`: a newline-less line over 64 KiB is
+    /// refused rather than buffered.
+    #[test]
+    fn inline_line_over_64k_is_rejected() {
+        let mut dec = Decoder::request();
+        let mut buf = BytesMut::from(&vec![b'a'; MAX_INLINE_LEN][..]);
+        assert!(dec.decode(&mut buf).unwrap().is_none(), "at the cap: wait for more");
+        buf.extend_from_slice(b"a");
+        let err = dec.decode(&mut buf).unwrap_err();
+        assert!(err.to_string().contains("too big inline request"), "{err}");
+    }
+
+    /// The response-side parser (used by the CLI client) still requires a
+    /// RESP type byte.
+    #[test]
+    fn response_decoder_does_not_accept_inline() {
+        assert!(parse(b"PING\r\n").is_err());
+    }
+
+    // ── Resumable scanning (KV stress report F-17) ──────────────────────
+
+    /// Feed `input` in `chunk`-byte reads and return the decoded frames and
+    /// the bytes the scanner examined.
+    fn trickle(input: &[u8], chunk: usize) -> (Vec<Frame>, usize) {
+        let mut dec = Decoder::request();
+        let mut buf = BytesMut::new();
+        let mut frames = Vec::new();
+        for piece in input.chunks(chunk) {
+            buf.extend_from_slice(piece);
+            while let Some(f) = dec.decode(&mut buf).unwrap() {
+                frames.push(f);
+            }
+        }
+        assert!(buf.is_empty(), "every byte must have been consumed");
+        (frames, dec.work)
+    }
+
+    fn mget_request(keys: usize) -> Vec<u8> {
+        let mut out = format!("*{}\r\n$4\r\nMGET\r\n", keys + 1).into_bytes();
+        for i in 0..keys {
+            let key = format!("key:{i:08}");
+            out.extend_from_slice(format!("${}\r\n{key}\r\n", key.len()).as_bytes());
+        }
+        out
+    }
+
+    /// The stress-run shape: a ~980 KB `MGET` arriving in 100-byte reads.
+    /// Restarting the scan from byte 0 on every read examined ~4.8 GB here
+    /// (quadratic); a resumable scan looks at each byte a bounded number of
+    /// times, however the input is split.
+    #[test]
+    fn trickled_large_array_costs_linear_work() {
+        let input = mget_request(50_000);
+        assert!(input.len() > 900_000);
+
+        let (whole, whole_work) = trickle(&input, input.len());
+        let (frames, work) = trickle(&input, 100);
+        assert_eq!(frames, whole, "chunking must not change the result");
+        assert_eq!(frames.len(), 1);
+        let Frame::Array(items) = &frames[0] else { panic!("expected an array") };
+        assert_eq!(items.len(), 50_001);
+
+        assert!(
+            work <= 4 * input.len(),
+            "100-byte reads examined {work} bytes for a {} byte frame (whole: {whole_work})",
+            input.len()
+        );
+    }
+
+    /// The worst case for a rescan: one byte per read. Each call re-reads
+    /// the element's type byte and the last byte of the previous read (a
+    /// possible `\r`), so the constant is ~3; a rescan from byte 0 would be
+    /// ~input.len() / 2 (~19,000 here).
+    #[test]
+    fn byte_by_byte_costs_linear_work() {
+        let input = mget_request(2_000);
+        let (frames, work) = trickle(&input, 1);
+        assert_eq!(frames.len(), 1);
+        assert!(work <= 4 * input.len(), "examined {work} bytes for {}", input.len());
+    }
+
+    /// A large bulk payload arriving slowly re-reads only its length line,
+    /// never the payload bytes already received.
+    #[test]
+    fn trickled_large_bulk_costs_linear_work() {
+        let value = vec![b'v'; 500_000];
+        let mut input = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${}\r\n", value.len()).into_bytes();
+        input.extend_from_slice(&value);
+        input.extend_from_slice(b"\r\n");
+        let (frames, work) = trickle(&input, 100);
+        assert_eq!(frames.len(), 1);
+        // The payload is located by length, not searched: work is tiny.
+        assert!(work <= input.len() / 10, "examined {work} bytes for {}", input.len());
+    }
+
+    /// A long inline line arriving slowly is searched for its newline once.
+    #[test]
+    fn trickled_inline_line_costs_linear_work() {
+        let mut input = b"ECHO ".to_vec();
+        input.extend_from_slice(&vec![b'x'; 60_000]);
+        input.extend_from_slice(b"\r\n");
+        let (frames, work) = trickle(&input, 1);
+        assert_eq!(frames.len(), 1);
+        assert!(work <= 4 * input.len(), "examined {work} bytes for {}", input.len());
+    }
+
+    /// Pipelined frames split at every possible boundary decode identically.
+    #[test]
+    fn every_split_point_decodes_the_same() {
+        let input: &[u8] = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\nPING\r\n*1\r\n*2\r\n:1\r\n$-1\r\n";
+        let expected = decode_all(input).unwrap();
+        assert_eq!(expected.len(), 3);
+        for split in 0..=input.len() {
+            let mut dec = Decoder::request();
+            let mut buf = BytesMut::from(&input[..split]);
+            let mut got = Vec::new();
+            while let Some(f) = dec.decode(&mut buf).unwrap() {
+                got.push(f);
+            }
+            buf.extend_from_slice(&input[split..]);
+            while let Some(f) = dec.decode(&mut buf).unwrap() {
+                got.push(f);
+            }
+            assert_eq!(got, expected, "split at {split}");
+        }
+    }
+
+    /// After a protocol error the decoder starts clean on fresh input.
+    #[test]
+    fn decoder_resets_after_error() {
+        let mut dec = Decoder::request();
+        let mut buf = BytesMut::from(&b"*1\r\n!oops\r\n"[..]);
+        assert!(dec.decode(&mut buf).is_err());
+        buf.clear();
+        buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        assert_eq!(dec.decode(&mut buf).unwrap(), Some(bulks(&[b"PING"])));
     }
 }

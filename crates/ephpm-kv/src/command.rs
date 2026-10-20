@@ -112,12 +112,12 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "SETEX" => {
             check_args!(cmd, argv, 3);
             let key = str_from(argv[0]);
-            let secs = match parse_i64(argv[1]) {
-                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
-                _ => return Frame::error("ERR invalid expire time in 'setex' command"),
+            let ttl = match expire_arg(argv[1], TtlUnit::Seconds, "setex") {
+                Ok(ttl) => ttl,
+                Err(f) => return f,
             };
             let val = argv[2].to_vec();
-            if store.set(key, val, Some(Duration::from_secs(secs))) { Frame::ok() } else { oom() }
+            if store.set(key, val, Some(ttl)) { Frame::ok() } else { oom() }
         }
         "MGET" => {
             if argv.is_empty() {
@@ -198,11 +198,14 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "DECRBY" => {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            let delta = match parse_i64(argv[1]) {
-                Ok(v) => v,
+            // `-i64::MIN` does not exist: negating it would panic in a debug
+            // build and wrap to `i64::MIN` (an *increment*) in release.
+            let delta = match parse_i64(argv[1]).map(i64::checked_neg) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Frame::error("ERR decrement would overflow"),
                 Err(f) => return f,
             };
-            match store.incr_by(&key, -delta) {
+            match store.incr_by(&key, delta) {
                 Ok(v) => Frame::integer(v),
                 Err(e) => Frame::error(e),
             }
@@ -281,21 +284,21 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "EXPIRE" => {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            let secs = match parse_i64(argv[1]) {
-                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
-                _ => return Frame::error("ERR invalid expire time in 'expire' command"),
+            let ttl = match expire_arg(argv[1], TtlUnit::Seconds, "expire") {
+                Ok(ttl) => ttl,
+                Err(f) => return f,
             };
-            let ok = store.expire(&key, Duration::from_secs(secs));
+            let ok = store.expire(&key, ttl);
             Frame::integer(i64::from(ok))
         }
         "PEXPIRE" => {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            let ms = match parse_i64(argv[1]) {
-                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
-                _ => return Frame::error("ERR invalid expire time in 'pexpire' command"),
+            let ttl = match expire_arg(argv[1], TtlUnit::Millis, "pexpire") {
+                Ok(ttl) => ttl,
+                Err(f) => return f,
             };
-            let ok = store.expire(&key, Duration::from_millis(ms));
+            let ok = store.expire(&key, ttl);
             Frame::integer(i64::from(ok))
         }
         "TTL" => {
@@ -460,9 +463,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Execute the SET command with options: SET key value [EX seconds|PX ms] [NX|XX] [GET].
-/// `EXAT`/`PXAT` are not implemented (they return `ERR syntax error`), and a
-/// non-positive or non-integer `EX`/`PX` value is accepted and stores the key
-/// with no expiry.
+/// `EXAT`/`PXAT` are not implemented (they return `ERR syntax error`). As in
+/// Redis, a non-integer `EX`/`PX` value is `ERR value is not an integer or out
+/// of range`, and a non-positive or overflowing one is `ERR invalid expire time
+/// in 'set' command`; giving both `EX` and `PX` is `ERR syntax error`.
 fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     if argv.len() < 2 {
         return Frame::error("ERR wrong number of arguments for 'set' command");
@@ -479,25 +483,14 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     while i < argv.len() {
         let opt = str_from(argv[i]).to_uppercase();
         match opt.as_str() {
-            "EX" => {
-                if i + 1 >= argv.len() {
+            "EX" | "PX" => {
+                if i + 1 >= argv.len() || ttl.is_some() {
                     return Frame::error("ERR syntax error");
                 }
-                if let Ok(sec) = parse_i64(argv[i + 1])
-                    && sec > 0
-                {
-                    ttl = Some(Duration::from_secs(u64::try_from(sec).unwrap_or(u64::MAX)));
-                }
-                i += 2;
-            }
-            "PX" => {
-                if i + 1 >= argv.len() {
-                    return Frame::error("ERR syntax error");
-                }
-                if let Ok(ms) = parse_i64(argv[i + 1])
-                    && ms > 0
-                {
-                    ttl = Some(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)));
+                let unit = if opt == "EX" { TtlUnit::Seconds } else { TtlUnit::Millis };
+                match expire_arg(argv[i + 1], unit, "set") {
+                    Ok(d) => ttl = Some(d),
+                    Err(f) => return f,
                 }
                 i += 2;
             }
@@ -579,6 +572,56 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     } else {
         Frame::ok()
     }
+}
+
+/// The unit of an expire argument (`EX`/`EXPIRE` vs `PX`/`PEXPIRE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtlUnit {
+    /// Seconds (`EX`, `SETEX`, `EXPIRE`).
+    Seconds,
+    /// Milliseconds (`PX`, `PEXPIRE`).
+    Millis,
+}
+
+/// Turn a relative expire `amount` into a TTL the store can hold, or `None`
+/// when it is out of range.
+///
+/// Mirrors Redis's `getExpireMillisecondsOrReply`: the amount must be
+/// positive, converting it to milliseconds must not overflow, and the
+/// resulting absolute deadline (Unix milliseconds) must fit in an `i64`. On
+/// top of that the deadline must be representable as an [`Instant`] — the
+/// store computes `Instant::now() + ttl`, which **panics** on overflow (KV
+/// stress report F-14: `SET k v EX 9223372036854775807` killed the
+/// connection's task). Every entry point that takes a caller-supplied TTL
+/// (RESP and the PHP bridge) must go through this before reaching the store.
+///
+/// [`Instant`]: std::time::Instant
+#[must_use]
+pub fn checked_ttl(amount: i64, unit: TtlUnit) -> Option<Duration> {
+    if amount <= 0 {
+        return None;
+    }
+    let ms = match unit {
+        TtlUnit::Seconds => amount.checked_mul(1000)?,
+        TtlUnit::Millis => amount,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    now_ms.checked_add(ms)?;
+    let ttl = Duration::from_millis(u64::try_from(ms).ok()?);
+    std::time::Instant::now().checked_add(ttl)?;
+    Some(ttl)
+}
+
+/// Parse an expire argument for `cmd` with Redis's error replies: a
+/// non-integer is `ERR value is not an integer or out of range`, a
+/// non-positive or overflowing one `ERR invalid expire time in '<cmd>'
+/// command`.
+fn expire_arg(arg: &[u8], unit: TtlUnit, cmd: &str) -> Result<Duration, Frame> {
+    let amount = parse_i64(arg)?;
+    checked_ttl(amount, unit)
+        .ok_or_else(|| Frame::error(format!("ERR invalid expire time in '{cmd}' command")))
 }
 
 /// Parse a byte slice as a string (lossy UTF-8).
@@ -1172,6 +1215,87 @@ mod tests {
         let s = store();
         cmd(&s, &["SET", "k", "v"]);
         assert!(matches!(cmd(&s, &["EXPIRE", "k", "-5"]), Frame::Error(_)));
+    }
+
+    // ── Out-of-range numeric arguments (KV stress report F-14) ───────────
+
+    fn err_text(f: &Frame) -> &str {
+        match f {
+            Frame::Error(e) => e,
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    /// `SET k v EX i64::MAX` used to panic inside the store
+    /// (`Instant + Duration` overflow), dropping the connection with no reply.
+    /// Every expire entry point now answers Redis's error instead.
+    #[test]
+    fn huge_expire_times_are_errors_not_panics() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        let max = i64::MAX.to_string();
+        let cases: [(&[&str], &str); 6] = [
+            (&["SET", "k", "v", "EX", &max], "set"),
+            (&["SET", "k", "v", "PX", &max], "set"),
+            (&["SETEX", "k", &max, "v"], "setex"),
+            (&["EXPIRE", "k", &max], "expire"),
+            (&["PEXPIRE", "k", &max], "pexpire"),
+            // Seconds that overflow only once multiplied by 1000.
+            (&["EXPIRE", "k", "9223372036854776"], "expire"),
+        ];
+        for (args, name) in cases {
+            let reply = cmd(&s, args);
+            assert_eq!(
+                err_text(&reply),
+                format!("ERR invalid expire time in '{name}' command"),
+                "{args:?}"
+            );
+        }
+        // Nothing was changed by the refused calls.
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("v"));
+        assert_eq!(int(&cmd(&s, &["PTTL", "k"])), Some(-1));
+    }
+
+    #[test]
+    fn set_rejects_non_positive_and_non_integer_expire_like_redis() {
+        let s = store();
+        for bad in ["0", "-1"] {
+            let reply = cmd(&s, &["SET", "k", "v", "EX", bad]);
+            assert_eq!(err_text(&reply), "ERR invalid expire time in 'set' command");
+        }
+        let reply = cmd(&s, &["SET", "k", "v", "PX", "soon"]);
+        assert_eq!(err_text(&reply), "ERR value is not an integer or out of range");
+        let reply = cmd(&s, &["SET", "k", "v", "EX", "10", "PX", "10"]);
+        assert_eq!(err_text(&reply), "ERR syntax error");
+        // None of the refused SETs wrote the key.
+        assert_eq!(cmd(&s, &["GET", "k"]), Frame::Null);
+    }
+
+    #[test]
+    fn large_but_valid_expire_is_accepted() {
+        let s = store();
+        // 100 years: far beyond any real TTL, well inside every bound.
+        assert_eq!(cmd(&s, &["SET", "k", "v", "EX", "3153600000"]), Frame::ok());
+        assert!(int(&cmd(&s, &["TTL", "k"])).unwrap() > 3_153_599_000);
+    }
+
+    /// `DECRBY k i64::MIN` negated the delta unchecked: a debug-build panic,
+    /// and in release a wrap to `i64::MIN` that *incremented*.
+    #[test]
+    fn decrby_min_is_an_error_not_an_overflow() {
+        let s = store();
+        cmd(&s, &["SET", "k", "5"]);
+        let reply = cmd(&s, &["DECRBY", "k", &i64::MIN.to_string()]);
+        assert_eq!(err_text(&reply), "ERR decrement would overflow");
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("5"));
+    }
+
+    #[test]
+    fn incrby_overflow_is_an_error() {
+        let s = store();
+        cmd(&s, &["SET", "k", &i64::MAX.to_string()]);
+        assert!(matches!(cmd(&s, &["INCRBY", "k", "1"]), Frame::Error(_)));
+        assert!(matches!(cmd(&s, &["INCR", "k"]), Frame::Error(_)));
     }
 
     #[test]

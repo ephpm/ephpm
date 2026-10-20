@@ -346,6 +346,10 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut write_buf = BytesMut::with_capacity(4096);
+    // One decoder per connection: it keeps the partial scan of an incomplete
+    // frame across reads, so a slowly sent request is scanned once, not once
+    // per read (KV stress report F-17). It also accepts inline commands.
+    let mut decoder = resp::Decoder::request();
 
     // Determine whether auth is required:
     // - HMAC multi-tenant mode: secret + multi_tenant both set
@@ -360,7 +364,7 @@ async fn handle_connection(
     loop {
         // Try to parse frames already in the buffer before reading more.
         loop {
-            match resp::parse_frame(&mut buf) {
+            match decoder.decode(&mut buf) {
                 Ok(Some(frame)) => {
                     let cmd_name = extract_command_name(&frame);
 
@@ -425,7 +429,8 @@ async fn handle_connection(
                     write_buf.clear();
                     err_frame.write_to(&mut write_buf);
                     stream.write_all(&write_buf).await?;
-                    // Clear the buffer on protocol error — we can't recover framing.
+                    // Clear the buffer on protocol error — we can't recover
+                    // framing. The decoder has already reset itself.
                     buf.clear();
                     break;
                 }
