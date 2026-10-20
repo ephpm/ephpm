@@ -735,7 +735,7 @@ impl SqliteElection {
             grpc_addr: self.grpc_listen.clone(),
             log_id: self.log_id.clone(),
         };
-        self.cluster.gossip_set(&self.primary_key(), &claim.encode(), Some(PRIMARY_TTL)).await;
+        self.cluster.gossip_set(&self.primary_key(), &claim.encode(), Some(PRIMARY_TTL));
     }
 }
 

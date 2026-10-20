@@ -65,7 +65,7 @@ use chitchat::ChitchatId;
 use crate::ClusterHandle;
 
 /// Key prefix for KV entries in chitchat state.
-const KV_PREFIX: &str = "kv:";
+pub(crate) const KV_PREFIX: &str = "kv:";
 
 /// Wire marker for a tombstone (deleted key) in the gossip KV tier.
 /// See the module docs for why we don't use chitchat's own `delete()`.
@@ -77,7 +77,7 @@ const TOMBSTONE_MARKER: &str = "TS:";
 pub const SEQ_BITS: u32 = 20;
 
 /// Current time in milliseconds since UNIX epoch.
-fn now_epoch_ms() -> u64 {
+pub(crate) fn now_epoch_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
@@ -190,7 +190,7 @@ impl StampClock {
 
 /// Encode a binary value with an absolute expiry and its write stamp into
 /// the chitchat string format `"{expiry_ms}:{write}:{b64}"`.
-fn encode_value(value: &[u8], expiry_ms: u64, write: u64) -> String {
+pub(crate) fn encode_value(value: &[u8], expiry_ms: u64, write: u64) -> String {
     let b64 = Base64::encode_string(value);
     format!("{expiry_ms}:{write}:{b64}")
 }
@@ -200,13 +200,13 @@ fn encode_value(value: &[u8], expiry_ms: u64, write: u64) -> String {
 /// Peers ordering the tombstone against a concurrent SET on the same key
 /// need the stamp to decide who wins; this reuses the same per-key
 /// last-writer-wins ordering the SET applier already runs.
-fn encode_tombstone(write: u64) -> String {
+pub(crate) fn encode_tombstone(write: u64) -> String {
     format!("{TOMBSTONE_MARKER}{write}")
 }
 
 /// Parse a tombstone-encoded payload. Returns the origin write stamp when
 /// `encoded` is a well-formed tombstone marker, otherwise `None`.
-fn decode_tombstone(encoded: &str) -> Option<u64> {
+pub(crate) fn decode_tombstone(encoded: &str) -> Option<u64> {
     let rest = encoded.strip_prefix(TOMBSTONE_MARKER)?;
     rest.parse::<u64>().ok()
 }
@@ -217,7 +217,7 @@ fn decode_tombstone(encoded: &str) -> Option<u64> {
 /// v1 entries are reported with `write = 0` — the smallest possible
 /// value, which lets the applier treat them as strictly older than any
 /// current-format entry and always apply them once.
-fn split_encoded(encoded: &str) -> Option<(u64, u64, &str)> {
+pub(crate) fn split_encoded(encoded: &str) -> Option<(u64, u64, &str)> {
     let (first, rest) = encoded.split_once(':')?;
     let expiry_ms: u64 = first.parse().ok()?;
     if let Some((second, tail)) = rest.split_once(':') {
@@ -253,6 +253,7 @@ fn decode_value(encoded: &str) -> Option<Vec<u8>> {
 ///
 /// v1 legacy entries return `write = 0`, which sorts before any
 /// stamped entry — so a legacy entry always applies on first arrival.
+#[cfg(test)]
 fn decode_value_with_write(encoded: &str) -> Option<(Vec<u8>, u64)> {
     let (expiry_ms, write, b64) = split_encoded(encoded)?;
     if expiry_ms > 0 && now_epoch_ms() >= expiry_ms {
@@ -281,6 +282,8 @@ fn remaining_ttl_ms(encoded: &str) -> Option<u64> {
     Some(expiry_ms.saturating_sub(now_epoch_ms()))
 }
 
+/// The winner for one key across every node state and the pending queue:
+/// the highest stamp seen, and what it carried.
 /// The stamp an encoded gossip entry (value or tombstone marker) carries,
 /// attributed to `origin`. `None` for an undecodable entry.
 pub(crate) fn stamp_of(encoded: &str, origin: &str) -> Option<Stamp> {
@@ -295,11 +298,12 @@ pub(crate) fn stamp_of(encoded: &str, origin: &str) -> Option<Stamp> {
 /// was written.
 ///
 /// Chitchat's `set` keeps whatever lands last. Two writes to one key take
-/// their stamps in order in the synchronous hook but reach chitchat from
-/// separate tasks, so without this the older write can land last: the
-/// origin's local copy and applied map then say one thing while its gossip
-/// state — the only thing a peer that missed the newer write will ever see —
-/// says the other, and the two never reconcile.
+/// their stamps in order in the synchronous hook but can reach the drain in
+/// the other order (one enqueued after the newer one was already drained),
+/// so without this the older write could land last: the origin's local copy
+/// and applied map would say one thing while its gossip state — the only
+/// thing a peer that missed the newer write will ever see — says the other,
+/// and the two would never reconcile.
 pub(crate) fn set_if_newer(
     state: &mut chitchat::NodeState,
     self_id: &str,
@@ -317,20 +321,76 @@ pub(crate) fn set_if_newer(
     true
 }
 
-/// The winner so far while scanning one key across node states: the
-/// highest stamp seen, and what it carried (`None` = tombstone).
-struct Winner<T> {
-    stamp: Stamp,
-    payload: Option<T>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The winning entry's stamp.
+    pub stamp: Stamp,
+    /// The winning value and its absolute expiry (`0` = none); `None` when
+    /// the winner is a tombstone **or an already-expired value** — an
+    /// expired newest entry means the key is gone, and an older live copy
+    /// from another node must not resurrect it.
+    pub value: Option<(Vec<u8>, u64)>,
 }
 
-impl<T> Winner<T> {
-    /// Replace the winner when `stamp` is strictly newer.
-    fn offer(best: &mut Option<Self>, stamp: Stamp, payload: Option<T>) {
+impl Resolved {
+    fn offer(best: &mut Option<Self>, stamp: Stamp, value: Option<(Vec<u8>, u64)>) {
         if best.as_ref().is_none_or(|w| stamp > w.stamp) {
-            *best = Some(Self { stamp, payload });
+            *best = Some(Self { stamp, value });
         }
     }
+
+    /// Offer one encoded gossip entry attributed to `origin`.
+    fn offer_encoded(best: &mut Option<Self>, encoded: &str, origin: &str, now_ms: u64) {
+        if let Some(write) = decode_tombstone(encoded) {
+            Self::offer(best, Stamp::new(write, origin), None);
+            return;
+        }
+        let Some((expiry_ms, write, b64)) = split_encoded(encoded) else { return };
+        let stamp = Stamp::new(write, origin);
+        if expiry_ms > 0 && now_ms >= expiry_ms {
+            Self::offer(best, stamp, None);
+            return;
+        }
+        if let Ok(bytes) = Base64::decode_vec(b64) {
+            Self::offer(best, stamp, Some((bytes, expiry_ms)));
+        }
+    }
+
+    /// Remaining TTL of the winning value in milliseconds: `None` for no TTL
+    /// or no live value.
+    #[must_use]
+    pub fn remaining_ttl_ms(&self) -> Option<u64> {
+        let (_, expiry_ms) = self.value.as_ref()?;
+        (*expiry_ms > 0).then(|| expiry_ms.saturating_sub(now_epoch_ms()))
+    }
+}
+
+/// Resolve `chitchat_key` under a held chitchat lock: the self state, every
+/// known node state (dead ones included — a node that wrote last and then
+/// died still holds the newest entry) and this node's pending queue.
+pub(crate) fn resolve_locked(
+    guard: &mut chitchat::Chitchat,
+    writer: &crate::gossip_writer::GossipWriter,
+    chitchat_key: &str,
+) -> Option<Resolved> {
+    let now_ms = now_epoch_ms();
+    let mut best: Option<Resolved> = None;
+    let self_id = guard.self_chitchat_id().node_id.clone();
+    if let Some(encoded) = guard.self_node_state().get(chitchat_key) {
+        Resolved::offer_encoded(&mut best, encoded, &self_id, now_ms);
+    }
+    for (node_id, state) in guard.node_states() {
+        if node_id.node_id == self_id {
+            continue;
+        }
+        if let Some(encoded) = state.get(chitchat_key) {
+            Resolved::offer_encoded(&mut best, encoded, &node_id.node_id, now_ms);
+        }
+    }
+    if let Some(pending) = writer.pending_view(chitchat_key) {
+        Resolved::offer(&mut best, pending.stamp, pending.value);
+    }
+    best
 }
 
 impl ClusterHandle {
@@ -354,72 +414,57 @@ impl ClusterHandle {
     /// The value is stored in this node's chitchat state and replicated
     /// to all other nodes via gossip (typically within 1-3 seconds).
     /// Callers that also keep a local copy should take the stamp
-    /// themselves and use [`gossip_set_stamped`](Self::gossip_set_stamped)
+    /// themselves and use [`gossip_set_queued`](Self::gossip_set_queued)
     /// so both carry the same one.
-    pub async fn gossip_set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Stamp {
+    pub fn gossip_set(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Stamp {
         let stamp = self.stamp();
-        self.gossip_set_stamped(key, value, expiry_ms_for(ttl), stamp).await;
+        self.gossip_set_queued(key, value, expiry_ms_for(ttl), stamp);
         stamp
     }
 
     /// Set a small key in the gossip KV tier with a stamp and absolute
     /// expiry the caller already fixed.
     ///
-    /// The state write is ordered by stamp (see [`set_if_newer`]): two
-    /// writes to one key from this node reach chitchat from separate tasks,
-    /// and the older one must not land last.
-    pub async fn gossip_set_stamped(&self, key: &str, value: &[u8], expiry_ms: u64, stamp: Stamp) {
+    /// Queues the write on this node's [`GossipWriter`](crate::gossip_writer::GossipWriter);
+    /// the drain task puts it into chitchat state within milliseconds. Reads
+    /// on this node see it immediately. Synchronous — the replication hooks
+    /// call it from PHP threads and RESP tasks with no runtime context —
+    /// and never blocks. Returns `false` when the queue was full and the
+    /// write was shed (the key does not replicate until it is written again).
+    pub fn gossip_set_queued(&self, key: &str, value: &[u8], expiry_ms: u64, stamp: Stamp) -> bool {
         let chitchat_key = format!("{KV_PREFIX}{key}");
         let encoded = encode_value(value, expiry_ms, stamp.write);
+        self.writer.enqueue_set(chitchat_key, encoded, expiry_ms, stamp)
+    }
+
+    /// Resolve the newest entry for `key` across every node state and this
+    /// node's pending writes. `None` when no node has ever written it (or
+    /// everything about it has been garbage-collected).
+    pub async fn gossip_resolve(&self, key: &str) -> Option<Resolved> {
+        let chitchat_key = format!("{KV_PREFIX}{key}");
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
-        let self_id = guard.self_chitchat_id().node_id.clone();
-        set_if_newer(guard.self_node_state(), &self_id, chitchat_key, encoded, stamp);
+        resolve_locked(&mut guard, &self.writer, &chitchat_key)
     }
 
     /// Get a small key from the gossip KV tier.
     ///
-    /// Searches this node's state and every live node's, and returns the
-    /// value with the highest stamp (tombstones included) — the same
-    /// last-writer-wins rule the applier runs, applied at read time so
-    /// nodes still catching up show consistent results. If the newest
-    /// visible entry is a tombstone, the key reads as deleted — a stale
-    /// live copy on another node cannot resurrect a concurrent delete.
+    /// Searches this node's state, every known node's, and this node's
+    /// pending writes, and returns the value with the highest stamp
+    /// (tombstones included) — the same last-writer-wins rule the applier
+    /// runs, applied at read time so nodes still catching up show
+    /// consistent results. If the newest visible entry is a tombstone or
+    /// has expired, the key reads as deleted — a stale live copy on another
+    /// node cannot resurrect it.
     pub async fn gossip_get(&self, key: &str) -> Option<Vec<u8>> {
-        let chitchat_key = format!("{KV_PREFIX}{key}");
-        let chitchat = self.handle.chitchat();
-        let mut guard = chitchat.lock().await;
-
-        let mut best: Option<Winner<Vec<u8>>> = None;
-        let consider = |encoded: &str, origin: &str, best: &mut Option<Winner<Vec<u8>>>| {
-            if let Some(write) = decode_tombstone(encoded) {
-                Winner::offer(best, Stamp::new(write, origin), None);
-                return;
-            }
-            if let Some((value, write)) = decode_value_with_write(encoded) {
-                Winner::offer(best, Stamp::new(write, origin), Some(value));
-            }
-        };
-
-        let self_id = guard.self_chitchat_id().node_id.clone();
-        if let Some(encoded) = guard.self_node_state().get(&chitchat_key) {
-            consider(encoded, &self_id, &mut best);
-        }
-        for node_id in guard.live_nodes().cloned().collect::<Vec<_>>() {
-            if let Some(state) = guard.node_state(&node_id)
-                && let Some(encoded) = state.get(&chitchat_key)
-            {
-                consider(encoded, &node_id.node_id, &mut best);
-            }
-        }
-        best.and_then(|w| w.payload)
+        self.gossip_resolve(key).await?.value.map(|(bytes, _)| bytes)
     }
 
     /// Broadcast a delete for `key` across the gossip KV tier, stamping it
-    /// now. See [`gossip_del_stamped`](Self::gossip_del_stamped).
-    pub async fn gossip_del(&self, key: &str) -> bool {
+    /// now. See [`gossip_del_queued`](Self::gossip_del_queued).
+    pub fn gossip_del(&self, key: &str) -> bool {
         let stamp = self.stamp();
-        self.gossip_del_stamped(key, stamp).await
+        self.gossip_del_queued(key, stamp)
     }
 
     /// Broadcast a delete for `key` across the gossip KV tier with a stamp
@@ -435,14 +480,56 @@ impl ClusterHandle {
     /// data-plane replica of the same key. Returns `true` regardless of
     /// whether this node had previously set the key locally — the
     /// intent-to-delete has been broadcast either way.
-    pub async fn gossip_del_stamped(&self, key: &str, stamp: Stamp) -> bool {
+    ///
+    /// Synchronous and non-blocking, like [`gossip_set_queued`](Self::gossip_set_queued).
+    /// Returns `false` when the queue was full and the tombstone was shed.
+    pub fn gossip_del_queued(&self, key: &str, stamp: Stamp) -> bool {
         let chitchat_key = format!("{KV_PREFIX}{key}");
-        let encoded = encode_tombstone(stamp.write);
+        self.writer.enqueue_tombstone(chitchat_key, stamp)
+    }
+
+    /// Ask the writer to delete this node's own gossip copy of `key` if it
+    /// is older than `superseded_by` — a peer's write for the key that has
+    /// just been applied locally. See [`crate::gossip_writer`] for why.
+    pub fn gossip_retire(&self, key: &str, superseded_by: Stamp) {
+        let chitchat_key = format!("{KV_PREFIX}{key}");
+        self.writer.enqueue_retire(&chitchat_key, superseded_by);
+    }
+
+    /// Counters of this node's gossip writer (pending, shed, swept).
+    #[must_use]
+    pub fn gossip_writer_stats(&self) -> crate::gossip_writer::GossipWriterStats {
+        self.writer.stats()
+    }
+
+    /// Size of this node's **own** gossip KV state: entries readers can see
+    /// (values and tombstone markers) and entries chitchat-deleted by the
+    /// sweep that are awaiting chitchat's grace-period GC.
+    pub async fn gossip_state_size(&self) -> GossipStateSize {
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
-        let self_id = guard.self_chitchat_id().node_id.clone();
-        set_if_newer(guard.self_node_state(), &self_id, chitchat_key, encoded, stamp);
-        true
+        let mut size = GossipStateSize::default();
+        for (key, versioned) in guard.self_node_state().key_values_including_deleted() {
+            if !key.starts_with(KV_PREFIX) {
+                continue;
+            }
+            if versioned.is_deleted() {
+                size.awaiting_gc += 1;
+            } else {
+                size.live += 1;
+            }
+        }
+        size
+    }
+
+    /// Whether this node's own gossip state holds a visible entry (value or
+    /// tombstone marker) for `key` — i.e. whether this node is still
+    /// publishing it.
+    pub async fn gossip_self_publishes(&self, key: &str) -> bool {
+        let chitchat_key = format!("{KV_PREFIX}{key}");
+        let chitchat = self.handle.chitchat();
+        let mut guard = chitchat.lock().await;
+        guard.self_node_state().get(&chitchat_key).is_some()
     }
 
     /// Check if a small key exists in the gossip KV tier (not expired).
@@ -455,51 +542,32 @@ impl ClusterHandle {
     /// Returns `None` if the key has no TTL, does not exist, or the
     /// newest visible entry is a tombstone (the key reads as deleted).
     pub async fn gossip_pttl(&self, key: &str) -> Option<u64> {
-        let chitchat_key = format!("{KV_PREFIX}{key}");
-        let chitchat = self.handle.chitchat();
-        let mut guard = chitchat.lock().await;
-
-        // Same last-writer-wins scan as gossip_get, but return the TTL
-        // of the winning entry (None for tombstones and TTL-less values).
-        let mut best: Option<Winner<Option<u64>>> = None;
-        let consider = |encoded: &str, origin: &str, best: &mut Option<Winner<Option<u64>>>| {
-            if let Some(write) = decode_tombstone(encoded) {
-                Winner::offer(best, Stamp::new(write, origin), None);
-                return;
-            }
-            if let Some((expiry_ms, write, _b64)) = split_encoded(encoded) {
-                if expiry_ms > 0 && now_epoch_ms() >= expiry_ms {
-                    return; // already expired
-                }
-                let ttl = if expiry_ms == 0 {
-                    None
-                } else {
-                    Some(expiry_ms.saturating_sub(now_epoch_ms()))
-                };
-                Winner::offer(best, Stamp::new(write, origin), Some(ttl));
-            }
-        };
-        let self_id = guard.self_chitchat_id().node_id.clone();
-        if let Some(encoded) = guard.self_node_state().get(&chitchat_key) {
-            consider(encoded, &self_id, &mut best);
-        }
-        for node_id in guard.live_nodes().cloned().collect::<Vec<_>>() {
-            if let Some(state) = guard.node_state(&node_id)
-                && let Some(encoded) = state.get(&chitchat_key)
-            {
-                consider(encoded, &node_id.node_id, &mut best);
-            }
-        }
-        best.and_then(|w| w.payload).flatten()
+        self.gossip_resolve(key).await?.remaining_ttl_ms()
     }
 
     /// List all gossip KV keys visible to this node (across all live
-    /// nodes), excluding expired entries.
+    /// nodes and this node's pending writes), excluding expired entries.
     pub async fn gossip_keys(&self) -> Vec<String> {
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
         let mut keys = Vec::new();
         let mut seen = std::collections::HashSet::new();
+
+        // Pending writes first: a queued tombstone hides the key even if a
+        // state still holds a live copy, and a queued set shows it.
+        let mut hidden = std::collections::HashSet::new();
+        self.writer.for_each_pending(|chitchat_key, live| {
+            if let Some(stripped) = chitchat_key.strip_prefix(KV_PREFIX) {
+                if live {
+                    if seen.insert(stripped.to_string()) {
+                        keys.push(stripped.to_string());
+                    }
+                } else {
+                    hidden.insert(stripped.to_string());
+                }
+            }
+        });
+        seen.extend(hidden);
 
         // Collect from self.
         collect_kv_keys(guard.self_node_state(), &mut keys, &mut seen);
@@ -574,6 +642,18 @@ impl ClusterHandle {
             })
             .forever();
     }
+}
+
+/// Entry counts of one node's own gossip KV state
+/// ([`ClusterHandle::gossip_state_size`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GossipStateSize {
+    /// Entries visible to readers: live values, expired values the sweep
+    /// has not reached yet, and tombstone markers within their lifetime.
+    pub live: usize,
+    /// Entries the sweep has chitchat-deleted; chitchat removes them for
+    /// good once its grace period passes.
+    pub awaiting_gc: usize,
 }
 
 /// A change observed on the gossip KV tier by

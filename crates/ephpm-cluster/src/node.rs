@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -77,6 +78,10 @@ pub struct ClusterHandle {
     /// Source of this node's KV write stamps (see
     /// [`crate::gossip_kv::Stamp`]).
     pub(crate) clock: crate::gossip_kv::StampClock,
+    /// Bounded queue + sweeper for this node's gossip KV state.
+    pub(crate) writer: Arc<crate::gossip_writer::GossipWriter>,
+    /// The drain/sweep task; aborted on shutdown.
+    writer_task: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for ClusterHandle {
@@ -173,6 +178,7 @@ impl ClusterHandle {
 
     /// Gracefully shut down the gossip protocol.
     pub async fn shutdown(self) {
+        self.writer_task.abort();
         let _ = self.handle.shutdown().await;
     }
 }
@@ -256,6 +262,11 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         "gossip started"
     );
 
+    // The gossip KV writer: one task drains queued writes into chitchat
+    // state in batches and sweeps this node's state for garbage.
+    let writer = Arc::new(crate::gossip_writer::GossipWriter::new());
+    let writer_task = tokio::spawn(Arc::clone(&writer).run(handle.chitchat(), node_id.clone()));
+
     Ok(ClusterHandle {
         handle,
         clock: crate::gossip_kv::StampClock::new(&node_id),
@@ -263,6 +274,8 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         cluster_id: config.cluster_id.clone(),
         gossip_addr: listen_addr,
         data_port,
+        writer,
+        writer_task,
     })
 }
 

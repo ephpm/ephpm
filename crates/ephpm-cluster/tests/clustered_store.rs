@@ -188,8 +188,8 @@ async fn remove_from_both_tiers() {
     cs.set("gs".to_string(), b"tiny".to_vec(), None).await;
     cs.set("ls".to_string(), vec![0u8; 32], None).await;
 
-    assert!(cs.remove("gs").await);
-    assert!(cs.remove("ls").await);
+    assert!(cs.remove("gs"));
+    assert!(cs.remove("ls"));
     assert!(!cs.exists("gs").await);
     assert!(!cs.exists("ls").await);
 

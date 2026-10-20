@@ -85,7 +85,7 @@ This mode is **experimental**: the Turso engine is Beta upstream and multi-node 
 
 The KV store is two-tiered automatically when clustering is on:
 
-- **Small values** (≤ 512 bytes by default) ride the gossip protocol and end up on **every** node. Eventually consistent, fast convergence (~hundreds of ms).
+- **Small values** (≤ 512 bytes by default) ride the gossip protocol and end up on **every** node. Eventually consistent, fast convergence (~hundreds of ms). Sized for cluster-wide small state — sessions, counters, locks, control keys: gossip carries a few hundred entries per second per peer, so a node writing *distinct* small keys faster than that (a high-churn cache with unique keys) will shed replication for the excess (logged) rather than fall behind forever.
 - **Large values** are routed by `hash(key) % alive_nodes` (a plain modulo of the sorted alive-node list — no consistent hash ring or virtual nodes). Each key has a primary owner reached over the TCP data plane on port 7947, and is **replicated** to `replication_factor` nodes total (default 2). Reads try the owner first, then fall back to the other replicas, so a large value survives the loss of its owner. Hot keys additionally promote to a local read cache.
 
 ```toml
