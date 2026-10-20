@@ -23,6 +23,34 @@ pub struct NodeInfo {
     pub gossip_addr: String,
     /// Whether the node is alive or dead (per failure detector).
     pub state: NodeState,
+    /// The TCP port the node's KV data plane listens on, as advertised in
+    /// its gossip state ([`KV_DATA_PORT_KEY`]). `None` for a node that
+    /// predates the advertisement; callers then assume their own
+    /// `[cluster.kv] data_port`, which is what every node did before.
+    pub data_port: Option<u16>,
+}
+
+impl NodeInfo {
+    /// A node known only by id and gossip address — no advertised data port.
+    #[must_use]
+    pub fn new(id: impl Into<String>, gossip_addr: impl Into<String>, state: NodeState) -> Self {
+        Self { id: id.into(), gossip_addr: gossip_addr.into(), state, data_port: None }
+    }
+}
+
+/// Chitchat key under which a node advertises its KV data plane port.
+///
+/// Peers dial `<gossip IP>:<this port>` for large-value replication and
+/// read-through fetches. Before this key existed every node dialled its
+/// *own* `data_port` on every peer, so a cluster with heterogeneous ports
+/// silently sent "remote" writes to the wrong listener (stress finding
+/// F-15). Deliberately outside the `kv:` prefix so the KV applier never sees
+/// it.
+pub const KV_DATA_PORT_KEY: &str = "ephpm:kv_data_port";
+
+/// Read a node's advertised KV data port from its gossip state.
+fn advertised_data_port(state: &chitchat::NodeState) -> Option<u16> {
+    state.get(KV_DATA_PORT_KEY).and_then(|s| s.parse().ok())
 }
 
 /// Liveness state of a cluster node.
@@ -44,6 +72,8 @@ pub struct ClusterHandle {
     self_id: String,
     cluster_id: String,
     gossip_addr: SocketAddr,
+    /// This node's own KV data plane port (`[cluster.kv] data_port`).
+    data_port: u16,
 }
 
 impl std::fmt::Debug for ClusterHandle {
@@ -72,6 +102,7 @@ impl ClusterHandle {
                 id: id.node_id.clone(),
                 gossip_addr: id.gossip_advertise_addr.to_string(),
                 state: NodeState::Alive,
+                data_port: guard.node_state(id).and_then(advertised_data_port),
             });
         }
 
@@ -80,6 +111,7 @@ impl ClusterHandle {
                 id: id.node_id.clone(),
                 gossip_addr: id.gossip_advertise_addr.to_string(),
                 state: NodeState::Dead,
+                data_port: guard.node_state(id).and_then(advertised_data_port),
             });
         }
 
@@ -87,11 +119,7 @@ impl ClusterHandle {
         let self_in_live = live_ids.iter().any(|id| id.node_id == self.self_id);
         let self_in_dead = dead_ids.iter().any(|id| id.node_id == self.self_id);
         if !self_in_live && !self_in_dead {
-            nodes.push(NodeInfo {
-                id: self.self_id.clone(),
-                gossip_addr: self.gossip_addr.to_string(),
-                state: NodeState::Alive,
-            });
+            nodes.push(self.self_node());
         }
 
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -105,7 +133,15 @@ impl ClusterHandle {
             id: self.self_id.clone(),
             gossip_addr: self.gossip_addr.to_string(),
             state: NodeState::Alive,
+            data_port: Some(self.data_port),
         }
+    }
+
+    /// The address this node's KV data plane listens on: the gossip bind IP
+    /// with `[cluster.kv] data_port`.
+    #[must_use]
+    pub fn kv_data_plane_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.gossip_addr.ip(), self.data_port)
     }
 
     /// Return the cluster identifier.
@@ -202,12 +238,18 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
     }
     .context("failed to spawn chitchat gossip")?;
 
+    // Advertise where this node's KV data plane can be reached, so peers
+    // dial the port this node actually listens on rather than their own.
+    let data_port = config.kv.data_port;
+    handle.chitchat().lock().await.self_node_state().set(KV_DATA_PORT_KEY, data_port.to_string());
+
     tracing::info!(
         %node_id,
         %listen_addr,
         seeds = ?config.join,
         cluster_id = %config.cluster_id,
         encrypted,
+        kv_data_port = data_port,
         "gossip started"
     );
 
@@ -216,6 +258,7 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         self_id: node_id,
         cluster_id: config.cluster_id.clone(),
         gossip_addr: listen_addr,
+        data_port,
     })
 }
 

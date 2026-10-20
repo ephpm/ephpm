@@ -28,7 +28,9 @@ futures.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+# `test-util` for `start_paused` tests of the data plane's multi-second
+# timeouts — they finish instantly under paused time instead of sleeping.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

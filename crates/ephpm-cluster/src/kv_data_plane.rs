@@ -54,15 +54,65 @@
 //! protocol message. A peer without the matching secret cannot read
 //! values or inject writes: frames that fail authentication cause the
 //! connection to be dropped without a response.
+//!
+//! ## Connections, timeouts and bounds
+//!
+//! A connection carries **any number** of request/response exchanges, one at
+//! a time, until the client closes it or the server sees no request for
+//! [`SERVER_IDLE_TIMEOUT`]. Clients keep a small pool of idle connections per
+//! peer ([`DataPlaneClient`]) so a replication burst does not open one TCP
+//! connection per value. A server predating this closes after one response;
+//! the pool notices the closed connection on reuse and dials again, so the
+//! two interoperate.
+//!
+//! Every network step is bounded: [`CONNECT_TIMEOUT`] to dial, and
+//! [`REQUEST_TIMEOUT`] for a whole exchange. A peer that accepts and then
+//! stalls (a SIGSTOPped process, a black-holed route) costs one timeout, not
+//! a file descriptor forever — 20k large writes against a frozen peer used
+//! to leave 13k sockets in `SYN-SENT` (stress finding F-13). A peer that
+//! fails to connect is skipped for [`PEER_BREAKER_COOLDOWN`] before the next
+//! dial, so a dead peer does not charge every replica write a full connect
+//! timeout while the failure detector catches up.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ephpm_kv::store::{SetNxOutcome, Store};
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+// tokio's `Instant` (not std's) so the breaker cooldown follows paused time
+// in tests exactly like the timeouts around it do.
+use tokio::time::Instant;
 
 use crate::secure_transport::{ClusterCipher, SEAL_OVERHEAD};
+
+/// How long a client waits for a TCP connection to a peer to be established.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a client waits for one complete request/response exchange after
+/// the connection is up. Sized for a `MAX_VALUE_LEN` value on a slow link, not
+/// for the common sub-millisecond exchange; callers that block a request
+/// thread wrap their call in a tighter timeout of their own.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the server keeps an idle connection open waiting for its next
+/// request (or the first). A client whose request takes longer than this to
+/// arrive in full is also dropped, which bounds a slowloris at one timeout.
+pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the server allows for writing one response.
+const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle connections kept per peer by a [`DataPlaneClient`]. Anything beyond
+/// this is closed on return.
+const POOL_IDLE_PER_PEER: usize = 8;
+
+/// After a failed connect, the peer is reported unreachable without dialling
+/// for this long.
+pub const PEER_BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// Sentinel value indicating "key not found" in the wire protocol.
 const NOT_FOUND_SENTINEL: u32 = u32::MAX;
@@ -111,10 +161,16 @@ fn op_has_value(op: u8) -> bool {
     matches!(op, OP_SET | OP_SET_NX | OP_DEL_IF_EQ)
 }
 
-/// Start the TCP KV data plane listener on all interfaces at `port`.
+/// Start the TCP KV data plane listener on `addr`.
 ///
 /// Serves lookups against the local [`Store`] so remote cluster nodes
 /// can fetch large values that exceed the gossip tier threshold.
+///
+/// `addr` is the `[cluster] bind` IP with `[cluster.kv] data_port` — the
+/// listener follows the gossip bind address rather than `0.0.0.0`, so a node
+/// bound to one interface of a multi-homed host does not expose its KV data
+/// plane on the others (stress finding F-15). An unspecified bind IP stays
+/// unspecified.
 ///
 /// When `cipher` is `Some`, every request and response is exchanged as
 /// a sealed frame; connections that fail authentication are dropped.
@@ -124,10 +180,10 @@ fn op_has_value(op: u8) -> bool {
 /// Returns an error if the TCP listener fails to bind.
 pub async fn serve(
     store: Arc<Store>,
-    port: u16,
+    addr: SocketAddr,
     cipher: Option<Arc<ClusterCipher>>,
 ) -> anyhow::Result<()> {
-    serve_on(store, ([0, 0, 0, 0], port).into(), cipher).await
+    serve_on(store, addr, cipher).await
 }
 
 /// [`serve`] with per-vhost routing for multi-tenant nodes.
@@ -143,11 +199,10 @@ pub async fn serve(
 pub async fn serve_multi_tenant(
     store: Arc<Store>,
     multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
-    port: u16,
+    addr: SocketAddr,
     cipher: Option<Arc<ClusterCipher>>,
 ) -> anyhow::Result<()> {
-    serve_router(KvRouter::multi_tenant(store, multi_tenant), ([0, 0, 0, 0], port).into(), cipher)
-        .await
+    serve_router(KvRouter::multi_tenant(store, multi_tenant), addr, cipher).await
 }
 
 /// Resolves a data-plane transport key to the [`Store`] that owns it.
@@ -265,14 +320,53 @@ struct Request {
     ttl_ms: u64,
 }
 
-/// Handle a single TCP connection: read one request, write one response.
+/// Serve one TCP connection: request/response exchanges until the client
+/// closes it or stays silent for [`SERVER_IDLE_TIMEOUT`].
+///
+/// A clean close (EOF before the first byte of a request) is `Ok`; a
+/// timeout, a malformed request or an I/O error ends the connection with the
+/// error, and the client treats whatever it was waiting on as failed.
 async fn handle_connection(
     mut stream: TcpStream,
     router: &KvRouter,
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<()> {
-    let request = read_request(&mut stream, cipher).await?;
+    loop {
+        let request = match tokio::time::timeout(
+            SERVER_IDLE_TIMEOUT,
+            read_request(&mut stream, cipher),
+        )
+        .await
+        {
+            Ok(Ok(request)) => request,
+            Ok(Err(e)) => {
+                return if is_clean_close(&e) { Ok(()) } else { Err(e) };
+            }
+            Err(_) => anyhow::bail!("idle for {SERVER_IDLE_TIMEOUT:?} without a complete request"),
+        };
+        let response = serve_request(request, router)?;
+        tokio::time::timeout(SERVER_WRITE_TIMEOUT, write_message(&mut stream, &response, cipher))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("peer did not read the response within {SERVER_WRITE_TIMEOUT:?}")
+            })??;
+    }
+}
 
+/// Whether a request-read error is the client closing the connection between
+/// requests, i.e. EOF before the first byte of a new request.
+fn is_clean_close(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+        && err.to_string().contains(CLEAN_CLOSE_MARKER)
+}
+
+/// Appended to the EOF error raised when the connection closes between
+/// requests, so [`is_clean_close`] can tell it from a truncated request.
+const CLEAN_CLOSE_MARKER: &str = "connection closed between requests";
+
+/// Decide one request against the routed store and build its response.
+fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>> {
     // Route the transport key to its owning store. A per-site key arriving at
     // a node that is not multi-tenant has no store to land in; answer
     // not-found / rejected rather than flattening it into the global keyspace.
@@ -282,15 +376,14 @@ async fn handle_connection(
             "KV data plane received a per-site key but this node is not multi-tenant \
              ([server] sites_dir unset); refusing it"
         );
-        let response = match request.op {
+        return Ok(match request.op {
             OP_GET => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
             OP_SET_NX | OP_DEL_IF_EQ => vec![COND_UNROUTABLE],
             _ => vec![SET_REJECTED],
-        };
-        return write_message(&mut stream, &response, cipher).await;
+        });
     };
 
-    let response = match request.op {
+    Ok(match request.op {
         OP_GET => {
             // Look up in the resolved store and build the response.
             if let Some(value) = store.get(key) {
@@ -338,29 +431,40 @@ async fn handle_connection(
             // published as a tombstone by the store's replicator.
             vec![if store.del_if_eq_local(key, &token) { SET_OK } else { COND_NOT_APPLIED }]
         }
-        other => {
-            anyhow::bail!("unknown op code: {other:#04x}");
-        }
-    };
+        // An op this node does not know leaves an unknown number of bytes
+        // on the wire, so the only safe answer is to drop the connection —
+        // which is also what a pre-conditional-ops node did.
+        other => anyhow::bail!("unknown op code: {other:#04x}"),
+    })
+}
 
-    write_message(&mut stream, &response, cipher).await
+/// Tag an EOF on the first byte of a request as a clean close.
+fn mark_clean_close(err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        anyhow::Error::from(err).context(CLEAN_CLOSE_MARKER)
+    } else {
+        err.into()
+    }
 }
 
 /// Read and validate one request from the stream.
 ///
 /// In plaintext mode the fields are read incrementally off the wire; in
-/// encrypted mode one sealed frame is read and parsed in memory.
+/// encrypted mode one sealed frame is read and parsed in memory. EOF before
+/// the first byte is reported with [`CLEAN_CLOSE_MARKER`] so the connection
+/// loop can tell "client hung up between requests" from a truncated request.
 async fn read_request(
     stream: &mut TcpStream,
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<Request> {
     if let Some(cipher) = cipher {
-        let frame = read_frame(stream, cipher).await?;
+        let frame_len = stream.read_u32().await.map_err(mark_clean_close)?;
+        let frame = read_frame_body(stream, cipher, frame_len).await?;
         return parse_request(&frame);
     }
 
     // Plaintext: incremental reads, byte-compatible with older nodes.
-    let op = stream.read_u8().await?;
+    let op = stream.read_u8().await.map_err(mark_clean_close)?;
 
     let key_len = stream.read_u32().await?;
     if key_len > MAX_KEY_LEN {
@@ -443,6 +547,16 @@ async fn write_message(
 /// Read one sealed frame and decrypt it.
 async fn read_frame(stream: &mut TcpStream, cipher: &ClusterCipher) -> anyhow::Result<Vec<u8>> {
     let frame_len = stream.read_u32().await?;
+    read_frame_body(stream, cipher, frame_len).await
+}
+
+/// Read the body of a sealed frame whose length prefix has already been read,
+/// and decrypt it.
+async fn read_frame_body(
+    stream: &mut TcpStream,
+    cipher: &ClusterCipher,
+    frame_len: u32,
+) -> anyhow::Result<Vec<u8>> {
     if frame_len > MAX_FRAME_LEN {
         anyhow::bail!(
             "frame length {frame_len} exceeds maximum {MAX_FRAME_LEN} \
@@ -480,86 +594,317 @@ async fn read_exact_chunked(stream: &mut TcpStream, len: usize) -> anyhow::Resul
     Ok(buf)
 }
 
-/// Fetch a value from a remote node's KV data plane.
+// ─────────────────────────────────────────────────────────────────────
+// Client side
+// ─────────────────────────────────────────────────────────────────────
+
+/// The shape of the response a request expects, so the plaintext reader
+/// knows how many bytes make up one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseKind {
+    /// One status byte (SET, SETNX, DEL-IF-EQ).
+    Status,
+    /// `[value_len: u32][value]` or the not-found sentinel (GET).
+    Value,
+}
+
+/// Dial `addr` within [`CONNECT_TIMEOUT`].
+async fn connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("connect to {addr} timed out after {CONNECT_TIMEOUT:?}"))??;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
+/// One request/response exchange on an open connection, bounded by
+/// [`REQUEST_TIMEOUT`]. Returns the plaintext response message.
+async fn exchange_on(
+    stream: &mut TcpStream,
+    message: &[u8],
+    kind: ResponseKind,
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<Vec<u8>> {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        write_message(stream, message, cipher).await?;
+        if let Some(cipher) = cipher {
+            return read_frame(stream, cipher).await;
+        }
+        match kind {
+            ResponseKind::Status => Ok(vec![stream.read_u8().await?]),
+            ResponseKind::Value => {
+                let value_len = stream.read_u32().await?;
+                let mut response = value_len.to_be_bytes().to_vec();
+                if value_len == NOT_FOUND_SENTINEL {
+                    return Ok(response);
+                }
+                // The encrypted path is bounded by MAX_FRAME_LEN before anything
+                // is allocated; the plaintext path had no bound at all — which
+                // is exactly the deployment with no `[cluster] secret`, where
+                // the responder is not authenticated either. Bound it the same
+                // way the server bounds an inbound value, then read in chunks.
+                if value_len > MAX_VALUE_LEN {
+                    anyhow::bail!(
+                        "peer advertised value length {value_len} exceeding maximum {MAX_VALUE_LEN}"
+                    );
+                }
+                response.extend(read_exact_chunked(stream, value_len as usize).await?);
+                Ok(response)
+            }
+        }
+    })
+    .await
+    .map_err(|elapsed| {
+        // Keep `Elapsed` as the source so the pool can tell a stalled peer
+        // (do not retry) from a closed pooled connection (retry once).
+        anyhow::Error::new(elapsed)
+            .context(format!("KV data plane exchange timed out after {REQUEST_TIMEOUT:?}"))
+    })?
+}
+
+/// Whether an exchange error is the [`REQUEST_TIMEOUT`] firing.
+fn is_exchange_timeout(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tokio::time::error::Elapsed>().is_some()
+}
+
+/// Decode a GET response message into the value, or `None` for the sentinel.
+fn decode_get_response(response: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut buf = response;
+    let value_len = take_u32(&mut buf)?;
+    if value_len == NOT_FOUND_SENTINEL {
+        return Ok(None);
+    }
+    Ok(Some(take_bytes(&mut buf, value_len as usize)?.to_vec()))
+}
+
+/// Idle connections and breaker state for one peer.
+#[derive(Default)]
+struct PeerState {
+    /// Connections that completed their last exchange cleanly, ready to reuse.
+    idle: Vec<TcpStream>,
+    /// Set after a failed connect; dialling is skipped until it passes.
+    unreachable_until: Option<Instant>,
+}
+
+/// A client for peers' KV data planes with per-peer connection reuse and a
+/// per-peer connect breaker.
 ///
-/// Opens a TCP connection to `addr`, sends a GET request, and reads the
-/// response. Returns `None` if the remote node does not have the key.
-/// `cipher` must match the remote node's setting (both `Some` with the
-/// same secret, or both `None`).
+/// One instance is shared by everything on a node that talks to peers
+/// (replica writes, read-through fetches, routed conditional writes). Each
+/// exchange checks out one connection, so concurrency per peer is bounded by
+/// the number of concurrent callers, and idle connections beyond
+/// [`POOL_IDLE_PER_PEER`] are closed rather than kept.
+pub struct DataPlaneClient {
+    cipher: Option<Arc<ClusterCipher>>,
+    peers: Mutex<HashMap<SocketAddr, PeerState>>,
+}
+
+impl std::fmt::Debug for DataPlaneClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataPlaneClient")
+            .field("encrypted", &self.cipher.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataPlaneClient {
+    /// A client sealing every exchange with `cipher` (or plaintext when
+    /// `None`); must match the peers' listeners.
+    #[must_use]
+    pub fn new(cipher: Option<Arc<ClusterCipher>>) -> Self {
+        Self { cipher, peers: Mutex::new(HashMap::new()) }
+    }
+
+    /// The cipher this client seals with, for callers that still use the
+    /// one-shot functions.
+    #[must_use]
+    pub fn cipher(&self) -> Option<&ClusterCipher> {
+        self.cipher.as_deref()
+    }
+
+    /// Take an idle connection to `addr` out of the pool, if any.
+    fn checkout(&self, addr: SocketAddr) -> anyhow::Result<Option<TcpStream>> {
+        let mut peers = self.peers.lock();
+        let state = peers.entry(addr).or_default();
+        if let Some(until) = state.unreachable_until {
+            if Instant::now() < until {
+                anyhow::bail!("peer {addr} is in connect-failure cooldown");
+            }
+            state.unreachable_until = None;
+        }
+        Ok(state.idle.pop())
+    }
+
+    /// Return a healthy connection to the pool, closing it if the pool is full.
+    fn checkin(&self, addr: SocketAddr, stream: TcpStream) {
+        let mut peers = self.peers.lock();
+        let state = peers.entry(addr).or_default();
+        if state.idle.len() < POOL_IDLE_PER_PEER {
+            state.idle.push(stream);
+        }
+    }
+
+    /// Record a failed connect so the next [`PEER_BREAKER_COOLDOWN`] of calls
+    /// fail fast instead of each paying [`CONNECT_TIMEOUT`].
+    fn trip_breaker(&self, addr: SocketAddr) {
+        let mut peers = self.peers.lock();
+        let state = peers.entry(addr).or_default();
+        state.unreachable_until = Some(Instant::now() + PEER_BREAKER_COOLDOWN);
+        // Whatever was idle is suspect too.
+        state.idle.clear();
+    }
+
+    /// Number of idle connections currently pooled for `addr` (observability
+    /// and tests).
+    #[must_use]
+    pub fn idle_connections(&self, addr: SocketAddr) -> usize {
+        self.peers.lock().get(&addr).map_or(0, |s| s.idle.len())
+    }
+
+    /// Run one exchange against `addr`, reusing a pooled connection when one
+    /// exists.
+    ///
+    /// A reused connection may have been closed by the peer since its last
+    /// use (an idle timeout, or a pre-pooling server that closes after one
+    /// response), so an I/O failure on a reused connection is retried
+    /// **once** on a fresh one. A *timeout* on a reused connection is not
+    /// retried: the peer is stalled, and a second attempt would only double
+    /// the wait. The retry can duplicate a request whose first attempt
+    /// reached the peer and died on the response leg; for a SET that is
+    /// idempotent, and for a conditional write the second answer is the same
+    /// "not applied" the caller would have treated as unknown.
+    async fn exchange(
+        &self,
+        addr: SocketAddr,
+        message: &[u8],
+        kind: ResponseKind,
+    ) -> anyhow::Result<Vec<u8>> {
+        let cipher = self.cipher.as_deref();
+        if let Some(mut stream) = self.checkout(addr)? {
+            match exchange_on(&mut stream, message, kind, cipher).await {
+                Ok(response) => {
+                    self.checkin(addr, stream);
+                    return Ok(response);
+                }
+                Err(e) if is_exchange_timeout(&e) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(%addr, %e, "pooled KV data plane connection failed; redialling");
+                }
+            }
+        }
+        let mut stream = match connect(addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.trip_breaker(addr);
+                return Err(e);
+            }
+        };
+        let response = exchange_on(&mut stream, message, kind, cipher).await?;
+        self.checkin(addr, stream);
+        Ok(response)
+    }
+
+    /// Fetch `key` from the peer at `addr`; `None` when it has no such key.
+    ///
+    /// # Errors
+    ///
+    /// Connect/I-O failure, timeout, or a cipher mismatch.
+    pub async fn fetch(&self, addr: SocketAddr, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let response = self.exchange(addr, &encode_get_request(key)?, ResponseKind::Value).await?;
+        decode_get_response(&response)
+    }
+
+    /// Store `value` under `key` on the peer at `addr`, returning whether it
+    /// accepted the write.
+    ///
+    /// # Errors
+    ///
+    /// Connect/I-O failure, timeout, or a cipher mismatch.
+    pub async fn store(&self, addr: SocketAddr, key: &str, value: &[u8]) -> anyhow::Result<bool> {
+        let response =
+            self.exchange(addr, &encode_set_request(key, value)?, ResponseKind::Status).await?;
+        Ok(take_u8(&mut response.as_slice())? == SET_OK)
+    }
+
+    /// Owner-arbitrated `SETNX`; see [`set_nx_remote`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_nx_remote`].
+    pub async fn set_nx(
+        &self,
+        addr: SocketAddr,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> anyhow::Result<SetNxOutcome> {
+        let ttl_ms = ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1));
+        let response = self
+            .exchange(addr, &encode_set_nx_request(key, value, ttl_ms)?, ResponseKind::Status)
+            .await?;
+        decode_set_nx_status(addr, key, take_u8(&mut response.as_slice())?)
+    }
+
+    /// Owner-arbitrated compare-and-delete; see [`del_if_eq_remote`].
+    ///
+    /// # Errors
+    ///
+    /// As [`del_if_eq_remote`].
+    pub async fn del_if_eq(
+        &self,
+        addr: SocketAddr,
+        key: &str,
+        token: &[u8],
+    ) -> anyhow::Result<bool> {
+        let response = self
+            .exchange(addr, &encode_del_if_eq_request(key, token)?, ResponseKind::Status)
+            .await?;
+        decode_del_if_eq_status(addr, key, take_u8(&mut response.as_slice())?)
+    }
+}
+
+/// Fetch a value from a remote node's KV data plane over a one-shot
+/// connection.
+///
+/// Dials `addr`, sends a GET request, reads the response and closes. Returns
+/// `None` if the remote node does not have the key. `cipher` must match the
+/// remote node's setting (both `Some` with the same secret, or both `None`).
+/// Nodes use a pooled [`DataPlaneClient`] instead; this is the
+/// dependency-free form for tools and tests.
 ///
 /// # Errors
 ///
-/// Returns an error on connection or I/O failure, or when the peer's
-/// encryption setting or secret does not match.
+/// Returns an error on connection or I/O failure, a timeout, or when the
+/// peer's encryption setting or secret does not match.
 pub async fn fetch_remote(
     addr: SocketAddr,
     key: &str,
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let _ = stream.set_nodelay(true);
-
-    // Send GET op + key.
-    write_message(&mut stream, &encode_get_request(key)?, cipher).await?;
-
-    // Read response.
-    if let Some(cipher) = cipher {
-        let frame = read_frame(&mut stream, cipher).await?;
-        let mut buf = frame.as_slice();
-        let value_len = take_u32(&mut buf)?;
-        if value_len == NOT_FOUND_SENTINEL {
-            return Ok(None);
-        }
-        return Ok(Some(take_bytes(&mut buf, value_len as usize)?.to_vec()));
-    }
-
-    let value_len = stream.read_u32().await?;
-    if value_len == NOT_FOUND_SENTINEL {
-        return Ok(None);
-    }
-    // The encrypted path above is bounded by MAX_FRAME_LEN before anything
-    // is allocated; the plaintext path had no bound at all — which is
-    // exactly the deployment with no `[cluster] secret`, where the
-    // responder is not authenticated either. Bound it the same way the
-    // server bounds an inbound value, then read it in chunks.
-    if value_len > MAX_VALUE_LEN {
-        anyhow::bail!("peer advertised value length {value_len} exceeding maximum {MAX_VALUE_LEN}");
-    }
-    let buf = read_exact_chunked(&mut stream, value_len as usize).await?;
-    Ok(Some(buf))
+    let mut stream = connect(addr).await?;
+    let response =
+        exchange_on(&mut stream, &encode_get_request(key)?, ResponseKind::Value, cipher).await?;
+    decode_get_response(&response)
 }
 
-/// Store a value on a remote node's KV data plane.
-///
-/// Opens a TCP connection to `addr`, sends a SET request with the key
-/// and value, and reads the status response. `cipher` must match the
-/// remote node's setting (both `Some` with the same secret, or both
-/// `None`).
+/// Store a value on a remote node's KV data plane over a one-shot
+/// connection. See [`fetch_remote`].
 ///
 /// # Errors
 ///
-/// Returns an error on connection or I/O failure, or when the peer's
-/// encryption setting or secret does not match.
+/// Returns an error on connection or I/O failure, a timeout, or when the
+/// peer's encryption setting or secret does not match.
 pub async fn store_remote(
     addr: SocketAddr,
     key: &str,
     value: &[u8],
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<bool> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let _ = stream.set_nodelay(true);
-
-    // Send SET op + key + value.
-    write_message(&mut stream, &encode_set_request(key, value)?, cipher).await?;
-
-    // Read status response.
-    let status = if let Some(cipher) = cipher {
-        let frame = read_frame(&mut stream, cipher).await?;
-        take_u8(&mut frame.as_slice())?
-    } else {
-        stream.read_u8().await?
-    };
-    Ok(status == SET_OK)
+    let mut stream = connect(addr).await?;
+    let response =
+        exchange_on(&mut stream, &encode_set_request(key, value)?, ResponseKind::Status, cipher)
+            .await?;
+    Ok(take_u8(&mut response.as_slice())? == SET_OK)
 }
 
 /// Ask the owner node at `addr` to perform `SETNX key value [ttl]` on its own
@@ -585,13 +930,7 @@ pub async fn set_nx_remote(
     let ttl_ms = ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1));
     let status =
         conditional_roundtrip(addr, &encode_set_nx_request(key, value, ttl_ms)?, cipher).await?;
-    match status {
-        SET_OK => Ok(SetNxOutcome::Inserted),
-        COND_NOT_APPLIED => Ok(SetNxOutcome::Exists),
-        SET_REJECTED => Ok(SetNxOutcome::OutOfMemory),
-        COND_UNROUTABLE => anyhow::bail!("owner {addr} cannot route key {key:?}"),
-        other => anyhow::bail!("owner {addr} answered SETNX with unknown status {other:#04x}"),
-    }
+    decode_set_nx_status(addr, key, status)
 }
 
 /// Ask the owner node at `addr` to delete `key` only while its value equals
@@ -608,6 +947,22 @@ pub async fn del_if_eq_remote(
 ) -> anyhow::Result<bool> {
     let status =
         conditional_roundtrip(addr, &encode_del_if_eq_request(key, token)?, cipher).await?;
+    decode_del_if_eq_status(addr, key, status)
+}
+
+/// Map a SETNX status byte to the owner's decision.
+fn decode_set_nx_status(addr: SocketAddr, key: &str, status: u8) -> anyhow::Result<SetNxOutcome> {
+    match status {
+        SET_OK => Ok(SetNxOutcome::Inserted),
+        COND_NOT_APPLIED => Ok(SetNxOutcome::Exists),
+        SET_REJECTED => Ok(SetNxOutcome::OutOfMemory),
+        COND_UNROUTABLE => anyhow::bail!("owner {addr} cannot route key {key:?}"),
+        other => anyhow::bail!("owner {addr} answered SETNX with unknown status {other:#04x}"),
+    }
+}
+
+/// Map a DEL-IF-EQ status byte to whether the owner deleted the key.
+fn decode_del_if_eq_status(addr: SocketAddr, key: &str, status: u8) -> anyhow::Result<bool> {
     match status {
         SET_OK => Ok(true),
         COND_NOT_APPLIED => Ok(false),
@@ -616,20 +971,16 @@ pub async fn del_if_eq_remote(
     }
 }
 
-/// Send one conditional-write request and read its one-byte status.
+/// Send one conditional-write request over a one-shot connection and read
+/// its one-byte status.
 async fn conditional_roundtrip(
     addr: SocketAddr,
     message: &[u8],
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<u8> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let _ = stream.set_nodelay(true);
-    write_message(&mut stream, message, cipher).await?;
-    if let Some(cipher) = cipher {
-        let frame = read_frame(&mut stream, cipher).await?;
-        return take_u8(&mut frame.as_slice());
-    }
-    Ok(stream.read_u8().await?)
+    let mut stream = connect(addr).await?;
+    let response = exchange_on(&mut stream, message, ResponseKind::Status, cipher).await?;
+    take_u8(&mut response.as_slice())
 }
 
 /// Encode a plaintext SETNX request message.
@@ -1222,5 +1573,179 @@ mod tests {
         assert_eq!(parsed.op, OP_SET);
         assert_eq!(parsed.key, "mykey");
         assert_eq!(parsed.value.as_deref(), Some(b"myvalue".as_slice()));
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    //! Connection reuse, timeouts and the per-peer breaker (stress finding
+    //! F-13: a frozen peer used to pin one half-open socket per write).
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A listener that counts accepted connections and serves each one with
+    /// the production multi-request loop.
+    async fn counting_server(store: Arc<Store>) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, &KvRouter::global(store), None).await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Several exchanges through the pooled client ride one TCP connection,
+    /// and the connection goes back to the pool between them.
+    #[tokio::test]
+    async fn pooled_client_reuses_one_connection() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let (addr, accepted) = counting_server(Arc::clone(&store)).await;
+        let client = DataPlaneClient::new(None);
+
+        for i in 0..20 {
+            assert!(client.store(addr, &format!("k{i}"), b"v").await.unwrap());
+            assert_eq!(client.fetch(addr, &format!("k{i}")).await.unwrap(), Some(b"v".to_vec()));
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "40 exchanges must share one connection");
+        assert_eq!(client.idle_connections(addr), 1);
+    }
+
+    /// A server that closes after one response — a node predating connection
+    /// reuse — is transparently redialled by the pool.
+    #[tokio::test]
+    async fn pooled_client_tolerates_a_one_shot_server() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let store = Arc::clone(&server_store);
+                tokio::spawn(async move {
+                    // One request, one response, close — the old behaviour.
+                    let request = read_request(&mut stream, None).await.unwrap();
+                    let response = serve_request(request, &KvRouter::global(store)).unwrap();
+                    write_message(&mut stream, &response, None).await.unwrap();
+                });
+            }
+        });
+
+        let client = DataPlaneClient::new(None);
+        assert!(client.store(addr, "a", b"1").await.unwrap());
+        // The pooled connection is dead by now; the second call must still succeed.
+        assert_eq!(client.fetch(addr, "a").await.unwrap(), Some(b"1".to_vec()));
+        assert!(client.store(addr, "b", b"2").await.unwrap());
+        assert_eq!(store.get("b").as_deref(), Some(&b"2"[..]));
+    }
+
+    /// A peer that accepts and then never answers costs one bounded timeout,
+    /// after which the socket is closed — not a socket parked forever.
+    #[tokio::test(start_paused = true)]
+    async fn frozen_peer_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold the connection open without reading or writing.
+        let frozen = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let client = DataPlaneClient::new(None);
+        let err = client.store(addr, "k", b"v").await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+        assert_eq!(client.idle_connections(addr), 0, "a failed connection is never pooled");
+        frozen.abort();
+    }
+
+    /// A peer that answered once and then froze costs the pooled client one
+    /// request timeout, not a timeout plus a redial and a second one.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_pooled_connection_is_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Serve exactly one request, then stop reading forever.
+            let request = read_request(&mut stream, None).await.unwrap();
+            let response = serve_request(request, &KvRouter::global(store)).unwrap();
+            write_message(&mut stream, &response, None).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = DataPlaneClient::new(None);
+        assert!(client.store(addr, "k", b"v").await.unwrap());
+        assert_eq!(client.idle_connections(addr), 1);
+
+        let started = Instant::now();
+        let err = client.store(addr, "k", b"v2").await.unwrap_err();
+        assert!(is_exchange_timeout(&err), "got: {err}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= REQUEST_TIMEOUT && waited < REQUEST_TIMEOUT * 2,
+            "one timeout, no redial: waited {waited:?}"
+        );
+        server.abort();
+    }
+
+    /// After a refused connect the peer is not redialled for the cooldown,
+    /// so a dead peer does not charge every caller a connect attempt.
+    #[tokio::test(start_paused = true)]
+    async fn breaker_skips_dial_after_connect_failure() {
+        // Bind then drop: the port is closed and refuses connections.
+        let addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let client = DataPlaneClient::new(None);
+        let first = client.fetch(addr, "k").await.unwrap_err();
+        assert!(!first.to_string().contains("cooldown"), "first failure is the real connect error");
+        let second = client.fetch(addr, "k").await.unwrap_err();
+        assert!(second.to_string().contains("cooldown"), "got: {second}");
+        // Once the cooldown passes, dialling resumes (and fails for real again).
+        tokio::time::sleep(PEER_BREAKER_COOLDOWN + Duration::from_millis(1)).await;
+        let third = client.fetch(addr, "k").await.unwrap_err();
+        assert!(!third.to_string().contains("cooldown"), "got: {third}");
+    }
+
+    /// The server drops a connection that sends nothing for the idle timeout,
+    /// bounding what a stalled client can hold.
+    #[tokio::test(start_paused = true)]
+    async fn server_drops_idle_connections() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let (addr, _accepted) = counting_server(store).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Say nothing; the server must hang up on its own.
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(SERVER_IDLE_TIMEOUT * 2, client.read(&mut byte))
+            .await
+            .expect("the server must close within the idle timeout")
+            .unwrap();
+        assert_eq!(n, 0, "EOF from the server, not data");
+    }
+
+    /// A clean close between requests is not an error, a truncated request is.
+    #[test]
+    fn clean_close_is_only_eof_before_a_request() {
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof");
+        assert!(is_clean_close(&mark_clean_close(eof)));
+        let truncated: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof").into();
+        assert!(!is_clean_close(&truncated));
+        let other = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst");
+        assert!(!is_clean_close(&mark_clean_close(other)));
     }
 }

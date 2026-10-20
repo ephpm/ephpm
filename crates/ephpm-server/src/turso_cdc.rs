@@ -4570,10 +4570,8 @@ mod tests {
     /// is what lets an ownership move pull the data with it.
     #[test]
     fn previous_owner_is_hrw_without_self() {
-        let node = |id: &str, ip: &str| ephpm_cluster::NodeInfo {
-            id: id.into(),
-            gossip_addr: format!("{ip}:7946"),
-            state: ephpm_cluster::NodeState::Alive,
+        let node = |id: &str, ip: &str| {
+            ephpm_cluster::NodeInfo::new(id, format!("{ip}:7946"), ephpm_cluster::NodeState::Alive)
         };
         let before = [node("ephpm-0", "10.0.0.1"), node("ephpm-1", "10.0.0.2")];
         let after =
@@ -4610,22 +4608,19 @@ mod tests {
 
     #[test]
     fn peer_is_node_compares_hosts_not_ports() {
-        let owner = ephpm_cluster::NodeInfo {
-            id: "ephpm-1".into(),
-            gossip_addr: "10.0.0.2:7946".into(),
-            state: ephpm_cluster::NodeState::Alive,
-        };
+        let owner = ephpm_cluster::NodeInfo::new(
+            "ephpm-1",
+            "10.0.0.2:7946",
+            ephpm_cluster::NodeState::Alive,
+        );
         // Same host, cluster-channel port — this is what a real dial looks like.
         assert!(peer_is_node(&owner, "10.0.0.2:7948".parse().unwrap()));
         assert!(peer_is_node(&owner, "10.0.0.2:51234".parse().unwrap()));
         // A different host is not that node.
         assert!(!peer_is_node(&owner, "10.0.0.3:7948".parse().unwrap()));
         // An unparseable gossip address never matches.
-        let broken = ephpm_cluster::NodeInfo {
-            id: "ephpm-9".into(),
-            gossip_addr: "not-an-addr".into(),
-            state: ephpm_cluster::NodeState::Alive,
-        };
+        let broken =
+            ephpm_cluster::NodeInfo::new("ephpm-9", "not-an-addr", ephpm_cluster::NodeState::Alive);
         assert!(!peer_is_node(&broken, "10.0.0.2:7948".parse().unwrap()));
     }
 

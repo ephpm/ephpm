@@ -6288,7 +6288,9 @@ pub struct ClusterKvConfig {
     /// TCP listen port for the KV data plane.
     ///
     /// Used to fetch large values from the owner node when they exceed
-    /// the gossip tier threshold. Binds on `0.0.0.0:{port}`.
+    /// the gossip tier threshold. Binds on `<[cluster] bind IP>:{port}` and
+    /// is advertised to peers over gossip, so each node may use its own
+    /// port.
     ///
     /// Default: `7947`.
     #[serde(default = "default_kv_data_port")]

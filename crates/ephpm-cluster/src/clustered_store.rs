@@ -29,6 +29,7 @@ use ephpm_config::ClusterKvConfig;
 use ephpm_kv::store::{Routed, SetNxOutcome, Store};
 
 use crate::ClusterHandle;
+use crate::kv_data_plane::DataPlaneClient;
 use crate::node::NodeInfo;
 use crate::secure_transport::ClusterCipher;
 
@@ -129,8 +130,9 @@ pub struct ClusteredStore {
     cluster: Arc<ClusterHandle>,
     /// Configuration for tier routing and hot key behavior.
     config: ClusterKvConfig,
-    /// Cipher for TCP data plane traffic (`None` = plaintext).
-    cipher: Option<Arc<ClusterCipher>>,
+    /// Pooled, timeout-bounded client for peers' TCP data planes (sealed
+    /// with the cluster cipher when one is configured).
+    client: Arc<DataPlaneClient>,
     /// Per-key hit counters for hot key detection.
     hit_counters: DashMap<u64, HitCounter>,
     /// Locally cached hot key values.
@@ -210,7 +212,7 @@ impl ClusteredStore {
             store,
             cluster,
             config,
-            cipher,
+            client: Arc::new(DataPlaneClient::new(cipher)),
             hit_counters: DashMap::new(),
             hot_cache: DashMap::new(),
             subscribed: AtomicBool::new(false),
@@ -309,7 +311,7 @@ impl ClusteredStore {
             let Some(addr) = node_data_addr(&node, self.config.data_port) else {
                 continue;
             };
-            match crate::kv_data_plane::fetch_remote(addr, key, self.cipher.as_deref()).await {
+            match self.client.fetch(addr, key).await {
                 Ok(Some(value)) => {
                     self.track_remote_fetch(key, &value);
                     return Some(value);
@@ -596,8 +598,7 @@ impl ClusteredStore {
                 tracing::warn!(key, peer = %node.id, "broadcast peer has no parseable data address");
                 continue;
             };
-            match crate::kv_data_plane::store_remote(addr, key, value, self.cipher.as_deref()).await
-            {
+            match self.client.store(addr, key, value).await {
                 Ok(true) => delivered += 1,
                 Ok(false) => {
                     self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
@@ -699,20 +700,13 @@ impl ClusteredStore {
                     let Some(addr) = node_data_addr(node, self.config.data_port) else {
                         continue;
                     };
-                    let cipher = self.cipher.clone();
+                    let client = Arc::clone(&self.client);
                     let key = key.to_string();
                     let value = value.to_vec();
                     let node_id = node.id.clone();
                     let failures = Arc::clone(&self.replica_write_failures);
                     tokio::spawn(async move {
-                        match crate::kv_data_plane::store_remote(
-                            addr,
-                            &key,
-                            &value,
-                            cipher.as_deref(),
-                        )
-                        .await
-                        {
+                        match client.store(addr, &key, &value).await {
                             Ok(true) => {}
                             Ok(false) => {
                                 failures.fetch_add(1, Ordering::Relaxed);
@@ -783,7 +777,7 @@ impl ClusteredStore {
             tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
             return false;
         };
-        match crate::kv_data_plane::store_remote(addr, key, value, self.cipher.as_deref()).await {
+        match self.client.store(addr, key, value).await {
             Ok(accepted) => accepted,
             Err(e) => {
                 tracing::warn!(key, replica = %node.id, %addr, %e, "replica write failed");
@@ -864,13 +858,7 @@ impl ClusteredStore {
             tracing::warn!(key = transport_key, owner = %owner.id, "SETNX owner has no data address");
             return Routed::OwnerUnreachable;
         };
-        let call = crate::kv_data_plane::set_nx_remote(
-            addr,
-            transport_key,
-            value,
-            ttl,
-            self.cipher.as_deref(),
-        );
+        let call = self.client.set_nx(addr, transport_key, value, ttl);
         match tokio::time::timeout(CONDITIONAL_ROUTE_TIMEOUT, call).await {
             Ok(Ok(outcome)) => {
                 tracing::trace!(key = transport_key, owner = %owner.id, ?outcome, "SETNX routed");
@@ -903,12 +891,7 @@ impl ClusteredStore {
             tracing::warn!(key = transport_key, owner = %owner.id, "DELIFEQ owner has no data address");
             return Routed::OwnerUnreachable;
         };
-        let call = crate::kv_data_plane::del_if_eq_remote(
-            addr,
-            transport_key,
-            token,
-            self.cipher.as_deref(),
-        );
+        let call = self.client.del_if_eq(addr, transport_key, token);
         match tokio::time::timeout(CONDITIONAL_ROUTE_TIMEOUT, call).await {
             Ok(Ok(deleted)) => Routed::Owner(deleted),
             Ok(Err(e)) => {
@@ -1866,14 +1849,16 @@ fn replica_nodes_for(alive: &[NodeInfo], key_hash: u64, factor: usize) -> Vec<No
     (0..want).map(|offset| alive[(start + offset) % n].clone()).collect()
 }
 
-/// Derive a node's TCP data plane address from its gossip address and the
-/// configured data port. Returns `None` if the gossip address does not
-/// parse as a socket address.
-fn node_data_addr(node: &NodeInfo, data_port: u16) -> Option<SocketAddr> {
+/// Derive a node's TCP data plane address: its gossip IP with the data port
+/// it advertises via gossip, or — for a node that advertises none (one
+/// predating the advertisement) — this node's own configured `data_port`,
+/// which is what every node assumed before. Returns `None` if the gossip
+/// address does not parse as a socket address.
+fn node_data_addr(node: &NodeInfo, local_data_port: u16) -> Option<SocketAddr> {
     node.gossip_addr
         .parse::<SocketAddr>()
         .ok()
-        .map(|gossip| SocketAddr::new(gossip.ip(), data_port))
+        .map(|gossip| SocketAddr::new(gossip.ip(), node.data_port.unwrap_or(local_data_port)))
 }
 
 /// Parse a memory size string like `"64MB"` to bytes.
@@ -2073,10 +2058,12 @@ mod tests {
     /// Build a sorted 5-node fixture: `n0`..`n4`.
     fn fixture_nodes() -> Vec<NodeInfo> {
         (0..5)
-            .map(|i| NodeInfo {
-                id: format!("n{i}"),
-                gossip_addr: format!("127.0.0.1:{}", 7946 + i),
-                state: crate::NodeState::Alive,
+            .map(|i| {
+                NodeInfo::new(
+                    format!("n{i}"),
+                    format!("127.0.0.1:{}", 7946 + i),
+                    crate::NodeState::Alive,
+                )
             })
             .collect()
     }
@@ -2174,24 +2161,29 @@ mod tests {
         assert_eq!(after_ids, before_ids, "removing an unrelated node must not shift the set");
     }
 
+    /// A peer that advertises no data port (an older node) is dialled on
+    /// this node's own `data_port`, exactly as before the advertisement.
     #[test]
-    fn node_data_addr_uses_configured_port() {
-        let node = NodeInfo {
-            id: "n0".to_string(),
-            gossip_addr: "10.0.0.5:7946".to_string(),
-            state: crate::NodeState::Alive,
-        };
+    fn node_data_addr_falls_back_to_local_port() {
+        let node = NodeInfo::new("n0", "10.0.0.5:7946", crate::NodeState::Alive);
         let addr = node_data_addr(&node, 7947).unwrap();
         assert_eq!(addr.to_string(), "10.0.0.5:7947");
     }
 
+    /// A peer that advertises its data port is dialled there, not on this
+    /// node's port — heterogeneous `data_port`s used to send "remote" writes
+    /// to the wrong listener.
+    #[test]
+    fn node_data_addr_prefers_advertised_port() {
+        let mut node = NodeInfo::new("n0", "10.0.0.5:7946", crate::NodeState::Alive);
+        node.data_port = Some(19402);
+        let addr = node_data_addr(&node, 7947).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.5:19402");
+    }
+
     #[test]
     fn node_data_addr_rejects_unparseable_gossip_addr() {
-        let node = NodeInfo {
-            id: "n0".to_string(),
-            gossip_addr: "not-an-addr".to_string(),
-            state: crate::NodeState::Alive,
-        };
+        let node = NodeInfo::new("n0", "not-an-addr", crate::NodeState::Alive);
         assert!(node_data_addr(&node, 7947).is_none());
     }
 

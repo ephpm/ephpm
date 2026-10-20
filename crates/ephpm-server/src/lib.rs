@@ -212,7 +212,10 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // Start the KV TCP data plane for large-value cross-node fetches.
         // When [cluster] secret is set, frames are sealed with a key
         // derived from it (nodes without the secret cannot read/inject).
-        let data_port = config.cluster.kv.data_port;
+        // It binds the `[cluster] bind` IP (not 0.0.0.0) on
+        // `[cluster.kv] data_port`, and that port is advertised to peers over
+        // gossip so each peer dials the port this node really listens on.
+        let data_addr = handle.kv_data_plane_addr();
         let data_plane_store = Arc::clone(&kv_store);
         let data_plane_cipher = if config.cluster.secret.is_empty() {
             None
@@ -231,13 +234,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
                     ephpm_cluster::data_plane::serve_multi_tenant(
                         data_plane_store,
                         sites,
-                        data_port,
+                        data_addr,
                         data_plane_cipher,
                     )
                     .await
                 }
                 None => {
-                    ephpm_cluster::data_plane::serve(data_plane_store, data_port, data_plane_cipher)
+                    ephpm_cluster::data_plane::serve(data_plane_store, data_addr, data_plane_cipher)
                         .await
                 }
             };

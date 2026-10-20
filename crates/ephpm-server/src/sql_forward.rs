@@ -952,7 +952,7 @@ mod tests {
     use super::*;
 
     fn node(id: &str, state: NodeState) -> NodeInfo {
-        NodeInfo { id: id.into(), gossip_addr: "10.0.0.1:7946".into(), state }
+        NodeInfo::new(id, "10.0.0.1:7946", state)
     }
 
     #[test]
@@ -1103,17 +1103,9 @@ mod tests {
 
     #[test]
     fn member_channel_addr_is_derived_from_gossip_membership() {
-        let n = NodeInfo {
-            id: "ephpm-1".into(),
-            gossip_addr: "10.0.0.2:7946".into(),
-            state: NodeState::Alive,
-        };
+        let n = NodeInfo::new("ephpm-1", "10.0.0.2:7946", NodeState::Alive);
         assert_eq!(member_channel_addr(&n), Some("10.0.0.2:7948".parse().unwrap()));
-        let broken = NodeInfo {
-            id: "ephpm-2".into(),
-            gossip_addr: "nonsense".into(),
-            state: NodeState::Alive,
-        };
+        let broken = NodeInfo::new("ephpm-2", "nonsense", NodeState::Alive);
         assert_eq!(member_channel_addr(&broken), None);
     }
 

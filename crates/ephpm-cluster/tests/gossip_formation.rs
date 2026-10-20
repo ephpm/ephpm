@@ -223,3 +223,42 @@ async fn node_departure_detected() {
 
     handle1.shutdown().await;
 }
+
+/// Each node advertises its own KV data port over gossip, so peers dial the
+/// port it really listens on even when `data_port` differs per node.
+#[tokio::test]
+async fn nodes_advertise_their_kv_data_port() {
+    let addr1 = free_udp_addr();
+    let addr2 = free_udp_addr();
+
+    let mut config1 = node_config("dp-node-1", "test-dp-cluster", addr1, vec![]);
+    config1.kv.data_port = 19_401;
+    let handle1 = start_gossip(&config1).await.unwrap();
+
+    let mut config2 = node_config("dp-node-2", "test-dp-cluster", addr2, vec![addr1.to_string()]);
+    config2.kv.data_port = 19_402;
+    let handle2 = start_gossip(&config2).await.unwrap();
+
+    // Our own advertisement is immediate and the listener address follows it.
+    assert_eq!(handle1.self_node().data_port, Some(19_401));
+    assert_eq!(handle1.kv_data_plane_addr(), SocketAddr::new(addr1.ip(), 19_401));
+
+    // The peer's advertisement arrives with its gossip state.
+    let mut seen = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        seen = handle1
+            .nodes()
+            .await
+            .into_iter()
+            .find(|n| n.id == "dp-node-2")
+            .and_then(|n| n.data_port);
+        if seen.is_some() {
+            break;
+        }
+    }
+    assert_eq!(seen, Some(19_402), "node-1 must learn node-2's data port from gossip");
+
+    handle1.shutdown().await;
+    handle2.shutdown().await;
+}
