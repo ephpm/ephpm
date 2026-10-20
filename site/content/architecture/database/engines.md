@@ -267,6 +267,23 @@ replication unconditionally. Because the Turso engine is Beta upstream and the
 CDC path is manually (not yet CI-) validated, treat clustered mode as
 experimental and tested on Linux/macOS.
 
+**Busy databases report as busy.** Every clustered wire factory captures its
+sessions' writes into the change log, and Turso runs the capture pragma as a
+*write* transaction. Until litewire#51 that pragma ran when a session opened.
+While one connection held a long write transaction (a stress run used a
+3,000-row import), every new session on that database waited out the 5 s busy
+timeout and then failed. That covered readers, the owner side of forwarded
+statements, and stock `pdo_mysql` connections. Each route mislabelled the
+failure: the bridge said "failed to open embedded database session",
+forwarding clients said "owner connection closed … early eof", and
+`pdo_mysql` said `1698 Authenticate failed`. Capture is now switched on just
+before a session's first statement that is not a plain `SELECT`. Opening a
+session and reading never wait on the write lock. A write that cannot get the
+lock fails with `1205` "database is locked" on every route: the bridge, a
+forwarded statement (the owner answers with its error instead of closing the
+stream), and the wire. A verified MySQL credential is never reported as an
+authentication failure because its database is busy or cannot be opened.
+
 Metrics for this path — batches and rows shipped and applied, subscriber
 count, applied watermark, reconnects, snapshot bytes, and a replication-lag
 gauge measured in **change-log rows, not seconds** — are in the

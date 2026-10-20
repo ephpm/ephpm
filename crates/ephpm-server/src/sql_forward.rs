@@ -97,6 +97,14 @@
 //! `ephpm_db_*` exception — it never wedges. A transport failure also drops the
 //! proxy's stream so the next statement re-dials.
 //!
+//! An owner that is reachable but cannot serve the statement **answers** with
+//! the reason rather than closing the stream: a site database or session that
+//! will not open (a busy database still reads "database is locked", which the
+//! client maps to 1205) is that statement's error and is retried on the next
+//! one, and a refused stream (not the owner any more, unknown peer) answers the
+//! first request with a connection-shaped refusal flagged `closed`. Only a real
+//! transport failure reaches the client as `owner connection closed ...`.
+//!
 //! # Both tenant routes forward
 //!
 //! [`ClusteredSiteResolver`] serves **both** ways a tenant reaches its
@@ -238,9 +246,17 @@ enum SqlResponse {
     /// `sqlite` distinguishes a real SQL error ([`BackendError::Sqlite`], which
     /// the client re-maps to a MySQL error code so e.g. a duplicate key stays
     /// 1062) from an infrastructure error ([`BackendError::Other`]).
+    ///
+    /// `closed` is set when the owner ends the stream right after this reply
+    /// (it refused the stream), so the client drops it and re-dials for the
+    /// next statement instead of writing into a closed stream. Defaulted so a
+    /// reply from an owner that predates the field still parses, and ignored
+    /// by a client that predates it.
     Error {
         sqlite: bool,
         message: String,
+        #[serde(default)]
+        closed: bool,
     },
 }
 
@@ -352,7 +368,15 @@ impl RemoteProxyConn {
             )));
         }
         match read_msg::<_, SqlResponse>(stream).await {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                // The owner answered and then ended the stream (it refused
+                // it): forget it so the next statement re-dials rather than
+                // failing on a closed stream.
+                if matches!(resp, SqlResponse::Error { closed: true, .. }) {
+                    *guard = None;
+                }
+                Ok(resp)
+            }
             Err(e) => {
                 *guard = None;
                 Err(BackendError::Other(format!(
@@ -383,7 +407,7 @@ impl BackendConn for RemoteProxyConn {
                 columns: columns.into_iter().map(Column::from).collect(),
                 rows: rows.into_iter().map(|r| r.into_iter().map(Value::from).collect()).collect(),
             }),
-            SqlResponse::Error { sqlite, message } => Err(error_from_response(sqlite, message)),
+            SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
             SqlResponse::Ok { .. } => Err(BackendError::Other(
                 "site owner returned an OK to a forwarded query".to_string(),
             )),
@@ -399,7 +423,7 @@ impl BackendConn for RemoteProxyConn {
             SqlResponse::Ok { affected_rows, last_insert_rowid } => {
                 Ok(ExecuteResult { affected_rows, last_insert_rowid })
             }
-            SqlResponse::Error { sqlite, message } => Err(error_from_response(sqlite, message)),
+            SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
             SqlResponse::Rows { .. } => Err(BackendError::Other(
                 "site owner returned rows to a forwarded execute".to_string(),
             )),
@@ -714,9 +738,16 @@ pub fn spawn_owner_sql_handler(
 ///    correct — only the owner's writes are captured into the CDC log that
 ///    replicates.
 ///
-/// Holds the site's backend `Arc` for the stream's lifetime so the registry's
-/// refcount-aware LRU cannot evict the database out from under the live owner
-/// connection.
+/// # Failure is answered, never hung up on
+///
+/// Every way this side can fail is sent back as an [`SqlResponse::Error`]
+/// carrying the real reason. Dropping the stream instead is what made a
+/// non-owner's client report `owner connection closed ... early eof` — a
+/// transport error that hid the owner's actual problem (in the stress run that
+/// surfaced it: a site whose session could not open while another connection
+/// held its write lock). A refused stream gets its refusal as the answer to the
+/// client's first request, marked `closed` so the client re-dials; see
+/// [`refuse_stream`].
 async fn serve_forwarded_sql(
     mut stream: ChannelStream,
     cluster: &ClusterHandle,
@@ -732,6 +763,14 @@ async fn serve_forwarded_sql(
             "forwarded-SQL: refusing a stream from an address gossip does not know as a \
              cluster member"
         );
+        refuse_stream(
+            &mut stream,
+            format!(
+                "connection refused by the node serving site {site}: this peer is not a known \
+                 cluster member"
+            ),
+        )
+        .await;
         return Ok(());
     }
     let nodes = cluster.nodes().await;
@@ -742,34 +781,122 @@ async fn serve_forwarded_sql(
             "forwarded-SQL: not this site's HRW owner; refusing (peer is chasing a stale owner \
              and will re-resolve)"
         );
+        // "connection refused" is one of the bridge's connection-shaped
+        // markers, so the bridge recycles its session and re-resolves the
+        // site's current owner — the same recovery the old hang-up triggered,
+        // with the reason attached.
+        refuse_stream(
+            &mut stream,
+            format!(
+                "connection refused by node {self_id}: it is no longer the owner of site {site} \
+                 (ownership moved); reconnect to reach the current owner"
+            ),
+        )
+        .await;
         return Ok(());
     }
 
-    // Pin the site open for the stream's lifetime; `conn` (declared after) drops
-    // before this pin so the connection closes before the database can be
-    // evicted/re-opened.
-    let backend = registry
-        .get_or_open(site)
-        .await
-        .with_context(|| format!("forwarded-SQL: open local backend for {site}"))?;
-    let conn = backend
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("forwarded-SQL: open owner session for {site}: {e}"))?;
-
     tracing::debug!(peer = %peer, site = %site, "forwarded-SQL: serving owner session");
+    serve_owner_statements(&mut stream, registry, site).await
+}
 
+/// How long a refused stream waits for the client's first request before
+/// giving up on delivering the refusal. A client always sends one immediately
+/// after dialing; this only bounds a peer that never does.
+const REFUSAL_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Answer the client's first request on a stream this node will not serve
+/// with `reason` (an infrastructure error, flagged `closed`), then let the
+/// stream end. Best effort: a client that has already gone away gets nothing.
+async fn refuse_stream<S>(stream: &mut S, reason: String)
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let first: Result<Result<SqlRequest, _>, _> =
+        tokio::time::timeout(REFUSAL_READ_TIMEOUT, read_msg(stream)).await;
+    if let Ok(Ok(_)) = first {
+        let _ =
+            write_msg(stream, &SqlResponse::Error { sqlite: false, message: reason, closed: true })
+                .await;
+    }
+}
+
+/// Serve forwarded statements on an authorized stream until the client closes
+/// it.
+///
+/// The site's database and the owner session are opened **lazily**, on the
+/// first request, and re-attempted on each later request until they open. A
+/// failure to open is that request's answer — the owner's reason as an
+/// [`SqlResponse::Error`], with a busy database still saying "database is
+/// locked" so the client maps it to 1205 — and the stream stays up, so the
+/// client's next statement simply tries again. Nothing is lost by retrying: a
+/// session that never opened holds no transaction.
+///
+/// Holds the site's backend `Arc` for the stream's lifetime so the registry's
+/// refcount-aware LRU cannot evict the database out from under the live owner
+/// connection; the connection is dropped before that pin.
+async fn serve_owner_statements<S>(
+    stream: &mut S,
+    registry: &SiteBackends,
+    site: &str,
+) -> anyhow::Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut backend: Option<SharedBackend> = None;
+    let mut conn: Option<Box<dyn BackendConn>> = None;
     loop {
-        let req: SqlRequest = match read_msg(&mut stream).await {
+        let req: SqlRequest = match read_msg(stream).await {
             Ok(r) => r,
             // Clean close by the client (EOF) or a torn stream — either way this
             // stream is done; the client re-dials for its next session.
             Err(_) => break,
         };
-        let resp = execute_forwarded(conn.as_ref(), req).await;
-        write_msg(&mut stream, &resp).await.context("forwarded-SQL: write reply")?;
+        let resp = match open_owner_session(registry, site, &mut backend, &mut conn).await {
+            Ok(session) => execute_forwarded(session, req).await,
+            Err(e) => {
+                tracing::info!(site = %site, "forwarded-SQL: owner session not open: {e}");
+                error_response(&e)
+            }
+        };
+        write_msg(stream, &resp).await.context("forwarded-SQL: write reply")?;
     }
+    // Connection before the pin (see above).
+    drop(conn);
+    drop(backend);
     Ok(())
+}
+
+/// This stream's owner session, opening the site's database and a session on
+/// it if they are not open yet. Errors keep the backend's own words (so a busy
+/// database still classifies as 1205 on the client) and say which step failed.
+async fn open_owner_session<'c>(
+    registry: &SiteBackends,
+    site: &str,
+    backend: &mut Option<SharedBackend>,
+    conn: &'c mut Option<Box<dyn BackendConn>>,
+) -> Result<&'c dyn BackendConn, BackendError> {
+    if conn.is_none() {
+        if backend.is_none() {
+            let opened = registry.get_or_open(site).await.map_err(|e| {
+                BackendError::Other(format!(
+                    "could not open the database for site {site} on its owner: {e:#}"
+                ))
+            })?;
+            *backend = Some(opened);
+        }
+        let pinned = backend.as_ref().expect("backend was just ensured");
+        let session = pinned.connect().await.map_err(|e| {
+            let context =
+                format!("could not open a session on site {site}'s database on its owner");
+            match e {
+                BackendError::Sqlite(m) => BackendError::Sqlite(format!("{m} ({context})")),
+                BackendError::Other(m) => BackendError::Other(format!("{context}: {m}")),
+            }
+        })?;
+        *conn = Some(session);
+    }
+    Ok(conn.as_deref().expect("session was just ensured"))
 }
 
 /// Run one forwarded statement against the owner's local connection and shape
@@ -805,8 +932,12 @@ async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlRespon
 /// client can rebuild the exact variant and re-map it.
 fn error_response(e: &BackendError) -> SqlResponse {
     match e {
-        BackendError::Sqlite(msg) => SqlResponse::Error { sqlite: true, message: msg.clone() },
-        BackendError::Other(msg) => SqlResponse::Error { sqlite: false, message: msg.clone() },
+        BackendError::Sqlite(msg) => {
+            SqlResponse::Error { sqlite: true, message: msg.clone(), closed: false }
+        }
+        BackendError::Other(msg) => {
+            SqlResponse::Error { sqlite: false, message: msg.clone(), closed: false }
+        }
     }
 }
 
@@ -1051,18 +1182,58 @@ mod tests {
         // the inner message is sent, not the "SQLite error:"-prefixed Display.
         let sql_err = BackendError::Sqlite("UNIQUE constraint failed: t.id".into());
         match error_response(&sql_err) {
-            SqlResponse::Error { sqlite, message } => {
+            SqlResponse::Error { sqlite, message, closed } => {
+                assert!(!closed, "a statement error never ends the stream");
                 assert!(sqlite);
                 assert_eq!(message, "UNIQUE constraint failed: t.id");
             }
             _ => panic!("expected Error"),
         }
         match error_response(&BackendError::Other("boom".into())) {
-            SqlResponse::Error { sqlite, message } => {
+            SqlResponse::Error { sqlite, message, closed } => {
+                assert!(!closed, "a statement error never ends the stream");
                 assert!(!sqlite);
                 assert_eq!(message, "boom");
             }
             _ => panic!("expected Error"),
         }
+    }
+
+    /// A stream the owner will not serve is answered, not hung up on: the
+    /// client's first request gets the refusal as an infrastructure error
+    /// flagged `closed`, so the client reports the reason (and re-dials)
+    /// instead of `owner connection closed ... early eof`.
+    #[tokio::test]
+    async fn a_refused_stream_answers_the_first_request_with_the_reason() {
+        let (mut client, mut owner) = tokio::io::duplex(64 * 1024);
+        let refusal = tokio::spawn(async move {
+            refuse_stream(&mut owner, "connection refused by node n2: not the owner".into()).await;
+        });
+        write_msg(&mut client, &SqlRequest::Query { sql: "SELECT 1".into(), params: vec![] })
+            .await
+            .unwrap();
+        match read_msg::<_, SqlResponse>(&mut client).await.unwrap() {
+            SqlResponse::Error { sqlite, message, closed } => {
+                assert!(!sqlite, "a refusal is infrastructure, not SQL");
+                assert!(closed, "the client must drop the stream it was refused on");
+                assert!(message.contains("not the owner"), "{message}");
+                assert!(
+                    message.contains("connection refused"),
+                    "must stay connection-shaped so the bridge recycles and re-resolves: {message}"
+                );
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        refusal.await.unwrap();
+    }
+
+    /// Mixed-version clusters: an error reply from an owner that predates the
+    /// `closed` flag still parses, as "stream stays open".
+    #[test]
+    fn an_error_reply_without_the_closed_flag_still_parses() {
+        let resp: SqlResponse =
+            serde_json::from_str(r#"{"Error":{"sqlite":true,"message":"database is locked"}}"#)
+                .unwrap();
+        assert!(matches!(resp, SqlResponse::Error { sqlite: true, closed: false, .. }));
     }
 }

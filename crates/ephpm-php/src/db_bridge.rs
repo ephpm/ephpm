@@ -291,6 +291,10 @@ pub const ERR_NO_SITE_CONTEXT: u16 = 2001;
 ///
 /// Distinct from [`ERR_UNAVAILABLE`]: the bridge is configured and the tenant
 /// is known — the storage underneath failed.
+///
+/// A session that could not be opened because the database was **busy** (the
+/// busy timeout ran out behind another connection's write lock) is not this:
+/// it is reported as MySQL `1205`, exactly like a busy statement.
 pub const ERR_CONNECT: u16 = 2002;
 
 /// SQLSTATE reported alongside every reserved infrastructure code. `HY000`
@@ -811,6 +815,29 @@ fn infra_error(code: u16, message: String) -> BridgeError {
     BridgeError { code, sqlstate: INFRA_SQLSTATE, message }
 }
 
+/// The error for a thread session that could not be opened.
+///
+/// A **busy** database is not a broken one: opening the session waited out the
+/// busy timeout behind another connection's write lock. That is reported the way
+/// a busy statement is — MySQL `1205` (lock wait timeout, SQLSTATE `HY000`),
+/// which adapters and frameworks already treat as transient and retryable —
+/// with a message that says the database was busy. Anything else is
+/// [`ERR_CONNECT`]: the storage underneath failed.
+fn session_open_error(e: &litewire::backend::BackendError) -> BridgeError {
+    let mapped = litewire::session::error_map::classify(&e.to_string());
+    if mapped.code == litewire::session::error_map::ER_LOCK_WAIT_TIMEOUT {
+        return BridgeError {
+            code: mapped.code,
+            sqlstate: mapped.sqlstate,
+            message: format!(
+                "database is busy (another connection held its write lock for the whole busy \
+                 timeout): could not open an embedded database session: {e}"
+            ),
+        };
+    }
+    infra_error(ERR_CONNECT, format!("failed to open embedded database session: {e}"))
+}
+
 /// Message substrings that mark a [`SessionError`] as connection-shaped —
 /// the backend connection (not the SQL) is what failed.
 ///
@@ -1130,12 +1157,7 @@ fn run_held(
                     _backend: backend,
                 });
             }
-            Err(e) => {
-                return Err(RunFailure::Error(infra_error(
-                    ERR_CONNECT,
-                    format!("failed to open embedded database session: {e}"),
-                )));
-            }
+            Err(e) => return Err(RunFailure::Error(session_open_error(&e))),
         }
     }
 
@@ -3013,6 +3035,9 @@ mod panic_tests {
         connects: AtomicUsize,
         panic_on_connect: AtomicBool,
         panic_on_query: AtomicBool,
+        /// `connect` fails the way a session open does when the busy timeout
+        /// runs out behind another connection's write lock.
+        busy_on_connect: AtomicBool,
     }
 
     struct PanickyBackend {
@@ -3031,6 +3056,11 @@ mod panic_tests {
     impl Backend for PanickyBackend {
         async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
             assert!(!self.flags.panic_on_connect.load(Ordering::SeqCst), "{ASSERT_TEXT}");
+            if self.flags.busy_on_connect.load(Ordering::SeqCst) {
+                return Err(BackendError::Sqlite(
+                    "database is locked (SQLITE_BUSY): database is locked".into(),
+                ));
+            }
             let inner = self.inner.connect().await?;
             self.flags.connects.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(PanickyConn { inner, flags: Arc::clone(&self.flags) }))
@@ -3150,6 +3180,40 @@ mod panic_tests {
         assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
         assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
         finish();
+    }
+
+    /// A session that cannot open because the database is busy is reported
+    /// as busy — `1205`, like a busy statement — not as the infrastructure
+    /// failure `ERR_CONNECT` ("failed to open embedded database session"),
+    /// which reads like a broken database. The stress run's owner-side bridge
+    /// errors were exactly this.
+    #[test]
+    fn a_busy_database_at_session_open_is_a_lock_wait() {
+        let (bridge, flags, _dir) = panicky_bridge();
+        flags.busy_on_connect.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        with_error(|e| {
+            let (code, sqlstate, msg) = e.expect("an error must be staged");
+            assert_eq!(code, litewire::session::error_map::ER_LOCK_WAIT_TIMEOUT, "got: {msg}");
+            assert_eq!(sqlstate, b"HY000");
+            assert!(msg.contains("database is busy"), "got: {msg}");
+            assert!(msg.contains("database is locked"), "got: {msg}");
+        });
+        assert!(!held_session_exists());
+
+        // Not sticky: the next statement opens normally once it is free.
+        flags.busy_on_connect.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        finish();
+    }
+
+    /// Any other failure to open a session is still the infrastructure code.
+    #[test]
+    fn a_non_busy_session_open_failure_is_still_err_connect() {
+        let err = session_open_error(&BackendError::Other("disk I/O error".into()));
+        assert_eq!(err.code, ERR_CONNECT);
+        assert_eq!(&err.sqlstate, b"HY000");
+        assert!(err.message.contains("failed to open embedded database session"));
     }
 
     #[test]

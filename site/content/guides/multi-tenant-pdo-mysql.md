@@ -234,7 +234,8 @@ not its own.
 | Wrong / missing password | `ERROR 1698 (28000)`, connection closed, no database opened |
 | Username is not a valid site key | Refused before any path is derived from it |
 | Request `Host` matches no vhost | No `DB_*` injected and no database context — the default docroot cannot mint `<host>.db` |
-| A site's database cannot be opened | That connection is refused — never a fallback to another site's |
+| A site's database cannot be opened | That connection gets no database — never a fallback to another site's. The credential did verify, so this is **not** reported as `1698`: the client gets the database's own error (`1105`, naming the site and the cause), at connect time when the DSN names a `dbname`, otherwise on its first statement |
+| A site's database is busy (another connection holds its write lock) | Connecting and reading work; a write waits out the busy timeout (5 s) and then fails with `ERROR 1205 (HY000)` "database is locked", the same code MySQL uses for a lock-wait timeout. If the session itself cannot be opened, the same `1205` arrives at connect time (or on the first statement), never `1698`, and the open is retried on the next statement |
 | Per-site wire not active | No `DB_*` in `$_SERVER` at all — a visibly absent config, not a shared one |
 
 ## Interaction with the `ephpm_db_*` bridge
@@ -265,10 +266,18 @@ Two things worth knowing:
 - **A connection is routed once, when it is opened.** Ownership is recomputed
   from live membership, so it can move while a connection is open. When it does,
   the old owner refuses the forwarded statements and the tenant sees an ordinary
-  connection error until it reconnects — loudly, rather than writing somewhere
-  the write would not replicate. Non-persistent `pdo_mysql` (the default) opens
-  a connection per request, so the blast radius is one request;
+  connection error until it reconnects ("connection refused by node … it is no
+  longer the owner of site …") — loudly, rather than writing somewhere the write
+  would not replicate. Non-persistent `pdo_mysql` (the default) opens a
+  connection per request, so the blast radius is one request;
   `PDO::ATTR_PERSISTENT` widens it until PHP drops the handle.
+- **The owner's errors come back as they are.** A forwarded statement that fails
+  on the owner is reported with the owner's own error — a busy site is `1205`
+  "database is locked", a duplicate key is `1062` — on whichever node the request
+  hit. That includes the owner failing to open the site's database or a session
+  on it: the reason is sent back and the next statement retries. Only a real
+  transport failure (the owner is down or unreachable) reads as
+  `owner connection closed …`.
 - **A forwarded statement is measured on the owner.** Its
   [query stats](/architecture/query-stats/) are recorded there, not on the node
   the request hit. `ATTACH` / `VACUUM` / path-`PRAGMA` rejections are unchanged

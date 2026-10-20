@@ -220,7 +220,29 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 83820f3035c9 — WAL checkpoint gate escalation (litewire#50).
+# litewire @ 4c84c8034770 — busy databases report as busy (litewire#51).
+# Two misleading errors from a 3-node per-site clustered stress run while one
+# site held a 3,000-row write transaction. (1) `enable_cdc_on_connect` ran
+# `PRAGMA capture_data_changes_conn('full')` inside `Backend::connect`, and
+# Turso compiles that pragma as a WRITE transaction. Every new session on a
+# capturing factory therefore queued on the database's write lock behind any
+# open write transaction and failed to open once the 5 s busy timeout ran out.
+# That hit readers, the owner side of forwarded statements and pdo_mysql
+# connects. Capture now switches on just before a session's first statement
+# that is not a single plain SELECT (BEGIN included), so opening a session and
+# reading never touch the write lock, and every write is still captured.
+# (2) BREAKING API: `ConnectionAuthenticator::authenticate` returns
+# `AuthOutcome { Granted, Denied, Unavailable(reason) }` instead of
+# `Option<SharedBackend>`. When the credential verified but no session could be
+# opened, the MySQL frontend now answers with the database's own error,
+# classified like a statement error (busy -> 1205, otherwise 1105), at
+# COM_INIT_DB or the first command, and retries the open. It used to answer
+# `1698 Authenticate failed`. `SiteWireAuth` returns `Unavailable` when a
+# verified site's database cannot be resolved. Single commit on top of
+# 83820f3035c9; no dependency moves (turso stays =0.8.3); the lockfile changes
+# only the litewire crates' source rev.
+#
+# Previous pin 83820f3035c9 — WAL checkpoint gate escalation (litewire#50).
 # OPERABILITY: do not move this pin backwards. The gate below took its
 # exclusive lock with a bounded wait (250 ms) and backed off on timeout. In a
 # mixed stress run, 48 clients ran heavy reads (COUNT/GROUP BY/joins over a
@@ -524,7 +546,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "83820f3035c91b9c04df5cff929db2d1312c003f", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "4c84c803477072587966673d466ca4975096a619", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)

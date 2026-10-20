@@ -13455,7 +13455,7 @@ echo "post response";
         use std::collections::HashMap;
 
         use ephpm_config::SqliteConfig;
-        use litewire::backend::{AuthRequest, ConnectionAuthenticator};
+        use litewire::backend::{AuthOutcome, AuthRequest, ConnectionAuthenticator};
 
         use super::*;
         use crate::site_backends::SiteBackends;
@@ -13659,7 +13659,7 @@ echo "post response";
             let password = d.wire_password.expect("per-site DB_PASSWORD");
 
             // The listener accepts them...
-            let backend = auth
+            let AuthOutcome::Granted(backend) = auth
                 .authenticate(&AuthRequest {
                     auth_plugin: "mysql_native_password",
                     username: user.as_bytes(),
@@ -13669,7 +13669,9 @@ echo "post response";
                     peer_addr: "127.0.0.1:40000".parse().unwrap(),
                 })
                 .await
-                .expect("the credential the router injected must authenticate");
+            else {
+                panic!("the credential the router injected must authenticate");
+            };
 
             // ...and hands back the same file the bridge would open.
             backend

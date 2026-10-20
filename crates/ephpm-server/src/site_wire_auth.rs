@@ -138,7 +138,7 @@
 
 use std::sync::Arc;
 
-use litewire::backend::{AuthRequest, ConnectionAuthenticator, SharedBackend};
+use litewire::backend::{AuthOutcome, AuthRequest, ConnectionAuthenticator, SharedBackend};
 use litewire::litewire_mysql::native_password;
 
 use crate::site_backends::SiteBackends;
@@ -209,8 +209,10 @@ pub trait SiteWireRoute: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns an error if the site's database cannot be opened, or (clustered)
-    /// if its owner cannot be addressed. Either way the connection is refused;
-    /// there is never a fallback to another site's data.
+    /// if its owner cannot be addressed. Either way the connection gets no
+    /// backend — there is never a fallback to another site's data — and the
+    /// client is told why with a non-authentication error (the credential did
+    /// verify), not `1698 Authenticate failed`.
     async fn backend_for(&self, site_key: &str) -> anyhow::Result<SharedBackend>;
 }
 
@@ -344,12 +346,12 @@ impl SiteWireAuth {
 
 #[litewire::async_trait]
 impl ConnectionAuthenticator for SiteWireAuth {
-    async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
+    async fn authenticate(&self, req: &AuthRequest<'_>) -> AuthOutcome {
         // MySQL usernames are bytes; a site key is always ASCII, so anything
         // that is not valid UTF-8 cannot be one.
         let Ok(username) = std::str::from_utf8(req.username) else {
             tracing::warn!("per-site MySQL auth: rejected a non-UTF-8 username");
-            return None;
+            return AuthOutcome::Denied;
         };
 
         // Normalize exactly as the router does when it mints the password and
@@ -362,7 +364,7 @@ impl ConnectionAuthenticator for SiteWireAuth {
                 user = %username,
                 "per-site MySQL auth: rejected a username that is not a valid site key"
             );
-            return None;
+            return AuthOutcome::Denied;
         }
 
         // Verify BEFORE resolving. Order matters: resolving first would let an
@@ -376,7 +378,7 @@ impl ConnectionAuthenticator for SiteWireAuth {
                 peer = %req.peer_addr,
                 "per-site MySQL auth: password verification failed — refusing the connection"
             );
-            return None;
+            return AuthOutcome::Denied;
         }
 
         // Authenticated. Only now is this connection entitled to a database,
@@ -390,17 +392,26 @@ impl ConnectionAuthenticator for SiteWireAuth {
         match self.inner.route.backend_for(&site_key).await {
             Ok(backend) => {
                 tracing::debug!(site = %site_key, "per-site MySQL connection authenticated");
-                Some(backend)
+                AuthOutcome::Granted(backend)
             }
             Err(e) => {
                 // Fail closed: a site whose database cannot be opened gets no
-                // connection, never a fallback to some other site's.
+                // backend, never a fallback to some other site's. But the
+                // credential DID verify, so this is not an authentication
+                // failure and must not be reported as one: `Unavailable`
+                // gives the client the database's error (a busy database is
+                // 1205, anything else 1105) instead of `1698 Authenticate
+                // failed`, which reads as a wrong password. Safe to reveal:
+                // only a caller that proved it holds this site's password
+                // ever gets here.
                 tracing::error!(
                     site = %site_key,
                     "per-site MySQL auth: authenticated but could not open the site's database, \
                      refusing the connection: {e:#}"
                 );
-                None
+                AuthOutcome::Unavailable(format!(
+                    "could not open the database for site {site_key}: {e:#}"
+                ))
             }
         }
     }
@@ -440,6 +451,18 @@ mod tests {
         stage1.iter().zip(mask).map(|(s, m)| s ^ m).collect()
     }
 
+    /// The backend a granted connection is bound to, `None` otherwise.
+    fn granted(outcome: AuthOutcome) -> Option<SharedBackend> {
+        match outcome {
+            AuthOutcome::Granted(backend) => Some(backend),
+            AuthOutcome::Denied | AuthOutcome::Unavailable(_) => None,
+        }
+    }
+
+    fn is_denied(outcome: &AuthOutcome) -> bool {
+        matches!(outcome, AuthOutcome::Denied)
+    }
+
     const SALT: &[u8] = b"abcdefghijklmnopqrst";
 
     fn request<'a>(user: &'a str, response: &'a [u8]) -> AuthRequest<'a> {
@@ -460,10 +483,9 @@ mod tests {
         let auth = auth(tmp.path().to_path_buf());
 
         let pw = auth.password_for("site-a.test");
-        let backend = auth
-            .authenticate(&request("site-a.test", &client_response(&pw, SALT)))
-            .await
-            .expect("a site's own password must authenticate");
+        let backend =
+            granted(auth.authenticate(&request("site-a.test", &client_response(&pw, SALT))).await)
+                .expect("a site's own password must authenticate");
 
         // And it is that site's database, not some shared one.
         let conn = backend.connect().await.expect("connect");
@@ -482,7 +504,7 @@ mod tests {
         let denied =
             auth.authenticate(&request("site-a.test", &client_response(&b_password, SALT))).await;
 
-        assert!(denied.is_none(), "site-b's password must not open site-a's database");
+        assert!(is_denied(&denied), "site-b's password must not open site-a's database");
         assert!(
             !tmp.path().join("site-a.test.db").exists(),
             "a failed authentication must not open (or create) the target's database file"
@@ -525,7 +547,7 @@ mod tests {
     async fn no_password_is_denied() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let auth = auth(tmp.path().to_path_buf());
-        assert!(auth.authenticate(&request("site-a.test", b"")).await.is_none());
+        assert!(is_denied(&auth.authenticate(&request("site-a.test", b"")).await));
     }
 
     // -----------------------------------------------------------------------
@@ -590,10 +612,9 @@ mod tests {
             SiteWireAuth::with_route(Arc::clone(&route) as Arc<dyn SiteWireRoute>).expect("secret");
 
         let pw = auth.password_for("site-a.test");
-        let got = auth
-            .authenticate(&request("site-a.test", &client_response(&pw, SALT)))
-            .await
-            .expect("a site's own password must authenticate");
+        let got =
+            granted(auth.authenticate(&request("site-a.test", &client_response(&pw, SALT))).await)
+                .expect("a site's own password must authenticate");
 
         assert!(
             Arc::ptr_eq(&got, &route.backend),
@@ -624,7 +645,7 @@ mod tests {
         let denied =
             auth.authenticate(&request("site-a.test", &client_response(&b_password, SALT))).await;
 
-        assert!(denied.is_none(), "site-b's password must not open site-a's database");
+        assert!(is_denied(&denied), "site-b's password must not open site-a's database");
         assert!(
             route.asked().is_empty(),
             "a failed authentication must not consult the route at all, let alone dial \
@@ -642,7 +663,9 @@ mod tests {
 
         for user in ["../etc/passwd", "a/b", "", "site a"] {
             let pw = auth.password_for(user);
-            assert!(auth.authenticate(&request(user, &client_response(&pw, SALT))).await.is_none());
+            assert!(is_denied(
+                &auth.authenticate(&request(user, &client_response(&pw, SALT))).await
+            ));
         }
         assert_eq!(route.asked(), Vec::<String>::new());
     }
@@ -663,10 +686,25 @@ mod tests {
 
         let auth = SiteWireAuth::with_route(Arc::new(FailingRoute)).expect("secret");
         let pw = auth.password_for("site-a.test");
-        assert!(
-            auth.authenticate(&request("site-a.test", &client_response(&pw, SALT))).await.is_none(),
-            "a site whose backend cannot be resolved gets no connection"
-        );
+        match auth.authenticate(&request("site-a.test", &client_response(&pw, SALT))).await {
+            // No backend, and — because the credential DID verify — the reason
+            // rather than an access-denied error (which reads as a wrong
+            // password: the stress run's `1698 Authenticate failed`).
+            AuthOutcome::Unavailable(reason) => {
+                assert!(reason.contains("site-a.test"), "{reason}");
+                assert!(reason.contains("owner unreachable"), "{reason}");
+            }
+            AuthOutcome::Granted(_) => panic!("a site whose backend cannot be resolved got one"),
+            AuthOutcome::Denied => {
+                panic!("a verified credential must not be reported as an authentication failure")
+            }
+        }
+
+        // A wrong password against the same failing route is still Denied.
+        let b_password = auth.password_for("site-b.test");
+        assert!(is_denied(
+            &auth.authenticate(&request("site-a.test", &client_response(&b_password, SALT))).await
+        ));
     }
 
     /// The forwarding resolver **is** a wire route.
@@ -697,7 +735,7 @@ mod tests {
             let pw = auth.password_for(user);
             let denied = auth.authenticate(&request(user, &client_response(&pw, SALT))).await;
             assert!(
-                denied.is_none(),
+                is_denied(&denied),
                 "username {user:?} must be rejected even with a correctly derived password"
             );
         }
