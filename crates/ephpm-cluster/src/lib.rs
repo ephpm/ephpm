@@ -16,6 +16,7 @@
 pub mod cluster_channel;
 pub mod clustered_store;
 pub mod gossip_kv;
+pub mod gossip_writer;
 pub mod kv_data_plane;
 pub mod node;
 pub mod secure_transport;

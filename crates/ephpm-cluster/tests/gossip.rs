@@ -165,7 +165,7 @@ async fn gossip_kv_set_get_local() {
     let node = start_node(port, vec![], "kv-local").await;
 
     // Set and immediately read back on the same node.
-    node.gossip_set("greeting", b"hello", None).await;
+    node.gossip_set("greeting", b"hello", None);
     let value = node.gossip_get("greeting").await;
     assert_eq!(value.as_deref(), Some(b"hello".as_slice()));
 
@@ -178,7 +178,7 @@ async fn gossip_kv_set_get_local() {
     assert!(!node.gossip_exists("missing").await);
 
     // Delete.
-    assert!(node.gossip_del("greeting").await);
+    assert!(node.gossip_del("greeting"));
     assert!(!node.gossip_exists("greeting").await);
 
     node.shutdown().await;
@@ -190,7 +190,7 @@ async fn gossip_kv_ttl_expiry() {
     let node = start_node(port, vec![], "kv-ttl").await;
 
     // Set with a very short TTL.
-    node.gossip_set("ephemeral", b"data", Some(Duration::from_millis(200))).await;
+    node.gossip_set("ephemeral", b"data", Some(Duration::from_millis(200)));
 
     // Should be readable immediately.
     assert!(node.gossip_get("ephemeral").await.is_some());
@@ -216,7 +216,7 @@ async fn gossip_kv_binary_data() {
 
     // Store arbitrary binary data including null bytes.
     let binary: Vec<u8> = (0..=255).collect();
-    node.gossip_set("bin", &binary, None).await;
+    node.gossip_set("bin", &binary, None);
 
     let value = node.gossip_get("bin").await.expect("should exist");
     assert_eq!(value, binary);
@@ -237,7 +237,7 @@ async fn gossip_kv_replicates_between_nodes() {
     wait_for_convergence(&[&node1, &node2], 2, Duration::from_secs(10)).await;
 
     // Set a key on node1.
-    node1.gossip_set("shared-key", b"from-node1", None).await;
+    node1.gossip_set("shared-key", b"from-node1", None);
 
     // Poll until node2 can see it (gossip propagation).
     let start = Instant::now();
@@ -280,7 +280,7 @@ async fn gossip_kv_cross_node_delete_wins_by_write_ms() {
 
     wait_for_convergence(&[&node1, &node2], 2, Duration::from_secs(10)).await;
 
-    node1.gossip_set("owned-by-1", b"value", None).await;
+    node1.gossip_set("owned-by-1", b"value", None);
 
     // Wait for node2 to see it.
     let start = Instant::now();
@@ -294,7 +294,7 @@ async fn gossip_kv_cross_node_delete_wins_by_write_ms() {
 
     // Non-owner delete: node2 broadcasts a tombstone. Always returns
     // true — the intent has been published either way.
-    assert!(node2.gossip_del("owned-by-1").await);
+    assert!(node2.gossip_del("owned-by-1"));
 
     // The tombstone is newer than node1's SET, so read paths on both
     // nodes must report the key as deleted within convergence.
@@ -321,7 +321,7 @@ async fn gossip_kv_exists_returns_true_for_set_key() {
     let port = random_udp_port().await;
     let node = start_node(port, vec![], "exists-test").await;
 
-    node.gossip_set("present", b"val", None).await;
+    node.gossip_set("present", b"val", None);
     assert!(node.gossip_exists("present").await);
     assert!(!node.gossip_exists("absent").await);
 
@@ -334,14 +334,14 @@ async fn gossip_kv_pttl_returns_remaining_ms() {
     let node = start_node(port, vec![], "pttl-test").await;
 
     // Key with TTL
-    node.gossip_set("ttl-key", b"val", Some(Duration::from_secs(60))).await;
+    node.gossip_set("ttl-key", b"val", Some(Duration::from_secs(60)));
     let pttl = node.gossip_pttl("ttl-key").await;
     assert!(pttl.is_some(), "TTL key should have pttl");
     let ms = pttl.unwrap();
     assert!(ms > 58_000 && ms <= 60_000, "pttl should be ~60s, got {ms}");
 
     // Key without TTL
-    node.gossip_set("no-ttl", b"val", None).await;
+    node.gossip_set("no-ttl", b"val", None);
     assert!(node.gossip_pttl("no-ttl").await.is_none(), "key without TTL should return None");
 
     // Missing key
@@ -355,9 +355,9 @@ async fn gossip_kv_keys_returns_all_keys() {
     let port = random_udp_port().await;
     let node = start_node(port, vec![], "keys-test").await;
 
-    node.gossip_set("alpha", b"1", None).await;
-    node.gossip_set("beta", b"2", None).await;
-    node.gossip_set("gamma", b"3", None).await;
+    node.gossip_set("alpha", b"1", None);
+    node.gossip_set("beta", b"2", None);
+    node.gossip_set("gamma", b"3", None);
 
     let keys = node.gossip_keys().await;
     assert!(keys.contains(&"alpha".to_string()));
@@ -373,10 +373,10 @@ async fn gossip_kv_exists_false_after_delete() {
     let port = random_udp_port().await;
     let node = start_node(port, vec![], "del-exists").await;
 
-    node.gossip_set("ephemeral", b"here", None).await;
+    node.gossip_set("ephemeral", b"here", None);
     assert!(node.gossip_exists("ephemeral").await);
 
-    node.gossip_del("ephemeral").await;
+    node.gossip_del("ephemeral");
     assert!(!node.gossip_exists("ephemeral").await, "deleted key should not exist");
 
     node.shutdown().await;

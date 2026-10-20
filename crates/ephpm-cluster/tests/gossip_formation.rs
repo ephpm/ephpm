@@ -116,7 +116,7 @@ async fn gossip_kv_propagates_between_nodes() {
     }
 
     // Set a KV entry on node-1.
-    handle1.gossip_set("test-key", b"test-value", None).await;
+    handle1.gossip_set("test-key", b"test-value", None);
 
     // Wait for it to propagate to node-2.
     let mut found = false;
@@ -150,7 +150,7 @@ async fn gossip_kv_with_ttl() {
     let handle = start_gossip(&config).await.unwrap();
 
     // Set with a long TTL.
-    handle.gossip_set("ttl-key", b"data", Some(Duration::from_secs(3600))).await;
+    handle.gossip_set("ttl-key", b"data", Some(Duration::from_secs(3600)));
 
     let value = handle.gossip_get("ttl-key").await;
     assert!(value.is_some(), "key with future TTL should be readable");
@@ -169,10 +169,10 @@ async fn gossip_del_removes_key() {
     let config = node_config("del-node", "test-del-cluster", addr, vec![]);
     let handle = start_gossip(&config).await.unwrap();
 
-    handle.gossip_set("del-me", b"value", None).await;
+    handle.gossip_set("del-me", b"value", None);
     assert!(handle.gossip_exists("del-me").await);
 
-    let deleted = handle.gossip_del("del-me").await;
+    let deleted = handle.gossip_del("del-me");
     assert!(deleted, "should return true for existing key");
 
     // After delete, key should no longer be found.

@@ -64,7 +64,7 @@ async fn nodes_with_matching_secret_converge() {
     assert!(discovered, "nodes with matching secrets should discover each other");
 
     // KV must propagate through the encrypted channel too.
-    handle1.gossip_set("enc-key", b"enc-value", None).await;
+    handle1.gossip_set("enc-key", b"enc-value", None);
     let mut found = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -225,7 +225,7 @@ async fn kv_replication() {
     for i in 0..KEY_COUNT {
         let key = format!("stress-key-{i:03}");
         let value = format!("value-{i:03}");
-        node0.gossip_set(&key, value.as_bytes(), None).await;
+        node0.gossip_set(&key, value.as_bytes(), None);
     }
 
     // Poll until all 3 nodes can read all 50 entries.
