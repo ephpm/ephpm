@@ -212,16 +212,30 @@ impl Default for StoreConfig {
 }
 
 /// A hash entry with TTL support.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct HashEntry {
     /// Field → value map. Values are [`Bytes`] so `hget`/`hgetall`/
     /// `hvals` return `Arc`-clones instead of copying every byte.
     fields: HashMap<String, Bytes>,
     /// Absolute expiry time, or `None` for persistent keys.
     expires_at: Option<Instant>,
+    /// Last access, as nanoseconds since the store anchor — the hash's LRU
+    /// clock, so `allkeys-lru` can rank hashes against string keys. Atomic
+    /// for the same reason as [`Entry::last_accessed`]: reads touch it under
+    /// the shard read lock.
+    last_accessed: AtomicU64,
 }
 
 impl HashEntry {
+    /// Touch the LRU clock, with the same coarse granularity as
+    /// [`Entry::touch`].
+    fn touch(&self, now_nanos: u64) {
+        let prev = self.last_accessed.load(Ordering::Relaxed);
+        if now_nanos.saturating_sub(prev) >= entry::LRU_TOUCH_GRANULARITY_NANOS {
+            self.last_accessed.store(now_nanos, Ordering::Relaxed);
+        }
+    }
+
     fn is_expired(&self) -> bool {
         self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
@@ -414,6 +428,12 @@ pub struct Store {
     /// next round continues from here, so every TTL hint is reached within one
     /// sweep however the work is split across cycles and writes.
     expire_cursor: AtomicU64,
+    /// State of the splitmix64 generator that picks random sample positions
+    /// for eviction. Not cryptographic; it only spreads samples over the map.
+    rng: AtomicU64,
+    /// The approximated-LRU eviction pool: the best victims seen by recent
+    /// samples, oldest first (see `Store::next_victim`).
+    eviction_pool: parking_lot::Mutex<Vec<Victim>>,
     /// Approximate total memory used by all entries.
     mem_used: AtomicUsize,
     /// Store configuration.
@@ -448,6 +468,8 @@ impl std::fmt::Debug for Store {
             .field("hashes_len", &self.hashes.len())
             .field("ttl_keys_len", &self.ttl_keys.len())
             .field("expire_cursor", &MapCursor::unpack(self.expire_cursor.load(Ordering::Relaxed)))
+            .field("eviction_pool_len", &self.eviction_pool.try_lock().map(|p| p.len()))
+            .field("rng", &self.rng.load(Ordering::Relaxed))
             .field("mem_used", &self.mem_used.load(Ordering::Relaxed))
             .field("config", &self.config)
             .field("replicator_installed", &self.replicator.read().is_ok_and(|g| g.is_some()))
@@ -467,6 +489,8 @@ impl Store {
             hashes: DashMap::new(),
             ttl_keys: DashMap::new(),
             expire_cursor: AtomicU64::new(0),
+            rng: AtomicU64::new(rng_seed()),
+            eviction_pool: parking_lot::Mutex::new(Vec::with_capacity(EVICTION_POOL_SIZE)),
             mem_used: AtomicUsize::new(0),
             config,
             replicator: std::sync::RwLock::new(None),
@@ -1864,7 +1888,11 @@ impl Store {
         let value = Bytes::from(value);
         let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
             self.mem_add(64); // base hash overhead
-            HashEntry { fields: HashMap::new(), expires_at: None }
+            HashEntry {
+                fields: HashMap::new(),
+                expires_at: None,
+                last_accessed: AtomicU64::new(self.now_nanos()),
+            }
         });
         if entry.is_expired() {
             let old_mem = entry.mem_size();
@@ -1872,6 +1900,7 @@ impl Store {
             entry.expires_at = None;
             self.mem_sub(old_mem);
         }
+        entry.touch(self.now_nanos());
         let is_new = !entry.fields.contains_key(field);
         if let Some(old_val) = entry.fields.insert(field.to_string(), value) {
             // Replaced — adjust memory for the difference.
@@ -1899,6 +1928,7 @@ impl Store {
             self.hash_remove(key);
             return None;
         }
+        entry.touch(self.now_nanos());
         entry.fields.get(field).cloned()
     }
 
@@ -1944,6 +1974,7 @@ impl Store {
             self.hash_remove(key);
             return Vec::new();
         }
+        entry.touch(self.now_nanos());
         entry.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
@@ -1958,6 +1989,7 @@ impl Store {
             self.hash_remove(key);
             return Vec::new();
         }
+        entry.touch(self.now_nanos());
         entry.fields.keys().cloned().collect()
     }
 
@@ -1974,6 +2006,7 @@ impl Store {
             self.hash_remove(key);
             return Vec::new();
         }
+        entry.touch(self.now_nanos());
         entry.fields.values().cloned().collect()
     }
 
@@ -1988,6 +2021,7 @@ impl Store {
             self.hash_remove(key);
             return 0;
         }
+        entry.touch(self.now_nanos());
         entry.fields.len()
     }
 
@@ -2002,6 +2036,7 @@ impl Store {
             self.hash_remove(key);
             return false;
         }
+        entry.touch(self.now_nanos());
         entry.fields.contains_key(field)
     }
 
@@ -2200,197 +2235,187 @@ impl Store {
 
         match self.config.eviction_policy {
             EvictionPolicy::NoEviction => false,
-            EvictionPolicy::AllKeysLru => self.evict_lru(needed, false),
-            EvictionPolicy::VolatileLru => self.evict_lru(needed, true),
-            EvictionPolicy::AllKeysRandom => self.evict_random(needed),
+            EvictionPolicy::AllKeysLru
+            | EvictionPolicy::VolatileLru
+            | EvictionPolicy::AllKeysRandom => self.evict(needed),
         }
     }
 
-    /// Sample-based LRU eviction (Redis `maxmemory-*-lru` approach).
+    /// Evict keys, per the configured policy, until `needed` more bytes fit.
     ///
-    /// Each attempt draws up to [`Self::lru_sample_size`] candidate keys from
-    /// *random shards* and evicts the single oldest of that sample. This is
-    /// intentionally NOT a global LRU: an exact LRU would need an intrusive
-    /// ordering list kept consistent with the `DashMap` under concurrent
-    /// access (every `get`/`set`/`del` re-linking a node under a second
-    /// lock), which is both a hot-path cost and a real correctness hazard.
-    /// Sampling keeps eviction O(`sample_size`) per victim — never O(n) — and
-    /// approximates true LRU well: with a 16-key sample the evicted key is
-    /// among the oldest with very high probability.
+    /// Returns `false` only when that is impossible: `needed` alone exceeds
+    /// the limit, no eligible key is left (e.g. `volatile-lru` over a store
+    /// with no TTL'd keys), or [`EVICTION_BUDGET`] ran out first.
     ///
-    /// # Why random shards
+    /// # Bounded by time, not by a victim count
     ///
-    /// The previous implementation walked `self.data.iter()` from the front
-    /// and stopped at `sample_size`, so it only ever *saw* the keys in the
-    /// first shard(s) — a large store's hot recent keys living in later
-    /// shards were never eviction candidates, and the same handful of keys
-    /// were re-sampled every attempt. Drawing from random shards removes that
-    /// bias so the sample is representative of the whole keyspace.
-    ///
-    /// `last_accessed` is read via a `Relaxed` atomic load — LRU sampling is
-    /// approximate by design, so a lost coarse-clock update just picks a
-    /// slightly-wrong victim, never a correctness bug.
-    fn evict_lru(&self, needed: usize, volatile_only: bool) -> bool {
+    /// This used to give up after 100 victims. With the store full of small
+    /// keys, 100 victims free ~25 KB, so every larger write was refused under
+    /// the *evicting* policies (155,921 refused writes under the default
+    /// `allkeys-lru` in the stress run, and 69% of 64 KB writes at a 64 MB
+    /// limit). Each victim now costs `O(sample)` — see
+    /// [`next_victim`](Self::next_victim) — so evicting a few thousand small
+    /// keys for one large value takes milliseconds, and the only cap is the
+    /// time budget that keeps one write from stalling indefinitely.
+    fn evict(&self, needed: usize) -> bool {
         let limit = self.config.memory_limit;
-
-        for attempt in 0..100u64 {
-            let current = self.mem_used.load(Ordering::Relaxed);
-            if current + needed <= limit {
-                return true;
-            }
-
-            match self.sample_oldest(volatile_only, attempt) {
-                Some(key) => {
-                    debug!(key = %key, "evicting key (LRU)");
-                    // Eviction is a local memory-pressure decision — replicas
-                    // manage their own memory. Do not broadcast the reap.
-                    self.remove_local(&key);
-                }
-                None => return false, // nothing eligible to evict
-            }
+        if needed > limit {
+            return false; // no amount of eviction makes this fit
         }
-
-        // Gave it a good try.
-        self.mem_used.load(Ordering::Relaxed) + needed <= limit
+        let start = Instant::now();
+        let mut evicted = 0usize;
+        let fitted = loop {
+            if self.fits(needed) {
+                break true;
+            }
+            if start.elapsed() >= EVICTION_BUDGET {
+                break self.fits(needed);
+            }
+            let Some(victim) = self.next_victim() else {
+                break false; // nothing eligible left
+            };
+            debug!(key = %victim.key, hash = victim.hash, "evicting key");
+            // Eviction is a local memory-pressure decision — replicas manage
+            // their own memory — so it is never broadcast.
+            if self.evict_victim(&victim) {
+                evicted += 1;
+            }
+        };
+        trace!(evicted, needed, fitted, "eviction pass");
+        fitted
     }
 
-    /// Number of candidate keys drawn per eviction victim. Matches Redis'
-    /// default `maxmemory-samples` of 5-ish scaled up for our coarse
-    /// (100ms-granularity) LRU clock so ties on the coarse timestamp still
-    /// leave a meaningful spread of candidates.
-    const fn lru_sample_size() -> usize {
-        16
-    }
-
-    /// Draw up to [`Self::lru_sample_size`] candidate keys from random shards
-    /// and return the key with the oldest `last_accessed`.
+    /// Pick the next eviction victim for the configured policy, or `None`
+    /// when no eligible key exists.
     ///
-    /// Returns `None` only when no eligible key exists (`volatile_only` with
-    /// zero TTL'd keys, or an empty store). Bounded work: it visits at most
-    /// `shard_count + sample_size` shard entries regardless of store size, so
-    /// eviction never walks the whole map.
-    // The `raw-api` shard iterator is the only `unsafe` in this otherwise
-    // safe crate; it is fully justified by the SAFETY comment on the loop
-    // below (buckets are read under the shard's own read lock).
-    #[allow(unsafe_code)]
-    fn sample_oldest(&self, volatile_only: bool, attempt: u64) -> Option<String> {
-        let shards = self.data.shards();
-        let shard_count = shards.len();
-        if shard_count == 0 {
-            return None;
+    /// * `allkeys-lru` / `volatile-lru`: Redis' approximated LRU with an
+    ///   **eviction pool**. Each call samples [`EVICTION_SAMPLES`] keys from a
+    ///   random position — string keys and hashes for `allkeys-lru`, only
+    ///   TTL'd keys (drawn from the TTL index, not the whole map) for
+    ///   `volatile-lru` — merges them into a pool of the
+    ///   [`EVICTION_POOL_SIZE`] best candidates kept across calls, and takes
+    ///   the oldest. The pool carries good candidates over from earlier
+    ///   samples, so successive victims approximate a true LRU order far
+    ///   better than "oldest of one sample". An expired key is always the
+    ///   best candidate.
+    /// * `allkeys-random`: one key from a random position — a string key, or a
+    ///   hash once no string keys remain.
+    ///
+    /// Every policy costs `O(sample)` per victim. The old LRU sampler skipped
+    /// TTL-less keys *without counting them*, so `volatile-lru` over a store of
+    /// mostly persistent keys walked the whole map on every write (~3 ms per
+    /// write); the old random picker did `data.iter().nth(random)`, O(n) per
+    /// victim (filling a 64 MB store was 20x slower than LRU).
+    fn next_victim(&self) -> Option<Victim> {
+        match self.config.eviction_policy {
+            EvictionPolicy::NoEviction => None,
+            EvictionPolicy::AllKeysRandom => self.random_victim(),
+            EvictionPolicy::AllKeysLru => self.lru_victim(false),
+            EvictionPolicy::VolatileLru => self.lru_victim(true),
         }
-
-        // Pseudo-random starting shard, mixed from wall-clock nanos and the
-        // retry counter so successive attempts probe different shards (same
-        // entropy source as `evict_random`; avoids pulling in an rng crate).
-        let nanos = u64::from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos(),
-        );
-        let seed = nanos
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(attempt.wrapping_mul(1_442_695_040_888_963_407));
-        #[allow(clippy::cast_possible_truncation)]
-        let start = (seed >> 33) as usize % shard_count;
-
-        let sample_size = Self::lru_sample_size();
-        let mut oldest: Option<(String, u64)> = None;
-        let mut sampled = 0usize;
-
-        // Visit shards in a rotated order starting at `start`, collecting up
-        // to `sample_size` candidates. Small stores are fully covered (every
-        // shard is visited), so the true oldest is always found; large stores
-        // stop early once the sample budget is met.
-        for offset in 0..shard_count {
-            if sampled >= sample_size {
-                break;
-            }
-            let shard = shards[(start + offset) % shard_count].read();
-            // The `raw-api` shard is a `hashbrown::raw::RawTable`; its iterator
-            // yields buckets rather than `(&K, &V)` pairs.
-            //
-            // SAFETY: `bucket.as_ref()` dereferences a live bucket into a
-            // shared reference. The invariants are (1) the bucket belongs to
-            // this table and (2) the table is not mutated for the reference's
-            // lifetime. Both hold: the bucket comes from this shard's own
-            // `iter()`, and we hold the shard's read lock (`shard`) for the
-            // entire loop, so no writer can rehash or remove entries.
-            for bucket in unsafe { shard.iter() } {
-                let (key, slot) = unsafe { bucket.as_ref() };
-                let entry = slot.get();
-                if volatile_only && entry.expires_at.is_none() {
-                    continue;
-                }
-                let ts = entry.last_accessed_nanos();
-                match &oldest {
-                    Some((_, oldest_ts)) if ts < *oldest_ts => {
-                        oldest = Some((key.clone(), ts));
-                    }
-                    None => oldest = Some((key.clone(), ts)),
-                    _ => {}
-                }
-                sampled += 1;
-                if sampled >= sample_size {
-                    break;
-                }
-            }
-        }
-
-        oldest.map(|(key, _)| key)
     }
 
-    /// Random eviction — pick a pseudo-random key and remove it.
+    /// A random position in a map's bucket space, from the store's generator.
+    fn random_cursor(&self) -> MapCursor {
+        let r = self.next_rand();
+        #[allow(clippy::cast_possible_truncation, reason = "only the low bits pick a position")]
+        MapCursor { shard: (r >> 48) as usize, bucket: r as usize }
+    }
+
+    /// `allkeys-random`: the key at a random position.
+    fn random_victim(&self) -> Option<Victim> {
+        let mut found = None;
+        scan_map(&self.data, self.random_cursor(), 1, |k, _| {
+            found = Some(Victim { key: k.clone(), hash: false, idle_rank: 0 });
+        });
+        if found.is_none() {
+            scan_map(&self.hashes, self.random_cursor(), 1, |k, _| {
+                found = Some(Victim { key: k.clone(), hash: true, idle_rank: 0 });
+            });
+        }
+        found
+    }
+
+    /// LRU victim through the eviction pool (see [`next_victim`]).
     ///
-    /// Uses time-based entropy mixed with an iteration counter to select
-    /// different keys on each attempt, avoiding the deterministic "always
-    /// evict the first shard entry" pattern.
-    fn evict_random(&self, needed: usize) -> bool {
-        let limit = self.config.memory_limit;
-
-        for attempt in 0..100u64 {
-            let current = self.mem_used.load(Ordering::Relaxed);
-            if current + needed <= limit {
-                return true;
-            }
-
-            let len = self.data.len();
-            if len == 0 {
-                return false;
-            }
-
-            // Mix time nanos with attempt counter for pseudo-random offset.
-            let nanos = u64::from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos(),
-            );
-            let seed = nanos
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(attempt.wrapping_mul(1_442_695_040_888_963_407));
-            #[allow(clippy::cast_possible_truncation)]
-            let skip = (seed >> 33) as usize % len;
-
-            let key = self.data.iter().nth(skip).map(|e| e.key().clone());
-            if let Some(key) = key {
-                debug!(key = %key, "evicting key (random)");
-                // Eviction is a local memory-pressure decision.
-                self.remove_local(&key);
-            } else {
-                // skip went past the end — try first entry as fallback.
-                let key = self.data.iter().next().map(|e| e.key().clone());
-                if let Some(key) = key {
-                    debug!(key = %key, "evicting key (random fallback)");
-                    self.remove_local(&key);
+    /// [`next_victim`]: Self::next_victim
+    fn lru_victim(&self, volatile_only: bool) -> Option<Victim> {
+        let mut fresh: Vec<Victim> = Vec::with_capacity(EVICTION_SAMPLES + EVICTION_HASH_SAMPLES);
+        if volatile_only {
+            // Draw from the TTL index, so persistent keys cost nothing however
+            // many there are. The deadline in the hint says whether the key
+            // has already expired; otherwise its idle time decides.
+            let now = Instant::now();
+            let mut picked: Vec<(String, Instant)> = Vec::with_capacity(EVICTION_SAMPLES);
+            scan_map(&self.ttl_keys, self.random_cursor(), EVICTION_SAMPLES, |k, at| {
+                picked.push((k.clone(), *at));
+            });
+            for (key, at) in picked {
+                let rank = if at <= now {
+                    0
+                } else if let Some(entry) = self.data.get(&key) {
+                    entry.last_accessed_nanos().saturating_add(1)
                 } else {
-                    return false;
-                }
+                    continue; // stale hint; active expiry prunes it
+                };
+                fresh.push(Victim { key, hash: false, idle_rank: rank });
             }
+        } else {
+            scan_map(&self.data, self.random_cursor(), EVICTION_SAMPLES, |k, e| {
+                let rank =
+                    if e.is_expired() { 0 } else { e.last_accessed_nanos().saturating_add(1) };
+                fresh.push(Victim { key: k.clone(), hash: false, idle_rank: rank });
+            });
+            // Hashes are keys too: under `allkeys-lru` they used to be
+            // invisible to eviction, so a store filled by HSET could only
+            // refuse. A smaller sample keeps the common no-hash case cheap.
+            scan_map(&self.hashes, self.random_cursor(), EVICTION_HASH_SAMPLES, |k, h| {
+                let rank = h.last_accessed.load(Ordering::Relaxed).saturating_add(1);
+                fresh.push(Victim { key: k.clone(), hash: true, idle_rank: rank });
+            });
         }
 
-        self.mem_used.load(Ordering::Relaxed) + needed <= limit
+        let mut pool = self.eviction_pool.lock();
+        for victim in fresh {
+            match pool.iter_mut().find(|p| p.key == victim.key && p.hash == victim.hash) {
+                // Re-sampled: refresh its rank (it may have been touched).
+                Some(existing) => existing.idle_rank = victim.idle_rank,
+                None => pool.push(victim),
+            }
+        }
+        // Oldest (lowest rank) first; keep only the best candidates.
+        pool.sort_unstable_by_key(|v| v.idle_rank);
+        pool.truncate(EVICTION_POOL_SIZE);
+        if pool.is_empty() { None } else { Some(pool.remove(0)) }
+    }
+
+    /// Remove an eviction victim. Removes only the map the victim came from:
+    /// a string key and a hash may share a name, and evicting one must not
+    /// take the other. Returns `true` if something was removed (a pooled
+    /// candidate may have been deleted since it was sampled).
+    fn evict_victim(&self, victim: &Victim) -> bool {
+        let removed = if victim.hash {
+            self.hash_remove(&victim.key)
+        } else if let Some((_, old)) = self.data.remove(&victim.key) {
+            self.mem_sub(old.mem_size);
+            self.ttl_index_drop(&victim.key, old.expires_at);
+            true
+        } else {
+            false
+        };
+        if removed {
+            // Waiters observe an evicted key as deleted, as for any removal.
+            self.notify_write(&victim.key);
+        }
+        removed
+    }
+
+    /// Next value from the store's splitmix64 generator.
+    fn next_rand(&self) -> u64 {
+        let mut z = self.rng.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 
@@ -2405,6 +2430,43 @@ pub const EXPIRE_ACCEPTABLE_STALE_PERCENT: usize = 10;
 /// Most time a single write spends reclaiming expired keys before it falls
 /// back to eviction or refusal.
 const OOM_RECLAIM_BUDGET: Duration = Duration::from_millis(2);
+
+/// Most time one write spends evicting before it gives up and is refused.
+/// Generous: each victim costs a few microseconds, so this is thousands of
+/// victims — it exists to bound a pathological case, not to ration work.
+const EVICTION_BUDGET: Duration = Duration::from_millis(50);
+
+/// String keys sampled per LRU eviction step (Redis' `maxmemory-samples` is
+/// 5; more suits our coarse, 100 ms LRU clock, where ties are common).
+const EVICTION_SAMPLES: usize = 16;
+
+/// Hashes sampled per `allkeys-lru` eviction step, alongside the string keys.
+const EVICTION_HASH_SAMPLES: usize = 4;
+
+/// Best candidates the LRU eviction pool keeps across steps (Redis'
+/// `EVPOOL_SIZE`).
+const EVICTION_POOL_SIZE: usize = 16;
+
+/// An eviction candidate.
+#[derive(Debug, Clone)]
+struct Victim {
+    key: String,
+    /// `true` for a hash, `false` for a string key.
+    hash: bool,
+    /// Lower is a better victim: `0` for an already-expired key, otherwise
+    /// last access (nanos since the store anchor) plus one.
+    idle_rank: u64,
+}
+
+/// Seed for a store's sampling generator: wall-clock nanos mixed with a
+/// process-wide counter, so stores built in the same nanosecond still differ.
+fn rng_seed() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0xA076_1D64_78BD_642F)
+}
 
 /// What one active-expiry round saw.
 #[derive(Debug, Clone, Copy)]
@@ -3769,19 +3831,19 @@ mod tests {
         // (and it must NEVER evict it before the newer keys are gone, which is
         // covered separately by `allkeys_lru_evicts_oldest_accessed_key`).
         let mut evicted_ancient = false;
-        for n in 0..500u64 {
+        for _ in 0..500 {
             if s.get("ancient").is_none() {
                 evicted_ancient = true;
                 break;
             }
-            if let Some(victim) = s.sample_oldest(false, n) {
-                s.remove_local(&victim);
+            if let Some(victim) = s.lru_victim(false) {
+                s.evict_victim(&victim);
             }
         }
         assert!(evicted_ancient, "sampled LRU across many shards never evicted the oldest key");
     }
 
-    /// `sample_oldest` with `volatile_only = true` must never return a
+    /// `lru_victim` with `volatile_only = true` must never return a
     /// persistent (TTL-less) key, even when persistent keys vastly outnumber
     /// the volatile ones and are spread across shards.
     #[test]
@@ -3799,32 +3861,183 @@ mod tests {
             s.set(format!("vol{i}"), vec![0u8; 32], Some(Duration::from_secs(3600)));
         }
         // Every victim the volatile sampler yields must carry a TTL.
-        for attempt in 0..500u64 {
-            if let Some(victim) = s.sample_oldest(true, attempt) {
+        for _ in 0..500 {
+            if let Some(victim) = s.lru_victim(true) {
                 assert!(
-                    victim.starts_with("vol"),
-                    "volatile sampler returned persistent key {victim}"
+                    victim.key.starts_with("vol"),
+                    "volatile sampler returned persistent key {}",
+                    victim.key
                 );
             }
         }
     }
 
-    /// `sample_oldest` returns `None` when there is nothing eligible: an empty
+    /// `lru_victim` returns `None` when there is nothing eligible: an empty
     /// store, and a volatile-only sample over a store with no TTL'd keys.
     #[test]
-    fn sample_oldest_none_when_nothing_eligible() {
+    fn lru_victim_none_when_nothing_eligible() {
         let s = Store::new(StoreConfig {
             memory_limit: 0,
             eviction_policy: EvictionPolicy::VolatileLru,
             compression: CompressionConfig::default(),
         });
-        assert!(s.sample_oldest(false, 0).is_none(), "empty store has no victim");
+        assert!(s.lru_victim(false).is_none(), "empty store has no victim");
         s.set("perm".into(), vec![0u8; 16], None);
         assert!(
-            s.sample_oldest(true, 0).is_none(),
+            s.lru_victim(true).is_none(),
             "volatile sample over persistent-only store must be None"
         );
-        assert!(s.sample_oldest(false, 0).is_some(), "allkeys sample sees the persistent key");
+        assert!(s.lru_victim(false).is_some(), "allkeys sample sees the persistent key");
+    }
+
+    /// Fill a store of `limit` bytes under `policy` with 100-byte keys until
+    /// the first eviction (or refusal), TTL'd when `ttl` is set.
+    fn full_store(limit: usize, policy: EvictionPolicy, ttl: Option<Duration>) -> Arc<Store> {
+        let s = Store::new(StoreConfig {
+            memory_limit: limit,
+            eviction_policy: policy,
+            compression: CompressionConfig::default(),
+        });
+        let mut i = 0;
+        while s.mem_used() + 400 < limit {
+            assert!(s.set(format!("small{i}"), vec![b's'; 100], ttl));
+            i += 1;
+        }
+        s
+    }
+
+    /// F-3: eviction stopped after 100 victims (~25 KB of 100-byte keys), so
+    /// under every evicting policy a value larger than that was refused once
+    /// the store was full of small keys — 155,921 refused writes under the
+    /// default `allkeys-lru` in the stress run.
+    #[test]
+    fn eviction_makes_room_for_a_large_value_among_small_keys() {
+        let limit = 1024 * 1024;
+        for (policy, ttl) in [
+            (EvictionPolicy::AllKeysLru, None),
+            (EvictionPolicy::AllKeysRandom, None),
+            (EvictionPolicy::VolatileLru, Some(Duration::from_secs(3_600))),
+        ] {
+            let s = full_store(limit, policy, ttl);
+            let before = s.len();
+            assert!(
+                s.set("big".into(), vec![b'b'; 256 * 1024], None),
+                "{policy:?}: a 256 KiB write into a full 1 MiB store was refused"
+            );
+            assert!(s.mem_used() <= limit, "{policy:?}: over the limit");
+            assert!(before - s.len() > 100, "{policy:?}: needed more than 100 victims");
+            assert_eq!(s.get("big").map(|v| v.len()), Some(256 * 1024));
+        }
+    }
+
+    /// A value that cannot fit even in an empty store is refused at once,
+    /// without evicting anything.
+    #[test]
+    fn eviction_refuses_a_value_larger_than_the_limit_without_evicting() {
+        let s = full_store(64 * 1024, EvictionPolicy::AllKeysLru, None);
+        let before = s.len();
+        assert!(!s.set("huge".into(), vec![b'h'; 128 * 1024], None));
+        assert_eq!(s.len(), before, "nothing may be evicted for an impossible write");
+    }
+
+    /// F-4: `volatile-lru` skipped TTL-less keys without counting them, so
+    /// with few TTL'd keys every write walked the whole map (~3 ms per write,
+    /// 1,256 writes/s). With no TTL'd key at all the refusal must be cheap.
+    #[test]
+    fn volatile_lru_refusal_does_not_scan_persistent_keys() {
+        let s = full_store(32 * 1024 * 1024, EvictionPolicy::VolatileLru, None);
+        assert!(s.len() > 100_000);
+        let start = Instant::now();
+        for i in 0..2_000 {
+            assert!(!s.set(format!("x{i}"), vec![b'x'; 1024], None));
+        }
+        let elapsed = start.elapsed();
+        // The old code walked >100k entries per refusal: 2,000 refusals were
+        // ~200M entry visits. Now each is a handful of shard probes.
+        assert!(elapsed < Duration::from_secs(5), "2000 volatile-lru refusals took {elapsed:?}");
+    }
+
+    /// F-5: `allkeys-random` picked its victim with `data.iter().nth(random)`
+    /// — O(n) per victim — so filling a store was ~20x slower than LRU.
+    #[test]
+    fn allkeys_random_eviction_is_not_linear_per_victim() {
+        let s = full_store(16 * 1024 * 1024, EvictionPolicy::AllKeysRandom, None);
+        let resident = s.len();
+        assert!(resident > 50_000);
+        let start = Instant::now();
+        // Every write now evicts: 100k victims from a ~60k-key store was
+        // ~3 billion iterator steps with `nth`.
+        for i in 0..100_000 {
+            assert!(s.set(format!("more{i}"), vec![b'm'; 100], None));
+        }
+        let elapsed = start.elapsed();
+        assert!(s.mem_used() <= 16 * 1024 * 1024);
+        assert!(elapsed < Duration::from_secs(20), "100k random evictions took {elapsed:?}");
+    }
+
+    /// The pool keeps good candidates across steps, so the victims of a run
+    /// of evictions are the least recently used keys, not just "the oldest of
+    /// one 16-key sample".
+    #[test]
+    fn lru_pool_evicts_cold_keys_before_hot_ones() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..2_000 {
+            s.set(format!("k{i}"), vec![0u8; 10], None);
+        }
+        // Keys 0..1000 are cold; 1000..2000 are touched well after them.
+        for i in 0..2_000 {
+            let at = if i < 1_000 { 1_000 } else { 1_000_000_000 };
+            s.data.get(&format!("k{i}")).unwrap().touch_precise(at);
+        }
+        let mut hot_evicted = 0;
+        for _ in 0..500 {
+            let victim = s.lru_victim(false).expect("store is not empty");
+            if victim.key["k".len()..].parse::<usize>().unwrap() >= 1_000 {
+                hot_evicted += 1;
+            }
+            s.evict_victim(&victim);
+        }
+        assert_eq!(hot_evicted, 0, "a hot key was evicted while cold keys remained");
+    }
+
+    /// F-19: hashes were invisible to eviction, so a store filled by HSET
+    /// refused every write under `allkeys-lru`/`allkeys-random` instead of
+    /// evicting.
+    #[test]
+    fn evicting_policies_can_evict_hashes() {
+        for policy in [EvictionPolicy::AllKeysLru, EvictionPolicy::AllKeysRandom] {
+            let s = Store::new(StoreConfig {
+                memory_limit: 64 * 1024,
+                eviction_policy: policy,
+                compression: CompressionConfig::default(),
+            });
+            let mut i = 0;
+            while s.mem_used() + 2_000 < 64 * 1024 {
+                assert_eq!(s.hset(&format!("h{i}"), "f", vec![b'h'; 1_000]), Some(true));
+                i += 1;
+            }
+            assert!(
+                s.set("str".into(), vec![b's'; 8 * 1024], None),
+                "{policy:?}: a store full of hashes refused instead of evicting"
+            );
+            assert!(s.mem_used() <= 64 * 1024);
+        }
+    }
+
+    /// Evicting a string key leaves a hash of the same name alone (the two
+    /// maps share names; see the module docs on strings and hashes).
+    #[test]
+    fn evicting_a_string_keeps_a_same_named_hash() {
+        let s = test_store();
+        s.set("both".into(), b"v".to_vec(), None);
+        assert_eq!(s.hset("both", "f", b"hv".to_vec()), Some(true));
+        assert!(s.evict_victim(&Victim { key: "both".into(), hash: false, idle_rank: 1 }));
+        assert_eq!(s.get("both"), None);
+        assert_eq!(s.hget("both", "f").as_deref(), Some(&b"hv"[..]));
     }
 
     // ── AllKeysRandom eviction ──────────────────────────────────────

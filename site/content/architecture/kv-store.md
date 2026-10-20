@@ -76,7 +76,9 @@ When memory exceeds the limit, the eviction policy picks victims:
 - **volatile-lru** — least recently used among keys with a TTL only
 - **allkeys-random** — uniformly random victim
 
-LRU isn't strict — maintaining a true global LRU over a sharded map would be expensive. Instead, each eviction pass samples 16 candidates from map iteration, compares them by `last_accessed`, and evicts the best victim; passes repeat until usage drops back under the limit. Approximate but cheap.
+Expired keys are reclaimed before any live key is evicted (see [Storage](#storage)). Eviction then repeats until the write fits, however many victims that takes — a large value written into a store full of small keys evicts as many as it needs. A write is refused only when it cannot fit at all: the value is larger than `memory_limit` itself, no eligible key is left (for example `volatile-lru` with no TTL'd keys), or 50 ms of eviction was not enough.
+
+LRU isn't strict — maintaining a true global LRU over a sharded map would be expensive. It is Redis' approximated LRU instead: each eviction step samples 16 string keys (plus 4 hashes under `allkeys-lru`) from a random position in the map, merges them into a pool of the 16 best candidates kept across steps, and evicts the least recently used one. `volatile-lru` samples from the index of TTL'd keys, so persistent keys cost it nothing however many there are. `allkeys-random` takes the key at a random position (a string key, or a hash once no string keys remain). Each victim costs a few microseconds whatever the store size. The access clock has 100 ms granularity.
 
 ## RESP2 protocol
 
