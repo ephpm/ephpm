@@ -281,6 +281,42 @@ fn remaining_ttl_ms(encoded: &str) -> Option<u64> {
     Some(expiry_ms.saturating_sub(now_epoch_ms()))
 }
 
+/// The stamp an encoded gossip entry (value or tombstone marker) carries,
+/// attributed to `origin`. `None` for an undecodable entry.
+pub(crate) fn stamp_of(encoded: &str, origin: &str) -> Option<Stamp> {
+    if let Some(write) = decode_tombstone(encoded) {
+        return Some(Stamp::new(write, origin));
+    }
+    split_encoded(encoded).map(|(_, write, _)| Stamp::new(write, origin))
+}
+
+/// Write `encoded` under `key` in this node's own state unless the entry
+/// already there carries a stamp at or above `stamp`. Returns whether it
+/// was written.
+///
+/// Chitchat's `set` keeps whatever lands last. Two writes to one key take
+/// their stamps in order in the synchronous hook but reach chitchat from
+/// separate tasks, so without this the older write can land last: the
+/// origin's local copy and applied map then say one thing while its gossip
+/// state — the only thing a peer that missed the newer write will ever see —
+/// says the other, and the two never reconcile.
+pub(crate) fn set_if_newer(
+    state: &mut chitchat::NodeState,
+    self_id: &str,
+    key: String,
+    encoded: String,
+    stamp: Stamp,
+) -> bool {
+    if let Some(existing) = state.get(&key)
+        && let Some(current) = stamp_of(existing, self_id)
+        && current >= stamp
+    {
+        return false;
+    }
+    state.set(key, encoded);
+    true
+}
+
 /// The winner so far while scanning one key across node states: the
 /// highest stamp seen, and what it carried (`None` = tombstone).
 struct Winner<T> {
@@ -328,12 +364,17 @@ impl ClusterHandle {
 
     /// Set a small key in the gossip KV tier with a stamp and absolute
     /// expiry the caller already fixed.
+    ///
+    /// The state write is ordered by stamp (see [`set_if_newer`]): two
+    /// writes to one key from this node reach chitchat from separate tasks,
+    /// and the older one must not land last.
     pub async fn gossip_set_stamped(&self, key: &str, value: &[u8], expiry_ms: u64, stamp: Stamp) {
         let chitchat_key = format!("{KV_PREFIX}{key}");
         let encoded = encode_value(value, expiry_ms, stamp.write);
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
-        guard.self_node_state().set(chitchat_key, encoded);
+        let self_id = guard.self_chitchat_id().node_id.clone();
+        set_if_newer(guard.self_node_state(), &self_id, chitchat_key, encoded, stamp);
     }
 
     /// Get a small key from the gossip KV tier.
@@ -399,7 +440,8 @@ impl ClusterHandle {
         let encoded = encode_tombstone(stamp.write);
         let chitchat = self.handle.chitchat();
         let mut guard = chitchat.lock().await;
-        guard.self_node_state().set(chitchat_key, encoded);
+        let self_id = guard.self_chitchat_id().node_id.clone();
+        set_if_newer(guard.self_node_state(), &self_id, chitchat_key, encoded, stamp);
         true
     }
 

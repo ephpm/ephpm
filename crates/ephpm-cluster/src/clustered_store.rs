@@ -1313,12 +1313,20 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // nodes each win on the other, F-7.)
         let w = self.inner.new_write(ttl);
         if value.len() <= self.inner.config.small_key_threshold {
-            self.inner.store.set_local(key.clone(), value.clone(), ttl);
-            // Record OUR own write in the applied map so a slower echo of
-            // this write from gossip does not clobber a newer local
-            // overwrite that lands between the local materialization and
-            // the echo.
-            self.applied.insert(key.clone(), w.stamp);
+            // Record OUR own write in the applied map and materialize it in
+            // one step under the key's slot (`apply_if_newer`), so a slower
+            // echo of this write from gossip, a concurrent local writer or a
+            // peer's write racing this one cannot leave the local copy and
+            // the recorded stamp disagreeing.
+            let store = &self.inner.store;
+            let fresh = apply_if_newer(&self.applied, &key, w.stamp, || {
+                store.set_local(key.clone(), value.clone(), ttl);
+            });
+            if !fresh {
+                // A newer write for this key already landed here: last
+                // writer wins, and this one is neither kept nor published.
+                return true;
+            }
         }
         // Fire-and-forget: hand the routed write off to the runtime and
         // return success. The clustered set() itself decides gossip vs
@@ -1341,12 +1349,15 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // Store", and the node that wrote it is one of those nodes — the
         // caller (ACME certificate issuance) reads its own write back.
         let w = self.inner.new_write(ttl);
-        let local_ok = self.inner.store.set_local(key.clone(), value.clone(), ttl);
-        if value.len() <= self.inner.config.small_key_threshold {
-            // Same last-writer-wins bookkeeping as `replicate_set`: stop a
-            // slow gossip echo of this write from clobbering a newer local
-            // overwrite.
-            self.applied.insert(key.clone(), w.stamp);
+        // Same last-writer-wins bookkeeping as `replicate_set`, at every
+        // size: the record and the local write are one step.
+        let store = &self.inner.store;
+        let mut local_ok = true;
+        let fresh = apply_if_newer(&self.applied, &key, w.stamp, || {
+            local_ok = store.set_local(key.clone(), value.clone(), ttl);
+        });
+        if !fresh {
+            return true;
         }
 
         let inner = Arc::clone(&self.inner);
@@ -1386,8 +1397,14 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // slow echo of THIS tombstone through gossip does not clobber a
         // follow-up SET we later accept locally.
         let stamp = self.inner.cluster.stamp();
-        self.inner.store.remove_local(key);
-        self.applied.insert(key.to_string(), stamp);
+        let store = &self.inner.store;
+        let fresh = apply_if_newer(&self.applied, key, stamp, || {
+            store.remove_local(key);
+        });
+        if !fresh {
+            // A newer write already landed: it wins over this delete.
+            return true;
+        }
 
         let inner = Arc::clone(&self.inner);
         let key = key.to_string();
@@ -1411,8 +1428,11 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // gossip echo of THIS publish from clobbering a newer local value that
         // lands before the echo arrives.
         let w = self.inner.new_write(ttl);
-        if value.len() <= self.inner.config.small_key_threshold {
-            self.applied.insert(key.clone(), w.stamp);
+        if value.len() <= self.inner.config.small_key_threshold
+            && !apply_if_newer(&self.applied, &key, w.stamp, || {})
+        {
+            // Overtaken by a newer write for this key: not published.
+            return;
         }
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
@@ -1431,7 +1451,9 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // THIS tombstone cannot clobber a follow-up SET we later accept
         // locally, then fan the tombstone out on the gossip tier only.
         let stamp = self.inner.cluster.stamp();
-        self.applied.insert(key.clone(), stamp);
+        if !apply_if_newer(&self.applied, &key, stamp, || {}) {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
             inner.gossip_tombstone(&key, stamp).await;
@@ -1448,21 +1470,29 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // expiry the origin last stamped. That's what session refresh
         // needs; a shorter-wins rule would break lazy_write.
         let w = self.inner.new_write(Some(ttl));
-        let ok = self.inner.local_store().expire_local(key, ttl);
+        // Record OUR own stamp and apply the new expiry in one step, so a
+        // slower echo of the same expiry update from gossip (or a racing
+        // newer write) cannot leave the local copy and the record at odds.
+        let store = self.inner.local_store();
+        let mut ok = false;
+        let fresh = apply_if_newer(&self.applied, key, w.stamp, || {
+            ok = store.expire_local(key, ttl);
+        });
+        if !fresh {
+            // A newer write for this key already landed; it wins.
+            return true;
+        }
         if !ok {
             tracing::debug!(key, "expire: no local copy to re-broadcast (may exist only on peers)");
             return false;
         }
         // Read the current bytes so we can re-emit them with the new TTL.
         // `Store::get` returns Bytes cheaply (Arc-cloned).
-        let Some(bytes) = self.inner.local_store().get(key) else {
+        let Some(bytes) = store.get(key) else {
             // Racy edge: the entry expired between expire_local and get.
             // Nothing to broadcast, but the local update did succeed.
             return true;
         };
-        // Record OUR own stamp so a slower echo of the same expiry
-        // update from gossip does not clobber a newer local overwrite.
-        self.applied.insert(key.to_string(), w.stamp);
 
         let inner = Arc::clone(&self.inner);
         let key_owned = key.to_string();
@@ -1562,10 +1592,17 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // the raw-store readers this vhost's PHP and RESP clients use.
         let w = self.inner.new_write(ttl);
         if value.len() <= self.inner.config.small_key_threshold {
-            self.local.set_local(key.clone(), value.clone(), ttl);
             // Keyed by the TRANSPORT key so site A's "foo" and site B's "foo"
-            // occupy different ordering slots.
-            self.applied.insert(crate::site_namespace::encode(&self.site, &key), w.stamp);
+            // occupy different ordering slots; record + local write are one
+            // step (see `apply_if_newer`).
+            let transport = crate::site_namespace::encode(&self.site, &key);
+            let local = &self.local;
+            let fresh = apply_if_newer(&self.applied, &transport, w.stamp, || {
+                local.set_local(key.clone(), value.clone(), ttl);
+            });
+            if !fresh {
+                return true;
+            }
         }
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
@@ -1585,8 +1622,14 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
 
     fn replicate_remove(&self, key: &str) -> bool {
         let stamp = self.inner.cluster.stamp();
-        self.local.remove_local(key);
-        self.applied.insert(crate::site_namespace::encode(&self.site, key), stamp);
+        let transport = crate::site_namespace::encode(&self.site, key);
+        let local = &self.local;
+        let fresh = apply_if_newer(&self.applied, &transport, stamp, || {
+            local.remove_local(key);
+        });
+        if !fresh {
+            return true;
+        }
 
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
@@ -1604,8 +1647,15 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // would risk regressing a newer concurrent increment on this node. Only
         // the cluster-wide fan-out is left to do.
         let w = self.inner.new_write(ttl);
-        if value.len() <= self.inner.config.small_key_threshold {
-            self.applied.insert(crate::site_namespace::encode(&self.site, &key), w.stamp);
+        if value.len() <= self.inner.config.small_key_threshold
+            && !apply_if_newer(
+                &self.applied,
+                &crate::site_namespace::encode(&self.site, &key),
+                w.stamp,
+                || {},
+            )
+        {
+            return;
         }
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
@@ -1627,7 +1677,14 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // broadcast survives. Record the stamp keyed by the TRANSPORT key,
         // then gossip the per-site tombstone only.
         let stamp = self.inner.cluster.stamp();
-        self.applied.insert(crate::site_namespace::encode(&self.site, &key), stamp);
+        if !apply_if_newer(
+            &self.applied,
+            &crate::site_namespace::encode(&self.site, &key),
+            stamp,
+            || {},
+        ) {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         let site = Arc::clone(&self.site);
         self.handle.spawn(async move {
@@ -1639,7 +1696,16 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // Same shape as the global path: update locally, then re-broadcast the
         // unchanged value with the new expiry so peers converge on it.
         let w = self.inner.new_write(Some(ttl));
-        if !self.local.expire_local(key, ttl) {
+        let transport = crate::site_namespace::encode(&self.site, key);
+        let local = &self.local;
+        let mut ok = false;
+        let fresh = apply_if_newer(&self.applied, &transport, w.stamp, || {
+            ok = local.expire_local(key, ttl);
+        });
+        if !fresh {
+            return true;
+        }
+        if !ok {
             return false;
         }
         let Some(bytes) = self.local.get(key) else {
@@ -1647,7 +1713,6 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
             // update did happen, there is just nothing left to broadcast.
             return true;
         };
-        self.applied.insert(crate::site_namespace::encode(&self.site, key), w.stamp);
 
         let inner = Arc::clone(&self.inner);
         let site = Arc::clone(&self.site);
@@ -1770,17 +1835,6 @@ pub async fn start_gossip_applier_multi_tenant(
             }
             let transport_key = event.key();
             let stamp = event.stamp();
-            // Ordering is tracked per TRANSPORT key, so two sites sharing a
-            // bare key name never contend for one slot.
-            if !should_apply(&applied, transport_key, stamp) {
-                tracing::trace!(
-                    key = transport_key,
-                    from = %event.node().node_id,
-                    ?stamp,
-                    "gossip KV change skipped as stale"
-                );
-                return;
-            }
 
             // Route: per-site envelope → that site's store; anything else →
             // the global store. An envelope arriving on a node that is not
@@ -1820,27 +1874,34 @@ pub async fn start_gossip_applier_multi_tenant(
                     (_, None) => (Arc::clone(&store), transport_key, None),
                 };
 
-            match event {
+            // Ordering is tracked per TRANSPORT key, so two sites sharing a
+            // bare key name never contend for one slot. The record and the
+            // local write are one step under that slot (`apply_if_newer`).
+            let is_set = matches!(event, crate::gossip_kv::KvChangeEvent::Set { .. });
+            let fresh = apply_if_newer(&applied, transport_key, stamp, || match event {
                 crate::gossip_kv::KvChangeEvent::Set { value, ttl, .. } => {
                     target.set_local(key.to_string(), value.to_vec(), ttl);
-                    tracing::trace!(
-                        key,
-                        site,
-                        from = %event.node().node_id,
-                        ?stamp,
-                        "gossip KV set materialized locally"
-                    );
                 }
                 crate::gossip_kv::KvChangeEvent::Tombstone { .. } => {
                     target.remove_local(key);
-                    tracing::trace!(
-                        key,
-                        site,
-                        from = %event.node().node_id,
-                        ?stamp,
-                        "gossip KV tombstone applied locally"
-                    );
                 }
+            });
+            if fresh {
+                tracing::trace!(
+                    key,
+                    site,
+                    from = %event.node().node_id,
+                    ?stamp,
+                    is_set,
+                    "gossip KV change materialized locally"
+                );
+            } else {
+                tracing::trace!(
+                    key = transport_key,
+                    from = %event.node().node_id,
+                    ?stamp,
+                    "gossip KV change skipped as stale"
+                );
             }
         })
         .await;
@@ -1860,21 +1921,50 @@ pub async fn start_gossip_applier_multi_tenant(
 /// the desired behavior.
 ///
 /// The check and the record are one atomic step on the key's map entry, so
-/// two events for one key racing through here cannot both pass.
+/// two events for one key racing through here cannot both pass. Production
+/// paths use [`apply_if_newer`] directly so the local write happens under
+/// the same step; this is the record-only form the ordering tests exercise.
+#[cfg(test)]
 fn should_apply(applied: &AppliedWriteMap, key: &str, stamp: Stamp) -> bool {
-    match applied.entry(key.to_string()) {
+    apply_if_newer(applied, key, stamp, || {})
+}
+
+/// The one way a value lands on this node: compare `stamp` against the last
+/// applied write for `key`, and — while still holding that key's slot in the
+/// applied map — record it and run `write` (the local `set_local` /
+/// `remove_local` / `expire_local`). Returns whether `write` ran.
+///
+/// Every path that materializes a value locally goes through here: the
+/// replication hooks for this node's own writes, the gossip applier for
+/// peers' writes, and the verify pass. Holding the slot across the local
+/// write is what makes the order total: two concurrent hooks for one key
+/// take their stamps in one order but would otherwise reach the store in
+/// another, and a hook racing the applier for the same key could leave the
+/// local copy holding the older value while the applied map (and the
+/// cluster) agree on the newer — a divergence no later event repairs. The
+/// local write is a few microseconds under a per-shard lock of the applied
+/// map, taken before (never after) any store lock, so the lock order is the
+/// same everywhere.
+pub(crate) fn apply_if_newer(
+    applied: &AppliedWriteMap,
+    key: &str,
+    stamp: Stamp,
+    write: impl FnOnce(),
+) -> bool {
+    let guard = match applied.entry(key.to_string()) {
         dashmap::Entry::Occupied(mut prev) => {
             if stamp <= *prev.get() {
                 return false;
             }
-            prev.insert(stamp);
-            true
+            *prev.get_mut() = stamp;
+            prev.into_ref()
         }
-        dashmap::Entry::Vacant(slot) => {
-            slot.insert(stamp);
-            true
-        }
-    }
+        dashmap::Entry::Vacant(slot) => slot.insert(stamp),
+    };
+    // `guard` keeps the key's slot locked while the local write happens.
+    write();
+    drop(guard);
+    true
 }
 
 /// FNV-1a-style hash for key → u64 mapping.
