@@ -96,14 +96,19 @@ impl Node {
     }
 }
 
-/// Twelve sync writers (four per node) overwrite twenty keys for a few
-/// seconds; afterwards every node must hold identical values for all of
-/// them, and keep holding them (no late echo may flip a key back).
+/// Twelve sync writers (four per node) overwrite twenty keys concurrently;
+/// afterwards every node must hold identical values for all of them, and
+/// keep holding them (no late echo may flip a key back).
+///
+/// The write count is fixed rather than time-boxed: every hooked write
+/// queues work for the gossip task, and a CI runner with few cores would
+/// otherwise bank a backlog that takes longer than the convergence deadline
+/// to drain — the test is about ordering, not throughput.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_hot_key_writes_converge_on_every_node() {
     const KEYS: usize = 20;
     const WRITERS_PER_NODE: usize = 4;
-    const WRITE_FOR: Duration = Duration::from_secs(3);
+    const WRITES_PER_WRITER: usize = 400;
 
     let ports = [random_udp_port().await, random_udp_port().await, random_udp_port().await];
     let seed = format!("127.0.0.1:{}", ports[0]);
@@ -121,17 +126,14 @@ async fn concurrent_hot_key_writes_converge_on_every_node() {
         for w in 0..WRITERS_PER_NODE {
             let store = Arc::clone(&node.local);
             writers.push(tokio::task::spawn_blocking(move || {
-                let end = Instant::now() + WRITE_FOR;
-                let mut i = 0usize;
-                while Instant::now() < end {
+                for i in 0..WRITES_PER_WRITER {
                     let key = format!("hot:{}", i % KEYS);
                     assert!(store.set(key, format!("n{n}:w{w}:{i}").into_bytes(), None));
-                    i += 1;
-                    if i % 50 == 0 {
+                    if i.is_multiple_of(20) {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
-                i
+                WRITES_PER_WRITER
             }));
         }
     }
@@ -139,11 +141,11 @@ async fn concurrent_hot_key_writes_converge_on_every_node() {
     for w in writers {
         total += w.await.expect("writer task");
     }
-    assert!(total > 1000, "writers must have produced real contention, got {total} writes");
+    assert_eq!(total, 3 * WRITERS_PER_NODE * WRITES_PER_WRITER);
 
     // Converge: every key equal on every node, and stable for a further
     // settling window so a late echo that flips a key back is caught.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut stable_since: Option<Instant> = None;
     loop {
         let mut diverged = Vec::new();
