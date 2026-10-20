@@ -13512,7 +13512,6 @@ echo "post response";
                         proxy: ephpm_config::SqliteProxyConfig::default(),
                         sqld: None,
                         replication: ephpm_config::ReplicationConfig::default(),
-                        wal_checkpoint: ephpm_config::WalCheckpointConfig::default(),
                     }),
                     ..DbConfig::default()
                 },

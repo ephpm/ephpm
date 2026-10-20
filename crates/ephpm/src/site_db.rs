@@ -214,7 +214,7 @@ pub fn bind_site_db(
 /// `Session` and screens every statement — the correct offline path.
 ///
 /// Deliberately opened **without** the server's WAL checkpoint gate
-/// (`[db.sqlite.wal_checkpoint]`). The gate exists for a long-running process
+/// (`ephpm_server::wal_gate`). The gate exists for a long-running process
 /// whose readers never go idle; this is a short-lived CLI running one PHP
 /// request with no concurrent readers, and the engine itself runs a
 /// truncating checkpoint when the last connection closes at exit. A gate task

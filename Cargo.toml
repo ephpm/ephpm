@@ -230,12 +230,11 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # bigger log makes reads slower, which makes timeouts likelier. With this pin,
 # once the file is at least 4 x threshold_bytes, a timed-out attempt retries
 # on the next tick with double the wait, up to the new
-# `WalGateConfig::max_escalated_wait` (ePHPm `max_escalated_wait_ms`,
-# default 2 s), and only backs off once a wait at that ceiling times out.
+# `WalGateConfig::max_escalated_wait` (ePHPm hardcodes litewire's 2 s
+# default), and only backs off once a wait at that ceiling times out.
 # Below 4x the schedule is unchanged. `WalGateStats` gains `escalation_level`,
-# `consecutive_timeouts` and `next_wait_micros` (exported as
-# ephpm_sqlite_wal_gate_{escalation_level,consecutive_timeouts,
-# next_wait_seconds}). Single commit on top of 36ff34b0e5e9. No dependency
+# `consecutive_timeouts` and `next_wait_micros` (not exported by ePHPm).
+# Single commit on top of 36ff34b0e5e9. No dependency
 # moves (turso stays =0.8.3); the lockfile changes only the litewire crates'
 # source rev.
 #
@@ -257,8 +256,8 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # takes the exclusive side for a bounded wait and runs TRUNCATE. Plus
 # `Turso::wal_gate_stats`, `Turso::wal_gate_permit` (for raw-connection
 # callers, which get no busy timeout) and `Turso::wal_gate_task_finished`.
-# ePHPm turns the gate ON by default on every file-backed factory
-# (`[db.sqlite.wal_checkpoint]`, ephpm-server/src/wal_gate.rs). Single commit
+# ePHPm installs the gate, always on and not configurable, on every file-backed
+# factory (ephpm-server/src/wal_gate.rs). Single commit
 # on top of 5dbdbf6589aa; no dependency moves (turso stays =0.8.3); the
 # lockfile changes only the litewire crates' source rev.
 #

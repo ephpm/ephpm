@@ -225,8 +225,8 @@ use anyhow::Context;
 use dashmap::DashMap;
 use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream, NodeInfo};
 use ephpm_config::SqliteConfig;
+use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
-use litewire::litewire_turso::{Turso, WalGateConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -549,10 +549,9 @@ pub async fn start_clustered_turso_cdc(
     // the raw-connection apply/snapshot/head-sampler paths below hold. Two
     // maintenance tasks on one file are harmless by litewire's contract (the
     // attempt is serialized on the exclusive side).
-    let gate = wal_gate::gate_config(&sqlite_config.wal_checkpoint);
-    wal_gate::log_mode(gate.as_ref());
+    wal_gate::log_active();
     let mgmt_factory = Arc::new(
-        wal_gate::builder_with_gate(Turso::builder(db_path), gate.as_ref())
+        wal_gate::builder_with_gate(Turso::builder(db_path))
             .build()
             .await
             .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
@@ -614,7 +613,7 @@ pub async fn start_clustered_turso_cdc(
     // write it served after promotion would be invisible to replicas.
     // Capturing everywhere costs a `turso_cdc` row per local write on
     // replicas; shipping is gated by role at serve time instead.
-    let wire_factory = wal_gate::builder_with_gate(Turso::builder(db_path), gate.as_ref())
+    let wire_factory = wal_gate::builder_with_gate(Turso::builder(db_path))
         .enable_cdc_on_connect(true)
         .build()
         .await
@@ -2725,11 +2724,6 @@ type SiteMgmtSlot = Arc<tokio::sync::Mutex<Option<Arc<SiteMgmt>>>>;
 struct SiteMgmtRegistry {
     dir: Arc<PathBuf>,
     slots: Arc<DashMap<String, SiteMgmtSlot>>,
-    /// WAL checkpoint gate for every mgmt factory (`None` = disabled). On a
-    /// node that does not own a site, the mgmt factory is the **only**
-    /// factory open on that file — the apply loop's writes grow its WAL —
-    /// so the gate has to live here too, not just on the serving registry.
-    wal_gate: Option<WalGateConfig>,
 }
 
 impl WalGateStatsSource for SiteMgmtRegistry {
@@ -2751,8 +2745,8 @@ impl WalGateStatsSource for SiteMgmtRegistry {
 }
 
 impl SiteMgmtRegistry {
-    fn new(dir: PathBuf, wal_gate: Option<WalGateConfig>) -> Self {
-        Self { dir: Arc::new(dir), slots: Arc::new(DashMap::new()), wal_gate }
+    fn new(dir: PathBuf) -> Self {
+        Self { dir: Arc::new(dir), slots: Arc::new(DashMap::new()) }
     }
 
     /// The per-site lock guarding that site's opened-or-not [`SiteMgmt`].
@@ -2777,8 +2771,12 @@ impl SiteMgmtRegistry {
         let path_str = path
             .to_str()
             .with_context(|| format!("per-site db path is not valid UTF-8: {}", path.display()))?;
+        // Gated like every factory. On a node that does not own a site, the
+        // mgmt factory is the **only** factory open on that file — the apply
+        // loop's writes grow its WAL — so the gate has to live here too, not
+        // just on the serving registry.
         let factory = Arc::new(
-            wal_gate::builder_with_gate(Turso::builder(path_str), self.wal_gate.as_ref())
+            wal_gate::builder_with_gate(Turso::builder(path_str))
                 .build()
                 .await
                 .with_context(|| format!("open mgmt Turso factory for site {site}"))?,
@@ -3010,10 +3008,8 @@ pub async fn start_clustered_per_site_turso(
          discarded when that replica re-bootstraps. Turso is Beta upstream."
     );
 
-    // The same `[db.sqlite.wal_checkpoint]` config the serving registry got
-    // in `wire_per_site_clustered_db` (which already logged the mode).
-    let mgmt =
-        SiteMgmtRegistry::new(dir.clone(), wal_gate::gate_config(&sqlite_config.wal_checkpoint));
+    // Gated like the serving registry in `wire_per_site_clustered_db`.
+    let mgmt = SiteMgmtRegistry::new(dir.clone());
     wal_gate::register_source(Arc::new(mgmt.clone()));
 
     // Owner-side handlers (reactive; registered up front so a promotion is

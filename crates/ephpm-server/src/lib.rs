@@ -2604,14 +2604,12 @@ fn wire_per_site_db(
         )
     })?;
 
-    let gate = wal_gate::gate_config(&sqlite.wal_checkpoint);
-    wal_gate::log_mode(gate.as_ref());
+    wal_gate::log_active();
     let registry = site_backends::SiteBackends::new_with_gate(
         dir,
         sqlite.max_open_dbs,
         query_stats.clone(),
         tokio::runtime::Handle::current(),
-        gate,
     )?;
     registry.register_wal_gate_metrics();
     ephpm_php::PhpRuntime::set_db_backend_resolver(
@@ -2710,19 +2708,17 @@ fn wire_per_site_clustered_db(
     });
 
     // The gate is installed on every per-site factory (serving and mgmt alike;
-    // the per-site clustered mgmt registry reads the same config in
+    // the per-site clustered mgmt registry installs it too, in
     // `start_clustered_per_site_turso`). A per-site clustered owner's WAL
     // was the worst case measured — 6.5 GB in ten minutes, since its CDC
     // tailers are continuous readers.
-    let gate = wal_gate::gate_config(&sqlite.wal_checkpoint);
-    wal_gate::log_mode(gate.as_ref());
+    wal_gate::log_active();
     let registry = site_backends::SiteBackends::new_clustered(
         dir.clone(),
         sqlite.max_open_dbs,
         query_stats.clone(),
         tokio::runtime::Handle::current(),
         Arc::clone(&note_active),
-        gate,
     )?;
     registry.register_wal_gate_metrics();
 
@@ -2954,16 +2950,14 @@ async fn start_single_node_sqlite(
         .await
         .context("cannot start the embedded database's wire listeners")?;
     let db_path = &sqlite_config.path;
-    let gate = wal_gate::gate_config(&sqlite_config.wal_checkpoint);
-    wal_gate::log_mode(gate.as_ref());
-    let backend = wal_gate::builder_with_gate(litewire::Turso::builder(db_path), gate.as_ref())
+    wal_gate::log_active();
+    let backend = wal_gate::builder_with_gate(litewire::Turso::builder(db_path))
         .build()
         .await
         .with_context(|| format!("failed to open database with Turso engine: {db_path}"))?;
     tracing::info!(
         path = %db_path,
         engine = "turso",
-        wal_gate = gate.is_some(),
         "opened embedded database (single-node, Turso engine)"
     );
     // Held as a concrete `Arc` first so the WAL-gate sampler can read the
@@ -3408,7 +3402,6 @@ mod lib_tests {
                 primary_grpc_url: String::new(),
                 ..ephpm_config::ReplicationConfig::default()
             },
-            wal_checkpoint: ephpm_config::WalCheckpointConfig::default(),
         }
     }
 

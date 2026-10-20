@@ -140,8 +140,12 @@ Idle connections hold no read slot; only the engine's close-of-last-connection
 checkpoint ever shrank the file, which is why per-site databases used to shrink
 only when the LRU evicted them.
 
-**The fix is litewire's WAL checkpoint gate**, which ePHPm turns on for every
-embedded-Turso factory by default (`[db.sqlite.wal_checkpoint]`). Every
+**The workaround is litewire's WAL checkpoint gate**, which ePHPm installs on
+every embedded-Turso factory. It is always on and **not configurable**: there
+is no config section for it, and its settings (below) are fixed in the binary.
+It is a stopgap — once Turso's `TRUNCATE` checkpoint can wait for readers
+instead of failing `busy`, ePHPm will replace the gate with a plain periodic
+`PRAGMA wal_checkpoint(TRUNCATE)`. Every
 session statement — the wire listeners and the in-process `ephpm_db_*` bridge
 alike — and every CDC tailer poll holds the shared side of a per-file
 write-preferring lock; a statement that opens a transaction keeps its permit
@@ -167,7 +171,7 @@ went from 241 ms to 1,045 ms. A bigger log makes reads slower, which makes
 timeouts more likely: the loop the gate exists to break. So once the file is
 at least 4 × the threshold (256 MiB), a timeout no longer backs off. The next
 attempt, one tick later, waits twice as long (250 → 500 → 1000 → 2000 ms),
-capped at `max_escalated_wait_ms` (default 2 s). Only a timeout at that
+capped at 2 s. Only a timeout at that
 ceiling backs off, and a truncate resets the schedule. The trade is explicit:
 while an escalated attempt waits, new statements queue behind it. A request
 can therefore stall for up to 2 s, though in practice only until the
@@ -196,13 +200,11 @@ never held across a network wait.
 30 s → 1.3 s. Per-site clustered — owner's peak `-wal` 6,482 MiB → 363 MiB
 (six sites × 64 MiB), requests +1%, zero errors, replicas converged; the cost
 was about +100 ms at p999, from forwarded statements queueing behind an
-exclusive attempt. That trade is why the gate defaults to on. What it does
+exclusive attempt. That trade is why the gate is always on. What it does
 **not** fix: a transaction that genuinely stays open keeps the WAL growing for
-its duration — `ephpm_sqlite_wal_gate_timeouts_total` climbing while
-`ephpm_sqlite_wal_gate_truncations_total` is flat and `ephpm_sqlite_wal_bytes`
-stays over the threshold is the operator signal, and
-`ephpm_sqlite_wal_gate_escalation_level` shows when the gate is escalating. Every
-counter, plus the live `-wal` size per database, is in the
+its duration — `ephpm_sqlite_wal_bytes` staying well over the threshold while
+`ephpm_sqlite_wal_gate_timeouts_total` climbs is the operator signal. Both
+series are in the
 [metrics reference](/reference/metrics/#embedded-database-wal-checkpoint-gate).
 
 ## Turso 0.7.2 → 0.8.2 (v0.12.0)
