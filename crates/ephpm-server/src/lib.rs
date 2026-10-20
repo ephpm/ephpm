@@ -228,6 +228,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // the receiving node's GLOBAL keyspace. Single-keyspace nodes keep the
         // original listener exactly as before.
         let data_plane_sites = multi_tenant_kv.clone();
+        // Shared last-writer-wins ordering map: threaded through the
+        // replicator (records origin writes), the gossip applier (records
+        // remote applies) and the data plane (records stamped replica
+        // writes), so every path that lands a value on this node agrees on
+        // which write is newest.
+        let applied = ephpm_cluster::clustered_store::new_applied_write_map();
+        let data_plane_applied = Arc::clone(&applied);
         tokio::spawn(async move {
             let result = match data_plane_sites {
                 Some(sites) => {
@@ -236,12 +243,18 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
                         sites,
                         data_addr,
                         data_plane_cipher,
+                        data_plane_applied,
                     )
                     .await
                 }
                 None => {
-                    ephpm_cluster::data_plane::serve(data_plane_store, data_addr, data_plane_cipher)
-                        .await
+                    ephpm_cluster::data_plane::serve(
+                        data_plane_store,
+                        data_addr,
+                        data_plane_cipher,
+                        data_plane_applied,
+                    )
+                    .await
                 }
             };
             if let Err(e) = result {
@@ -278,11 +291,6 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // is disabled in config).
         clustered.init_hot_key_watcher().await;
 
-        // Shared last-arrival-wins ordering map: threaded through both the
-        // replicator (records origin writes) and the applier (records
-        // remote applies), so a slow gossip echo of an older write can't
-        // clobber a newer local overwrite.
-        let applied = ephpm_cluster::clustered_store::new_applied_write_map();
         let replicator = ephpm_cluster::KvReplicator::new(
             Arc::clone(&clustered),
             tokio::runtime::Handle::current(),

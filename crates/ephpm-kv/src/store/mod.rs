@@ -359,6 +359,18 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
         Box::pin(std::future::ready(None))
     }
 
+    /// Fetch `key` from the rest of the cluster **synchronously**, for a
+    /// reader on this node that found no local copy — the RESP `GET` and PHP
+    /// `ephpm_kv_get` path (see [`Store::get_through`]).
+    ///
+    /// A clustered implementation must bound this: it blocks a request
+    /// thread. The default is `None`, correct for a replicator with no
+    /// cluster behind it and for the test doubles in this crate.
+    fn fetch_through(&self, key: &str) -> Option<Vec<u8>> {
+        let _ = key;
+        None
+    }
+
     /// Decide where a `SETNX` on `key` is arbitrated.
     ///
     /// Called by [`Store::set_nx_outcome`] **before** it touches the local map.
@@ -915,6 +927,27 @@ impl Store {
         let replicator = self.active_replicator()?;
         let value = replicator.fetch_cluster(key).await?;
         Some(Bytes::from(value))
+    }
+
+    /// Read a key, fetching it from the cluster when this node has no local
+    /// copy — the **synchronous** read path for RESP `GET`/`MGET` and PHP
+    /// `ephpm_kv_get`.
+    ///
+    /// Identical to [`Store::get`] on a standalone node. In a cluster a large
+    /// value lives on `replication_factor` nodes only, so a reader elsewhere
+    /// used to see `nil` for a key that exists (stress finding F-8); this asks
+    /// the installed [`Replicator`] to fetch it. The replicator bounds the
+    /// wait and skips the network when this node is one of the key's replicas
+    /// (a miss there means the key does not exist). The fetched value is not
+    /// cached here — it carries no TTL — beyond whatever the replicator's own
+    /// hot-key cache keeps.
+    #[must_use]
+    pub fn get_through(&self, key: &str) -> Option<Bytes> {
+        if let Some(local) = self.get(key) {
+            return Some(local);
+        }
+        let replicator = self.active_replicator()?;
+        replicator.fetch_through(key).map(Bytes::from)
     }
 
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a

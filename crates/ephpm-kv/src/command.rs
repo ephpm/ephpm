@@ -103,7 +103,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "GET" => {
             check_args!(cmd, argv, 1);
             let key = str_from(argv[0]);
-            match store.get(&key) {
+            // Through the cluster: a large value held by other nodes only is
+            // fetched from them rather than answered `nil`.
+            match store.get_through(&key) {
                 Some(v) => Frame::bulk(v),
                 None => Frame::Null,
             }
@@ -127,7 +129,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 .iter()
                 .map(|k| {
                     let key = str_from(k);
-                    match store.get(&key) {
+                    match store.get_through(&key) {
                         Some(v) => Frame::bulk(v),
                         None => Frame::Null,
                     }

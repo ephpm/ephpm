@@ -61,6 +61,55 @@ const HOT_PREFIX: &str = "hot:";
 /// being the owner once gossip declares it dead.
 pub const CONDITIONAL_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Total budget for a read-through fetch of a large value from its replica
+/// set on behalf of a reader that blocks a request thread
+/// ([`ClusteredStore::fetch_through`]).
+pub const FETCH_THROUGH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Large-value writes waiting for a data-plane worker before new ones are
+/// shed. Each entry holds one value copy; with the default 512-byte gossip
+/// threshold and typical cache values this is tens of megabytes at most.
+pub const LARGE_QUEUE_CAP: usize = 4_096;
+
+/// Data-plane workers draining the large-write queue: the bound on
+/// concurrent replica writes a node makes (times the replica set size).
+pub const LARGE_WORKERS: usize = 16;
+
+/// One large-value write queued for the data-plane workers.
+///
+/// Two stamps travel with it: `w.stamp` on the value itself (every replica
+/// applies the value only if it is strictly newer than what it holds), and
+/// `marker`, stamped strictly *before* it, which is queued as a gossip
+/// tombstone so every node that is **not** a replica drops whatever older
+/// copy it held — a previous small value (stress finding F-10), or an
+/// earlier large write it originated — and fetches through to the owners on
+/// its next read. A replica orders the marker below the value, so it keeps
+/// the value whichever of the two arrives first.
+struct LargeWrite {
+    transport_key: String,
+    value: Vec<u8>,
+    ttl: Option<Duration>,
+    w: WriteStamp,
+    marker: Option<Stamp>,
+    scope: FanOut,
+}
+
+/// Which nodes a large value is written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanOut {
+    /// The key's replica set (`replication_factor` nodes).
+    ReplicaSet,
+    /// Every alive node ([`ClusteredStore::broadcast`]).
+    Everyone,
+}
+
+/// Outcome of one large-value fan-out.
+#[derive(Debug, Default, Clone, Copy)]
+struct Delivery {
+    delivered: usize,
+    failed: usize,
+}
+
 /// Run `fut` to completion from a **synchronous** caller on `handle`'s runtime.
 ///
 /// [`ephpm_kv::store::Replicator`]'s routing hooks are synchronous (RESP
@@ -163,6 +212,11 @@ pub struct ClusteredStore {
     /// in an `Arc` so fire-and-forget async replica tasks can record
     /// their failures too.
     replica_write_failures: Arc<AtomicU64>,
+    /// The bounded queue feeding the data-plane workers; started on first
+    /// use by a replication hook (see [`ClusteredStore::enqueue_large`]).
+    large_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<LargeWrite>>,
+    /// Large writes shed because that queue was full.
+    large_shed: AtomicU64,
 }
 
 /// Tracks remote fetch frequency for a single key.
@@ -234,6 +288,8 @@ impl ClusteredStore {
             subscribed: AtomicBool::new(false),
             hot_cache_mem: AtomicU64::new(0),
             replica_write_failures: Arc::new(AtomicU64::new(0)),
+            large_tx: std::sync::OnceLock::new(),
+            large_shed: AtomicU64::new(0),
         })
     }
 
@@ -346,46 +402,49 @@ impl ClusteredStore {
 
     /// Fix the stamp and absolute expiry for a write about to be made with
     /// `ttl`. The sync replication hooks call this before touching the local
-    /// store, then hand the result to the `*_at` variants below.
+    /// store.
     #[must_use]
     pub fn new_write(&self, ttl: Option<Duration>) -> WriteStamp {
         WriteStamp { stamp: self.cluster.stamp(), expiry_ms: expiry_ms_for(ttl) }
     }
 
-    /// Set a value, routing through the appropriate tier, stamping the write
-    /// now. See [`set_at`](Self::set_at).
-    pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
-        let w = self.new_write(ttl);
-        self.set_at(key, value, ttl, w).await
+    /// Fix the stamps for a **large** write: the gossip marker's stamp and,
+    /// strictly after it, the value's. See [`LargeWrite`] for why there are
+    /// two.
+    #[must_use]
+    pub fn new_large_write(&self, ttl: Option<Duration>) -> (Stamp, WriteStamp) {
+        let marker = self.cluster.stamp();
+        (marker, self.new_write(ttl))
     }
 
-    /// Set a value, routing through the appropriate tier, with a stamp the
-    /// caller already fixed.
+    /// Set a value, routing through the appropriate tier.
     ///
-    /// Returns `true` on success, `false` if the primary write failed
-    /// (the local store rejected it, or the primary owner rejected /
-    /// was unreachable and no local fallback succeeded).
+    /// Returns whether this node's own copy was written. Small values are
+    /// queued for gossip; large values are written locally and then fanned
+    /// out to the key's replica set over the data plane (awaited).
     ///
     /// # Large-value replication
     ///
-    /// Large values are written to the **replica set**: the primary
-    /// owner (`hash(key) % alive_nodes`) plus the next
-    /// `replication_factor - 1` distinct nodes on the sorted alive-node
-    /// ring (wrapping around; clamped to the number of alive nodes). The
-    /// client-visible result reflects only the **primary** write; replica
-    /// propagation follows the configured [`ReplicationMode`]:
+    /// A large value is written to this node's local store **always** —
+    /// whether or not this node is in the key's replica set — so the writing
+    /// node reads its own write back, and to the **replica set**: the primary
+    /// owner (`hash(key) % alive_nodes`) plus the next `replication_factor - 1`
+    /// distinct nodes on the sorted alive-node ring (wrapping around; clamped
+    /// to the number of alive nodes). Each copy carries the value's TTL and
+    /// stamp. A gossip tombstone stamped just *before* the value accompanies
+    /// every large write, so a node outside the replica set that still holds
+    /// an older copy (a previous small value, or an earlier large write it
+    /// originated) drops it and fetches through to the owners on its next
+    /// read; replicas order the marker below the value they received. This
+    /// is what fixed stress findings F-8 (large values unreadable on a third
+    /// of the nodes), F-9 (replica copies never expired) and F-10 (a stale
+    /// small copy served forever after a small→large overwrite).
     ///
-    /// - **async** (default): the primary write is awaited, then replica
-    ///   writes are spawned fire-and-forget. Failures are counted
-    ///   ([`ClusteredStore::replica_write_failures`]) and logged at
-    ///   `warn`, but never fail or delay the client set.
-    /// - **sync**: replica writes are awaited best-effort. The guarantee
-    ///   is *"every reachable replica has acknowledged when `set`
-    ///   returns"*. A replica that is down or rejects the write is
-    ///   logged and counted but does **not** fail the set — this is not
-    ///   a quorum/consensus protocol, and no rollback is performed. It
-    ///   trades the async latency win for read-your-writes durability
-    ///   against reachable peers.
+    /// A replica that is down or rejects the write is logged and counted
+    /// ([`ClusteredStore::replica_write_failures`]) but does **not** fail the
+    /// set — this is not a quorum/consensus protocol, and no rollback is
+    /// performed. The replication hooks decide whether a client waits for the
+    /// fan-out ([`ReplicationMode`]); this method always awaits it.
     ///
     /// ## Membership-change caveat (v1)
     ///
@@ -396,14 +455,9 @@ impl ClusteredStore {
     /// that has it. Likewise, when membership changes the replica set
     /// for existing keys is not recomputed retroactively. This is an
     /// honest v1 — durable-through-rebalance replication is future work.
-    pub async fn set_at(
-        &self,
-        key: String,
-        value: Vec<u8>,
-        ttl: Option<Duration>,
-        w: WriteStamp,
-    ) -> bool {
+    pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         if value.len() <= self.config.small_key_threshold {
+            let w = self.new_write(ttl);
             // Gossip tier: replicate to all nodes.
             self.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
 
@@ -416,26 +470,19 @@ impl ClusteredStore {
             return true;
         }
 
-        // Large value — write to the replica set (primary + N-1 peers).
-        let ok = self.set_large(&key, &value, ttl).await;
+        let (marker, w) = self.new_large_write(ttl);
+        let local_ok = self.store.set_local(key.clone(), value.clone(), ttl);
+        self.fan_out_large(&key, &value, ttl, w, Some(marker), FanOut::ReplicaSet).await;
 
         // Bump hot key version for remote invalidation.
-        if ok && self.config.hot_key_cache {
+        if local_ok && self.config.hot_key_cache {
             self.maybe_bump_hot_version(&key).await;
         }
 
-        ok
+        local_ok
     }
 
-    /// Fan out an **already-applied local value** to the rest of the cluster,
-    /// stamping it now. See [`publish_at`](Self::publish_at).
-    pub async fn publish(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
-        let w = self.new_write(ttl);
-        self.publish_at(key, value, ttl, w).await
-    }
-
-    /// Fan out an **already-applied local value** to the rest of the cluster
-    /// with a stamp the caller already fixed.
+    /// Fan out an **already-applied local value** to the rest of the cluster.
     ///
     /// Same tier routing as [`set`](Self::set) — gossip for small values,
     /// replica-set writes for large ones — with one deliberate difference: it
@@ -444,25 +491,21 @@ impl ClusteredStore {
     /// already, and re-writing it here would let an older publish overwrite a
     /// newer local total, losing an update on the origin node. See
     /// [`ephpm_kv::store::Replicator::replicate_published`].
-    pub async fn publish_at(
-        &self,
-        key: &str,
-        value: &[u8],
-        ttl: Option<Duration>,
-        w: WriteStamp,
-    ) -> bool {
+    pub async fn publish(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
         if value.len() <= self.config.small_key_threshold {
+            let w = self.new_write(ttl);
             self.cluster.gossip_set_queued(key, value, w.expiry_ms, w.stamp);
             if self.config.hot_key_cache {
                 self.maybe_bump_hot_version(key).await;
             }
             return true;
         }
-        let ok = self.set_large_routed(key, &self.store, key, value, ttl, LocalCopy::Skip).await;
-        if ok && self.config.hot_key_cache {
+        let (marker, w) = self.new_large_write(ttl);
+        self.fan_out_large(key, value, ttl, w, Some(marker), FanOut::ReplicaSet).await;
+        if self.config.hot_key_cache {
             self.maybe_bump_hot_version(key).await;
         }
-        ok
+        true
     }
 
     /// Write a value that **every** node must hold a local copy of,
@@ -483,10 +526,10 @@ impl ClusteredStore {
     /// implies "shard it" — for cluster-wide state such as an ACME
     /// certificate it implies the opposite.
     ///
-    /// Unlike the sharded path, peer writes are **awaited**: a broadcast key
-    /// is written rarely (certificate issuance and renewal) and the caller
-    /// wants cluster-wide read-your-writes far more than it wants the write
-    /// to return quickly. A peer that is unreachable is logged and counted
+    /// Peer writes are **awaited**: a broadcast key is written rarely
+    /// (certificate issuance and renewal) and the caller wants cluster-wide
+    /// read-your-writes far more than it wants the write to return quickly.
+    /// A peer that is unreachable is logged and counted
     /// ([`ClusteredStore::replica_write_failures`]) but does not fail the
     /// write, matching the rest of this store: this is not a consensus
     /// protocol.
@@ -503,17 +546,6 @@ impl ClusteredStore {
     /// [`get`](Self::get), whose miss path fetches from a peer.
     pub async fn broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         let w = self.new_write(ttl);
-        self.broadcast_at(key, value, ttl, w).await
-    }
-
-    /// [`broadcast`](Self::broadcast) with a stamp the caller already fixed.
-    pub async fn broadcast_at(
-        &self,
-        key: String,
-        value: Vec<u8>,
-        ttl: Option<Duration>,
-        w: WriteStamp,
-    ) -> bool {
         if value.len() <= self.config.small_key_threshold {
             // Gossip already means "every node"; nothing to widen.
             self.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
@@ -523,11 +555,14 @@ impl ClusteredStore {
             return true;
         }
 
-        let ok = self.broadcast_large(&key, &value, ttl).await;
-        if ok && self.config.hot_key_cache {
+        // This node's own copy first: it must be able to serve the value out
+        // of its local store even if every peer write below fails.
+        let local_ok = self.store.set_local(key.clone(), value.clone(), ttl);
+        self.fan_out_large(&key, &value, ttl, w, None, FanOut::Everyone).await;
+        if local_ok && self.config.hot_key_cache {
             self.maybe_bump_hot_version(&key).await;
         }
-        ok
+        local_ok
     }
 
     /// [`publish`](Self::publish) for a **per-site** key: the site-namespaced
@@ -536,18 +571,19 @@ impl ClusteredStore {
     pub async fn publish_for_site(
         &self,
         site: &str,
-        local: &Store,
         key: &str,
         value: &[u8],
         ttl: Option<Duration>,
-        w: WriteStamp,
     ) -> bool {
         let transport = crate::site_namespace::encode(site, key);
         if value.len() <= self.config.small_key_threshold {
+            let w = self.new_write(ttl);
             self.cluster.gossip_set_queued(&transport, value, w.expiry_ms, w.stamp);
             return true;
         }
-        self.set_large_routed(&transport, local, key, value, ttl, LocalCopy::Skip).await
+        let (marker, w) = self.new_large_write(ttl);
+        self.fan_out_large(&transport, value, ttl, w, Some(marker), FanOut::ReplicaSet).await;
+        true
     }
 
     /// Replicate a **per-site** (multi-tenant) write.
@@ -573,10 +609,10 @@ impl ClusteredStore {
         key: String,
         value: Vec<u8>,
         ttl: Option<Duration>,
-        w: WriteStamp,
     ) -> bool {
         let transport = crate::site_namespace::encode(site, &key);
         if value.len() <= self.config.small_key_threshold {
+            let w = self.new_write(ttl);
             // Gossip tier: replicated to all nodes, applied per-site on arrival.
             tracing::trace!(
                 site,
@@ -598,21 +634,24 @@ impl ClusteredStore {
             tier = "data-plane",
             "per-site KV: publishing"
         );
-        let ok =
-            self.set_large_routed(&transport, local, &key, &value, ttl, LocalCopy::Write).await;
-        if !ok {
-            // A large-tier publish that fails leaves this vhost's key on this
-            // node only. Never silent — that is exactly how the INCR gap
-            // survived a full deploy cycle.
+        let (marker, w) = self.new_large_write(ttl);
+        let local_ok = local.set_local(key.clone(), value.clone(), ttl);
+        let delivered =
+            self.fan_out_large(&transport, &value, ttl, w, Some(marker), FanOut::ReplicaSet).await;
+        if delivered.failed > 0 {
+            // A large-tier publish that fails leaves this vhost's key on fewer
+            // nodes than intended. Never silent — that is exactly how the INCR
+            // gap survived a full deploy cycle.
             tracing::warn!(
                 site,
                 key,
                 bytes = value.len(),
-                "per-site KV: large-value publish FAILED — this key is now node-local and will \
-                 not be visible on peers until it is rewritten"
+                failed = delivered.failed,
+                "per-site KV: large-value publish did not reach every replica; readers on \
+                 those nodes fetch through to the ones that have it"
             );
         }
-        ok
+        local_ok
     }
 
     /// Delete a per-site key: gossip tombstone under the namespaced transport
@@ -634,222 +673,192 @@ impl ClusteredStore {
         self.cluster.gossip_del_queued(&transport, stamp)
     }
 
-    /// Re-broadcast a per-site key's current value with a new TTL, so peers
-    /// pick up the new expiry by the same last-writer-wins rule the global
-    /// path uses. Small-key tier only, matching the global `replicate_expire`.
-    pub fn expire_for_site(&self, site: &str, key: &str, value: &[u8], w: WriteStamp) {
-        if value.len() <= self.config.small_key_threshold {
-            let transport = crate::site_namespace::encode(site, key);
-            self.cluster.gossip_set_queued(&transport, value, w.expiry_ms, w.stamp);
+    /// Fetch `transport_key` from the key's replica set for a reader on this
+    /// node that has no local copy — the bounded, synchronous-safe read-through
+    /// behind [`ephpm_kv::store::Store::get_through`].
+    ///
+    /// Costs nothing when this node is itself one of the key's replicas (a
+    /// miss here means the key does not exist, modulo in-flight replication)
+    /// or when it is the only node alive. Otherwise the owners are asked in
+    /// ring order within one [`FETCH_THROUGH_TIMEOUT`] budget, and a value
+    /// found counts toward hot-key promotion exactly like a fetch from
+    /// [`get`](Self::get). The value is not materialized locally beyond that
+    /// cache: it arrives with no TTL.
+    pub async fn fetch_through(&self, transport_key: &str) -> Option<Vec<u8>> {
+        if self.config.hot_key_cache {
+            let key_hash = hash_key(transport_key);
+            if let Some(cached) = self.hot_cache.get(&key_hash) {
+                let ttl = Duration::from_secs(self.config.hot_key_local_ttl_secs);
+                if cached.cached_at.elapsed() < ttl && cached.key == transport_key {
+                    return Some(cached.data.clone());
+                }
+                drop(cached);
+                evict_hot_entry(&self.hot_cache, &self.hot_cache_mem, key_hash);
+            }
         }
+
+        let alive = self.alive_nodes().await;
+        if alive.len() <= 1 {
+            return None;
+        }
+        let self_id = self.cluster.self_node().id;
+        let replicas =
+            replica_nodes_for(&alive, hash_key(transport_key), self.config.replication_factor);
+        if replicas.iter().any(|n| n.id == self_id) {
+            // We are a replica and we have no copy: the key does not exist.
+            return None;
+        }
+
+        let deadline = tokio::time::Instant::now() + FETCH_THROUGH_TIMEOUT;
+        for node in &replicas {
+            let Some(addr) = node_data_addr(node, self.config.data_port) else { continue };
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if budget.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(budget, self.client.fetch(addr, transport_key)).await {
+                Ok(Ok(Some(value))) => {
+                    self.track_remote_fetch(transport_key, &value);
+                    return Some(value);
+                }
+                Ok(Ok(None)) => {
+                    tracing::trace!(key = transport_key, replica = %node.id, "not on replica");
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(key = transport_key, replica = %node.id, %addr, %e, "fetch-through failed");
+                }
+                Err(_) => {
+                    tracing::debug!(key = transport_key, replica = %node.id, %addr, "fetch-through timed out");
+                    break;
+                }
+            }
+        }
+        None
     }
 
-    /// Write a large value to every alive node. See
-    /// [`broadcast`](Self::broadcast).
-    async fn broadcast_large(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
-        // This node's own copy first: it must be able to serve the value out
-        // of its local store even if every peer write below fails.
-        let local_ok = self.store.set_local(key.to_string(), value.to_vec(), ttl);
+    /// Fan a large value out over the data plane and await every target.
+    ///
+    /// `marker`, when given, is queued as a gossip tombstone **before** the
+    /// data-plane writes: it carries a stamp strictly below the value's, so a
+    /// replica that receives the value first keeps it (the marker is older),
+    /// a replica that receives the marker first drops its old copy and then
+    /// takes the value, and every other node drops whatever older copy it
+    /// held and fetches through on its next read.
+    async fn fan_out_large(
+        &self,
+        transport_key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+        w: WriteStamp,
+        marker: Option<Stamp>,
+        scope: FanOut,
+    ) -> Delivery {
+        debug_assert!(marker.is_none_or(|m| m < w.stamp), "marker must order below the value");
+        if let Some(marker) = marker {
+            self.cluster.gossip_del_queued(transport_key, marker);
+        }
 
         let self_id = self.cluster.self_node().id;
-        let mut delivered = 0usize;
-        let mut peers = 0usize;
-        for node in self.alive_nodes().await {
-            if node.id == self_id {
-                continue;
-            }
-            peers += 1;
-            let Some(addr) = node_data_addr(&node, self.config.data_port) else {
+        let targets: Vec<NodeInfo> = match scope {
+            FanOut::ReplicaSet => self.replica_nodes(transport_key).await,
+            FanOut::Everyone => self.alive_nodes().await,
+        }
+        .into_iter()
+        .filter(|n| n.id != self_id)
+        .collect();
+
+        let mut delivery = Delivery::default();
+        for node in &targets {
+            let Some(addr) = node_data_addr(node, self.config.data_port) else {
+                delivery.failed += 1;
                 self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key, peer = %node.id, "broadcast peer has no parseable data address");
+                tracing::warn!(key = transport_key, peer = %node.id, "peer has no parseable data address");
                 continue;
             };
-            match self.client.store(addr, key, value).await {
-                Ok(true) => delivered += 1,
+            match self.client.store_stamped(addr, transport_key, value, ttl, w.stamp).await {
+                Ok(true) => delivery.delivered += 1,
                 Ok(false) => {
+                    delivery.failed += 1;
                     self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(key, peer = %node.id, %addr, "broadcast peer rejected the write");
+                    tracing::warn!(key = transport_key, peer = %node.id, %addr, "peer rejected large-value write");
                 }
                 Err(e) => {
+                    delivery.failed += 1;
                     self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(key, peer = %node.id, %addr, %e, "broadcast peer write failed");
+                    tracing::warn!(key = transport_key, peer = %node.id, %addr, %e, "large-value write failed");
                 }
             }
         }
-
-        if delivered < peers {
+        if delivery.failed > 0 && scope == FanOut::Everyone {
             // Never silent: a partially-delivered broadcast means some nodes
             // cannot read a value they are supposed to hold locally.
             tracing::warn!(
-                key,
+                key = transport_key,
                 bytes = value.len(),
-                delivered,
-                peers,
+                delivered = delivery.delivered,
+                peers = targets.len(),
                 "broadcast reached only some peers; the rest must fetch through on read"
             );
-        } else {
-            tracing::debug!(key, bytes = value.len(), peers, "broadcast written to every peer");
         }
-
-        local_ok
+        delivery
     }
 
-    /// Write a large value to its replica set. Returns whether the
-    /// primary write succeeded (the client-visible result). See
-    /// [`ClusteredStore::set`] for the replication semantics.
-    async fn set_large(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
-        // The global path's transport key IS the key, and its local target is
-        // the process-wide store — so this is byte-for-byte the old behaviour.
-        self.set_large_routed(key, &self.store, key, value, ttl, LocalCopy::Write).await
-    }
-
-    /// [`set_large`](Self::set_large) with the wire key and the local target
-    /// decoupled, so the per-site path can put a namespaced key on the wire
-    /// while writing the bare key into that site's store. The global path
-    /// passes `transport_key == local_key` and the process-wide store.
-    ///
-    /// `local_copy` decides whether this node's own copy is (re)written. Every
-    /// `set` path passes [`LocalCopy::Write`] — the value has to land somewhere
-    /// locally. The publish paths pass [`LocalCopy::Skip`]: the mutation already
-    /// wrote it under the key's shard lock, and rewriting it from a spawned
-    /// task could regress a newer concurrent mutation.
-    #[allow(clippy::too_many_arguments)]
-    async fn set_large_routed(
-        &self,
-        transport_key: &str,
-        local: &Store,
-        local_key: &str,
-        value: &[u8],
-        ttl: Option<Duration>,
-        local_copy: LocalCopy,
-    ) -> bool {
-        let key = transport_key;
-        let self_id = self.cluster.self_node().id;
-        let replicas = self.replica_nodes(key).await;
-
-        // No cluster peers (single node, or only self alive): store
-        // locally and we're done.
-        if replicas.is_empty() {
-            return local_copy.write(local, local_key, value, ttl);
-        }
-
-        // The primary is the first replica; the rest are secondaries.
-        // Write the primary copy first — its result is what the client
-        // sees. Secondaries follow per the replication mode.
-        let (primary, secondaries) = replicas.split_first().expect("replicas is non-empty");
-        let primary_ok = self
-            .write_one_replica(primary, &self_id, key, local, local_key, value, ttl, local_copy)
-            .await;
-        if !primary_ok {
-            // The primary write failed. Fall back to a local copy so the
-            // value is not lost outright, mirroring the pre-replication
-            // behaviour. Do not attempt secondaries in this case.
-            if primary.id != self_id {
-                return local_copy.write(local, local_key, value, ttl);
-            }
-            return false;
-        }
-
-        let mode = ReplicationMode::from_config(&self.config.replication_mode);
-        match mode {
-            ReplicationMode::Async => {
-                // Fire-and-forget: spawn each secondary write and return.
-                for node in secondaries {
-                    if node.id == self_id {
-                        // Local replica — write inline (cheap, no task).
-                        if !local_copy.write(local, local_key, value, ttl) {
-                            self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(key, "local replica write rejected (memory limit?)");
-                        }
-                        continue;
+    /// Queue a large write for the bounded worker pool, starting the pool on
+    /// `handle` the first time. Returns `false` when the queue is full and
+    /// the write was shed: this node's copy was already written by the
+    /// caller, the value just does not reach its replicas until it is
+    /// written again (counted, rate-limited WARN).
+    fn enqueue_large(self: &Arc<Self>, handle: &tokio::runtime::Handle, job: LargeWrite) -> bool {
+        let tx = self.large_tx.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<LargeWrite>(LARGE_QUEUE_CAP);
+            let rx = Arc::new(tokio::sync::Mutex::new(rx));
+            for _ in 0..LARGE_WORKERS {
+                let rx = Arc::clone(&rx);
+                // Weak, not Arc: the workers must not keep the store (and
+                // through it the cluster handle) alive. Dropping the store
+                // drops the sender, `recv` yields `None`, and they exit.
+                let store = Arc::downgrade(self);
+                handle.spawn(async move {
+                    loop {
+                        let job = rx.lock().await.recv().await;
+                        let Some(job) = job else { break };
+                        let Some(store) = store.upgrade() else { break };
+                        store.run_large(job).await;
                     }
-                    let Some(addr) = node_data_addr(node, self.config.data_port) else {
-                        continue;
-                    };
-                    let client = Arc::clone(&self.client);
-                    let key = key.to_string();
-                    let value = value.to_vec();
-                    let node_id = node.id.clone();
-                    let failures = Arc::clone(&self.replica_write_failures);
-                    tokio::spawn(async move {
-                        match client.store(addr, &key, &value).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                failures.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(
-                                    key,
-                                    replica = %node_id,
-                                    %addr,
-                                    "async replica rejected large-value write"
-                                );
-                            }
-                            Err(e) => {
-                                failures.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(
-                                    key,
-                                    replica = %node_id,
-                                    %addr,
-                                    %e,
-                                    "async replica write failed"
-                                );
-                            }
-                        }
-                    });
-                }
+                });
             }
-            ReplicationMode::Sync => {
-                // Best-effort: await every reachable secondary. Failures
-                // are logged/counted but do not fail the client write.
-                for node in secondaries {
-                    let ok = self
-                        .write_one_replica(
-                            node, &self_id, key, local, local_key, value, ttl, local_copy,
-                        )
-                        .await;
-                    if !ok {
-                        self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
-                    }
+            tx
+        });
+        match tx.try_send(job) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+                let shed = self.large_shed.fetch_add(1, Ordering::Relaxed) + 1;
+                if shed.is_multiple_of(1000) || shed == 1 {
+                    tracing::warn!(
+                        key = %job.transport_key,
+                        queue = LARGE_QUEUE_CAP,
+                        shed_total = shed,
+                        "large-value replication shed: the data-plane queue is full (the local \
+                         write succeeded; this key reaches its replicas when written again)"
+                    );
                 }
-            }
-        }
-
-        true
-    }
-
-    /// Write one copy of a large value to a single replica node.
-    ///
-    /// Writes locally when `node` is this node, otherwise via the TCP
-    /// data plane. Returns whether the write was accepted (a data plane
-    /// error is logged and reported as `false`). The caller decides
-    /// whether a `false` result bumps the replica-failure counter — the
-    /// primary's failure is handled by the [`set_large`](Self::set_large)
-    /// fallback, not counted as a replica failure.
-    #[allow(clippy::too_many_arguments)]
-    async fn write_one_replica(
-        &self,
-        node: &NodeInfo,
-        self_id: &str,
-        key: &str,
-        local: &Store,
-        local_key: &str,
-        value: &[u8],
-        ttl: Option<Duration>,
-        local_copy: LocalCopy,
-    ) -> bool {
-        if node.id == self_id {
-            return local_copy.write(local, local_key, value, ttl);
-        }
-        let Some(addr) = node_data_addr(node, self.config.data_port) else {
-            tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
-            return false;
-        };
-        match self.client.store(addr, key, value).await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                tracing::warn!(key, replica = %node.id, %addr, %e, "replica write failed");
                 false
             }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    /// Execute one queued large write.
+    async fn run_large(&self, job: LargeWrite) {
+        self.fan_out_large(&job.transport_key, &job.value, job.ttl, job.w, job.marker, job.scope)
+            .await;
+    }
+
+    /// Large writes shed because the data-plane queue was full.
+    #[must_use]
+    pub fn large_writes_shed(&self) -> u64 {
+        self.large_shed.load(Ordering::Relaxed)
     }
 
     /// Delete a key from whichever tier owns it, stamping the delete now.
@@ -1305,14 +1314,14 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // origin's own record and what peers see are the same point in the
         // order. (Stamping again inside the spawned task is what let two
         // nodes each win on the other, F-7.)
-        let w = self.inner.new_write(ttl);
+        let store = &self.inner.store;
         if value.len() <= self.inner.config.small_key_threshold {
             // Record OUR own write in the applied map and materialize it in
             // one step under the key's slot (`apply_if_newer`), so a slower
             // echo of this write from gossip, a concurrent local writer or a
             // peer's write racing this one cannot leave the local copy and
             // the recorded stamp disagreeing.
-            let store = &self.inner.store;
+            let w = self.inner.new_write(ttl);
             let verdict = apply_if_newer(&self.applied, &key, w.stamp, || {
                 store.set_local(key.clone(), value.clone(), ttl);
             });
@@ -1326,17 +1335,28 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             self.inner.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
             return true;
         }
-        // Large value: hand the routed data-plane write off to the runtime
-        // and return success. The clustered set() does all local writes via
-        // Store::set_local, so no recursion is possible.
-        let inner = Arc::clone(&self.inner);
-        self.handle.spawn(async move {
-            let ok = inner.set_at(key.clone(), value, ttl, w).await;
-            if !ok {
-                tracing::warn!(key, "clustered set returned false (primary rejected)");
-            }
+        // Large value: this node's own copy is written here, always — so the
+        // writing node reads its own write back whether or not it is in the
+        // replica set (F-8) — and the replica fan-out goes through the
+        // bounded data-plane queue (or is awaited in `sync` mode). Same
+        // one-step record + local write as the small path.
+        let (marker, w) = self.inner.new_large_write(ttl);
+        let mut local_ok = true;
+        let verdict = apply_if_newer(&self.applied, &key, w.stamp, || {
+            local_ok = store.set_local(key.clone(), value.clone(), ttl);
         });
-        true
+        if verdict == Apply::Skip {
+            return true;
+        }
+        self.dispatch_large(LargeWrite {
+            transport_key: key,
+            value,
+            ttl,
+            w,
+            marker: Some(marker),
+            scope: FanOut::ReplicaSet,
+        });
+        local_ok
     }
 
     fn replicate_broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
@@ -1361,12 +1381,13 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             self.inner.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
             return local_ok;
         }
-
-        let inner = Arc::clone(&self.inner);
-        self.handle.spawn(async move {
-            if !inner.broadcast_at(key.clone(), value, ttl, w).await {
-                tracing::warn!(key, "clustered broadcast returned false (local write rejected)");
-            }
+        self.dispatch_large(LargeWrite {
+            transport_key: key,
+            value,
+            ttl,
+            w,
+            marker: None,
+            scope: FanOut::Everyone,
         });
         local_ok
     }
@@ -1379,6 +1400,12 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // store, hot cache, then a data-plane fetch from the key's replica
         // set. That last step is what a node which missed the write needs.
         Box::pin(async move { self.inner.get(key).await })
+    }
+
+    fn fetch_through(&self, key: &str) -> Option<Vec<u8>> {
+        // The global keyspace's transport key IS the key. Bounded by
+        // FETCH_THROUGH_TIMEOUT inside; `None` on a shut-down runtime.
+        block_on_cluster(&self.handle, self.inner.fetch_through(key)).flatten()
     }
 
     fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
@@ -1426,8 +1453,8 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // Recording our own stamp is still required: it is what stops the
         // gossip echo of THIS publish from clobbering a newer local value that
         // lands before the echo arrives.
-        let w = self.inner.new_write(ttl);
         if value.len() <= self.inner.config.small_key_threshold {
+            let w = self.inner.new_write(ttl);
             if apply_if_newer(&self.applied, &key, w.stamp, || {}) == Apply::Skip {
                 // Overtaken by a newer write for this key: not published.
                 return;
@@ -1435,11 +1462,17 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             self.inner.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
             return;
         }
-        let inner = Arc::clone(&self.inner);
-        self.handle.spawn(async move {
-            if !inner.publish_at(&key, &value, ttl, w).await {
-                tracing::warn!(key, "clustered publish returned false (primary rejected)");
-            }
+        let (marker, w) = self.inner.new_large_write(ttl);
+        if apply_if_newer(&self.applied, &key, w.stamp, || {}) == Apply::Skip {
+            return;
+        }
+        self.dispatch_large(LargeWrite {
+            transport_key: key,
+            value,
+            ttl,
+            w,
+            marker: Some(marker),
+            scope: FanOut::ReplicaSet,
         });
     }
 
@@ -1492,18 +1525,60 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             return true;
         };
 
-        // Small-key tier only: the gossip TTL update is what carries
-        // the new expiry across the cluster. Large values live only on
-        // their replica set; a TTL update for a large value updates
-        // this node's copy (already done above) but does not fan out
-        // to peer replicas — the roadmap's OP_EXPIRE data-plane frame
-        // is out of scope for this change. Session blobs are almost
-        // always well below `small_key_threshold`, so refresh works
-        // for the primary consumer.
         if bytes.len() <= self.inner.config.small_key_threshold {
             self.inner.cluster.gossip_set_queued(key, &bytes, w.expiry_ms, w.stamp);
+        } else {
+            // A large value's TTL change is re-sent to its replicas as a
+            // stamped SET with the new TTL — one path for "value and expiry
+            // on the replica set", and it repairs a replica that missed the
+            // value (F-11: this used to be node-local). No marker: nothing
+            // outside the replica set holds a copy to invalidate.
+            self.dispatch_large(LargeWrite {
+                transport_key: key.to_string(),
+                value: bytes.to_vec(),
+                ttl: Some(ttl),
+                w,
+                marker: None,
+                scope: FanOut::ReplicaSet,
+            });
         }
         true
+    }
+}
+
+impl KvReplicator {
+    /// Hand a large write to the data-plane workers, or — in
+    /// `replication_mode = "sync"` — run it to completion here so the client
+    /// is answered only once every reachable replica has acknowledged.
+    fn dispatch_large(&self, job: LargeWrite) {
+        dispatch_large(&self.inner, &self.handle, job);
+    }
+}
+
+/// Shared by both replicators: queue a large write, or in `sync` mode await
+/// its fan-out from the synchronous hook via [`block_on_cluster`].
+fn dispatch_large(inner: &Arc<ClusteredStore>, handle: &tokio::runtime::Handle, job: LargeWrite) {
+    if ReplicationMode::from_config(&inner.config.replication_mode) == ReplicationMode::Sync
+        && can_block_here()
+    {
+        // Answer the client only once the fan-out is done. `None` (the
+        // runtime is shutting down) leaves the local copy, already written,
+        // as the only one.
+        let _ = block_on_cluster(handle, inner.run_large(job));
+        return;
+    }
+    // Async mode — or a current-thread runtime, where blocking would deadlock
+    // the only worker: the queue delivers the same writes, just not before
+    // the client is answered.
+    inner.enqueue_large(handle, job);
+}
+
+/// Whether [`block_on_cluster`] can run a future from this thread: off any
+/// runtime, or on a multi-thread runtime worker.
+fn can_block_here() -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => true,
+        Ok(current) => current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
     }
 }
 
@@ -1582,13 +1657,13 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // Materialize into THIS SITE's store synchronously (mirrors the global
         // replicator): the gossip tier lives in chitchat state, invisible to
         // the raw-store readers this vhost's PHP and RESP clients use.
-        let w = self.inner.new_write(ttl);
+        // Keyed by the TRANSPORT key so site A's "foo" and site B's "foo"
+        // occupy different ordering slots.
+        // Record + local write are one step (see `apply_if_newer`).
+        let transport = crate::site_namespace::encode(&self.site, &key);
+        let local = &self.local;
         if value.len() <= self.inner.config.small_key_threshold {
-            // Keyed by the TRANSPORT key so site A's "foo" and site B's "foo"
-            // occupy different ordering slots; record + local write are one
-            // step (see `apply_if_newer`).
-            let transport = crate::site_namespace::encode(&self.site, &key);
-            let local = &self.local;
+            let w = self.inner.new_write(ttl);
             let verdict = apply_if_newer(&self.applied, &transport, w.stamp, || {
                 local.set_local(key.clone(), value.clone(), ttl);
             });
@@ -1598,20 +1673,29 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
             self.inner.cluster.gossip_set_queued(&transport, &value, w.expiry_ms, w.stamp);
             return true;
         }
-        let inner = Arc::clone(&self.inner);
-        let local = Arc::clone(&self.local);
-        let site = Arc::clone(&self.site);
-        self.handle.spawn(async move {
-            let ok = inner.set_for_site(&site, &local, key.clone(), value, ttl, w).await;
-            if !ok {
-                tracing::warn!(
-                    %site,
-                    key,
-                    "per-site KV: clustered set returned false — the write did not reach peers"
-                );
-            }
+        // Large value: this site's own copy under the bare key, the fan-out
+        // under the transport key (see `KvReplicator::replicate_set`).
+        let (marker, w) = self.inner.new_large_write(ttl);
+        let mut local_ok = true;
+        let verdict = apply_if_newer(&self.applied, &transport, w.stamp, || {
+            local_ok = local.set_local(key.clone(), value.clone(), ttl);
         });
-        true
+        if verdict == Apply::Skip {
+            return true;
+        }
+        dispatch_large(
+            &self.inner,
+            &self.handle,
+            LargeWrite {
+                transport_key: transport,
+                value,
+                ttl,
+                w,
+                marker: Some(marker),
+                scope: FanOut::ReplicaSet,
+            },
+        );
+        local_ok
     }
 
     fn replicate_remove(&self, key: &str) -> bool {
@@ -1633,27 +1717,36 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // holds this value (applied under its shard lock), so writing it back
         // would risk regressing a newer concurrent increment on this node. Only
         // the cluster-wide fan-out is left to do.
-        let w = self.inner.new_write(ttl);
+        let transport = crate::site_namespace::encode(&self.site, &key);
         if value.len() <= self.inner.config.small_key_threshold {
-            let transport = crate::site_namespace::encode(&self.site, &key);
+            let w = self.inner.new_write(ttl);
             if apply_if_newer(&self.applied, &transport, w.stamp, || {}) == Apply::Skip {
                 return;
             }
             self.inner.cluster.gossip_set_queued(&transport, &value, w.expiry_ms, w.stamp);
             return;
         }
-        let inner = Arc::clone(&self.inner);
-        let local = Arc::clone(&self.local);
-        let site = Arc::clone(&self.site);
-        self.handle.spawn(async move {
-            if !inner.publish_for_site(&site, &local, &key, &value, ttl, w).await {
-                tracing::warn!(
-                    %site,
-                    key,
-                    "per-site KV: clustered publish returned false — the value did not reach peers"
-                );
-            }
-        });
+        let (marker, w) = self.inner.new_large_write(ttl);
+        if apply_if_newer(&self.applied, &transport, w.stamp, || {}) == Apply::Skip {
+            return;
+        }
+        dispatch_large(
+            &self.inner,
+            &self.handle,
+            LargeWrite {
+                transport_key: transport,
+                value,
+                ttl,
+                w,
+                marker: Some(marker),
+                scope: FanOut::ReplicaSet,
+            },
+        );
+    }
+
+    fn fetch_through(&self, key: &str) -> Option<Vec<u8>> {
+        let transport = crate::site_namespace::encode(&self.site, key);
+        block_on_cluster(&self.handle, self.inner.fetch_through(&transport)).flatten()
     }
 
     fn replicate_remove_published(&self, key: String) {
@@ -1693,6 +1786,20 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // Small-key tier only, matching the global `replicate_expire`.
         if bytes.len() <= self.inner.config.small_key_threshold {
             self.inner.cluster.gossip_set_queued(&transport, &bytes, w.expiry_ms, w.stamp);
+        } else {
+            // Re-send to the replica set with the new TTL, as the global path does.
+            dispatch_large(
+                &self.inner,
+                &self.handle,
+                LargeWrite {
+                    transport_key: transport,
+                    value: bytes.to_vec(),
+                    ttl: Some(ttl),
+                    w,
+                    marker: None,
+                    scope: FanOut::ReplicaSet,
+                },
+            );
         }
         true
     }
@@ -2119,32 +2226,6 @@ fn hash_key(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
-}
-
-/// Whether a large-value fan-out may (re)write this node's own copy.
-///
-/// A `set` must: the value has to land somewhere locally. A **publish** must
-/// not: the read-modify-write op that produced the value already wrote it under
-/// the key's shard lock, and publishes are spawned, so rewriting from one could
-/// overwrite a newer concurrent mutation on this node — the lost-update bug the
-/// publish-only path exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalCopy {
-    /// Write the value into the local target store.
-    Write,
-    /// Leave the local store alone; only fan out to peers.
-    Skip,
-}
-
-impl LocalCopy {
-    /// Perform (or skip) the local write, reporting success either way — a
-    /// skipped write is not a failure.
-    fn write(self, local: &Store, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
-        match self {
-            Self::Write => local.set_local(key.to_string(), value.to_vec(), ttl),
-            Self::Skip => true,
-        }
-    }
 }
 
 /// Select the replica set for a key from a sorted alive-node list.

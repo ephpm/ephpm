@@ -289,7 +289,9 @@ unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c
         return 0;
     };
 
-    match store.get(key_str) {
+    // Through the cluster: a large value held by other nodes only is fetched
+    // from them (bounded) rather than reported missing.
+    match store.get_through(key_str) {
         Some(val) => {
             // `try_with` (issue #269): reachable from a shutdown function on
             // an exiting thread. Without the buffer there is nowhere to hand
