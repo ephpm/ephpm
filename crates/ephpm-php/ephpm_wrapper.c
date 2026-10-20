@@ -32,6 +32,8 @@
 #include <string.h>
 #include <setjmp.h>
 #include <ctype.h>
+#include <limits.h>
+#include <time.h>
 
 /* MSVC has no POSIX strtok_r; its strtok_s has the same 3-arg semantics. */
 #ifdef _MSC_VER
@@ -3816,27 +3818,32 @@ int ephpm_worker_run(const char *script)
  * ephpm_set_kv_ops().
  * =================================================================== */
 
+/* Every key is passed as (pointer, length), never as a NUL-terminated C
+ * string: PHP strings are binary, and a `const char *key` alone truncated
+ * "nul\0A" and "nul\0B" to the same key "nul" (KV stress report F-18). */
 typedef struct {
-    int  (*get)(const char *key);
+    int  (*get)(const char *key, size_t key_len);
     void (*get_result)(const char **ptr, size_t *len);
-    int  (*set)(const char *key, const char *val, size_t val_len, long long ttl_ms);
+    int  (*set)(const char *key, size_t key_len, const char *val, size_t val_len,
+                long long ttl_ms);
     /* 1 inserted, 0 not inserted (exists / OOM), -1 clustered owner
      * unreachable: outcome unknown (a timed-out request may have landed). */
-    int  (*set_nx)(const char *key, const char *val, size_t val_len, long long ttl_ms);
-    long (*del)(const char *key);
-    int  (*exists)(const char *key);
-    int  (*incr_by)(const char *key, long long delta, long long *result);
-    int  (*expire)(const char *key, long long ttl_ms);
-    long long (*pttl)(const char *key);
+    int  (*set_nx)(const char *key, size_t key_len, const char *val, size_t val_len,
+                   long long ttl_ms);
+    long (*del)(const char *key, size_t key_len);
+    int  (*exists)(const char *key, size_t key_len);
+    int  (*incr_by)(const char *key, size_t key_len, long long delta, long long *result);
+    int  (*expire)(const char *key, size_t key_len, long long ttl_ms);
+    long long (*pttl)(const char *key, size_t key_len);
     int  (*flush_all)(void);
     /* Blocking versioned wait. Returns 0 = timeout, 1 = changed with a
      * value (in the get_result buffer), 2 = changed but key absent. */
-    int  (*wait)(const char *key, long long last_version, long long timeout_ms,
-                 long long *new_version);
+    int  (*wait)(const char *key, size_t key_len, long long last_version,
+                 long long timeout_ms, long long *new_version);
     /* Compare-and-delete: delete key only while its value equals the
      * token/token_len bytes. Returns 1 if deleted, 0 otherwise. The
      * safe-release primitive for KV locks (delete-side companion to set_nx). */
-    int  (*del_if_eq)(const char *key, const char *token, size_t token_len);
+    int  (*del_if_eq)(const char *key, size_t key_len, const char *token, size_t token_len);
     /* Whether this request has a KV keyspace: 0 yes; 1 no (a multi-tenant
      * request whose Host matched no vhost), first call this request — warn;
      * 2 no, already warned. Checked before every ephpm_kv_* op.
@@ -3897,6 +3904,87 @@ static void ephpm_kv_warn_unwired(void)
         "this warning", get_active_function_name());
 }
 
+/* Strict UTF-8 check with the same acceptance as Rust's str::from_utf8: no
+ * overlong forms, no surrogates, nothing above U+10FFFF. */
+static int ephpm_kv_utf8_valid(const unsigned char *s, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        size_t n;
+        unsigned int cp, min;
+        if (c >= 0xC2 && c <= 0xDF) {
+            n = 1; cp = c & 0x1Fu; min = 0x80u;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            n = 2; cp = c & 0x0Fu; min = 0x800u;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            n = 3; cp = c & 0x07u; min = 0x10000u;
+        } else {
+            return 0;
+        }
+        if (len - i - 1 < n) {
+            return 0;
+        }
+        for (size_t k = 1; k <= n; k++) {
+            unsigned char b = s[i + k];
+            if ((b & 0xC0u) != 0x80u) {
+                return 0;
+            }
+            cp = (cp << 6) | (b & 0x3Fu);
+        }
+        if (cp < min || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+            return 0;
+        }
+        i += n + 1;
+    }
+    return 1;
+}
+
+/* Non-zero (after a warning) when `key` cannot be a KV key. The store keys
+ * entries by UTF-8 string, so a binary key — e.g. raw md5($x, true) output —
+ * cannot be stored faithfully. It used to fail with no diagnostic at all
+ * (KV stress report F-18); now the call warns and returns its failure value.
+ * NUL bytes are fine: keys travel as (pointer, length). */
+static int ephpm_kv_bad_key(const char *key, size_t key_len)
+{
+    if (ephpm_kv_utf8_valid((const unsigned char *)key, key_len)) {
+        return 0;
+    }
+    zend_error(E_WARNING,
+        "%s(): KV keys must be valid UTF-8, and this one is not, so the call did "
+        "nothing and returned its failure value. For a binary digest such as "
+        "md5($x, true), use its hex form (md5($x)) or bin2hex() as the key",
+        get_active_function_name());
+    return 1;
+}
+
+/* Convert a TTL in seconds to the milliseconds the KV ops take. ttl <= 0
+ * means "no expiry" (0). Returns 0 (after a warning) when the TTL is so large
+ * that ttl * 1000, or the absolute expiry time in Unix milliseconds,
+ * overflows a 64-bit integer — the same bound Redis applies. Multiplying
+ * unchecked was signed-overflow UB in C. */
+static int ephpm_kv_ttl_ms(zend_long ttl, long long *out)
+{
+    if (ttl <= 0) {
+        *out = 0;
+        return 1;
+    }
+    long long now_ceiling_ms = ((long long)time(NULL) + 1) * 1000LL;
+    if ((long long)ttl > (LLONG_MAX - now_ceiling_ms) / 1000LL) {
+        zend_error(E_WARNING,
+            "%s(): TTL of " ZEND_LONG_FMT " seconds is out of range, so the call did "
+            "nothing and returned its failure value",
+            get_active_function_name(), ttl);
+        return 0;
+    }
+    *out = (long long)ttl * 1000LL;
+    return 1;
+}
+
 /* ── PHP_FUNCTION implementations ─────────────────────────────── */
 
 PHP_FUNCTION(ephpm_kv_get)
@@ -3908,7 +3996,8 @@ PHP_FUNCTION(ephpm_kv_get)
 
     if (!g_kv_ops.get) { ephpm_kv_warn_unwired(); RETURN_NULL(); }
     if (ephpm_kv_no_site_context()) { RETURN_NULL(); }
-    if (!g_kv_ops.get(key)) { RETURN_NULL(); }
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_NULL(); }
+    if (!g_kv_ops.get(key, key_len)) { RETURN_NULL(); }
 
     const char *ptr; size_t len;
     g_kv_ops.get_result(&ptr, &len);
@@ -3929,8 +4018,10 @@ PHP_FUNCTION(ephpm_kv_set)
 
     if (!g_kv_ops.set) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
-    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
-    RETURN_BOOL(g_kv_ops.set(key, val, val_len, ttl_ms));
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.set(key, key_len, val, val_len, ttl_ms));
 }
 
 PHP_FUNCTION(ephpm_kv_setnx)
@@ -3947,14 +4038,16 @@ PHP_FUNCTION(ephpm_kv_setnx)
 
     if (!g_kv_ops.set_nx) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
-    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_FALSE; }
     /* Returns true if the value was inserted, false if a live entry was
      * already present at this key. The check-and-set is atomic under the
      * KV store's per-shard lock — this is the primitive the PHP-side lock
      * libraries (Cache::lock, Symfony LockFactory) build on. The op returns
      * -1 when a clustered owner was unreachable (outcome unknown) — only 1
      * means inserted. */
-    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms) == 1);
+    RETURN_BOOL(g_kv_ops.set_nx(key, key_len, val, val_len, ttl_ms) == 1);
 }
 
 PHP_FUNCTION(ephpm_kv_del)
@@ -3966,7 +4059,8 @@ PHP_FUNCTION(ephpm_kv_del)
 
     if (!g_kv_ops.del) { ephpm_kv_warn_unwired(); RETURN_LONG(0); }
     if (ephpm_kv_no_site_context()) { RETURN_LONG(0); }
-    RETURN_LONG(g_kv_ops.del(key));
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_LONG(0); }
+    RETURN_LONG(g_kv_ops.del(key, key_len));
 }
 
 PHP_FUNCTION(ephpm_kv_del_if_eq)
@@ -3980,13 +4074,14 @@ PHP_FUNCTION(ephpm_kv_del_if_eq)
 
     if (!g_kv_ops.del_if_eq) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
     /* Deletes key only while its stored value still equals `token`; returns
      * true if this call removed it, false otherwise (mismatch, absent, or
      * expired). The compare-and-delete is atomic under the KV store's per-key
      * shard lock — this is the safe-release primitive a lock library pairs
      * with ephpm_kv_setnx(): a holder that overran its TTL can no longer
      * delete the new holder's lock. */
-    RETURN_BOOL(g_kv_ops.del_if_eq(key, token, token_len));
+    RETURN_BOOL(g_kv_ops.del_if_eq(key, key_len, token, token_len));
 }
 
 PHP_FUNCTION(ephpm_kv_exists)
@@ -3998,7 +4093,8 @@ PHP_FUNCTION(ephpm_kv_exists)
 
     if (!g_kv_ops.exists) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
-    RETURN_BOOL(g_kv_ops.exists(key));
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.exists(key, key_len));
 }
 
 PHP_FUNCTION(ephpm_kv_incr)
@@ -4010,8 +4106,9 @@ PHP_FUNCTION(ephpm_kv_incr)
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
     long long result = 0;
-    if (!g_kv_ops.incr_by(key, 1, &result)) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by(key, key_len, 1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
 }
 
@@ -4024,8 +4121,9 @@ PHP_FUNCTION(ephpm_kv_decr)
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
     long long result = 0;
-    if (!g_kv_ops.incr_by(key, -1, &result)) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by(key, key_len, -1, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
 }
 
@@ -4040,8 +4138,9 @@ PHP_FUNCTION(ephpm_kv_incr_by)
 
     if (!g_kv_ops.incr_by) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
     long long result = 0;
-    if (!g_kv_ops.incr_by(key, (long long)delta, &result)) { RETURN_FALSE; }
+    if (!g_kv_ops.incr_by(key, key_len, (long long)delta, &result)) { RETURN_FALSE; }
     RETURN_LONG((zend_long)result);
 }
 
@@ -4056,8 +4155,11 @@ PHP_FUNCTION(ephpm_kv_expire)
 
     if (!g_kv_ops.expire) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
-    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
-    RETURN_BOOL(g_kv_ops.expire(key, ttl_ms));
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_FALSE; }
+    /* ttl <= 0 gives ttl_ms 0, which the op refuses (returns 0). */
+    RETURN_BOOL(g_kv_ops.expire(key, key_len, ttl_ms));
 }
 
 PHP_FUNCTION(ephpm_kv_ttl)
@@ -4069,7 +4171,8 @@ PHP_FUNCTION(ephpm_kv_ttl)
 
     if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
     if (ephpm_kv_no_site_context()) { RETURN_LONG(-2); }
-    long long pttl = g_kv_ops.pttl(key);
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_LONG(-2); }
+    long long pttl = g_kv_ops.pttl(key, key_len);
     if (pttl < 0) {
         /* -1 = no expiry, -2 = missing — pass through */
         RETURN_LONG((zend_long)pttl);
@@ -4088,7 +4191,8 @@ PHP_FUNCTION(ephpm_kv_pttl)
 
     if (!g_kv_ops.pttl) { ephpm_kv_warn_unwired(); RETURN_LONG(-2); }
     if (ephpm_kv_no_site_context()) { RETURN_LONG(-2); }
-    RETURN_LONG((zend_long)g_kv_ops.pttl(key));
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_LONG(-2); }
+    RETURN_LONG((zend_long)g_kv_ops.pttl(key, key_len));
 }
 
 /* Redis-style FLUSHDB / FLUSHALL: removes every key from the effective
@@ -4141,8 +4245,10 @@ PHP_FUNCTION(ephpm_kv_wait)
     if (!g_kv_ops.wait) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
     if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
 
+    if (ephpm_kv_bad_key(key, key_len)) { RETURN_FALSE; }
+
     long long new_version = 0;
-    int rc = g_kv_ops.wait(key, (long long)last_version, (long long)timeout_ms,
+    int rc = g_kv_ops.wait(key, key_len, (long long)last_version, (long long)timeout_ms,
                            &new_version);
     if (rc == 0) { RETURN_FALSE; } /* timeout */
 
@@ -5592,6 +5698,12 @@ static long long ephpm_session_ttl_ms(void)
     if (lifetime <= 0) {
         return 0;
     }
+    /* A lifetime too large to express in ms (or as an absolute expiry) means
+     * "forever" — no expiry — rather than signed-overflow UB. */
+    long long now_ceiling_ms = ((long long)time(NULL) + 1) * 1000LL;
+    if (lifetime > (LLONG_MAX - now_ceiling_ms) / 1000LL) {
+        return 0;
+    }
     return lifetime * 1000LL;
 }
 
@@ -5741,8 +5853,9 @@ static void ephpm_session_lock_release(void)
             EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
             session_lock_sid, session_lock_sid_len,
             stack, sizeof(stack), &used_heap);
-        (void)g_kv_ops.del_if_eq(lock_key, session_lock_token,
-                                 EPHPM_SESSION_LOCK_TOKEN_LEN);
+        (void)g_kv_ops.del_if_eq(lock_key,
+                                 EPHPM_SESSION_LOCK_PREFIX_LEN + session_lock_sid_len,
+                                 session_lock_token, EPHPM_SESSION_LOCK_TOKEN_LEN);
         ephpm_session_key_free(lock_key, used_heap);
     }
     free(session_lock_sid);
@@ -5781,6 +5894,7 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
     char *lock_key = ephpm_session_make_prefixed_key(
         EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
         sid, sid_len, stack, sizeof(stack), &used_heap);
+    const size_t lock_key_len = EPHPM_SESSION_LOCK_PREFIX_LEN + sid_len;
 
     unsigned int backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_START_MS;
     int acquired = 0;
@@ -5798,8 +5912,8 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
     ephpm_session_lock_new_token();
 
     for (;;) {
-        int rc = g_kv_ops.set_nx(lock_key, session_lock_token, EPHPM_SESSION_LOCK_TOKEN_LEN,
-                                 EPHPM_SESSION_LOCK_TTL_MS);
+        int rc = g_kv_ops.set_nx(lock_key, lock_key_len, session_lock_token,
+                                 EPHPM_SESSION_LOCK_TOKEN_LEN, EPHPM_SESSION_LOCK_TTL_MS);
         if (rc == 1) {
             acquired = 1;
             break;
@@ -5841,7 +5955,7 @@ static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
             /* OOM copying the sid: we cannot track ownership, so we must
              * not keep the lock — a lock we can't release would block the
              * session until the TTL fires. Undo and run lockless. */
-            (void)g_kv_ops.del_if_eq(lock_key, session_lock_token,
+            (void)g_kv_ops.del_if_eq(lock_key, lock_key_len, session_lock_token,
                                      EPHPM_SESSION_LOCK_TOKEN_LEN);
             php_error_docref(NULL, E_WARNING,
                 "ephpm session handler: out of memory tracking session lock; "
@@ -5938,7 +6052,7 @@ PS_READ_FUNC(ephpm)
     int used_heap = 0;
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
 
-    if (!g_kv_ops.get(kv_key)) {
+    if (!g_kv_ops.get(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len)) {
         ephpm_session_key_free(kv_key, used_heap);
         /* Missing keys are NOT an error — return an empty string so PHP
          * treats the session as new. */
@@ -5972,7 +6086,8 @@ PS_WRITE_FUNC(ephpm)
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
 
     long long ttl_ms = ephpm_session_ttl_ms();
-    int ok = g_kv_ops.set(kv_key, ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
+    int ok = g_kv_ops.set(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len,
+                          ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
     ephpm_session_key_free(kv_key, used_heap);
 
     return ok ? SUCCESS : FAILURE;
@@ -6003,7 +6118,7 @@ PS_DESTROY_FUNC(ephpm)
     char stack[128];
     int used_heap = 0;
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
-    (void)g_kv_ops.del(kv_key);
+    (void)g_kv_ops.del(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len);
     ephpm_session_key_free(kv_key, used_heap);
     return SUCCESS;
 }
@@ -6053,7 +6168,7 @@ PS_VALIDATE_SID_FUNC(ephpm)
     char stack[128];
     int used_heap = 0;
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
-    int found = g_kv_ops.exists(kv_key);
+    int found = g_kv_ops.exists(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len);
     ephpm_session_key_free(kv_key, used_heap);
     return found ? SUCCESS : FAILURE;
 }
@@ -6083,12 +6198,13 @@ PS_UPDATE_TIMESTAMP_FUNC(ephpm)
     long long ttl_ms = ephpm_session_ttl_ms();
     int ok = 1;
     if (ttl_ms > 0) {
-        ok = g_kv_ops.expire(kv_key, ttl_ms);
+        ok = g_kv_ops.expire(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len, ttl_ms);
         if (!ok && g_kv_ops.set) {
             /* Key may have expired between read and update — restore it
              * by falling through to a full write so the session is not
              * silently dropped. */
-            ok = g_kv_ops.set(kv_key, ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
+            ok = g_kv_ops.set(kv_key, EPHPM_SESSION_KEY_PREFIX_LEN + sid_len,
+                              ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
         }
     }
     ephpm_session_key_free(kv_key, used_heap);

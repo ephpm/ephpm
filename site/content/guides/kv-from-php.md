@@ -78,10 +78,17 @@ Edge cases worth knowing:
   there is no sub-second expiry from PHP. `pttl` only *reads* milliseconds.
 - **`incr` / `decr` / `incr_by` return `false`** when the stored value is not
   an integer.
-- **Keys are C strings; values are binary-safe.** A key containing a NUL byte
-  is truncated at the NUL (`"a\0b"` addresses the key `"a"`), and a key that
-  is not valid UTF-8 never matches anything: reads miss (`ttl`/`pttl` report
-  `-2`) and writes fail (`false`, or `0` from `del`). Values may hold any bytes.
+- **Keys must be valid UTF-8; values are binary-safe.** Keys are passed with
+  their length, so a NUL byte is an ordinary character (`"a\0b"` and `"a\0c"`
+  are two keys). A key that is not valid UTF-8, such as raw
+  `md5($x, true)` output, is refused: the call raises an `E_WARNING` and
+  returns its failure value (`null` from `get`, `false` from writes, `0` from
+  `del`, `-2` from `ttl`/`pttl`). Use a text form such as `md5($x)` or
+  `bin2hex()` instead. Unlike Redis, the store cannot hold binary keys. Values
+  may hold any bytes.
+- **An out-of-range TTL is refused.** A `$ttl` so large that the expiry time
+  overflows a 64-bit millisecond count (for example `PHP_INT_MAX`) makes
+  `set`, `setnx` and `expire` raise an `E_WARNING` and return `false`.
 - **`ephpm_kv_flush_all()` is per-site in multi-tenant mode.** With
   `[server] sites_dir` set, it empties only the calling virtual host's
   keyspace, never another tenant's. In single-site mode it empties the whole
