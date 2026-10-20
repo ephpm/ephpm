@@ -2821,6 +2821,23 @@ pub struct SqliteConfig {
 /// deadlocks and never stalls a long transaction. The exclusive window is the
 /// checkpoint itself: milliseconds on a backfilled log.
 ///
+/// # Escalation
+///
+/// Statements that routinely run longer than `max_wait_ms` (heavy
+/// `COUNT`/`GROUP BY`/join reads) would make *every* attempt time out. The
+/// backoff would then stretch attempts to one a minute while the log, and
+/// with it read latency, kept growing (measured: 1.2 GiB `-wal`, p99 4×).
+/// So once the `-wal` file is at least **4 × `threshold_bytes`**, a timed-out
+/// attempt does not back off: the next one, an interval later, waits twice
+/// as long, doubling up to
+/// [`max_escalated_wait_ms`](Self::max_escalated_wait_ms). Only a timeout at
+/// that ceiling backs off. A truncate, or the file dropping back under
+/// 4 × `threshold_bytes`, resets it. **Trade-off:** new statements queue
+/// for as long as an attempt waits, so while escalated a request can stall
+/// for up to `max_escalated_wait_ms`, though in practice only until the
+/// statements already in flight finish. That only happens while the log is
+/// already several times over its threshold.
+///
 /// # Default: on
 ///
 /// Measured against the same stress harness that found the growth (single
@@ -2871,7 +2888,33 @@ pub struct WalCheckpointConfig {
     /// Default: `60`.
     #[serde(default = "default_wal_checkpoint_max_backoff_secs")]
     pub max_backoff_secs: u64,
+
+    /// Ceiling, in milliseconds, for the escalated wait used once the `-wal`
+    /// file is at least 4 × `threshold_bytes` and attempts keep timing out
+    /// (see "Escalation" above). New statements queue for as long as an
+    /// attempt waits, so **this is the worst-case stall an escalated attempt
+    /// can add to a request**. It must be ≥ `max_wait_ms`; setting it equal to
+    /// `max_wait_ms` turns escalation off (the plain bounded-wait-and-backoff
+    /// schedule). Unset: `2000`, or `max_wait_ms` if that is larger, so a
+    /// config that raised `max_wait_ms` past 2 s keeps loading. Read it
+    /// through [`effective_max_escalated_wait_ms`](Self::effective_max_escalated_wait_ms).
+    #[serde(default)]
+    pub max_escalated_wait_ms: Option<u64>,
 }
+
+impl WalCheckpointConfig {
+    /// The escalation ceiling in force: the configured value, or when unset
+    /// `2000` ms (never below `max_wait_ms`).
+    #[must_use]
+    pub fn effective_max_escalated_wait_ms(&self) -> u64 {
+        self.max_escalated_wait_ms
+            .unwrap_or_else(|| DEFAULT_WAL_CHECKPOINT_MAX_ESCALATED_WAIT_MS.max(self.max_wait_ms))
+    }
+}
+
+/// Default escalation ceiling for `[db.sqlite.wal_checkpoint]`, in
+/// milliseconds (litewire's `WalGateConfig::max_escalated_wait` default).
+pub const DEFAULT_WAL_CHECKPOINT_MAX_ESCALATED_WAIT_MS: u64 = 2000;
 
 impl Default for WalCheckpointConfig {
     fn default() -> Self {
@@ -2881,6 +2924,7 @@ impl Default for WalCheckpointConfig {
             interval_secs: default_wal_checkpoint_interval_secs(),
             max_wait_ms: default_wal_checkpoint_max_wait_ms(),
             max_backoff_secs: default_wal_checkpoint_max_backoff_secs(),
+            max_escalated_wait_ms: None,
         }
     }
 }
@@ -5080,6 +5124,18 @@ impl Config {
                     "[db.sqlite.wal_checkpoint] max_backoff_secs ({}) must be at least \
                      interval_secs ({})",
                     w.max_backoff_secs, w.interval_secs
+                )));
+            }
+            // An escalation ceiling below the plain wait is contradictory
+            // (litewire would silently treat it as "escalation off"); equal
+            // is the documented way to turn escalation off.
+            if let Some(ceiling) = w.max_escalated_wait_ms
+                && ceiling < w.max_wait_ms
+            {
+                return Err(ConfigError::Validation(format!(
+                    "[db.sqlite.wal_checkpoint] max_escalated_wait_ms ({ceiling}) must be at \
+                     least max_wait_ms ({}); set it equal to max_wait_ms to disable escalation",
+                    w.max_wait_ms
                 )));
             }
         }
@@ -8745,7 +8801,8 @@ listen = "0.0.0.0:8080"
              threshold_bytes = 1048576\n\
              interval_secs = 5\n\
              max_wait_ms = 100\n\
-             max_backoff_secs = 30\n",
+             max_backoff_secs = 30\n\
+             max_escalated_wait_ms = 1500\n",
         );
         let sqlite = config.db.sqlite.expect("sqlite section present");
         assert!(sqlite.replication.per_site);
@@ -8755,6 +8812,8 @@ listen = "0.0.0.0:8080"
         assert_eq!(sqlite.wal_checkpoint.interval_secs, 5);
         assert_eq!(sqlite.wal_checkpoint.max_wait_ms, 100);
         assert_eq!(sqlite.wal_checkpoint.max_backoff_secs, 30);
+        assert_eq!(sqlite.wal_checkpoint.max_escalated_wait_ms, Some(1500));
+        assert_eq!(sqlite.wal_checkpoint.effective_max_escalated_wait_ms(), 1500);
         // Removed-but-declared knobs parse (and warn at startup) rather than
         // hard-failing an upgrading config with "unknown field".
         assert!(sqlite.replication.cdc_experimental);
@@ -9529,6 +9588,8 @@ path = "app.db"
         assert_eq!(wal.interval_secs, 2);
         assert_eq!(wal.max_wait_ms, 250);
         assert_eq!(wal.max_backoff_secs, 60);
+        assert_eq!(wal.max_escalated_wait_ms, None);
+        assert_eq!(wal.effective_max_escalated_wait_ms(), 2000, "escalation ceiling: 2 s");
         assert_eq!(
             WalCheckpointConfig::default().threshold_bytes,
             wal.threshold_bytes,
@@ -9547,6 +9608,8 @@ path = "app.db"
             ("max_wait_ms = 0\n", "max_wait_ms"),
             ("interval_secs = 10\nmax_backoff_secs = 5\n", "max_backoff_secs"),
             ("enabled = false\nmax_wait_ms = 0\n", "max_wait_ms"),
+            ("max_escalated_wait_ms = 0\n", "max_escalated_wait_ms"),
+            ("max_wait_ms = 500\nmax_escalated_wait_ms = 400\n", "max_escalated_wait_ms"),
         ];
         for (body, key) in cases {
             let err = validate_toml(&format!("[db.sqlite]\n[db.sqlite.wal_checkpoint]\n{body}"))
@@ -9561,6 +9624,14 @@ path = "app.db"
              interval_secs = 1\nmax_wait_ms = 50\nmax_backoff_secs = 1\n",
         )
         .expect("a sane override must validate");
+        // Equal to max_wait_ms is the documented "escalation off"; an unset
+        // ceiling with max_wait_ms raised past the 2 s default still loads.
+        validate_toml(
+            "[db.sqlite]\n[db.sqlite.wal_checkpoint]\nmax_wait_ms = 300\nmax_escalated_wait_ms = 300\n",
+        )
+        .expect("ceiling == max_wait_ms (escalation off) must validate");
+        validate_toml("[db.sqlite]\n[db.sqlite.wal_checkpoint]\nmax_wait_ms = 3000\n")
+            .expect("an unset ceiling must not reject a large max_wait_ms");
     }
 
     #[test]

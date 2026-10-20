@@ -276,11 +276,17 @@ path is a **single ordered stream** with no schema-sync side channel.
   exclusive window. ePHPm's raw-connection apply/snapshot/handoff work
   takes the permit explicitly. Measured: single-node peak `-wal` 1,286 →
   68 MiB with 7.9% more requests; clustered owner 6,482 → 363 MiB, zero
-  errors, about +100 ms at p999. Counters and the live `-wal` size per
-  database are exported — see
+  errors, about +100 ms at p999. A later mixed-workload run, with reads
+  routinely longer than the 250 ms wait, starved every attempt (1.2 GiB
+  `-wal`, p99 ×4). Since then a log at 4 × the threshold escalates the
+  wait (doubling up to `max_escalated_wait_ms`, 2 s) instead of backing
+  off, and the price is an occasional stall of up to that ceiling. Counters,
+  escalation gauges and the live `-wal` size per database are exported —
+  see
   [Database engines → WAL growth](/architecture/database/engines/#wal-growth-under-load-and-the-checkpoint-gate).
   What remains open: a genuinely long transaction still holds the log for
-  its duration (the gate times out and backs off by design), and
+  its duration (past the escalation ceiling the gate times out and backs
+  off by design), and
   `turso_cdc` retention — the *table*, not the WAL — is still unbounded
   (below).
 

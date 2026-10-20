@@ -12,8 +12,11 @@
 //! `TursoBuilder::wal_checkpoint_gate`) fixes it: every session statement and
 //! every CDC tailer poll holds the shared side of a per-file lock, and a
 //! maintenance task drains statements for a bounded wait and truncates the log
-//! once it crosses a threshold. See `litewire_turso::wal_gate` for the
-//! mechanism and its guarantees.
+//! once it crosses a threshold. Once the log is at least 4× the threshold,
+//! timeouts escalate the wait (doubling up to `max_escalated_wait_ms`) rather
+//! than back off, so statements that routinely outlast `max_wait_ms` cannot
+//! starve it. See `litewire_turso::wal_gate` for the mechanism and its
+//! guarantees.
 //!
 //! # ePHPm's part
 //!
@@ -71,7 +74,8 @@ pub const METRIC_TRUNCATIONS: &str = "ephpm_sqlite_wal_gate_truncations_total";
 /// after the gate was held (a reader outside the gate was active).
 pub const METRIC_BUSY: &str = "ephpm_sqlite_wal_gate_busy_total";
 /// Counter: attempts abandoned because the exclusive side could not be taken
-/// within `max_wait_ms` (an open transaction outlived the wait).
+/// within the attempt's wait — `max_wait_ms`, or the escalated wait (an open
+/// transaction or a slow statement outlived it).
 pub const METRIC_TIMEOUTS: &str = "ephpm_sqlite_wal_gate_timeouts_total";
 /// Counter: attempts that failed with an engine error.
 pub const METRIC_ERRORS: &str = "ephpm_sqlite_wal_gate_errors_total";
@@ -91,6 +95,17 @@ pub const METRIC_MAX_EXCLUSIVE_SECONDS: &str = "ephpm_sqlite_wal_gate_max_exclus
 pub const METRIC_LAST_BACKFILL_SECONDS: &str = "ephpm_sqlite_wal_gate_last_backfill_seconds";
 /// Gauge: longest passive backfill phase seen, in seconds.
 pub const METRIC_MAX_BACKFILL_SECONDS: &str = "ephpm_sqlite_wal_gate_max_backfill_seconds";
+/// Gauge: escalation level of the gate's schedule. `0` = attempts wait the
+/// plain `max_wait_ms`; `n` = the next attempt waits `max_wait_ms × 2ⁿ`
+/// (capped at `max_escalated_wait_ms`) because the log is at least
+/// 4 × `threshold_bytes` and earlier attempts timed out. Resets on a truncate.
+pub const METRIC_ESCALATION_LEVEL: &str = "ephpm_sqlite_wal_gate_escalation_level";
+/// Gauge: attempts in a row that timed out since the last truncate (resets on
+/// a truncate or once the log is back under `threshold_bytes`).
+pub const METRIC_CONSECUTIVE_TIMEOUTS: &str = "ephpm_sqlite_wal_gate_consecutive_timeouts";
+/// Gauge: the exclusive wait the next attempt will use, in seconds — the
+/// worst-case stall it can add to new statements.
+pub const METRIC_NEXT_WAIT_SECONDS: &str = "ephpm_sqlite_wal_gate_next_wait_seconds";
 
 /// Translate `[db.sqlite.wal_checkpoint]` into litewire's gate config.
 ///
@@ -107,6 +122,7 @@ pub fn gate_config(cfg: &ephpm_config::WalCheckpointConfig) -> Option<WalGateCon
         interval: Duration::from_secs(cfg.interval_secs),
         max_wait: Duration::from_millis(cfg.max_wait_ms),
         max_backoff: Duration::from_secs(cfg.max_backoff_secs),
+        max_escalated_wait: Duration::from_millis(cfg.effective_max_escalated_wait_ms()),
     })
 }
 
@@ -128,6 +144,7 @@ pub fn log_mode(gate: Option<&WalGateConfig>) {
             interval_ms = cfg.interval.as_millis(),
             max_wait_ms = cfg.max_wait.as_millis(),
             max_backoff_ms = cfg.max_backoff.as_millis(),
+            max_escalated_wait_ms = cfg.max_escalated_wait.as_millis(),
             "WAL checkpoint gate enabled for embedded databases"
         ),
         None => tracing::warn!(
@@ -281,8 +298,15 @@ fn publish(sample: &WalGateSample) {
         (METRIC_MAX_EXCLUSIVE_SECONDS, s.max_exclusive_micros),
         (METRIC_LAST_BACKFILL_SECONDS, s.last_backfill_micros),
         (METRIC_MAX_BACKFILL_SECONDS, s.max_backfill_micros),
+        (METRIC_NEXT_WAIT_SECONDS, s.next_wait_micros),
     ] {
         gauge!(name, "site" => site.clone()).set(micros as f64 / 1_000_000.0);
+    }
+    for (name, value) in [
+        (METRIC_ESCALATION_LEVEL, s.escalation_level),
+        (METRIC_CONSECUTIVE_TIMEOUTS, s.consecutive_timeouts),
+    ] {
+        gauge!(name, "site" => site.clone()).set(value as f64);
     }
 }
 
@@ -312,6 +336,7 @@ mod tests {
             interval_secs: 3,
             max_wait_ms: 40,
             max_backoff_secs: 9,
+            max_escalated_wait_ms: Some(900),
         }
     }
 
@@ -324,7 +349,20 @@ mod tests {
         assert_eq!(gate.interval, Duration::from_secs(3));
         assert_eq!(gate.max_wait, Duration::from_millis(40));
         assert_eq!(gate.max_backoff, Duration::from_secs(9));
+        assert_eq!(gate.max_escalated_wait, Duration::from_millis(900));
         assert!(gate_config(&cfg(false)).is_none());
+    }
+
+    /// An unset escalation ceiling is 2 s, but never below `max_wait_ms`, so a
+    /// config that raised `max_wait_ms` past 2 s keeps loading and simply
+    /// runs without escalation.
+    #[test]
+    fn unset_escalation_ceiling_follows_max_wait() {
+        let mut c = cfg(true);
+        c.max_escalated_wait_ms = None;
+        assert_eq!(gate_config(&c).unwrap().max_escalated_wait, Duration::from_secs(2));
+        c.max_wait_ms = 3000;
+        assert_eq!(gate_config(&c).unwrap().max_escalated_wait, Duration::from_millis(3000));
     }
 
     /// The shipped defaults are litewire's own defaults, so "on, untouched"
@@ -337,6 +375,7 @@ mod tests {
         assert_eq!(ours.interval, theirs.interval);
         assert_eq!(ours.max_wait, theirs.max_wait);
         assert_eq!(ours.max_backoff, theirs.max_backoff);
+        assert_eq!(ours.max_escalated_wait, theirs.max_escalated_wait);
     }
 
     /// A gated file-backed factory reports stats; an ungated one, and an
@@ -349,10 +388,14 @@ mod tests {
         let gate = gate_config(&cfg(true));
 
         let gated = builder_with_gate(Turso::builder(path), gate.as_ref()).build().await.unwrap();
+        // Counters start at zero. (The schedule gauges, e.g. `next_wait_micros`,
+        // are published by the task as soon as it starts, so they are not
+        // compared here.)
+        let stats = gated.wal_gate_stats().expect("a gated factory must expose gate stats");
         assert_eq!(
-            gated.wal_gate_stats(),
-            Some(WalGateStats::default()),
-            "a gated factory must expose (zeroed) gate stats"
+            (stats.attempts, stats.truncated, stats.timed_out, stats.escalation_level),
+            (0, 0, 0, 0),
+            "a fresh gate has done nothing: {stats:?}"
         );
         let finished = gated.wal_gate_task_finished().expect("gated factory has a task");
         assert!(!*finished.borrow(), "the task runs while the factory lives");

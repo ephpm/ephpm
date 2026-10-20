@@ -220,7 +220,26 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 36ff34b0e5e9 — WAL checkpoint gate for the Turso backend
+# litewire @ 83820f3035c9 — WAL checkpoint gate escalation (litewire#50).
+# OPERABILITY: do not move this pin backwards. The gate below took its
+# exclusive lock with a bounded wait (250 ms) and backed off on timeout. In a
+# mixed stress run, 48 clients ran heavy reads (COUNT/GROUP BY/joins over a
+# growing table) that routinely took longer than that, so every attempt timed
+# out. Truncations froze, the backoff stretched attempts to about one a
+# minute, the -wal file reached 1,225 MiB, and p99 went 241 -> 1,045 ms. A
+# bigger log makes reads slower, which makes timeouts likelier. With this pin,
+# once the file is at least 4 x threshold_bytes, a timed-out attempt retries
+# on the next tick with double the wait, up to the new
+# `WalGateConfig::max_escalated_wait` (ePHPm `max_escalated_wait_ms`,
+# default 2 s), and only backs off once a wait at that ceiling times out.
+# Below 4x the schedule is unchanged. `WalGateStats` gains `escalation_level`,
+# `consecutive_timeouts` and `next_wait_micros` (exported as
+# ephpm_sqlite_wal_gate_{escalation_level,consecutive_timeouts,
+# next_wait_seconds}). Single commit on top of 36ff34b0e5e9. No dependency
+# moves (turso stays =0.8.3); the lockfile changes only the litewire crates'
+# source rev.
+#
+# Previous pin 36ff34b0e5e9 — WAL checkpoint gate for the Turso backend
 # (litewire#49). OPERABILITY: do not move this pin backwards. Turso 0.8.3
 # never rewinds its write-ahead log while any reader is active: the passive
 # auto-checkpoint backfills frames, but `PRAGMA wal_checkpoint(TRUNCATE)`
@@ -506,7 +525,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "36ff34b0e5e98a4c68aa4deae9d864237eb83fdc", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "83820f3035c91b9c04df5cff929db2d1312c003f", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)

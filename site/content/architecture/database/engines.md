@@ -153,9 +153,27 @@ then takes the exclusive side for at most 250 ms (new statements queue behind
 it) and runs `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction that
 outlives the wait makes the attempt give up and retry with exponential backoff
 (capped at 60 s), so the gate never deadlocks and never stalls a long
-transaction; the only cost it can impose on traffic is a ≤ 250 ms delay for
-new statements per attempt. The exclusive window itself is the checkpoint,
-which is milliseconds once the passive phase has done the copying.
+transaction. While the log is under 4 × the threshold, the only cost it can
+impose on traffic is a ≤ 250 ms delay for new statements per attempt. The
+exclusive window itself is the checkpoint, which is milliseconds once the
+passive phase has done the copying.
+
+**Escalation.** That bounded wait has its own failure mode, found by a
+mixed-workload stress run. 48 clients ran `COUNT`/`GROUP BY`/join reads over
+a growing table, and those reads routinely took longer than 250 ms. Every
+exclusive attempt timed out, the backoff stretched attempts to about one a
+minute, and truncations froze at 17. The `-wal` file reached 1,225 MiB and p99
+went from 241 ms to 1,045 ms. A bigger log makes reads slower, which makes
+timeouts more likely: the loop the gate exists to break. So once the file is
+at least 4 × the threshold (256 MiB), a timeout no longer backs off. The next
+attempt, one tick later, waits twice as long (250 → 500 → 1000 → 2000 ms),
+capped at `max_escalated_wait_ms` (default 2 s). Only a timeout at that
+ceiling backs off, and a truncate resets the schedule. The trade is explicit:
+while an escalated attempt waits, new statements queue behind it. A request
+can therefore stall for up to 2 s, though in practice only until the
+statements already in flight finish, and only while the log is already
+several times over its threshold. The alternative was a `-wal` file and read
+latency that grow without limit.
 
 The passive phase is not optional, and this is the detail that cost a run
 during validation: a bare `TRUNCATE` inside the exclusive window has to copy
@@ -181,7 +199,9 @@ was about +100 ms at p999, from forwarded statements queueing behind an
 exclusive attempt. That trade is why the gate defaults to on. What it does
 **not** fix: a transaction that genuinely stays open keeps the WAL growing for
 its duration — `ephpm_sqlite_wal_gate_timeouts_total` climbing while
-`ephpm_sqlite_wal_gate_truncations_total` is flat is the operator signal. Every
+`ephpm_sqlite_wal_gate_truncations_total` is flat and `ephpm_sqlite_wal_bytes`
+stays over the threshold is the operator signal, and
+`ephpm_sqlite_wal_gate_escalation_level` shows when the gate is escalating. Every
 counter, plus the live `-wal` size per database, is in the
 [metrics reference](/reference/metrics/#embedded-database-wal-checkpoint-gate).
 
