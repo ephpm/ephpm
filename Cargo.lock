@@ -2953,7 +2953,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "anyhow",
  "futures",
@@ -2972,7 +2972,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -2984,7 +2984,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2999,7 +2999,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -3016,7 +3016,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "async-trait",
  "futures",
@@ -3031,7 +3031,7 @@ dependencies = [
 [[package]]
 name = "litewire-session"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "litewire-backend",
  "litewire-translate",
@@ -3042,7 +3042,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -3055,7 +3055,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "lru 0.18.2",
  "parking_lot",
@@ -3067,7 +3067,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.2.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=83820f3035c91b9c04df5cff929db2d1312c003f#83820f3035c91b9c04df5cff929db2d1312c003f"
+source = "git+https://github.com/ephpm/litewire.git?rev=4c84c803477072587966673d466ca4975096a619#4c84c803477072587966673d466ca4975096a619"
 dependencies = [
  "async-trait",
  "litewire-backend",

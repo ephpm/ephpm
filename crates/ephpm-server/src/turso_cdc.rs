@@ -63,6 +63,12 @@
 //! captured is decided at serve time by the current role, not at
 //! factory-build time.
 //!
+//! Capture is switched on per session just before that session's first
+//! statement that is not a plain `SELECT` (litewire#51), not when the session
+//! opens: the capture pragma is a write transaction, and running it at
+//! connect made every new session — readers included — wait on another
+//! connection's write lock. Every write is still captured.
+//!
 //! **A replica's wire frontend is read-write, and writes made against
 //! it are NOT replicated anywhere.** litewire has no read-only frontend
 //! mode, so v1 cannot enforce this; the replica logs a warning at

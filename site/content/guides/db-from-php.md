@@ -339,7 +339,7 @@ a SQL error without matching message text:
 |---|---|---|
 | `2000` | No embedded database is active (`[db.sqlite]` not configured) | `HY000` |
 | `2001` | Per-site mode, and this request has no tenant identity | `HY000` |
-| `2002` | The database for this request could not be opened | `HY000` |
+| `2002` | The database for this request could not be opened (a session that could not open only because the database was **busy** is `1205` instead, like a busy statement) | `HY000` |
 | `2003` | A parameter's PHP type cannot bind (thrown before the statement runs) | — |
 | `2004` | This thread is retiring and can no longer reach the database — nothing was executed (see [Shutdown functions and destructors](#shutdown-functions-and-destructors)) | — |
 
