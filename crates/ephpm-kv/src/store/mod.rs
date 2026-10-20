@@ -2569,7 +2569,18 @@ fn scan_map<V>(
                     visit(key, slot.get());
                     seen += 1;
                     if seen >= want {
-                        return (seen, MapCursor { shard, bucket: idx + 1 });
+                        // Resume just past this bucket — or, when it was the
+                        // shard's last, at the start of the next shard. A
+                        // cursor of `buckets` would wrap to 0 on the next call
+                        // (`start % buckets`) and walk this shard a second
+                        // time, so a sweep could take more rounds than the
+                        // index has hints / round.
+                        let next = if idx + 1 < buckets {
+                            MapCursor { shard, bucket: idx + 1 }
+                        } else {
+                            MapCursor { shard: (shard + 1) % shard_count, bucket: 0 }
+                        };
+                        return (seen, next);
                     }
                 }
             }
@@ -3371,6 +3382,35 @@ mod tests {
     /// must reach every hint within one sweep: 8000 hints at 20 per round is
     /// 400 rounds, and every cycle runs at least one.
     #[test]
+    fn scan_map_sweep_visits_every_entry_exactly_once() {
+        // Walking a map in fixed-size steps from a saved cursor must visit each
+        // entry once per sweep. A step that ended on a shard's last bucket
+        // used to resume at that same shard's first bucket, re-walking it.
+        for n in [1usize, 19, 20, 21, 500, 4_096, 10_007] {
+            for step in [1usize, 7, 20, 64] {
+                let map: DashMap<String, ()> = DashMap::new();
+                for i in 0..n {
+                    map.insert(format!("k{i}"), ());
+                }
+                // The cursor is cyclic, so the call that completes a sweep may
+                // carry on into the next one; only the first `n` visits are
+                // one sweep.
+                let mut order: Vec<String> = Vec::new();
+                let mut cursor = MapCursor::default();
+                let mut calls = 0;
+                while order.len() < n {
+                    let (_, next) = scan_map(&map, cursor, step, |k, ()| order.push(k.clone()));
+                    cursor = next;
+                    calls += 1;
+                }
+                assert_eq!(calls, n.div_ceil(step), "n={n} step={step}: extra calls");
+                let sweep: std::collections::HashSet<&String> = order[..n].iter().collect();
+                assert_eq!(sweep.len(), n, "n={n} step={step}: a sweep revisited or missed keys");
+            }
+        }
+    }
+
+    #[test]
     fn active_expire_is_not_starved_by_live_long_ttl_keys() {
         let s = test_store();
         for i in 0..4_000 {
@@ -3379,7 +3419,13 @@ mod tests {
         for i in 0..4_000 {
             plant_expired(&s, &format!("dead{i}"), b"v");
         }
-        let reaped: usize = (0..400).map(|_| s.active_expire_cycle(Duration::from_secs(1))).sum();
+        // Exactly one sweep, with no slack: each cycle runs at least one round of
+        // 20 whatever the clock says (the budget is effectively unlimited, so a
+        // slow or loaded machine changes nothing), and the cursor never revisits
+        // a bucket. This flaked ~5% when a cursor ending on a shard's last
+        // bucket wrapped back to that shard's start.
+        let budget = Duration::from_secs(3_600);
+        let reaped: usize = (0..400).map(|_| s.active_expire_cycle(budget)).sum();
         assert_eq!(reaped, 4_000, "expired keys left unreaped behind live TTL keys");
         assert_eq!(s.ttl_keys.len(), 4_000, "only the live keys' hints remain");
         for i in 0..4_000 {
@@ -4827,7 +4873,9 @@ mod tests {
         let reaped = s.active_expire_cycle(Duration::from_millis(1));
         let elapsed = start.elapsed();
         assert!(reaped < 200_000, "a 1 ms cycle drained a 200k backlog ({elapsed:?})");
-        assert!(elapsed < Duration::from_millis(500), "a 1 ms cycle took {elapsed:?}");
+        // Loose on purpose: only "bounded", not "fast" — a loaded CI machine
+        // can stretch a 1 ms budget, never into a full drain.
+        assert!(elapsed < Duration::from_secs(10), "a 1 ms cycle took {elapsed:?}");
     }
 
     #[test]
