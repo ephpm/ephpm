@@ -74,6 +74,9 @@ pub struct ClusterHandle {
     gossip_addr: SocketAddr,
     /// This node's own KV data plane port (`[cluster.kv] data_port`).
     data_port: u16,
+    /// Source of this node's KV write stamps (see
+    /// [`crate::gossip_kv::Stamp`]).
+    pub(crate) clock: crate::gossip_kv::StampClock,
 }
 
 impl std::fmt::Debug for ClusterHandle {
@@ -255,6 +258,7 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
 
     Ok(ClusterHandle {
         handle,
+        clock: crate::gossip_kv::StampClock::new(&node_id),
         self_id: node_id,
         cluster_id: config.cluster_id.clone(),
         gossip_addr: listen_addr,

@@ -29,9 +29,25 @@ use ephpm_config::ClusterKvConfig;
 use ephpm_kv::store::{Routed, SetNxOutcome, Store};
 
 use crate::ClusterHandle;
+use crate::gossip_kv::{Stamp, expiry_ms_for};
 use crate::kv_data_plane::DataPlaneClient;
 use crate::node::NodeInfo;
 use crate::secure_transport::ClusterCipher;
+
+/// The stamp and absolute expiry fixed for one replicated write.
+///
+/// Taken **once**, by the synchronous replication hook before the local copy
+/// is written, and carried unchanged onto every transport — the gossip
+/// payload, the applied map, and (for large values) the data plane. A
+/// second stamp taken later in a spawned task is what made concurrent writes
+/// to one key diverge for good (stress finding F-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteStamp {
+    /// Position in the cluster-wide last-writer-wins order.
+    pub stamp: Stamp,
+    /// Epoch-millisecond expiry carried on the gossip wire; `0` = no TTL.
+    pub expiry_ms: u64,
+}
 
 /// Key prefix for hot-key version metadata in chitchat state.
 const HOT_PREFIX: &str = "hot:";
@@ -328,7 +344,23 @@ impl ClusteredStore {
         None
     }
 
-    /// Set a value, routing through the appropriate tier.
+    /// Fix the stamp and absolute expiry for a write about to be made with
+    /// `ttl`. The sync replication hooks call this before touching the local
+    /// store, then hand the result to the `*_at` variants below.
+    #[must_use]
+    pub fn new_write(&self, ttl: Option<Duration>) -> WriteStamp {
+        WriteStamp { stamp: self.cluster.stamp(), expiry_ms: expiry_ms_for(ttl) }
+    }
+
+    /// Set a value, routing through the appropriate tier, stamping the write
+    /// now. See [`set_at`](Self::set_at).
+    pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        let w = self.new_write(ttl);
+        self.set_at(key, value, ttl, w).await
+    }
+
+    /// Set a value, routing through the appropriate tier, with a stamp the
+    /// caller already fixed.
     ///
     /// Returns `true` on success, `false` if the primary write failed
     /// (the local store rejected it, or the primary owner rejected /
@@ -364,10 +396,16 @@ impl ClusteredStore {
     /// that has it. Likewise, when membership changes the replica set
     /// for existing keys is not recomputed retroactively. This is an
     /// honest v1 — durable-through-rebalance replication is future work.
-    pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+    pub async fn set_at(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        w: WriteStamp,
+    ) -> bool {
         if value.len() <= self.config.small_key_threshold {
             // Gossip tier: replicate to all nodes.
-            self.cluster.gossip_set(&key, &value, ttl).await;
+            self.cluster.gossip_set_stamped(&key, &value, w.expiry_ms, w.stamp).await;
 
             // Also bump the hot key version if this key was hot, so
             // remote caches invalidate.
@@ -389,7 +427,15 @@ impl ClusteredStore {
         ok
     }
 
-    /// Fan out an **already-applied local value** to the rest of the cluster.
+    /// Fan out an **already-applied local value** to the rest of the cluster,
+    /// stamping it now. See [`publish_at`](Self::publish_at).
+    pub async fn publish(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        let w = self.new_write(ttl);
+        self.publish_at(key, value, ttl, w).await
+    }
+
+    /// Fan out an **already-applied local value** to the rest of the cluster
+    /// with a stamp the caller already fixed.
     ///
     /// Same tier routing as [`set`](Self::set) — gossip for small values,
     /// replica-set writes for large ones — with one deliberate difference: it
@@ -398,9 +444,15 @@ impl ClusteredStore {
     /// already, and re-writing it here would let an older publish overwrite a
     /// newer local total, losing an update on the origin node. See
     /// [`ephpm_kv::store::Replicator::replicate_published`].
-    pub async fn publish(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+    pub async fn publish_at(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+        w: WriteStamp,
+    ) -> bool {
         if value.len() <= self.config.small_key_threshold {
-            self.cluster.gossip_set(key, value, ttl).await;
+            self.cluster.gossip_set_stamped(key, value, w.expiry_ms, w.stamp).await;
             if self.config.hot_key_cache {
                 self.maybe_bump_hot_version(key).await;
             }
@@ -450,9 +502,21 @@ impl ClusteredStore {
     /// on the sharded path. Readers that must tolerate that should use
     /// [`get`](Self::get), whose miss path fetches from a peer.
     pub async fn broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        let w = self.new_write(ttl);
+        self.broadcast_at(key, value, ttl, w).await
+    }
+
+    /// [`broadcast`](Self::broadcast) with a stamp the caller already fixed.
+    pub async fn broadcast_at(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        w: WriteStamp,
+    ) -> bool {
         if value.len() <= self.config.small_key_threshold {
             // Gossip already means "every node"; nothing to widen.
-            self.cluster.gossip_set(&key, &value, ttl).await;
+            self.cluster.gossip_set_stamped(&key, &value, w.expiry_ms, w.stamp).await;
             if self.config.hot_key_cache {
                 self.maybe_bump_hot_version(&key).await;
             }
@@ -476,10 +540,11 @@ impl ClusteredStore {
         key: &str,
         value: &[u8],
         ttl: Option<Duration>,
+        w: WriteStamp,
     ) -> bool {
         let transport = crate::site_namespace::encode(site, key);
         if value.len() <= self.config.small_key_threshold {
-            self.cluster.gossip_set(&transport, value, ttl).await;
+            self.cluster.gossip_set_stamped(&transport, value, w.expiry_ms, w.stamp).await;
             return true;
         }
         self.set_large_routed(&transport, local, key, value, ttl, LocalCopy::Skip).await
@@ -508,6 +573,7 @@ impl ClusteredStore {
         key: String,
         value: Vec<u8>,
         ttl: Option<Duration>,
+        w: WriteStamp,
     ) -> bool {
         let transport = crate::site_namespace::encode(site, &key);
         if value.len() <= self.config.small_key_threshold {
@@ -519,7 +585,7 @@ impl ClusteredStore {
                 tier = "gossip",
                 "per-site KV: publishing"
             );
-            self.cluster.gossip_set(&transport, &value, ttl).await;
+            self.cluster.gossip_set_stamped(&transport, &value, w.expiry_ms, w.stamp).await;
             return true;
         }
         // Large value: replica-set write over the data plane. The transport key
@@ -551,9 +617,15 @@ impl ClusteredStore {
 
     /// Delete a per-site key: gossip tombstone under the namespaced transport
     /// key, plus a local drop from the site's own store.
-    pub async fn remove_for_site(&self, site: &str, local: &Store, key: &str) -> bool {
+    pub async fn remove_for_site(
+        &self,
+        site: &str,
+        local: &Store,
+        key: &str,
+        stamp: Stamp,
+    ) -> bool {
         let transport = crate::site_namespace::encode(site, key);
-        let gossip_deleted = self.cluster.gossip_del(&transport).await;
+        let gossip_deleted = self.cluster.gossip_del_stamped(&transport, stamp).await;
         let local_deleted = local.remove_local(key);
         gossip_deleted || local_deleted
     }
@@ -563,18 +635,18 @@ impl ClusteredStore {
     /// site-namespaced delete without removing the site store's local copy, so
     /// a value recreated between `del_if_eq`'s removal and this broadcast
     /// survives on this node.
-    pub async fn gossip_tombstone_for_site(&self, site: &str, key: &str) -> bool {
+    pub async fn gossip_tombstone_for_site(&self, site: &str, key: &str, stamp: Stamp) -> bool {
         let transport = crate::site_namespace::encode(site, key);
-        self.cluster.gossip_del(&transport).await
+        self.cluster.gossip_del_stamped(&transport, stamp).await
     }
 
     /// Re-broadcast a per-site key's current value with a new TTL, so peers
-    /// pick up the new expiry by the same last-arrival-wins rule the global
+    /// pick up the new expiry by the same last-writer-wins rule the global
     /// path uses. Small-key tier only, matching the global `replicate_expire`.
-    pub async fn expire_for_site(&self, site: &str, key: &str, value: Vec<u8>, ttl: Duration) {
+    pub async fn expire_for_site(&self, site: &str, key: &str, value: Vec<u8>, w: WriteStamp) {
         if value.len() <= self.config.small_key_threshold {
             let transport = crate::site_namespace::encode(site, key);
-            self.cluster.gossip_set(&transport, &value, Some(ttl)).await;
+            self.cluster.gossip_set_stamped(&transport, &value, w.expiry_ms, w.stamp).await;
         }
     }
 
@@ -786,10 +858,17 @@ impl ClusteredStore {
         }
     }
 
-    /// Delete a key from whichever tier owns it.
+    /// Delete a key from whichever tier owns it, stamping the delete now.
     pub async fn remove(&self, key: &str) -> bool {
+        let stamp = self.cluster.stamp();
+        self.remove_at(key, stamp).await
+    }
+
+    /// Delete a key from whichever tier owns it with a stamp the caller
+    /// already fixed.
+    pub async fn remove_at(&self, key: &str, stamp: Stamp) -> bool {
         // Try gossip tier first.
-        let gossip_deleted = self.cluster.gossip_del(key).await;
+        let gossip_deleted = self.cluster.gossip_del_stamped(key, stamp).await;
 
         // Also remove from local store. `remove_local` skips the Replicator
         // hook so we don't re-enter ourselves when this ClusteredStore is
@@ -816,9 +895,9 @@ impl ClusteredStore {
     /// different value in the gap between that local removal and this call, and
     /// re-removing here would destroy it — reopening the delete-after-recreate
     /// race the compare-and-delete exists to close. Peers converge by the
-    /// gossip tier's usual last-arrival-wins rule.
-    pub async fn gossip_tombstone(&self, key: &str) -> bool {
-        let deleted = self.cluster.gossip_del(key).await;
+    /// gossip tier's usual last-writer-wins rule.
+    pub async fn gossip_tombstone(&self, key: &str, stamp: Stamp) -> bool {
+        let deleted = self.cluster.gossip_del_stamped(key, stamp).await;
         if self.config.hot_key_cache {
             evict_hot_entry(&self.hot_cache, &self.hot_cache_mem, hash_key(key));
         }
@@ -1188,7 +1267,7 @@ pub struct KvReplicator {
     /// async replication work.
     handle: tokio::runtime::Handle,
     /// Shared with [`start_gossip_applier`]. When we materialize a local
-    /// copy synchronously we also record the origin `write_ms` here so a
+    /// copy synchronously we also record the write's stamp here so a
     /// slower echo of that same write cannot clobber a newer overwrite.
     applied: AppliedWriteMap,
 }
@@ -1227,16 +1306,27 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // without this, the origin node itself could not read back its own
         // write. Peers materialize via the gossip applier
         // (start_gossip_applier).
+        // ONE stamp per write, taken before anything is written, and carried
+        // unchanged into the applied map and the gossip payload — so the
+        // origin's own record and what peers see are the same point in the
+        // order. (Stamping again inside the spawned task is what let two
+        // nodes each win on the other, F-7.)
+        let w = self.inner.new_write(ttl);
         if value.len() <= self.inner.config.small_key_threshold {
-            self.inner.store.set_local(key.clone(), value.clone(), ttl);
-            // Record OUR own write in the applied map so a slower echo of
-            // this write from gossip does not clobber a newer local
-            // overwrite that lands between the local materialization and
-            // the echo. Use the same wall-clock now-ms that encode_value
-            // stamps into the gossip payload so the ordering is
-            // consistent across the two paths.
-            let write_ms = current_write_ms();
-            self.applied.insert(key.clone(), write_ms);
+            // Record OUR own write in the applied map and materialize it in
+            // one step under the key's slot (`apply_if_newer`), so a slower
+            // echo of this write from gossip, a concurrent local writer or a
+            // peer's write racing this one cannot leave the local copy and
+            // the recorded stamp disagreeing.
+            let store = &self.inner.store;
+            let fresh = apply_if_newer(&self.applied, &key, w.stamp, || {
+                store.set_local(key.clone(), value.clone(), ttl);
+            });
+            if !fresh {
+                // A newer write for this key already landed here: last
+                // writer wins, and this one is neither kept nor published.
+                return true;
+            }
         }
         // Fire-and-forget: hand the routed write off to the runtime and
         // return success. The clustered set() itself decides gossip vs
@@ -1244,7 +1334,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // Store::set_local, so no recursion is possible.
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
-            let ok = inner.set(key.clone(), value, ttl).await;
+            let ok = inner.set_at(key.clone(), value, ttl, w).await;
             if !ok {
                 tracing::warn!(key, "clustered set returned false (primary rejected)");
             }
@@ -1258,17 +1348,21 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // broadcast key's contract is "readable from every node's raw local
         // Store", and the node that wrote it is one of those nodes — the
         // caller (ACME certificate issuance) reads its own write back.
-        let local_ok = self.inner.store.set_local(key.clone(), value.clone(), ttl);
-        if value.len() <= self.inner.config.small_key_threshold {
-            // Same last-arrival-wins bookkeeping as `replicate_set`: stop a
-            // slow gossip echo of this write from clobbering a newer local
-            // overwrite.
-            self.applied.insert(key.clone(), current_write_ms());
+        let w = self.inner.new_write(ttl);
+        // Same last-writer-wins bookkeeping as `replicate_set`, at every
+        // size: the record and the local write are one step.
+        let store = &self.inner.store;
+        let mut local_ok = true;
+        let fresh = apply_if_newer(&self.applied, &key, w.stamp, || {
+            local_ok = store.set_local(key.clone(), value.clone(), ttl);
+        });
+        if !fresh {
+            return true;
         }
 
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
-            if !inner.broadcast(key.clone(), value, ttl).await {
+            if !inner.broadcast_at(key.clone(), value, ttl, w).await {
                 tracing::warn!(key, "clustered broadcast returned false (local write rejected)");
             }
         });
@@ -1299,17 +1393,23 @@ impl ephpm_kv::store::Replicator for KvReplicator {
     fn replicate_remove(&self, key: &str) -> bool {
         // Drop the local materialized copy synchronously (mirror of the
         // set path above), then propagate the removal via a gossip
-        // tombstone. Record our own write_ms in the applied map so a
+        // tombstone. Record our own stamp in the applied map so a
         // slow echo of THIS tombstone through gossip does not clobber a
         // follow-up SET we later accept locally.
-        self.inner.store.remove_local(key);
-        let write_ms = current_write_ms();
-        self.applied.insert(key.to_string(), write_ms);
+        let stamp = self.inner.cluster.stamp();
+        let store = &self.inner.store;
+        let fresh = apply_if_newer(&self.applied, key, stamp, || {
+            store.remove_local(key);
+        });
+        if !fresh {
+            // A newer write already landed: it wins over this delete.
+            return true;
+        }
 
         let inner = Arc::clone(&self.inner);
         let key = key.to_string();
         self.handle.spawn(async move {
-            let _ = inner.remove(&key).await;
+            let _ = inner.remove_at(&key, stamp).await;
         });
         // We cannot know synchronously whether the key existed on any
         // tier; return `true` optimistically (RESP DEL semantics: the
@@ -1324,15 +1424,19 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // local total (the publishes are spawned, so they race). See
         // `Replicator::replicate_published`.
         //
-        // Recording our own `write_ms` is still required: it is what stops the
+        // Recording our own stamp is still required: it is what stops the
         // gossip echo of THIS publish from clobbering a newer local value that
         // lands before the echo arrives.
-        if value.len() <= self.inner.config.small_key_threshold {
-            self.applied.insert(key.clone(), current_write_ms());
+        let w = self.inner.new_write(ttl);
+        if value.len() <= self.inner.config.small_key_threshold
+            && !apply_if_newer(&self.applied, &key, w.stamp, || {})
+        {
+            // Overtaken by a newer write for this key: not published.
+            return;
         }
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
-            if !inner.publish(&key, &value, ttl).await {
+            if !inner.publish_at(&key, &value, ttl, w).await {
                 tracing::warn!(key, "clustered publish returned false (primary rejected)");
             }
         });
@@ -1343,13 +1447,16 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // the matching entry under its shard lock; a re-removal here (whether
         // synchronous or via `inner.remove`, which also drops the local copy)
         // would destroy a value recreated between that removal and this
-        // broadcast. Record our own `write_ms` first so a slow gossip echo of
+        // broadcast. Record our own stamp first so a slow gossip echo of
         // THIS tombstone cannot clobber a follow-up SET we later accept
         // locally, then fan the tombstone out on the gossip tier only.
-        self.applied.insert(key.clone(), current_write_ms());
+        let stamp = self.inner.cluster.stamp();
+        if !apply_if_newer(&self.applied, &key, stamp, || {}) {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
-            inner.gossip_tombstone(&key).await;
+            inner.gossip_tombstone(&key, stamp).await;
         });
     }
 
@@ -1357,27 +1464,35 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // Update the local copy synchronously so this node's readers see
         // the new expiry immediately, then re-broadcast the (unchanged)
         // value with the new TTL through the gossip tier. Peers apply the
-        // event by the same last-arrival-wins rule the SET applier uses,
+        // event by the same last-writer-wins rule the SET applier uses,
         // so a TTL refresh (extend) propagates just like a shorten — the
-        // origin's newer `write_ms` wins, and the peer takes whatever
+        // origin's newer stamp wins, and the peer takes whatever
         // expiry the origin last stamped. That's what session refresh
         // needs; a shorter-wins rule would break lazy_write.
-        let ok = self.inner.local_store().expire_local(key, ttl);
+        let w = self.inner.new_write(Some(ttl));
+        // Record OUR own stamp and apply the new expiry in one step, so a
+        // slower echo of the same expiry update from gossip (or a racing
+        // newer write) cannot leave the local copy and the record at odds.
+        let store = self.inner.local_store();
+        let mut ok = false;
+        let fresh = apply_if_newer(&self.applied, key, w.stamp, || {
+            ok = store.expire_local(key, ttl);
+        });
+        if !fresh {
+            // A newer write for this key already landed; it wins.
+            return true;
+        }
         if !ok {
             tracing::debug!(key, "expire: no local copy to re-broadcast (may exist only on peers)");
             return false;
         }
         // Read the current bytes so we can re-emit them with the new TTL.
         // `Store::get` returns Bytes cheaply (Arc-cloned).
-        let Some(bytes) = self.inner.local_store().get(key) else {
+        let Some(bytes) = store.get(key) else {
             // Racy edge: the entry expired between expire_local and get.
             // Nothing to broadcast, but the local update did succeed.
             return true;
         };
-        // Record OUR own write_ms so a slower echo of the same expiry
-        // update from gossip does not clobber a newer local overwrite.
-        let write_ms = current_write_ms();
-        self.applied.insert(key.to_string(), write_ms);
 
         let inner = Arc::clone(&self.inner);
         let key_owned = key.to_string();
@@ -1393,7 +1508,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             // always well below `small_key_threshold`, so refresh works
             // for the primary consumer.
             if value.len() <= threshold {
-                inner.cluster().gossip_set(&key_owned, &value, Some(ttl)).await;
+                inner.cluster().gossip_set_stamped(&key_owned, &value, w.expiry_ms, w.stamp).await;
             }
         });
         true
@@ -1475,18 +1590,25 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // Materialize into THIS SITE's store synchronously (mirrors the global
         // replicator): the gossip tier lives in chitchat state, invisible to
         // the raw-store readers this vhost's PHP and RESP clients use.
+        let w = self.inner.new_write(ttl);
         if value.len() <= self.inner.config.small_key_threshold {
-            self.local.set_local(key.clone(), value.clone(), ttl);
             // Keyed by the TRANSPORT key so site A's "foo" and site B's "foo"
-            // occupy different ordering slots.
-            self.applied
-                .insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+            // occupy different ordering slots; record + local write are one
+            // step (see `apply_if_newer`).
+            let transport = crate::site_namespace::encode(&self.site, &key);
+            let local = &self.local;
+            let fresh = apply_if_newer(&self.applied, &transport, w.stamp, || {
+                local.set_local(key.clone(), value.clone(), ttl);
+            });
+            if !fresh {
+                return true;
+            }
         }
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
         let site = Arc::clone(&self.site);
         self.handle.spawn(async move {
-            let ok = inner.set_for_site(&site, &local, key.clone(), value, ttl).await;
+            let ok = inner.set_for_site(&site, &local, key.clone(), value, ttl, w).await;
             if !ok {
                 tracing::warn!(
                     %site,
@@ -1499,15 +1621,22 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     }
 
     fn replicate_remove(&self, key: &str) -> bool {
-        self.local.remove_local(key);
-        self.applied.insert(crate::site_namespace::encode(&self.site, key), current_write_ms());
+        let stamp = self.inner.cluster.stamp();
+        let transport = crate::site_namespace::encode(&self.site, key);
+        let local = &self.local;
+        let fresh = apply_if_newer(&self.applied, &transport, stamp, || {
+            local.remove_local(key);
+        });
+        if !fresh {
+            return true;
+        }
 
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
         let site = Arc::clone(&self.site);
         let key = key.to_string();
         self.handle.spawn(async move {
-            let _ = inner.remove_for_site(&site, &local, &key).await;
+            let _ = inner.remove_for_site(&site, &local, &key, stamp).await;
         });
         true
     }
@@ -1517,15 +1646,22 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // holds this value (applied under its shard lock), so writing it back
         // would risk regressing a newer concurrent increment on this node. Only
         // the cluster-wide fan-out is left to do.
-        if value.len() <= self.inner.config.small_key_threshold {
-            self.applied
-                .insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+        let w = self.inner.new_write(ttl);
+        if value.len() <= self.inner.config.small_key_threshold
+            && !apply_if_newer(
+                &self.applied,
+                &crate::site_namespace::encode(&self.site, &key),
+                w.stamp,
+                || {},
+            )
+        {
+            return;
         }
         let inner = Arc::clone(&self.inner);
         let local = Arc::clone(&self.local);
         let site = Arc::clone(&self.site);
         self.handle.spawn(async move {
-            if !inner.publish_for_site(&site, &local, &key, &value, ttl).await {
+            if !inner.publish_for_site(&site, &local, &key, &value, ttl, w).await {
                 tracing::warn!(
                     %site,
                     key,
@@ -1538,20 +1674,38 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     fn replicate_remove_published(&self, key: String) {
         // PUBLISH ONLY — mirrors the global replicator: no local removal, so a
         // value recreated on this node between `del_if_eq`'s removal and this
-        // broadcast survives. Record `write_ms` keyed by the TRANSPORT key,
+        // broadcast survives. Record the stamp keyed by the TRANSPORT key,
         // then gossip the per-site tombstone only.
-        self.applied.insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+        let stamp = self.inner.cluster.stamp();
+        if !apply_if_newer(
+            &self.applied,
+            &crate::site_namespace::encode(&self.site, &key),
+            stamp,
+            || {},
+        ) {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         let site = Arc::clone(&self.site);
         self.handle.spawn(async move {
-            inner.gossip_tombstone_for_site(&site, &key).await;
+            inner.gossip_tombstone_for_site(&site, &key, stamp).await;
         });
     }
 
     fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
         // Same shape as the global path: update locally, then re-broadcast the
         // unchanged value with the new expiry so peers converge on it.
-        if !self.local.expire_local(key, ttl) {
+        let w = self.inner.new_write(Some(ttl));
+        let transport = crate::site_namespace::encode(&self.site, key);
+        let local = &self.local;
+        let mut ok = false;
+        let fresh = apply_if_newer(&self.applied, &transport, w.stamp, || {
+            ok = local.expire_local(key, ttl);
+        });
+        if !fresh {
+            return true;
+        }
+        if !ok {
             return false;
         }
         let Some(bytes) = self.local.get(key) else {
@@ -1559,14 +1713,13 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
             // update did happen, there is just nothing left to broadcast.
             return true;
         };
-        self.applied.insert(crate::site_namespace::encode(&self.site, key), current_write_ms());
 
         let inner = Arc::clone(&self.inner);
         let site = Arc::clone(&self.site);
         let key = key.to_string();
         let value = bytes.to_vec();
         self.handle.spawn(async move {
-            inner.expire_for_site(&site, &key, value, ttl).await;
+            inner.expire_for_site(&site, &key, value, w).await;
         });
         true
     }
@@ -1587,30 +1740,17 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     }
 }
 
-/// Current epoch time in milliseconds, matching the stamp
-/// [`gossip_kv::encode_value`] and [`gossip_kv::encode_tombstone`]
-/// use — so origin-side bookkeeping in the applied map orders correctly
-/// against remote echoes.
-fn current_write_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis()),
-    )
-    .unwrap_or(u64::MAX)
-}
-
-/// Per-key last-applied `write_ms` shared between the gossip applier and
+/// Per-key last-applied [`Stamp`] shared between the gossip applier and
 /// the origin-side [`KvReplicator::replicate_set`]. Keeps the local
-/// materialized copy last-arrival-wins: a slow gossip echo of an older
+/// materialized copy last-writer-wins: a slow gossip echo of an older
 /// write can no longer clobber a newer write we already applied
-/// locally.
+/// locally, and two nodes writing one key in the same millisecond settle
+/// on the same winner everywhere (the stamp's node tag breaks the tie).
 ///
-/// v1 legacy entries decode as `write_ms = 0` and always apply on first
-/// arrival (0 <= any current-format write_ms is not true for the strict
-/// `<=` check → applied on first sight; a second stale echo with
-/// write_ms=0 is skipped, which is the correct behavior).
-pub type AppliedWriteMap = Arc<DashMap<String, u64>>;
+/// v1 legacy entries decode as `write = 0` and always apply on first
+/// arrival (the map has no entry yet); a second stale echo with the same
+/// stamp is skipped, which is the correct behavior.
+pub type AppliedWriteMap = Arc<DashMap<String, Stamp>>;
 
 /// Construct a fresh [`AppliedWriteMap`] for use by both the applier and
 /// [`KvReplicator`]. Callers wire the SAME handle through both so origin
@@ -1630,16 +1770,18 @@ pub fn new_applied_write_map() -> AppliedWriteMap {
 /// Origin nodes materialize synchronously in
 /// [`KvReplicator::replicate_set`]; their own events are skipped here.
 ///
-/// **Last-arrival-wins ordering.** The applier keeps a per-key
-/// `last-applied write_ms` in `applied` and skips any incoming event
-/// whose `write_ms <= last_seen`. The origin also records its own
-/// `write_ms` in the same map, so a delayed echo of the origin's own
-/// write cannot clobber a newer local overwrite. Pre-`write_ms` peers
-/// send `write_ms = 0`, which always applies on first sight.
+/// **Last-writer-wins ordering.** The applier keeps a per-key
+/// last-applied [`Stamp`] in `applied` and skips any incoming event whose
+/// stamp is not strictly greater. The origin also records its own stamp
+/// in the same map — the very stamp it put on the wire — so a delayed echo
+/// of the origin's own write cannot clobber a newer local overwrite, and
+/// two nodes writing one key in the same millisecond settle on the same
+/// winner on every node (the stamp's node tag breaks the tie). Pre-stamp
+/// peers send `write = 0`, which always applies on first sight.
 ///
 /// **Tombstones.** A remote delete rides the same subscription as a
 /// tombstone-marker payload (see [`crate::gossip_kv`]). When the
-/// tombstone's `write_ms` beats the last-applied write for its key, the
+/// tombstone's stamp beats the last-applied write for its key, the
 /// applier calls `remove_local` — dropping both the gossip-materialized
 /// copy and any locally-held data-plane replica of the same key. That
 /// unifies delete propagation for the two tiers without a separate
@@ -1648,8 +1790,8 @@ pub fn new_applied_write_map() -> AppliedWriteMap {
 /// value.
 ///
 /// **TTL updates.** An EXPIRE on the origin re-emits the current value
-/// with the new `expiry_ms` and a fresh `write_ms`. Peers apply the
-/// event verbatim by the same last-arrival-wins rule — so a session TTL
+/// with the new `expiry_ms` and a fresh stamp. Peers apply the
+/// event verbatim by the same last-writer-wins rule — so a session TTL
 /// refresh (which *extends* the expiry) replicates correctly, not just a
 /// shortening. Write-time ordering already serializes intent; the peer
 /// takes whatever expiry the origin last stamped.
@@ -1692,18 +1834,7 @@ pub async fn start_gossip_applier_multi_tenant(
                 return;
             }
             let transport_key = event.key();
-            let write_ms = event.write_ms();
-            // Ordering is tracked per TRANSPORT key, so two sites sharing a
-            // bare key name never contend for one slot.
-            if !should_apply(&applied, transport_key, write_ms) {
-                tracing::trace!(
-                    key = transport_key,
-                    from = %event.node().node_id,
-                    write_ms,
-                    "gossip KV change skipped as stale"
-                );
-                return;
-            }
+            let stamp = event.stamp();
 
             // Route: per-site envelope → that site's store; anything else →
             // the global store. An envelope arriving on a node that is not
@@ -1743,48 +1874,96 @@ pub async fn start_gossip_applier_multi_tenant(
                     (_, None) => (Arc::clone(&store), transport_key, None),
                 };
 
-            match event {
+            // Ordering is tracked per TRANSPORT key, so two sites sharing a
+            // bare key name never contend for one slot. The record and the
+            // local write are one step under that slot (`apply_if_newer`).
+            let is_set = matches!(event, crate::gossip_kv::KvChangeEvent::Set { .. });
+            let fresh = apply_if_newer(&applied, transport_key, stamp, || match event {
                 crate::gossip_kv::KvChangeEvent::Set { value, ttl, .. } => {
                     target.set_local(key.to_string(), value.to_vec(), ttl);
-                    tracing::trace!(
-                        key,
-                        site,
-                        from = %event.node().node_id,
-                        write_ms,
-                        "gossip KV set materialized locally"
-                    );
                 }
                 crate::gossip_kv::KvChangeEvent::Tombstone { .. } => {
                     target.remove_local(key);
-                    tracing::trace!(
-                        key,
-                        site,
-                        from = %event.node().node_id,
-                        write_ms,
-                        "gossip KV tombstone applied locally"
-                    );
                 }
+            });
+            if fresh {
+                tracing::trace!(
+                    key,
+                    site,
+                    from = %event.node().node_id,
+                    ?stamp,
+                    is_set,
+                    "gossip KV change materialized locally"
+                );
+            } else {
+                tracing::trace!(
+                    key = transport_key,
+                    from = %event.node().node_id,
+                    ?stamp,
+                    "gossip KV change skipped as stale"
+                );
             }
         })
         .await;
 }
 
-/// Pure last-arrival-wins gate for the gossip applier.
+/// Pure last-writer-wins gate for the gossip applier.
 ///
-/// Returns `true` (and records `write_ms`) when this incoming write is
+/// Returns `true` (and records `stamp`) when this incoming write is
 /// strictly newer than the last one we materialized for `key`; returns
-/// `false` when it is stale (write_ms <= last-applied) so a slow echo
-/// cannot clobber a newer write we already accepted. Legacy v1 payloads
-/// (`write_ms = 0`) apply on first sight — the map has no entry yet —
-/// and subsequent v1 echoes for the same key are skipped, which is the
-/// desired behavior.
-fn should_apply(applied: &AppliedWriteMap, key: &str, write_ms: u64) -> bool {
-    if let Some(prev) = applied.get(key)
-        && write_ms <= *prev
-    {
-        return false;
-    }
-    applied.insert(key.to_string(), write_ms);
+/// `false` when it is stale (stamp <= last-applied) so a slow echo
+/// cannot clobber a newer write we already accepted. Because a [`Stamp`]
+/// carries the origin's node tag, two different nodes' writes are never
+/// equal: a same-millisecond tie is decided by the tag, identically on
+/// every node, instead of being treated as stale on both. Legacy v1
+/// payloads (`write = 0`) apply on first sight — the map has no entry
+/// yet — and subsequent v1 echoes for the same key are skipped, which is
+/// the desired behavior.
+///
+/// The check and the record are one atomic step on the key's map entry, so
+/// two events for one key racing through here cannot both pass. Production
+/// paths use [`apply_if_newer`] directly so the local write happens under
+/// the same step; this is the record-only form the ordering tests exercise.
+#[cfg(test)]
+fn should_apply(applied: &AppliedWriteMap, key: &str, stamp: Stamp) -> bool {
+    apply_if_newer(applied, key, stamp, || {})
+}
+
+/// The one way a value lands on this node: compare `stamp` against the last
+/// applied write for `key`, and — while still holding that key's slot in the
+/// applied map — record it and run `write` (the local `set_local` /
+/// `remove_local` / `expire_local`). Returns whether `write` ran.
+///
+/// Every path that materializes a value locally goes through here: the
+/// replication hooks for this node's own writes, the gossip applier for
+/// peers' writes, and the verify pass. Holding the slot across the local
+/// write is what makes the order total: two concurrent hooks for one key
+/// take their stamps in one order but would otherwise reach the store in
+/// another, and a hook racing the applier for the same key could leave the
+/// local copy holding the older value while the applied map (and the
+/// cluster) agree on the newer — a divergence no later event repairs. The
+/// local write is a few microseconds under a per-shard lock of the applied
+/// map, taken before (never after) any store lock, so the lock order is the
+/// same everywhere.
+pub(crate) fn apply_if_newer(
+    applied: &AppliedWriteMap,
+    key: &str,
+    stamp: Stamp,
+    write: impl FnOnce(),
+) -> bool {
+    let guard = match applied.entry(key.to_string()) {
+        dashmap::Entry::Occupied(mut prev) => {
+            if stamp <= *prev.get() {
+                return false;
+            }
+            *prev.get_mut() = stamp;
+            prev.into_ref()
+        }
+        dashmap::Entry::Vacant(slot) => slot.insert(stamp),
+    };
+    // `guard` keeps the key's slot locked while the local write happens.
+    write();
+    drop(guard);
     true
 }
 
@@ -2201,41 +2380,67 @@ mod tests {
     // Last-arrival-wins ordering (issue #150.1)
     // -----------------------------------------------------------------
 
+    fn at(write: u64, node: &str) -> Stamp {
+        Stamp::new(write, node)
+    }
+
     #[test]
     fn should_apply_first_write_lands() {
         let applied = new_applied_write_map();
-        assert!(should_apply(&applied, "k", 1000));
-        assert_eq!(*applied.get("k").unwrap(), 1000);
+        assert!(should_apply(&applied, "k", at(1000, "a")));
+        assert_eq!(*applied.get("k").unwrap(), at(1000, "a"));
     }
 
     #[test]
     fn should_apply_newer_write_lands() {
         let applied = new_applied_write_map();
-        assert!(should_apply(&applied, "k", 1000));
-        assert!(should_apply(&applied, "k", 2000));
-        assert_eq!(*applied.get("k").unwrap(), 2000);
+        assert!(should_apply(&applied, "k", at(1000, "a")));
+        assert!(should_apply(&applied, "k", at(2000, "b")));
+        assert_eq!(*applied.get("k").unwrap(), at(2000, "b"));
     }
 
     #[test]
     fn should_apply_stale_write_is_skipped() {
         let applied = new_applied_write_map();
-        assert!(should_apply(&applied, "k", 2000));
+        assert!(should_apply(&applied, "k", at(2000, "a")));
         // Delayed echo of an older write must NOT clobber the newer one.
-        assert!(!should_apply(&applied, "k", 1000));
-        // Equal write_ms is treated as stale (write_ms <= last_applied).
-        assert!(!should_apply(&applied, "k", 2000));
-        assert_eq!(*applied.get("k").unwrap(), 2000);
+        assert!(!should_apply(&applied, "k", at(1000, "b")));
+        // The identical stamp (an echo of the same write) is stale.
+        assert!(!should_apply(&applied, "k", at(2000, "a")));
+        assert_eq!(*applied.get("k").unwrap(), at(2000, "a"));
+    }
+
+    /// Two nodes writing one key in the same millisecond: the node tag
+    /// decides, the same way on both nodes, so they converge instead of
+    /// each treating the other's write as "stale" (F-7).
+    #[test]
+    fn should_apply_breaks_same_millisecond_ties_by_node_tag() {
+        let a = at(7000, "node-a");
+        let b = at(7000, "node-b");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+
+        // Node that wrote `lo` first, then sees `hi`: applies it.
+        let applied = new_applied_write_map();
+        applied.insert("k".into(), lo);
+        assert!(should_apply(&applied, "k", hi));
+        assert_eq!(*applied.get("k").unwrap(), hi);
+
+        // Node that wrote `hi` first, then sees `lo`: keeps its own.
+        let applied = new_applied_write_map();
+        applied.insert("k".into(), hi);
+        assert!(!should_apply(&applied, "k", lo));
+        assert_eq!(*applied.get("k").unwrap(), hi);
     }
 
     #[test]
-    fn should_apply_legacy_zero_write_ms_lands_once() {
-        // Pre-write_ms peers emit write_ms = 0. The first echo applies
+    fn should_apply_legacy_zero_write_lands_once() {
+        // Pre-stamp peers emit write = 0. The first echo applies
         // (map has no entry), the second is treated as stale — matches
         // the desired "apply on first sight, deduplicate re-sends"
         // behavior during rolling upgrades.
         let applied = new_applied_write_map();
-        assert!(should_apply(&applied, "legacy-key", 0));
-        assert!(!should_apply(&applied, "legacy-key", 0));
+        assert!(should_apply(&applied, "legacy-key", at(0, "old")));
+        assert!(!should_apply(&applied, "legacy-key", at(0, "old")));
     }
 
     #[test]
@@ -2244,10 +2449,25 @@ mod tests {
         // in the applied map, then a slow echo of the SAME write coming
         // back through gossip. The echo must be skipped.
         let applied = new_applied_write_map();
-        let origin_write_ms = 5000;
-        applied.insert("origin-key".into(), origin_write_ms);
-        assert!(!should_apply(&applied, "origin-key", origin_write_ms));
+        let origin = at(5000, "self");
+        applied.insert("origin-key".into(), origin);
+        assert!(!should_apply(&applied, "origin-key", origin));
         // A newer overwrite (say a follow-up SET) should still apply.
-        assert!(should_apply(&applied, "origin-key", origin_write_ms + 1));
+        assert!(should_apply(&applied, "origin-key", at(5001, "self")));
+    }
+
+    /// The hook's stamp and the gossip payload's stamp are one and the same
+    /// object, so what the origin records is exactly what peers compare
+    /// against.
+    #[test]
+    fn write_stamp_fixes_expiry_and_stamp_together() {
+        let clock = crate::gossip_kv::StampClock::new("n");
+        let w = WriteStamp {
+            stamp: clock.next(),
+            expiry_ms: crate::gossip_kv::expiry_ms_for(Some(Duration::from_secs(30))),
+        };
+        assert!(w.expiry_ms > 0);
+        let later = WriteStamp { stamp: clock.next(), expiry_ms: 0 };
+        assert!(later.stamp > w.stamp);
     }
 }
