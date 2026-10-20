@@ -1650,29 +1650,56 @@ mod connection_tests {
         assert_eq!(store.get("b").as_deref(), Some(&b"2"[..]));
     }
 
+    // The multi-second timeouts below are exercised under tokio's paused
+    // clock, which auto-advances to the next timer whenever the runtime would
+    // otherwise block. That is exactly right for a stall (nothing will ever
+    // arrive, so jump to the deadline) and exactly wrong for real loopback
+    // I/O: the clock is advanced after a single zero-length poll of the I/O
+    // driver, so a connect whose readiness the kernel has not delivered yet
+    // "times out after 2s" in microseconds. Linux reports a loopback connect
+    // as ready on that first poll; macOS does not always, which is how
+    // `stalled_pooled_connection_is_not_retried` failed on the macOS CI leg
+    // with `connect to 127.0.0.1:49409 timed out after 2s` after 0.010 s.
+    // So every test here does its real I/O (connect, accept, the first
+    // exchange) with the clock running and calls `tokio::time::pause()` only
+    // once the next thing to wait for is the stall itself.
+
     /// A peer that accepts and then never answers costs one bounded timeout,
     /// after which the socket is closed — not a socket parked forever.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn frozen_peer_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Accept and hold the connection open without reading or writing.
-        let frozen = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-            drop(stream);
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let frozen = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted.notify_one();
+                std::future::pending::<()>().await;
+                drop(stream);
+            }
         });
 
-        let client = DataPlaneClient::new(None);
-        let err = client.store(addr, "k", b"v").await.unwrap_err();
-        assert!(err.to_string().contains("timed out"), "got: {err}");
+        let client = Arc::new(DataPlaneClient::new(None));
+        let exchange = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.store(addr, "k", b"v").await }
+        });
+        // The connection is established once the peer has accepted it; from
+        // here on the only thing left to wait for is the request timeout.
+        accepted.notified().await;
+        tokio::time::pause();
+        let err = exchange.await.unwrap().unwrap_err();
+        assert!(is_exchange_timeout(&err), "the request, not the connect, timed out: {err}");
         assert_eq!(client.idle_connections(addr), 0, "a failed connection is never pooled");
         frozen.abort();
     }
 
     /// A peer that answered once and then froze costs the pooled client one
     /// request timeout, not a timeout plus a redial and a second one.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stalled_pooled_connection_is_not_retried() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1690,6 +1717,9 @@ mod connection_tests {
         assert!(client.store(addr, "k", b"v").await.unwrap());
         assert_eq!(client.idle_connections(addr), 1);
 
+        // The pooled connection is up; the second exchange only ever waits
+        // on a response that never comes.
+        tokio::time::pause();
         let started = Instant::now();
         let err = client.store(addr, "k", b"v2").await.unwrap_err();
         assert!(is_exchange_timeout(&err), "got: {err}");
@@ -1703,7 +1733,7 @@ mod connection_tests {
 
     /// After a refused connect the peer is not redialled for the cooldown,
     /// so a dead peer does not charge every caller a connect attempt.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn breaker_skips_dial_after_connect_failure() {
         // Bind then drop: the port is closed and refuses connections.
         let addr = {
@@ -1715,19 +1745,29 @@ mod connection_tests {
         assert!(!first.to_string().contains("cooldown"), "first failure is the real connect error");
         let second = client.fetch(addr, "k").await.unwrap_err();
         assert!(second.to_string().contains("cooldown"), "got: {second}");
-        // Once the cooldown passes, dialling resumes (and fails for real again).
+        // Once the cooldown passes, dialling resumes (and fails for real
+        // again). Only the wait itself runs on the paused clock: the refused
+        // connect that follows is real I/O again.
+        tokio::time::pause();
         tokio::time::sleep(PEER_BREAKER_COOLDOWN + Duration::from_millis(1)).await;
+        tokio::time::resume();
         let third = client.fetch(addr, "k").await.unwrap_err();
         assert!(!third.to_string().contains("cooldown"), "got: {third}");
     }
 
     /// The server drops a connection that sends nothing for the idle timeout,
     /// bounding what a stalled client can hold.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn server_drops_idle_connections() {
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
-        let (addr, _accepted) = counting_server(store).await;
+        let (addr, accepted) = counting_server(store).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
+        // Let the server pick the connection up with the clock running, so
+        // its idle timer exists before the clock starts auto-advancing.
+        while accepted.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
         // Say nothing; the server must hang up on its own.
         let mut byte = [0u8; 1];
         let n = tokio::time::timeout(SERVER_IDLE_TIMEOUT * 2, client.read(&mut byte))
