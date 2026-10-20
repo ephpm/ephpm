@@ -111,7 +111,6 @@ use anyhow::Context as _;
 use dashmap::DashMap;
 use ephpm_php::db_bridge::SiteBackendResolver;
 use litewire::backend::SharedBackend;
-use litewire::litewire_turso::WalGateConfig;
 use tokio::sync::RwLock;
 
 use crate::screened_backend::ScreenedBackend;
@@ -218,11 +217,12 @@ struct Inner {
     /// newly-active site into the replication working set. Idempotent
     /// downstream — it may fire again after an evict/re-open.
     on_open: Option<SiteOpenHook>,
-    /// WAL checkpoint gate installed on every site factory this registry
-    /// opens (`None` = `[db.sqlite.wal_checkpoint] enabled = false`). The
-    /// gate's maintenance task is owned by the factory, so evicting a site
-    /// stops its task — see `evicting_a_site_stops_its_wal_gate_task`.
-    wal_gate: Option<WalGateConfig>,
+    /// Install the WAL checkpoint gate on every site factory this registry
+    /// opens. `true` on every production registry; only the test/tooling
+    /// constructor [`SiteBackends::new`] leaves it off. The gate's
+    /// maintenance task is owned by the factory, so evicting a site stops
+    /// its task — see `evicting_a_site_stops_its_wal_gate_task`.
+    wal_gate: bool,
 }
 
 impl WalGateStatsSource for Inner {
@@ -255,8 +255,8 @@ pub struct SiteBackends {
 impl SiteBackends {
     /// Build a registry over `dir` (created if absent) with **no** WAL
     /// checkpoint gate. Test and tooling constructor: the production
-    /// single-node per-site path uses [`new_with_gate`](Self::new_with_gate)
-    /// so the `[db.sqlite.wal_checkpoint]` knob is honoured.
+    /// single-node per-site path uses [`new_with_gate`](Self::new_with_gate),
+    /// because every production Turso factory is gated.
     ///
     /// # Errors
     ///
@@ -267,11 +267,12 @@ impl SiteBackends {
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
-        Self::build(dir, max_open, query_stats, handle, false, None, None)
+        Self::build(dir, max_open, query_stats, handle, false, None, false)
     }
 
-    /// Build a registry over `dir` (created if absent), installing `wal_gate`
-    /// on every per-site factory it opens (`None` = gate disabled).
+    /// Build a registry over `dir` (created if absent), installing the WAL
+    /// checkpoint gate ([`wal_gate::builder_with_gate`]) on every per-site
+    /// factory it opens.
     ///
     /// # Errors
     ///
@@ -281,9 +282,8 @@ impl SiteBackends {
         max_open: usize,
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
-        wal_gate: Option<WalGateConfig>,
     ) -> anyhow::Result<Self> {
-        Self::build(dir, max_open, query_stats, handle, false, None, wal_gate)
+        Self::build(dir, max_open, query_stats, handle, false, None, true)
     }
 
     /// Build a registry for per-site **clustered** replication.
@@ -304,9 +304,8 @@ impl SiteBackends {
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
         on_open: SiteOpenHook,
-        wal_gate: Option<WalGateConfig>,
     ) -> anyhow::Result<Self> {
-        Self::build(dir, max_open, query_stats, handle, true, Some(on_open), wal_gate)
+        Self::build(dir, max_open, query_stats, handle, true, Some(on_open), true)
     }
 
     fn build(
@@ -316,7 +315,7 @@ impl SiteBackends {
         handle: tokio::runtime::Handle,
         cdc_capture: bool,
         on_open: Option<SiteOpenHook>,
-        wal_gate: Option<WalGateConfig>,
+        wal_gate: bool,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("failed to create per-site database directory: {}", dir.display())
@@ -354,8 +353,8 @@ impl SiteBackends {
     }
 
     /// Put this registry's open databases on the process-wide WAL-gate
-    /// metrics walk (`ephpm_sqlite_wal_bytes{site}` and the
-    /// `ephpm_sqlite_wal_gate_*` counters). Called once by the production
+    /// metrics walk (`ephpm_sqlite_wal_bytes{site}` and
+    /// `ephpm_sqlite_wal_gate_timeouts_total{site}`). Called once by the production
     /// wiring; the sampler holds the registry weakly.
     pub fn register_wal_gate_metrics(&self) {
         let weak: std::sync::Weak<Inner> = Arc::downgrade(&self.inner);
@@ -434,14 +433,15 @@ impl SiteBackends {
         })?;
         // Clustered per-site mode captures writes into `turso_cdc` on every
         // connection so an owned site can ship them; single-node per-site
-        // opens a plain factory (no capture overhead). Either way the WAL
-        // checkpoint gate is installed when configured: the factory owns the
-        // gate's maintenance task, so LRU eviction (which drops the factory)
-        // stops it.
-        let builder = wal_gate::builder_with_gate(
-            litewire::Turso::builder(path_str).enable_cdc_on_connect(self.inner.cdc_capture),
-            self.inner.wal_gate.as_ref(),
-        );
+        // opens a plain factory (no capture overhead). Either way a
+        // production registry installs the WAL checkpoint gate: the factory
+        // owns the gate's maintenance task, so LRU eviction (which drops the
+        // factory) stops it.
+        let mut builder =
+            litewire::Turso::builder(path_str).enable_cdc_on_connect(self.inner.cdc_capture);
+        if self.inner.wal_gate {
+            builder = wal_gate::builder_with_gate(builder);
+        }
         let turso = builder.build().await.with_context(|| {
             format!(
                 "failed to open per-site database (cdc_capture={}) for {site_key}: {path_str}",
@@ -453,7 +453,7 @@ impl SiteBackends {
             site = site_key,
             path = path_str,
             cdc_capture = self.inner.cdc_capture,
-            wal_gate = self.inner.wal_gate.is_some(),
+            wal_gate = self.inner.wal_gate,
             "opened per-site database (Turso engine)"
         );
         // Screening sits innermost, against the raw engine: it must see exactly
@@ -717,7 +717,6 @@ mod tests {
             stats(),
             tokio::runtime::Handle::current(),
             hook,
-            Some(WalGateConfig::default()),
         )
         .expect("build clustered registry");
 
@@ -746,19 +745,18 @@ mod tests {
         assert!(samples.iter().all(|s| s.stats.is_some()), "clustered factories must be gated");
     }
 
-    /// `[db.sqlite.wal_checkpoint]` reaches every per-site factory: a gated
-    /// registry reports stats for each open site (keyed by site, with the
-    /// site's own file), an ungated one reports the sites with no stats, and a
-    /// site that is not open is not reported at all.
+    /// The WAL checkpoint gate reaches every per-site factory of a production
+    /// registry: it reports stats for each open site (keyed by site, with the
+    /// site's own file), the ungated test constructor reports the sites with
+    /// no stats, and a site that is not open is not reported at all.
     #[tokio::test]
-    async fn gate_is_installed_per_site_factory_when_configured() {
+    async fn gate_is_installed_on_every_per_site_factory() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let gated = SiteBackends::new_with_gate(
             tmp.path().to_path_buf(),
             8,
             stats(),
             tokio::runtime::Handle::current(),
-            Some(WalGateConfig::default()),
         )
         .expect("build gated registry");
         let _a = gated.get_or_open("a.test").await.expect("open a");
@@ -777,7 +775,7 @@ mod tests {
         let samples = plain.wal_gate_samples();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].site, "c.test");
-        assert!(samples[0].stats.is_none(), "`enabled = false` installs no gate");
+        assert!(samples[0].stats.is_none(), "the test constructor installs no gate");
     }
 
     /// Evicting a site drops its factory, and the factory owns the gate's
@@ -791,7 +789,6 @@ mod tests {
             1,
             stats(),
             tokio::runtime::Handle::current(),
-            Some(WalGateConfig::default()),
         )
         .expect("build gated registry");
 
