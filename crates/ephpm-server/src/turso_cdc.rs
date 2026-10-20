@@ -636,6 +636,9 @@ pub async fn start_clustered_turso_cdc(
     // "replication is on and idle" from "this build has no CDC
     // instrumentation", and an absent counter cannot say which.
     cdc_metrics::init();
+    // One database, labelled `site="default"`: its subscriber gauge reads 0
+    // from boot rather than appearing on the first attach.
+    cdc_metrics::track_shipping(DEFAULT_SITE);
 
     // Publish MAX(change_id) on a timer while primary. See
     // HEAD_SAMPLE_INTERVAL for why this cannot be folded into the
@@ -990,7 +993,7 @@ fn spawn_head_sampler(
                 current_max_change_id(&conn).await
             };
             match head {
-                Ok(head) => cdc_metrics::observe_head(head),
+                Ok(head) => cdc_metrics::observe_head(DEFAULT_SITE, head),
                 Err(e) => tracing::debug!("CDC head sampler: MAX(change_id) failed: {e:#}"),
             }
         }
@@ -1041,9 +1044,21 @@ fn spawn_head_sampler(
 /// Returns an error if the first frame is not a valid `Subscribe`, if a
 /// `turso_cdc` poll fails, or if the stream breaks.
 pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: S,
+    mgmt: &Turso,
+    local_log_id: &str,
+) -> anyhow::Result<()> {
+    serve_site_subscriber(stream, mgmt, local_log_id, DEFAULT_SITE).await
+}
+
+/// [`serve_subscriber`] for one named site: the shipping metrics (subscriber
+/// count, head, shipped cursor, lag) are recorded under `site`, so the
+/// per-site clustered path's sites never mix their logs' positions.
+async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     mgmt: &Turso,
     local_log_id: &str,
+    site: &str,
 ) -> anyhow::Result<()> {
     write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string() })
         .await
@@ -1059,7 +1074,7 @@ pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // subscriber gauge and this cursor's contribution to the lag gauge
     // are unwound by the guard's Drop rather than by a detach call this
     // function has no single place to make.
-    let subscriber = cdc_metrics::attach_subscriber(from);
+    let subscriber = cdc_metrics::attach_subscriber(site, from);
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
@@ -1111,7 +1126,7 @@ pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 // supplies the exact MAX, and an in-flight uncommitted
                 // transaction (whose rows are already in the log but not
                 // yet yielded) is the gap between the two.
-                cdc_metrics::observe_head(tailer.cursor());
+                cdc_metrics::observe_head(site, tailer.cursor());
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
@@ -1235,6 +1250,17 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
+    subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE).await
+}
+
+/// [`subscribe_and_consume`] for one named site: the applied-watermark gauge
+/// is recorded under `site`.
+async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    factory: &Turso,
+    apply_conn: &litewire::litewire_turso::TursoConnection,
+    site: &str,
+) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
         anyhow::anyhow!(
             "primary sent no Hello within {HELLO_TIMEOUT:?} — wire protocol mismatch? \
@@ -1261,19 +1287,20 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // Publish what we are resuming from before a single batch lands, so
     // the watermark gauge reflects durable local state rather than only
     // what this process has applied since it started.
-    cdc_metrics::record_applied_watermark(watermark);
+    cdc_metrics::record_applied_watermark(site, watermark);
     tracing::info!(
         from_change_id = watermark,
         source_log = %source_log_id,
         "CDC replica: subscribed"
     );
-    consume_frames(stream, factory, apply_conn).await
+    consume_frames(stream, factory, apply_conn, site).await
 }
 
 async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
+    site: &str,
 ) -> anyhow::Result<()> {
     loop {
         let frame = read_frame(stream).await?;
@@ -1315,7 +1342,12 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                         // Advances the watermark gauge to `change_id`,
                         // which is exactly what the local watermark table
                         // now holds.
-                        cdc_metrics::record_batch_applied(change_id, row_count, started.elapsed());
+                        cdc_metrics::record_batch_applied(
+                            site,
+                            change_id,
+                            row_count,
+                            started.elapsed(),
+                        );
                     }
                     Err(e) => {
                         // Deliberately does NOT touch the watermark
@@ -2206,7 +2238,7 @@ async fn maybe_bootstrap_cold_replica(
         // is populated before the first batch rather than reading 0 until
         // one arrives.
         if let Ok(wm) = read_watermark(&conn).await {
-            cdc_metrics::record_applied_watermark(wm);
+            cdc_metrics::record_applied_watermark(DEFAULT_SITE, wm);
         }
         tracing::info!("snapshot bootstrap: local DB already populated; skipping");
         return Ok(());
@@ -2349,7 +2381,7 @@ async fn fetch_and_apply_snapshot_on(
     cdc_metrics::record_snapshot_received(received, started.elapsed());
     // The local watermark table now holds exactly this value, so the
     // replica's watermark gauge is correct before the CDC tail starts.
-    cdc_metrics::record_applied_watermark(header.watermark);
+    cdc_metrics::record_applied_watermark(DEFAULT_SITE, header.watermark);
     Ok(header.watermark)
 }
 
@@ -3160,7 +3192,7 @@ fn spawn_per_site_stream_handler(
                 match kind {
                     StreamKind::Cdc => {
                         if let Err(e) =
-                            serve_subscriber(stream, &site_mgmt.factory, &site_mgmt.log_id).await
+                            serve_site_subscriber(stream, &site_mgmt.factory, &site_mgmt.log_id, &site).await
                         {
                             tracing::info!(peer = %peer, site = %site, "per-site CDC subscriber disconnected: {e:#}");
                         }
@@ -3217,6 +3249,9 @@ fn ensure_site_driver(
         {
             tracing::warn!(site = %site, "per-site replication driver exited: {e:#}");
         }
+        // The site has left this node's replication set: its per-site CDC
+        // gauges must disappear rather than linger at their last value.
+        cdc_metrics::forget_site(&site);
         // Allow a future open-event to restart the driver for this site.
         drivers.remove(&site);
     });
@@ -3293,11 +3328,21 @@ async fn run_site_replication(
                     )
                     .await;
                 }
-                if role_rx.changed().await.is_err() {
+                // Metrics: this node now ships the site and is nobody's
+                // replica of it. Cleared after the handoff, which records an
+                // applied watermark of its own while pulling the snapshot.
+                cdc_metrics::forget_applied(&site);
+                cdc_metrics::track_shipping(&site);
+                if !sample_owned_head_until_role_changes(&site, &site_mgmt.factory, &mut role_rx)
+                    .await
+                {
                     return Ok(());
                 }
             }
             ElectedRole::Replica { primary_grpc_url } if !primary_grpc_url.is_empty() => {
+                // Another node ships this site now; drop our owner-side
+                // series so a stale lag/head cannot outlive the ownership.
+                cdc_metrics::forget_shipping(&site);
                 let owner = match parse_primary_addr(&primary_grpc_url) {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -3346,8 +3391,60 @@ async fn run_site_replication(
             }
             ElectedRole::Replica { .. } => {
                 // Owner not resolved yet — wait for the election to name one.
+                // Either way this node no longer ships the site.
+                cdc_metrics::forget_shipping(&site);
                 if role_rx.changed().await.is_err() {
                     return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// While this node owns `site`, sample `MAX(turso_cdc.change_id)` of the
+/// site's log every [`HEAD_SAMPLE_INTERVAL`] into
+/// `ephpm_cdc_primary_head_change_id{site}`, until the role changes.
+///
+/// The per-site counterpart of [`spawn_head_sampler`], and needed for the
+/// same reason: without it the site's head only advances as a side effect
+/// of shipping, so an owner whose replica just died would report a frozen
+/// lag instead of a growing one. One indexed `MAX()` per owned site per
+/// tick; the connection is opened on the first tick and held for the
+/// ownership stint (a raw connection, so each read takes the WAL-gate
+/// permit, exactly like the whole-database sampler).
+///
+/// Returns `false` when the election's role channel closed (the driver
+/// should exit), `true` on a role change.
+async fn sample_owned_head_until_role_changes(
+    site: &str,
+    factory: &Turso,
+    role_rx: &mut tokio::sync::watch::Receiver<ElectedRole>,
+) -> bool {
+    let mut conn = None;
+    let mut ticker = tokio::time::interval(HEAD_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            changed = role_rx.changed() => return changed.is_ok(),
+            _ = ticker.tick() => {
+                if conn.is_none() {
+                    match factory.raw_connection() {
+                        Ok(c) => conn = Some(c),
+                        Err(e) => {
+                            tracing::debug!(site = %site, "per-site CDC head sampler: cannot open a connection: {e:#}");
+                            continue;
+                        }
+                    }
+                }
+                let Some(c) = conn.as_ref() else { continue };
+                let head = {
+                    let _permit = factory.wal_gate_permit().await;
+                    current_max_change_id(c).await
+                };
+                match head {
+                    Ok(head) => cdc_metrics::observe_head(site, head),
+                    Err(e) => tracing::debug!(site = %site, "per-site CDC head sampler: MAX(change_id) failed: {e:#}"),
                 }
             }
         }
@@ -3608,7 +3705,7 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    subscribe_and_consume(&mut stream, factory, &conn).await
+    subscribe_and_consume_site(&mut stream, factory, &conn, site).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
@@ -3640,7 +3737,7 @@ async fn bootstrap_site_from(
             .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
     }
     cdc_metrics::record_snapshot_received(received, started.elapsed());
-    cdc_metrics::record_applied_watermark(header.watermark);
+    cdc_metrics::record_applied_watermark(site, header.watermark);
     Ok(header.watermark)
 }
 
@@ -3811,15 +3908,13 @@ mod tests {
     /// The assertion is two-part on purpose: staying alive is not enough,
     /// the subscriber must still deliver the first real batch afterwards.
     ///
-    /// `#[serial(cdc_registry)]` because this drives the production
-    /// `serve_subscriber`, which attaches to the process-global subscriber
-    /// registry in `turso_cdc_metrics`. Left concurrent, its subscriber
-    /// (attached at change_id 0) pulls that registry's `shipped` cursor to 0
-    /// and adds a `cursors` row underneath the gauge tests asserting on both —
-    /// the crate's dominant flake at 13/100 full-suite runs. See the group's
-    /// invariant documented on `turso_cdc_metrics::tests`.
+    /// This drives the production `serve_subscriber`, which attaches to the
+    /// process-global registry in `turso_cdc_metrics` under `site="default"`.
+    /// It used to need `#[serial(cdc_registry)]` against the gauge tests
+    /// there (13/100 full-suite flake), because the registry was one
+    /// unkeyed slot; it is keyed by site now and those tests use their own
+    /// site keys, so nothing here can move a value they assert on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(cdc_registry)]
     async fn cold_primary_holds_subscriber_open_until_first_write() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();

@@ -400,66 +400,107 @@ Turso CDC replication path). A single-node deployment has no `ephpm_cdc_*`
 series at all. The whole path is **experimental** — see
 [Roadmap → Turso engine](/roadmap/turso-engine/).
 
-Every node registers the **counters** and `ephpm_cdc_subscribers` at startup,
-zeroed, so an idle node is distinguishable from a build without the
-instrumentation. The three `*_change_id` gauges, the replication-lag gauge, and
-the two histograms are deliberately **not** pre-seeded — they are absent from
-`/metrics` until the first subscriber connects or the first batch is applied,
-so a query against them returns no data on an idle cluster. Which series
-actually move depends on the elected role.
+**Positions are per site; event counts are per node.** Every *gauge* below —
+the four position gauges and `ephpm_cdc_subscribers` — carries a `site` label,
+because a `change_id` is a position in one database's change log and each site
+has its own log. In whole-database clustered mode there is one database and the
+label is `site="default"` (the same value `ephpm_sqlite_wal_bytes{site}` uses,
+so the two join). In per-site clustered mode it is the vhost's canonical site
+key. Every *counter and histogram* is node-wide with no `site` label: it counts
+events, and a sum across sites is exactly the right number for "is anything
+replicating" and "is anything failing".
 
-### Primary (shipping) side
+Every node registers the counters at startup, zeroed, so an idle node is
+distinguishable from a build without the instrumentation. In whole-database
+mode `ephpm_cdc_subscribers{site="default"}` is also present from boot. The
+position gauges are deliberately **not** pre-seeded — they appear once there is
+a position to report (see each row) — so a query against them returns no data
+on an idle cluster. Which series a node publishes for a site depends on its role
+**for that site**.
+
+### Shipping side (the primary / the site's owner)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_cdc_subscribers` | gauge | — | CDC subscriber streams currently attached to this node. Counted from the moment a stream sends its `Subscribe` frame until the stream ends for any reason. **This is the metric to alert on**: `0` on a primary means nothing is being replicated. |
-| `ephpm_cdc_batches_shipped_total` | counter | — | Committed transaction batches written into subscriber streams, summed across subscribers. Counted after the frame is on the wire, so a batch that failed to write is not counted. |
+| `ephpm_cdc_subscribers` | gauge | `site` | CDC subscriber streams currently attached for `site`. Counted from the moment a stream sends its `Subscribe` frame until the stream ends for any reason. Published by the node shipping the site: in per-site mode it appears (at `0`) as soon as this node becomes the site's owner. **This is the metric to alert on**: `0` on the shipping node means that site is not being replicated. |
+| `ephpm_cdc_batches_shipped_total` | counter | — | Committed transaction batches written into subscriber streams, summed across subscribers and sites. Counted after the frame is on the wire, so a batch that failed to write is not counted. |
 | `ephpm_cdc_rows_shipped_total` | counter | — | `turso_cdc` rows contained in those batches. |
-| `ephpm_cdc_shipped_change_id` | gauge | — | The **lowest** `change_id` shipped across all attached subscribers — i.e. the slowest replica's position, so one caught-up replica cannot mask another that is far behind. Retained after the last subscriber detaches. Absent until the first subscriber ever attaches. |
-| `ephpm_cdc_primary_head_change_id` | gauge | — | `MAX(turso_cdc.change_id)` on this node: the write head of the change log. Sampled once a second while primary, and also advanced for free whenever a tailer runs dry. Monotonic. |
-| `ephpm_cdc_replication_lag_changes` | gauge | — | `primary_head_change_id - shipped_change_id`. **The headline replication-lag metric — see the unit warning below.** Clamped at `0`. Absent until the first subscriber ever attaches. |
+| `ephpm_cdc_shipped_change_id` | gauge | `site` | The **lowest** `change_id` shipped across the site's attached subscribers — i.e. the slowest replica's position, so one caught-up replica cannot mask another that is far behind. Retained after the last subscriber detaches. Absent until the first subscriber of the site attaches. |
+| `ephpm_cdc_primary_head_change_id` | gauge | `site` | `MAX(turso_cdc.change_id)` of the site's change log on the node shipping it: the write head. Sampled once a second while this node is the primary (whole-database mode) or the site's owner (per-site mode — one indexed `MAX()` per owned site per second), and also advanced for free whenever a tailer runs dry. Monotonic while the node keeps shipping the site. |
+| `ephpm_cdc_replication_lag_changes` | gauge | `site` | `primary_head_change_id{site} - shipped_change_id{site}`. **The headline replication-lag metric — see the unit warning below.** Clamped at `0`. Published only by the node shipping the site, and absent until the site's first subscriber attaches. |
 | `ephpm_cdc_tail_poll_errors_total` | counter | — | `turso_cdc` poll failures. The stream is dropped and the replica resumes from the same watermark, so this is a retry signal, not a data-loss signal. |
-| `ephpm_cdc_streams_refused_total` | counter | `stream` | Inbound streams refused because this node is not the elected primary — a peer is dialing a stale primary address. `stream` is `cdc` or `snapshot`. |
+| `ephpm_cdc_streams_refused_total` | counter | `stream` | Inbound streams refused because this node is not the elected primary (whole-database) or not the site's owner (per-site) — a peer is dialing a stale address. `stream` is `cdc` or `snapshot`. |
 | `ephpm_cdc_snapshots_served_total` | counter | `status` | Snapshot bootstraps served to cold replicas. `status` is `ok` or `error`. |
 | `ephpm_cdc_snapshot_bytes_served_total` | counter | — | Logical-dump bytes written to dialing replicas. Successful transfers only. |
 | `ephpm_cdc_snapshot_duration_seconds` | histogram | `role` | Snapshot transfer time. `role` is `serve` (primary produced and streamed the dump) or `fetch` (replica received and applied it). |
 
-### Replica (apply) side
+### Applying side (a replica of the site)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_cdc_batches_applied_total` | counter | — | CDC batches applied to the local database. A batch that failed to apply is **not** counted here; it appears in `ephpm_cdc_apply_errors_total`. |
+| `ephpm_cdc_batches_applied_total` | counter | — | CDC batches applied to the local database, across sites. A batch that failed to apply is **not** counted here; it appears in `ephpm_cdc_apply_errors_total`. |
 | `ephpm_cdc_rows_applied_total` | counter | — | `turso_cdc` rows applied. |
-| `ephpm_cdc_applied_change_id` | gauge | — | This replica's applied watermark, mirroring litewire's `__litewire_cdc_watermark` table. Published on subscribe, after a snapshot bootstrap, and after every applied batch — deliberately **not** advanced past a batch that failed to apply. Watermarks are scoped to the source primary's CDC log identity, so this gauge legitimately **drops** (usually to 0) when the replica re-subscribes to a newly promoted primary after a failover. |
+| `ephpm_cdc_applied_change_id` | gauge | `site` | This replica's applied watermark for `site`, mirroring litewire's `__litewire_cdc_watermark` table in that site's database. Published on subscribe, after a snapshot bootstrap, and after every applied batch — deliberately **not** advanced past a batch that failed to apply. Watermarks are scoped to the source's CDC log identity, so this gauge legitimately **drops** (usually to 0) when the replica re-subscribes to a newly promoted primary or a new owner. Not published by the site's owner. |
 | `ephpm_cdc_apply_errors_total` | counter | — | `apply_batch` failures. The stream is failed and the watermark does not move; the replica reconnects and retries from the identical cursor. Any non-zero rate here means replication is stalled, not degraded. |
 | `ephpm_cdc_apply_duration_seconds` | histogram | — | Per-batch apply time on the replica. One batch is one replicated transaction. |
-| `ephpm_cdc_replica_connects_total` | counter | `outcome` | Subscribe attempts, one increment per attempt by terminal outcome: `closed` (primary closed the stream cleanly), `dial_error` (could not reach the primary), `stream_error` (connected, then the stream failed), `watermark_error` (could not resolve the local watermark for the log the primary announced). Reconnect rate is the sum across all four. |
-| `ephpm_cdc_bootstrap_total` | counter | `outcome` | Cold-start snapshot bootstrap decisions. `outcome` is `ok`, `skipped` (local database already populated) or `failed` (retry budget exhausted — startup aborts deliberately rather than serving incomplete data). |
-| `ephpm_cdc_snapshot_bytes_received_total` | counter | — | Logical-dump bytes received and successfully applied during bootstrap. |
+| `ephpm_cdc_replica_connects_total` | counter | `outcome` | Subscribe attempts, one increment per attempt by terminal outcome: `closed` (primary closed the stream cleanly), `dial_error` (could not reach the primary), `stream_error` (connected, then the stream failed), `watermark_error` (could not resolve the local watermark for the log the primary announced). Reconnect rate is the sum across all four. Whole-database mode only — the per-site driver does not record it, so it stays at `0` there. |
+| `ephpm_cdc_bootstrap_total` | counter | `outcome` | Cold-start snapshot bootstrap decisions. `outcome` is `ok`, `skipped` (local database already populated) or `failed` (retry budget exhausted — startup aborts deliberately rather than serving incomplete data). Whole-database mode only; stays at `0` in per-site mode. |
+| `ephpm_cdc_snapshot_bytes_received_total` | counter | — | Logical-dump bytes received and successfully applied during a bootstrap (both modes, including a per-site ownership handoff). |
+
+### Per-site series lifecycle
+
+In per-site clustered mode a node's role is decided per site, and the per-site
+series follow it:
+
+- When this node becomes a site's **owner**, its `applied_change_id{site}` is
+  removed and `subscribers{site}` appears (at `0`); the head sampler starts.
+- When ownership **moves away**, the site's `subscribers`,
+  `primary_head_change_id`, `shipped_change_id` and `replication_lag_changes`
+  series are removed; the node then publishes `applied_change_id{site}` as a
+  replica.
+- When the site's replication driver **exits** (the site left this node's
+  replication set), every series for that site is removed.
+
+"Removed" means the series is absent from the next scrape — not set to `0`,
+which for a position gauge would be a false value. A replica never publishes a
+lag (it does not know the owner's head), and the owner publishes one only for
+replicas that have subscribed.
 
 ### What the lag metric means (and does not)
 
 `ephpm_cdc_replication_lag_changes` is a **row count, not a duration**. Both of
-its inputs are `change_id` values, and turso allocates one `change_id` per
-captured row change. A lag of `500` means five hundred row changes behind — which
-is sub-millisecond on an idle cluster and several minutes behind a bulk import.
-**Do not graph it with a seconds unit and do not alert on it as if it were one.**
+its inputs are `change_id` values from the same site's change log, and turso
+allocates one `change_id` per captured row change. A lag of `500` means five
+hundred row changes behind — which is sub-millisecond on an idle cluster and
+several minutes behind a bulk import. **Do not graph it with a seconds unit and
+do not alert on it as if it were one.**
 
 It is measured at the *ship* boundary — the moment a batch is written into the
 subscriber's stream — not at the *apply* boundary on the replica. It therefore
 excludes network flight time and the replica's apply cost. For true end-to-end
-lag, subtract across nodes:
+lag, subtract across nodes **per site** (only the shipping node publishes a
+site's head, so `max by (site)` picks it):
 
 ```promql
-# End-to-end replication lag, in change-log rows.
-max(ephpm_cdc_primary_head_change_id) - min(ephpm_cdc_applied_change_id)
+# End-to-end replication lag per site, in change-log rows.
+max by (site) (ephpm_cdc_primary_head_change_id)
+  - min by (site) (ephpm_cdc_applied_change_id)
 
-# Replication is not happening at all — the unambiguous alert.
-max(ephpm_cdc_subscribers) == 0
+# Ship-side lag per site, as the owner sees it.
+max by (site) (ephpm_cdc_replication_lag_changes)
+
+# A site whose shipping node has no replica attached — not being replicated.
+max by (site) (ephpm_cdc_subscribers) == 0
 
 # Replication is stalled on a failing apply (the watermark is not moving).
 rate(ephpm_cdc_apply_errors_total[5m]) > 0
 ```
+
+Do not aggregate the position gauges *across* sites (`max(...)` without
+`by (site)`): each site's `change_id`s count a different log, so a cross-site
+difference is meaningless. Before the `site` label existed that is exactly what
+the gauges did internally, and a stress run reported thousands of changes of
+lag while every replica was byte-identical.
 
 There is deliberately **no seconds-valued lag metric**. Producing one requires a
 commit timestamp travelling with each change so the consumer can subtract it
@@ -469,38 +510,18 @@ litewire change to carry `change_time` plus a matching CDC wire-format change �
 not an ePHPm-side calculation. Until both land, any "seconds behind" figure
 would be invented, so none is published.
 
-### Per-site clustered mode (`per_site = true`)
-
-With `[db.sqlite.replication] per_site = true`, every site replicates over its
-own CDC stream, but all of them record into the **same unlabelled series**
-above. There is no `site` label. What that means for each series:
-
-- **Counters** (`batches_*`, `rows_*`, `snapshot_bytes_*`, `snapshots_served_total`,
-  `streams_refused_total`, `apply_errors_total`, `tail_poll_errors_total`) and
-  both histograms are **sums across all sites**. They still work as
-  "is anything replicating" and "is anything failing" signals.
-- **`ephpm_cdc_subscribers`** counts attached per-site streams across all
-  sites, not replicas.
-- **`ephpm_cdc_applied_change_id`** is overwritten by whichever site applied or
-  bootstrapped last. Each site has its own change log, so the value is not a
-  watermark for anything.
-- **`ephpm_cdc_primary_head_change_id`** is the highest position seen in any
-  site's log, and **`ephpm_cdc_shipped_change_id`** the lowest cursor of any
-  attached stream. They come from different logs, so
-  **`ephpm_cdc_replication_lag_changes` is meaningless in this mode**. Do not
-  alert on it, or on the end-to-end lag query above.
-- **`ephpm_cdc_replica_connects_total`** and **`ephpm_cdc_bootstrap_total`**
-  are not recorded by the per-site driver and stay at `0`.
-
-There is currently no per-site replication-lag metric.
-
 ### Cardinality
 
-Every series above is either unlabelled or carries a label with a fixed, small
-set of values (`stream`: 2, `status`: 2, `role`: 2, `outcome`: 4 or 3). There are
-deliberately **no per-peer or per-address labels** — a label per replica would
-scale series count with cluster size and churn a new series on every pod
-replacement.
+The `site` label is bounded by the number of sites this node replicates — one
+`default` series in whole-database mode, and in per-site mode one set per site
+in this node's replication set (the same bound `ephpm_sqlite_wal_bytes{site}`
+has: one entry per vhost directory on disk). A node publishes at most four
+series for a site it owns and one for a site it replicates, and removes them
+when that stops. Counters and histograms have no `site` label; their other
+labels have a fixed, small set of values (`stream`: 2, `status`: 2, `role`: 2,
+`outcome`: 4 or 3). There are deliberately **no per-peer or per-address
+labels** — a label per replica would scale series count with cluster size and
+churn a new series on every pod replacement.
 
 ## Cardinality notes
 

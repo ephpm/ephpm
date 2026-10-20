@@ -54,7 +54,6 @@ fn clustered_registry(dir: &std::path::Path) -> SiteBackends {
         stats(),
         tokio::runtime::Handle::current(),
         hook,
-        None,
     )
     .expect("clustered per-site registry")
 }

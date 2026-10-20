@@ -476,10 +476,16 @@ fn escape_toml(path: &Path) -> String {
 }
 
 /// Value of the first unlabeled Prometheus series named exactly `name`.
+/// Value of the first `name` sample, labelled or not. The CDC position and
+/// subscriber gauges carry `site="default"` in this (whole-database) mode, so
+/// the series key is `name{site="default"}`, not the bare name.
 fn parse_metric(text: &str, name: &str) -> Option<f64> {
+    let labelled = format!("{name}{{");
     text.lines()
         .filter(|l| !l.starts_with('#'))
-        .find(|l| l.split_whitespace().next() == Some(name))
+        .find(|l| {
+            l.split_whitespace().next().is_some_and(|k| k == name || k.starts_with(&labelled))
+        })
         .and_then(|l| l.split_whitespace().last())
         .and_then(|v| v.parse().ok())
 }
