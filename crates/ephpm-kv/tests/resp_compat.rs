@@ -110,6 +110,51 @@ async fn connection_cap_refuses_excess_clients() {
     handle.abort();
 }
 
+// ── Raw wire: inline commands and bad arguments (stress report F-14/F-16) ────
+
+/// Write `request` on a raw socket and read until `want` bytes have arrived.
+async fn raw_roundtrip(stream: &mut tokio::net::TcpStream, request: &[u8], want: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    stream.write_all(request).await.expect("write");
+    let mut reply = vec![0u8; want];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+        .await
+        .expect("reply timed out — was the connection dropped?")
+        .expect("read");
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// `PING` typed into telnet, as `site/content/reference/kv-resp.md` promises.
+/// It used to be `-ERR protocol error: unexpected type byte: 0x50`.
+#[tokio::test]
+async fn inline_commands_work_over_the_wire() {
+    let srv = TestServer::start().await;
+    let mut s = tokio::net::TcpStream::connect(&srv.addr).await.expect("connect");
+
+    assert_eq!(raw_roundtrip(&mut s, b"PING\r\n", 7).await, "+PONG\r\n");
+    assert_eq!(raw_roundtrip(&mut s, b"SET greeting \"hello world\"\r\n", 5).await, "+OK\r\n");
+    assert_eq!(raw_roundtrip(&mut s, b"GET greeting\n", 18).await, "$11\r\nhello world\r\n");
+}
+
+/// `SET k v EX i64::MAX` panicked the connection's task (no reply, socket
+/// closed). It must be Redis's error, and the connection must stay usable.
+#[tokio::test]
+async fn huge_expire_is_an_error_and_keeps_the_connection() {
+    let srv = TestServer::start().await;
+    let mut s = tokio::net::TcpStream::connect(&srv.addr).await.expect("connect");
+
+    let want = "-ERR invalid expire time in 'set' command\r\n";
+    let req =
+        b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$19\r\n9223372036854775807\r\n";
+    assert_eq!(raw_roundtrip(&mut s, req, want.len()).await, want);
+
+    let want = "-ERR invalid expire time in 'expire' command\r\n";
+    assert_eq!(raw_roundtrip(&mut s, b"EXPIRE k 9223372036854775807\r\n", want.len()).await, want);
+
+    assert_eq!(raw_roundtrip(&mut s, b"PING\r\n", 7).await, "+PONG\r\n");
+}
+
 // ── Connection commands ───────────────────────────────────────────────────────
 
 #[tokio::test]

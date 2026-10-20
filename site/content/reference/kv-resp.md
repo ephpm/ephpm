@@ -17,7 +17,7 @@ same store without a socket. See [KV from PHP](/guides/kv-from-php/).
 | Setting | Behavior |
 |---|---|
 | Transport | TCP only, on `[kv.redis_compat] listen` (default `127.0.0.1:6379`). `socket` is parsed but not implemented and logs a startup warning. |
-| Protocol | RESP2 arrays, plus inline commands (`PING` typed into `telnet`). No RESP3: `HELLO` is an unknown command. |
+| Protocol | RESP2 arrays, plus inline commands (`PING` typed into `telnet` or `nc`). An inline command is one line ending in `\n` (a `\r` before it is optional), split on whitespace with Redis's quoting rules: `"..."` understands `\n`, `\r`, `\t`, `\b`, `\a`, `\xHH` and `\"`; `'...'` understands only `\'`. A line with unbalanced quotes, or one longer than 64 KiB, is a protocol error. No RESP3: `HELLO` is an unknown command. |
 | Databases | One. `SELECT 0` is accepted; any other index is `ERR DB index is out of range`. |
 | Connection cap | `max_connections` (default 1000). Excess clients get `-ERR max number of clients reached` and are closed. |
 | Input buffer | `max_input_buffer` per connection (default 1 MiB). |
@@ -72,17 +72,17 @@ than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
 | | `COMMAND` | Stub: returns an empty array. Clients that introspect the command table learn nothing. |
 | | `INFO` | Fixed text: `redis_version:7.0.0`, `redis_mode:embedded`, `tcp_port:6379` (**always 6379**, whatever the listen port), and `used_memory`. Ignores a section argument. See the note below. |
 | Strings | `GET key` | `nil` for a missing key, and also for a key that only exists as a hash. |
-| | `SET key value [EX s \| PX ms] [NX \| XX] [GET]` | `EXAT`/`PXAT`/`KEEPTTL` are `ERR syntax error`. An `EX`/`PX` value that is zero, negative or not a number is **silently ignored** and the key is stored with no TTL (Redis returns an error). `NX` with `XX` is an error. |
-| | `SETEX key seconds value` | `seconds` must be positive. |
+| | `SET key value [EX s \| PX ms] [NX \| XX] [GET]` | `EXAT`/`PXAT`/`KEEPTTL` are `ERR syntax error`. As in Redis, an `EX`/`PX` value that is not a number is `ERR value is not an integer or out of range`, and one that is zero, negative, or so large the expiry time overflows is `ERR invalid expire time in 'set' command`; nothing is written. Giving both `EX` and `PX` is `ERR syntax error`. `NX` with `XX` is an error. |
+| | `SETEX key seconds value` | `seconds` must be positive and must not overflow, as for `SET EX`. |
 | | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` (nothing written on this node; the owner may still have applied a request that timed out). The same applies to `SET … NX`. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
-| | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
+| | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. A result that would overflow is an error and leaves the value unchanged; `DECRBY key -9223372036854775808` is `ERR decrement would overflow`, as in Redis. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
 | | `APPEND`, `STRLEN` | |
 | Keys | `DEL key...` | Removes the string and the hash of that name. |
 | | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`). Owner-decided in a cluster, like `SETNX`; an unreachable owner answers `-CLUSTERDOWN …`. |
 | | `EXISTS key...` | Counts strings and hashes. |
-| | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time`; Redis would delete the key. Options (`NX`/`XX`/`GT`/`LT`) are ignored. **String keys only:** on a hash it returns `0` and sets nothing. |
+| | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time in 'expire' command`; Redis would delete the key. A value so large the expiry time overflows is the same error, as in Redis. Options (`NX`/`XX`/`GT`/`LT`) are ignored. **String keys only:** on a hash it returns `0` and sets nothing. |
 | | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. String keys only: a hash reports `-2`. |
 | | `TYPE key` | `hash`, `string` or `none`. A name that holds both reports `hash`. |
 | | `RENAME old new` | **Strings only.** Renaming a hash returns `ERR no such key`. Keeps the TTL. |
