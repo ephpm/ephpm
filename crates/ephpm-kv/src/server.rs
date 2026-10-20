@@ -74,8 +74,9 @@ impl Default for ServerConfig {
 
 /// Run the KV store RESP server.
 ///
-/// Binds a TCP listener, spawns a background expiry task, and accepts
-/// connections until a shutdown signal (Ctrl-C) is received.
+/// Binds a TCP listener and accepts connections until a shutdown signal
+/// (Ctrl-C) is received. Active expiry is not started here; start it with the
+/// store ([`crate::expiry::spawn`]).
 ///
 /// When `multi_tenant` is provided alongside a `secret` in the config,
 /// HMAC-derived per-site AUTH is required. Clients must send
@@ -141,15 +142,9 @@ pub async fn serve_on(
     let conn_permits = (config.max_connections > 0)
         .then(|| Arc::new(tokio::sync::Semaphore::new(config.max_connections)));
 
-    // Background expiry reaper — runs every second.
-    let expiry_store = Arc::clone(&store);
-    let _expiry_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            expiry_store.expire_pass(100);
-        }
-    });
+    // No expiry reaper here: active expiry is a property of the store, not of
+    // this listener, and runs whether or not RESP is enabled — see
+    // `crate::expiry`, started alongside the store.
 
     loop {
         match listener.accept().await {

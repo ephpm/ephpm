@@ -11,11 +11,11 @@ mod watch;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 pub use entry::Entry;
 use tracing::{debug, trace};
 use watch::WatchSlot;
@@ -386,26 +386,34 @@ pub struct Store {
     data: DashMap<String, Entry>,
     /// Hash values stored separately to avoid Entry enum complexity.
     hashes: DashMap<String, HashEntry>,
-    /// Set of keys whose entries currently have a non-`None` `expires_at`.
+    /// Keys whose entries currently carry an expiry, mapped to that expiry.
     ///
     /// # Why a side index
     ///
-    /// The periodic [`expire_pass`](Self::expire_pass) used to iterate the
-    /// entire `data` map calling `is_expired` on every entry — O(all keys)
-    /// under memory pressure even when only a few percent had TTLs. Session
-    /// stores, rate-limit counters, and cache keys typically fit this
-    /// pattern (small TTL'd subset alongside a much larger persistent set).
+    /// Active expiry ([`active_expire_cycle`](Self::active_expire_cycle))
+    /// samples this index instead of the `data` map, so its cost does not
+    /// depend on how many persistent keys sit alongside the TTL'd ones (the
+    /// session / rate-limit / cache-key pattern: a small TTL'd subset next to a
+    /// much larger persistent set). Holding the deadline here lets a sample
+    /// decide "expired?" without touching `data` at all; only the expired
+    /// candidates cost a map lookup.
     ///
-    /// This set is maintained by every write path: `set_local`,
-    /// `expire_local`, `persist`, `remove_local`, `incr_by_with_ttl` for
-    /// create-with-ttl, and `flush`. It is treated as a **hint** — the
-    /// authoritative TTL check is still `Entry::is_expired`, so a
-    /// stale/false-positive entry in the set just costs an extra map lookup
-    /// (the pass re-checks and removes if the entry no longer has a TTL).
+    /// Maintained by every write path through [`ttl_index_put`] and
+    /// [`ttl_index_drop`]: `set_local`, `set_nx_outcome_local`,
+    /// `expire_local`, `persist`, `remove_local`, `del_if_eq_local`,
+    /// `incr_by_with_ttl` for create-with-ttl, the reap paths, and `flush`. It
+    /// is a **hint**: the authority on expiry is still `Entry::expires_at`, and
+    /// a reap only removes an entry whose `expires_at` equals the hint's
+    /// deadline. Removals are likewise conditional on the deadline, so a
+    /// remove racing a re-write cannot delete the *new* entry's hint.
     ///
-    /// Complexity: `expire_pass` cost drops from O(data.len()) to
-    /// O(ttl_keys.len() + reaped) per invocation.
-    ttl_keys: DashSet<String>,
+    /// [`ttl_index_put`]: Self::ttl_index_put
+    /// [`ttl_index_drop`]: Self::ttl_index_drop
+    ttl_keys: DashMap<String, Instant>,
+    /// Where active expiry stopped in `ttl_keys` (a packed `MapCursor`). The
+    /// next round continues from here, so every TTL hint is reached within one
+    /// sweep however the work is split across cycles and writes.
+    expire_cursor: AtomicU64,
     /// Approximate total memory used by all entries.
     mem_used: AtomicUsize,
     /// Store configuration.
@@ -439,6 +447,7 @@ impl std::fmt::Debug for Store {
             .field("data_len", &self.data.len())
             .field("hashes_len", &self.hashes.len())
             .field("ttl_keys_len", &self.ttl_keys.len())
+            .field("expire_cursor", &MapCursor::unpack(self.expire_cursor.load(Ordering::Relaxed)))
             .field("mem_used", &self.mem_used.load(Ordering::Relaxed))
             .field("config", &self.config)
             .field("replicator_installed", &self.replicator.read().is_ok_and(|g| g.is_some()))
@@ -456,7 +465,8 @@ impl Store {
         Arc::new(Self {
             data: DashMap::new(),
             hashes: DashMap::new(),
-            ttl_keys: DashSet::new(),
+            ttl_keys: DashMap::new(),
+            expire_cursor: AtomicU64::new(0),
             mem_used: AtomicUsize::new(0),
             config,
             replicator: std::sync::RwLock::new(None),
@@ -943,7 +953,7 @@ impl Store {
         };
 
         let new_size = entry.mem_size;
-        let has_ttl = entry.expires_at.is_some();
+        let deadline = entry.expires_at;
 
         // PEEK the bytes already charged for this key — deliberately not a
         // remove. The old entry has to stay visible for the whole
@@ -957,30 +967,22 @@ impl Store {
         // `evict_lru` takes write locks on arbitrary shards (possibly this
         // one) and would deadlock under a guard. `set_nx` and
         // `incr_by_with_ttl` make the same trade for the same reason.
-        if !self.ensure_memory(new_size.saturating_sub(old_size)) {
+        if !self.reserve(&key, new_size.saturating_sub(old_size)) {
             // Leave the existing entry — and its TTL hint — untouched.
-            self.log_write_rejected(&key, new_size);
             return false;
         }
 
-        // Maintain the TTL side index: add on TTL'd writes, remove on the
-        // TTL-less overwrite of a previously-TTL'd key. Set-membership is
-        // idempotent so a re-write with the same TTL state is a no-op.
+        // Maintain the TTL side index: record the new deadline on a TTL'd
+        // write, drop the hint on the TTL-less overwrite of a TTL'd key.
         //
         // This runs before the insert (it borrows `key`, which the insert
         // consumes), so there is a moment where the index disagrees with the
         // entry. That is not the same class of bug: `ttl_keys` is only a
-        // *hint* for `expire_pass`, which re-checks `Entry::expires_at` for
-        // every hint it visits and prunes the ones that no longer hold. The
-        // authority on expiry is the entry itself, and readers enforce it
-        // lazily, so a hint that is briefly stale can at worst delay a
-        // proactive reap by one pass — it can never make a live key read as
-        // missing.
-        if has_ttl {
-            self.ttl_keys.insert(key.clone());
-        } else {
-            self.ttl_keys.remove(&key);
-        }
+        // *hint*, and active expiry reaps an entry only when its `expires_at`
+        // equals the hint's deadline, so a hint that is briefly ahead of the
+        // entry can at worst delay a proactive reap — it can never make a live
+        // key read as missing.
+        self.ttl_index_put(&key, deadline);
         // Snapshot the watch slot BEFORE `key` moves into the insert; bump
         // AFTER the insert so a woken waiter always reads the new value.
         // One Acquire load when nothing is watched (the common case).
@@ -1003,38 +1005,52 @@ impl Store {
         true
     }
 
+    /// Reserve `needed` more bytes for a write to `key`, reclaiming expired
+    /// keys and evicting per the policy as required (see
+    /// [`ensure_memory`](Self::ensure_memory)). Logs the refusal when it fails.
+    ///
+    /// Every write path that grows the store goes through here, so none of
+    /// them can bypass `memory_limit`. Must be called with **no shard guard
+    /// held**: reclaiming and evicting lock arbitrary shards.
+    fn reserve(&self, key: &str, needed: usize) -> bool {
+        if self.ensure_memory(needed) {
+            return true;
+        }
+        self.log_write_rejected(key, needed);
+        false
+    }
+
     /// Report a write refused by the memory budget: `warn!` for the first one
     /// in the process, `debug!` for every one after.
     ///
-    /// The RESP layer now surfaces a refusal to the client as Redis `-OOM`
-    /// (#477), so a network client is no longer left in the dark. This line
-    /// stays because not every caller reads the return value — the in-process
-    /// `ephpm_kv_*` bridge hands PHP a `0`/`false` a caller may ignore, and an
-    /// operator watching the log still wants one clear signal that the store is
-    /// parked at its limit under `noeviction`.
+    /// The RESP layer surfaces a refusal to the client as Redis `-OOM` (#477).
+    /// This line stays because not every caller reads the return value — the
+    /// in-process `ephpm_kv_*` bridge hands PHP a `0`/`false` a caller may
+    /// ignore, and an operator watching the log still wants one clear signal
+    /// that the store is parked at its limit.
     ///
     /// It also has to go quiet, for the same reason
     /// [`Store::warn_hash_not_replicated`] does: a store sitting at the limit
     /// refuses *every* write, and a `warn!` per write would bury the log in a
     /// message whose content never changes.
-    fn log_write_rejected(&self, key: &str, new_size: usize) {
+    fn log_write_rejected(&self, key: &str, needed: usize) {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mem_used = self.mem_used();
         let limit = self.config.memory_limit;
         if WARNED.swap(true, Ordering::Relaxed) {
-            debug!(key, new_size, mem_used, limit, "write refused: over the memory limit");
+            debug!(key, needed, mem_used, limit, "write refused: over the memory limit");
             return;
         }
         tracing::warn!(
             key,
-            new_size,
+            needed,
             mem_used,
             limit,
             policy = ?self.config.eviction_policy,
-            "write refused: the KV store is over its memory limit and could not free enough space. \
-             The existing value at this key is left intact, and the RESP client was still answered \
-             +OK. Raise `[kv] memory_limit` or choose an eviction policy. Further refusals are \
-             logged at DEBUG."
+            "write refused: the KV store is over its memory limit and could not free enough space \
+             (expired keys were reclaimed first). The existing value at this key is left intact; a \
+             RESP client is answered -OOM and a PHP ephpm_kv_* call reports failure. Raise `[kv] \
+             memory_limit` or choose an evicting policy. Further refusals are logged at DEBUG."
         );
     }
 
@@ -1176,12 +1192,11 @@ impl Store {
         // may need to remove entries from arbitrary shards (potentially
         // including this one) and would deadlock if called under the
         // entry guard. The `set()` method makes the same trade-off.
-        if !self.ensure_memory(new_size) {
+        if !self.reserve(&key, new_size) {
             return SetNxOutcome::OutOfMemory;
         }
 
         let published_expiry = new_entry.expires_at;
-        let has_ttl = new_entry.expires_at.is_some();
         // Atomic check-and-insert. The shard write lock held by `entry()`
         // serialises concurrent set_nx calls for this key.
         let key_ref = match self.data.entry(key) {
@@ -1208,11 +1223,7 @@ impl Store {
                 k
             }
         };
-        if has_ttl {
-            self.ttl_keys.insert(key_ref.clone());
-        } else {
-            self.ttl_keys.remove(&key_ref);
-        }
+        self.ttl_index_put(&key_ref, published_expiry);
         // Wake any waiters — the insert is visible at this point.
         self.notify_write(&key_ref);
         // Broadcast the winning value. This path already *has* the exact
@@ -1339,7 +1350,7 @@ impl Store {
         // accounting, the TTL side index, and watch wakeups (the key is now
         // absent, so a `wait_for_change` observer must be woken).
         self.mem_sub(old.mem_size);
-        self.ttl_keys.remove(key);
+        self.ttl_index_drop(key, old.expires_at);
         self.notify_write(key);
         // Clustered: broadcast a publish-only tombstone. The compare already
         // happened locally under the shard lock; peers drop the key by
@@ -1370,10 +1381,10 @@ impl Store {
     pub fn remove_local(&self, key: &str) -> bool {
         let string_removed = if let Some((_, old)) = self.data.remove(key) {
             self.mem_sub(old.mem_size);
-            // Keep the TTL hint set consistent — a false positive would just
-            // cost `expire_pass` a dead lookup, but strict consistency here
-            // keeps the set size proportional to live TTL'd keys.
-            self.ttl_keys.remove(key);
+            // Keep the TTL index proportional to live TTL'd keys. Conditional
+            // on the removed entry's deadline, so a concurrent re-write's
+            // fresh hint survives.
+            self.ttl_index_drop(key, old.expires_at);
             true
         } else {
             false
@@ -1421,16 +1432,46 @@ impl Store {
     /// constraint does not apply here and is not reintroduced.
     fn reap_if_expired(&self, key: &str, observed: Instant) -> bool {
         let removed = self.data.remove_if(key, |_, entry| entry.expires_at == Some(observed));
+        // Drop the hint for the entry we observed — whether we reaped it or a
+        // concurrent remove got there first. A hint carrying a different
+        // deadline belongs to a newer write and is kept.
+        self.ttl_index_drop(key, Some(observed));
         if let Some((_, old)) = removed {
             self.mem_sub(old.mem_size);
-            // Keep the TTL hint set consistent, same as remove_local.
-            self.ttl_keys.remove(key);
             // A reap is a state change (the key becomes absent) — wake waiters,
             // matching remove_local's contract.
             self.notify_write(key);
             true
         } else {
             false
+        }
+    }
+
+    /// Record `key`'s expiry in the TTL index, or drop its hint when the new
+    /// value has none. Called by write paths that have just stored (or are
+    /// about to store) an entry with expiry `deadline`.
+    fn ttl_index_put(&self, key: &str, deadline: Option<Instant>) {
+        match deadline {
+            Some(at) => {
+                if let Some(mut slot) = self.ttl_keys.get_mut(key) {
+                    *slot = at;
+                } else {
+                    self.ttl_keys.insert(key.to_string(), at);
+                }
+            }
+            None => {
+                self.ttl_keys.remove(key);
+            }
+        }
+    }
+
+    /// Drop `key`'s TTL hint, but only if it still records `deadline` — the
+    /// expiry of the entry the caller just removed. A hint with any other
+    /// deadline was written by a newer write and stays. `None` (the removed
+    /// entry had no expiry) has no hint to drop.
+    fn ttl_index_drop(&self, key: &str, deadline: Option<Instant>) {
+        if let Some(at) = deadline {
+            self.ttl_keys.remove_if(key, |_, hint| *hint == at);
         }
     }
 
@@ -1454,11 +1495,12 @@ impl Store {
                 self.remove_local(key);
                 return false;
             }
-            entry.expires_at = Some(Instant::now() + ttl);
+            let deadline = Instant::now() + ttl;
+            entry.expires_at = Some(deadline);
             drop(entry);
-            // Track this key in the TTL side index so the periodic
-            // expire_pass scans only TTL'd keys instead of the whole map.
-            self.ttl_keys.insert(key.to_string());
+            // Track the new deadline in the TTL side index so active expiry
+            // can find this key without scanning the whole map.
+            self.ttl_index_put(key, Some(deadline));
             true
         } else {
             false
@@ -1490,9 +1532,9 @@ impl Store {
             });
             drop(entry);
             if had_ttl {
-                // Key no longer has a TTL — drop from the side index so
-                // `expire_pass` doesn't waste a lookup on it.
-                self.ttl_keys.remove(key);
+                // Key no longer has a TTL — drop it from the side index so
+                // active expiry doesn't waste a sample on it.
+                self.ttl_index_put(key, None);
                 // Re-broadcast the value with no expiry, so peers drop their
                 // TTL too instead of expiring a key this node made permanent.
                 if let Some(value) = published_value {
@@ -1560,7 +1602,7 @@ impl Store {
             let create_size =
                 Entry::new(Bytes::from(delta.to_string().into_bytes()), key.len(), false, 0)
                     .mem_size;
-            if !self.ensure_memory(create_size) {
+            if !self.reserve(key, create_size) {
                 // Redis-compatible `-OOM` so INCR fails the same way SET does
                 // when the store is parked at its limit (#477).
                 return Err(OOM_ERROR.to_string());
@@ -1640,7 +1682,7 @@ impl Store {
                     None => Entry::new(Bytes::from(val_bytes), key.len(), false, now),
                 };
                 let new_size = new_entry.mem_size;
-                let has_ttl = new_entry.expires_at.is_some();
+                let deadline = new_entry.expires_at;
                 if publishing {
                     published = Some((delta.to_string().into_bytes(), new_entry.expires_at));
                 }
@@ -1656,11 +1698,7 @@ impl Store {
                         vac.insert(new_entry);
                     }
                 }
-                if has_ttl {
-                    self.ttl_keys.insert(key.to_string());
-                } else {
-                    self.ttl_keys.remove(key);
-                }
+                self.ttl_index_put(key, deadline);
                 delta
             }
         };
@@ -1678,13 +1716,23 @@ impl Store {
 
     /// Append `value` to the existing value at `key`, or create it.
     ///
-    /// Returns `Some(new_length)` on success. Returns `None` only when the key
-    /// was **absent** and the create was refused by the memory budget
-    /// (`NoEviction` over `memory_limit`) — the RESP layer maps that to Redis
-    /// `-OOM` instead of falsely answering with a length (#477). Growing an
-    /// *existing* value is done in place and is not memory-guarded, so it never
-    /// returns `None`.
+    /// Returns `Some(new_length)` on success. Returns `None` when the memory
+    /// budget refused the write — the create of an absent key, or the growth
+    /// of an existing one — and the RESP layer maps that to Redis `-OOM`
+    /// instead of falsely answering with a length (#477). A refused append
+    /// leaves the existing value untouched.
     pub fn append(&self, key: &str, value: &[u8]) -> Option<usize> {
+        // Make room for the growth BEFORE taking the entry guard: reclaiming
+        // and evicting lock arbitrary shards, possibly this key's. An append to
+        // a live key used to grow it in place with no budget check at all, so
+        // a loop of APPENDs could take the store arbitrarily far past
+        // `memory_limit`. The appended length is the exact growth of an
+        // uncompressed value and an over-estimate for a compressed one; the
+        // bytes actually charged are the exact delta computed under the guard.
+        let live = self.data.get(key).is_some_and(|e| !e.is_expired());
+        if live && !self.reserve(key, value.len()) {
+            return None;
+        }
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
@@ -1793,13 +1841,26 @@ impl Store {
 
     /// Set a field in a hash. Creates the hash if it doesn't exist.
     ///
-    /// Returns `true` if the field was newly inserted, `false` if updated.
+    /// Returns `Some(true)` if the field was newly inserted, `Some(false)` if
+    /// an existing field was updated, and `None` if the memory budget refused
+    /// the write (the RESP layer answers `-OOM`, as for `SET`). A refused write
+    /// leaves the hash untouched.
     ///
     /// **Not replicated** in clustered mode — see
     /// `warn_hash_not_replicated`.
-    pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> bool {
+    pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> Option<bool> {
         self.warn_hash_not_replicated("HSET");
         let field_mem = field.len() + value.len() + 64;
+        // Reserve before taking the hash's shard guard (reclaiming and evicting
+        // lock arbitrary shards). HSET used to skip the budget entirely, so
+        // hashes could grow past `memory_limit` under every policy. The
+        // check is for the whole new field plus, for a new hash, its base
+        // overhead — for an overwrite that is slightly stricter than the true
+        // delta. The bytes are charged by the exact accounting below.
+        let base = if self.hashes.contains_key(key) { 0 } else { 64 };
+        if !self.reserve(key, field_mem + base) {
+            return None;
+        }
         let value = Bytes::from(value);
         let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
             self.mem_add(64); // base hash overhead
@@ -1823,7 +1884,7 @@ impl Store {
         } else {
             self.mem_add(field_mem);
         }
-        is_new
+        Some(is_new)
     }
 
     /// Get a field value from a hash.
@@ -1993,77 +2054,94 @@ impl Store {
 
     // ── Background maintenance ───────────────────────────────────
 
-    /// Run a single pass of lazy expiration, removing up to `sample_size`
-    /// expired keys. Called periodically by the background task.
+    /// Run one adaptive active-expiry cycle (Redis' `activeExpireCycle`):
+    /// examine the next [`EXPIRE_SAMPLE_KEYS`] keys that carry a TTL, reap the
+    /// expired ones, and repeat while more than
+    /// [`EXPIRE_ACCEPTABLE_STALE_PERCENT`]% of a round was expired — until
+    /// `budget` has elapsed. Returns the number of keys reaped.
     ///
-    /// # Performance
+    /// At least one round always runs, whatever the budget, so a caller
+    /// driving many stores from one budget still makes progress on each.
     ///
-    /// Iterates over the TTL side index [`ttl_keys`](Self::ttl_keys) instead
-    /// of the whole `data` map — O(TTL'd keys) rather than O(all keys). The
-    /// side index is a *hint*: an entry might have had its TTL cleared by
-    /// `persist` between insertion and the pass, or the key might already
-    /// have been reaped by a concurrent `get`/`remove`. The authoritative
-    /// check remains `Entry::is_expired`; false-positive hints just cost an
-    /// extra map lookup and get pruned in-band.
-    pub fn expire_pass(&self, sample_size: usize) -> usize {
-        let mut removed = 0;
-        let mut keys_to_remove = Vec::new();
-        // Also drop hint entries whose underlying key no longer exists or no
-        // longer has a TTL. Bounded by the same sample budget so the pass is
-        // still cheap under a large index.
-        let mut hints_to_prune = Vec::new();
-
-        // Iterate the TTL hint set, bounding TOTAL work per pass by
-        // `sample_size` — not just the reap count. Every visited hint is one
-        // `data.get()` plus, potentially, a prune. If we capped only the reap
-        // count, a large stale-hint population (mass `persist()` after mass
-        // `expire()` leaves the index full of hints whose entries no longer
-        // carry a TTL) would keep `removed` at 0 and scan the entire index —
-        // reintroducing the O(ttl_keys.len()) stall this index exists to
-        // avoid. Stale hints instead drain incrementally across successive
-        // passes. `DashSet` iterates by-value refs, so `hint` is a `RefMulti`
-        // yielding the &String key.
-        for (visited, hint) in self.ttl_keys.iter().enumerate() {
-            if removed >= sample_size || visited >= sample_size {
+    /// # Why a cursor, and why it adapts
+    ///
+    /// The previous `expire_pass(100)` walked the TTL index from its first
+    /// shard and stopped after 100 *visited* hints, once a second. That capped
+    /// reclamation at 100 keys/s, and once the front of the index held live
+    /// long-TTL keys it never reached an expired key again. Rounds now continue
+    /// from a saved cursor (`expire_cursor`), so every hint is examined within
+    /// one sweep of the index however the work is split up. Repeating while
+    /// the expired share is high makes the reap rate follow the expiry rate;
+    /// the threshold ends a cycle once further work would mostly find live
+    /// keys, so a store full of long-TTL keys costs one small round per cycle.
+    ///
+    /// Expired keys that are not yet reaped are never readable (every read
+    /// path checks expiry), and a write that needs the memory they hold
+    /// reclaims them first (see [`ensure_memory`](Self::ensure_memory)).
+    ///
+    /// Reaps are local only, like lazy expiry: replicas expire keys on their
+    /// own clocks.
+    pub fn active_expire_cycle(&self, budget: Duration) -> usize {
+        let start = Instant::now();
+        let mut reaped = 0;
+        loop {
+            let round = self.expire_round();
+            reaped += round.expired;
+            if !round.worth_continuing() || start.elapsed() >= budget {
                 break;
             }
-            let key: &String = hint.key();
-            match self.data.get(key) {
-                Some(entry) => {
-                    // Authoritative TTL check.
-                    if entry.expires_at.is_none() {
-                        // persist() cleared the TTL after the hint was
-                        // added — drop the stale hint.
-                        let stale = key.clone();
-                        drop(entry);
-                        hints_to_prune.push(stale);
-                    } else if entry.is_expired() {
-                        let expired = key.clone();
-                        drop(entry);
-                        keys_to_remove.push(expired);
-                        removed += 1;
-                    }
-                }
-                None => {
-                    // Entry already reaped elsewhere; the hint is dead.
-                    hints_to_prune.push(key.clone());
-                }
+        }
+        if reaped > 0 {
+            trace!(reaped, "active expiry reaped keys");
+        }
+        reaped
+    }
+
+    /// Examine the next [`EXPIRE_SAMPLE_KEYS`] TTL hints from the expiry
+    /// cursor and reap every expired one.
+    fn expire_round(&self) -> SampleRound {
+        let now = Instant::now();
+        let mut expired: Vec<(String, Instant)> = Vec::new();
+        let from = MapCursor::unpack(self.expire_cursor.load(Ordering::Relaxed));
+        // The scan only reads the TTL index (under its shard read lock) and
+        // copies out the expired candidates; the reaps run after the lock is
+        // released, because they take `data` and `ttl_keys` write locks.
+        let (sampled, next) = scan_map(&self.ttl_keys, from, EXPIRE_SAMPLE_KEYS, |k, at| {
+            if *at <= now {
+                expired.push((k.clone(), *at));
+            }
+        });
+        // Concurrent rounds (the expiry thread and a write reclaiming memory)
+        // may overwrite each other's cursor; that only re-examines or skips a
+        // few hints, which a later sweep covers.
+        self.expire_cursor.store(next.pack(), Ordering::Relaxed);
+        let expired_count = expired.len();
+        for (key, at) in expired {
+            // Compare-and-remove: only the entry whose expiry the hint
+            // recorded. A re-write since the hint was read carries a fresh
+            // deadline and survives (#478). A stale hint is pruned either way.
+            self.reap_if_expired(&key, at);
+        }
+        SampleRound { sampled, expired: expired_count }
+    }
+
+    /// Reclaim expired keys until `needed` more bytes fit under the limit,
+    /// working the way [`active_expire_cycle`](Self::active_expire_cycle)
+    /// does. Stops once a round is mostly live — so a store that is genuinely
+    /// full of live data pays one small round per refused write, not a scan —
+    /// or after [`OOM_RECLAIM_BUDGET`]. The cursor carries over, so successive
+    /// writes continue the sweep rather than re-examining the same hints.
+    fn reclaim_expired_for(&self, needed: usize) {
+        let start = Instant::now();
+        loop {
+            let round = self.expire_round();
+            if self.fits(needed)
+                || !round.worth_continuing()
+                || start.elapsed() >= OOM_RECLAIM_BUDGET
+            {
+                return;
             }
         }
-
-        for key in &hints_to_prune {
-            self.ttl_keys.remove(key);
-        }
-        for key in &keys_to_remove {
-            // Lazy-expiry cleanup: local only. Replicas run their own
-            // expire_pass on the same TTLs.
-            self.remove_local(key);
-        }
-
-        if removed > 0 {
-            trace!(removed, "expired keys reaped");
-        }
-        removed
     }
 
     // ── Memory management ────────────────────────────────────────
@@ -2093,17 +2171,30 @@ impl Store {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)));
     }
 
-    /// Ensure there is room for `needed` bytes. Runs eviction if necessary.
-    /// Returns `false` only if the `NoEviction` policy is active and we're
-    /// over the limit.
-    fn ensure_memory(&self, needed: usize) -> bool {
+    /// Whether `needed` more bytes fit under the memory limit right now.
+    fn fits(&self, needed: usize) -> bool {
         let limit = self.config.memory_limit;
-        if limit == 0 {
-            return true; // unlimited
+        limit == 0 || self.mem_used.load(Ordering::Relaxed).saturating_add(needed) <= limit
+    }
+
+    /// Ensure there is room for `needed` bytes. Returns `false` when there is
+    /// not and none could be made.
+    ///
+    /// Order of resort:
+    /// 1. **Expired keys.** Their bytes still count against the limit until
+    ///    they are reaped, so before refusing a write or evicting live data
+    ///    the store reclaims expired keys (see
+    ///    [`reclaim_expired_for`](Self::reclaim_expired_for)). Under
+    ///    `noeviction` this used to be skipped: a store whose keys had all
+    ///    expired refused writes as out of memory while holding no live data.
+    /// 2. **Eviction**, per the configured policy. `noeviction` refuses.
+    fn ensure_memory(&self, needed: usize) -> bool {
+        if self.fits(needed) {
+            return true;
         }
 
-        let current = self.mem_used.load(Ordering::Relaxed);
-        if current + needed <= limit {
+        self.reclaim_expired_for(needed);
+        if self.fits(needed) {
             return true;
         }
 
@@ -2301,6 +2392,134 @@ impl Store {
 
         self.mem_used.load(Ordering::Relaxed) + needed <= limit
     }
+}
+
+/// TTL hints examined per active-expiry round (Redis'
+/// `ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP`).
+pub const EXPIRE_SAMPLE_KEYS: usize = 20;
+
+/// An active-expiry cycle keeps going while more than this percentage of a
+/// round was expired (Redis 6+ default, `active-expire-effort 1`).
+pub const EXPIRE_ACCEPTABLE_STALE_PERCENT: usize = 10;
+
+/// Most time a single write spends reclaiming expired keys before it falls
+/// back to eviction or refusal.
+const OOM_RECLAIM_BUDGET: Duration = Duration::from_millis(2);
+
+/// What one active-expiry round saw.
+#[derive(Debug, Clone, Copy)]
+struct SampleRound {
+    /// TTL hints examined.
+    sampled: usize,
+    /// Of those, the ones already past their deadline (reaped, or found
+    /// already gone).
+    expired: usize,
+}
+
+impl SampleRound {
+    /// Whether another round is likely to pay: the index is not empty and
+    /// more than [`EXPIRE_ACCEPTABLE_STALE_PERCENT`]% of this round was
+    /// expired.
+    fn worth_continuing(self) -> bool {
+        self.sampled > 0 && self.expired * 100 > self.sampled * EXPIRE_ACCEPTABLE_STALE_PERCENT
+    }
+}
+
+/// A position in a `DashMap`'s bucket space: a shard index and a bucket index
+/// inside that shard. Kept across calls by active expiry so successive cycles
+/// continue a sweep instead of restarting it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MapCursor {
+    shard: usize,
+    bucket: usize,
+}
+
+impl MapCursor {
+    /// Pack into one `u64` (shard in the top 16 bits) so the cursor can live
+    /// in an atomic. DashMap never has anywhere near 2^16 shards.
+    fn pack(self) -> u64 {
+        ((self.shard as u64) << 48) | (self.bucket as u64 & ((1 << 48) - 1))
+    }
+
+    #[allow(clippy::cast_possible_truncation, reason = "inverse of `pack`")]
+    fn unpack(v: u64) -> Self {
+        Self { shard: (v >> 48) as usize, bucket: (v & ((1 << 48) - 1)) as usize }
+    }
+}
+
+/// Visit up to `want` entries of `map` in bucket order, starting at `from`,
+/// calling `visit` for each. Returns how many were visited and the position
+/// just past the last one, from which a later call continues.
+///
+/// This is the shape of Redis' `dictScan`-driven active expiry: a cursor walks
+/// the table a little at a time, so every entry is reached within one full
+/// sweep however the work is split up — unlike restarting at the front each
+/// time, which never reaches whatever sits behind a long run of entries that
+/// are not eligible. The cost of a call is `O(want)` occupied buckets plus the
+/// empty buckets stepped over. A bucket index past the end of a shard's table
+/// (the table was resized since the cursor was saved) wraps into range.
+///
+/// Each shard's read lock is held only while that shard is being walked;
+/// `visit` must not touch `map`. Every bucket is visited at most once per
+/// call, so on a map with fewer than `want` entries this returns all of them.
+// The `raw-api` shard table is the only `unsafe` here; justified by the SAFETY
+// comments on each use (buckets are read under the shard's own read lock).
+#[allow(unsafe_code)]
+fn scan_map<V>(
+    map: &DashMap<String, V>,
+    from: MapCursor,
+    want: usize,
+    mut visit: impl FnMut(&String, &V),
+) -> (usize, MapCursor) {
+    let shards = map.shards();
+    let shard_count = shards.len();
+    if shard_count == 0 || want == 0 {
+        return (0, from);
+    }
+    let first = from.shard % shard_count;
+    let mut shard = first;
+    let start = from.bucket;
+    let mut seen = 0;
+    // `shard_count + 1` passes: the first shard from `start` to its end, every
+    // other shard whole, then the first shard again from 0 up to `start`.
+    for pass in 0..=shard_count {
+        let guard = shards[shard].read();
+        if !guard.is_empty() {
+            // `buckets()` is a power of two for an allocated table.
+            let buckets = guard.buckets();
+            let (lo, hi) = if pass == 0 {
+                (start % buckets, buckets)
+            } else if pass == shard_count {
+                (0, (start % buckets).min(buckets))
+            } else {
+                (0, buckets)
+            };
+            for idx in lo..hi {
+                // SAFETY: `idx < buckets()`, the precondition of
+                // `is_bucket_full`; the table is allocated (it is non-empty).
+                if unsafe { guard.is_bucket_full(idx) } {
+                    // SAFETY: the bucket is in range and full, so it holds an
+                    // initialised element; `guard` holds this shard's read
+                    // lock for the whole loop, so no writer can move or drop
+                    // it while the reference lives. The reference does not
+                    // escape `visit`.
+                    let (key, slot) = unsafe { guard.bucket(idx).as_ref() };
+                    visit(key, slot.get());
+                    seen += 1;
+                    if seen >= want {
+                        return (seen, MapCursor { shard, bucket: idx + 1 });
+                    }
+                }
+            }
+        }
+        drop(guard);
+        if pass == shard_count {
+            break;
+        }
+        shard = (shard + 1) % shard_count;
+    }
+    // The whole map was walked; the next sweep may start anywhere.
+    (seen, MapCursor { shard: first, bucket: start })
 }
 
 /// Parse a stored byte value as a decimal integer.
@@ -3048,25 +3267,196 @@ mod tests {
         assert!(elapsed < Duration::from_secs(2), "KEYS took {elapsed:?}");
     }
 
+    /// Plant an entry that expired a minute ago — and its TTL hint — without
+    /// waiting on the clock, accounted exactly as a real write would be.
+    fn plant_expired(s: &Store, key: &str, value: &[u8]) {
+        let past = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let entry = Entry::with_expiry(Bytes::copy_from_slice(value), key.len(), false, past, 0);
+        s.mem_add(entry.mem_size);
+        s.data.insert(key.to_string(), entry);
+        s.ttl_keys.insert(key.to_string(), past);
+    }
+
     #[test]
-    fn expire_pass_reaps() {
+    fn active_expire_cycle_reaps() {
         let s = test_store();
-        let entry = Entry::with_expiry(
-            Bytes::from_static(b"v"),
-            1,
-            false,
-            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-            0,
-        );
-        s.data.insert("expired".into(), entry);
-        // The direct data.insert bypasses set_local's TTL-index maintenance;
-        // plant the hint by hand so the pass sees the entry.
-        s.ttl_keys.insert("expired".into());
+        plant_expired(&s, "expired", b"v");
         s.set("alive".into(), b"v".to_vec(), None);
-        let reaped = s.expire_pass(100);
+        let reaped = s.active_expire_cycle(Duration::from_secs(1));
         assert_eq!(reaped, 1);
-        assert!(!s.exists("expired"));
+        assert!(!s.data.contains_key("expired"));
         assert!(s.exists("alive"));
+        assert_eq!(s.ttl_keys.len(), 0);
+    }
+
+    /// F-1: `expire_pass(100)` reclaimed at most 100 keys a second. One cycle
+    /// must keep going while most of what it samples is expired.
+    #[test]
+    fn active_expire_cycle_is_not_capped_at_a_fixed_key_count() {
+        let s = test_store();
+        for i in 0..50_000 {
+            plant_expired(&s, &format!("t{i}"), b"v");
+        }
+        let reaped = s.active_expire_cycle(Duration::from_secs(30));
+        assert_eq!(reaped, 50_000, "an all-expired index is drained in one cycle");
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.mem_used(), 0, "reaped bytes are given back");
+    }
+
+    /// F-1: `expire_pass` restarted from the front of the TTL index every pass
+    /// and gave up after 100 *visited* hints, so once the front held live
+    /// long-TTL keys, expired keys behind them were never reached. The cursor
+    /// must reach every hint within one sweep: 8000 hints at 20 per round is
+    /// 400 rounds, and every cycle runs at least one.
+    #[test]
+    fn active_expire_is_not_starved_by_live_long_ttl_keys() {
+        let s = test_store();
+        for i in 0..4_000 {
+            assert!(s.set(format!("long{i}"), b"v".to_vec(), Some(Duration::from_secs(86_400))));
+        }
+        for i in 0..4_000 {
+            plant_expired(&s, &format!("dead{i}"), b"v");
+        }
+        let reaped: usize = (0..400).map(|_| s.active_expire_cycle(Duration::from_secs(1))).sum();
+        assert_eq!(reaped, 4_000, "expired keys left unreaped behind live TTL keys");
+        assert_eq!(s.ttl_keys.len(), 4_000, "only the live keys' hints remain");
+        for i in 0..4_000 {
+            assert!(s.data.contains_key(&format!("long{i}")), "a live key was reaped");
+        }
+    }
+
+    /// A store full of live TTL keys must cost one small round per cycle,
+    /// not a walk of its index.
+    #[test]
+    fn active_expire_cycle_stops_early_on_live_keys() {
+        let s = test_store();
+        for i in 0..10_000 {
+            assert!(s.set(format!("live{i}"), b"v".to_vec(), Some(Duration::from_secs(3_600))));
+        }
+        assert_eq!(s.expire_round().sampled, EXPIRE_SAMPLE_KEYS);
+        assert_eq!(s.active_expire_cycle(Duration::from_secs(5)), 0);
+        assert_eq!(s.len(), 10_000);
+    }
+
+    /// F-1: under `noeviction`, bytes held by expired-but-unreaped keys
+    /// counted against the limit, so a store with **no live keys** refused
+    /// writes as out of memory (19,499 of 20,000 in the stress run). A write
+    /// must reclaim expired keys before it refuses.
+    #[test]
+    fn noeviction_reclaims_expired_keys_before_refusing() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 64 * 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        let mut i = 0;
+        while s.mem_used() + 300 < 64 * 1024 {
+            plant_expired(&s, &format!("old{i}"), &[b'x'; 100]);
+            i += 1;
+        }
+        // As many fresh writes as the limit holds once the expired keys are
+        // gone (~240 accounted bytes each). Before the fix the first one was
+        // refused.
+        for n in 0..200 {
+            assert!(s.set(format!("new{n}"), vec![b'y'; 100], None), "write {n} refused");
+        }
+        assert!(s.mem_used() <= 64 * 1024);
+        // The same holds for the other write paths.
+        let s = Store::new(StoreConfig {
+            memory_limit: 8 * 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..40 {
+            plant_expired(&s, &format!("old{i}"), &[b'x'; 100]);
+        }
+        assert!(s.mem_used() > 4 * 1024);
+        assert_eq!(s.incr_by("ctr", 1), Ok(1));
+        assert_eq!(s.set_nx_outcome("nx".into(), vec![b'z'; 2048], None), SetNxOutcome::Inserted);
+        assert_eq!(s.hset("h", "f", vec![b'h'; 2048]), Some(true));
+        assert!(s.set("ap".into(), b"a".to_vec(), None));
+        assert_eq!(s.append("ap", &[b'b'; 2048]), Some(2049));
+    }
+
+    /// F-19: `hset` never consulted the memory budget, so hashes grew past
+    /// `memory_limit` under every policy.
+    #[test]
+    fn hset_respects_the_memory_limit() {
+        let limit = 16 * 1024;
+        let s = Store::new(StoreConfig {
+            memory_limit: limit,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        let mut refused = false;
+        for i in 0..100 {
+            match s.hset("h", &format!("f{i}"), vec![b'x'; 1024]) {
+                Some(_) => {}
+                None => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "100 KiB of fields into a 16 KiB store must be refused");
+        assert!(s.mem_used() <= limit, "hash grew past the limit: {}", s.mem_used());
+
+        // Under an evicting policy the write makes room instead of refusing.
+        let s = Store::new(StoreConfig {
+            memory_limit: limit,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..40 {
+            assert!(s.set(format!("s{i}"), vec![b'x'; 300], None));
+        }
+        assert_eq!(s.hset("h", "f", vec![b'y'; 4096]), Some(true));
+        assert!(s.mem_used() <= limit);
+    }
+
+    /// F-19 audit: appending to a live key grew it in place with no budget
+    /// check, so repeated APPENDs could take the store far past its limit.
+    #[test]
+    fn append_growth_respects_the_memory_limit() {
+        let limit = 8 * 1024;
+        let s = Store::new(StoreConfig {
+            memory_limit: limit,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        assert!(s.set("log".into(), b"start".to_vec(), None));
+        let mut refused = false;
+        for _ in 0..100 {
+            if s.append("log", &[b'x'; 1024]).is_none() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "100 KiB of appends into an 8 KiB store must be refused");
+        assert!(s.mem_used() <= limit, "append grew past the limit: {}", s.mem_used());
+        let len = s.get("log").map(|v| v.len()).unwrap();
+        assert!(
+            len > 5 && (len - 5).is_multiple_of(1024),
+            "a refused append must leave the value intact"
+        );
+    }
+
+    /// A refused write under `noeviction` with only live data still refuses —
+    /// the reclaim must not turn into eviction.
+    #[test]
+    fn noeviction_reclaim_never_removes_live_keys() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 4 * 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        let mut n = 0;
+        while s.set(format!("live{n}"), vec![b'x'; 100], Some(Duration::from_secs(3_600))) {
+            n += 1;
+        }
+        assert!(n > 0);
+        assert!(!s.set("one-more".into(), vec![b'y'; 100], None));
+        assert_eq!(s.len(), n, "no live key may be removed to make room");
     }
 
     #[test]
@@ -3113,11 +3503,11 @@ mod tests {
         let s = test_store();
         let past = Instant::now() - Duration::from_secs(60);
         s.data.insert("k".into(), Entry::with_expiry(Bytes::from_static(b"v"), 1, false, past, 0));
-        s.ttl_keys.insert("k".into());
+        s.ttl_keys.insert("k".into(), past);
 
         assert_eq!(s.get("k"), None);
         assert!(!s.data.contains_key("k"), "expired entry should be reaped");
-        assert!(!s.ttl_keys.contains("k"), "TTL hint should be cleared");
+        assert!(!s.ttl_keys.contains_key("k"), "TTL hint should be cleared");
     }
 
     #[test]
@@ -3599,7 +3989,7 @@ mod tests {
         // entry AND pruned its `ttl_keys` hint on the way out.
         assert_eq!(s.get("sess").as_deref(), Some(&[b'a'; 64][..]));
         assert!(s.pttl("sess").is_some_and(|ms| ms > 0), "the TTL must survive a refused write");
-        assert!(s.ttl_keys.contains("sess"), "the TTL hint must survive a refused write");
+        assert!(s.ttl_keys.contains_key("sess"), "the TTL hint must survive a refused write");
     }
 
     #[test]
@@ -3740,15 +4130,15 @@ mod tests {
     #[test]
     fn hset_and_hget() {
         let s = test_store();
-        assert!(s.hset("myhash", "field1", b"value1".to_vec()));
+        assert_eq!(s.hset("myhash", "field1", b"value1".to_vec()), Some(true));
         assert_eq!(s.hget("myhash", "field1").as_deref(), Some(&b"value1"[..]));
     }
 
     #[test]
     fn hset_overwrite_returns_false() {
         let s = test_store();
-        assert!(s.hset("myhash", "f", b"v1".to_vec()));
-        assert!(!s.hset("myhash", "f", b"v2".to_vec()));
+        assert_eq!(s.hset("myhash", "f", b"v1".to_vec()), Some(true));
+        assert_eq!(s.hset("myhash", "f", b"v2".to_vec()), Some(false));
         assert_eq!(s.hget("myhash", "f").as_deref(), Some(&b"v2"[..]));
     }
 
@@ -4141,16 +4531,16 @@ mod tests {
         assert!(s.get("oldest").is_some(), "oldest should survive (was touched past granularity)");
     }
 
-    // ── TTL side index (expire_pass optimization) ───────────────────
+    // ── TTL side index and active expiry ──────────────────────────────
 
     #[test]
     fn ttl_keys_populated_on_set_with_ttl() {
         let s = test_store();
         s.set("volatile".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
-        assert!(s.ttl_keys.contains("volatile"), "TTL'd key must appear in the side index");
+        assert!(s.ttl_keys.contains_key("volatile"), "TTL'd key must appear in the side index");
         s.set("permanent".into(), b"v".to_vec(), None);
         assert!(
-            !s.ttl_keys.contains("permanent"),
+            !s.ttl_keys.contains_key("permanent"),
             "persistent key must NOT appear in the side index"
         );
     }
@@ -4159,27 +4549,27 @@ mod tests {
     fn ttl_keys_removed_on_persist() {
         let s = test_store();
         s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
-        assert!(s.ttl_keys.contains("k"));
+        assert!(s.ttl_keys.contains_key("k"));
         assert!(s.persist("k"), "persist must succeed for a TTL'd key");
-        assert!(!s.ttl_keys.contains("k"), "persist must drop the key from the TTL index");
+        assert!(!s.ttl_keys.contains_key("k"), "persist must drop the key from the TTL index");
     }
 
     #[test]
     fn ttl_keys_added_on_expire() {
         let s = test_store();
         s.set("k".into(), b"v".to_vec(), None);
-        assert!(!s.ttl_keys.contains("k"));
+        assert!(!s.ttl_keys.contains_key("k"));
         assert!(s.expire("k", Duration::from_secs(60)));
-        assert!(s.ttl_keys.contains("k"), "expire must add the key to the TTL index");
+        assert!(s.ttl_keys.contains_key("k"), "expire must add the key to the TTL index");
     }
 
     #[test]
     fn ttl_keys_removed_on_remove() {
         let s = test_store();
         s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
-        assert!(s.ttl_keys.contains("k"));
+        assert!(s.ttl_keys.contains_key("k"));
         s.remove("k");
-        assert!(!s.ttl_keys.contains("k"), "remove must drop the TTL index entry");
+        assert!(!s.ttl_keys.contains_key("k"), "remove must drop the TTL index entry");
     }
 
     #[test]
@@ -4193,78 +4583,70 @@ mod tests {
     }
 
     #[test]
-    fn expire_pass_prunes_stale_ttl_hints() {
-        // If a hint outlives its underlying entry (e.g. remove_local was
-        // racing with the pass) or the entry lost its TTL via persist,
-        // expire_pass must self-heal by dropping the stale hint. Plant
-        // both scenarios by hand and confirm the pass cleans up.
+    fn active_expire_prunes_stale_ttl_hints() {
+        // A hint can outlive its entry (a remove racing a re-write) or the
+        // entry's TTL (persist). Once the hint's deadline has passed, a sample
+        // drops it without touching any live entry.
         let s = test_store();
+        let past = Instant::now() - Duration::from_secs(60);
         // Case 1: hint points at a key that no longer exists.
-        s.ttl_keys.insert("ghost".into());
+        s.ttl_keys.insert("ghost".into(), past);
         // Case 2: hint points at a key whose TTL was cleared.
         s.set("persistent".into(), b"v".to_vec(), None);
-        s.ttl_keys.insert("persistent".into()); // stale hint
+        s.ttl_keys.insert("persistent".into(), past); // stale hint
         assert_eq!(s.ttl_keys.len(), 2);
 
-        let reaped = s.expire_pass(100);
-        assert_eq!(reaped, 0, "no live TTL'd keys → nothing to reap");
-        // Both stale hints must be pruned.
-        assert_eq!(s.ttl_keys.len(), 0, "expire_pass must self-heal stale hints");
+        s.active_expire_cycle(Duration::from_secs(1));
+        assert_eq!(s.ttl_keys.len(), 0, "active expiry must self-heal stale hints");
         // The persistent key must NOT be removed.
         assert!(s.exists("persistent"));
     }
 
     #[test]
-    fn expire_pass_bounds_total_work_under_stale_hints() {
-        // A large stale-hint population (mass persist() after mass expire()
-        // leaves the index full of hints whose entries no longer carry a TTL)
-        // must NOT make one pass O(ttl_keys.len()). With sample_size = 10 and
-        // 100 all-stale hints, a single pass visits at most 10 and prunes at
-        // most 10 — it does not drain all 100 in one shot (that would be the
-        // O(n) stall the index exists to avoid). Successive passes drain them.
+    fn active_expire_cycle_respects_its_time_budget() {
+        // An enormous backlog must not turn one cycle into an unbounded stall:
+        // the cycle stops at its budget and the rest waits for later cycles.
         let s = test_store();
-        for i in 0..100 {
-            s.ttl_keys.insert(format!("ghost{i}")); // dead hints: no backing entry
+        for i in 0..200_000 {
+            plant_expired(&s, &format!("t{i}"), b"v");
         }
-        assert_eq!(s.ttl_keys.len(), 100);
-
-        let reaped = s.expire_pass(10);
-        assert_eq!(reaped, 0, "no live TTL'd keys → nothing to reap");
-        assert!(
-            s.ttl_keys.len() >= 90,
-            "one pass must be bounded by sample_size, not prune all hints; left {}",
-            s.ttl_keys.len()
-        );
-
-        // Self-healing across passes: repeated bounded passes drain the index.
-        for _ in 0..20 {
-            s.expire_pass(10);
-        }
-        assert_eq!(s.ttl_keys.len(), 0, "successive passes must drain stale hints");
+        let start = Instant::now();
+        let reaped = s.active_expire_cycle(Duration::from_millis(1));
+        let elapsed = start.elapsed();
+        assert!(reaped < 200_000, "a 1 ms cycle drained a 200k backlog ({elapsed:?})");
+        assert!(elapsed < Duration::from_millis(500), "a 1 ms cycle took {elapsed:?}");
     }
 
     #[test]
-    fn expire_pass_only_visits_ttl_keys() {
-        // Regression on the O(all keys) → O(TTL keys) win: with 100
-        // persistent keys and 1 TTL'd expired key, the pass reaps the
-        // expired one without touching the persistents. This is a
-        // behavioural test — full complexity proof needs the bench harness.
+    fn active_expire_only_reaps_ttl_keys() {
+        // Persistent keys are not in the TTL index, so active expiry cannot
+        // touch them however many there are.
         let s = test_store();
         for i in 0..100 {
             s.set(format!("perm{i}"), b"v".to_vec(), None);
         }
-        // Plant one already-expired TTL'd entry via the public API — then
-        // hand-manipulate the entry's expires_at into the past.
-        s.set("expired".into(), b"v".to_vec(), Some(Duration::from_millis(1)));
-        // The 1ms TTL is a legitimate expiry; sleep past it.
-        std::thread::sleep(Duration::from_millis(20));
+        plant_expired(&s, "expired", b"v");
 
-        let reaped = s.expire_pass(100);
+        let reaped = s.active_expire_cycle(Duration::from_secs(1));
         assert_eq!(reaped, 1);
-        assert!(!s.exists("expired"));
+        assert!(!s.data.contains_key("expired"));
         for i in 0..100 {
-            assert!(s.exists(&format!("perm{i}")), "perm{i} must survive expire_pass");
+            assert!(s.exists(&format!("perm{i}")), "perm{i} must survive active expiry");
         }
+    }
+
+    #[test]
+    fn a_reap_keeps_the_hint_of_a_newer_write() {
+        // The reap of an old entry must not drop the TTL hint a re-write has
+        // just recorded for the same key, or the new value would never be
+        // actively expired.
+        let s = test_store();
+        let past = Instant::now() - Duration::from_secs(60);
+        assert!(s.set("k".into(), b"new".to_vec(), Some(Duration::from_secs(60))));
+        // A sample taken before the re-write still holds the old deadline.
+        assert!(!s.reap_if_expired("k", past));
+        assert!(s.ttl_keys.contains_key("k"), "the new write's hint must survive");
+        assert_eq!(s.get("k").as_deref(), Some(&b"new"[..]));
     }
 
     #[test]
@@ -4273,25 +4655,25 @@ mod tests {
         // dropped from the index. And back the other way.
         let s = test_store();
         s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
-        assert!(s.ttl_keys.contains("k"));
+        assert!(s.ttl_keys.contains_key("k"));
 
         // Overwrite without TTL — must clear the hint.
         s.set("k".into(), b"v2".to_vec(), None);
-        assert!(!s.ttl_keys.contains("k"), "overwrite w/o TTL must clear the hint");
+        assert!(!s.ttl_keys.contains_key("k"), "overwrite w/o TTL must clear the hint");
 
         // Overwrite with TTL — must re-add.
         s.set("k".into(), b"v3".to_vec(), Some(Duration::from_secs(30)));
-        assert!(s.ttl_keys.contains("k"), "overwrite w/ TTL must re-add the hint");
+        assert!(s.ttl_keys.contains_key("k"), "overwrite w/ TTL must re-add the hint");
     }
 
     #[test]
     fn set_nx_maintains_ttl_index() {
         let s = test_store();
         assert!(s.set_nx("k1".into(), b"v".to_vec(), Some(Duration::from_secs(60))));
-        assert!(s.ttl_keys.contains("k1"), "set_nx with TTL must add the hint");
+        assert!(s.ttl_keys.contains_key("k1"), "set_nx with TTL must add the hint");
 
         assert!(s.set_nx("k2".into(), b"v".to_vec(), None));
-        assert!(!s.ttl_keys.contains("k2"), "set_nx without TTL must not add the hint");
+        assert!(!s.ttl_keys.contains_key("k2"), "set_nx without TTL must not add the hint");
     }
 
     /// **Divergence regression.** Every op that mutates a string key must

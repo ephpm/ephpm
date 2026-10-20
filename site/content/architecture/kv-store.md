@@ -42,7 +42,9 @@ Hash entries are kept in a separate map from string entries. Unlike Redis, the t
 
 [DashMap](https://docs.rs/dashmap/) — lock-sharded concurrent hash map. Reads are wait-free for the common case; writes scale with the number of shards (default = `4 * num_cpus`). For ePHPm's workloads (cache + counters + sessions) this comfortably outpaces a hand-rolled `Mutex<HashMap>` and avoids the latency tail of a global lock.
 
-Entries carry an optional expiry timestamp. A background reaper sweeps expired entries; reads also opportunistically delete expired entries on access (so even without the reaper, you never see stale data via a Get).
+Entries carry an optional expiry timestamp. Reads check it, so an expired key is never returned, and delete the expired entry they find. Keys that are never read again are reclaimed by **active expiry**: a dedicated `ephpm-kv-expiry` thread, started with the store whether or not the RESP listener is enabled, covering the default store and every per-site store. Ten times a second it examines TTL'd keys 20 at a time from a cursor that carries over between runs (so every TTL'd key is reached within one sweep), reaps the expired ones, and keeps going while more than 10% of a batch was expired, within a 25 ms budget shared by all stores. A store full of long-TTL keys therefore costs one small batch per run, and a burst of expiring keys is reclaimed as fast as the budget allows. Some expired keys can wait until the next sweep reaches them; they are never readable and never block a write:
+
+Expired keys still count toward `memory_limit` until they are reclaimed, so a write that would exceed the limit first reclaims expired keys, and only then evicts or refuses.
 
 ## Compression
 
@@ -69,7 +71,7 @@ eviction_policy = "allkeys-lru"   # noeviction / allkeys-lru / volatile-lru / al
 
 When memory exceeds the limit, the eviction policy picks victims:
 
-- **noeviction** — refuse new writes with an error
+- **noeviction** — refuse new writes with an error (`-OOM` over RESP). Every write that grows the store is checked: `SET`/`SETEX`/`MSET`/`GETSET`/`SETNX`, `INCR` creating a key, `APPEND`, and `HSET`.
 - **allkeys-lru** — least recently used across all keys
 - **volatile-lru** — least recently used among keys with a TTL only
 - **allkeys-random** — uniformly random victim

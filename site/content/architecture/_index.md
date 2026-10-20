@@ -435,20 +435,7 @@ impl KvStore {
 }
 ```
 
-A background Tokio task runs periodically to sweep expired keys (active expiry), so memory doesn't leak from keys that are set-and-forgotten:
-
-```rust
-async fn expiry_sweeper(store: Arc<KvStore>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        let now = Instant::now();
-        store.data.retain(|_, entry| {
-            entry.expires_at.map_or(true, |exp| now < exp)
-        });
-    }
-}
-```
+Expired keys are also reclaimed actively, so memory doesn't leak from keys that are set-and-forgotten. A dedicated `ephpm-kv-expiry` thread, started with the store whether or not the RESP listener is enabled, covers the default store and every per-site store: ten times a second it examines TTL'd keys 20 at a time from a cursor that carries over between runs, reaps the expired ones, and keeps going while more than 10% of a batch was expired, within a 25 ms budget shared by all stores. A write that would exceed `memory_limit` first reclaims expired keys. See [`crates/ephpm-kv/src/expiry.rs`](https://github.com/ephpm/ephpm/tree/main/crates/ephpm-kv/src/expiry.rs).
 
 ### Architecture: Clustering
 
