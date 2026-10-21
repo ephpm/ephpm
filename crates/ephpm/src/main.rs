@@ -204,11 +204,12 @@ enum Commands {
     /// `update`, `require`, `remove`, `dump-autoload`). It is not full
     /// Composer: no other command exists, scripts are not run unless you pass
     /// `--run-scripts`, and locks it cannot install natively are handed to a
-    /// real `composer` on `PATH` (exit 3 without one). `install` and
-    /// `dump-autoload` need no PHP, so they work in every build, including
-    /// stub mode, and on Windows. `update`, `require` and `remove` run a `php`
-    /// to probe platform requirements: `VIVACITY_PHP` if set, otherwise in a
-    /// PHP-linked build this `ephpm` binary itself (so no system PHP is
+    /// real `composer` on `PATH` (exit 3 without one). `install` from a
+    /// `composer.lock` and `dump-autoload` need no PHP, so they work in every
+    /// build, including stub mode, and on Windows. `update`, `require` and
+    /// `remove` (and `install` without a lock, which runs an update) run a
+    /// `php` to probe platform requirements: `VIVACITY_PHP` if set, otherwise
+    /// in a PHP-linked build this `ephpm` binary itself (so no system PHP is
     /// needed), in a stub build `php` on `PATH`. `-vv`/`-vvv`, and `-v` on a
     /// project with an active plugin, hand the whole command to a real
     /// `composer` (exit 3 without one). The process exits with vivacity's exit
