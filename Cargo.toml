@@ -551,7 +551,9 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "4c84c80347707
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
 # so the two resolve to a single crate instance and TursoConnection
-# (re-exported by litewire) is the same turso::Connection.
+# (re-exported by litewire) is the same turso::Connection. The 0.8.3 crates
+# themselves are replaced by a fork carrying the page-1 allocation race fix —
+# see the turso entries in [patch.crates-io] at the end of this file.
 #
 # 0.8.x adds a per-connection operation gate to the Rust binding:
 # `Connection::execute_batch` needs the connection exclusively and fails with
@@ -685,3 +687,25 @@ used_underscore_binding = "allow"
 # libz-sys so it cannot return unnoticed.
 [patch.crates-io]
 opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "25b7ac8ac222955336de6fce1e44a00e556920ec" }
+# CORRECTNESS: Turso 0.8.3's page-1 allocation race. When several connections
+# make the first write to a fresh database file at once (a new per-site
+# database under concurrent traffic), two pagers could both allocate page 1;
+# the engine then panics (caught per statement by `catch_engine_panic`, but the
+# write fails). Fixed upstream by tursodatabase/turso#10117, not yet released.
+# The fork branch `fix/page1-allocation-race-0.8.3` is the v0.8.3 tag plus
+# exactly two commits (the regression tests and the backported fix, which holds
+# `init_lock` across the whole page-1 write and re-checks under it); crate
+# versions stay 0.8.3 so this patch replaces the published crates in place and
+# the `turso = "=0.8.3"` requirements (here and in litewire) still resolve.
+# Every turso crate the lockfile pulls from crates.io is patched so no
+# crates.io 0.8.3 copy remains beside the fork. Remove this block (and the
+# deny.toml allow-git entry) once a Turso release carrying #10117 is pinned.
+turso = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_core = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_ext = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_macros = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_parser = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sdk_kit = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sdk_kit_macros = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sync_engine = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sync_sdk_kit = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }

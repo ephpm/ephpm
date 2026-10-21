@@ -84,7 +84,9 @@ black-box sidecar ever was.
 > **Status: SHIPPED, 2026-07; became the default and only engine in
 > v0.7.0.** litewire has a `litewire-turso` backend (engine pinned
 > `turso =0.7.2` as of v0.7.1, `turso =0.8.2` in v0.12.0 (ephpm#535),
-> `turso =0.8.3` from the release after v0.12.0 (litewire#47)) and ePHPm
+> `turso =0.8.3` from the release after v0.12.0 (litewire#47) — built from a
+> fork of the v0.8.3 tag carrying the page-1 allocation race fix
+> (tursodatabase/turso#10117) via ePHPm's `[patch.crates-io]`) and ePHPm
 > builds it as the sole embedded engine.
 > Gate 2–4 evidence lives in `docs/turso-phase1-results.md`; Phase 2
 > design notes in `docs/turso-phase2-cdc-design.md`.
