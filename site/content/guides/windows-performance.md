@@ -76,8 +76,8 @@ kind is fixed when PHP is compiled — there is no `opcache.vm_kind` or
 ([how the TAILCALL VM works, §2.5](/analysis/php-on-windows/#2-the-interpreter-half-msvc-gets-a-slower-virtual-machine)).
 
 - It ships as a separate, suffixed download:
-  `ephpm-vX.Y.Z+php8.5.11-windows-x86_64-tailcall.tar.gz` alongside the
-  regular `ephpm-vX.Y.Z+php8.5.11-windows-x86_64.tar.gz`.
+  `ephpm-vX.Y.Z+php8.5.12-windows-x86_64-tailcall.tar.gz` alongside the
+  regular `ephpm-vX.Y.Z+php8.5.12-windows-x86_64.tar.gz`.
 - Release builds from source select it with `cargo xtask release --target
   windows --variant clang` (pending the #329 integration; on a released
   v0.7.3 the prebuilt artifact is the supported route).

@@ -31,9 +31,9 @@
 # version via xtask::PHP_SDK_VERSIONS and passes it as PHP_SDK_VERSION.
 
 # Pinned full version of the PHP SDK to download. Must match a release tag
-# at github.com/ephpm/php-sdk/releases (e.g., v8.5.11). The default mirrors
+# at github.com/ephpm/php-sdk/releases (e.g., v8.5.12). The default mirrors
 # xtask::PHP_SDK_VERSIONS — keep them in sync if you bump.
-ARG PHP_SDK_VERSION=8.5.11
+ARG PHP_SDK_VERSION=8.5.12
 
 # ── Base image digest pins ───────────────────────────────────────────────────
 #

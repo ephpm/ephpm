@@ -20,7 +20,7 @@
 //! ```sh
 //! # 1. fetch + extract the catalog for the image's PHP minor + arch
 //! curl -fsSL -o ext.tgz \
-//!   https://github.com/ephpm/php-sdk/releases/download/ext-8.5.11/ephpm-ext-8.5.11-linux-x86_64-gnu.tar.gz
+//!   https://github.com/ephpm/php-sdk/releases/download/ext-8.5.12/ephpm-ext-8.5.12-linux-x86_64-gnu.tar.gz
 //! mkdir ext && tar xzf ext.tgz -C ext
 //!
 //! # 2. serve a docroot containing tests/fixtures/ext-probe.php with a config:

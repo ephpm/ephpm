@@ -120,7 +120,7 @@ API (60 requests/hour); a rate-limited response is reported as such.
 > **Catalog status:** the Linux (x86_64, aarch64) and macOS arm64 catalogs
 > ship Xdebug 3.5.3 for PHP 8.3, 8.4 and 8.5 — in the current patch
 > releases and in the ones the current binaries are built against
-> (`ext-8.3.33`, `ext-8.4.23`, `ext-8.5.7`) — and 3.6.0alpha1 for the 8.6
+> (`ext-8.3.36`, `ext-8.4.27`, `ext-8.5.12`) — and 3.6.0alpha1 for the 8.6
 > beta on Linux. Where no release for your PHP minor has a tarball for your
 > platform, `--xdebug` stops with "the ePHPm extension catalog does not
 > publish <platform> builds for PHP 8.x yet" — use `--xdebug-path` with your
