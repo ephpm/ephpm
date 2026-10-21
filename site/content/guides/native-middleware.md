@@ -651,13 +651,12 @@ roughly cluster-wide under light cross-node concurrency, and as up to
 N × the allowance in the worst case for a client spread across N nodes. It
 is not a strict cluster-wide quota.
 
-At startup ePHPm logs a `WARN` when a mount named exactly `ratelimit` is
-loaded with `[cluster].enabled = true`. Two caveats about that line, both
-code-side: it does not fire for the other accepted spellings (`rate-limit`,
-`ephpm-middleware-ratelimit`, …), and its text — "KV INCR is not yet
-replicated … rate limits are enforced PER NODE" — predates the replication
-described above. The [ratelimit reference](/reference/middleware/ratelimit/)
-is the page that warning points operators to.
+At startup ePHPm logs a `WARN` when the module is mounted with
+`[cluster].enabled = true`, whichever spelling the mount uses (`ratelimit`,
+`rate-limit`, `rate_limit`, the `ephpm-middleware-ratelimit` /
+`ephpm_middleware_ratelimit` crate names, or a path to its cdylib). It says
+the limit is approximate and points to the
+[ratelimit reference](/reference/middleware/ratelimit/#in-a-cluster).
 
 **Fail-open by design:** if the KV store is unavailable, requests are
 allowed through with a warning log — a rate limiter that hard-fails would

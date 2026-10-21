@@ -140,7 +140,7 @@ int ephpm_execute_script(const char *filename) {
 Two layers bound how long a request can run:
 
 - **`max_execution_time` (PHP-level, catchable).** On Linux ZTS builds with per-thread execution timers (`--enable-zend-max-execution-timers`, the shipped default), PHP arms a **per-thread POSIX timer** (`timer_create` + `SIGRTMIN` via `SIGEV_THREAD_ID`, on a wall-clock `CLOCK_BOOTTIME`) delivered only to the owning PHP thread — safe under the dedicated execution pool. Exceeding it raises the catchable "Maximum execution time exceeded" fatal (500, shutdown functions run, output flushed), and `set_time_limit()` re-arms it at runtime. On builds without per-thread timers (macOS, and Windows — ZTS but built without `ZEND_MAX_EXECUTION_TIMERS`), the inner timer cannot be armed safely, so `max_execution_time` is not enforced there (on Linux the unsafe process-wide `SIGPROF`/`setitimer` fallback is additionally neutralized via `--wrap`).
-- **`[server.timeouts] request` (HTTP-level, hard backstop).** `tokio::time::timeout` wraps the pooled PHP execution and surfaces a timeout as HTTP 504 — the ceiling for a script wedged where the inner timer cannot interrupt it (a C extension or syscall that never returns to the VM). Keep `max_execution_time` below this value so the inner, graceful limit fires first.
+- **`[server.timeouts] request` (HTTP-level, hard backstop).** The wait for the pooled PHP execution ends at the request's deadline and surfaces as HTTP 504 — the ceiling for a script wedged where the inner timer cannot interrupt it (a C extension or syscall that never returns to the VM). The wedged thread is abandoned and replaced, not killed. Keep `max_execution_time` below this value so the inner, graceful limit fires first.
 
 ### Process state
 

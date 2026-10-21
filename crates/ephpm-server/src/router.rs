@@ -2505,7 +2505,10 @@ impl Router {
             }
         }
 
-        gauge!("ephpm_http_requests_in_flight").increment(1.0);
+        // Held across every await below and released by Drop, so the gauge
+        // also comes back down when hyper drops this future mid-request
+        // (client disconnect) — a bare increment/decrement pair leaked there.
+        let in_flight = crate::metrics::GaugeGuard::enter("ephpm_http_requests_in_flight");
         let start = std::time::Instant::now();
 
         // Timeline capture (dev mode / [server.diagnostics] request_log):
@@ -2600,15 +2603,30 @@ impl Router {
         // handler directly rather than paying to arm and disarm a tokio
         // timer on every request (issue #135) - the timer registration is
         // ~0.02ms of pure overhead when the deadline never fires.
-        let inner = tracing::Instrument::instrument(
-            self.handle_inner(req, remote_addr, is_tls),
-            span.clone(),
+        //
+        // Otherwise the request gets ONE absolute deadline, published to the
+        // PHP dispatch paths through `php_wait::REQUEST_DEADLINE`. They wait
+        // on PHP until exactly this instant and answer the 504 themselves —
+        // which is where a wedged thread is noted hung and replaced. This
+        // outer guard fires `OUTER_GRACE` later, so it only ever catches a
+        // request stuck somewhere else (routing, middleware, a starved
+        // dispatch queue). See `php_wait` for why the two must not race.
+        let deadline = (!self.request_timeout.is_zero())
+            .then(|| tokio::time::Instant::now() + self.request_timeout);
+        let inner = crate::php_wait::REQUEST_DEADLINE.scope(
+            deadline,
+            tracing::Instrument::instrument(
+                self.handle_inner(req, remote_addr, is_tls),
+                span.clone(),
+            ),
         );
-        let (result, handler) = if self.request_timeout.is_zero() {
-            let result = inner.await;
-            let handler = result.as_ref().map_or("error", |(_, h)| *h);
-            (result.map(|(resp, _)| resp), handler)
-        } else if let Ok(result) = tokio::time::timeout(self.request_timeout, inner).await {
+        let outcome = match deadline {
+            None => Ok(inner.await),
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline + crate::php_wait::OUTER_GRACE, inner).await
+            }
+        };
+        let (result, handler) = if let Ok(result) = outcome {
             let handler = result.as_ref().map_or("error", |(_, h)| *h);
             (result.map(|(resp, _)| resp), handler)
         } else {
@@ -2617,7 +2635,7 @@ impl Router {
         };
 
         let elapsed = start.elapsed().as_secs_f64();
-        gauge!("ephpm_http_requests_in_flight").decrement(1.0);
+        drop(in_flight);
 
         // Advertise HTTP/3 on every TLS response, including error and timeout
         // paths — a client that only ever sees 404s should still discover h3.
@@ -3067,12 +3085,29 @@ impl Router {
             return Ok((resp, "websocket"));
         }
 
-        // Extract If-None-Match for ETag support before consuming the request.
-        let if_none_match = if self.etag {
+        // Extract If-None-Match before consuming the request. It feeds two
+        // independent features, each behind its own switch: static-file 304s
+        // (`[server.static] etag`, applied in `serve_file`) and the PHP ETag
+        // cache (`[server.php_etag_cache] enabled`). It used to be read only
+        // when the static switch was on, so `etag = false` silently disabled
+        // the PHP cache's 304s too. Only GET/HEAD are evaluated: RFC 9110
+        // answers a failed If-None-Match on any other method with 412, never
+        // 304, and the PHP application is the one to decide that.
+        let if_none_match = if method_ref == hyper::Method::GET || method_ref == hyper::Method::HEAD
+        {
             req.headers().get("if-none-match").and_then(|v| v.to_str().ok()).map(String::from)
         } else {
             None
         };
+        // The cache answers its 304 ahead of `handle_php`, i.e. before the
+        // request phase (preview gate, `[[middleware]]` chain) runs. It must
+        // never answer where a gate would decide, so it is off for a site
+        // with a preview gate and whenever a middleware chain is mounted:
+        // request-phase middleware fails closed on both paths.
+        let php_etag_cacheable = self.php_etag_cache_config.enabled
+            && (method_ref == hyper::Method::GET || method_ref == hyper::Method::HEAD)
+            && site_roots.preview_gate.is_none()
+            && self.middleware_chain.is_none();
 
         let (mut response, handler) = match self.resolve_fallback(
             &uri_path,
@@ -3086,32 +3121,17 @@ impl Router {
                     if self.is_php_allowed(&uri_path)
                         && self.php_script_contained(&fs_path, &site_roots)
                     {
-                        let is_cacheable = (method_ref == hyper::Method::GET
-                            || method_ref == hyper::Method::HEAD)
-                            && self.php_etag_cache_config.enabled;
-
                         // Pre-check: bypass PHP if client's ETag matches stored value.
-                        if is_cacheable && let Some(client_tag) = &if_none_match {
-                            let key = php_etag_cache_key(
-                                &self.php_etag_cache_config.key_prefix,
+                        if php_etag_cacheable
+                            && let Some(not_modified) = self.php_etag_cache_hit(
                                 site_key.as_deref(),
                                 method,
                                 &uri_path,
                                 &query_string,
-                            );
-                            if let Some(stored) = self.store.get(&key) {
-                                let stored_etag = String::from_utf8_lossy(&stored);
-                                if etag_matches_value(&stored_etag, client_tag) {
-                                    return Ok((
-                                        Response::builder()
-                                            .status(StatusCode::NOT_MODIFIED)
-                                            .header("etag", stored_etag.as_ref())
-                                            .body(body::buffered(Full::new(Bytes::new())))
-                                            .expect("304 builder"),
-                                        "php",
-                                    ));
-                                }
-                            }
+                                if_none_match.as_deref(),
+                            )
+                        {
+                            return Ok((not_modified, "php"));
                         }
 
                         // Execute PHP
@@ -3129,27 +3149,15 @@ impl Router {
                             )
                             .await;
 
-                        // Post-store: cache any ETag PHP set in the response.
-                        if is_cacheable
-                            && let Some(etag_val) =
-                                resp.headers().get("etag").and_then(|v| v.to_str().ok())
-                        {
-                            let key = php_etag_cache_key(
-                                &self.php_etag_cache_config.key_prefix,
+                        // Post-store: record (or forget) the ETag PHP sent.
+                        if php_etag_cacheable {
+                            self.php_etag_cache_update(
                                 site_key.as_deref(),
                                 method,
                                 &uri_path,
                                 &query_string,
+                                &resp,
                             );
-                            #[allow(clippy::cast_sign_loss)]
-                            let ttl = if self.php_etag_cache_config.ttl_secs > 0 {
-                                Some(Duration::from_secs(
-                                    self.php_etag_cache_config.ttl_secs as u64,
-                                ))
-                            } else {
-                                None
-                            };
-                            self.store.set(key, etag_val.as_bytes().to_vec(), ttl);
                         }
 
                         (resp, "php")
@@ -3209,8 +3217,22 @@ impl Router {
                     // script is the entrypoint); use the conventional front
                     // controller path so $_SERVER looks familiar to frameworks.
                     let script = site_root.join("index.php");
-                    (
-                        self.handle_php(
+                    // The PHP ETag cache applies to front-controller routes
+                    // exactly as to a request for an existing `.php` file —
+                    // in worker mode most dynamic pages arrive here.
+                    if php_etag_cacheable
+                        && let Some(not_modified) = self.php_etag_cache_hit(
+                            site_key.as_deref(),
+                            method,
+                            &uri_path,
+                            &query_string,
+                            if_none_match.as_deref(),
+                        )
+                    {
+                        return Ok((not_modified, "php"));
+                    }
+                    let resp = self
+                        .handle_php(
                             req,
                             effective_addr,
                             is_https,
@@ -3221,9 +3243,17 @@ impl Router {
                             site_key.clone(),
                             None,
                         )
-                        .await,
-                        "php",
-                    )
+                        .await;
+                    if php_etag_cacheable {
+                        self.php_etag_cache_update(
+                            site_key.as_deref(),
+                            method,
+                            &uri_path,
+                            &query_string,
+                            &resp,
+                        );
+                    }
+                    (resp, "php")
                 } else {
                     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
                     (
@@ -4342,14 +4372,19 @@ impl Router {
         // to, after an optional `shed_after` grace, so overload becomes a fast
         // 503 instead of a client timeout (issue #301). Both share every
         // downstream arm — only admission differs.
+        //
+        // `started` is raised by the pool thread when it begins the job, so a
+        // request that times out while still queued is not mistaken for a
+        // hung thread (see `php_wait`).
+        let started = crate::php_wait::StartFlag::default();
+        let task = crate::php_wait::track_start(Box::new(run_php), &started);
         let recv = match self.overload_policy {
             ephpm_config::OverloadPolicy::Wait => {
-                pool.dispatch(Box::new(run_php)).await.map_err(ShedReason::from)
+                pool.dispatch(task).await.map_err(ShedReason::from)
             }
-            ephpm_config::OverloadPolicy::Shed => pool
-                .try_dispatch(Box::new(run_php), self.shed_after)
-                .await
-                .map_err(ShedReason::from),
+            ephpm_config::OverloadPolicy::Shed => {
+                pool.try_dispatch(task, self.shed_after).await.map_err(ShedReason::from)
+            }
         };
         let queue_wait = php_start.elapsed();
         let rx = match recv {
@@ -4368,25 +4403,26 @@ impl Router {
                 return resp;
             }
         };
-        // Bound the wait so a wedged thread becomes a 504 AND signals the
-        // pool to replace it. A `request` timeout of 0 disables the deadline
-        // (issue #135). `rx` awaited bare yields `Result<_, RecvError>`;
-        // wrap it as `Ok(_)` to match the `timeout` arm's shape.
-        let awaited = if self.request_timeout.is_zero() {
-            Ok(rx.await)
-        } else {
-            tokio::time::timeout(self.request_timeout, rx).await
-        };
+        // Bound the wait by the request deadline (the same instant the outer
+        // guard in `handle` derives its own from, minus its grace), so a
+        // wedged thread becomes a 504 here AND — if it had started the job —
+        // is noted hung and replaced. A `request` timeout of 0 disables the
+        // deadline (issue #135).
+        let deadline = crate::php_wait::current_deadline(self.request_timeout);
+        let awaited = crate::php_wait::PendingReply::new(rx, started, deadline, Arc::clone(&pool))
+            .wait()
+            .await;
         let result: Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError> = match awaited {
-            Ok(Ok(exec_output)) => exec_output,
+            crate::php_wait::ReplyOutcome::Reply(Ok(exec_output)) => exec_output,
             // Thread dropped its sender (retired without replying) — 500,
             // via the same `build_php_response` error arm as a bailout.
-            Ok(Err(_)) => {
+            crate::php_wait::ReplyOutcome::Reply(Err(_)) => {
                 Err(ephpm_php::PhpError::ExecutionFailed("fpm pool thread dropped response".into()))
             }
-            // No reply within the request timeout — replace the thread, 504.
-            Err(_) => {
-                pool.note_hung();
+            // No reply by the deadline — 504. The thread was already noted
+            // hung (and replaced) if it had started the job.
+            crate::php_wait::ReplyOutcome::TimedOut { hung } => {
+                tracing::debug!(hung, "per-request PHP reply missed the request deadline");
                 counter!("ephpm_http_timeouts_total", "stage" => "fpm_pool").increment(1);
                 drop(php_span);
                 let mut resp = apply_response_headers(
@@ -4543,7 +4579,10 @@ impl Router {
         let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let queue_wait_start = php_start;
-        let recv = target.dispatch(owned).await;
+        // Raised by the worker when it pulls the job: a request that times
+        // out while still queued is overload, not a hung worker.
+        let started = crate::php_wait::StartFlag::default();
+        let recv = target.dispatch_tracked(owned, &started).await;
         let queue_wait = queue_wait_start.elapsed();
         drop(queue_span);
         #[allow(clippy::cast_precision_loss)]
@@ -4557,7 +4596,7 @@ impl Router {
 
         // Dispatch channel closed (pool draining / all workers gone; debug
         // lane draining or full of abandoned sessions) — 503.
-        let Ok(mut dispatched) = recv else {
+        let Ok(dispatched) = recv else {
             return with_php_timings(
                 error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
                 queued_only,
@@ -4565,41 +4604,48 @@ impl Router {
         };
 
         // Held for the await below and released by Drop, so the gauge also
-        // comes back down when the OUTER request timeout (or a client
-        // disconnect) drops this future mid-await — which the debug lane
-        // makes routine, since its slot wait runs before this inner timer.
-        let busy = BusyGauge::enter();
-        // Bound the wait so a wedged worker becomes a 504 AND signals the pool
-        // to replace it (design §5.4). This inner timeout fires at or before
-        // the outer request timeout.
+        // comes back down when this future is dropped mid-await (client
+        // disconnect, or the outer request guard) — which the debug lane
+        // makes routine, since its slot wait runs before the reply wait.
+        let busy = crate::metrics::GaugeGuard::enter("ephpm_worker_busy");
+        // Bound the wait by the request deadline so a wedged worker becomes a
+        // 504 AND — if it had pulled the job — signals the pool to replace it
+        // (design §5.4). The outer guard in `handle` fires only after this
+        // deadline, so this arm is the one that answers.
         //
         // NOTE: for a streaming response this awaits only the HEADERS (the
         // `send_response_stream` -> response_begin delivers status+headers
         // immediately, before the body is produced), so a long streamed
         // download is NOT cut off by this timeout — the body flows afterward.
         //
-        // A `request` timeout of 0 disables the deadline (issue #135): await
-        // the receiver directly so no inner timer is armed. `rx` awaited bare
-        // yields `Result<_, RecvError>`; wrap it as `Ok(_)` to match the
-        // `timeout` arm's `Result<Result<_, _>, Elapsed>` shape.
+        // A `request` timeout of 0 disables the deadline (issue #135).
         //
-        // `dispatched` lives until this function returns: on the debug lane
-        // it holds the request's debug slot, released when it drops —
-        // answered, timed out, or (handler future dropped) abandoned.
-        let awaited = if self.request_timeout.is_zero() {
-            Ok((&mut dispatched.rx).await)
-        } else {
-            tokio::time::timeout(self.request_timeout, &mut dispatched.rx).await
+        // `slot` lives until this function returns: on the debug lane it
+        // holds the request's debug slot, released when it drops — answered,
+        // timed out, or (handler future dropped) abandoned.
+        let deadline = crate::php_wait::current_deadline(self.request_timeout);
+        let (rx, mut slot) = dispatched.into_parts();
+        let awaited = match target {
+            crate::debug_lane::WorkerTarget::Pool(pool) => {
+                crate::php_wait::PendingReply::new(rx, started, deadline, Arc::clone(pool))
+                    .wait()
+                    .await
+            }
+            crate::debug_lane::WorkerTarget::Debug(lane) => {
+                crate::php_wait::PendingReply::new(rx, started, deadline, Arc::clone(lane))
+                    .wait()
+                    .await
+            }
         };
-        if awaited.is_ok() {
-            dispatched.mark_answered();
+        if matches!(awaited, crate::php_wait::ReplyOutcome::Reply(_)) {
+            slot.mark_answered();
         }
         drop(busy);
 
         let worker_resp = match awaited {
-            Ok(Ok(resp)) => resp,
+            crate::php_wait::ReplyOutcome::Reply(Ok(resp)) => resp,
             // Sender dropped (worker unwound with no stashed sender) — 500.
-            Ok(Err(_)) => {
+            crate::php_wait::ReplyOutcome::Reply(Err(_)) => {
                 counter!("ephpm_php_executions_total", "status" => "error").increment(1);
                 return with_php_timings(
                     build_php_response(
@@ -4613,9 +4659,11 @@ impl Router {
                     queued_only,
                 );
             }
-            // Worker never responded in time — replace it, return 504.
-            Err(_) => {
-                target.note_hung();
+            // No reply by the deadline — 504. A pool worker that had pulled
+            // the job was already noted hung (and replaced); a debug-lane
+            // thread is only logged (it was never part of the serving set).
+            crate::php_wait::ReplyOutcome::TimedOut { hung } => {
+                tracing::debug!(hung, "worker reply missed the request deadline");
                 counter!("ephpm_http_timeouts_total", "stage" => "worker").increment(1);
                 return with_php_timings(
                     error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),
@@ -5175,6 +5223,82 @@ impl Router {
                 json_escape(&what)
             ),
         ))
+    }
+
+    /// PHP ETag cache, read side: answer a conditional GET/HEAD with `304`
+    /// from the stored tag, without running PHP. `None` = run PHP.
+    ///
+    /// The caller has already checked the cache is enabled and the method is
+    /// GET/HEAD. Matching is RFC 9110 weak comparison, the same rule the
+    /// static-file path applies.
+    fn php_etag_cache_hit(
+        &self,
+        site_key: Option<&str>,
+        method: &str,
+        path: &str,
+        query: &str,
+        if_none_match: Option<&str>,
+    ) -> Option<Response<ServerBody>> {
+        let client_tags = if_none_match?;
+        let key = php_etag_cache_key(
+            &self.php_etag_cache_config.key_prefix,
+            site_key,
+            method,
+            path,
+            query,
+        );
+        let stored = self.store.get(&key)?;
+        let stored_etag = String::from_utf8_lossy(&stored);
+        if !etag_matches_value(&stored_etag, client_tags) {
+            return None;
+        }
+        Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("etag", stored_etag.as_ref())
+                .body(body::buffered(Full::new(Bytes::new())))
+                .expect("304 builder"),
+        )
+    }
+
+    /// PHP ETag cache, write side: remember the tag of a fresh PHP response,
+    /// or forget a stale one.
+    ///
+    /// Only a `200` that carries an `ETag` and is safe to revalidate on the
+    /// client's word alone is stored — not one with `Set-Cookie` (per-visitor
+    /// state the 304 would skip re-issuing) or `Cache-Control: no-store` /
+    /// `private` (the application said not to cache it). Any other response
+    /// to the same URL drops the stored tag: otherwise a page that stopped
+    /// sending an `ETag`, or started answering differently, would keep being
+    /// served `304`s from the old tag until the TTL ran out.
+    fn php_etag_cache_update(
+        &self,
+        site_key: Option<&str>,
+        method: &str,
+        path: &str,
+        query: &str,
+        resp: &Response<ServerBody>,
+    ) {
+        let key = php_etag_cache_key(
+            &self.php_etag_cache_config.key_prefix,
+            site_key,
+            method,
+            path,
+            query,
+        );
+        let Some(etag) = php_etag_storable(resp) else {
+            // A 304 from PHP itself confirms the client's copy without
+            // saying anything new about the tag; leave the entry alone.
+            if resp.status() != StatusCode::NOT_MODIFIED {
+                self.store.remove(&key);
+            }
+            return;
+        };
+        let ttl = u64::try_from(self.php_etag_cache_config.ttl_secs)
+            .ok()
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs);
+        self.store.set(key, etag.as_bytes().to_vec(), ttl);
     }
 
     /// Apply custom response headers from config.
@@ -6113,23 +6237,6 @@ fn json_response(status: StatusCode, body: &'static str) -> Response<ServerBody>
         .expect("static json response")
 }
 
-/// `ephpm_worker_busy` +1 for as long as it lives. Drop-based so the gauge
-/// is restored on every exit, including a future cancelled mid-await.
-struct BusyGauge;
-
-impl BusyGauge {
-    fn enter() -> Self {
-        gauge!("ephpm_worker_busy").increment(1.0);
-        Self
-    }
-}
-
-impl Drop for BusyGauge {
-    fn drop(&mut self) {
-        gauge!("ephpm_worker_busy").decrement(1.0);
-    }
-}
-
 /// Stash PHP-path timings in the response extensions so `Router::handle`
 /// can hand the already-taken measurements to the request timeline without
 /// re-measuring anything.
@@ -7029,16 +7136,35 @@ fn php_etag_cache_key(
 
 /// Check if a stored `ETag` value matches the client's `If-None-Match` header.
 ///
-/// Implements RFC 7232 semantics:
-/// - Handles `*` (matches any `ETag`)
-/// - Handles comma-separated lists of `ETag`s
-/// - Trims whitespace correctly
+/// The same RFC 9110 rule the static-file path applies — see
+/// [`static_files::if_none_match_matches`].
 fn etag_matches_value(etag: &str, if_none_match: &str) -> bool {
-    let trimmed = if_none_match.trim();
-    if trimmed == "*" {
-        return true;
+    static_files::if_none_match_matches(etag, if_none_match)
+}
+
+/// The `ETag` of a PHP response the PHP ETag cache may store, if any: a
+/// `200` with an `ETag`, no `Set-Cookie`, and no `Cache-Control: no-store` /
+/// `private`. See `Router::php_etag_cache_update`.
+fn php_etag_storable(resp: &Response<ServerBody>) -> Option<&str> {
+    if resp.status() != StatusCode::OK {
+        return None;
     }
-    trimmed.split(',').any(|tag| tag.trim() == etag)
+    let headers = resp.headers();
+    if headers.contains_key(hyper::header::SET_COOKIE) {
+        return None;
+    }
+    let forbids_storing = headers.get_all(hyper::header::CACHE_CONTROL).iter().any(|value| {
+        value.to_str().map_or(true, |v| {
+            v.split(',').any(|directive| {
+                let name = directive.split('=').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("private")
+            })
+        })
+    });
+    if forbids_storing {
+        return None;
+    }
+    headers.get(hyper::header::ETAG)?.to_str().ok().filter(|tag| !tag.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -8502,6 +8628,169 @@ mod tests {
         }
     }
 
+    // ── Request deadline vs. PHP reply wait; in-flight gauges ───────────
+
+    /// A worker-mode router with no worker threads: dispatched jobs sit in
+    /// the queue until a test pulls them (`pull_job_for_test`).
+    fn worker_mode_router(
+        dir: &Path,
+        timeout_secs: u64,
+    ) -> (Router, Arc<crate::worker_pool::WorkerPool>) {
+        std::fs::write(dir.join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = timeout_secs;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.join("worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
+        );
+        let router =
+            Router::new(&config, test_store(), None, None, None, None, Some(Arc::clone(&pool)));
+        (router, pool)
+    }
+
+    fn php_get() -> Request<Empty<Bytes>> {
+        Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap()
+    }
+
+    /// B5: the PHP reply wait and the outer request timeout used the same
+    /// duration with the inner timer starting later, so the outer always won
+    /// and `stage="worker"` was unreachable. Now the PHP-aware arm answers.
+    /// A job still queued at the deadline is overload, not a hung worker.
+    #[test]
+    fn a_queued_worker_request_times_out_on_the_worker_stage_without_a_hung_recycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, payload) = crate::metrics::record_locally(|| async {
+            let (router, _pool) = worker_mode_router(dir.path(), 1);
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            router.handle(php_get(), addr, false).await.unwrap().status()
+        });
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let value = |series| crate::metrics::rendered_value(&payload, series);
+        assert_eq!(value("ephpm_http_timeouts_total{stage=\"worker\"}"), Some(1.0), "{payload}");
+        assert_eq!(value("ephpm_http_timeouts_total{stage=\"request\"}"), None, "{payload}");
+        assert_eq!(value("ephpm_worker_recycles_total{reason=\"hung\"}"), None, "{payload}");
+        assert_eq!(value("ephpm_http_requests_in_flight"), Some(0.0), "{payload}");
+        assert_eq!(value("ephpm_worker_busy"), Some(0.0), "{payload}");
+    }
+
+    /// A worker that pulled the request and never answered is hung: 504 on
+    /// the worker stage, and the pool records a `hung` recycle (replacement).
+    #[test]
+    fn a_started_worker_request_past_the_deadline_marks_the_worker_hung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, payload) = crate::metrics::record_locally(|| async {
+            let (router, pool) = worker_mode_router(dir.path(), 1);
+            // Play a worker that takes the request and wedges.
+            let wedged = tokio::spawn(async move {
+                loop {
+                    if let Some(job) = pool.pull_job_for_test() {
+                        return job;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            let status = router.handle(php_get(), addr, false).await.unwrap().status();
+            // Let the wedged worker answer late; the pool hears it recovered.
+            drop(wedged.await.unwrap());
+            tokio::task::yield_now().await;
+            status
+        });
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let value = |series| crate::metrics::rendered_value(&payload, series);
+        assert_eq!(value("ephpm_http_timeouts_total{stage=\"worker\"}"), Some(1.0), "{payload}");
+        assert_eq!(value("ephpm_worker_recycles_total{reason=\"hung\"}"), Some(1.0), "{payload}");
+        assert_eq!(value("ephpm_http_timeouts_total{stage=\"request\"}"), None, "{payload}");
+    }
+
+    /// B6: a request future dropped mid-PHP-wait (client disconnect) must not
+    /// leave `ephpm_http_requests_in_flight` / `ephpm_worker_busy` raised.
+    #[test]
+    fn a_dropped_request_future_releases_the_in_flight_gauges() {
+        let dir = tempfile::tempdir().unwrap();
+        let ((), payload) = crate::metrics::record_locally(|| async {
+            let (router, _pool) = worker_mode_router(dir.path(), 30);
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            let request = router.handle(php_get(), addr, false);
+            // Get it parked on the worker reply, then drop it — what hyper
+            // does when the client goes away.
+            assert!(tokio::time::timeout(Duration::from_millis(100), request).await.is_err());
+        });
+        let value = |series| crate::metrics::rendered_value(&payload, series);
+        assert_eq!(value("ephpm_http_requests_in_flight"), Some(0.0), "{payload}");
+        assert_eq!(value("ephpm_worker_busy"), Some(0.0), "{payload}");
+    }
+
+    /// A started debug-lane request that misses its deadline is a 504 on the
+    /// worker stage, but it must not mark a *pool* worker hung: the debug
+    /// thread was never part of the serving set, so nothing is replaced.
+    #[test]
+    fn a_timed_out_debug_lane_request_does_not_replace_a_pool_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy =
+            crate::xdebug_trigger::TriggerPolicy::from_ini(&ephpm_php::xdebug::XdebugIni {
+                mode: "debug".into(),
+                start_with_request: "trigger".into(),
+                ..ephpm_php::xdebug::XdebugIni::default()
+            })
+            .unwrap();
+        // Fake debug thread: take the job, mark it started, then sit on it
+        // (paused in the debugger) until the test releases it.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let runner: crate::debug_lane::Runner = Arc::new(move |_id, _seed, rx| {
+            let job = rx.recv_blocking().expect("job queued for the debug thread");
+            if let Some(started) = &job.started {
+                started.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            drop(job);
+        });
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let status = ::metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+                async {
+                    let (router, _pool) = worker_mode_router(dir.path(), 1);
+                    let lane = crate::debug_lane::DebugLane::with_runner(1, policy, runner);
+                    let router = router.with_debug_lane(Some(lane));
+                    let req = Request::builder()
+                        .uri("/index.php?XDEBUG_TRIGGER=1")
+                        .body(Empty::<Bytes>::new())
+                        .unwrap();
+                    let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+                    router.handle(req, addr, false).await.unwrap().status()
+                },
+            )
+        });
+        let _ = release_tx.send(());
+        let payload = handle.render();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        let value = |series| crate::metrics::rendered_value(&payload, series);
+        assert_eq!(value("ephpm_http_timeouts_total{stage=\"worker\"}"), Some(1.0), "{payload}");
+        assert_eq!(value("ephpm_worker_recycles_total{reason=\"hung\"}"), None, "{payload}");
+        assert_eq!(value("ephpm_worker_busy"), Some(0.0), "{payload}");
+    }
+
     /// Issue #380: in multi-site mode the span carries the **resolved**
     /// canonical site key, and a host that matched no vhost carries nothing.
     ///
@@ -9653,6 +9942,9 @@ mod tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.static_files.etag = true;
+        // Only the PHP-linked ETag-cache tests use this router, and the cache
+        // is off by default — without this they exercise nothing.
+        config.server.php_etag_cache.enabled = true;
         Router::new(&config, store, None, None, None, None, None)
     }
 
@@ -11084,6 +11376,212 @@ mod tests {
         assert!(glob_match("/index.php", "/index.php"));
         assert!(!glob_match("/index.php", "/index.phps"));
         assert!(!glob_match("/index.php", "/index.ph"));
+    }
+
+    // ── Conditional GET consistency (no PHP required) ────────────────
+
+    /// A router with the PHP ETag cache on and `[server.static] etag` as
+    /// given. `/index.php` exists; other paths fall back to `=404`.
+    fn php_etag_router(dir: &Path, static_etag: bool) -> (Router, Arc<Store>) {
+        std::fs::write(dir.join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.static_files.etag = static_etag;
+        config.server.php_etag_cache.enabled = true;
+        let store = test_store();
+        (Router::new(&config, Arc::clone(&store), None, None, None, None, None), store)
+    }
+
+    fn conditional_get(path: &str, if_none_match: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("if-none-match", if_none_match)
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    }
+
+    /// `[server.static] etag = false` used to stop the router reading
+    /// `If-None-Match` at all, which silently disabled the PHP ETag cache's
+    /// 304s as well. The two switches are independent now.
+    #[tokio::test]
+    async fn static_etag_off_does_not_disable_the_php_etag_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, store) = php_etag_router(dir.path(), false);
+        store.set(
+            php_etag_cache_key("etag:", None, "GET", "/index.php", ""),
+            b"\"v1\"".to_vec(),
+            None,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resp =
+            router.handle(conditional_get("/index.php", "\"v1\""), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers()["etag"], "\"v1\"");
+    }
+
+    /// The PHP ETag cache compares weakly, like the static path: a client
+    /// holding the `W/` form of a stored strong tag (or vice versa) gets 304.
+    #[tokio::test]
+    async fn php_etag_cache_matches_weakly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, store) = php_etag_router(dir.path(), true);
+        store.set(
+            php_etag_cache_key("etag:", None, "GET", "/index.php", ""),
+            b"\"v1\"".to_vec(),
+            None,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resp =
+            router.handle(conditional_get("/index.php", "W/\"v1\""), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    /// The cache's 304 is decided ahead of the request phase, so with a
+    /// middleware chain mounted it must not answer: a `jwt`-protected page
+    /// must not hand an unauthenticated client a 304 for a known tag.
+    #[tokio::test]
+    async fn php_etag_cache_never_answers_ahead_of_request_middleware() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, store) = php_etag_router(dir.path(), true);
+        let jwt = MiddlewareMount {
+            library: "jwt".to_string(),
+            match_pattern: Some("/index.php".to_string()),
+            order: 10,
+            config: Some(serde_json::json!({ "secret": "s3cret" })),
+        };
+        let router = router.with_middleware_chain(Some(chain_with(vec![jwt])));
+        store.set(
+            php_etag_cache_key("etag:", None, "GET", "/index.php", ""),
+            b"\"v1\"".to_vec(),
+            None,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resp =
+            router.handle(conditional_get("/index.php", "\"v1\""), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the gate decides, not the cache");
+    }
+
+    /// Worker mode sends front-controller routes (no file on disk) straight
+    /// to the worker; the PHP ETag cache used to be skipped for them, so it
+    /// never applied to most dynamic pages in worker mode.
+    #[tokio::test(start_paused = true)]
+    async fn php_etag_cache_applies_to_worker_mode_front_controller_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.php_etag_cache.enabled = true;
+        config.server.timeouts.request = 1;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
+        );
+        let store = test_store();
+        let router = Router::new(&config, Arc::clone(&store), None, None, None, None, Some(pool));
+        store.set(
+            php_etag_cache_key("etag:", None, "GET", "/blog/hello", ""),
+            b"\"post-7\"".to_vec(),
+            None,
+        );
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let resp =
+            router.handle(conditional_get("/blog/hello", "\"post-7\""), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_MODIFIED,
+            "a cached tag must short-circuit the worker (no worker runs here, so a miss is a 504)"
+        );
+    }
+
+    fn php_response(status: u16, headers: &[(&str, &str)]) -> Response<ServerBody> {
+        let mut builder = Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(body::buffered(Full::new(Bytes::new()))).unwrap()
+    }
+
+    /// Only a 200 that is safe to revalidate on the client's word alone is
+    /// stored.
+    #[test]
+    fn php_etag_storable_rules() {
+        assert_eq!(php_etag_storable(&php_response(200, &[("etag", "\"a\"")])), Some("\"a\""));
+        assert_eq!(php_etag_storable(&php_response(200, &[])), None, "no ETag");
+        assert_eq!(php_etag_storable(&php_response(404, &[("etag", "\"a\"")])), None, "not a 200");
+        assert_eq!(
+            php_etag_storable(&php_response(200, &[("etag", "\"a\""), ("set-cookie", "s=1")])),
+            None,
+            "Set-Cookie: a 304 would skip re-issuing per-visitor state"
+        );
+        for cc in ["no-store", "private", "max-age=0, Private", "private=\"set-cookie\""] {
+            assert_eq!(
+                php_etag_storable(&php_response(200, &[("etag", "\"a\""), ("cache-control", cc)])),
+                None,
+                "Cache-Control: {cc}"
+            );
+        }
+        assert_eq!(
+            php_etag_storable(&php_response(
+                200,
+                &[("etag", "\"a\""), ("cache-control", "public, max-age=60")]
+            )),
+            Some("\"a\"")
+        );
+    }
+
+    /// A response that is no longer storable drops the stored tag, so a
+    /// stale tag cannot keep answering 304 until its TTL; PHP's own 304
+    /// leaves it alone.
+    #[tokio::test]
+    async fn php_etag_cache_update_stores_and_forgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, store) = php_etag_router(dir.path(), true);
+        let key = php_etag_cache_key("etag:", None, "GET", "/p", "");
+        let update = |resp: &Response<ServerBody>| {
+            router.php_etag_cache_update(None, "GET", "/p", "", resp);
+        };
+
+        update(&php_response(200, &[("etag", "\"v1\"")]));
+        assert_eq!(store.get(&key).as_deref(), Some(&b"\"v1\""[..]));
+        update(&php_response(304, &[]));
+        assert_eq!(store.get(&key).as_deref(), Some(&b"\"v1\""[..]), "PHP's own 304 keeps it");
+        update(&php_response(200, &[]));
+        assert!(store.get(&key).is_none(), "a 200 without an ETag forgets the stale tag");
+        update(&php_response(200, &[("etag", "\"v2\"")]));
+        update(&php_response(200, &[("etag", "\"v3\""), ("cache-control", "no-store")]));
+        assert!(store.get(&key).is_none(), "a no-store response forgets the stale tag");
     }
 
     // ── ETag cache unit tests (no PHP required) ───────────────────────

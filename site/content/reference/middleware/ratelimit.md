@@ -128,25 +128,19 @@ affinity by client IP) makes the per-node count exact for that client.
 
 ### The cluster startup warning
 
-At startup, ePHPm logs this `WARN` when a mount whose `library` is exactly
-`ratelimit` is loaded with `[cluster].enabled = true`:
+At startup, ePHPm logs this `WARN` when the module is mounted with
+`[cluster].enabled = true`, whichever spelling the mount uses (`ratelimit`,
+`rate-limit`, `rate_limit`, `ephpm-middleware-ratelimit`,
+`ephpm_middleware_ratelimit`, or a path to the module's cdylib). It is one
+log line, wrapped here for display:
 
 ```
-[middleware] ratelimit mounted with [cluster].enabled = true — KV INCR is not
-yet replicated across nodes (SET/DEL/EXPIRE now do), so rate limits are
-enforced PER NODE. A client hitting N nodes gets up to N × the configured
-allowance. See site/content/reference/middleware/ratelimit.md for the current
-status.
+[middleware] ratelimit mounted with [cluster].enabled = true — the counter
+replicates across nodes as a last-arrival-wins value, not a cluster-wide atomic
+add, so concurrent increments on different nodes can overwrite each other. The
+limit is approximate: up to N × the configured allowance in the worst case for
+a client spread across N nodes. See
+https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster for details.
 ```
 
-Read it with two corrections, both known gaps in the code rather than in your
-config:
-
-- **The text is out of date.** `INCR` results *are* replicated now (see
-  [In a cluster](#in-a-cluster)). "Up to N × the allowance" remains the right
-  worst-case bound, but "enforced per node" understates the convergence that
-  does happen.
-- **It only fires for the spelling `ratelimit`.** A mount written
-  `rate-limit`, `rate_limit`, `ephpm-middleware-ratelimit` or
-  `ephpm_middleware_ratelimit` loads the same module, behaves identically in a
-  cluster, and logs no warning.
+It restates [In a cluster](#in-a-cluster); nothing in your config is wrong.
