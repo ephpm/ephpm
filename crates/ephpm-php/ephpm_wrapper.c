@@ -7422,9 +7422,11 @@ static zend_class_entry *cli_find_class(const char *name)
  *      `zend_pass_function`) installed around the constructor call is what
  *      makes the engine report any diagnostic raised during construction as
  *      "in Unknown on line 0". Evaluated code carries the eval's own filename
- *      and line instead. That is observable today: on PHP 8.5,
- *      `--rf Class::method` constructs ReflectionMethod with one argument and
- *      the resulting deprecation notice is part of the output php-cli prints.
+ *      and line instead, so any constructor diagnostic (e.g. a deprecation
+ *      raised by a future Reflection change) would carry the wrong context.
+ *      `--rf Class::method` on 8.4+ goes through
+ *      ReflectionMethod::createFromMethodName(), exactly as php-cli does, so
+ *      the one-argument-constructor deprecation is never raised.
  *   2. The exception path prints the raw `message` property and swallows the
  *      exception, so a message containing formatting or newlines is reproduced
  *      byte for byte, and no uncaught-exception fatal is ever emitted.
@@ -7443,15 +7445,36 @@ static int cli_reflection_print(const char *class_name, const char *what)
 
     zval arg, ref;
     ZVAL_STRING(&arg, what);
-    object_init_ex(&ref, pce);
+    ZVAL_UNDEF(&ref);
 
     zend_execute_data execute_data;
     zend_execute_data *orig_execute_data = EG(current_execute_data);
     memset(&execute_data, 0, sizeof(zend_execute_data));
     execute_data.func = (zend_function *)&zend_pass_function;
     EG(current_execute_data) = &execute_data;
-    zend_call_known_instance_method_with_1_params(
-        pce->constructor, Z_OBJ(ref), NULL, &arg);
+#if PHP_VERSION_ID >= 80400
+    /* PHP 8.4 deprecated the one-argument ReflectionMethod constructor, and
+     * php-cli 8.4+ sidesteps the notice by building the object through the
+     * static ReflectionMethod::createFromMethodName() instead ("Avoid
+     * deprecation warnings from ReflectionMethod::__construct() with one
+     * argument" in php_cli.c). Constructing it directly printed a
+     * `Deprecated:` line php-cli never prints. 8.3's php-cli still uses the
+     * constructor (no deprecation there), so it stays on the generic path. */
+    zend_function *create_from_method = NULL;
+    if (strcmp(class_name, "ReflectionMethod") == 0) {
+        create_from_method = zend_hash_str_find_ptr(
+            &pce->function_table, "createfrommethodname",
+            sizeof("createfrommethodname") - 1);
+    }
+    if (create_from_method) {
+        zend_call_known_function(create_from_method, NULL, pce, &ref, 1, &arg, NULL);
+    } else
+#endif
+    {
+        object_init_ex(&ref, pce);
+        zend_call_known_instance_method_with_1_params(
+            pce->constructor, Z_OBJ(ref), NULL, &arg);
+    }
     /* php-cli leaves the fake frame installed (it exits straight afterwards);
      * this CLI keeps running, so the real frame is put back. */
     EG(current_execute_data) = orig_execute_data;
@@ -7690,10 +7713,9 @@ int ephpm_cli_main(int argc, char **argv)
              *   - the error context. php-cli constructs the Reflection object
              *     under a zeroed execute_data frame, so a diagnostic raised by
              *     the constructor reads "in Unknown on line 0". Evaluated code
-             *     stamps the eval's own name and line. On PHP 8.5 this is not
-             *     hypothetical: `--rf Class::method` builds a ReflectionMethod
-             *     from one argument, which is deprecated, and the notice is
-             *     part of the output.
+             *     stamps the eval's own name and line. (`--rf Class::method`
+             *     uses ReflectionMethod::createFromMethodName() on 8.4+, as
+             *     php-cli does, so it raises no deprecation notice.)
              *   - `--rf Class::method` at all. The eval always built a
              *     ReflectionFunction, so a method name was simply "not a
              *     function" (issue #358).
