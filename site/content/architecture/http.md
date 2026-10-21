@@ -464,7 +464,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.timeouts.header_read` | int | `30` | Seconds to receive headers |
 | `server.timeouts.idle` | int | `60` | Idle connection timeout (seconds) |
 | `server.timeouts.request` | int | `300` | Total request timeout (seconds) |
-| `server.timeouts.shutdown` | int | `30` | Graceful shutdown drain on SIGTERM: one budget covering in-flight requests (keep-alive connections close after their current request) and the PHP pool drain; the runtime then gets at most 5 s more |
+| `server.timeouts.shutdown` | int | `30` | Graceful shutdown drain on SIGTERM: one budget covering in-flight requests (keep-alive connections close after their current request) and the PHP pool drain; the runtime then gets at most 15 s more to close databases and stop |
 | `server.response.compression` | bool | `true` | Enable response compression (Brotli preferred, gzip fallback) |
 | `server.response.compression_level` | int | `1` | Compression level (1-9) |
 | `server.response.compression_min_size` | int | `1024` | Min bytes to compress |

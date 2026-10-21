@@ -1316,7 +1316,14 @@ const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disa
 /// tokio's worker and blocking-pool threads; a blocking task still running
 /// after this is left behind (the process exits around it) rather than
 /// keeping a SIGTERMed server alive until SIGKILL.
-const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// Not tiny on purpose: dropping the background tasks closes every embedded
+/// database, and those closes `fsync` (observed: runtime threads parked in
+/// `jbd2_log_wait_commit`). A loaded per-site node with 60 open databases
+/// needed more than 5 s for that; cutting it short is survivable (the engine
+/// recovers its WAL on the next open) but turns a clean shutdown into a
+/// crash-equivalent one, so the bound only has to catch a genuinely stuck task.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Mode-dependent PHP error display/logging defaults for the generated ini.
 ///
@@ -2148,11 +2155,17 @@ fn run_with_config(
     // this is only the tail.
     let runtime_stop = std::time::Instant::now();
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
-    if runtime_stop.elapsed() >= RUNTIME_SHUTDOWN_GRACE {
+    let stop_elapsed = runtime_stop.elapsed();
+    if stop_elapsed >= RUNTIME_SHUTDOWN_GRACE {
         tracing::warn!(
             grace_secs = RUNTIME_SHUTDOWN_GRACE.as_secs(),
             "async runtime did not stop within its shutdown grace — exiting with blocking \
              work still running"
+        );
+    } else {
+        tracing::info!(
+            elapsed_ms = u64::try_from(stop_elapsed.as_millis()).unwrap_or(u64::MAX),
+            "async runtime stopped"
         );
     }
 

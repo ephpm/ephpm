@@ -97,7 +97,7 @@ The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub
 | `header_read` | u64 | `30` | Time to receive complete request headers after connect. |
 | `idle` | u64 | `60` | Idle connection timeout: a connection with no read or write activity for this long is shut down gracefully. `0` disables it. |
 | `request` | u64 | `300` | Total request timeout including PHP execution, measured from when the request arrives. A request still waiting on PHP at the deadline gets a 504, and the PHP thread running it (if it had started) is abandoned and replaced; see `ephpm_http_timeouts_total` in [Metrics](/reference/metrics/#http). `0` disables the per-request deadline (the router skips arming a tokio timer per request); a stuck request then relies on the idle/header-read timeouts instead of a hard cutoff. |
-| `shutdown` | u64 | `30` | Grace period for the whole shutdown drain (SIGTERM/Ctrl+C). Listeners stop accepting, every open HTTP connection finishes the request it is serving and then closes (keep-alive connections do not wait for another request), and the PHP pool threads drain — all inside this one budget, not one budget per phase. After it the async runtime gets at most 5 s more to stop, then the process exits. |
+| `shutdown` | u64 | `30` | Grace period for the whole shutdown drain (SIGTERM/Ctrl+C). Listeners stop accepting, every open HTTP connection finishes the request it is serving and then closes (keep-alive connections do not wait for another request), and the PHP pool threads drain — all inside this one budget, not one budget per phase. After it the async runtime gets at most 15 s more to stop (closing the embedded databases happens here), then the process exits. |
 
 ### `[server.response]`
 
