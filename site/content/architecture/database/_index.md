@@ -303,7 +303,9 @@ bridge and `pdo_mysql` routes, so reads and writes work on any node. There is
 no cluster-wide primary in this mode, and `/_ephpm/primary` returns `200` on
 every healthy node. See
 [`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only)
-for the ownership-move rules.
+for the ownership-move rules. Every node must use the same ownership hash: v0.13.0
+changed it, so a per-site cluster upgrades to v0.13.0 with a full-cluster restart
+(see [Clustering setup](/guides/clustering-setup/)).
 
 Full detail on the engine, including its Beta-upstream limits and file-format
 compatibility, is in [Database engines](/architecture/database/engines/).

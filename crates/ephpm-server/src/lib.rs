@@ -2409,6 +2409,12 @@ async fn start_db_proxies(
                 "per-site clustered mode is active but its replication wiring is missing \
                  (startup ordering bug: wire_per_site_db should have produced it)",
             )?;
+            // Every node must compute site ownership with the same hash
+            // scheme; report (loudly) any peer that does not — e.g. a node
+            // still on a pre-v0.13.0 binary during a forbidden rolling upgrade.
+            if let Some(cluster) = cluster {
+                handles.push(ephpm_cluster::spawn_hrw_scheme_watch(Arc::clone(cluster)));
+            }
             turso_cdc::start_clustered_per_site_turso(
                 sqlite_config,
                 wiring.dir,

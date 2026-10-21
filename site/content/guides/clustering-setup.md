@@ -79,6 +79,15 @@ How it differs from whole-database clustering:
 - **A connection is routed once, when it opens.** If ownership moves while it is open (a node joining is enough), the tenant sees a connection error until it reconnects.
 - **A forwarded statement never waits forever.** While the owner runs a forwarded statement it sends a heartbeat every 5 s, so a slow statement is never cut off; but 30 s with no reply and no heartbeat (a stopped, overloaded or partitioned owner) fails the statement with a connection error, and the next statement re-resolves the site's owner. Channel sockets use TCP keepalive, so a peer whose host died is noticed in about 30 s. During a rolling upgrade, a statement forwarded to an owner still on an older release (which sends no heartbeats) fails if it runs longer than 30 s.
 - **Ownership moves carry the data.** A new owner without the site's data pulls a snapshot from the previous owner before serving.
+- **Every node must use the same ownership hash.** Nodes compute owners independently, so they must all hash the same way. Each node advertises its ownership-hash scheme in gossip, and in this mode a node logs an `ERROR` naming any alive peer that advertises a different scheme (or none).
+
+> **Upgrading per-site clustered mode to v0.13.0 requires a full-cluster restart.** v0.13.0 replaced the ownership hash (scheme 2). The old one put sites whose keys share a prefix, such as `s001`, `s002` or `pr-12`, on a single node. The new scheme moves most sites to a different owner, and a v0.12.x node and a v0.13.0 node disagree on who owns what, so a rolling upgrade can refuse writes or commit them on a node whose writes do not replicate. Whole-database clustered mode and single-node mode are unaffected.
+>
+> 1. Stop writes and wait until every site's replicas have caught up: `ephpm_cdc_replication_lag_changes{site=...}` is `0` for every site on the node that serves it.
+> 2. Check that every node holds a copy of every site: each node's `[db.sqlite] dir` contains `<site-key>.db` for every site. A node replicates a site once it has served or forwarded a request for it, so round-robin traffic across all nodes normally gives this.
+> 3. Stop every node, upgrade, then start them all.
+>
+> After the restart a site's new owner serves its own copy, and step 1 makes that copy current. A new owner with no copy pulls a snapshot from the node the new hash ranks next for that site, and that node is not necessarily the old owner. If it has no copy either, the new owner serves an empty database. The data stays untouched on the node that holds it, because a node never discards its data for an empty snapshot, but the site serves empty. Step 2 is there to prevent this.
 
 This mode is **experimental**: the Turso engine is Beta upstream and multi-node ownership churn is unit-tested, not validated on a live cluster. The full rules are in the [`[db.sqlite.replication]` reference](/reference/config/#dbsqlitereplication-clustered-mode-only) and [Multi-tenant `pdo_mysql` → Clustered mode](/guides/multi-tenant-pdo-mysql/#clustered-mode).
 
