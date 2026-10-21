@@ -726,15 +726,11 @@ fn reflection_of_present_symbol_exits_zero() {
 /// as `Exception: Function Class::method() does not exist` with exit 1 — a
 /// name php-cli reflects fine (issue #358).
 ///
-/// On PHP 8.5 php-cli's single-argument `ReflectionMethod` construction is
-/// itself deprecated, and the notice is part of the output (`display_errors`
-/// routes it to **stdout** under the CLI). ePHPm reproduces it, including the
-/// `in Unknown on line 0` context that comes from the zeroed `execute_data`
-/// frame php_cli.c installs around the constructor call — which is why this
-/// path is native C and not an evaluated `new ReflectionMethod(...)` snippet.
-/// The notice text is version-dependent, so it is not asserted here; the
-/// byte-exact comparison lives in the conformance corpus
-/// (`tests/cli-conformance/142-reflection-rf-method`).
+/// On PHP 8.4+ the single-argument `ReflectionMethod` constructor is
+/// deprecated, and php-cli avoids it by calling
+/// `ReflectionMethod::createFromMethodName()`; ePHPm does the same, so no
+/// `Deprecated:` line may appear. The byte-exact comparison lives in the
+/// conformance corpus (`tests/cli-conformance/142-reflection-rf-method`).
 #[test]
 fn reflection_of_class_method_prints_a_method_and_exits_zero() {
     let Some(bin) = cli_binary() else {
@@ -754,6 +750,13 @@ fn reflection_of_class_method_prints_a_method_and_exits_zero() {
         !run.output().contains("does not exist"),
         "--rf ArrayObject::count still reported the method missing:\n--- stdout ---\n{}\n\
          --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        !run.output().contains("Deprecated:"),
+        "--rf ArrayObject::count printed a deprecation php-cli does not print:\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
         run.stdout,
         run.stderr
     );

@@ -244,11 +244,11 @@ loaded prints `Extension '<name>' not present.` and also exits `1`, so
 `ephpm php --ri <ext> >/dev/null` is a usable presence probe. A flag that
 succeeds exits `0`.
 
-On PHP 8.5, `--rf Class::method` emits a `Deprecated: Calling
-ReflectionMethod::__construct() with 1 argument is deprecated …` notice on
-**stdout** before the dump. That is php-cli's output too, verbatim — including
-the `in Unknown on line 0` context — because php-cli constructs the object the
-same way.
+On PHP 8.4 and later, `--rf Class::method` builds the object through
+`ReflectionMethod::createFromMethodName()`, exactly as php-cli does, so it
+prints no `ReflectionMethod::__construct() with 1 argument is deprecated`
+notice. (Builds up to and including v0.12.0 used the one-argument constructor
+and printed that notice on stdout before the dump; php-cli never does.)
 
 > **Fixed after v0.9.1.** Up to and including v0.9.1, `--rf Class::method`
 > always built a `ReflectionFunction`, so every method name came back as
