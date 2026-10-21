@@ -20,6 +20,15 @@ class — is contained instead of fatal: the offending request is answered
 corruption and wild writes still kill the process exactly as described on
 this page.
 
+A process that ends with **exit status 137** and no fatal-signal block, right
+after a `Hard memory limit of N bytes exhausted` line from PHP, was not killed
+by a signal: PHP 8.3.36 / 8.4.27 / 8.5.12+ called `_exit(137)` because a request
+crossed its [hard memory limit](/reference/config/#phps-hard-memory-limit). On
+Linux ePHPm contains that exit (the request gets a `500`, its thread is
+replaced) whatever `crash_containment` says, so you only see a 137 exit on
+macOS and Windows. (137 is also what the kernel OOM killer's `SIGKILL`
+produces; the PHP line is what tells the two apart.)
+
 ## What you get
 
 On `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE` or `SIGABRT`, ePHPm writes a block

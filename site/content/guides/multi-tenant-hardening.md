@@ -321,6 +321,10 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
 - **PostgreSQL/PDO persistence** — see §3.
 - **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`
   and OOM the shared process (another availability, not confidentiality, gap).
+  On PHP 8.3.36/8.4.27/8.5.12+ a tenant can also deliberately cross PHP's
+  [hard memory limit](/reference/config/#phps-hard-memory-limit), whose
+  `_exit(137)` ePHPm contains to that request on Linux but which ends the whole
+  process on macOS and Windows.
 - **Server endpoints are process-wide.** See the next section.
 
 ### Server endpoints are not tenant-scoped

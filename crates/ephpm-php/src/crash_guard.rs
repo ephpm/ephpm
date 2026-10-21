@@ -1,9 +1,43 @@
-//! Stack-overflow crash containment for the single-process ZTS model.
+//! Crash containment for the single-process ZTS model.
 //!
-//! Off unless `[php] crash_containment = true` in per-request mode
-//! (see [`set_enabled`]). When off, [`run_guarded`] is never called, no
-//! guard is ever armed, and the fatal-signal handler's recovery hook is not
-//! even registered — a crash kills the process exactly as it always has.
+//! Two fault classes are contained, both by abandoning the PHP thread that hit
+//! them:
+//!
+//! - **C-stack overflow** — off unless `[php] crash_containment = true` in
+//!   per-request mode (see [`set_enabled`]). When off, no guard catches
+//!   faults and the fatal-signal handler's recovery hook is not even
+//!   registered — a stack overflow kills the process exactly as it always has.
+//!   Most of this page is about this class.
+//! - **PHP's hard memory limit** — always on, on Linux (see
+//!   [`exit_containment_available`] and "The hard memory limit" below).
+//!
+//! # The hard memory limit
+//!
+//! PHP 8.3.36 / 8.4.27 / 8.5.12 made `memory_limit` a soft limit (exceeding
+//! it queues an out-of-memory error the VM raises at its next interrupt check)
+//! and added a hard limit, `memory_hard_limit_percent` (default 200% of
+//! `memory_limit`, or `memory_limit` + 1G above 1G). An allocation that cannot
+//! fail gracefully and would cross it makes PHP print
+//! `Hard memory limit of N bytes exhausted` to stderr and call `_exit(137)`.
+//! Because the soft limit is checked only between VM instructions, one
+//! internal function call can overshoot it that far. php-fpm loses one worker;
+//! ePHPm would lose every tenant at once.
+//!
+//! On Linux the binary is linked with `-Wl,--wrap=_exit`. The C wrapper
+//! (`crash_guard.c`) turns an `_exit(137)` on a guarded PHP thread of this
+//! process into a `siglongjmp` back to [`run_guarded`], which reports
+//! [`Guarded::HardMemoryLimit`]. The request answers 500, the thread is
+//! poisoned and retired exactly like a contained stack overflow, and its Zend
+//! heap is freed first (the hard-limit check runs before the allocator touches
+//! the heap, so the heap is consistent — see `ephpm_release_contained_heap`).
+//! This guard is armed on every request whether or not `crash_containment` is
+//! set: unlike the signal path it needs no signal handler, and an `_exit(137)`
+//! is never an acceptable outcome for a multi-tenant server. Arming without
+//! fault catching does not save the signal mask, so it costs no system call.
+//!
+//! macOS and Windows link without `--wrap`, so there the hard limit still ends
+//! the process; [`exit_containment_available`] reports `false` and nothing is
+//! armed for it.
 //!
 //! # The problem
 //!
@@ -26,7 +60,7 @@
 //!
 //! # The mechanism
 //!
-//! This module contains exactly that fault class and nothing else:
+//! The signal path contains exactly that fault class and nothing else:
 //!
 //! 1. [`run_guarded`] establishes a per-thread `sigsetjmp` recovery point (in
 //!    the pure-libc C shim `crash_guard.c`) and runs the request inside it.
@@ -35,7 +69,7 @@
 //!    `ephpm_guard_try_recover` — first thing for every SIGSEGV/SIGBUS. If the
 //!    current thread is inside a guarded region **and** the faulting address is
 //!    at/just below this thread's own stack low bound (a stack overflow), it
-//!    `siglongjmp`s back into [`run_guarded`], which returns [`Guarded::Contained`].
+//!    `siglongjmp`s back into [`run_guarded`], which returns [`Guarded::StackOverflow`].
 //!    Otherwise it returns and the handler proceeds to its normal
 //!    die-with-diagnostic path (a genuine fatal still kills the process).
 //!
@@ -57,7 +91,7 @@
 //!
 //! # After containment: the thread is poisoned
 //!
-//! When [`run_guarded`] returns [`Guarded::Contained`] the recovery skipped the
+//! When [`run_guarded`] returns [`Guarded::StackOverflow`] the recovery skipped the
 //! rest of `zend_object_std_dtor`, so the thread's ZMM free lists and
 //! `EG(objects_store)` are mid-mutation and inconsistent. That state is confined
 //! to this one thread, but the thread must never run PHP again and must never be
@@ -79,7 +113,13 @@
 //! thread pool (tokio's `spawn_blocking`, where PHP no longer runs) has no
 //! such retire primitive, and a worker-mode thread holds booted framework
 //! state that cannot be abandoned mid-flight — which is why worker mode
-//! refuses to arm containment at startup.
+//! refuses to arm stack-overflow containment at startup.
+//!
+//! The hard-memory-limit path differs in one respect: the heap is consistent,
+//! so after marking the thread poisoned `ephpm-php` frees the thread's Zend
+//! heap (`ephpm_release_contained_heap`) instead of leaking it. That also makes
+//! it safe in worker mode — the booted framework is simply freed with the heap
+//! and the worker pool boots a replacement ([`crate::WorkerExit::Contained`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -110,44 +150,87 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Result of [`run_guarded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guarded {
+    /// `work` ran to completion normally.
+    Completed,
+    /// A C-stack overflow was contained (only when `run_guarded` was asked to
+    /// catch faults). `work` did **not** finish and the calling thread's PHP
+    /// context is poisoned, including its Zend heap (see the module docs).
+    StackOverflow,
+    /// PHP's hard memory limit called `_exit(137)` and the exit was turned into
+    /// a return. `work` did **not** finish and the calling thread's PHP context
+    /// is poisoned, but its Zend heap is consistent and may be freed. Linux
+    /// only.
+    HardMemoryLimit,
+}
+
+impl Guarded {
+    /// Whether `work` was abandoned and the thread is now poisoned.
+    #[must_use]
+    pub fn is_contained(self) -> bool {
+        self != Self::Completed
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::os::raw::c_void;
 
+    use super::Guarded;
+
     unsafe extern "C" {
-        /// Run `work(ctx)` inside a stack-overflow recovery region. Returns 0
-        /// on normal completion, 1 if a stack overflow was contained.
-        fn ephpm_guard_run(work: extern "C" fn(*mut c_void), ctx: *mut c_void) -> i32;
+        /// Run `work(ctx)` inside a recovery region. Returns 0 on normal
+        /// completion, 1 if a stack overflow was contained (only with
+        /// `catch_faults`), 2 if a hard-memory-limit `_exit(137)` was.
+        fn ephpm_guard_run(
+            work: extern "C" fn(*mut c_void),
+            ctx: *mut c_void,
+            catch_faults: i32,
+        ) -> i32;
 
         /// Classify a SIGSEGV/SIGBUS fault; recover (does not return) if it is a
         /// contained stack overflow, else return 0. Async-signal-safe.
         fn ephpm_guard_try_recover(fault_addr: usize) -> i32;
+
+        /// 1 if this binary was linked with `--wrap=_exit`, so a guarded
+        /// `_exit(137)` is contained; 0 otherwise.
+        fn ephpm_guard_exit_containment_available() -> i32;
 
         /// Test-only: whether the current thread is inside a guarded region.
         #[cfg(test)]
         fn ephpm_guard_is_armed() -> i32;
     }
 
-    /// Result of [`run_guarded`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Guarded {
-        /// `work` ran to completion normally.
-        Completed,
-        /// A stack overflow was contained; `work` did **not** finish and the
-        /// calling thread's PHP context is poisoned (see the module docs).
-        Contained,
+    /// Whether this binary contains PHP's hard-memory-limit `_exit(137)`.
+    ///
+    /// `true` only on Linux, in a target linked with `-Wl,--wrap=_exit` (the
+    /// `ephpm` binary and its tests, and `ephpm-php`'s own tests). Everywhere
+    /// else the hard limit still ends the process.
+    #[must_use]
+    pub fn exit_containment_available() -> bool {
+        // SAFETY: a pure query of a link-time constant (whether the weak
+        // `__real__exit` was bound); no state, no locks.
+        unsafe { ephpm_guard_exit_containment_available() != 0 }
     }
 
-    /// Run `work` inside the per-thread stack-overflow recovery region.
+    /// Run `work` inside the per-thread recovery region.
     ///
-    /// On [`Guarded::Contained`], `work` was abandoned mid-flight by a
-    /// `siglongjmp` out of the signal handler: any Rust value created **inside**
-    /// `work` is leaked (its destructor does not run), which is acceptable for a
-    /// contained crash. Keep `work` minimal — in ePHPm it wraps exactly one
-    /// request-lifecycle FFI call (`ephpm_begin_request`, `ephpm_run_request`
-    /// or `ephpm_finish_request`), so the leak is the abandoned Zend request,
-    /// not Rust state.
-    pub fn run_guarded<F: FnOnce()>(work: F) -> Guarded {
+    /// `catch_faults` arms C-stack-overflow containment (only meaningful once
+    /// the fatal-signal hook is registered — see [`super::set_enabled`]); the
+    /// hard-memory-limit `_exit(137)` is caught either way where
+    /// [`exit_containment_available`].
+    ///
+    /// On a contained outcome, `work` was abandoned mid-flight by a
+    /// `siglongjmp` (out of the signal handler, or out of the `_exit`
+    /// wrapper): any Rust value created **inside** `work` is leaked (its
+    /// destructor does not run), which is acceptable for a contained crash.
+    /// Keep `work` minimal — in ePHPm it wraps exactly one request-lifecycle
+    /// FFI call (`ephpm_begin_request`, `ephpm_run_request`,
+    /// `ephpm_finish_request` or `ephpm_worker_run`), so the leak is the
+    /// abandoned Zend request, not Rust state.
+    pub fn run_guarded<F: FnOnce()>(catch_faults: bool, work: F) -> Guarded {
         // The closure is moved into an `Option` so the trampoline can take it by
         // value exactly once. A raw pointer to it crosses the C boundary.
         let mut slot: Option<F> = Some(work);
@@ -165,11 +248,20 @@ mod imp {
         // SAFETY: `trampoline::<F>` matches the `void(*)(void*)` C signature and
         // `slot` outlives the call. `ephpm_guard_run` either returns normally or
         // (on containment) via `siglongjmp` back to its own `sigsetjmp`, which
-        // unwinds only C frames it owns — never across this Rust frame.
+        // skips only frames inside `work` — never this Rust frame, which is
+        // below the jump target.
         let ret = unsafe {
-            ephpm_guard_run(trampoline::<F>, std::ptr::from_mut(&mut slot).cast::<c_void>())
+            ephpm_guard_run(
+                trampoline::<F>,
+                std::ptr::from_mut(&mut slot).cast::<c_void>(),
+                i32::from(catch_faults),
+            )
         };
-        if ret == 0 { Guarded::Completed } else { Guarded::Contained }
+        match ret {
+            0 => Guarded::Completed,
+            1 => Guarded::StackOverflow,
+            _ => Guarded::HardMemoryLimit,
+        }
     }
 
     /// The async-signal-safe fault-classification hook to register with the
@@ -306,11 +398,11 @@ mod imp {
 
                     assert_eq!(unsafe { ephpm_guard_is_armed() }, 0, "should start disarmed");
 
-                    let outcome = run_guarded(|| {
+                    let outcome = run_guarded(true, || {
                         // Never returns normally: overflows the stack.
                         std::hint::black_box(blow_the_stack(std::hint::black_box(0)));
                     });
-                    assert_eq!(outcome, Guarded::Contained, "overflow must be contained");
+                    assert_eq!(outcome, Guarded::StackOverflow, "overflow must be contained");
                     assert_eq!(
                         unsafe { ephpm_guard_is_armed() },
                         0,
@@ -320,16 +412,16 @@ mod imp {
                     // The thread is alive and usable: a normal guarded region
                     // now completes.
                     let ran = std::cell::Cell::new(false);
-                    let outcome2 = run_guarded(|| ran.set(true));
+                    let outcome2 = run_guarded(true, || ran.set(true));
                     assert_eq!(outcome2, Guarded::Completed);
                     assert!(ran.get(), "post-recovery guarded work must run");
 
                     // And a SECOND overflow on the same thread is contained too
                     // (no one-shot latch left armed).
-                    let outcome3 = run_guarded(|| {
+                    let outcome3 = run_guarded(true, || {
                         std::hint::black_box(blow_the_stack(std::hint::black_box(0)));
                     });
-                    assert_eq!(outcome3, Guarded::Contained, "second overflow must contain");
+                    assert_eq!(outcome3, Guarded::StackOverflow, "second overflow must contain");
 
                     "survived"
                 })
@@ -343,7 +435,7 @@ mod imp {
         fn normal_work_completes_without_containment() {
             let n = std::cell::Cell::new(0u32);
             for _ in 0..1000 {
-                let outcome = run_guarded(|| n.set(n.get() + 1));
+                let outcome = run_guarded(true, || n.set(n.get() + 1));
                 assert_eq!(outcome, Guarded::Completed);
             }
             assert_eq!(n.get(), 1000);
@@ -369,7 +461,7 @@ mod imp {
                     libc::setrlimit(libc::RLIMIT_CORE, &raw const no_core);
                 }
                 install_test_handler();
-                let _ = run_guarded(|| unsafe {
+                let _ = run_guarded(true, || unsafe {
                     // Wild write through null — a genuine fatal, not an overflow.
                     std::ptr::write_volatile(std::ptr::null_mut::<u32>(), 0x41);
                 });
@@ -390,30 +482,130 @@ mod imp {
                 "a wild write must NOT be contained — it must re-raise and die with SIGSEGV"
             );
         }
+
+        // ── The hard-memory-limit `_exit(137)` interception (Linux) ─────────
+        //
+        // This crate's build script links its test targets with
+        // `-Wl,--wrap=_exit` on Linux (stub mode included), so the mechanism
+        // is exercised here without libphp: `_exit(137)` is what
+        // `zend_mm_hard_limit_error` calls.
+
+        /// Run `child` in a forked process and return its raw wait status.
+        #[cfg(target_os = "linux")]
+        fn in_child(child: impl FnOnce()) -> c_int {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                child();
+                // The child's closure must end the process itself.
+                unsafe { libc::_exit(96) };
+            }
+            let mut status: c_int = 0;
+            unsafe { libc::waitpid(pid, &raw mut status, 0) };
+            status
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn exit_containment_is_linked_into_linux_tests() {
+            assert!(
+                exit_containment_available(),
+                "ephpm-php's build script must link its Linux test targets with \
+                 -Wl,--wrap=_exit; without it the hard-limit tests below would \
+                 end the test process"
+            );
+        }
+
+        /// `_exit(137)` inside a guarded region returns to `run_guarded` as
+        /// `HardMemoryLimit`; the thread survives and can arm again.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn exit_137_inside_guard_is_contained_and_thread_survives() {
+            assert!(exit_containment_available());
+            let handle = std::thread::spawn(|| {
+                let outcome = run_guarded(false, || unsafe { libc::_exit(137) });
+                assert_eq!(outcome, Guarded::HardMemoryLimit);
+                assert_eq!(unsafe { ephpm_guard_is_armed() }, 0, "disarmed after recovery");
+
+                let ran = std::cell::Cell::new(false);
+                assert_eq!(run_guarded(false, || ran.set(true)), Guarded::Completed);
+                assert!(ran.get());
+
+                // A second hit on the same thread is contained too.
+                let again = run_guarded(true, || unsafe { libc::_exit(137) });
+                assert_eq!(again, Guarded::HardMemoryLimit);
+                "survived"
+            });
+            assert_eq!(handle.join().expect("thread must survive"), "survived");
+        }
+
+        /// Only status 137 is the hard limit. Any other `_exit` inside a guard
+        /// ends the process with that status, as it always did.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn other_exit_status_inside_guard_still_exits() {
+            let status = in_child(|| {
+                let _ = run_guarded(false, || unsafe { libc::_exit(3) });
+                unsafe { libc::_exit(98) };
+            });
+            assert!(libc::WIFEXITED(status), "child must exit, not be signalled");
+            assert_eq!(libc::WEXITSTATUS(status), 3);
+        }
+
+        /// `_exit(137)` with no guard armed ends the process with 137.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn exit_137_outside_guard_still_exits() {
+            let status = in_child(|| unsafe { libc::_exit(137) });
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 137);
+        }
+
+        /// A process forked from inside a guarded region inherits the armed
+        /// thread-local state. Its `_exit(137)` must end the CHILD, never jump
+        /// into the copy of the parent's request it inherited.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn forked_child_of_a_guarded_thread_exits_for_real() {
+            assert!(exit_containment_available());
+            let handle = std::thread::spawn(|| {
+                let mut child_status: c_int = -1;
+                let outcome = run_guarded(false, || {
+                    child_status = in_child(|| unsafe { libc::_exit(137) });
+                });
+                assert_eq!(outcome, Guarded::Completed, "the parent's region is untouched");
+                child_status
+            });
+            let status = handle.join().expect("parent thread");
+            assert!(libc::WIFEXITED(status), "child must exit, not fall back into the guard");
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                137,
+                "a forked child's _exit(137) must end the child with 137"
+            );
+        }
     }
 }
 
 #[cfg(unix)]
-pub use imp::{Guarded, recover_hook, run_guarded};
+pub use imp::{exit_containment_available, recover_hook, run_guarded};
 
 // ── Windows: no signals, no containment (single-process ZTS is Unix-only) ────
 
-/// Result of [`run_guarded`] (Windows stub).
-#[cfg(not(unix))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Guarded {
-    /// `work` ran to completion.
-    Completed,
-    /// Never produced on Windows.
-    Contained,
-}
-
 /// Run `work` with no containment (Windows delivers faults as SEH exceptions,
-/// not signals; the mechanism does not apply). Always [`Guarded::Completed`].
+/// not signals, and `link.exe` cannot wrap `_exit`; neither mechanism
+/// applies). Always [`Guarded::Completed`].
 #[cfg(not(unix))]
-pub fn run_guarded<F: FnOnce()>(work: F) -> Guarded {
+pub fn run_guarded<F: FnOnce()>(_catch_faults: bool, work: F) -> Guarded {
     work();
     Guarded::Completed
+}
+
+/// Always `false` on Windows: PHP's hard memory limit ends the process.
+#[cfg(not(unix))]
+#[must_use]
+pub fn exit_containment_available() -> bool {
+    false
 }
 
 /// No-op recovery hook on Windows.
