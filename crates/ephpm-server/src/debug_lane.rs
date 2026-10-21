@@ -134,6 +134,27 @@ impl Dispatched {
             slot.answered = true;
         }
     }
+
+    /// Split into the response receiver (for a reply wait that takes
+    /// ownership of it) and the guard that holds the debug slot.
+    #[must_use]
+    pub fn into_parts(self) -> (oneshot::Receiver<WorkerResponse>, SlotGuard) {
+        (self.rx, SlotGuard(self.slot))
+    }
+}
+
+/// The debug slot of a [`Dispatched`] request after [`Dispatched::into_parts`]
+/// (empty for the warm pool). Hold it until the request is done; dropping it
+/// without [`SlotGuard::mark_answered`] reports the request abandoned.
+pub struct SlotGuard(Option<DebugSlot>);
+
+impl SlotGuard {
+    /// See [`Dispatched::mark_answered`].
+    pub fn mark_answered(&mut self) {
+        if let Some(slot) = self.0.as_mut() {
+            slot.answered = true;
+        }
+    }
 }
 
 /// One held debug slot. Dropping it frees the slot for the next triggered
@@ -175,22 +196,45 @@ impl WorkerTarget<'_> {
             Self::Pool(pool) => {
                 pool.dispatch(request).await.map(|rx| Dispatched { rx, slot: None })
             }
-            Self::Debug(lane) => lane.dispatch(request).await,
+            Self::Debug(lane) => lane.dispatch_tracked(request, None).await,
         }
     }
 
-    /// The request's `oneshot` timed out. The pool replaces the stuck worker;
-    /// the debug lane has nothing to replace (its thread was never part of
-    /// the serving set) — the slot is released when the [`Dispatched`] drops.
-    pub fn note_hung(&self) {
+    /// [`WorkerTarget::dispatch`], plus a flag the worker raises when it
+    /// pulls the job — how the reply wait tells a request that was *running*
+    /// at its deadline from one still queued (see [`crate::php_wait`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`WorkerTarget::dispatch`].
+    pub(crate) async fn dispatch_tracked(
+        &self,
+        request: WorkerRequestOwned,
+        started: &crate::php_wait::StartFlag,
+    ) -> Result<Dispatched, DispatchClosed> {
+        let started = Some(Arc::clone(started));
         match self {
-            Self::Pool(pool) => pool.note_hung(),
-            Self::Debug(_) => tracing::warn!(
-                "debug-lane request hit [server.timeouts] request (still paused in the \
-                 debugger?) — set it to 0 while step debugging"
-            ),
+            Self::Pool(pool) => pool
+                .dispatch_tracked(request, started)
+                .await
+                .map(|rx| Dispatched { rx, slot: None }),
+            Self::Debug(lane) => lane.dispatch_tracked(request, started).await,
         }
     }
+}
+
+/// A started debug-lane request missed its deadline. There is nothing to
+/// replace — the thread was never part of the serving set, and its slot is
+/// released when the request's [`SlotGuard`] drops — so this only explains
+/// the 504.
+impl crate::php_wait::HungTracker for DebugLane {
+    fn hung(_lane: &Arc<Self>) {
+        tracing::warn!(
+            "debug-lane request hit [server.timeouts] request (still paused in the debugger?) — \
+             set it to 0 while step debugging"
+        );
+    }
+    fn recovered(_lane: &Arc<Self>) {}
 }
 
 /// Decrements the live-thread count when a debug thread ends (normally or by
@@ -399,6 +443,16 @@ impl DebugLane {
         self: &Arc<Self>,
         request: WorkerRequestOwned,
     ) -> Result<Dispatched, DispatchClosed> {
+        self.dispatch_tracked(request, None).await
+    }
+
+    /// [`DebugLane::dispatch`] with the job's start flag (see
+    /// [`WorkerTarget::dispatch_tracked`]).
+    async fn dispatch_tracked(
+        self: &Arc<Self>,
+        request: WorkerRequestOwned,
+        started: Option<Arc<AtomicBool>>,
+    ) -> Result<Dispatched, DispatchClosed> {
         let permit = match self.acquire_slot().await {
             Ok(permit) => permit,
             Err(waiting_room_full) => {
@@ -432,7 +486,7 @@ impl DebugLane {
         let seed = DebugSeed::from_request(&request);
         let (respond_to, rx) = oneshot::channel();
         let (job_tx, job_rx) = async_channel::bounded(1);
-        let job = WorkerJob { request, respond_to, admission: None };
+        let job = WorkerJob { request, respond_to, admission: None, started };
         // Capacity 1 on a fresh channel whose receiver is held here: neither
         // Full nor Closed is possible.
         if job_tx.try_send(job).is_err() {
