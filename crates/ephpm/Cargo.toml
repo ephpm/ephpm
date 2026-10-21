@@ -92,7 +92,9 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 # vivacity: the embedded pure-Rust Composer installer that backs the
 # `ephpm composer` subcommand. `main.rs` forwards argv to `vivacity::run` and
-# exits with its returned code — no PHP needed, so this works in stub mode.
+# exits with its returned code. It links no PHP, so it compiles in stub mode;
+# its update/require/remove platform probe runs `$VIVACITY_PHP`, which a
+# PHP-linked build points at this binary (src/php_personality.rs).
 vivacity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
