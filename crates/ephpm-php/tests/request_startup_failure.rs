@@ -87,6 +87,14 @@ fn request(script: &Path, method: &str, body: Vec<u8>, content_type: Option<&str
     }
 }
 
+/// An `open_basedir` value covering the test scripts and the temp dir, joined
+/// with PHP's `DEFAULT_DIR_SEPARATOR` (`;` on Windows, where `:` follows every
+/// drive letter, and `:` elsewhere).
+fn basedir_list() -> String {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    format!("{}{sep}{}", script_dir().display(), std::env::temp_dir().display())
+}
+
 fn body(resp: &PhpResponse) -> String {
     String::from_utf8_lossy(&resp.body).trim().to_string()
 }
@@ -147,7 +155,7 @@ fn failed_request_startup_leaves_the_thread_clean() {
     );
 
     // A per-site sandbox the failing request carries, as the router buffers it.
-    let tenant_basedir = format!("{}:{}", script_dir().display(), std::env::temp_dir().display());
+    let tenant_basedir = basedir_list();
     let tenant_tmp = std::env::temp_dir().display().to_string();
 
     let (failed, after) = on_fresh_thread(move || {
@@ -181,7 +189,7 @@ fn repeated_startup_failures_do_not_accumulate_ini_overrides() {
     init_once();
     let probe_script = write_script("probe_repeat.php", PROBE);
     let unreachable = write_script("never_runs_repeat.php", "<?php echo 'script ran';");
-    let own_basedir = format!("{}:{}", script_dir().display(), std::env::temp_dir().display());
+    let own_basedir = basedir_list();
     let other_tmp_dir = script_dir().join("other-tenant");
     std::fs::create_dir_all(&other_tmp_dir).expect("create the other tenant's temp dir");
     let other_tmp = other_tmp_dir.display().to_string();
