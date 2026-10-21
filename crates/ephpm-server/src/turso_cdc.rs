@@ -299,9 +299,14 @@ const WATERMARK_TABLE: &str = "__litewire_cdc_watermark";
 /// has no wakeup signal for CDC inserts, so we poll on a schedule.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How long a replica waits between connect retries when the primary
-/// is unreachable.
-const REPLICA_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Nominal pause between snapshot-bootstrap attempts, and the cap on the
+/// mgmt-open backoff. Every *sleep* on it is jittered
+/// ([`ephpm_cluster::reconnect::jittered`]); the replica stream reconnect loops
+/// do not use it at all — they back off exponentially with jitter
+/// ([`ephpm_cluster::ReconnectBackoff`]), because a cohort of streams retrying
+/// on one fixed delay is what turned an owner stall into a self-sustaining
+/// reconnect storm (stress report F1).
+const REPLICA_RECONNECT_DELAY: Duration = ephpm_cluster::ReconnectBackoff::REPLICA_BASE;
 
 /// Base backoff between per-site mgmt-factory open retries when the file's
 /// write lock is held by the cdc-on wire factory. Grows linearly per attempt,
@@ -1187,7 +1192,9 @@ pub async fn run_replica(
          traffic at the primary."
     );
 
+    let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
     loop {
+        let attempt_started = tokio::time::Instant::now();
         match channel.dial(primary_addr, &cdc_stream_type(DEFAULT_SITE)).await {
             Ok(mut stream) => {
                 // Watermark resolution happens INSIDE subscribe_and_consume,
@@ -1218,7 +1225,11 @@ pub async fn run_replica(
                 tracing::debug!(primary = %primary_addr, "CDC replica dial failed: {e:#}");
             }
         }
-        tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+        // A subscription that stayed up for a while resets the failure run;
+        // a dial or stream that keeps failing backs off (jittered) instead
+        // of re-dialing on a fixed beat.
+        backoff.record_attempt(attempt_started.elapsed());
+        tokio::time::sleep(backoff.next_delay()).await;
     }
 }
 
@@ -2272,7 +2283,11 @@ async fn maybe_bootstrap_cold_replica(
                     "snapshot bootstrap attempt failed: {e:#}"
                 );
                 last_error = Some(e);
-                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                // Fixed attempt budget, so the nominal pause stays fixed (the
+                // budget's total duration is what the error message promises)
+                // — but jittered, so cold replicas do not retry in lockstep.
+                tokio::time::sleep(ephpm_cluster::reconnect::jittered(REPLICA_RECONNECT_DELAY))
+                    .await;
             }
         }
     }
@@ -3307,6 +3322,8 @@ async fn run_site_replication(
     // only meaningful for a node that starts owning a site it has no data for,
     // and re-running it later would race live writes.
     let mut took_handoff = false;
+    // Reconnect pacing for this site's replica stream; see the failure arm.
+    let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
 
     loop {
         let role = role_rx.borrow().clone();
@@ -3355,18 +3372,26 @@ async fn run_site_replication(
                 };
                 // One dial+tail attempt, interruptible by a role change (a
                 // failover re-homes this site to a different owner).
-                tokio::select! {
+                let attempt_started = tokio::time::Instant::now();
+                let failed = tokio::select! {
                     biased;
                     changed = role_rx.changed() => {
-                        // A failover re-homes the site; drop any reset intent.
+                        // A failover re-homes the site; drop any reset intent
+                        // and start the next owner's retries from scratch.
                         force_reset = false;
+                        backoff.reset();
                         if changed.is_err() {
                             return Ok(());
                         }
+                        false
                     }
                     res = replicate_site_once(&site, owner, &channel, &site_mgmt.factory, &site_mgmt.log_id, max_snapshot_bytes, force_reset) => {
                         match res {
-                            Ok(()) => force_reset = false,
+                            Ok(()) => {
+                                force_reset = false;
+                                backoff.reset();
+                                false
+                            }
                             Err(e) if is_schema_collision_error(&e) => {
                                 // Divergence: the replica holds a local-origin
                                 // object the owner's CDC batch collides with.
@@ -3379,13 +3404,34 @@ async fn run_site_replication(
                                      and re-bootstrapping from the owner: {e:#}"
                                 );
                                 force_reset = true;
-                                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                                true
                             }
                             Err(e) => {
                                 tracing::warn!(site = %site, owner = %owner, "per-site replica stream error: {e:#}");
-                                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                                true
                             }
                         }
+                    }
+                };
+                if failed {
+                    // Jittered exponential backoff (stress report F1): every
+                    // site's driver that failed in the same instant must not
+                    // re-dial in the same instant, and an owner that keeps
+                    // refusing gets progressively fewer dials. The wait is
+                    // still cut short by a role change, so a failover is
+                    // followed as promptly as before.
+                    backoff.record_attempt(attempt_started.elapsed());
+                    let delay = backoff.next_delay();
+                    tokio::select! {
+                        biased;
+                        changed = role_rx.changed() => {
+                            force_reset = false;
+                            backoff.reset();
+                            if changed.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        () = tokio::time::sleep(delay) => {}
                     }
                 }
             }

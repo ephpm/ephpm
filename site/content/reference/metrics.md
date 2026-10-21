@@ -527,6 +527,30 @@ labels have a fixed, small set of values (`stream`: 2, `status`: 2, `role`: 2,
 labels** — a label per replica would scale series count with cluster size and
 churn a new series on every pod replacement.
 
+## Cluster channel
+
+The cluster channel is the authenticated TCP data plane between nodes (default
+port `gossip_port + 2`, 7948): CDC replication streams, snapshot bootstraps and,
+in per-site clustered mode, forwarded SQL. These series appear only on a node
+where the channel listener is bound (clustered embedded SQLite).
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ephpm_cluster_channel_connections` | gauge | `direction` | Channel connections whose driver task is running. `direction` is `dialed` (this node opened it — every dialed stream is its own connection) or `accepted`. Should sit near the number of replication streams plus forwarding sessions and return to that baseline after load; a value that only ever climbs is a connection leak. |
+| `ephpm_cluster_channel_handshakes_total` | counter | `direction`, `outcome` | Channel handshakes by terminal outcome. `direction` is `dial` or `accept`. `outcome` is `ok`, `failed` (wrong secret, protocol mismatch, peer closed mid-handshake), `timeout` (not finished within 10 s), `connect_error` (dial only: the TCP connect failed or took more than 5 s) or `not_member` (accept only: the source address is not a gossip member). `over_capacity` (accept only) counts connections dropped unread because 64 handshakes were already running — **alert on its rate**: on a cluster's own traffic it is the signature of a reconnect storm. |
+| `ephpm_sql_forward_timeouts_total` | counter | `stage` | Per-site clustered mode only. Forwarded-SQL streams given up on by a timeout. `stage` is `send` (the site owner stopped reading the request for 30 s) or `reply` (no reply and no heartbeat from the owner for 30 s — the owner is stalled or partitioned) on the forwarding node, and `owner_idle` on the owner (a forwarding stream that sat idle for 10 minutes was closed, releasing its database and session). The `send`/`reply` stages fail the statement with a connection error; `owner_idle` is routine housekeeping. |
+
+```promql
+# Reconnect storm: the node is refusing its own cluster's handshakes.
+rate(ephpm_cluster_channel_handshakes_total{direction="accept",outcome="over_capacity"}[5m]) > 0
+
+# A site owner is stalled or unreachable from this node.
+rate(ephpm_sql_forward_timeouts_total{stage=~"send|reply"}[5m]) > 0
+```
+
+`direction` and `stage` have 2–3 fixed values and `outcome` at most 6; there are
+no per-peer labels.
+
 ## Cardinality notes
 
 The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.

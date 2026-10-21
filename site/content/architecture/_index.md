@@ -18,7 +18,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
 | CLI | **Implemented** | Full subcommand set: `serve`, `dev`, `php`, `kv`, `install`/`uninstall`/`start`/`stop`/`restart`/`status`/`logs` |
-| Graceful shutdown | **Implemented** | Stops accepting, then drains in-flight connections up to `server.timeouts.shutdown` |
+| Graceful shutdown | **Implemented** | Stops accepting, closes keep-alive connections after their current request, then drains in-flight work — all within `server.timeouts.shutdown` |
 | Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
 | Observability — logging | **Implemented** | `tracing` crate, structured logs, request lifecycle events |
 | Observability — query stats | **Implemented** | `ephpm-query-stats`: SQL normalization, digest tracking, slow query log, Prometheus metrics |

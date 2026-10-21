@@ -26,11 +26,15 @@ tokio-util.workspace = true
 yamux.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+metrics.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 # `test-util` for `start_paused` tests of the data plane's multi-second
 # timeouts — they finish instantly under paused time instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }
+# `all` exposes the keepalive getters the socket-option test reads back.
+socket2 = { workspace = true, features = ["all"] }
 
 [lints]
 workspace = true

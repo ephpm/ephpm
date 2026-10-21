@@ -593,13 +593,24 @@ struct Listeners {
 }
 
 /// Connection-level settings passed into spawned tasks.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ConnSettings {
     header_read_timeout: Duration,
     max_header_size: usize,
     /// Close connections with no read/write activity for this long.
     /// Zero disables the idle watchdog.
     idle_timeout: Duration,
+    /// Cancelled once when the server begins shutting down. Every HTTP
+    /// connection watches it and switches to hyper's graceful shutdown: the
+    /// request in progress finishes, then the connection closes instead of
+    /// waiting for the client's next keep-alive request.
+    ///
+    /// Without it, a client holding keep-alive connections open (any load
+    /// generator, any busy reverse proxy) kept every connection in flight
+    /// for the whole drain window, so a loaded node never finished shutting
+    /// down inside `[server.timeouts] shutdown` (stress report F8) while an
+    /// idle one stopped at once.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Parse config, build TLS, and bind all listeners.
@@ -658,6 +669,7 @@ async fn bind_listeners(
         header_read_timeout: Duration::from_secs(config.server.timeouts.header_read),
         max_header_size: config.server.request.max_header_size,
         idle_timeout: Duration::from_secs(config.server.timeouts.idle),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     };
     let file_cache = if config.server.file_cache.enabled {
         tracing::info!(
@@ -1158,7 +1170,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 };
                 dispatch_main_connection(
                     stream, remote_addr, &tls_mode, tls_listener.is_some(),
-                    redirect_http, conn, &router, guard, &in_flight,
+                    redirect_http, conn.clone(), &router, guard, &in_flight,
                 );
             }
 
@@ -1181,7 +1193,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                     ConnAdmission::Admit(guard) => guard,
                     ConnAdmission::Shed => continue,
                 };
-                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard, &in_flight);
+                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn.clone(), &router, guard, &in_flight);
             }
 
             () = &mut shutdown => {
@@ -1190,6 +1202,18 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             }
         }
     }
+
+    // ONE deadline for the whole drain. Every wait below (connections, then
+    // each pool's threads) used to get a fresh `shutdown_timeout` of its own,
+    // so a node with lingering work took a multiple of the configured grace —
+    // longer than any supervisor that sends SIGKILL after that grace waits.
+    let shutdown_started = tokio::time::Instant::now();
+    let deadline = shutdown_started + shutdown_timeout;
+
+    // Tell every open HTTP connection to finish its current request and close
+    // (see `ConnSettings::shutdown`): keep-alive clients otherwise hold their
+    // connections — and the drain below — open for the full grace period.
+    conn.shutdown.cancel();
 
     // Stop accepting new QUIC connections. In-flight HTTP/3 requests keep
     // running and are covered by the `in_flight` drain below.
@@ -1226,7 +1250,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             "waiting for in-flight connections to drain"
         );
 
-        let deadline = tokio::time::Instant::now() + shutdown_timeout;
         loop {
             let remaining = in_flight.load(Ordering::Relaxed);
             if remaining == 0 {
@@ -1252,7 +1275,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // while any of those TSRM entries are still live (issue #266), so give
     // the drain a real window before the caller proceeds to PHP teardown.
     if let Some(pool) = &worker_pool {
-        let deadline = tokio::time::Instant::now() + shutdown_timeout;
         loop {
             let live = pool.live_count();
             if live == 0 {
@@ -1276,7 +1298,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // deadline; `PhpRuntime::shutdown()` then skips module teardown, which is
     // the safe outcome.
     if let Some(lane) = &debug_lane {
-        let deadline = tokio::time::Instant::now() + shutdown_timeout;
         loop {
             let live = lane.live_count();
             if live == 0 {
@@ -1298,7 +1319,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // thread has released its TSRM slot (worker_thread_shutdown), so
     // php_embed_shutdown() is safe once it does.
     if let Some(pool) = &fpm_pool {
-        let deadline = tokio::time::Instant::now() + shutdown_timeout;
         loop {
             let live = pool.live_count();
             if live == 0 {
@@ -1324,6 +1344,10 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
+    tracing::info!(
+        elapsed_ms = u64::try_from(shutdown_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "server drain finished"
+    );
     Ok(())
 }
 
@@ -1771,20 +1795,32 @@ async fn serve_connection<I>(
     let conn = builder.serve_connection_with_upgrades(io, service);
     let mut conn = std::pin::pin!(conn);
 
-    let result = if settings.idle_timeout.is_zero() {
-        conn.await
-    } else {
-        tokio::select! {
-            result = conn.as_mut() => result,
-            () = tracker.idle_expired(settings.idle_timeout) => {
-                tracing::debug!(
-                    %remote_addr,
-                    idle_secs = settings.idle_timeout.as_secs(),
-                    "closing idle connection"
-                );
-                conn.as_mut().graceful_shutdown();
-                conn.await
-            }
+    // The idle watchdog, or a future that never fires when it is disabled.
+    let idle_timeout = settings.idle_timeout;
+    let idle = async {
+        if idle_timeout.is_zero() {
+            std::future::pending::<()>().await;
+        } else {
+            tracker.idle_expired(idle_timeout).await;
+        }
+    };
+    let result = tokio::select! {
+        result = conn.as_mut() => result,
+        () = idle => {
+            tracing::debug!(
+                %remote_addr,
+                idle_secs = idle_timeout.as_secs(),
+                "closing idle connection"
+            );
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+        // Server shutdown: finish the request in progress (if any), then
+        // close rather than wait for the next keep-alive request. See
+        // `ConnSettings::shutdown`.
+        () = settings.shutdown.cancelled() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
         }
     };
 
@@ -3259,6 +3295,7 @@ mod lib_tests {
                     header_read_timeout: Duration::from_secs(5),
                     max_header_size: 16 * 1024,
                     idle_timeout: Duration::from_secs(5),
+                    shutdown: tokio_util::sync::CancellationToken::new(),
                 },
                 &router,
                 None,
@@ -3856,6 +3893,7 @@ mod lib_tests {
             header_read_timeout: Duration::from_secs(30),
             max_header_size: 8192,
             idle_timeout: Duration::from_secs(1),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
         .await;
 
@@ -3878,6 +3916,7 @@ mod lib_tests {
             header_read_timeout: Duration::from_secs(30),
             max_header_size: 8192,
             idle_timeout: Duration::from_secs(1),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
         .await;
 
@@ -3904,6 +3943,53 @@ mod lib_tests {
         assert!(saw_response, "expected an HTTP response before the idle close");
     }
 
+    /// **F8 regression.** Server shutdown must close a keep-alive connection
+    /// as soon as its current request is done, not leave it open for the
+    /// client's next request. Before, nothing told the connection the server
+    /// was stopping: a load generator's keep-alive connections stayed in
+    /// flight for the entire drain window, so a loaded node never finished
+    /// shutting down inside the grace and was SIGKILLed. The idle watchdog is
+    /// disabled here, so only the shutdown signal can close the connection.
+    #[tokio::test]
+    async fn server_shutdown_closes_keep_alive_connections() {
+        use tokio::io::AsyncReadExt as _;
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_one_shot_server(ConnSettings {
+            header_read_timeout: Duration::from_secs(30),
+            max_header_size: 8192,
+            idle_timeout: Duration::ZERO,
+            shutdown: shutdown.clone(),
+        })
+        .await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /missing.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("response within 5s")
+            .expect("read response");
+        assert!(buf[..n].starts_with(b"HTTP/1.1"), "expected a response first");
+
+        // The connection is now idle and keep-alive: it would stay open
+        // indefinitely. Shutdown must close it promptly.
+        shutdown.cancel();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "shutdown must close an idle keep-alive connection");
+    }
+
     #[tokio::test]
     async fn idle_timeout_zero_disables_watchdog() {
         use tokio::io::AsyncReadExt as _;
@@ -3912,6 +3998,7 @@ mod lib_tests {
             header_read_timeout: Duration::from_secs(30),
             max_header_size: 8192,
             idle_timeout: Duration::ZERO,
+            shutdown: tokio_util::sync::CancellationToken::new(),
         })
         .await;
 
