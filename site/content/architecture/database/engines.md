@@ -114,6 +114,25 @@ Turso itself refuses the switch while CDC capture is on (see below). On a
 single-node `pdo_mysql` connection the switch outside a transaction is still
 possible.
 
+## Page-1 allocation race (patched Turso 0.8.3)
+
+From the release after v0.12.0, ePHPm builds Turso 0.8.3 from a fork rather
+than the crates.io release: the v0.8.3 tag plus a backport of
+[tursodatabase/turso#10117](https://github.com/tursodatabase/turso/pull/10117),
+which is not yet in a Turso release. The crate versions stay 0.8.3; the swap is
+a `[patch.crates-io]` entry in ePHPm's workspace `Cargo.toml`, and it goes away
+once a Turso release carrying the fix is pinned.
+
+The bug: when several connections make the **first write to a fresh database
+file** at the same time — typically a new per-site database receiving
+concurrent traffic — two of them could both allocate page 1, and the engine
+panicked. ePHPm catches engine panics per statement, so the process kept
+running, but the affected writes failed with an SQL error. The fix holds the
+engine's initialization lock across the whole page-1 write and re-checks under
+it. The file format is unchanged. `crates/ephpm-server/tests/turso_page1_race.rs`
+races 32 threads' first writes on 1000 fresh files; on Linux it fails against
+the unpatched crates.io 0.8.3 and passes against the fork.
+
 ## WAL growth under load, and the checkpoint gate
 
 Found by the WAL-growth stress runs of 2026-10-17/18 (ePHPm on Turso 0.8.3)
