@@ -960,6 +960,16 @@ int ephpm_thread_init(void)
     /* Start a request on this thread so PHP globals are initialized. */
     int ret = php_request_startup();
     if (ret != SUCCESS) {
+        /* Tear the half-started request down now (see the failure path of
+         * ephpm_begin_request): the caller does not mark this thread
+         * registered, so a retry runs ephpm_thread_init() again and must find
+         * no partial request — and no pending delayed out-of-memory error —
+         * left behind by this one. */
+        zend_try {
+            php_request_shutdown(NULL);
+        } zend_catch {
+        } zend_end_try();
+        request_active = 0;
         return -1;
     }
 
@@ -1934,6 +1944,41 @@ int ephpm_begin_request(void)
     ephpm_request_ini_apply();
 
     if (php_request_startup() != SUCCESS) {
+        /* A failed startup is a half-started request: php_request_startup()
+         * caught a bailout somewhere inside it — most reachably while parsing
+         * the request body (sapi_activate -> php_hash_environment -> the
+         * urlencoded / rfc1867 POST handlers), e.g. a body that exhausts
+         * memory_limit. php-src's own SAPIs never reuse a thread after that
+         * without php_request_shutdown() (FPM and CGI exit the process,
+         * apache2handler always runs its request destructor), and neither may
+         * we: the executor, the heap and every module that already activated
+         * are torn down here, now, rather than never — the next
+         * php_request_startup() on this thread used to run on top of them.
+         *
+         * On the PHP releases fixing CVE-2026-109618/109619 (8.3.36, 8.4.27,
+         * 8.5.12) this is also the only thing that clears a delayed
+         * out-of-memory error raised during request parsing: until
+         * php_request_shutdown() resets EG(delayed_oom), every later request
+         * on the thread would run with zend_call_function() refusing every
+         * callback and php_error_docref() dropping every warning.
+         *
+         * php_request_shutdown() is built to tear down partial state (it is
+         * what runs after any fatal; ephpm_thread_init_preseeded relies on the
+         * same, #266). Its own phases are bailout-guarded; the outer guard
+         * keeps anything that escapes them from longjmp-ing into Rust. */
+        zend_try {
+            php_request_shutdown(NULL);
+        } zend_catch {
+        } zend_end_try();
+        request_active = 0;
+
+        /* The buffered per-site INI overrides are released at the end of
+         * ephpm_run_request(), which a failed startup never reaches. Left in
+         * the buffer they were applied again — before its own — to whichever
+         * request, of whichever site, this thread served next, and repeated
+         * failures filled the MAX_REQUEST_INI slots until that site's own
+         * open_basedir was silently dropped. */
+        ephpm_request_ini_reset();
         return EPHPM_EXEC_STARTUP_FAIL;
     }
     request_active = 1;
@@ -2105,6 +2150,23 @@ int ephpm_run_request(const char *filename)
      * shutdown functions a second time. (Object destructors are NOT run
      * here: php_request_shutdown() runs them after the response is out, in
      * php-fpm's order — shutdown functions, then destructors.) */
+#ifdef ZEND_HAS_OOM
+    /* PHP 8.3.36 / 8.4.27 / 8.5.12 (CVE-2026-109618/109619) no longer bail
+     * out on memory_limit: the error is delayed (EG(delayed_oom)), reported,
+     * and the script unwinds like exit(). The state then stays HANDLED, and
+     * while it is set zend_call_function() refuses every callback — so the
+     * shutdown functions and output handlers below would be skipped
+     * silently. php_request_shutdown() clears the state before it calls
+     * them; this is where that phase runs here, so clear it the same way.
+     * Only HANDLED: its message was already released, and a still-PENDING
+     * error must be reported by the first callback, not dropped. The
+     * response is still discarded — the bailout the engine raised (and
+     * caught) while reporting the error set CG(unclean_shutdown), which the
+     * classification below reads. */
+    if (EG(delayed_oom).state == ZEND_OOM_STATE_HANDLED) {
+        EG(delayed_oom).state = ZEND_OOM_STATE_NONE;
+    }
+#endif
     span_saved = ephpm_bailout_span_begin(bailout_state);
     zend_try {
         php_call_shutdown_functions();
@@ -3021,11 +3083,21 @@ PHP_FUNCTION(ephpm_worker_take_request)
          * Envelope accessors below rely on. */
         ephpm_request_set_server_vars(
             req.server_var_count, req.server_var_keys, req.server_var_vals);
-        zend_try {
-            php_hash_environment();
-        } zend_catch {
-            /* Non-fatal: the envelope below still gives the framework the data. */
-        } zend_end_try();
+        /* No zend_try here, deliberately. A bailout out of
+         * php_hash_environment() (memory_limit exhausted while building the
+         * superglobals from client-controlled cookies/query/server vars, a
+         * fatal from an input filter) can land half-way through a hash
+         * update, and this worker's request is never torn down between
+         * iterations — catching the jump and carrying on would serve every
+         * later request on this long-lived request from that state. That is
+         * the state-corruption-via-bailout primitive CVE-2026-109618/109619
+         * closed in php-src. Let it propagate instead: it unwinds to
+         * php_execute_script()'s guard in ephpm_worker_run(), which reports
+         * the bailout (-2), the in-flight request gets a 500 and the worker
+         * is recycled through php_request_shutdown(). No Rust frame lies
+         * between here and that guard: the take_request callback has already
+         * returned. */
+        php_hash_environment();
     }
 
     /* Build the Envelope object.
