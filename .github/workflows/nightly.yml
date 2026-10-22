@@ -231,6 +231,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cargo checks out git dependencies with libgit2, which fails with
+      # "path too long" on the Turso fork's deep test-snapshot paths (#611)
+      # unless core.longpaths is set in the user's global git config.
+      - name: Enable git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
+
       - name: Install Rust toolchain
         shell: powershell
         run: |
