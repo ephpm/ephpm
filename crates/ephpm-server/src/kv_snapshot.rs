@@ -17,10 +17,19 @@
 //! * **On demand** — `POST /_ephpm/kv/snapshot` (see the router), which
 //!   `ephpm kv snapshot save` calls.
 //!
+//! Two targets. **Local** (`mode = "local"`): the file at
+//! `<path>/<identity>.kvsnap`. **Object** (`mode = "object"`): the same file
+//! is written to a staging directory, uploaded as one object
+//! (`s3://bucket/<prefix>/<identity>.kvsnap`, see [`crate::s3`]) and removed
+//! locally; a load downloads the object to the staging file, loads it and
+//! removes it. The object is the only source of truth in that mode — a pod
+//! with an empty disk warms up from it, and a failed download is a cold
+//! start, never a fallback to a stale local copy.
+//!
 //! Every write and load runs on a blocking thread (`spawn_blocking`): the
 //! snapshot code is synchronous file + CPU work and must never hold a tokio
 //! worker, for the same reason the engine work in `db_shutdown` is kept off
-//! them (#621).
+//! them (#621). The upload and download are async reqwest streams.
 //!
 //! A snapshot is a cache warm-up, not durability; see `ephpm_kv::snapshot`.
 
@@ -32,24 +41,28 @@ use anyhow::Context as _;
 use ephpm_config::Config;
 use ephpm_kv::multi_tenant::MultiTenantStore;
 use ephpm_kv::snapshot::{
-    LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, WriteOptions, load_snapshot,
-    write_snapshot,
+    ColdReason, LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, WriteOptions,
+    load_snapshot, write_snapshot,
 };
 use ephpm_kv::store::Store;
 use metrics::{counter, gauge, histogram};
+
+use crate::s3::{S3Client, S3Location};
+use crate::sigv4::Credentials;
 
 /// File extension of a snapshot.
 pub const SNAPSHOT_EXTENSION: &str = "kvsnap";
 
 /// Last-resort bound on the shutdown save. Generous: a 1 GiB snapshot is a
-/// few seconds of work; this only exists so a stuck disk cannot keep a
-/// stopped server alive forever. Past it the process exits and the next
-/// start removes the abandoned temporary file.
+/// few seconds of work plus, in object mode, the upload; this only exists so
+/// a stuck disk or network cannot keep a stopped server alive forever. Past
+/// it the process exits and the next start removes the abandoned temporary
+/// file.
 pub const SHUTDOWN_SAVE_BOUND: Duration = Duration::from_secs(5 * 60);
 
 /// Metric: snapshots written, by outcome and trigger.
 pub const METRIC_SAVE_TOTAL: &str = "ephpm_kv_snapshot_save_total";
-/// Metric: wall time of a snapshot write.
+/// Metric: wall time of a snapshot write (upload included in object mode).
 pub const METRIC_SAVE_DURATION: &str = "ephpm_kv_snapshot_save_duration_seconds";
 /// Metric: bytes of the last successful snapshot.
 pub const METRIC_LAST_SAVE_BYTES: &str = "ephpm_kv_snapshot_last_save_bytes";
@@ -57,7 +70,7 @@ pub const METRIC_LAST_SAVE_BYTES: &str = "ephpm_kv_snapshot_last_save_bytes";
 pub const METRIC_LAST_SAVE_KEYS: &str = "ephpm_kv_snapshot_last_save_keys";
 /// Metric: snapshot loads, by outcome and reason.
 pub const METRIC_LOAD_TOTAL: &str = "ephpm_kv_snapshot_load_total";
-/// Metric: wall time of a snapshot load.
+/// Metric: wall time of a snapshot load (download included in object mode).
 pub const METRIC_LOAD_DURATION: &str = "ephpm_kv_snapshot_load_duration_seconds";
 /// Metric: keys restored by the last load.
 pub const METRIC_LAST_LOAD_KEYS: &str = "ephpm_kv_snapshot_last_load_keys";
@@ -103,10 +116,20 @@ pub struct LoadStatus {
     pub report: LoadReport,
 }
 
+/// Where the snapshot lives.
+enum Target {
+    /// `<path>/<identity>.kvsnap` is the snapshot.
+    Local,
+    /// The object is the snapshot; the local file is a staging copy that
+    /// exists only during a save or a load.
+    Object { client: Arc<S3Client>, key: String },
+}
+
 /// The running server's snapshot lifecycle. One per process, built by
 /// [`KvSnapshotService::from_config`] when `[kv.snapshot] mode != "off"`.
 pub struct KvSnapshotService {
     file: PathBuf,
+    target: Target,
     secret: Vec<u8>,
     node_id: String,
     store: Arc<Store>,
@@ -127,6 +150,7 @@ impl std::fmt::Debug for KvSnapshotService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KvSnapshotService")
             .field("file", &self.file)
+            .field("object", &self.object_url())
             .field("node_id", &self.node_id)
             .field("multi_tenant", &self.sites.is_some())
             .field("max_size", &self.max_size)
@@ -138,18 +162,84 @@ impl std::fmt::Debug for KvSnapshotService {
     }
 }
 
+/// The object client `[kv.snapshot]` describes, with the key prefix
+/// (`""` or `"a/b"`, no trailing slash). Shared with the CLI
+/// (`ephpm kv snapshot list|rm`).
+///
+/// # Errors
+///
+/// Not object mode, an unparsable `url`, or missing `AWS_ACCESS_KEY_ID` /
+/// `AWS_SECRET_ACCESS_KEY`.
+pub fn object_client_from_config(config: &Config) -> anyhow::Result<(S3Client, String)> {
+    let snap = &config.kv.snapshot;
+    anyhow::ensure!(snap.is_object(), "[kv.snapshot] mode is not \"object\"");
+    let url = snap.url.as_deref().context("[kv.snapshot] url is required in object mode")?;
+    let (bucket, prefix) = S3Location::parse_url(url.trim()).context("[kv.snapshot] url")?;
+    Ok((object_client_for_bucket(config, bucket)?, prefix))
+}
+
+/// An object client for `bucket` using `[kv.snapshot]`'s endpoint, region
+/// and addressing style — for the CLI's `inspect`/`verify` of an arbitrary
+/// `s3://` URL.
+///
+/// # Errors
+///
+/// Missing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+pub fn object_client_for_bucket(config: &Config, bucket: String) -> anyhow::Result<S3Client> {
+    let snap = &config.kv.snapshot;
+    let creds = Credentials::from_env().context(
+        "[kv.snapshot] mode = \"object\" needs credentials in the environment: set \
+         AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN for temporary \
+         credentials). They are read from the environment only — never from ephpm.toml.",
+    )?;
+    let location = S3Location {
+        bucket,
+        endpoint: snap
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| S3Location::aws_endpoint(snap.region.trim())),
+        region: snap.region.trim().to_string(),
+        path_style: snap.effective_path_style(),
+    };
+    S3Client::new(location, creds)
+}
+
+/// The object key of `identity`'s snapshot under `prefix`.
+#[must_use]
+pub fn object_key(prefix: &str, identity: &str) -> String {
+    if prefix.is_empty() {
+        format!("{identity}.{SNAPSHOT_EXTENSION}")
+    } else {
+        format!("{prefix}/{identity}.{SNAPSHOT_EXTENSION}")
+    }
+}
+
+/// The identity `[kv.snapshot]` resolves to: `identity`, else
+/// `[cluster] node_id`, else the host name.
+#[must_use]
+pub fn resolve_identity(config: &Config) -> String {
+    config
+        .kv
+        .snapshot
+        .identity
+        .clone()
+        .or_else(|| Some(config.cluster.node_id.clone()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(host_name)
+}
+
 impl KvSnapshotService {
     /// Build the service from `[kv.snapshot]`, or `None` when snapshots are
-    /// off. Creates the snapshot directory and removes temporary files an
-    /// earlier process left behind.
+    /// off. Creates the snapshot (or staging) directory, removes temporary
+    /// files an earlier process left behind, and in object mode checks the
+    /// credentials are present.
     ///
     /// `node_id` is the effective cluster node id when clustered; it is only
-    /// used for the header and as the identity fallback.
+    /// used for the header.
     ///
     /// # Errors
     ///
-    /// A directory that cannot be created, or an unparsable knob (which
-    /// `Config::validate` normally catches first).
+    /// A directory that cannot be created, missing object credentials, or
+    /// an unparsable knob (which `Config::validate` normally catches first).
     pub fn from_config(
         config: &Config,
         store: Arc<Store>,
@@ -168,29 +258,48 @@ impl KvSnapshotService {
             .context("[kv.snapshot] requires [kv] secret")?
             .as_bytes()
             .to_vec();
-        let dir = PathBuf::from(
-            snap.path.as_deref().context("[kv.snapshot] mode = \"local\" requires path")?,
-        );
+        let identity = resolve_identity(config);
+        let (dir, target) = if snap.is_object() {
+            let (client, prefix) = object_client_from_config(config)?;
+            let dir = snap
+                .path
+                .as_deref()
+                .map_or_else(|| std::env::temp_dir().join("ephpm-kv-snapshot"), PathBuf::from);
+            (dir, Target::Object { client: Arc::new(client), key: object_key(&prefix, &identity) })
+        } else {
+            let dir = PathBuf::from(
+                snap.path.as_deref().context("[kv.snapshot] mode = \"local\" requires path")?,
+            );
+            (dir, Target::Local)
+        };
         std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating [kv.snapshot] path {}", dir.display()))?;
-        let identity = snap
-            .identity
-            .clone()
-            .or_else(|| Some(config.cluster.node_id.clone()).filter(|s| !s.is_empty()))
-            .unwrap_or_else(host_name);
+            .with_context(|| format!("creating [kv.snapshot] directory {}", dir.display()))?;
         let file = dir.join(format!("{identity}.{SNAPSHOT_EXTENSION}"));
         remove_stale_temp_files(&dir, &identity);
         let node_id = node_id.map_or_else(|| identity.clone(), str::to_string);
-        tracing::info!(
-            file = %file.display(),
-            identity,
-            on_shutdown = snap.on_shutdown,
-            load_on_start = snap.load_on_start,
-            interval = %snap.interval,
-            "KV warm-restart snapshots enabled (local file)"
-        );
+        match &target {
+            Target::Local => tracing::info!(
+                file = %file.display(),
+                identity,
+                on_shutdown = snap.on_shutdown,
+                load_on_start = snap.load_on_start,
+                interval = %snap.interval,
+                "KV warm-restart snapshots enabled (local file)"
+            ),
+            Target::Object { client, key } => tracing::info!(
+                object = %format!("s3://{}/{key}", client.location().bucket),
+                endpoint = %client.location().endpoint,
+                staging = %file.display(),
+                identity,
+                on_shutdown = snap.on_shutdown,
+                load_on_start = snap.load_on_start,
+                interval = %snap.interval,
+                "KV warm-restart snapshots enabled (object storage)"
+            ),
+        }
         Ok(Some(Arc::new(Self {
             file,
+            target,
             secret,
             node_id,
             store,
@@ -206,10 +315,22 @@ impl KvSnapshotService {
         })))
     }
 
-    /// The snapshot file this node writes and loads.
+    /// The snapshot file this node writes and loads (the staging file in
+    /// object mode).
     #[must_use]
     pub fn file(&self) -> &Path {
         &self.file
+    }
+
+    /// `s3://bucket/key` in object mode.
+    #[must_use]
+    pub fn object_url(&self) -> Option<String> {
+        match &self.target {
+            Target::Local => None,
+            Target::Object { client, key } => {
+                Some(format!("s3://{}/{key}", client.location().bucket))
+            }
+        }
     }
 
     /// Every store with its site key, the default store first (`""`).
@@ -232,18 +353,67 @@ impl KvSnapshotService {
         Some(self.load_now().await)
     }
 
-    /// Load the snapshot into the live stores now, under `load_timeout`.
+    /// Load the snapshot into the live stores now, under `load_timeout`. In
+    /// object mode the object is downloaded first (within the same budget).
     pub async fn load_now(&self) -> LoadReport {
+        let started = Instant::now();
+        let deadline = started + self.load_timeout;
+        let report = match &self.target {
+            Target::Local => self.load_file(deadline).await,
+            Target::Object { client, key } => match self.download(client, key, deadline).await {
+                Ok(true) => {
+                    let report = self.load_file(deadline).await;
+                    let _ = std::fs::remove_file(&self.file);
+                    report
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        object = %self.object_url().unwrap_or_default(),
+                        "no KV snapshot object to load (cold start)"
+                    );
+                    LoadReport::cold(ColdReason::Missing, None, 0, started.elapsed())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        object = %self.object_url().unwrap_or_default(),
+                        reason = ColdReason::Io.label(),
+                        "KV snapshot not loaded (cold start): {e:#}"
+                    );
+                    LoadReport::cold(ColdReason::Io, None, 0, started.elapsed())
+                }
+            },
+        };
+        let report = LoadReport { elapsed: started.elapsed(), ..report };
+        self.record_load(&report);
+        report
+    }
+
+    /// Download the object to the staging file. `Ok(false)` = no object.
+    async fn download(
+        &self,
+        client: &S3Client,
+        key: &str,
+        deadline: Instant,
+    ) -> anyhow::Result<bool> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, client.get_to_file(key, &self.file)).await {
+            Ok(Ok(Some(bytes))) => {
+                tracing::debug!(bytes, key, "KV snapshot object downloaded");
+                Ok(true)
+            }
+            Ok(Ok(None)) => Ok(false),
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!("download did not finish within load_timeout"),
+        }
+    }
+
+    async fn load_file(&self, deadline: Instant) -> LoadReport {
         let file = self.file.clone();
         let secret = self.secret.clone();
         let store = Arc::clone(&self.store);
         let sites = self.sites.clone();
-        let opts = LoadOptions {
-            deadline: Some(Instant::now() + self.load_timeout),
-            max_size: self.max_size,
-            workers: 0,
-        };
-        let report = tokio::task::spawn_blocking(move || {
+        let opts = LoadOptions { deadline: Some(deadline), max_size: self.max_size, workers: 0 };
+        tokio::task::spawn_blocking(move || {
             let resolve = move |site: &str| -> Option<Arc<Store>> {
                 if site.is_empty() {
                     Some(Arc::clone(&store))
@@ -259,22 +429,8 @@ impl KvSnapshotService {
         .await
         .unwrap_or_else(|e| {
             tracing::error!("KV snapshot load task failed: {e}");
-            LoadReport {
-                outcome: LoadOutcome::Cold(ephpm_kv::snapshot::ColdReason::Io),
-                restored: 0,
-                expired: 0,
-                refused: 0,
-                unknown_site: 0,
-                blocks: 0,
-                bad_blocks: 0,
-                unreached_blocks: 0,
-                bytes: 0,
-                header: None,
-                elapsed: Duration::ZERO,
-            }
-        });
-        self.record_load(&report);
-        report
+            LoadReport::cold(ColdReason::Io, None, 0, Duration::ZERO)
+        })
     }
 
     fn record_load(&self, report: &LoadReport) {
@@ -286,9 +442,10 @@ impl KvSnapshotService {
         .increment(1);
         histogram!(METRIC_LOAD_DURATION).record(report.elapsed.as_secs_f64());
         gauge!(METRIC_LAST_LOAD_KEYS).set(report.restored as f64);
+        let source = self.object_url().unwrap_or_else(|| self.file.display().to_string());
         match report.outcome {
             LoadOutcome::Ok => tracing::info!(
-                file = %self.file.display(),
+                source,
                 keys = report.restored,
                 expired_skipped = report.expired,
                 blocks = report.blocks,
@@ -298,7 +455,7 @@ impl KvSnapshotService {
                 "KV snapshot loaded — serving warm"
             ),
             LoadOutcome::Partial(reason) => tracing::warn!(
-                file = %self.file.display(),
+                source,
                 reason = reason.label(),
                 keys = report.restored,
                 refused = report.refused,
@@ -308,8 +465,8 @@ impl KvSnapshotService {
                 elapsed_ms = report.elapsed.as_millis() as u64,
                 "KV snapshot partially loaded"
             ),
-            // The cold reasons are logged by the loader itself (missing at
-            // INFO, everything else at WARN) with the underlying error.
+            // The cold reasons are logged where they are detected (missing
+            // at INFO, everything else at WARN) with the underlying error.
             LoadOutcome::Cold(_) => {}
         }
         if let Ok(mut slot) = self.last_load.lock() {
@@ -321,7 +478,8 @@ impl KvSnapshotService {
     ///
     /// # Errors
     ///
-    /// The write failed; the previous snapshot (if any) is intact.
+    /// The write (or, in object mode, the upload) failed; the previous
+    /// snapshot, if any, is intact.
     pub async fn save(&self, trigger: SaveTrigger) -> Result<SaveReport, SnapshotError> {
         let _guard = self.saving.lock().await;
         self.save_locked(trigger).await
@@ -344,6 +502,7 @@ impl KvSnapshotService {
     }
 
     async fn save_locked(&self, trigger: SaveTrigger) -> Result<SaveReport, SnapshotError> {
+        let started = Instant::now();
         let file = self.file.clone();
         let secret = self.secret.clone();
         let stores = self.stores();
@@ -353,12 +512,24 @@ impl KvSnapshotService {
             multi_tenant: self.sites.is_some(),
             ..WriteOptions::default()
         };
-        let result =
+        let mut result =
             tokio::task::spawn_blocking(move || write_snapshot(&file, &secret, &stores, &opts))
                 .await
                 .unwrap_or_else(|e| {
                     Err(SnapshotError::Io(std::io::Error::other(format!("save task failed: {e}"))))
                 });
+        if let (Ok(_), Target::Object { client, key }) = (&result, &self.target) {
+            if let Err(e) = client.put_file(key, &self.file).await {
+                result = Err(SnapshotError::Io(std::io::Error::other(format!("upload: {e:#}"))));
+            }
+            // The object is the snapshot; the staging copy has done its job
+            // either way (on failure it is a snapshot nobody will load).
+            let _ = std::fs::remove_file(&self.file);
+        }
+        if let Ok(report) = &mut result {
+            report.elapsed = started.elapsed();
+        }
+        let target = self.object_url().unwrap_or_else(|| self.file.display().to_string());
         match &result {
             Ok(report) => {
                 counter!(METRIC_SAVE_TOTAL, "outcome" => "ok", "trigger" => trigger.label())
@@ -367,7 +538,7 @@ impl KvSnapshotService {
                 gauge!(METRIC_LAST_SAVE_BYTES).set(report.bytes as f64);
                 gauge!(METRIC_LAST_SAVE_KEYS).set(report.keys() as f64);
                 tracing::info!(
-                    file = %self.file.display(),
+                    target,
                     trigger = trigger.label(),
                     keys = report.keys(),
                     sites = report.sites,
@@ -381,7 +552,7 @@ impl KvSnapshotService {
                 counter!(METRIC_SAVE_TOTAL, "outcome" => "error", "trigger" => trigger.label())
                     .increment(1);
                 tracing::warn!(
-                    file = %self.file.display(),
+                    target,
                     trigger = trigger.label(),
                     "KV snapshot NOT written (the previous snapshot, if any, is kept): {e}"
                 );
@@ -437,7 +608,10 @@ impl KvSnapshotService {
     pub fn status_json(&self) -> String {
         let last_save = self.last_save.lock().ok().and_then(|s| s.clone());
         let last_load = self.last_load.lock().ok().and_then(|s| s.clone());
-        let file_bytes = std::fs::metadata(&self.file).ok().map(|m| m.len());
+        let file_bytes = match self.target {
+            Target::Local => std::fs::metadata(&self.file).ok().map(|m| m.len()),
+            Target::Object { .. } => None,
+        };
         let save = last_save.map(|s| match s.result {
             Ok(r) => serde_json::json!({
                 "at_unix_ms": ephpm_kv::snapshot::unix_ms_for(s.at),
@@ -475,10 +649,16 @@ impl KvSnapshotService {
                 "created_at_unix_ms": r.header.as_ref().map(|h| h.created_at_ms),
             })
         });
+        let (mode, endpoint) = match &self.target {
+            Target::Local => ("local", None),
+            Target::Object { client, .. } => ("object", Some(client.location().endpoint.clone())),
+        };
         serde_json::json!({
-            "mode": "local",
+            "mode": mode,
             "file": self.file.display().to_string(),
             "file_bytes": file_bytes,
+            "object": self.object_url(),
+            "endpoint": endpoint,
             "on_shutdown": self.on_shutdown,
             "load_on_start": self.load_on_start,
             "interval_secs": self.interval.map(|d| d.as_secs()),
@@ -582,6 +762,7 @@ mod tests {
                 .expect("enabled");
         assert!(!stale.exists(), "stale temp file removed");
         assert_eq!(svc.file(), dir.path().join("node-a.kvsnap"));
+        assert_eq!(svc.object_url(), None);
         let report = svc.save(SaveTrigger::Request).await.unwrap();
         assert_eq!(report.keys(), 1);
 
@@ -593,6 +774,7 @@ mod tests {
         assert_eq!(load.outcome, LoadOutcome::Ok, "{load:?}");
         assert_eq!(fresh.get("warm").as_deref(), Some(&b"yes"[..]));
         let status: serde_json::Value = serde_json::from_str(&svc2.status_json()).unwrap();
+        assert_eq!(status["mode"], "local");
         assert_eq!(status["last_load"]["outcome"], "ok");
         assert_eq!(status["last_load"]["written_by"], "gossip-id");
         assert!(status["file_bytes"].as_u64().unwrap() > 0);
@@ -644,6 +826,20 @@ mod tests {
         assert_eq!(sites2.get_site_store("alice.test").get("k").as_deref(), Some(&b"alice"[..]));
         assert_eq!(sites2.get_site_store("bob.test").get("k").as_deref(), Some(&b"bob"[..]));
         assert_eq!(sites2.site_count(), 2);
+    }
+
+    #[test]
+    fn object_keys_and_identity_resolution() {
+        assert_eq!(object_key("", "web-1"), "web-1.kvsnap");
+        assert_eq!(object_key("prod/kv", "web-1"), "prod/kv/web-1.kvsnap");
+        let cfg: Config =
+            toml::from_str("[cluster]\nnode_id = \"n-7\"\n[kv.snapshot]\nidentity = \"x\"\n")
+                .unwrap();
+        assert_eq!(resolve_identity(&cfg), "x");
+        let cfg: Config = toml::from_str("[cluster]\nnode_id = \"n-7\"\n").unwrap();
+        assert_eq!(resolve_identity(&cfg), "n-7");
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(resolve_identity(&cfg), host_name());
     }
 
     #[test]

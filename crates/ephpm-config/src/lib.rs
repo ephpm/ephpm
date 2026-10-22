@@ -3484,6 +3484,36 @@ pub struct KvSnapshotConfig {
     /// Default: `"1GB"`.
     #[serde(default = "default_kv_snapshot_max_size")]
     pub max_size: String,
+
+    /// `mode = "object"`: where the snapshot object lives, as
+    /// `s3://<bucket>[/<prefix>]`. The object key is
+    /// `<prefix>/<identity>.kvsnap`. **Required** in object mode. Credentials
+    /// come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+    /// (and optional `AWS_SESSION_TOKEN`) environment variables, never from
+    /// this file; startup fails when they are unset.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// `mode = "object"`: the S3-compatible endpoint origin, e.g.
+    /// `https://<account>.r2.cloudflarestorage.com`, `http://minio:9000`,
+    /// `https://storage.googleapis.com`. Default: AWS S3 for `region`
+    /// (`https://s3.<region>.amazonaws.com`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// `mode = "object"`: the SigV4 signing region. `"auto"` for Cloudflare
+    /// R2; MinIO accepts anything.
+    ///
+    /// Default: `"us-east-1"`.
+    #[serde(default = "default_kv_snapshot_region")]
+    pub region: String,
+
+    /// `mode = "object"`: path-style addressing (`endpoint/bucket/key`)
+    /// rather than virtual-hosted (`bucket.endpoint/key`). Default: `true`
+    /// when `endpoint` is set (MinIO, R2 and GCS all accept it), `false`
+    /// for AWS S3.
+    #[serde(default)]
+    pub path_style: Option<bool>,
 }
 
 impl Default for KvSnapshotConfig {
@@ -3497,6 +3527,10 @@ impl Default for KvSnapshotConfig {
             interval: default_kv_snapshot_interval(),
             load_timeout: default_kv_snapshot_load_timeout(),
             max_size: default_kv_snapshot_max_size(),
+            url: None,
+            endpoint: None,
+            region: default_kv_snapshot_region(),
+            path_style: None,
         }
     }
 }
@@ -3506,6 +3540,19 @@ impl KvSnapshotConfig {
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.mode != "off"
+    }
+
+    /// Whether the snapshot lives in object storage (`mode = "object"`).
+    #[must_use]
+    pub fn is_object(&self) -> bool {
+        self.mode == "object"
+    }
+
+    /// Path-style addressing as configured, or the default for the
+    /// endpoint (`true` with a custom endpoint, `false` for AWS S3).
+    #[must_use]
+    pub fn effective_path_style(&self) -> bool {
+        self.path_style.unwrap_or(self.endpoint.is_some())
     }
 
     /// The periodic interval, or `None` when disabled.
@@ -3604,8 +3651,12 @@ fn default_kv_snapshot_max_size() -> String {
     "1GB".to_string()
 }
 
+fn default_kv_snapshot_region() -> String {
+    "us-east-1".to_string()
+}
+
 /// Every accepted `[kv.snapshot] mode` value.
-const KV_SNAPSHOT_MODES: [&str; 2] = ["off", "local"];
+const KV_SNAPSHOT_MODES: [&str; 3] = ["off", "local", "object"];
 
 impl KvConfig {
     /// Why a single-site RESP listener must refuse to start, if it must.
@@ -5132,10 +5183,45 @@ impl Config {
                         snap.mode,
                     )));
                 }
-                if snap.path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                if !snap.is_object() && snap.path.as_deref().is_none_or(|p| p.trim().is_empty()) {
                     return Err(ConfigError::Validation(format!(
                         "[kv.snapshot] mode = \"{}\" requires [kv.snapshot] path (the directory the \
                          snapshot file is written to)",
+                        snap.mode,
+                    )));
+                }
+                if snap.is_object() {
+                    let url = snap.url.as_deref().map(str::trim).unwrap_or_default();
+                    let rest = url.strip_prefix("s3://").unwrap_or_default();
+                    let bucket = rest.split('/').next().unwrap_or_default();
+                    let bucket_ok = !bucket.is_empty()
+                        && bucket.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'
+                        });
+                    if !bucket_ok {
+                        return Err(ConfigError::Validation(format!(
+                            "[kv.snapshot] mode = \"object\" requires [kv.snapshot] url = \
+                             \"s3://<bucket>[/<prefix>]\" (a lowercase bucket name), got {url:?}"
+                        )));
+                    }
+                    if let Some(endpoint) = snap.endpoint.as_deref()
+                        && !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+                    {
+                        return Err(ConfigError::Validation(format!(
+                            "[kv.snapshot] endpoint must be an origin such as \
+                             \"https://minio.internal:9000\", got {endpoint:?}"
+                        )));
+                    }
+                    if snap.region.trim().is_empty() {
+                        return Err(ConfigError::Validation(
+                            "[kv.snapshot] region must not be empty".to_string(),
+                        ));
+                    }
+                } else if snap.url.is_some() || snap.endpoint.is_some() || snap.path_style.is_some()
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "[kv.snapshot] url / endpoint / path_style only apply to mode = \"object\" \
+                         (mode is \"{}\")",
                         snap.mode,
                     )));
                 }
@@ -10491,6 +10577,39 @@ multi_tenant_hardening = false
         cfg.kv.snapshot.identity = Some("../other".to_string());
         let err = cfg.validate().expect_err("identity with a separator → refuse").to_string();
         assert!(err.contains("identity"), "{err}");
+    }
+
+    #[test]
+    fn kv_snapshot_object_mode_requires_a_bucket_url_and_rejects_stray_keys() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.secret = Some("s3cret".to_string());
+        cfg.kv.snapshot.mode = "object".to_string();
+        let err = cfg.validate().expect_err("no url → refuse").to_string();
+        assert!(err.contains("s3://<bucket>"), "{err}");
+
+        cfg.kv.snapshot.url = Some("s3://My_Bucket/x".to_string());
+        assert!(cfg.validate().is_err(), "uppercase/underscore bucket");
+        cfg.kv.snapshot.url = Some("s3://kv-snapshots/prod/web".to_string());
+        cfg.validate().expect("object mode needs no path");
+        assert!(!cfg.kv.snapshot.effective_path_style(), "AWS default is virtual-hosted");
+
+        cfg.kv.snapshot.endpoint = Some("minio:9000".to_string());
+        let err = cfg.validate().expect_err("endpoint without a scheme").to_string();
+        assert!(err.contains("endpoint"), "{err}");
+        cfg.kv.snapshot.endpoint = Some("http://minio:9000".to_string());
+        cfg.validate().expect("endpoint with a scheme");
+        assert!(cfg.kv.snapshot.effective_path_style(), "custom endpoint defaults to path style");
+        cfg.kv.snapshot.path_style = Some(false);
+        assert!(!cfg.kv.snapshot.effective_path_style());
+
+        // Object keys on a local-mode config are a mistake, not a no-op.
+        let mut local = Config::default_config().unwrap();
+        local.kv.secret = Some("s3cret".to_string());
+        local.kv.snapshot.mode = "local".to_string();
+        local.kv.snapshot.path = Some("/var/lib/ephpm/kv".to_string());
+        local.kv.snapshot.url = Some("s3://b".to_string());
+        let err = local.validate().expect_err("url under local → refuse").to_string();
+        assert!(err.contains("only apply to mode = \"object\""), "{err}");
     }
 
     #[test]

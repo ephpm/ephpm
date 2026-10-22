@@ -176,7 +176,9 @@ pub struct LoadReport {
 }
 
 impl LoadReport {
-    fn cold(reason: ColdReason, header: Option<Header>, bytes: u64, elapsed: Duration) -> Self {
+    /// A report for a load that restored nothing.
+    #[must_use]
+    pub fn cold(reason: ColdReason, header: Option<Header>, bytes: u64, elapsed: Duration) -> Self {
         Self {
             outcome: LoadOutcome::Cold(reason),
             restored: 0,

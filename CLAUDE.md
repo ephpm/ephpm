@@ -170,6 +170,7 @@ Invariants to keep:
 - **Blocking work off the runtime.** Every save/load runs under `spawn_blocking`; the shutdown save is bounded by its own 5-minute last resort, not `[server.timeouts] shutdown`.
 - **Entry encoding is extensible** (type byte, flags, reserved `ext` block, payload length so unknown types are skipped; hash fields carry an optional per-field expiry). Adding a field means a new flag or `ext` content, not a new format version; a new major version must be refused by old readers (`UnsupportedVersion`).
 - Stores restore through `Store::restore_string` / `restore_hash` (crate-private): bytes go in as stored (compressed flag kept) when the value algorithm matches the target store's, else decoded and re-encoded via `set_local`. Restores are node-local and never replicate.
+- **Object mode** (`mode = "object"`, `url = "s3://bucket[/prefix]"`) uses `crates/ephpm-server/src/s3.rs` — a five-call client (PUT/GET/HEAD/DELETE/ListObjectsV2) over reqwest and the shared `sigv4.rs` signer (also used by the Route 53 DNS-01 provider). **Not** the AWS SDK or `object_store`: both link `ring` through reqwest's `rustls-tls-native-roots` (#241). Credentials are the standard `AWS_*` env vars only (never config, never logged; startup fails without them). The staging file is deleted after each upload/download; a failed download is a cold start, never a fallback to a local copy. The SigV4 client is tested by an in-process mock that re-derives every signature (`tests/kv_snapshot_object.rs`).
 
 ## Critical Conventions
 

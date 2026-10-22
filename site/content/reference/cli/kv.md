@@ -126,14 +126,16 @@ All three exit `0`.
 Warm-restart snapshot operations ([`[kv.snapshot]`](/reference/config/#kvsnapshot)). These do **not** use the RESP listener, so `--host`/`--port`/`--password`/`--user` do not apply: the file subcommands read a snapshot directly, and the server subcommands call the running server's `/_ephpm/kv/snapshot` [control endpoint](/reference/http-endpoints/#server-owned-paths), which is gated like `/_ephpm/requests` (`[server.diagnostics] allow`/`token`; a token is mandatory on a multi-site server).
 
 ```bash
-ephpm kv snapshot inspect <FILE> [--config PATH] [--json]
-ephpm kv snapshot verify  <FILE>  --config PATH
+ephpm kv snapshot inspect <FILE|s3://bucket/key> [--config PATH] [--json]
+ephpm kv snapshot verify  <FILE|s3://bucket/key>  --config PATH
+ephpm kv snapshot list    --config PATH [--json]
+ephpm kv snapshot rm      <IDENTITY> --config PATH
 ephpm kv snapshot save    [--url URL] [--token TOKEN] [--config PATH]
 ephpm kv snapshot load    [--url URL] [--token TOKEN] [--config PATH]
 ephpm kv snapshot status  [--url URL] [--token TOKEN] [--config PATH]
 ```
 
-**`inspect <FILE>`** prints the plaintext header — format version, when and by which node it was written, whether it is multi-tenant, the cipher/KDF/compression ids and the file size. It never decrypts a value. With `--config` (read for `[kv] secret`) it also opens the sealed index and lists, per site, the number of blocks, entries and plaintext bytes. `--json` prints the same as one JSON document.
+**`inspect <SOURCE>`** prints the plaintext header — format version, when and by which node it was written, whether it is multi-tenant, the cipher/KDF/compression ids and the file size. It never decrypts a value. With `--config` (read for `[kv] secret`) it also opens the sealed index and lists, per site, the number of blocks, entries and plaintext bytes. `--json` prints the same as one JSON document. The source is a file path, or `s3://bucket/key` — then `--config` is required (for `[kv.snapshot] endpoint`/`region`/`path_style`; the bucket comes from the URL) and the credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; the object is downloaded to a temporary directory that is removed afterwards.
 
 ```bash
 $ ephpm kv snapshot inspect /var/lib/ephpm/kv/web-1.kvsnap --config /etc/ephpm/ephpm.toml
@@ -153,7 +155,19 @@ site                                       blocks      entries  plaintext bytes
 blog.example.com                               39       210841         94496029
 ```
 
-**`verify <FILE> --config PATH`** authenticates and decodes every block (what a load would do, without restoring anything) and reports `ok: … N blocks, M entries verified` or lists the block indexes that failed.
+**`verify <SOURCE> --config PATH`** authenticates and decodes every block (what a load would do, without restoring anything) and reports `ok: … N blocks, M entries verified` or lists the block indexes that failed. Same sources as `inspect`.
+
+**`list --config PATH`** lists the snapshots at the configured location — the `*.kvsnap` objects under `[kv.snapshot] url` in object mode, the files under `[kv.snapshot] path` in local mode — as identity, size and last-modified. `--json` for a document.
+
+```bash
+$ ephpm kv snapshot list --config /etc/ephpm/ephpm.toml
+location: s3://kv-snapshots/prod/kv/
+identity                                          bytes modified
+web-0                                          48213776 2026-10-22T14:03:11.000Z
+web-1                                          47990112 2026-10-22T14:02:58.000Z
+```
+
+**`rm <IDENTITY> --config PATH`** deletes one snapshot (object or file) by identity; exits `1` when there is none.
 
 **`save`**, **`load`**, **`status`** talk to a running server. `--url` is the server's base URL (`http://127.0.0.1:8080`); with `--config` instead, the URL is derived from `[server] listen` (an unspecified bind such as `0.0.0.0` becomes `127.0.0.1`) and the token from `[server.diagnostics] token`. `save` asks the server to write its snapshot now and prints the report; `load` asks it to load the configured snapshot into the live store; `status` prints the status document (file, last save, last load).
 

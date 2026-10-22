@@ -28,11 +28,13 @@ use ephpm_kv::snapshot::{self, SnapshotError};
 /// `ephpm kv snapshot <COMMAND>`.
 #[derive(Subcommand, Debug)]
 pub enum KvSnapshotCommand {
-    /// Print a snapshot file's header; with --config (for [kv] secret), its
-    /// per-site totals too. Never decrypts a value.
+    /// Print a snapshot's header; with --config (for [kv] secret), its
+    /// per-site totals too. Never decrypts a value. The source is a file
+    /// path, or an s3://bucket/key object (then --config supplies the
+    /// endpoint/region and the environment the credentials).
     Inspect {
-        /// The snapshot file.
-        file: PathBuf,
+        /// The snapshot file, or s3://bucket/key.
+        source: String,
         /// Config file to read [kv] secret from, so the index can be opened.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -40,12 +42,31 @@ pub enum KvSnapshotCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Authenticate and decode every block of a snapshot file (exit 2 on any
-    /// bad block). Needs [kv] secret from --config.
+    /// Authenticate and decode every block of a snapshot (exit 2 on any bad
+    /// block). Needs [kv] secret from --config. Source as for inspect.
     Verify {
-        /// The snapshot file.
-        file: PathBuf,
+        /// The snapshot file, or s3://bucket/key.
+        source: String,
         /// Config file to read [kv] secret from.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// List the snapshots at the configured location: the objects under
+    /// [kv.snapshot] url, or the files under [kv.snapshot] path.
+    List {
+        /// Config file naming the location.
+        #[arg(long)]
+        config: PathBuf,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete one snapshot (by identity) at the configured location.
+    Rm {
+        /// The snapshot's identity (the file stem / object name without
+        /// `.kvsnap`), as `list` shows it.
+        identity: String,
+        /// Config file naming the location.
         #[arg(long)]
         config: PathBuf,
     },
@@ -81,10 +102,16 @@ pub struct ServerTarget {
 /// verify is reported on stderr with exit 2, not as an error.
 pub fn run(cmd: KvSnapshotCommand) -> anyhow::Result<ExitCode> {
     match cmd {
-        KvSnapshotCommand::Inspect { file, config, json } => {
-            inspect(&file, config.as_deref(), json)
+        KvSnapshotCommand::Inspect { source, config, json } => {
+            let local = materialize(&source, config.as_deref())?;
+            inspect(&local.path, config.as_deref(), json)
         }
-        KvSnapshotCommand::Verify { file, config } => verify(&file, &config),
+        KvSnapshotCommand::Verify { source, config } => {
+            let local = materialize(&source, Some(&config))?;
+            verify(&local.path, &config)
+        }
+        KvSnapshotCommand::List { config, json } => list(&config, json),
+        KvSnapshotCommand::Rm { identity, config } => rm(&identity, &config),
         KvSnapshotCommand::Save(target) => call(&target, "POST", "/_ephpm/kv/snapshot"),
         KvSnapshotCommand::Load(target) => call(&target, "POST", "/_ephpm/kv/snapshot/load"),
         KvSnapshotCommand::Status(target) => call(&target, "GET", "/_ephpm/kv/snapshot"),
@@ -106,6 +133,160 @@ fn secret_from_config(path: &Path) -> anyhow::Result<Vec<u8>> {
 fn load_config(path: &Path) -> anyhow::Result<Config> {
     Config::load(&path.to_path_buf())
         .with_context(|| format!("could not load config {}", path.display()))
+}
+
+/// A snapshot available on the local disk: the path given, or an
+/// `s3://` object downloaded into a temporary directory that lives as long
+/// as this value.
+struct LocalSnapshot {
+    path: PathBuf,
+    _tmp: Option<tempfile::TempDir>,
+}
+
+/// Resolve `source` to a local file, downloading an `s3://bucket/key`
+/// object with the endpoint/region from `--config` and credentials from the
+/// environment.
+fn materialize(source: &str, config: Option<&Path>) -> anyhow::Result<LocalSnapshot> {
+    let Some(rest) = source.strip_prefix("s3://") else {
+        return Ok(LocalSnapshot { path: PathBuf::from(source), _tmp: None });
+    };
+    let (bucket, key) = rest
+        .split_once('/')
+        .filter(|(b, k)| !b.is_empty() && !k.is_empty())
+        .with_context(|| format!("expected s3://bucket/key, got {source:?}"))?;
+    let config_path = config.context(
+        "an s3:// source needs --config, for [kv.snapshot] endpoint/region (credentials come \
+         from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)",
+    )?;
+    let cfg = load_config(config_path)?;
+    let client = ephpm_server::kv_snapshot::object_client_for_bucket(&cfg, bucket.to_string())?;
+    let tmp = tempfile::Builder::new().prefix("ephpm-kv-snapshot-").tempdir()?;
+    let path = tmp.path().join("object.kvsnap");
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let got = rt.block_on(client.get_to_file(key, &path))?;
+    if got.is_none() {
+        anyhow::bail!("{source}: no such object");
+    }
+    Ok(LocalSnapshot { path, _tmp: Some(tmp) })
+}
+
+/// One listed snapshot.
+struct Listed {
+    identity: String,
+    bytes: u64,
+    modified: String,
+}
+
+fn listed(config: &Config) -> anyhow::Result<(String, Vec<Listed>)> {
+    let snap = &config.kv.snapshot;
+    anyhow::ensure!(snap.enabled(), "[kv.snapshot] mode is \"off\": nothing to list");
+    let suffix = format!(".{}", ephpm_server::kv_snapshot::SNAPSHOT_EXTENSION);
+    if snap.is_object() {
+        let (client, prefix) = ephpm_server::kv_snapshot::object_client_from_config(config)?;
+        let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+        let dir = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        let objects = rt.block_on(client.list(&dir))?;
+        let mut out: Vec<Listed> = objects
+            .into_iter()
+            .filter_map(|o| {
+                let name = o.key.strip_prefix(&dir)?;
+                let identity = name.strip_suffix(&suffix)?;
+                (!identity.contains('/')).then(|| Listed {
+                    identity: identity.to_string(),
+                    bytes: o.size,
+                    modified: o.last_modified,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.identity.cmp(&b.identity));
+        Ok((format!("s3://{}/{dir}", client.location().bucket), out))
+    } else {
+        let dir = PathBuf::from(snap.path.as_deref().context("[kv.snapshot] path is not set")?);
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("could not read {}", dir.display()))?
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(identity) = name.strip_suffix(&suffix) else { continue };
+            if identity.starts_with('.') {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            let modified = meta
+                .modified()
+                .ok()
+                .map(|t| format_unix_ms(ephpm_kv::snapshot::unix_ms_for(t)))
+                .unwrap_or_default();
+            out.push(Listed { identity: identity.to_string(), bytes: meta.len(), modified });
+        }
+        out.sort_by(|a, b| a.identity.cmp(&b.identity));
+        Ok((dir.display().to_string(), out))
+    }
+}
+
+fn list(config: &Path, json: bool) -> anyhow::Result<ExitCode> {
+    let cfg = load_config(config)?;
+    let (location, items) = listed(&cfg)?;
+    if json {
+        let doc = serde_json::json!({
+            "location": location,
+            "snapshots": items.iter().map(|i| serde_json::json!({
+                "identity": i.identity,
+                "bytes": i.bytes,
+                "modified": i.modified,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("location: {location}");
+    if items.is_empty() {
+        println!("(no snapshots)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("{:<40} {:>14} {:<28}", "identity", "bytes", "modified");
+    for i in &items {
+        println!("{:<40} {:>14} {:<28}", i.identity, i.bytes, i.modified);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn rm(identity: &str, config: &Path) -> anyhow::Result<ExitCode> {
+    anyhow::ensure!(
+        !identity.is_empty() && !identity.contains(['/', '\\']) && !identity.starts_with('.'),
+        "identity must be a plain name, got {identity:?}"
+    );
+    let cfg = load_config(config)?;
+    let snap = &cfg.kv.snapshot;
+    anyhow::ensure!(snap.enabled(), "[kv.snapshot] mode is \"off\": nothing to remove");
+    if snap.is_object() {
+        let (client, prefix) = ephpm_server::kv_snapshot::object_client_from_config(&cfg)?;
+        let key = ephpm_server::kv_snapshot::object_key(&prefix, identity);
+        let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+        let url = format!("s3://{}/{key}", client.location().bucket);
+        if rt.block_on(client.head(&key))?.is_none() {
+            eprintln!("error: {url}: no such object");
+            return Ok(ExitCode::FAILURE);
+        }
+        rt.block_on(client.delete(&key))?;
+        println!("removed {url}");
+    } else {
+        let dir = PathBuf::from(snap.path.as_deref().context("[kv.snapshot] path is not set")?);
+        let file =
+            dir.join(format!("{identity}.{}", ephpm_server::kv_snapshot::SNAPSHOT_EXTENSION));
+        match std::fs::remove_file(&file) {
+            Ok(()) => println!("removed {}", file.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("error: {}: no such file", file.display());
+                return Ok(ExitCode::FAILURE);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("remove {}", file.display())));
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn inspect(file: &Path, config: Option<&Path>, json: bool) -> anyhow::Result<ExitCode> {
