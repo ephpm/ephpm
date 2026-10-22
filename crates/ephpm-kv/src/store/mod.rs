@@ -2141,6 +2141,31 @@ impl Store {
         }
     }
 
+    /// A live string value, decoded, with its remaining TTL — both read
+    /// under one shard read guard, so the pair is consistent. `None` when
+    /// absent or expired. Does not touch the LRU clock.
+    #[must_use]
+    pub fn get_with_ttl(&self, key: &str) -> Option<(Bytes, Option<Duration>)> {
+        let entry = self.data.get(key)?;
+        let now = Instant::now();
+        let ttl = match entry.expires_at {
+            None => None,
+            Some(at) => {
+                let remaining = at.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    return None;
+                }
+                Some(remaining)
+            }
+        };
+        let value = if entry.compressed {
+            decompress_value(&entry.data, self.config.compression.algo)?
+        } else {
+            entry.data.clone()
+        };
+        Some((value, ttl))
+    }
+
     /// Visit every live string entry with its **decoded** value and
     /// remaining TTL, one shard at a time (see
     /// [`for_each_string_shard`](Self::for_each_string_shard) for the locking

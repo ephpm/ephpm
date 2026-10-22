@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ephpm_config::ClusterKvConfig;
+use ephpm_kv::store::Store;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -80,6 +81,34 @@ pub const PEER_DISCOVERY_WAIT: Duration = Duration::from_secs(10);
 #[must_use]
 pub fn transport_key(site: &str, key: &str) -> String {
     if site.is_empty() { key.to_string() } else { crate::site_namespace::encode(site, key) }
+}
+
+/// Build the entry a handoff sends for `key`: the value, its remaining TTL
+/// and the stamp recorded for it, read as one consistent pair through
+/// [`KvRouter::read_stamped`]. `None` when the key is gone, expired, or no
+/// longer large (the walk that enumerated it ran a moment earlier).
+///
+/// The walk's own copy of the value is deliberately **not** used: it was
+/// taken under the shard lock in a batch, before the stamp lookup, and a
+/// write landing in between pairs an old value with a new stamp.
+pub(crate) fn stamped_entry(
+    router: &KvRouter,
+    store: &Store,
+    source: &HandoffSource,
+    site: &str,
+    key: &str,
+) -> Option<ShareEntry> {
+    let transport_key = transport_key(site, key);
+    let ((value, ttl), stamp) = router.read_stamped(&transport_key, || store.get_with_ttl(key))?;
+    if value.len() < source.large_min_len() {
+        return None;
+    }
+    Some(ShareEntry {
+        transport_key,
+        value: value.to_vec(),
+        ttl_ms: ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)),
+        stamp: stamp.unwrap_or_else(|| source.unknown_stamp()),
+    })
 }
 
 /// What a push or pull did.
@@ -357,25 +386,19 @@ impl PeerHandoff {
                     if closed {
                         break;
                     }
-                    store.scan_strings_decoded(source.large_min_len(), |key, value, ttl| {
+                    // The scan only enumerates candidate keys; the value and
+                    // its stamp are re-read as a consistent pair per key.
+                    store.scan_strings_decoded(source.large_min_len(), |key, _value, _ttl| {
                         if closed {
                             return;
                         }
-                        let transport_key = transport_key(&site, key);
-                        let targets = targets_of(&transport_key);
+                        let targets = targets_of(&transport_key(&site, key));
                         if targets.is_empty() {
                             return;
                         }
-                        let stamp = router
-                            .applied_stamp(&transport_key)
-                            .unwrap_or_else(|| source.unknown_stamp());
-                        let entry = ShareEntry {
-                            transport_key,
-                            value: value.to_vec(),
-                            ttl_ms: ttl.map_or(0, |d| {
-                                u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
-                            }),
-                            stamp,
+                        let Some(entry) = stamped_entry(&router, &store, &source, &site, key)
+                        else {
+                            return;
                         };
                         if tx.blocking_send((entry, targets)).is_err() {
                             closed = true;

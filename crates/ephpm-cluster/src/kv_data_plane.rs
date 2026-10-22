@@ -320,11 +320,36 @@ impl KvRouter {
         out
     }
 
-    /// The last-applied stamp recorded for `transport_key`, if the record
-    /// is still within the applied horizon.
-    #[must_use]
-    pub fn applied_stamp(&self, transport_key: &str) -> Option<Stamp> {
-        self.applied.as_ref().and_then(|a| a.get(transport_key).map(|s| *s))
+    /// Read a value **together with** the stamp recorded for its key, as one
+    /// consistent pair: `read` runs while this node's applied-map slot for
+    /// `transport_key` is held, the same slot [`apply_if_newer`] holds across
+    /// its local write, so a write cannot land between the two reads.
+    ///
+    /// Reading them separately is a real bug, not a theoretical one: the
+    /// handoff walk once copied a value, then looked up the stamp, and a
+    /// replica write that landed in between left it sending the *old* value
+    /// under the *new* stamp — which then beat the real new value on every
+    /// receiver (two keys of three thousand in the lab's race scenario).
+    ///
+    /// `None` from `read` means there is nothing to send; the stamp is
+    /// `None` when the key has no record within the applied horizon.
+    pub fn read_stamped<T>(
+        &self,
+        transport_key: &str,
+        read: impl FnOnce() -> Option<T>,
+    ) -> Option<(T, Option<Stamp>)> {
+        match self.applied.as_ref() {
+            Some(applied) => {
+                // Lock order: applied slot, then (inside `read`) the store's
+                // shard — the same order `apply_if_newer` uses.
+                let slot = applied.get(transport_key);
+                let stamp = slot.as_ref().map(|s| **s);
+                let value = read()?;
+                drop(slot);
+                Some((value, stamp))
+            }
+            None => read().map(|v| (v, None)),
+        }
     }
 
     /// Land a stamped value on this node — the [`OP_SET_V2`] path, also used
@@ -725,7 +750,9 @@ async fn serve_share(
                 if closed {
                     break;
                 }
-                store.scan_strings_decoded(source.large_min_len(), |key, value, ttl| {
+                // The scan only enumerates candidate keys; the value and
+                // its stamp are re-read as a consistent pair per key.
+                store.scan_strings_decoded(source.large_min_len(), |key, _value, _ttl| {
                     if closed {
                         return;
                     }
@@ -733,15 +760,10 @@ async fn serve_share(
                     if !source.replica_includes(&membership, &requester, &transport_key) {
                         return;
                     }
-                    let stamp = router
-                        .applied_stamp(&transport_key)
-                        .unwrap_or_else(|| source.unknown_stamp());
-                    let entry = ShareEntry {
-                        transport_key,
-                        value: value.to_vec(),
-                        ttl_ms: ttl
-                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)),
-                        stamp,
+                    let Some(entry) =
+                        crate::kv_handoff::stamped_entry(&router, &store, &source, &site, key)
+                    else {
+                        return;
                     };
                     if tx.blocking_send(entry).is_err() {
                         closed = true;
@@ -1556,6 +1578,39 @@ fn take_bytes<'a>(buf: &mut &'a [u8], len: usize) -> anyhow::Result<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handoff reads a value and its stamp as one pair: with a writer
+    /// racing through `apply_stamped` (stamp n, value "n"), a reader must
+    /// never observe a value from a different write than the stamp.
+    #[test]
+    fn read_stamped_never_pairs_a_value_with_another_writes_stamp() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let applied = crate::clustered_store::new_applied_write_map();
+        let router = KvRouter::global(Arc::clone(&store)).with_applied(applied);
+        let key = "race";
+        let writer = {
+            let router = router.clone();
+            std::thread::spawn(move || {
+                for n in 1..=20_000u64 {
+                    let stamp = Stamp { write: n, node_tag: 1 };
+                    let _ = router.apply_stamped(key, n.to_string().into_bytes(), 0, stamp);
+                }
+            })
+        };
+        let mut seen = 0u64;
+        while !writer.is_finished() {
+            if let Some(((value, _ttl), stamp)) =
+                router.read_stamped(key, || store.get_with_ttl(key))
+            {
+                let v: u64 = std::str::from_utf8(&value).unwrap().parse().unwrap();
+                let s = stamp.expect("a recorded write has a stamp").write;
+                assert_eq!(v, s, "value {v} observed under stamp {s}");
+                seen += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert!(seen > 0, "the reader must have overlapped the writer");
+    }
 
     /// Spawn a data plane listener that handles a single connection.
     async fn spawn_single_handler(
