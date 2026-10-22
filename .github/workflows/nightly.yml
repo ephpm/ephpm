@@ -199,6 +199,20 @@ jobs:
           test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
           PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
 
+      - name: Free disk after the test build
+        # Every PHP-linked debug test binary carries its own copy of libphp +
+        # ICU, so the step above fills the macOS VM's disk. The job then went
+        # red in rust-cache's post step (ENOSPC writing the runner's _diag
+        # log) with the release binary already built and uploaded. The
+        # release binary lives in target/aarch64-apple-darwin, not
+        # target/debug, so dropping the test build loses nothing this job
+        # still needs. `df` before/after so the headroom is in the log.
+        if: always()
+        run: |
+          df -h . || true
+          rm -rf target/debug
+          df -h . || true
+
       - name: Verify binary
         run: |
           FILE="target/aarch64-apple-darwin/release/ephpm"

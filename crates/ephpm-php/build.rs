@@ -337,6 +337,17 @@ fn link_php(lib_dir: &Path, target_os: &str, shared: bool) {
                 }
             }
         }
+        if target_os == "macos" {
+            // The macOS SDK's ICU (and ext/intl's C++ objects) are built
+            // against Apple's libc++, which the SDK does not ship — php-config
+            // `--libs` ends in `-lc++`. Emitted here, from the crate that
+            // links libphp, so it reaches every target that links this crate:
+            // the `ephpm` binary also passes `-lc++` from its own build.rs, but
+            // rustc-link-arg never reaches a dependent package's targets, so
+            // ephpm-server's linked test binaries (`http3_e2e` first) failed
+            // with undefined `std::*` / `___cxa_*` / `___gxx_personality_v0`.
+            println!("cargo::rustc-link-lib=dylib=c++");
+        }
     }
 }
 
