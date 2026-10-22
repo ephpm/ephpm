@@ -4199,8 +4199,10 @@ pub struct WorkerConfig {
     #[serde(default = "default_worker_boot_timeout")]
     pub boot_timeout: u64,
 
-    /// Populate native PHP superglobals (`$_GET`/`$_POST`/`$_SERVER`/...) per
-    /// request in worker mode.
+    /// Populate native PHP superglobals (`$_GET`/`$_COOKIE`/`$_SERVER`) per
+    /// request in worker mode. `$_POST`/`$_FILES` are not populated: PHP's
+    /// form/multipart parser runs only at request startup, which a worker
+    /// iteration never goes through, so adapters parse `Envelope::rawBody()`.
     ///
     /// Off by default: Octane/PSR-15 adapters build their own request object
     /// from the `Envelope` and never touch superglobals. Turn this on for the
@@ -4215,8 +4217,8 @@ pub struct WorkerConfig {
     /// Request-body size (bytes) at or above which the body is *streamed* into
     /// the worker in fixed-size chunks instead of buffered whole (Phase 3).
     /// Requests with a `Content-Length` at or above this — or with no
-    /// `Content-Length` (chunked) — flow through `Envelope::bodyStream()` /
-    /// PHP's POST reader without ePHPm holding the whole body in memory,
+    /// `Content-Length` (chunked) — flow through `Envelope::bodyStream()`
+    /// without ePHPm holding the whole body in memory,
     /// keeping worker RSS flat for multi-GB uploads.
     ///
     /// Smaller requests stay on the buffered Phase-1 path (one copy each way),

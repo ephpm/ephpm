@@ -574,6 +574,10 @@ pub struct EphpmWorkerOps {
     pub response_chunk: Option<unsafe extern "C" fn(buf: *const c_char, len: usize) -> isize>,
     /// Finish the streaming response (close the body channel).
     pub response_end: Option<unsafe extern "C" fn()>,
+    /// Abandon the streaming response: producing the body failed after the
+    /// headers were sent, so the body ends in an error instead of a clean
+    /// end-of-body. Completes the iteration like `response_end`.
+    pub response_abort: Option<unsafe extern "C" fn()>,
 }
 
 // ── Thread-local per-worker state ────────────────────────────────────────
@@ -1413,6 +1417,25 @@ unsafe extern "C" fn worker_response_end() {
     finish_iteration();
 }
 
+/// C-callable `response_abort`: the body stream failed after the headers were
+/// sent (PHP's delayed out-of-memory error inside a userland stream wrapper,
+/// or an exception out of it). The worker itself may live on, so this is not
+/// the bailout path: break the body framing exactly as
+/// [`clear_in_flight_streams`] does for a dead worker, then complete the
+/// iteration as `response_end` would.
+#[cfg(php_linked)]
+unsafe extern "C" fn worker_response_abort() {
+    if clear_in_flight_streams() {
+        metrics::counter!("ephpm_worker_stream_aborts_total").increment(1);
+        tracing::error!(
+            "worker response stream failed after its headers were sent (out of memory or an \
+             exception in the body stream) — response body deliberately aborted (no \
+             terminating chunk)"
+        );
+    }
+    finish_iteration();
+}
+
 /// Copy the parallel (ptr, len) header arrays C hands to `send_response` /
 /// `response_begin` into owned `(name, value)` pairs (issue #134 — replaces
 /// parsing a `"Name: Value\n"` pack).
@@ -1483,6 +1506,7 @@ pub static WORKER_OPS: EphpmWorkerOps = EphpmWorkerOps {
     response_begin: Some(worker_response_begin),
     response_chunk: Some(worker_response_chunk),
     response_end: Some(worker_response_end),
+    response_abort: Some(worker_response_abort),
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────

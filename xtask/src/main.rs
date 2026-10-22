@@ -16,7 +16,7 @@ mod php_versions;
 /// Users may also pass a full version explicitly (e.g. "8.5.6") and the
 /// resolver will accept it as-is.
 const PHP_SDK_VERSIONS: &[(&str, &str)] =
-    &[("8.3", "8.3.33"), ("8.4", "8.4.23"), ("8.5", "8.5.11")];
+    &[("8.3", "8.3.36"), ("8.4", "8.4.27"), ("8.5", "8.5.12")];
 
 /// EXPERIMENTAL: PHP minors published only as an upstream pre-release (beta/RC).
 ///

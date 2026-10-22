@@ -72,7 +72,10 @@ populate_superglobals = true      # REQUIRED for WordPress
 `[php.worker] populate_superglobals = true` is **required**: unlike Octane/PSR-15
 adapters (which build their own request object from the `Envelope`), WordPress
 assumes real `$_GET`/`$_POST`/`$_SERVER`/`$_COOKIE` superglobals. ePHPm
-repopulates them per request through PHP's normal `treat_data` path.
+repopulates `$_GET`, `$_SERVER` and `$_COOKIE` per request through PHP's normal
+`treat_data` path. It does not populate `$_POST` or `$_FILES` in worker mode;
+the adapter parses the request body from the `Envelope` into `$_POST`/`$_FILES`
+(and rebuilds `$_REQUEST`) itself.
 
 `[php.worker] script` must resolve to a file under `document_root`, so the adapter
 must be installed inside the WordPress root.
