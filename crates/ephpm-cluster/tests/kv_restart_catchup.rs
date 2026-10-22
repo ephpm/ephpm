@@ -295,15 +295,18 @@ async fn cold_node_reads_own_writes_locally_and_everything_else_through_peers() 
     assert!(r.clustered.is_cold());
     // Wait for the failure detector to call A alive (the join wait covers it).
     wait_alive(&[&a, &r], 2, Duration::from_secs(15)).await;
-    assert!(
-        wait_until(
-            || r.clustered.catch_up_stats().cold && r.local.get("theirs").is_some(),
-            Duration::from_secs(10)
-        )
-        .await
-            || !r.clustered.is_cold(),
-        "A's small state arrives quickly"
-    );
+    // The gate's peer list follows the failure detector by one poll, and A's
+    // advertised data port rides gossip; until both have landed a cold read
+    // is a deliberate miss. Poll until the peer answers (or the gate opens).
+    let peer_answers = wait_until(
+        || {
+            !r.clustered.is_cold()
+                || r.local.get_through("theirs").as_deref() == Some(b"peer-value".as_slice())
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(peer_answers, "A must answer cold reads: {:?}", r.clustered.catch_up_stats());
     if r.clustered.is_cold() {
         // Own write: local, no peer asked.
         let before = r.clustered.catch_up_stats();
