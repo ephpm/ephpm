@@ -40,7 +40,23 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] =
 /// `cargo xtask php-sdk 8.6` resolve to the pinned beta once its SDK is
 /// published at github.com/ephpm/php-sdk. Not GA — do not document 8.6 as
 /// supported.
-const EXPERIMENTAL_PHP_VERSIONS: &[(&str, &str)] = &[("8.6", "8.6.0beta1")];
+///
+/// EMPTY ON PURPOSE (v0.13.0). The only published pre-release SDK, php-sdk
+/// `v8.6.0beta1`, predates the php-src fix for CVE-2026-109618/109619
+/// (php-src 31c0ea7d7f — the `memory_hard_limit_percent` hard limit that
+/// ePHPm's per-request containment relies on); php-src `php-8.6.0beta1`
+/// through `beta3` lack it, and the first 8.6 tag that carries it is
+/// `php-8.6.0RC4`. With `("8.6", "8.6.0beta1")` here, `release-php-beta.yml`
+/// would publish a `v<tag>-php8.6.0beta1` pre-release built on vulnerable PHP
+/// after every stable release. With the table empty, both experimental
+/// matrices are `[]`, every beta build job self-skips, and the publish job is
+/// skipped too, so the lane is a no-op.
+///
+/// To re-enable: publish a php-sdk pre-release built from a php-src tag that
+/// contains the fix (8.6.0RC4 or later; check that the SDK's headers declare
+/// `ZEND_HAS_OOM` and `zend_set_memory_hard_limit_percent`), then add it here,
+/// e.g. `&[("8.6", "8.6.0RC4")]`.
+const EXPERIMENTAL_PHP_VERSIONS: &[(&str, &str)] = &[];
 
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
@@ -54,9 +70,10 @@ const DEFAULT_PHP_MINOR: &str = "8.5";
 ///   * `tailcall_matrix` = `PHP_SDK_VERSIONS` ∩ this set — the GA TAILCALL legs
 ///     of `release.yml`'s gating-adjacent `build-windows-tailcall` job (8.5).
 ///   * `experimental_tailcall_matrix` = `EXPERIMENTAL_PHP_VERSIONS` ∩ this set —
-///     the non-gating beta TAILCALL leg of `release-php-beta.yml` (8.6 today).
+///     the non-gating beta TAILCALL leg of `release-php-beta.yml` (empty while
+///     `EXPERIMENTAL_PHP_VERSIONS` is empty).
 ///
-/// 8.6 lives only in `EXPERIMENTAL_PHP_VERSIONS`, so listing it here does not add
+/// 8.6 is never in `PHP_SDK_VERSIONS`, so listing it here does not add
 /// it to the gating `tailcall_matrix` (which filters `PHP_SDK_VERSIONS`).
 const TAILCALL_MINORS: &[&str] = &["8.5", "8.6"];
 

@@ -830,7 +830,7 @@ This is the same approach FrankenPHP uses.
 | PHP 8.3 | Active support (until Dec 2026) | **Supported — in CI (pinned 8.3.36)** |
 | PHP 8.4 | Active support (until Dec 2027) | **Supported — in CI (pinned 8.4.27)** |
 | PHP 8.5 | Active support | **Supported — in CI (pinned 8.5.12)** |
-| PHP 8.6 | Beta (8.6.0beta1, Aug 2026) | Experimental — pre-release, not GA. Built by the non-gating `release-php-beta.yml` lane against a beta SDK, automatically after every successful stable `v*` release (and on manual dispatch). Published as a **separate** `v<ref>-php<beta>` pre-release; never part of, and never able to block, the stable release. Windows/clang-TAILCALL beta legs are attached only once their php-sdk beta SDKs exist. |
+| PHP 8.6 | Pre-release (beta/RC, 2026) | Not built at the moment. The non-gating `release-php-beta.yml` lane builds against whatever pre-release SDK xtask's `EXPERIMENTAL_PHP_VERSIONS` pins and publishes it as a **separate** `v<ref>-php<beta>` pre-release after every successful stable `v*` release. That table is empty as of v0.13.0: the only published 8.6 SDK (8.6.0beta1) predates the PHP fix for CVE-2026-109618/109619, so the lane does nothing until an SDK built from 8.6.0RC4 or later is pinned. The `v<ref>-php8.6.0beta1` pre-releases it published earlier (v0.11.1 through v0.12.0) are built on that unpatched beta. |
 
 ### Release Naming
 

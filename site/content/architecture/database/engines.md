@@ -179,9 +179,21 @@ per write for as long as the process runs. Measured on the same harness:
   **6.5 GB**, growing linearly, because every CDC tailer is a continuous
   reader.
 
-Idle connections hold no read slot; only the engine's close-of-last-connection
-checkpoint ever shrank the file, which is why per-site databases used to shrink
-only when the LRU evicted them.
+Idle connections hold no read slot, but nothing else rewinds the log either.
+The engine has a truncating checkpoint that runs when a database's last
+connection is closed explicitly, but the Turso Rust SDK has no `close()`:
+dropping its handles (an LRU eviction of a per-site database, or process exit)
+only releases locks and memory maps and never runs that checkpoint. So the
+`-wal` file kept every frame until the process exited, and the next start had
+to recover it.
+
+Outside the gate below, ePHPm truncates logs explicitly at exit, in two
+places. `ephpm serve`'s graceful shutdown runs a final
+`PRAGMA wal_checkpoint(TRUNCATE)` on every database it has open. When
+`ephpm php --site` opens a site database directly (offline, no server running),
+it has no gate, but it runs the same checkpoint once PHP is done. It retries a
+`busy` answer for up to 10 s, then exits with a WARN and leaves the log for the
+next opener to recover.
 
 **The workaround is litewire's WAL checkpoint gate**, which ePHPm installs on
 every embedded-Turso factory. It is always on and **not configurable**: there

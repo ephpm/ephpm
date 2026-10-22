@@ -1360,8 +1360,8 @@ const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_se
 /// `error_log` file configured, PHP's log lines reach ePHPm's own log through
 /// the SAPI `log_message` hook. `ephpm dev` keeps diagnostics on screen.
 ///
-/// These are written *first* into the generated ini, so `[php] ini_file`,
-/// `[php] ini_overrides` and per-site overrides all win over them.
+/// These are written *first* into the generated ini, so `[php] ini_file` and
+/// `[php] ini_overrides` both win over them.
 fn error_display_ini_defaults(dev_mode: bool) -> [(&'static str, &'static str); 3] {
     if dev_mode {
         [("display_errors", "On"), ("display_startup_errors", "On"), ("log_errors", "On")]
@@ -1828,7 +1828,7 @@ fn run_with_config(
 
             let mut content = String::new();
             // Error display/logging defaults, first so `ini_file` and
-            // `ini_overrides` (and per-site overrides at request time) win.
+            // `ini_overrides` win.
             // Serve never renders PHP diagnostics into the HTTP response —
             // they carry absolute filesystem paths — and logs them to ePHPm's
             // own log instead. Dev keeps them on screen. Worker mode also
@@ -1913,8 +1913,7 @@ fn run_with_config(
                 let _ = writeln!(content, "{k}={v}");
             }
             // Native max_execution_time (per-thread execution timers only).
-            // Written before ini_overrides and before any per-site ini_overrides
-            // are replayed at request time, so an explicit override still wins.
+            // Written before ini_overrides, so an explicit override still wins.
             // PHP arms/disarms its own per-thread POSIX timer from this value on
             // each php_request_startup/shutdown; set_time_limit() re-arms it live.
             #[cfg(php_max_exec_timers)]

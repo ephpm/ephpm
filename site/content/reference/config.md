@@ -657,7 +657,7 @@ alt_svc_max_age = 86400
 | `realpath_cache_ttl` | u32 (sec) | `600` (serve) | Override `realpath_cache_ttl`. Serve uses `600` (vs PHP's `120`); dev keeps the PHP default. |
 | `zend_assertions` | i8 | `-1` (serve) / `1` (dev) | Override `zend.assertions`. Serve uses `-1` (assertions compiled out — zero runtime cost, production-recommended); dev uses `1` (assertions active). Set `-1`/`0`/`1` to pin. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
-| `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. ePHPm seeds mode-dependent error defaults **before** `ini_file`/`ini_overrides` (either one, and per-site overrides, can override them): under `ephpm serve`, `display_errors=Off`, `display_startup_errors=Off`, `log_errors=On`, so PHP warnings/notices/fatals — which quote the script's absolute filesystem path — never render into an HTTP response and instead appear in ePHPm's own log on the `php` target (fatal/parse → ERROR, warning → WARN, notice/deprecated → INFO), unless you configure an `error_log` file; under `ephpm dev` / bare `ephpm`, `display_errors=On` (plus `log_errors=On`). Worker mode follows the same defaults, so worker boot fatals always reach the log. Through v0.11.3, ePHPm set no `display_errors` line and PHP's compiled-in `display_errors=1` applied in every mode — set `[["display_errors", "On"]]` to restore it. `ephpm php` is unaffected (php-cli defaults). |
+| `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. Server-wide: there is no per-site INI setting. ePHPm seeds mode-dependent error defaults **before** `ini_file`/`ini_overrides` (either one can override them): under `ephpm serve`, `display_errors=Off`, `display_startup_errors=Off`, `log_errors=On`, so PHP warnings/notices/fatals — which quote the script's absolute filesystem path — never render into an HTTP response and instead appear in ePHPm's own log on the `php` target (fatal/parse → ERROR, warning → WARN, notice/deprecated → INFO), unless you configure an `error_log` file; under `ephpm dev` / bare `ephpm`, `display_errors=On` (plus `log_errors=On`). Worker mode follows the same defaults, so worker boot fatals always reach the log. Through v0.11.3, ePHPm set no `display_errors` line and PHP's compiled-in `display_errors=1` applied in every mode — set `[["display_errors", "On"]]` to restore it. `ephpm php` is unaffected (php-cli defaults). |
 | `extensions` | array of string | `[]` | Shared PHP extensions loaded at startup as `extension=` lines in the generated php.ini, emitted **before** `ini_file`/`ini_overrides`. Bare names (`"redis"`) use PHP's `extension_dir` search; paths load verbatim (values are written double-quoted with `\`, `"` and `$` escaped, so PHP reads them back literally). A library that exports `zend_extension_entry` and `extension_version_info` (a **Zend extension** — Xdebug, OPcache-style) is detected by inspecting the file and emitted as `zend_extension=` instead, with a relative path made absolute against the working directory (PHP resolves a relative `zend_extension` against `extension_dir`); bare names are inspected only when `extension_dir` is known (an `ini_overrides` entry, else the compiled-in default). Must match the embedded PHP's ABI: same PHP minor, ZTS (every platform, Windows included), glibc on Linux — PHP reports a mismatch at startup. Note distro/[Sury](https://deb.sury.org/) extension packages are NTS-only (no ZTS variants as of July 2026) — on Linux, compile the extension for ZTS (phpize/gcc against matching ZTS headers). On Windows only the shared-engine build (`--variant shared`) can load extension DLLs; the default static Windows build refuses a non-empty `extensions` at startup. Empty entries fail validation. See the [PHP Extensions guide](/guides/php-extensions/). |
 | `mode` | enum | `"per_request"` | Request-execution model. `"per_request"` (default) = php-fpm-shaped: full `php_request_startup`/`shutdown` per request on ePHPm's dedicated PHP thread pool. `"worker"` = persistent worker mode: boot the framework once per worker, loop over requests (Octane/RoadRunner model); worker-only knobs live in [`[php.worker]`](#phpworker). Any other value — including the pre-v0.9.0 `"fpm"` — is a **startup error naming the key**, never a silent fallback. Env: `EPHPM_PHP__MODE=worker`. |
 | `concurrency` | usize | `0` (derive) | Max PHP requests executing concurrently — the execution-pool size in **both** modes (per-request thread pool / persistent worker pool). `0` derives it: from the cgroup CPU quota when running under one (Linux), otherwise from host parallelism — clamped `[2, 32]` on **both** paths. The floor is 2, never 1: a 1-thread pool deadlocks a PHP loopback subrequest (a script HTTP-requesting its own server holds the only thread while waiting for a response that needs that thread — #461), and `--cpus 1` is a common container shape. An explicit value is used as-is, including `1`. The pool is separate from tokio's blocking pool, so capping PHP never caps static-file serving. Startup logs the effective value and its source at INFO. Env: `EPHPM_PHP__CONCURRENCY=8`. |
@@ -732,8 +732,12 @@ Sizing guidance:
 - Only operators set `memory_hard_limit_percent`. Upstream registers it
   `PHP_INI_ALL`; ePHPm lowers it to system-only at startup, so `ini_set()` and
   `ini_restore()` on it return `false` and leave the value unchanged, while
-  php.ini, `[php] ini_overrides` and a site's `ini_overrides` still apply. The
-  CLI (`ephpm php`) keeps the upstream behaviour. `memory_limit` stays
+  `[php] ini_file` and `[php] ini_overrides` still apply. Both are
+  server-wide: there is no per-site INI setting (a [per-site override
+  file](#per-site-override-files-site_overrides_dir) accepts only
+  `document_root`, `auto_prepend_file` and `[preview_auth]`), so every site on a
+  server shares one `memory_hard_limit_percent`. The CLI (`ephpm php`) keeps
+  the upstream behaviour. `memory_limit` stays
   `PHP_INI_ALL` as upstream ships it, so a script can still raise its own soft
   limit, and with it the hard limit (which is a percentage of it). A tenant can
   therefore always reach the hard limit on purpose; on Linux that costs only
@@ -742,8 +746,8 @@ Sizing guidance:
 ### Where PHP errors go
 
 ePHPm writes mode-dependent error defaults at the top of the php.ini it
-generates, so `[php] ini_file`, `[php] ini_overrides` and per-site overrides
-all win over them:
+generates, so `[php] ini_file` and `[php] ini_overrides` both win over them
+(there is no per-site INI setting):
 
 | Mode | `display_errors` | `display_startup_errors` | `log_errors` |
 |------|------------------|--------------------------|--------------|

@@ -73,8 +73,9 @@ fn experimental_matrix_json() -> String {
 ///
 /// The matrix for `release-php-beta.yml`'s non-gating `build-windows-tailcall`
 /// (clang) job — the `EXPERIMENTAL_PHP_VERSIONS` minors that are TAILCALL-capable
-/// (`TAILCALL_MINORS`, 8.5+). 8.6.0beta1 today. Empty (`[]`) when no such beta is
-/// pinned, which expands to zero matrix runs — the leg self-skips. Kept separate
+/// (`TAILCALL_MINORS`, 8.5+). Empty (`[]`) when no such beta is pinned — as
+/// today, see `EXPERIMENTAL_PHP_VERSIONS` — which expands to zero matrix runs,
+/// so the leg self-skips. Kept separate
 /// from `tailcall_matrix` so a beta never enters the GA TAILCALL matrix.
 fn experimental_tailcall_matrix_json() -> String {
     let items: Vec<String> = EXPERIMENTAL_PHP_VERSIONS
@@ -262,6 +263,17 @@ mod tests {
             // No trailing/leading commas, one more `{` than `},{` separators.
             assert_eq!(inner.matches('{').count(), objects, "object/comma mismatch: {json}");
             assert!(!inner.contains(",,") && !inner.starts_with(',') && !inner.ends_with(','));
+        }
+    }
+
+    /// The experimental matrices render as the literal `[]` when the table is
+    /// empty — `release-php-beta.yml` compares against exactly that string to
+    /// skip every job, so `[ ]` or similar would re-enable the lane.
+    #[test]
+    fn empty_experimental_table_renders_as_bare_brackets() {
+        if EXPERIMENTAL_PHP_VERSIONS.is_empty() {
+            assert_eq!(experimental_matrix_json(), "[]");
+            assert_eq!(experimental_tailcall_matrix_json(), "[]");
         }
     }
 }

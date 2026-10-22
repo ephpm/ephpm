@@ -326,8 +326,9 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   `_exit(137)` ePHPm contains to that request on Linux but which ends the whole
   process on macOS and Windows. What a tenant cannot do is move that limit
   itself: ePHPm makes `memory_hard_limit_percent` system-only, so `ini_set()` on
-  it returns `false`; only php.ini and `ini_overrides` (server-wide or per site)
-  set it.
+  it returns `false`; only the operator's `[php] ini_file` and
+  `[php] ini_overrides` set it, and both are server-wide (there is no per-site
+  INI setting).
 - **Server endpoints are process-wide.** See the next section.
 
 ### Server endpoints are not tenant-scoped

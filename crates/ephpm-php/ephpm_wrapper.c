@@ -3769,10 +3769,12 @@ static const zend_function_entry ephpm_worker_envelope_methods[] = {
  * thread's request with _exit(137) — contained on Linux, process-fatal on
  * macOS and Windows — so in a multi-tenant server a tenant must not be able to
  * `ini_set()` it down to 100. Lowering the entry's `modifiable` to SYSTEM makes
- * ini_set()/ini_restore() (ZEND_INI_USER) fail and return false, while php.ini,
- * `[php] ini` (sapi ini_entries, applied at registration) and the per-site
- * overrides (applied with PHP_INI_SYSTEM by ephpm_request_ini_apply) still set
- * it.
+ * ini_set()/ini_restore() (ZEND_INI_USER) fail and return false, while php.ini
+ * (ePHPm's generated one carries `[php] ini_file` and `[php] ini_overrides`,
+ * both server-wide) still sets it. The per-request channel
+ * (ephpm_request_ini_apply, PHP_INI_SYSTEM) could set it too, but the router
+ * only ever puts its own derived per-vhost keys there (open_basedir, temp and
+ * session dirs, auto_prepend_file) — there is no per-site INI setting.
  *
  * Runs from this module's MINIT, i.e. inside php_module_startup() and before
  * zend_post_startup(): there EG(ini_directives) IS the registered table that
