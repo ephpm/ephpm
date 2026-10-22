@@ -2193,15 +2193,53 @@ pub async fn spawn_deferred(
     stats: QueryStats,
     health: Arc<ProxyHealth>,
 ) -> Result<tokio::task::JoinHandle<()>, DbError> {
-    let db_url = Arc::new(DbUrl::parse(url)?);
+    // Parse before binding: a malformed URL must fail startup with nothing
+    // bound.
+    DbUrl::parse(url)?;
     let listener = TcpListener::bind(listen).await?;
+    spawn_deferred_on(
+        url,
+        listener,
+        socket,
+        pool_config,
+        reset_strategy,
+        replica_urls,
+        rw_split,
+        stats,
+        health,
+    )
+}
+
+/// [`spawn_deferred`] on a listener the caller has already bound.
+///
+/// Identical behaviour, minus the bind. This exists so a caller that must
+/// own the port for its whole lifetime — chiefly tests, which otherwise have
+/// to discover a free port, release it and hope nothing else claims it
+/// before the proxy rebinds it — can hand over the socket instead.
+///
+/// # Errors
+///
+/// Returns an error if the URL is malformed, or if the listener's local
+/// address cannot be read.
+pub fn spawn_deferred_on(
+    url: &str,
+    listener: TcpListener,
+    socket: Option<std::path::PathBuf>,
+    pool_config: PoolConfig,
+    reset_strategy: ResetStrategy,
+    replica_urls: Vec<String>,
+    rw_split: RwSplitParams,
+    stats: QueryStats,
+    health: Arc<ProxyHealth>,
+) -> Result<tokio::task::JoinHandle<()>, DbError> {
+    let db_url = Arc::new(DbUrl::parse(url)?);
+    let listen_owned = listener.local_addr()?.to_string();
     info!(
-        listen = %listen,
+        listen = %listen_owned,
         upstream = %db_url.addr(),
         "MySQL proxy listening (upstream connect continues in the background)"
     );
 
-    let listen_owned = listen.to_string();
     let listener = Arc::new(listener);
     Ok(tokio::spawn(async move {
         // Fail-fast guard for a long outage; aborted the moment the upstream

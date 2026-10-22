@@ -13,7 +13,10 @@
 //!
 //! Everything here runs against an in-process mock `MySQL` server, so the
 //! tests need no container and run in ordinary CI. The mock is deliberately
-//! started *late* — that is the whole point.
+//! started *late* — that is the whole point. "Late" means its port is
+//! reserved (bound, not listening, so connections are refused) for the
+//! whole test and only starts listening when the test says so; the port is
+//! never released and re-bound, which raced parallel test processes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +28,7 @@ use ephpm_db::health::{ProxyHealth, RetryBudget};
 use ephpm_db::mysql::RwSplitParams;
 use ephpm_db::pool::PoolConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 // ── MySQL packet framing (test-local, deliberately independent of the crate) ──
 
@@ -89,37 +92,43 @@ fn handshake_response() -> Vec<u8> {
 
 // ── A mock MySQL backend that can be started whenever the test wants ─────────
 
-/// Reserve a loopback port and release it, so a backend can be bound there
-/// later. Between the release and the late `start_mock_backend_on`, the
-/// address is exactly what the bug needs: routable but refusing connections.
+/// A loopback port held for the whole test but **not listening**.
 ///
-/// This is a deliberate bind-drop pattern, unlike the rebind race fixed in
-/// the proxy integration tests (`run_on` with a held listener): these tests
-/// *require* an address with nothing listening, and a held listener would
-/// accept connections into its backlog. There is no portable way to reserve
-/// a TCP port as "refusing". The residual cross-process TOCTOU — another
-/// test binding `:0` could be issued this port before the late rebind —
-/// fails closed on both rebind paths: `spawn_deferred` refuses to start on
-/// an occupied listen port (see `bind_failure_is_an_error_not_a_warning`)
-/// and `start_mock_backend_on` panics if its bind fails, so neither silently
-/// proceeds against another test's socket. What remains is a theoretical
-/// assertion flake — a stranger binding a reserved *upstream* port and
-/// speaking MySQL could flip `ever_connected` early — which the kernel's
-/// aversion to immediate ephemeral-port reuse makes vanishingly rare, and
-/// which cannot reproduce the wrong-backend mid-session failure mode the
-/// proxy tests had: nothing here ever exchanges application traffic with a
-/// socket it did not bind or verify by handshake.
-async fn reserve_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("reserve port");
-    let addr = listener.local_addr().expect("reserved addr");
-    drop(listener);
-    addr
+/// The socket is bound and never `listen()`ed, so the address is exactly
+/// what #226 needs — routable, but refusing connections (with no listener
+/// the kernel answers a SYN with RST) — while the port stays ours: this
+/// socket does not set `SO_REUSEADDR`, so no other `bind` can be issued the
+/// port. When a test wants the upstream to "appear", [`start_mock_backend`]
+/// calls `listen()` on this same socket.
+///
+/// This replaces a bind-drop-rebind pattern (`bind(:0)`, read the port,
+/// drop the listener, rebind later) that raced every other process on the
+/// host for the port in between. Under parallel `nextest` load it lost both
+/// ways: the late rebind failed with `EADDRINUSE`, or another test binary's
+/// mock `MySQL` backend took the port, so a test whose upstream "never comes
+/// up" got a handshake from a stranger's backend.
+struct ReservedPort {
+    socket: TcpSocket,
+    addr: SocketAddr,
 }
 
-/// Bind a mock `MySQL` server on `addr`. Returns the count of accepted
-/// backend connections.
-async fn start_mock_backend_on(addr: SocketAddr) -> Arc<AtomicUsize> {
-    let listener = TcpListener::bind(addr).await.expect("bind mock backend");
+fn reserve_port() -> ReservedPort {
+    let socket = TcpSocket::new_v4().expect("create socket");
+    socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("reserve port");
+    let addr = socket.local_addr().expect("reserved addr");
+    ReservedPort { socket, addr }
+}
+
+/// A loopback listener for the proxy itself, owned from the start and handed
+/// straight to `spawn_deferred_on` — no window in which the port is free.
+async fn proxy_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0").await.expect("bind proxy listener")
+}
+
+/// Start listening on the reserved port and serve a mock `MySQL` server
+/// there. Returns the count of accepted backend connections.
+fn start_mock_backend(reserved: ReservedPort) -> Arc<AtomicUsize> {
+    let listener = reserved.socket.listen(1024).expect("listen on the reserved mock backend port");
     let connects = Arc::new(AtomicUsize::new(0));
     let connects_task = Arc::clone(&connects);
     tokio::spawn(async move {
@@ -167,13 +176,15 @@ fn test_pool_config() -> PoolConfig {
     }
 }
 
-/// Start a proxy on a free port with the deferred (production) startup path.
+/// Start a proxy with the deferred (production) startup path, on a listener
+/// this process owns from the start.
 async fn spawn_proxy(upstream: SocketAddr) -> (String, Arc<ProxyHealth>) {
-    let listen = reserve_addr().await.to_string();
+    let listener = proxy_listener().await;
+    let listen = listener.local_addr().expect("proxy addr").to_string();
     let health = ProxyHealth::new("mysql", listen.clone(), upstream.to_string());
-    ephpm_db::mysql::spawn_deferred(
+    ephpm_db::mysql::spawn_deferred_on(
         &format!("mysql://root@{upstream}/test"),
-        &listen,
+        listener,
         None,
         test_pool_config(),
         ResetStrategy::Smart,
@@ -182,8 +193,7 @@ async fn spawn_proxy(upstream: SocketAddr) -> (String, Arc<ProxyHealth>) {
         ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
         Arc::clone(&health),
     )
-    .await
-    .expect("spawn_deferred must succeed without a reachable upstream");
+    .expect("spawn_deferred_on must succeed without a reachable upstream");
     (listen, health)
 }
 
@@ -219,8 +229,8 @@ async fn client_handshake(sock: &mut TcpStream) -> Result<(), String> {
 /// was no proxy and no socket. Now the socket exists immediately.
 #[tokio::test]
 async fn listener_is_bound_before_the_upstream_exists() {
-    let upstream = reserve_addr().await; // nothing is listening there
-    let (listen, health) = spawn_proxy(upstream).await;
+    let upstream = reserve_port(); // held, but nothing is listening there
+    let (listen, health) = spawn_proxy(upstream.addr).await;
 
     let client = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&listen))
         .await
@@ -236,14 +246,14 @@ async fn listener_is_bound_before_the_upstream_exists() {
 /// server — must be picked up by the retry loop.
 #[tokio::test]
 async fn upstream_that_appears_late_is_picked_up() {
-    let upstream = reserve_addr().await;
-    let (listen, health) = spawn_proxy(upstream).await;
+    let upstream = reserve_port();
+    let (listen, health) = spawn_proxy(upstream.addr).await;
 
     // The proxy is now burning connect attempts against a dead address.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!health.ever_connected(), "sanity: nothing to connect to yet");
 
-    let backend_connects = start_mock_backend_on(upstream).await;
+    let backend_connects = start_mock_backend(upstream);
 
     assert!(
         await_first_connect(&health, Duration::from_secs(15)).await,
@@ -263,15 +273,15 @@ async fn upstream_that_appears_late_is_picked_up() {
 /// makes PHP's first request survive a cold start rather than 500.
 #[tokio::test]
 async fn client_connected_before_the_upstream_is_served_from_the_backlog() {
-    let upstream = reserve_addr().await;
-    let (listen, health) = spawn_proxy(upstream).await;
+    let upstream = reserve_port();
+    let (listen, health) = spawn_proxy(upstream.addr).await;
 
     // Connect while the upstream is still dead and hold the socket.
     let mut early_client =
         TcpStream::connect(&listen).await.expect("connect must succeed into the backlog");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    start_mock_backend_on(upstream).await;
+    start_mock_backend(upstream);
     assert!(await_first_connect(&health, Duration::from_secs(15)).await);
 
     // The connection made before any upstream existed now gets its greeting.
@@ -290,8 +300,8 @@ async fn client_connected_before_the_upstream_is_served_from_the_backlog() {
 /// first cut of the fix traded a fast 500 for a 300 s hang.
 #[tokio::test]
 async fn a_long_dead_upstream_closes_clients_instead_of_hanging_them() {
-    let upstream = reserve_addr().await; // never comes up
-    let (listen, health) = spawn_proxy(upstream).await;
+    let upstream = reserve_port(); // held for the whole test, never listens
+    let (listen, health) = spawn_proxy(upstream.addr).await;
 
     tokio::time::sleep(ephpm_db::health::BACKLOG_GRACE + Duration::from_millis(750)).await;
     assert!(!health.ever_connected(), "sanity: the upstream never appeared");
@@ -348,13 +358,17 @@ async fn bind_failure_is_an_error_not_a_warning() {
 }
 
 /// A malformed URL is likewise fatal at startup, before anything is bound.
+///
+/// The listen address is `:0`, which always binds: if URL parsing ever moved
+/// after the bind, this would start a proxy and return `Ok`, not pass
+/// vacuously on a port collision.
 #[tokio::test]
 async fn malformed_url_is_an_error() {
-    let listen = reserve_addr().await.to_string();
-    let health = ProxyHealth::new("mysql", listen.clone(), "unparsed".to_string());
+    let listen = "127.0.0.1:0";
+    let health = ProxyHealth::new("mysql", listen.to_string(), "unparsed".to_string());
     let result = ephpm_db::mysql::spawn_deferred(
         "not-a-database-url",
-        &listen,
+        listen,
         None,
         test_pool_config(),
         ResetStrategy::Smart,

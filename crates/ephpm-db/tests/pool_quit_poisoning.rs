@@ -317,10 +317,15 @@ fn test_pool_config() -> PoolConfig {
 /// Deliberately does **not** start the pool maintenance task: no background
 /// warmer, no background health check. Every recovery observed in these tests
 /// is therefore attributable to the request path itself.
+///
+/// The listener is bound here and handed to `run_on`, never released: a
+/// bind-drop-rebind left a window in which another test process could be
+/// issued the port, and the readiness poll that followed would then have
+/// "found" a stranger's server. A held listener is live on return; early
+/// clients queue in the accept backlog until `run_on` starts accepting.
 async fn start_proxy(backend: &MockBackend, reset_strategy: ResetStrategy) -> String {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind for port discovery");
-    let listen = probe.local_addr().expect("probe addr").to_string();
-    drop(probe);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy listener");
+    let listen = listener.local_addr().expect("proxy addr").to_string();
 
     let proxy = MySqlProxy::new(
         &backend.url(),
@@ -338,18 +343,12 @@ async fn start_proxy(backend: &MockBackend, reset_strategy: ResetStrategy) -> St
     .expect("build MySqlProxy against mock backend");
 
     tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
+        if let Err(e) = proxy.run_on(Arc::new(listener)).await {
             eprintln!("mock proxy stopped: {e}");
         }
     });
 
-    for _ in 0..100 {
-        if TcpStream::connect(&listen).await.is_ok() {
-            return listen;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("proxy never became ready at {listen}");
+    listen
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
