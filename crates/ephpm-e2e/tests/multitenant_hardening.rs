@@ -17,7 +17,7 @@
 //! - `EPHPM_URL` — base URL of the ephpm instance
 //! - `EPHPM_SITES_DIR` — writable path to the sites directory on the ephpm host
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ephpm_e2e::required_env;
 
@@ -38,7 +38,7 @@ async fn get_with_host(base_url: &str, host: &str, path: &str) -> (u16, String) 
     (status, body)
 }
 
-fn deploy_site(sites: &PathBuf, hostname: &str, php_filename: &str, php_content: &str) {
+fn deploy_site(sites: &Path, hostname: &str, php_filename: &str, php_content: &str) {
     let site_dir = sites.join(hostname);
     let _ = std::fs::remove_dir_all(&site_dir);
     std::fs::create_dir_all(&site_dir)

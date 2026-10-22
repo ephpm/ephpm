@@ -15,8 +15,6 @@ struct SqliteResponse {
     #[serde(default)]
     rows: Vec<serde_json::Value>,
     #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     message: Option<String>,

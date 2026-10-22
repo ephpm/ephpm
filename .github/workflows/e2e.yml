@@ -31,8 +31,9 @@ on:
 # Cap how many of these land on the ephemerd fleet at once.
 #
 # Bare-process runs are independent *of each other* — each job spawns ephpm on
-# high, per-run loopback ports and cleans up on exit, so there is no port or
-# state collision. That was the original reason this workflow had no
+# loopback ports picked at random per run (xtask/src/e2e_bare.rs, PORT_RANGE)
+# and cleans up on exit, so there is no port or state collision even if two
+# legs share a network namespace. That was the original reason this workflow had no
 # `concurrency` group at all. What that reasoning missed is the host: every leg
 # does a full `lto = "fat"`, `codegen-units = 1` release build of the whole
 # workspace plus a statically linked PHP (~2.3 GB peak RSS in the final rustc

@@ -17,11 +17,25 @@
 //!   cluster.rs` (and future cluster suites) needs 3 nodes; single-node tests
 //!   just need one. The env vars set here mirror what the old Kind harness
 //!   exported so existing test files don't need to change.
+//!
+//! - **No fixed ports.** Every listener a node opens — HTTP, the SQLite wire
+//!   frontends, the KV RESP listener, a cluster node's gossip/channel/KV-data
+//!   ports — is drawn at random from [`PORT_RANGE`], held by a probe socket
+//!   until the node is spawned, and then *proven* to be the node's own (it
+//!   must log binding it). A node that loses a port anyway is respawned on a
+//!   fresh set (see [`SPAWN_ATTEMPTS`]). The suites learn the ports from the
+//!   environment (`EPHPM_URL`, `EPHPM_KV_PORT`, `EPHPM_HRANA_URL`, ...) and the
+//!   docroot's PHP from `DB_HOST`/`DB_PORT` in the node's process environment.
+//!   The fixed ports this harness used to hard-code (18100, 3306, 6379, ...)
+//!   meant two runs on one host — or one run and a leftover process from an
+//!   earlier fixture — answered each other's health checks and served each
+//!   other's suites.
 
 use std::collections::BTreeMap;
+use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io, thread};
 
 use crate::{DEFAULT_PHP_MINOR, canonicalize_portable, release, workspace_root};
@@ -51,9 +65,8 @@ const CLUSTER_SUITES: &[&str] = &["cluster"];
 /// but NOT this intra-suite races; serial execution does. These suites are
 /// short, so the serial cost is negligible.
 ///
-/// Each of these reuses the single-node DB-proxy ports (3306, ...), so they
-/// run strictly sequentially -- spawned, run, torn down -- one at a time,
-/// BEFORE the shared node claims those ports.
+/// Each of these runs strictly sequentially -- spawned, run, torn down -- one
+/// at a time, on its own freshly reserved ports.
 ///
 /// `db_bridge` is DB-stateful for the same reason as `sqlite` (it
 /// creates/drops its own table and asserts exact row counts), it just
@@ -81,7 +94,7 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 ];
 
 /// Single-node suites that need a bespoke server config and their own fresh
-/// node (also sequential, also reusing the single-node ports).
+/// node (also sequential, each on freshly reserved ports).
 ///
 /// `opcache_invalidation` needs `[opcache] cluster_invalidation = true` (off by
 /// default in single-node mode) AND a config where the default document_root
@@ -268,7 +281,7 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// **no** node for them and hands them only `EPHPM_BINARY` (plus
 /// `EXPECTED_PHP_VERSION`). Each such suite spawns, kills, and restarts its
 /// own processes on freshly-reserved loopback ports, so it cannot collide
-/// with the fixed-port fixtures spawned later in the run.
+/// with the fixtures spawned later in the run.
 ///
 /// `turso_cdc` is here because its scenarios are process-lifecycle tests:
 /// electing a primary among nodes it can kill, and cold-bootstrapping a node
@@ -283,7 +296,7 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// 2-node cluster from the library fixture and asserts both nodes serve PHP.
 /// That fixture writes its own config template and reserves its own loopback
 /// ports, so — exactly like `turso_cdc` — it needs no node from the harness
-/// and cannot collide with the fixed-port fixtures spawned later. Until #239
+/// and cannot collide with the fixtures spawned later. Until #239
 /// it was dormant (nothing set `EPHPM_BINARY`, so it self-skipped and reported
 /// `ok`) *and* broken (it derived its docroot from `CARGO_MANIFEST_DIR`, which
 /// is xtask's under this harness). `EPHPM_DOCROOT` below fixes the second half.
@@ -410,38 +423,32 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    let scratch_root = root.join("target").join("e2e-bare");
-    if let Err(e) = recreate_dir(&scratch_root) {
+    // Per-node configs, data dirs and logs. Overridable so two runs can share
+    // one checkout (e.g. to reproduce two CI legs landing on one host).
+    let (scratch_root, scratch_is_default) = match parse_named_flag(args, "--scratch-dir") {
+        Some(dir) => (PathBuf::from(dir), false),
+        None => (root.join("target").join("e2e-bare"), true),
+    };
+    if let Err(e) = prepare_scratch_dir(&scratch_root, scratch_is_default) {
         eprintln!("error: failed to prepare {}: {e}", scratch_root.display());
         return ExitCode::FAILURE;
     }
 
     // Compile the e2e test binaries. `--no-run` builds every test target
-    // without executing anything, then we pick them up out of
-    // crates/ephpm-e2e/target/debug/deps/ by stem name.
+    // without executing anything; cargo's JSON messages name each test
+    // binary's executable, wherever CARGO_TARGET_DIR put it.
     eprintln!("==> Building ephpm-e2e test binaries...");
     let e2e_manifest = root.join("crates").join("ephpm-e2e").join("Cargo.toml");
-    let status = Command::new("cargo")
-        .args(["test", "--manifest-path"])
-        .arg(&e2e_manifest)
-        .args(["--no-run", "--tests"])
-        .status();
-    if !matches!(&status, Ok(s) if s.success()) {
-        eprintln!("error: cargo test --no-run failed for ephpm-e2e");
-        return ExitCode::FAILURE;
-    }
-
-    let deps_dir = root.join("crates").join("ephpm-e2e").join("target").join("debug").join("deps");
-    let binaries = match discover_test_binaries(&deps_dir) {
+    let binaries = match build_test_binaries(&e2e_manifest) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: failed to discover test binaries: {e}");
+            eprintln!("error: cargo test --no-run failed for ephpm-e2e: {e}");
             return ExitCode::FAILURE;
         }
     };
 
     if binaries.is_empty() {
-        eprintln!("error: no ephpm-e2e test binaries found under {}", deps_dir.display());
+        eprintln!("error: cargo reported no ephpm-e2e test binaries");
         return ExitCode::FAILURE;
     }
 
@@ -522,10 +529,9 @@ pub fn run(args: &[String]) -> ExitCode {
     };
 
     // Self-managed suites next (after the server-less ones): the harness
-    // spawns nothing for them either, they
-    // just need the binary path. They use freshly-reserved ports, so ordering
-    // relative to the fixed-port fixtures is a non-issue — running them first
-    // simply keeps all "one at a time" phases together.
+    // spawns nothing for them either, they just need the binary path. Every
+    // topology in this run reserves its own ports, so ordering is a non-issue
+    // — running them first simply keeps all "one at a time" phases together.
     let (self_managed_suites, single_suites): (Vec<_>, Vec<_>) = single_suites
         .into_iter()
         .partition(|(name, _)| SELF_MANAGED_SUITES.contains(&name.as_str()));
@@ -555,9 +561,8 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Split the single-node suites into "isolated" (each needs its own fresh
     // node -- for DB state isolation or a bespoke config) and "shared" (all
-    // run against one long-lived node). The isolated suites reuse the same
-    // single-node DB-proxy ports (3306, ...), so they MUST run before the
-    // shared node claims those ports, and strictly one at a time.
+    // run against one long-lived node). The isolated suites run strictly one
+    // at a time, each node torn down before the next is spawned.
     let (isolated_suites, shared_suites): (Vec<_>, Vec<_>) =
         single_suites.into_iter().partition(|(name, _)| suite_needs_fresh_node(name));
 
@@ -695,7 +700,14 @@ Options:
                           if it does not exist).
   --tests <suite>         Run only the named test binary (e.g. `basic`, `kv`,
                           `cluster`) — useful for iteration.
+  --scratch-dir <path>    Where node configs, data and logs go (default:
+                          target/e2e-bare). Wiped at the start of the run, so
+                          an existing directory must be empty or one this
+                          harness created. Lets two runs share a checkout.
   --help                  Print this message.
+
+Every node listens on loopback ports picked at random per run, so concurrent
+runs on one host do not collide.
 
 For opt-in K8s deployment testing (Kind + Tilt), use `cargo xtask k8s-e2e`."
     );
@@ -722,7 +734,8 @@ fn parse_named_flag_ref<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 ///
 /// Precedence:
 /// 1. `--ephpm-binary <path>` explicit override
-/// 2. `target/release/ephpm` if it already exists
+/// 2. `target/release/ephpm` (or its per-triple equivalent) if it already
+///    exists, under `CARGO_TARGET_DIR` first when that is set
 /// 3. Build it via `crate::release(...)` and then use `target/release/ephpm`
 fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
     if let Some(path) = parse_named_flag_ref(args, "--ephpm-binary") {
@@ -745,18 +758,27 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
     // Windows binary, it writes to `target/x86_64-pc-windows-msvc/release/`, and
     // without this entry a Windows host never finds a binary it just built and
     // falls through to a redundant `cargo xtask release` (issue #367).
-    let candidates = [
-        root.join("target").join("release").join(bin_name),
-        root.join("target")
-            .join(format!("{}-unknown-linux-gnu", std::env::consts::ARCH))
-            .join("release")
-            .join(bin_name),
-        root.join("target")
-            .join(format!("{}-apple-darwin", std::env::consts::ARCH))
-            .join("release")
-            .join(bin_name),
-        root.join("target").join("x86_64-pc-windows-msvc").join("release").join(bin_name),
-    ];
+    //
+    // `CARGO_TARGET_DIR` is searched first: a release build made with it set
+    // lands there, never under `<root>/target`.
+    let mut target_roots: Vec<PathBuf> =
+        std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).into_iter().collect();
+    target_roots.push(root.join("target"));
+    let candidates: Vec<PathBuf> = target_roots
+        .iter()
+        .flat_map(|t| {
+            [
+                t.join("release").join(bin_name),
+                t.join(format!("{}-unknown-linux-gnu", std::env::consts::ARCH))
+                    .join("release")
+                    .join(bin_name),
+                t.join(format!("{}-apple-darwin", std::env::consts::ARCH))
+                    .join("release")
+                    .join(bin_name),
+                t.join("x86_64-pc-windows-msvc").join("release").join(bin_name),
+            ]
+        })
+        .collect();
     for c in &candidates {
         if c.exists() {
             eprintln!("==> Using existing ephpm binary at {}", c.display());
@@ -837,53 +859,84 @@ fn build_middleware_cdylib() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Enumerate `<deps>/<suite>-<hash>[.exe]`, keeping only the newest binary per
-/// suite name.
-fn discover_test_binaries(deps: &Path) -> io::Result<Vec<(String, PathBuf)>> {
-    let mut by_stem: BTreeMap<String, (PathBuf, std::time::SystemTime)> = BTreeMap::new();
-
-    for entry in fs::read_dir(deps)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        // Skip .d, .rlib, .rmeta, .pdb, etc. — only keep executables.
-        let ext = path.extension().and_then(|s| s.to_str());
-        let is_exe = matches!(ext, None | Some("exe"));
-        if !is_exe {
-            continue;
-        }
-        // deps files look like `<crate>-<16 hex>`. Split off the hash.
-        let Some(sep) = stem.rfind('-') else {
-            continue;
-        };
-        let (name, hash) = stem.split_at(sep);
-        if hash.len() < 2 || !hash[1..].chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        // Skip the ephpm_e2e library test binary itself (only integration
-        // tests under tests/*.rs matter here — they compile as separate
-        // binaries and produce the per-suite deps files we want).
-        if name == "ephpm_e2e" {
-            continue;
-        }
-        let mtime = entry.metadata()?.modified()?;
-        by_stem
-            .entry(name.to_string())
-            .and_modify(|(existing, existing_mtime)| {
-                if mtime > *existing_mtime {
-                    *existing = path.clone();
-                    *existing_mtime = mtime;
-                }
-            })
-            .or_insert((path, mtime));
+/// Build every `ephpm-e2e` integration-test binary and return `(suite, path)`
+/// pairs, one per `tests/*.rs` file.
+///
+/// The paths come from cargo's own JSON artifact messages rather than from
+/// scanning a `deps/` directory. A scan has to guess the directory (it used to
+/// assume `crates/ephpm-e2e/target`, which does not exist when
+/// `CARGO_TARGET_DIR` is set) and the binary (the newest `<name>-<hash>`
+/// file; a target dir shared with the main workspace holds that workspace's
+/// test binaries too, under names a scan cannot tell apart).
+fn build_test_binaries(manifest: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    let output = Command::new("cargo")
+        .args(["test", "--manifest-path"])
+        .arg(manifest)
+        .args(["--no-run", "--tests", "--message-format=json-render-diagnostics"])
+        .stderr(Stdio::inherit())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!("cargo exited with {}", output.status)));
     }
+    Ok(parse_test_executables(&String::from_utf8_lossy(&output.stdout)))
+}
 
-    Ok(by_stem.into_iter().map(|(name, (path, _))| (name, path)).collect())
+/// Pick the integration-test executables out of cargo's JSON message stream.
+///
+/// Only `compiler-artifact` messages whose target kind is exactly `test` (a
+/// `tests/*.rs` file) count; the library's own unit-test binary is kind `lib`
+/// and is skipped. xtask is dependency-free, so this reads just the three
+/// fields it needs instead of parsing JSON in general.
+fn parse_test_executables(messages: &str) -> Vec<(String, PathBuf)> {
+    let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for line in messages.lines() {
+        if !line.contains("\"reason\":\"compiler-artifact\"") {
+            continue;
+        }
+        // The `target` object holds only scalars and arrays, so it ends at
+        // the first `}` after it opens.
+        let Some(start) = line.find("\"target\":{") else {
+            continue;
+        };
+        let target = &line[start..];
+        let target = &target[..target.find('}').unwrap_or(target.len())];
+        if !target.contains("\"kind\":[\"test\"]") {
+            continue;
+        }
+        let (Some(name), Some(exe)) =
+            (json_string_field(target, "name"), json_string_field(line, "executable"))
+        else {
+            continue;
+        };
+        by_name.insert(name, PathBuf::from(exe));
+    }
+    by_name.into_iter().collect()
+}
+
+/// The value of the first `"key":"..."` string field in `json`, unescaped.
+/// `None` when the key is absent or its value is not a string (e.g. `null`).
+fn json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let rest = &json[json.find(&needle)? + needle.len()..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
 }
 
 fn run_suite(name: &str, binary: &Path, env: &[(String, String)]) -> bool {
@@ -905,11 +958,30 @@ fn run_suite(name: &str, binary: &Path, env: &[(String, String)]) -> bool {
     ok
 }
 
-fn recreate_dir(path: &Path) -> io::Result<()> {
+/// Marker file identifying a directory as this harness's scratch space.
+const SCRATCH_MARKER: &str = ".ephpm-e2e-scratch";
+
+/// Empty `path` and (re)create it as a scratch directory.
+///
+/// The default scratch dir is always wiped. A `--scratch-dir` the caller named
+/// is wiped only when it is empty or carries [`SCRATCH_MARKER`] — i.e. when
+/// this harness made it — so a typo cannot delete someone's directory.
+fn prepare_scratch_dir(path: &Path, is_default: bool) -> io::Result<()> {
     if path.exists() {
+        let ours = is_default
+            || path.join(SCRATCH_MARKER).exists()
+            || fs::read_dir(path)?.next().is_none();
+        if !ours {
+            return Err(io::Error::other(format!(
+                "refusing to wipe {}: it is not empty and was not created by `cargo xtask e2e` \
+                 (no {SCRATCH_MARKER})",
+                path.display()
+            )));
+        }
         fs::remove_dir_all(path)?;
     }
-    fs::create_dir_all(path)
+    fs::create_dir_all(path)?;
+    fs::write(path.join(SCRATCH_MARKER), "")
 }
 
 // ── config templates ────────────────────────────────────────────────────────
@@ -928,15 +1000,16 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// and `crash_containment` nodes, or empty), `{CRASH_CONTAINMENT_LINE}` (the
 /// `[php] crash_containment = true` line for the `crash_containment` node, or
 /// empty), `{OVERLOAD_BLOCK}` (the load-shedding policy plus the tiny pool
-/// sizing for the `load_shedding` node, or empty), `{KV_SOCKET}`.
+/// sizing for the `load_shedding` node, or empty), `{KV_SOCKET}`, `{KV_PORT}`
+/// (the RESP listener's reserved port).
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
 /// (a) `listen`/`sites_dir`/`document_root`/`db.sqlite.*`/`kv.redis_compat.socket`
 /// point at per-run scratch paths instead of the container's fixed
-/// `/var/www/...` and `/tmp/...` layout; (b) the HTTP `listen` port is a high
-/// loopback port so a single-node fixture can coexist with the cluster fixture
-/// on the same host.
+/// `/var/www/...` and `/tmp/...` layout; (b) every listener — HTTP, the
+/// `[db.sqlite.proxy]` frontends, the KV RESP listener — is on a port
+/// reserved for this node (see [`PORT_RANGE`]) instead of a fixed one.
 ///
 /// # Why the `[db.sqlite]` and `[kv] secret` bits are a placeholder
 ///
@@ -951,21 +1024,21 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 ///   that listener unauthenticated.
 /// - **`[db.sqlite]`** — with `sites_dir` set, single-node embedded SQLite runs
 ///   in per-site mode, where `dir` (one database file per vhost) is REQUIRED
-///   and the shared wire listeners are deliberately NOT started: one listener
-///   means one backend for every tenant, which is the cross-tenant hole
-///   per-site isolation exists to close. So a `sites_dir` node cannot serve
-///   `pdo_mysql` at all, and a node whose suites use `pdo_mysql` cannot have a
-///   `sites_dir`.
+///   and the only wire listener is the per-site-authenticating `mysql_listen`
+///   (Hrana/PG/TDS are not started: they cannot bind a backend per
+///   connection). So the docroot's single-database `pdo_mysql` scripts cannot
+///   run on a `sites_dir` node, and a node whose suites use them cannot have a
+///   `sites_dir`. `mysql_listen` is still pinned to the node's reserved port —
+///   left at its default it would bind 127.0.0.1:3306.
 ///
-/// On nodes WITHOUT `sites_dir` the DB proxy listeners deliberately keep the
-/// SAME ports as the reference config (mysql 3306, hrana 8081, postgres 5432,
-/// tds 1433). The docroot PHP scripts (`db.php`, `sqlite_test.php`,
-/// `rw_split_test.php`, ...) connect via `pdo_mysql` to a hardcoded
-/// `127.0.0.1:3306` fallback -- `[db.sqlite]` mode does NOT inject
-/// `DB_HOST`/`DB_PORT` into PHP (only `[db.mysql]`/`[db.postgres]` do, see
-/// `build_db_env_vars` in ephpm-server/src/router.rs). Moving the mysql proxy
-/// off 3306 makes every SQLite write 500 with a connection-refused. Only one
-/// single node runs at a time, so the standard ports do not collide.
+/// On nodes WITHOUT `sites_dir` the docroot PHP scripts (`db.php`,
+/// `sqlite_test.php`, `rw_split_test.php`, ...) reach the mysql proxy via
+/// `getenv('DB_HOST')`/`getenv('DB_PORT')`, falling back to `127.0.0.1:3306`.
+/// Single-site `[db.sqlite]` mode does NOT inject those into PHP (only
+/// `[db.mysql]`/`[db.postgres]` and per-site mode do, see `build_db_env_vars`
+/// in ephpm-server/src/router.rs), so the harness puts them in the node's
+/// *process* environment, which PHP's `getenv()` reads — see
+/// [`SingleNodeSpawn::start`].
 const SINGLE_NODE_TEMPLATE: &str = r#"# Auto-generated by `cargo xtask e2e` -- do not edit.
 [server]
 listen = "127.0.0.1:{HTTP_PORT}"
@@ -1074,6 +1147,7 @@ eviction_policy = "allkeys-lru"
 
 [kv.redis_compat]
 enabled = true
+listen = "127.0.0.1:{KV_PORT}"
 socket = "{KV_SOCKET}"
 {OPCACHE_BLOCK}
 {WEBSOCKET_BLOCK}
@@ -1081,15 +1155,18 @@ socket = "{KV_SOCKET}"
 "#;
 
 /// Cluster node template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
-/// `{GOSSIP_PORT}`, `{KV_DATA_PORT}`, `{NODE_ID}`,
-/// `{CLUSTER_BIND}`, `{CLUSTER_JOIN}`, `{DATA_DIR}`, `{DOCROOT}`.
+/// `{KV_DATA_PORT}`, `{CHANNEL_PORT}`, `{NODE_ID}`, `{CLUSTER_BIND}`,
+/// `{CLUSTER_JOIN}`, `{DATA_DIR}`, `{DOCROOT}`.
 ///
 /// Clustered SQLite uses the in-process Turso CDC path (v0.7.0+): the engine
 /// defaults to `turso`, `replication.role = "auto"` with `[cluster] enabled`
-/// elects a primary via gossip, and the cluster channel (bound at the gossip
-/// port + 2 from the specific `bind` address) carries CDC batches. No sqld
-/// sidecar. Every address is `127.0.0.1:PORT` because all nodes share the
-/// host loopback instead of having their own container IP.
+/// elects a primary via gossip, and the cluster channel carries CDC batches.
+/// No sqld sidecar. Every address is `127.0.0.1:PORT` because all nodes share
+/// the host loopback instead of having their own container IP.
+///
+/// `[cluster.channel] listen` is pinned to a reserved port rather than left
+/// to its derived default (gossip port + 2), which nobody would otherwise
+/// reserve — the `ephpm-e2e` fixtures learned that the hard way (#239).
 const CLUSTER_NODE_TEMPLATE: &str = r#"# Auto-generated by `cargo xtask e2e` — do not edit.
 [server]
 listen = "127.0.0.1:{HTTP_PORT}"
@@ -1123,6 +1200,9 @@ join = [{CLUSTER_JOIN}]
 node_id = "{NODE_ID}"
 cluster_id = "ephpm-e2e-bare"
 secret = "bare-e2e-secret-do-not-use-in-prod-b7e4d3f0"
+
+[cluster.channel]
+listen = "127.0.0.1:{CHANNEL_PORT}"
 
 [cluster.kv]
 data_port = {KV_DATA_PORT}
@@ -1509,9 +1589,40 @@ impl SingleNodeOptions {
     }
 }
 
+/// The ports one single node listens on, all reserved together.
+#[derive(Clone, Copy, Debug)]
+struct SingleNodePorts {
+    http: u16,
+    mysql: u16,
+    hrana: u16,
+    pg: u16,
+    tds: u16,
+    kv: u16,
+}
+
+impl SingleNodePorts {
+    const KINDS: [PortKind; 6] = [PortKind::Tcp; 6];
+
+    fn from_reserved(ports: &[u16]) -> Self {
+        Self {
+            http: ports[0],
+            mysql: ports[1],
+            hrana: ports[2],
+            pg: ports[3],
+            tds: ports[4],
+            kv: ports[5],
+        }
+    }
+}
+
 struct SingleNodeSpawn {
     child: Child,
     http_port: u16,
+    /// The KV RESP listener's port, exported as `EPHPM_KV_PORT`.
+    kv_port: u16,
+    /// The Hrana listener's port, exported as `EPHPM_HRANA_URL`. `None` on a
+    /// `sites_dir` node, which does not start Hrana.
+    hrana_port: Option<u16>,
     _data_dir: PathBuf,
     sites_dir: Option<PathBuf>,
     /// The (canonicalized) document_root this node serves, exported to tests as
@@ -1543,25 +1654,60 @@ struct SingleNodeSpawn {
 }
 
 impl SingleNodeSpawn {
+    /// Spawn a node on freshly reserved ports and wait until it is serving.
+    ///
+    /// A node that loses one of its ports to another process before binding
+    /// it is torn down and respawned on a new set, up to [`SPAWN_ATTEMPTS`]
+    /// times. Any other startup failure is returned at once, after the node's
+    /// logs are dumped. Either way the child is never left running.
     fn start(
         binary: &Path,
         docroot: &Path,
         scratch_root: &Path,
         opts: &SingleNodeOptions,
     ) -> io::Result<Self> {
-        let http_port: u16 = 18100;
-        // DB proxy listeners keep the reference-config ports. The docroot PHP
-        // scripts connect to a hardcoded 127.0.0.1:3306 fallback (single-node
-        // [db.sqlite] does not inject DB_HOST/DB_PORT), so the mysql proxy must
-        // own 3306 or every SQLite write 500s. Only one single node runs at a
-        // time (isolated suites are spawned/torn down sequentially, before the
-        // shared node), so these ports never collide.
-        let mysql_port: u16 = 3306;
-        let hrana_port: u16 = 8081;
-        let pg_port: u16 = 5432;
-        let tds_port: u16 = 1433;
+        let mut picker = PortPicker::new();
+        let mut last_collision = String::new();
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            match Self::try_start(binary, docroot, scratch_root, opts, &mut picker) {
+                Ok(node) => return Ok(node),
+                Err(StartFailure::PortTaken(line)) => {
+                    eprintln!(
+                        "    [{}] lost a reserved port (attempt {attempt}/{SPAWN_ATTEMPTS}): \
+                         {line} -- respawning on fresh ports",
+                        opts.slug
+                    );
+                    last_collision = line;
+                }
+                Err(StartFailure::Fatal(e)) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "[{}] lost a reserved port on all {SPAWN_ATTEMPTS} attempts; last: {last_collision}",
+                opts.slug
+            ),
+        ))
+    }
 
+    fn try_start(
+        binary: &Path,
+        docroot: &Path,
+        scratch_root: &Path,
+        opts: &SingleNodeOptions,
+        picker: &mut PortPicker,
+    ) -> Result<Self, StartFailure> {
+        let reservation = picker.reserve(&SingleNodePorts::KINDS)?;
+        let ports = SingleNodePorts::from_reserved(reservation.ports());
+        let http_port = ports.http;
+
+        // A fresh directory per attempt: a respawn must not inherit the
+        // previous attempt's database or logs.
         let node_dir = scratch_root.join(&opts.slug);
+        if node_dir.exists() {
+            fs::remove_dir_all(&node_dir)?;
+        }
         fs::create_dir_all(&node_dir)?;
         let data_dir = node_dir.join("data");
         fs::create_dir_all(&data_dir)?;
@@ -1697,26 +1843,37 @@ impl SingleNodeSpawn {
             // Per-site database isolation: one file per vhost under `dir`.
             // `dir` is REQUIRED here — the server refuses to start multi-site
             // with only `path`, which would be one shared database for every
-            // tenant. No `[db.sqlite.proxy]`: per-site mode intentionally does
-            // not start the shared wire listeners (a single listener cannot
-            // route by virtual host), so configuring them would only earn a
-            // "configured but IGNORED" warning.
+            // tenant. Only `mysql_listen` is configured: it is the one wire
+            // listener per-site mode starts (credential-routed per tenant), and
+            // its default would be the fixed 127.0.0.1:3306. Hrana/PG/TDS are
+            // not started in this mode (one listener cannot route by virtual
+            // host), so configuring them would only earn an "IGNORED" warning.
             (
-                format!("[db.sqlite]\ndir = \"{}\"", escape_toml(&data_dir.join("sites-db"))),
+                format!(
+                    "[db.sqlite]\ndir = \"{}\"\n\n\
+                     [db.sqlite.proxy]\n\
+                     mysql_listen = \"127.0.0.1:{}\"",
+                    escape_toml(&data_dir.join("sites-db")),
+                    ports.mysql
+                ),
                 format!("secret = \"{E2E_KV_SECRET}\""),
             )
         } else {
-            // Single-site: one database file, reachable over the wire
-            // listeners on the reference-config ports.
+            // Single-site: one database file, reachable over every wire
+            // listener, each on its own reserved port.
             (
                 format!(
                     "[db.sqlite]\npath = \"{}/ephpm-test.db\"\n\n\
                      [db.sqlite.proxy]\n\
-                     mysql_listen = \"127.0.0.1:{mysql_port}\"\n\
-                     hrana_listen = \"127.0.0.1:{hrana_port}\"\n\
-                     postgres_listen = \"127.0.0.1:{pg_port}\"\n\
-                     tds_listen = \"127.0.0.1:{tds_port}\"",
-                    escape_toml(&data_dir)
+                     mysql_listen = \"127.0.0.1:{}\"\n\
+                     hrana_listen = \"127.0.0.1:{}\"\n\
+                     postgres_listen = \"127.0.0.1:{}\"\n\
+                     tds_listen = \"127.0.0.1:{}\"",
+                    escape_toml(&data_dir),
+                    ports.mysql,
+                    ports.hrana,
+                    ports.pg,
+                    ports.tds
                 ),
                 // Deliberately NO `[kv] secret`: without a `sites_dir` the
                 // shared KV store is the intended behaviour, and a secret would
@@ -1754,57 +1911,102 @@ impl SingleNodeSpawn {
             .replace("{OVERLOAD_BLOCK}", overload_block)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
+            .replace("{KV_PORT}", &ports.kv.to_string())
             .replace("{DOCROOT}", &escape_toml(docroot));
 
         let config_path = node_dir.join("ephpm.toml");
         fs::write(&config_path, config)?;
 
-        let stdout_log = node_dir.join("stdout.log");
-        let stderr_log = node_dir.join("stderr.log");
-        let stdout_file = fs::File::create(&stdout_log)?;
-        let stderr_file = fs::File::create(&stderr_log)?;
+        let logs =
+            NodeLogs { stdout: node_dir.join("stdout.log"), stderr: node_dir.join("stderr.log") };
+        let stdout_file = fs::File::create(&logs.stdout)?;
+        let stderr_file = fs::File::create(&logs.stderr)?;
 
         eprintln!(
             "    spawning single-node ephpm [{}] on 127.0.0.1:{http_port} (config: {})",
             opts.slug,
             config_path.display()
         );
-        let child = Command::new(binary)
-            .args(["serve", "--config"])
+        let mut cmd = Command::new(binary);
+        cmd.args(["serve", "--config"])
             .arg(&config_path)
             .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()?;
-
-        // Worker mode has to boot the framework in every worker before the
-        // first request can be served, so it gets a longer readiness window.
-        let health_timeout =
-            if opts.worker { Duration::from_secs(60) } else { Duration::from_secs(10) };
-        wait_for_health(http_port, health_timeout)?;
-        if opts.worker {
-            // `/_ephpm/health` is pure liveness (200 as soon as the listener is
-            // up), so on a worker node it says nothing about whether any worker
-            // has finished booting the framework. Wait for a real request to be
-            // served before handing the node to the suite, otherwise the first
-            // test races the boot and sees a 504.
-            wait_for_worker(http_port, health_timeout)?;
+            .stderr(Stdio::from(stderr_file));
+        if !opts.with_sites_dir {
+            // The docroot's pdo_mysql scripts find the proxy through
+            // `getenv('DB_HOST')`/`getenv('DB_PORT')`, which reads this
+            // process environment; single-site `[db.sqlite]` injects nothing
+            // itself. See SINGLE_NODE_TEMPLATE.
+            cmd.env("DB_HOST", "127.0.0.1").env("DB_PORT", ports.mysql.to_string());
         }
-        eprintln!("    single-node ephpm [{}] ready on 127.0.0.1:{http_port}", opts.slug);
+        // Hand the ports over: drop the probes and spawn in the same breath.
+        reservation.release();
+        let child = cmd.spawn()?;
 
-        Ok(Self {
+        // From here on the child is owned by `node`, whose Drop kills it: an
+        // early return can no longer orphan a half-started ephpm that later
+        // binds its ports and answers the next fixture's health checks.
+        let mut node = Self {
             child,
             http_port,
+            kv_port: ports.kv,
+            hrana_port: (!opts.with_sites_dir).then_some(ports.hrana),
             _data_dir: data_dir,
             sites_dir,
             docroot: docroot.to_path_buf(),
             label: opts.slug.clone(),
             binary: binary.to_path_buf(),
             middleware_lib: opts.middleware_lib.clone(),
-            stderr_log,
-            stdout_log,
+            stderr_log: logs.stderr.clone(),
+            stdout_log: logs.stdout.clone(),
             worker: opts.worker,
             preview: opts.preview,
-        })
+        };
+        let ready = node.await_ready(&logs, opts.worker);
+        if let Err(StartFailure::Fatal(_)) = &ready {
+            node.dump_logs();
+        }
+        ready?;
+        eprintln!("    single-node ephpm [{}] ready on 127.0.0.1:{http_port}", opts.slug);
+        Ok(node)
+    }
+
+    /// Wait until this node serves HTTP on its own port, its KV RESP listener
+    /// is bound, and (in worker mode) a worker has booted.
+    fn await_ready(&mut self, logs: &NodeLogs, worker: bool) -> Result<(), StartFailure> {
+        // Generous on purpose: the wait ends the moment the node answers (or
+        // exits), so only a node that is alive but stuck pays for it. A busy
+        // CI host has been measured taking >10s to start a node; a deadline
+        // shorter than that turns "slow" into "failed". Worker mode boots the
+        // framework in every worker first, hence longer still.
+        let health_timeout = if worker { Duration::from_secs(90) } else { Duration::from_secs(60) };
+        wait_until_serving(&mut self.child, logs, self.http_port, health_timeout)?;
+        // The RESP listener's bind failure is logged, not fatal — the node
+        // keeps serving HTTP without it — so it needs its own check.
+        wait_for_listener(
+            &mut self.child,
+            logs,
+            "RESP server listening",
+            self.kv_port,
+            Duration::from_secs(15),
+        )?;
+        if worker {
+            // `/_ephpm/health` is pure liveness (200 as soon as the listener is
+            // up), so on a worker node it says nothing about whether any worker
+            // has finished booting the framework. Wait for a real request to be
+            // served before handing the node to the suite, otherwise the first
+            // test races the boot and sees a 504.
+            wait_for_worker(self.http_port, health_timeout)?;
+        }
+        Ok(())
+    }
+
+    fn dump_logs(&self) {
+        dump_log(&format!("single-node [{}] stderr", self.label), &self.stderr_log);
+        dump_log(
+            &format!("single-node [{}] stdout (last 200 lines)", self.label),
+            &self.stdout_log,
+        );
     }
 
     fn env(&self, php_version: &str) -> Vec<(String, String)> {
@@ -1820,7 +2022,15 @@ impl SingleNodeSpawn {
             // Under bare-process that is the repo's tests/docroot, not the
             // container's /var/www/html, so hand the test the actual value.
             ("EXPECTED_DOCUMENT_ROOT".to_string(), self.docroot.to_string_lossy().into_owned()),
+            // The RESP listener, for suites that speak RESP directly
+            // (`opcache_invalidation` writes its version key through it).
+            ("EPHPM_KV_HOST".to_string(), "127.0.0.1".to_string()),
+            ("EPHPM_KV_PORT".to_string(), self.kv_port.to_string()),
         ];
+        // `hrana` probes the Hrana HTTP API directly when this is set.
+        if let Some(port) = self.hrana_port {
+            env.push(("EPHPM_HRANA_URL".to_string(), format!("http://127.0.0.1:{port}")));
+        }
         // vhost/security_p0 suites deploy per-host site dirs into this path.
         // Only set when this node actually has a sites_dir configured.
         if let Some(dir) = &self.sites_dir {
@@ -1867,11 +2077,7 @@ impl SingleNodeSpawn {
         if failed.is_empty() {
             return;
         }
-        dump_log(&format!("single-node [{}] stderr", self.label), &self.stderr_log);
-        dump_log(
-            &format!("single-node [{}] stdout (last 200 lines)", self.label),
-            &self.stdout_log,
-        );
+        self.dump_logs();
     }
 }
 
@@ -1890,55 +2096,114 @@ struct ClusterSpawn {
 struct ClusterNode {
     child: Child,
     http_port: u16,
-    stderr_log: PathBuf,
-    stdout_log: PathBuf,
+    logs: NodeLogs,
 }
 
+/// The ports one cluster node listens on.
+#[derive(Clone, Copy, Debug)]
+struct ClusterNodePorts {
+    http: u16,
+    mysql: u16,
+    kv_data: u16,
+    channel: u16,
+    /// UDP: chitchat gossip.
+    gossip: u16,
+}
+
+impl ClusterNodePorts {
+    const KINDS: [PortKind; 5] =
+        [PortKind::Tcp, PortKind::Tcp, PortKind::Tcp, PortKind::Tcp, PortKind::Udp];
+}
+
+/// How long each cluster node gets to answer `/_ephpm/health`. Matches
+/// `ephpm-e2e`'s `CLUSTER_HEALTH_TIMEOUT`, which was sized from measured
+/// cold starts (three nodes starting at once on a loaded host); the old 15s
+/// sat inside that spread. Costs nothing on a healthy node, and a node that
+/// dies returns at once.
+const CLUSTER_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
+
 impl ClusterSpawn {
+    /// Spawn a `size`-node cluster on freshly reserved ports. Retries on a
+    /// lost port exactly like [`SingleNodeSpawn::start`]; every node of a
+    /// failed attempt is killed before the next one.
     fn start(binary: &Path, docroot: &Path, scratch_root: &Path, size: usize) -> io::Result<Self> {
         assert!(size >= 2, "cluster fixture needs at least 2 nodes");
+        let mut picker = PortPicker::new();
+        let mut last_collision = String::new();
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            match Self::try_start(binary, docroot, scratch_root, size, &mut picker) {
+                Ok(cluster) => return Ok(cluster),
+                Err(StartFailure::PortTaken(line)) => {
+                    eprintln!(
+                        "    cluster lost a reserved port (attempt {attempt}/{SPAWN_ATTEMPTS}): \
+                         {line} -- respawning every node on fresh ports"
+                    );
+                    last_collision = line;
+                }
+                Err(StartFailure::Fatal(e)) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "cluster lost a reserved port on all {SPAWN_ATTEMPTS} attempts; last: \
+                 {last_collision}"
+            ),
+        ))
+    }
 
-        let node_defs: Vec<_> = (0..size)
-            .map(|i| {
-                let i16 = u16::try_from(i).expect("cluster size fits in u16");
-                (
-                    i,
-                    18100 + i16, // HTTP
-                    13306 + i16, // MySQL
-                    18200 + i16, // gossip
-                    7947 + i16,  // kv data
-                )
+    fn try_start(
+        binary: &Path,
+        docroot: &Path,
+        scratch_root: &Path,
+        size: usize,
+        picker: &mut PortPicker,
+    ) -> Result<Self, StartFailure> {
+        // One reservation for the whole cluster, so no two nodes can be handed
+        // the same port, held until the moment the nodes are spawned.
+        let kinds: Vec<PortKind> = (0..size).flat_map(|_| ClusterNodePorts::KINDS).collect();
+        let reservation = picker.reserve(&kinds)?;
+        let node_ports: Vec<ClusterNodePorts> = reservation
+            .ports()
+            .chunks(ClusterNodePorts::KINDS.len())
+            .map(|p| ClusterNodePorts {
+                http: p[0],
+                mysql: p[1],
+                kv_data: p[2],
+                channel: p[3],
+                gossip: p[4],
             })
             .collect();
 
         // Every node lists all peers as join seeds (chitchat de-dupes; giving
         // it all peers up-front means startup order does not matter).
         let join_addrs: Vec<String> =
-            node_defs.iter().map(|(_, _, _, gossip, _)| format!("127.0.0.1:{gossip}")).collect();
+            node_ports.iter().map(|p| format!("127.0.0.1:{}", p.gossip)).collect();
 
-        let mut nodes = Vec::with_capacity(size);
-
-        for (i, http_port, mysql_port, gossip_port, kv_data_port) in &node_defs {
+        let mut commands = Vec::with_capacity(size);
+        for (i, ports) in node_ports.iter().enumerate() {
             let node_dir = scratch_root.join(format!("cluster-node-{i}"));
-            fs::create_dir_all(&node_dir)?;
+            if node_dir.exists() {
+                fs::remove_dir_all(&node_dir)?;
+            }
             let data_dir = node_dir.join("data");
             fs::create_dir_all(&data_dir)?;
 
             let cluster_join = join_addrs
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| j != i)
+                .filter(|(j, _)| *j != i)
                 .map(|(_, a)| format!("\"{a}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
 
             let config = CLUSTER_NODE_TEMPLATE
-                .replace("{HTTP_PORT}", &http_port.to_string())
-                .replace("{MYSQL_PORT}", &mysql_port.to_string())
-                .replace("{GOSSIP_PORT}", &gossip_port.to_string())
-                .replace("{KV_DATA_PORT}", &kv_data_port.to_string())
+                .replace("{HTTP_PORT}", &ports.http.to_string())
+                .replace("{MYSQL_PORT}", &ports.mysql.to_string())
+                .replace("{KV_DATA_PORT}", &ports.kv_data.to_string())
+                .replace("{CHANNEL_PORT}", &ports.channel.to_string())
                 .replace("{NODE_ID}", &format!("bare-node-{i}"))
-                .replace("{CLUSTER_BIND}", &format!("127.0.0.1:{gossip_port}"))
+                .replace("{CLUSTER_BIND}", &format!("127.0.0.1:{}", ports.gossip))
                 .replace("{CLUSTER_JOIN}", &cluster_join)
                 .replace("{DATA_DIR}", &escape_toml(&data_dir))
                 .replace("{DOCROOT}", &escape_toml(docroot));
@@ -1946,31 +2211,65 @@ impl ClusterSpawn {
             let config_path = node_dir.join("ephpm.toml");
             fs::write(&config_path, config)?;
 
-            let stdout_log = node_dir.join("stdout.log");
-            let stderr_log = node_dir.join("stderr.log");
-            let stdout_file = fs::File::create(&stdout_log)?;
-            let stderr_file = fs::File::create(&stderr_log)?;
-
+            let logs = NodeLogs {
+                stdout: node_dir.join("stdout.log"),
+                stderr: node_dir.join("stderr.log"),
+            };
+            let mut cmd = Command::new(binary);
+            cmd.args(["serve", "--config"])
+                .arg(&config_path)
+                .stdout(Stdio::from(fs::File::create(&logs.stdout)?))
+                .stderr(Stdio::from(fs::File::create(&logs.stderr)?));
             eprintln!(
-                "    spawning cluster node {i} on 127.0.0.1:{http_port} (config: {})",
+                "    spawning cluster node {i} on 127.0.0.1:{} (config: {})",
+                ports.http,
                 config_path.display()
             );
-            let child = Command::new(binary)
-                .args(["serve", "--config"])
-                .arg(&config_path)
-                .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::from(stderr_file))
-                .spawn()?;
-
-            nodes.push(ClusterNode { child, http_port: *http_port, stderr_log, stdout_log });
+            commands.push((cmd, ports.http, logs));
         }
 
-        for node in &nodes {
-            wait_for_health(node.http_port, Duration::from_secs(15))?;
+        // Hand the ports over: drop the probes, then spawn every node at once.
+        reservation.release();
+        let mut cluster = Self { nodes: Vec::with_capacity(size) };
+        for (mut cmd, http_port, logs) in commands {
+            // Pushed as soon as it exists, so the cluster's Drop kills it on
+            // any early return below.
+            cluster.nodes.push(ClusterNode { child: cmd.spawn()?, http_port, logs });
         }
+
+        let ready = cluster.await_ready();
+        if let Err(StartFailure::Fatal(_)) = &ready {
+            cluster.dump_logs();
+        }
+        ready?;
         eprintln!("    all {size} cluster nodes ready");
+        Ok(cluster)
+    }
 
-        Ok(Self { nodes })
+    fn await_ready(&mut self) -> Result<(), StartFailure> {
+        for node in &mut self.nodes {
+            wait_until_serving(
+                &mut node.child,
+                &node.logs,
+                node.http_port,
+                CLUSTER_HEALTH_TIMEOUT,
+            )?;
+        }
+        // Gossip, channel and KV-data-plane bind failures are logged rather
+        // than fatal, so a node can be healthy over HTTP with a port lost.
+        for node in &self.nodes {
+            if let Some(line) = bind_failure_line(&node.logs.read()) {
+                return Err(StartFailure::PortTaken(line));
+            }
+        }
+        Ok(())
+    }
+
+    fn dump_logs(&self) {
+        for (i, node) in self.nodes.iter().enumerate() {
+            dump_log(&format!("cluster node {i} stderr"), &node.logs.stderr);
+            dump_log(&format!("cluster node {i} stdout (last 200 lines)"), &node.logs.stdout);
+        }
     }
 
     fn env(&self, php_version: &str) -> Vec<(String, String)> {
@@ -1995,10 +2294,7 @@ impl ClusterSpawn {
         if failed.is_empty() {
             return;
         }
-        for (i, node) in self.nodes.iter().enumerate() {
-            dump_log(&format!("cluster node {i} stderr"), &node.stderr_log);
-            dump_log(&format!("cluster node {i} stdout (last 200 lines)"), &node.stdout_log);
-        }
+        self.dump_logs();
     }
 }
 
@@ -2010,24 +2306,294 @@ impl Drop for ClusterSpawn {
     }
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── loopback port allocation ───────────────────────────────────────────────
 
-fn wait_for_health(port: u16, timeout: Duration) -> io::Result<()> {
+/// The range (half-open) every node listener's port is drawn from, at random.
+///
+/// It sits below the ephemeral range of every host this runs on (Linux
+/// 32768-60999, Windows and macOS 49152-65535), so a port the harness picked
+/// is never handed to an unrelated *outgoing* connection in the gap between
+/// the probe releasing it and the node binding it. That gap is what makes
+/// `bind(":0")` reservations racy on a busy host (`PortLease` in `ephpm-e2e`,
+/// #438). It also stays clear of the 20000-43999 host ports the
+/// `db-integration` and `pdo-mysql-e2e` workflows publish database containers
+/// on. A port something else already holds fails its probe and is skipped.
+const PORT_RANGE: std::ops::Range<u16> = 10_000..20_000;
+
+/// How many candidate ports one reservation may try per port before failing.
+const PORT_PROBE_ATTEMPTS: usize = 256;
+
+/// How many times a node (or a whole cluster) is respawned on fresh ports
+/// after losing one of its reserved ports to another process.
+///
+/// Probing closes most of the window, not all of it: between the probe
+/// releasing a port and the node binding it, anything else on the host can
+/// take it. The node then fails its bind, the harness notices (the node exits
+/// or logs the failure — see [`bind_failure_line`]) and tries again.
+const SPAWN_ATTEMPTS: usize = 5;
+
+/// The protocol a reserved port will be bound with. A TCP probe says nothing
+/// about UDP availability and vice versa, so each port is probed as what it
+/// will be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortKind {
+    Tcp,
+    /// Chitchat gossip.
+    Udp,
+}
+
+/// Picks random candidate ports from [`PORT_RANGE`].
+///
+/// xorshift64*, seeded from std's per-process random hasher keys plus the pid
+/// and the clock: two harness runs on one host start from unrelated points,
+/// so they do not walk the range in lockstep and keep colliding. xtask is
+/// dependency-free, hence no `rand`.
+struct PortPicker {
+    state: u64,
+}
+
+impl PortPicker {
+    fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        // xorshift must never hold an all-zero state.
+        Self { state: h.finish() | 1 }
+    }
+
+    fn candidate(&mut self) -> u16 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        let span = u64::from(PORT_RANGE.end - PORT_RANGE.start);
+        let offset = x.wrapping_mul(0x2545_F491_4F6C_DD1D) % span;
+        PORT_RANGE.start + u16::try_from(offset).expect("offset < span <= u16::MAX")
+    }
+
+    /// Reserve one distinct port per entry in `kinds`, each **held** by a
+    /// bound probe socket until [`PortReservation::release`].
+    fn reserve(&mut self, kinds: &[PortKind]) -> io::Result<PortReservation> {
+        let mut res = PortReservation { ports: Vec::new(), tcp: Vec::new(), udp: Vec::new() };
+        for kind in kinds {
+            let mut reserved = false;
+            for _ in 0..PORT_PROBE_ATTEMPTS {
+                let port = self.candidate();
+                if res.ports.contains(&port) {
+                    continue;
+                }
+                let held = match kind {
+                    PortKind::Tcp => {
+                        TcpListener::bind(("127.0.0.1", port)).map(|s| res.tcp.push(s))
+                    }
+                    PortKind::Udp => UdpSocket::bind(("127.0.0.1", port)).map(|s| res.udp.push(s)),
+                };
+                if held.is_ok() {
+                    res.ports.push(port);
+                    reserved = true;
+                    break;
+                }
+            }
+            if !reserved {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "no bindable loopback {kind:?} port in {}..{} after {PORT_PROBE_ATTEMPTS} \
+                         tries",
+                        PORT_RANGE.start, PORT_RANGE.end
+                    ),
+                ));
+            }
+        }
+        Ok(res)
+    }
+}
+
+/// Ports reserved by [`PortPicker::reserve`], held open until handed off.
+///
+/// The probes are `std` sockets, which are close-on-exec on Unix and
+/// non-inheritable on Windows, so one held across a `spawn` does not leak into
+/// the child (see the note on `PortProbes` in `ephpm-e2e`).
+struct PortReservation {
+    ports: Vec<u16>,
+    tcp: Vec<TcpListener>,
+    udp: Vec<UdpSocket>,
+}
+
+impl PortReservation {
+    /// The reserved ports, in the order their kinds were requested.
+    fn ports(&self) -> &[u16] {
+        &self.ports
+    }
+
+    /// Close the probes so the node about to be spawned can bind the ports.
+    /// Call it immediately before `spawn`.
+    fn release(self) {
+        drop(self.tcp);
+        drop(self.udp);
+    }
+}
+
+// ── node startup ───────────────────────────────────────────────────────────
+
+/// Why a node did not come up.
+#[derive(Debug)]
+enum StartFailure {
+    /// The node lost one of its reserved ports to another process (the
+    /// offending log line). Recoverable: respawn on fresh ports.
+    PortTaken(String),
+    /// Anything else. Returned to the caller as-is.
+    Fatal(io::Error),
+}
+
+impl From<io::Error> for StartFailure {
+    fn from(e: io::Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+impl From<StartFailure> for io::Error {
+    fn from(f: StartFailure) -> Self {
+        match f {
+            StartFailure::PortTaken(line) => {
+                io::Error::new(io::ErrorKind::AddrInUse, format!("reserved port taken: {line}"))
+            }
+            StartFailure::Fatal(e) => e,
+        }
+    }
+}
+
+/// A node's two log files. ePHPm's tracing output goes to stdout; a fatal
+/// startup error (e.g. the HTTP bind failing) to stderr.
+struct NodeLogs {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl NodeLogs {
+    fn read(&self) -> String {
+        let mut text = fs::read_to_string(&self.stderr).unwrap_or_default();
+        text.push('\n');
+        text.push_str(&fs::read_to_string(&self.stdout).unwrap_or_default());
+        text
+    }
+}
+
+/// Error texts that mean "a port this node was given is held by someone else".
+///
+/// Linux reports `EADDRINUSE` as os error 98, macOS as 48, Windows as 10048
+/// (`WSAEADDRINUSE`). Windows also refuses ports inside a Hyper-V/WinNAT
+/// excluded range with 10013 (`WSAEACCES`), which a fresh port fixes too.
+const BIND_FAILURE_MARKERS: &[&str] = &[
+    "Address already in use",
+    "address already in use",
+    "(os error 98)",
+    "(os error 48)",
+    "(os error 10048)",
+    "(os error 10013)",
+];
+
+/// The first log line reporting a lost port, if any.
+fn bind_failure_line(logs: &str) -> Option<String> {
+    logs.lines()
+        .find(|line| BIND_FAILURE_MARKERS.iter().any(|m| line.contains(m)))
+        .map(|line| line.trim().to_string())
+}
+
+/// Whether some log line contains `marker` and mentions `127.0.0.1:<port>`
+/// (the port not merely a prefix of a longer number). Tolerates the ANSI
+/// colour codes ePHPm's log lines carry.
+fn log_reports_listener(logs: &str, marker: &str, port: u16) -> bool {
+    let needle = format!(":{port}");
+    logs.lines().filter(|line| line.contains(marker)).any(|line| {
+        line.match_indices(&needle)
+            .any(|(at, _)| !line[at + needle.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+/// Wait until the node serves `/_ephpm/health` **on its own listener**.
+///
+/// A `200` alone proves nothing: if the node lost its HTTP port, whatever owns
+/// that port answers instead. That is exactly how one leaked ePHPm used to
+/// serve every later fixture's health check (and then its suites). So readiness
+/// also requires the node to have logged binding the port (`HTTP listening`).
+/// A node that exits returns at once — as [`StartFailure::PortTaken`] when its
+/// logs say a port was taken, else as fatal.
+fn wait_until_serving(
+    child: &mut Child,
+    logs: &NodeLogs,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), StartFailure> {
     let deadline = Instant::now() + timeout;
-    let mut last_err = String::from("no attempts made");
-    while Instant::now() < deadline {
-        match tcp_get(port, "/_ephpm/health") {
-            Ok(200) => return Ok(()),
-            Ok(status) => last_err = format!("health returned HTTP {status}"),
-            Err(e) => last_err = format!("connect error: {e}"),
+    loop {
+        exit_check(child, logs)?;
+        let last = match tcp_get(port, "/_ephpm/health") {
+            Ok(200) if log_reports_listener(&logs.read(), "HTTP listening", port) => return Ok(()),
+            Ok(200) => format!(
+                "/_ephpm/health answered 200, but this node has not logged binding \
+                 127.0.0.1:{port} -- another process may own the port (or a RUST_LOG \
+                 setting hides ePHPm's INFO lines, which this check reads)"
+            ),
+            Ok(status) => format!("/_ephpm/health returned HTTP {status}"),
+            Err(e) => e.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(StartFailure::Fatal(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("ephpm on 127.0.0.1:{port} not serving within {timeout:?}: {last}"),
+            )));
         }
         thread::sleep(Duration::from_millis(200));
     }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("ephpm on 127.0.0.1:{port} did not become healthy within {timeout:?}: {last_err}"),
-    ))
 }
+
+/// Wait for a listener whose bind failure is *logged* rather than fatal (the
+/// node keeps running without it) to report `marker` on `port`.
+fn wait_for_listener(
+    child: &mut Child,
+    logs: &NodeLogs,
+    marker: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), StartFailure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        exit_check(child, logs)?;
+        let text = logs.read();
+        if let Some(line) = bind_failure_line(&text) {
+            return Err(StartFailure::PortTaken(line));
+        }
+        if log_reports_listener(&text, marker, port) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(StartFailure::Fatal(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no \"{marker}\" log line for 127.0.0.1:{port} within {timeout:?}"),
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `Err` if the node has exited: `PortTaken` when its logs blame a taken
+/// port, fatal otherwise.
+fn exit_check(child: &mut Child, logs: &NodeLogs) -> Result<(), StartFailure> {
+    let Some(status) = child.try_wait()? else {
+        return Ok(());
+    };
+    Err(match bind_failure_line(&logs.read()) {
+        Some(line) => StartFailure::PortTaken(line),
+        None => StartFailure::Fatal(io::Error::other(format!(
+            "ephpm exited ({status}) before it was serving"
+        ))),
+    })
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
 
 /// Wait until a worker-mode node actually serves a PHP request (not just the
 /// liveness probe). Proves at least one worker finished booting the framework.
@@ -2038,7 +2604,7 @@ fn wait_for_worker(port: u16, timeout: Duration) -> io::Result<()> {
         match tcp_get(port, "/_xtask_worker_warmup") {
             Ok(200) => return Ok(()),
             Ok(status) => last_err = format!("worker request returned HTTP {status}"),
-            Err(e) => last_err = format!("connect error: {e}"),
+            Err(e) => last_err = e.to_string(),
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -2050,22 +2616,37 @@ fn wait_for_worker(port: u16, timeout: Duration) -> io::Result<()> {
 
 /// Minimal HTTP/1.0 GET — returns the status code. Avoids pulling reqwest
 /// into xtask just for a health check.
+///
+/// Errors say which step failed. In particular a read that times out is
+/// reported as such: on Unix it surfaces as `EAGAIN` ("Resource temporarily
+/// unavailable (os error 11)"), which used to be printed as a *connect* error
+/// and read like a networking failure rather than a node that accepted the
+/// connection and never answered.
 fn tcp_get(port: u16, path: &str) -> io::Result<u16> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
+    let step =
+        |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_secs(1),
-    )?;
+    )
+    .map_err(step("connect"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(req.as_bytes()).map_err(step("write"))?;
 
     let mut buf = [0u8; 128];
-    let n = stream.read(&mut buf)?;
+    let n = stream.read(&mut buf).map_err(|e| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connected, but no response within 2s ({e})"),
+        ),
+        _ => step("read")(e),
+    })?;
     if n == 0 {
         return Err(io::Error::other("empty response"));
     }
@@ -2143,7 +2724,112 @@ fn escape_toml(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ISOLATED_CONFIG_SUITES, platform_skip_reason_for};
+    use std::path::PathBuf;
+
+    use super::{
+        CLUSTER_NODE_TEMPLATE, ISOLATED_CONFIG_SUITES, PORT_RANGE, PortKind, PortPicker,
+        SINGLE_NODE_TEMPLATE, bind_failure_line, log_reports_listener, parse_test_executables,
+        platform_skip_reason_for,
+    };
+
+    /// A reservation hands out distinct, in-range ports that are genuinely
+    /// held: nothing else can bind them until the reservation is released.
+    #[test]
+    fn reservation_holds_distinct_in_range_ports_until_released() {
+        let mut picker = PortPicker::new();
+        let kinds = [PortKind::Tcp, PortKind::Tcp, PortKind::Udp, PortKind::Tcp, PortKind::Udp];
+        let res = picker.reserve(&kinds).expect("reserve");
+        let ports = res.ports().to_vec();
+        assert_eq!(ports.len(), kinds.len());
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ports.len(), "ports must be distinct: {ports:?}");
+        for (port, kind) in ports.iter().zip(kinds) {
+            assert!(PORT_RANGE.contains(port), "{port} outside {PORT_RANGE:?}");
+            let taken = match kind {
+                PortKind::Tcp => std::net::TcpListener::bind(("127.0.0.1", *port)).is_err(),
+                PortKind::Udp => std::net::UdpSocket::bind(("127.0.0.1", *port)).is_err(),
+            };
+            assert!(taken, "{kind:?} port {port} must be held while reserved");
+        }
+        res.release();
+        let tcp_port = ports[0];
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", tcp_port)).is_ok(),
+            "port {tcp_port} must be bindable once released"
+        );
+    }
+
+    /// Two pickers (two harness runs) do not start from the same candidate
+    /// sequence, so they do not keep reaching for the same ports.
+    #[test]
+    fn pickers_are_independently_seeded() {
+        let a: Vec<u16> = (0..8).map(|_| PortPicker::new().candidate()).collect();
+        let mut p = PortPicker::new();
+        let b: Vec<u16> = (0..8).map(|_| p.candidate()).collect();
+        assert_ne!(a, b);
+    }
+
+    /// No template may name a fixed port: every listener goes through a
+    /// placeholder the harness fills from a reservation.
+    #[test]
+    fn templates_hard_code_no_ports() {
+        for (name, template) in
+            [("single", SINGLE_NODE_TEMPLATE), ("cluster", CLUSTER_NODE_TEMPLATE)]
+        {
+            for line in template.lines().filter(|l| l.contains("127.0.0.1:")) {
+                assert!(line.contains("127.0.0.1:{"), "{name} template binds a fixed port: {line}");
+            }
+        }
+        assert!(SINGLE_NODE_TEMPLATE.contains("listen = \"127.0.0.1:{KV_PORT}\""));
+        assert!(CLUSTER_NODE_TEMPLATE.contains("listen = \"127.0.0.1:{CHANNEL_PORT}\""));
+    }
+
+    #[test]
+    fn bind_failures_are_recognised_on_every_platform() {
+        for line in [
+            "error: failed to bind to 127.0.0.1:18100: Address already in use (os error 98)",
+            "\u{1b}[31mERROR\u{1b}[0m KV RESP server error: failed to bind KV server to \
+             127.0.0.1:6379: Address already in use (os error 98)",
+            "failed to bind: Only one usage of each socket address is normally permitted. \
+             (os error 10048)",
+            "failed to bind: An attempt was made to access a socket in a way forbidden by its \
+             access permissions. (os error 10013)",
+        ] {
+            assert!(bind_failure_line(&format!("ok\n{line}\nok")).is_some(), "{line}");
+        }
+        assert_eq!(bind_failure_line("INFO ephpm_server: HTTP listening addr=127.0.0.1:1"), None);
+    }
+
+    #[test]
+    fn listener_lines_must_name_the_exact_port() {
+        let logs = "\u{1b}[32m INFO\u{1b}[0m ephpm_server: HTTP listening \
+                    \u{1b}[3maddr\u{1b}[0m\u{1b}[2m=\u{1b}[0m127.0.0.1:12345\n\
+                    INFO ephpm: starting ePHPm listen=127.0.0.1:11111";
+        assert!(log_reports_listener(logs, "HTTP listening", 12345));
+        assert!(!log_reports_listener(logs, "HTTP listening", 1234), "prefix of another port");
+        assert!(!log_reports_listener(logs, "HTTP listening", 11111), "not a listening line");
+    }
+
+    /// Cargo's JSON stream: only `tests/*.rs` targets count, escaped paths
+    /// are unescaped, and a `null` executable is skipped.
+    #[test]
+    fn test_executables_come_from_cargo_json() {
+        let messages = concat!(
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{"kind":["lib"],"crate_types":["lib"],"name":"ephpm_e2e","src_path":"s","test":true},"executable":"/t/deps/ephpm_e2e-1","fresh":true}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{"kind":["test"],"crate_types":["bin"],"name":"basic","src_path":"s","test":true},"executable":"C:\\t\\deps\\basic-2.exe","fresh":true}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{"kind":["test"],"crate_types":["bin"],"name":"kv","src_path":"s","test":true},"executable":null,"fresh":true}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+        );
+        assert_eq!(
+            parse_test_executables(messages),
+            vec![("basic".to_string(), PathBuf::from(r"C:\t\deps\basic-2.exe"))]
+        );
+    }
 
     /// Issue #454: on Windows the `crash_containment` suite is dropped with a
     /// reason that names the missing capability, never silently.

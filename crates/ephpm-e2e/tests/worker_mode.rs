@@ -281,7 +281,7 @@ fn trailer_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("{key}=");
     let start = body.rfind(&needle)? + needle.len();
     let rest = &body[start..];
-    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+    let end = rest.find([' ', '\n']).unwrap_or(rest.len());
     Some(&rest[..end])
 }
 
