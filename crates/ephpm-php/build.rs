@@ -64,8 +64,18 @@ fn main() {
     // trigger a real hard-limit exit without ending the test process. (Not
     // `rustc-link-arg-tests`: that one skips the lib's unit-test binary, where
     // the stub-mode tests of the mechanism live.)
+    //
+    // The flag reaches every test binary of this package, including ones that
+    // never link the ephpm_php rlib (an integration test whose whole file is
+    // `#![cfg(php_linked)]` is empty in stub mode). Those still reference
+    // `_exit` through std, so the wrap leaves `__wrap__exit` undefined unless
+    // the crash-guard archive is on their link line too. It is pure libc, so
+    // naming it directly is safe in every binary; where the rlib already
+    // brings it in, the member is extracted only once.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo::rustc-link-arg=-Wl,--wrap=_exit");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set for build scripts"));
+        println!("cargo::rustc-link-arg={}", out_dir.join("libephpm_crash_guard.a").display());
     }
 
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
