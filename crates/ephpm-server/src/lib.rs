@@ -324,6 +324,11 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // Wake the hot-key invalidation watcher (no-op when hot_key_cache
         // is disabled in config).
         clustered.init_hot_key_watcher().await;
+        // Serve reads through peers until this node's gossip catch-up is
+        // complete: a (re)started node otherwise serves whatever version its
+        // per-peer, version-ordered catch-up delivered first, which can be a
+        // copy a peer has already superseded — for minutes (#631).
+        clustered.init_catch_up_gate().await;
 
         let replicator = ephpm_cluster::KvReplicator::new(
             Arc::clone(&clustered),
