@@ -75,12 +75,25 @@ fn request(path: PathBuf, name: &str) -> PhpRequest {
 /// Run one request on a fresh thread, the way a pool thread would: execute,
 /// then (if nothing was contained) the post-response teardown.
 fn run_on_fresh_thread(name: &'static str, body: &'static str) -> Result<PhpResponse, PhpError> {
+    run_on_fresh_thread_with_ini(name, body, &[])
+}
+
+/// [`run_on_fresh_thread`] with per-request INI overrides applied the way the
+/// router applies a site's `ini_overrides` (`PhpRuntime::set_request_ini`).
+fn run_on_fresh_thread_with_ini(
+    name: &'static str,
+    body: &'static str,
+    ini: &'static [(&'static str, &'static str)],
+) -> Result<PhpResponse, PhpError> {
     init_once();
     let path = script(name, body);
     std::thread::Builder::new()
         .name(format!("hard-limit-{name}"))
         .stack_size(ephpm_php::PHP_THREAD_STACK)
         .spawn(move || {
+            for (key, value) in ini {
+                PhpRuntime::set_request_ini(key, value);
+            }
             let out = PhpRuntime::execute(request(path, name));
             if !matches!(out, Err(PhpError::Contained(_))) {
                 PhpRuntime::finish_request().expect("teardown");
@@ -155,19 +168,53 @@ fn hard_limit_in_a_shutdown_function_is_contained() {
     assert_still_serving();
 }
 
-/// Lowering `memory_hard_limit_percent` to 100 (it is `PHP_INI_ALL`) makes the
-/// hard limit equal the soft one — still one thread, not the process.
+/// An operator lowering `memory_hard_limit_percent` to 100 (a site's
+/// `ini_overrides`) makes the hard limit equal the soft one — still one
+/// thread, not the process.
 #[cfg(php_hard_memory_limit)]
 #[test]
 #[serial]
-fn script_lowering_the_hard_limit_to_the_soft_limit_is_contained() {
-    let out = run_on_fresh_thread(
+fn hard_limit_lowered_to_the_soft_limit_is_contained() {
+    let out = run_on_fresh_thread_with_ini(
         "overshoot_percent.php",
-        "<?php ini_set('memory_limit', '16M'); ini_set('memory_hard_limit_percent', '100'); \
-         $s = sprintf(\"%'x20000000s\", ''); echo strlen($s);",
+        "<?php $s = sprintf(\"%'x20000000s\", ''); echo strlen($s);",
+        &[("memory_limit", "16M"), ("memory_hard_limit_percent", "100")],
     );
     assert_hard_limit_outcome(out);
     assert_still_serving();
+}
+
+/// Upstream registers `memory_hard_limit_percent` as `PHP_INI_ALL`; ePHPm
+/// lowers it to system-only at startup so a tenant script cannot move another
+/// tenant's process-wide cliff. `ini_set()` must fail and leave the value
+/// alone, while the operator's per-site override still applies.
+#[cfg(php_hard_memory_limit)]
+#[test]
+#[serial]
+fn scripts_cannot_change_the_hard_limit_percent() {
+    // before | ini_set's return | after ini_set | after ini_restore
+    const PROBE: &str = "<?php $k = 'memory_hard_limit_percent'; $before = ini_get($k); \
+         $set = var_export(ini_set($k, '100'), true); $after = ini_get($k); \
+         ini_restore($k); echo implode('|', [$before, $set, $after, ini_get($k)]);";
+
+    let resp = run_on_fresh_thread("percent_locked.php", PROBE).expect("probe request");
+    let out = text(&resp);
+    let parts: Vec<&str> = out.split('|').collect();
+    let [before, set, after, restored] = parts[..] else {
+        panic!("unexpected probe output: {out}");
+    };
+    assert_eq!(set, "false", "ini_set must be refused: {out}");
+    assert_eq!(after, before, "the refused ini_set must not change the value: {out}");
+    assert_eq!(restored, before, "ini_restore must not change the value either: {out}");
+
+    let resp = run_on_fresh_thread_with_ini(
+        "percent_override.php",
+        PROBE,
+        &[("memory_hard_limit_percent", "150")],
+    )
+    .expect("probe request with a site override");
+    let out = text(&resp);
+    assert_eq!(out, "150|false|150|150", "the site override must still apply");
 }
 
 /// Resident set size of this process, in bytes (`VmRSS` in `/proc/self/status`).

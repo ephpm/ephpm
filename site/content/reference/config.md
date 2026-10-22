@@ -729,9 +729,15 @@ Sizing guidance:
   request. Lowering it towards `100` stops overshooting requests sooner, and on
   Linux that only ever costs the request. Set it server-wide with
   `ini_overrides = [["memory_hard_limit_percent", "150"]]`.
-- Both `memory_limit` and `memory_hard_limit_percent` are `PHP_INI_ALL`, so a
-  script can change them with `ini_set()`. A tenant can therefore always reach
-  the hard limit on purpose; on Linux that costs only its own request.
+- Only operators set `memory_hard_limit_percent`. Upstream registers it
+  `PHP_INI_ALL`; ePHPm lowers it to system-only at startup, so `ini_set()` and
+  `ini_restore()` on it return `false` and leave the value unchanged, while
+  php.ini, `[php] ini_overrides` and a site's `ini_overrides` still apply. The
+  CLI (`ephpm php`) keeps the upstream behaviour. `memory_limit` stays
+  `PHP_INI_ALL` as upstream ships it, so a script can still raise its own soft
+  limit, and with it the hard limit (which is a percentage of it). A tenant can
+  therefore always reach the hard limit on purpose; on Linux that costs only
+  its own request.
 
 ### Where PHP errors go
 

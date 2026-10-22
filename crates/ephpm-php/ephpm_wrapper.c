@@ -3740,6 +3740,35 @@ static const zend_function_entry ephpm_worker_envelope_methods[] = {
  * class from the bare shim, where EG(current_module) is NULL, segfaults. The
  * module's own `functions` table registers the namespaced free functions with
  * the same correct module context. */
+/* Take `memory_hard_limit_percent` (PHP 8.3.36 / 8.4.27 / 8.5.12, registered
+ * PHP_INI_ALL upstream) away from scripts. Crossing the hard limit ends the
+ * thread's request with _exit(137) — contained on Linux, process-fatal on
+ * macOS and Windows — so in a multi-tenant server a tenant must not be able to
+ * `ini_set()` it down to 100. Lowering the entry's `modifiable` to SYSTEM makes
+ * ini_set()/ini_restore() (ZEND_INI_USER) fail and return false, while php.ini,
+ * `[php] ini` (sapi ini_entries, applied at registration) and the per-site
+ * overrides (applied with PHP_INI_SYSTEM by ephpm_request_ini_apply) still set
+ * it.
+ *
+ * Runs from this module's MINIT, i.e. inside php_module_startup() and before
+ * zend_post_startup(): there EG(ini_directives) IS the registered table that
+ * every ZTS thread copies its own directives from (zend_copy_ini_directives),
+ * so one write covers every thread. main.c registers its entries before any
+ * module starts, so the entry exists here on a patched SDK; on an older SDK it
+ * is absent and this is a no-op. Not in `ephpm php` (g_cli_mode): the CLI runs
+ * the operator's own script, as php-cli would. */
+static void ephpm_lock_hard_limit_ini(void)
+{
+    if (g_cli_mode) {
+        return;
+    }
+    zend_ini_entry *entry = zend_hash_str_find_ptr(
+        EG(ini_directives), ZEND_STRL("memory_hard_limit_percent"));
+    if (entry) {
+        entry->modifiable = ZEND_INI_SYSTEM;
+    }
+}
+
 static PHP_MINIT_FUNCTION(ephpm_worker)
 {
     (void)type;
@@ -3759,6 +3788,8 @@ static PHP_MINIT_FUNCTION(ephpm_worker)
          * constraint. Not final, so adapters may subclass if useful. */
         ephpm_worker_envelope_ce->ce_flags |= ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES;
     }
+
+    ephpm_lock_hard_limit_ini();
 
     return SUCCESS;
 }
