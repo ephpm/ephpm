@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod body;
 pub mod db_health;
+pub mod db_shutdown;
 pub mod debug_lane;
 pub mod dns01;
 pub mod dns01_digitalocean;
@@ -1342,6 +1343,18 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // close instead of a timeout.
     if let Some(task) = http3_task {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // Requests are drained; now leave every embedded database with an empty
+    // write-ahead log. Deliberately outside the drain deadline above: a final
+    // checkpoint runs to completion (see `db_shutdown` for its last-resort
+    // bound), so exiting never depends on WAL recovery at the next start.
+    let checkpoint = db_shutdown::checkpoint_all().await;
+    if !checkpoint.abandoned.is_empty() {
+        tracing::warn!(
+            sites = ?checkpoint.abandoned,
+            "exiting with un-truncated WAL on these databases"
+        );
     }
 
     tracing::info!(

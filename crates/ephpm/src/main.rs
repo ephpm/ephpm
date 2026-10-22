@@ -1317,12 +1317,13 @@ const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disa
 /// after this is left behind (the process exits around it) rather than
 /// keeping a SIGTERMed server alive until SIGKILL.
 ///
-/// Not tiny on purpose: dropping the background tasks closes every embedded
-/// database, and those closes `fsync` (observed: runtime threads parked in
-/// `jbd2_log_wait_commit`). A loaded per-site node with 60 open databases
-/// needed more than 5 s for that; cutting it short is survivable (the engine
-/// recovers its WAL on the next open) but turns a clean shutdown into a
-/// crash-equivalent one, so the bound only has to catch a genuinely stuck task.
+/// Database durability does not depend on this bound: `serve` runs a final
+/// `wal_checkpoint(TRUNCATE)` of every open embedded database
+/// (`ephpm_server::db_shutdown`) to completion *before* it returns, so the
+/// tasks dropped here hold no un-checkpointed state worth waiting for. It is
+/// still not tiny, so in-flight commits (observed: runtime threads parked in
+/// `jbd2_log_wait_commit`) normally finish; it only has to catch a genuinely
+/// stuck task.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Mode-dependent PHP error display/logging defaults for the generated ini.
