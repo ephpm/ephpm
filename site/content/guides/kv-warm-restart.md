@@ -253,6 +253,69 @@ ephpm kv snapshot inspect s3://my-kv-snapshots/prod/web/web.kvsnap --config /etc
 ephpm kv snapshot rm web --config /etc/ephpm/ephpm.toml
 ```
 
+## Cluster: peer handoff (rolling deploys)
+
+On a clustered node (`[cluster] enabled = true`) warm restarts need no file
+and no bucket: with `peer_handoff = true` (the default) a node that stops
+gracefully hands the large KV values it holds to the peers that take over
+their replica slots, and a node that starts pulls its share back from its
+peers before it serves. Small values (at or below
+`[cluster.kv] small_key_threshold`, the gossip tier) come back through
+gossip on their own. The details are in
+[KV snapshots → Peer handoff](/architecture/kv-snapshots/#peer-handoff-peer_handoff-on-by-default).
+
+A rolling deploy of a 3-node StatefulSet therefore looks like this:
+
+1. `web-2` gets `SIGTERM`. It drains requests, pushes its large values to
+   `web-0`/`web-1` (seconds, logged as `KV handoff to peers done
+   keys=… bytes=…`), writes its local/object snapshot if one is configured,
+   and exits.
+2. `web-2` restarts, opens for traffic at once, and in the background
+   joins gossip and pulls its share of large values from `web-0` and
+   `web-1` (`KV warm-up pull from peers done`, typically a couple of
+   seconds). A request that arrives before its key has been pulled is a
+   miss, not a stale hit. Readiness is reported when the listeners are
+   bound, as without handoff.
+3. Repeat for `web-1`, then `web-0`.
+
+The transfer in both directions is bounded by `load_timeout` (default
+30 s); a starting pod with `[cluster] join` seeds first waits up to 10 s
+for gossip to show an alive peer, and that wait is not shortened by
+`load_timeout`. Size `terminationGracePeriodSeconds` for the drain plus
+the push plus the snapshot. A pod killed without a graceful stop pushes nothing — its keys
+survive only where `replication_factor` already put them, which is why the
+default is 2.
+
+On a clustered node the snapshot and the peers do **not** both apply.
+With at least one alive peer, the snapshot is not restored at all: large
+values come from the peers (the pull delivers exactly the keys this node
+is a replica for now, with their write stamps) and small values arrive
+through gossip over the next minutes (about one 64 KB gossip datagram per
+second per peer), so the node misses on small keys until gossip has
+caught up — and is never stale. The log says so:
+`KV snapshot not restored ... reason="peers_present"`. Restoring the
+snapshot next to live peers was measured and rejected: it served the
+pre-restart value of every small key another node had rewritten while
+this one was down (for minutes, on that node), and a stale session, lock
+token or invalidation is worse than a miss.
+
+Only a node that finds no peer within the join wait (10 s) restores its
+snapshot — whole. Plainly: a whole-cluster restart where all nodes come
+up together is cold; if warmth matters, stop every node and start one
+first, then the others. A value that lone node restored stays in its own
+store (it is not re-published into gossip); the nodes that join later
+pull its large values and build the small tier from live writes.
+
+```toml
+[kv.snapshot]
+peer_handoff = true        # the default; mode may stay "off" on a cluster node
+load_timeout = "30s"       # bounds the pull on start and the push on stop
+```
+
+Metrics: `ephpm_kv_handoff_keys_total{direction}`,
+`ephpm_kv_handoff_bytes_total{direction}`,
+`ephpm_kv_handoff_duration_seconds{direction}`.
+
 ## Checking on it
 
 ```bash
@@ -307,9 +370,9 @@ passwords already have.
 
 ## Limits, honestly
 
-- Peer handoff in a cluster (warming a new node from its peers, no disk or
-  bucket involved) is the next piece; until then a cluster node warms from
-  its own file or object only.
+- Peer handoff moves data only on a graceful stop and a start; it does not
+  rebalance on other membership changes, and hashes are not handed off (they
+  are not replicated at all).
 - Object mode reads static `AWS_*` credentials only; no instance profile,
   no IRSA, no multipart upload (one `PutObject` up to 5 GiB).
 - A snapshot is node-local. In a cluster each node writes its own; nothing

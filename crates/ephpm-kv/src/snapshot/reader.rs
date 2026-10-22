@@ -48,11 +48,62 @@ pub struct LoadOptions {
     pub max_size: u64,
     /// Worker threads. `0` = one per available core, at most 8.
     pub workers: usize,
+    /// Which value tier to restore; see [`ValueFilter`].
+    pub value_filter: ValueFilter,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        Self { deadline: None, max_size: 1 << 30, workers: 0 }
+        Self { deadline: None, max_size: 1 << 30, workers: 0, value_filter: ValueFilter::All }
+    }
+}
+
+/// Restore every entry, or only one of the cluster's two value tiers.
+///
+/// A clustered node with peer handoff takes its **large** values (above
+/// `[cluster.kv] small_key_threshold`) from its peers at startup — stamped,
+/// current, and exactly the keys it is a replica for — so restoring them
+/// from the snapshot would only add copies of keys this node is no longer a
+/// replica for, which later writes never reach. It therefore restores the
+/// gossip tier first ([`SmallOnly`](Self::SmallOnly)) and the large tier
+/// from the snapshot only when no peer could be asked
+/// ([`LargeOnly`](Self::LargeOnly)). Hashes are never replicated, so they
+/// count as the small tier. A string stored compressed is counted as large
+/// (its decoded size is unknown without decoding; the store's compression
+/// floor is above the threshold by default, so this is also true).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValueFilter {
+    /// Every entry.
+    #[default]
+    All,
+    /// Strings whose stored, uncompressed length is at most this, plus every
+    /// hash.
+    SmallOnly(usize),
+    /// Strings larger than this (or stored compressed); no hashes.
+    LargeOnly(usize),
+}
+
+impl ValueFilter {
+    /// Whether a string entry passes.
+    fn keeps_string(self, stored_len: usize, compressed: bool) -> bool {
+        let large = compressed || stored_len > self.threshold().unwrap_or(usize::MAX);
+        match self {
+            Self::All => true,
+            Self::SmallOnly(_) => !large,
+            Self::LargeOnly(_) => large,
+        }
+    }
+
+    /// Whether hash entries pass.
+    fn keeps_hashes(self) -> bool {
+        !matches!(self, Self::LargeOnly(_))
+    }
+
+    fn threshold(self) -> Option<usize> {
+        match self {
+            Self::All => None,
+            Self::SmallOnly(t) | Self::LargeOnly(t) => Some(t),
+        }
     }
 }
 
@@ -161,6 +212,8 @@ pub struct LoadReport {
     pub refused: u64,
     /// Entries in blocks whose site resolved to no store.
     pub unknown_site: u64,
+    /// Entries left out by the [`ValueFilter`] (the other tier).
+    pub filtered: u64,
     /// Data blocks in the file.
     pub blocks: usize,
     /// Data blocks that failed to open or decode.
@@ -185,6 +238,7 @@ impl LoadReport {
             expired: 0,
             refused: 0,
             unknown_site: 0,
+            filtered: 0,
             blocks: 0,
             bad_blocks: 0,
             unreached_blocks: 0,
@@ -408,6 +462,7 @@ pub fn load_snapshot(
     let stats = &stats;
     let next = &next;
     let deadline = opts.deadline;
+    let filter = opts.value_filter;
     std::thread::scope(|scope| {
         for i in 0..workers {
             std::thread::Builder::new()
@@ -431,6 +486,7 @@ pub fn load_snapshot(
                             header_bytes,
                             resolve,
                             deadline,
+                            filter,
                             stats,
                         ) {
                             Ok(()) => {}
@@ -474,6 +530,7 @@ pub fn load_snapshot(
         expired: stats.expired.load(Ordering::Relaxed),
         refused,
         unknown_site,
+        filtered: stats.filtered.load(Ordering::Relaxed),
         blocks: total_blocks,
         bad_blocks,
         unreached_blocks: total_blocks - reached,
@@ -486,6 +543,7 @@ pub fn load_snapshot(
 #[derive(Default)]
 struct Stats {
     restored: AtomicU64,
+    filtered: AtomicU64,
     expired: AtomicU64,
     refused: AtomicU64,
     unknown_site: AtomicU64,
@@ -507,6 +565,7 @@ fn apply_block(
     header_bytes: &[u8],
     resolve: SiteResolver<'_>,
     deadline: Option<Instant>,
+    filter: ValueFilter,
     stats: &Stats,
 ) -> Result<(), BlockFailure> {
     let ct = read_block(file, entry.offset, entry.len, BLOCK_KIND_DATA)
@@ -548,6 +607,10 @@ fn apply_block(
         };
         match rec {
             EntryRecord::String { key, data, compressed, expires_at_ms } => {
+                if !filter.keeps_string(data.len(), compressed) {
+                    stats.filtered.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let expires_at = match clock.deadline(expires_at_ms) {
                     Ok(d) => d,
                     Err(Expired) => {
@@ -576,6 +639,10 @@ fn apply_block(
                 }
             }
             EntryRecord::Hash { key, fields, expires_at_ms } => {
+                if !filter.keeps_hashes() {
+                    stats.filtered.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let expires_at = match clock.deadline(expires_at_ms) {
                     Ok(d) => d,
                     Err(Expired) => {

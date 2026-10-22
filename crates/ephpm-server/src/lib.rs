@@ -198,6 +198,11 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Some(Arc::new(chain))
     };
 
+    // Peer handoff of large KV values (`[kv.snapshot] peer_handoff`): built
+    // inside the cluster block, used before the accept loop (pull) and after
+    // it (push).
+    let mut kv_handoff: Option<Arc<ephpm_cluster::PeerHandoff>> = None;
+
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
         // Fail closed on an unauthenticated cluster: an empty secret means
@@ -252,35 +257,46 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // writes), so every path that lands a value on this node agrees on
         // which write is newest.
         let applied = ephpm_cluster::clustered_store::new_applied_write_map();
-        let data_plane_applied = Arc::clone(&applied);
+        let cluster_handle = Arc::new(handle);
+
+        // The router the data plane serves. It also answers peer warm-up
+        // pulls (`OP_SHARE`) from the handoff source when `[kv.snapshot]
+        // peer_handoff` is on, and is the router this node's own pull and
+        // push walk — so a value handed off lands exactly as a replica write.
+        let handoff_source = config.kv.snapshot.peer_handoff.then(|| {
+            ephpm_cluster::HandoffSource::new(Arc::clone(&cluster_handle), &config.cluster.kv)
+        });
+        let data_plane_router = match data_plane_sites {
+            Some(sites) => {
+                ephpm_cluster::data_plane::KvRouter::multi_tenant(data_plane_store, sites)
+            }
+            None => ephpm_cluster::data_plane::KvRouter::global(data_plane_store),
+        }
+        .with_applied(Arc::clone(&applied));
+        let data_plane_router = match &handoff_source {
+            Some(source) => data_plane_router.with_handoff(Arc::clone(source)),
+            None => data_plane_router,
+        };
+        if let Some(source) = &handoff_source {
+            kv_handoff = Some(ephpm_cluster::PeerHandoff::new(
+                Arc::clone(&cluster_handle),
+                data_plane_cipher.clone(),
+                data_plane_router.clone(),
+                Arc::clone(source),
+                &config.cluster.kv,
+            ));
+        }
         tokio::spawn(async move {
-            let result = match data_plane_sites {
-                Some(sites) => {
-                    ephpm_cluster::data_plane::serve_multi_tenant(
-                        data_plane_store,
-                        sites,
-                        data_addr,
-                        data_plane_cipher,
-                        data_plane_applied,
-                    )
-                    .await
-                }
-                None => {
-                    ephpm_cluster::data_plane::serve(
-                        data_plane_store,
-                        data_addr,
-                        data_plane_cipher,
-                        data_plane_applied,
-                    )
-                    .await
-                }
-            };
-            if let Err(e) = result {
+            if let Err(e) = ephpm_cluster::data_plane::serve_router(
+                data_plane_router,
+                data_addr,
+                data_plane_cipher,
+            )
+            .await
+            {
                 tracing::error!(%e, "KV data plane error");
             }
         });
-
-        let cluster_handle = Arc::new(handle);
 
         // Wire the local KV Store through the ClusteredStore replicator so
         // RESP + PHP native writes routed via `Store::set`/`remove`/`expire`
@@ -511,6 +527,9 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Arc::clone(&kv_store),
         multi_tenant_kv.clone(),
         effective_node_id.as_deref(),
+        // With peer handoff the snapshot is restored only when no peer is
+        // found after the join wait (see `load_after_pull`).
+        kv_handoff.is_some(),
     )
     .context("failed to set up KV snapshots")?;
     if let Some(svc) = &kv_snapshot {
@@ -553,7 +572,57 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // race the process-wide credential change.
     privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
+    // Peer warm-up: pull this node's share of large KV values from its
+    // peers — a join wait of up to 10 s for gossip to list a peer (not
+    // shortened by `load_timeout`, since `peers == 0` is what lets the
+    // snapshot be restored), then the transfer bounded by `load_timeout`.
+    // It runs *concurrently with the accept loop*, not before it: holding
+    // the first request back for the ~2 s the transfer takes roughly
+    // doubled the node's downtime per restart, and the lab measured
+    // 1.3–1.7x the small-tier stale reads of a plain restart from that
+    // alone (the gossip tier's own catch-up is what goes stale; longer
+    // downtime widens it). Serving during the pull is safe by
+    // construction: every pulled entry lands through the stamped-write
+    // path, so a request racing the pull sees a miss — never an older
+    // value — exactly what a node with handoff off would serve.
+    let warm_up = kv_handoff.as_ref().map(|handoff| {
+        let handoff = Arc::clone(handoff);
+        let snapshot = kv_snapshot.clone();
+        let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
+        let expect_peers = !config.cluster.join.is_empty();
+        tokio::spawn(async move {
+            let report = handoff.pull(deadline, expect_peers).await;
+            kv_snapshot::record_handoff("in", &report);
+            // Alone (no alive peer within the join wait): the snapshot is
+            // the only copy there is, so restore it. With peers present
+            // nothing is restored from it — gossip and the pull are the
+            // sources.
+            if let Some(svc) = &snapshot {
+                svc.load_after_pull(report.peers).await;
+            }
+        })
+    });
+
     let served = accept_loop(listeners).await;
+
+    // A drain that begins before the warm-up finished: abandon the pull
+    // rather than push while still pulling (both walk the same stores and
+    // the peers are about to take over this node's slots anyway).
+    if let Some(warm_up) = warm_up
+        && !warm_up.is_finished()
+    {
+        warm_up.abort();
+        tracing::info!("shutdown began before the KV warm-up pull finished; pull abandoned");
+    }
+
+    // Requests are drained. Hand this node's large KV values to the peers
+    // that take over their replica slots — while gossip still lists this
+    // node and the data plane is still up on both ends. Then the snapshot.
+    if let Some(handoff) = &kv_handoff {
+        let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
+        let report = handoff.push(deadline).await;
+        kv_snapshot::record_handoff("out", &report);
+    }
 
     // Requests are drained. Write the warm-restart KV snapshot first — it
     // reflects the last request served, and it needs nothing below to still

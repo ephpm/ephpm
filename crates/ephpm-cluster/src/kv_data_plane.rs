@@ -158,6 +158,34 @@ const MAX_REMOTE_TTL_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
 /// Op code for an owner-arbitrated compare-and-delete.
 const OP_DEL_IF_EQ: u8 = 0x03;
 
+/// Op code for a peer warm-up pull (`[key]` = the requester's node id, no
+/// value): the server streams back every large value for which the
+/// requester is in the replica set, as a sequence of [`SHARE_BATCH`]
+/// messages ending with a [`SHARE_END`] message. A batch message is
+/// `[SHARE_BATCH][len u32][payload]` (one sealed frame when encrypted),
+/// `payload` = `[count u32]` then `count` entries of
+/// `[key_len u32][transport_key][value_len u32][value][ttl_ms u64][write u64][node_tag u64]`,
+/// about [`SHARE_BATCH_BYTES`] per batch — so a share of any size is bounded
+/// by one batch in flight on each end, and costs a syscall per batch rather
+/// than per value (one value per message pulled 400k entries at 13 MB/s;
+/// batched, the same pull runs at the data plane's push rate). See
+/// [`crate::kv_handoff`]. A node predating this op drops the connection,
+/// which the puller reports as that peer being unable to share.
+const OP_SHARE: u8 = 0x05;
+
+/// Share stream message flag: a batch of entries follows.
+const SHARE_BATCH: u8 = 0x02;
+
+/// Share stream message flag: the stream is complete.
+const SHARE_END: u8 = 0x00;
+
+/// Target payload bytes per share batch.
+const SHARE_BATCH_BYTES: usize = 256 * 1024;
+
+/// Largest share batch a puller accepts (a batch holds at least one entry,
+/// so it can exceed the target by one value).
+const MAX_SHARE_BATCH: u32 = SHARE_BATCH_BYTES as u32 + MAX_KEY_LEN + MAX_VALUE_LEN + 64;
+
 /// SET response: success.
 const SET_OK: u8 = 0x00;
 
@@ -243,13 +271,17 @@ pub struct KvRouter {
     /// A stamped SET is applied only when strictly newer than the record.
     /// `None` (tests, tools) applies every stamped SET unconditionally.
     applied: Option<AppliedWriteMap>,
+    /// Answers [`OP_SHARE`] (peer warm-up pulls). `None` = the op is
+    /// answered with an empty stream, so a node without handoff still
+    /// interoperates with one that pulls.
+    handoff: Option<Arc<crate::kv_handoff::HandoffSource>>,
 }
 
 impl KvRouter {
     /// A router that sends every key to the process-wide store.
     #[must_use]
     pub fn global(store: Arc<Store>) -> Self {
-        Self { global: store, multi_tenant: None, applied: None }
+        Self { global: store, multi_tenant: None, applied: None, handoff: None }
     }
 
     /// A router that honours the per-site envelope.
@@ -258,7 +290,7 @@ impl KvRouter {
         store: Arc<Store>,
         multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
     ) -> Self {
-        Self { global: store, multi_tenant: Some(multi_tenant), applied: None }
+        Self { global: store, multi_tenant: Some(multi_tenant), applied: None, handoff: None }
     }
 
     /// Gate stamped SETs through `applied` — the same map the gossip applier
@@ -268,6 +300,92 @@ impl KvRouter {
     pub fn with_applied(mut self, applied: AppliedWriteMap) -> Self {
         self.applied = Some(applied);
         self
+    }
+
+    /// Answer peer warm-up pulls ([`OP_SHARE`]) from `source`.
+    #[must_use]
+    pub fn with_handoff(mut self, source: Arc<crate::kv_handoff::HandoffSource>) -> Self {
+        self.handoff = Some(source);
+        self
+    }
+
+    /// Every store this router can route to, with its site key (`""` for
+    /// the global store) — the stores a handoff walks.
+    #[must_use]
+    pub fn stores(&self) -> Vec<(String, Arc<Store>)> {
+        let mut out = vec![(String::new(), Arc::clone(&self.global))];
+        if let Some(mt) = &self.multi_tenant {
+            out.extend(mt.site_stores());
+        }
+        out
+    }
+
+    /// Read a value **together with** the stamp recorded for its key, as one
+    /// consistent pair: `read` runs while this node's applied-map slot for
+    /// `transport_key` is held, the same slot [`apply_if_newer`] holds across
+    /// its local write, so a write cannot land between the two reads.
+    ///
+    /// Reading them separately is a real bug, not a theoretical one: the
+    /// handoff walk once copied a value, then looked up the stamp, and a
+    /// replica write that landed in between left it sending the *old* value
+    /// under the *new* stamp — which then beat the real new value on every
+    /// receiver (two keys of three thousand in the lab's race scenario).
+    ///
+    /// `None` from `read` means there is nothing to send; the stamp is
+    /// `None` when the key has no record within the applied horizon.
+    pub fn read_stamped<T>(
+        &self,
+        transport_key: &str,
+        read: impl FnOnce() -> Option<T>,
+    ) -> Option<(T, Option<Stamp>)> {
+        match self.applied.as_ref() {
+            Some(applied) => {
+                // Lock order: applied slot, then (inside `read`) the store's
+                // shard — the same order `apply_if_newer` uses.
+                let slot = applied.get(transport_key);
+                let stamp = slot.as_ref().map(|s| **s);
+                let value = read()?;
+                drop(slot);
+                Some((value, stamp))
+            }
+            None => read().map(|v| (v, None)),
+        }
+    }
+
+    /// Land a stamped value on this node — the [`OP_SET_V2`] path, also used
+    /// by a warm-up pull for every entry a peer shares. The write is ordered
+    /// through the applied map: an older stamp than the one recorded for the
+    /// key is acknowledged but not applied, so a shared copy can never
+    /// regress a write that landed here first.
+    ///
+    /// `Some(accepted)` — the store took (or skipped as stale) the write;
+    /// `None` — the key claims a vhost this node cannot route.
+    #[must_use]
+    pub fn apply_stamped(
+        &self,
+        transport_key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        stamp: Stamp,
+    ) -> Option<bool> {
+        let (store, key) = self.resolve(transport_key)?;
+        let ttl =
+            (ttl_ms > 0).then(|| std::time::Duration::from_millis(ttl_ms.min(MAX_REMOTE_TTL_MS)));
+        let mut ok = true;
+        let verdict = match self.applied.as_ref() {
+            Some(applied) => apply_if_newer(applied, transport_key, stamp, || {
+                ok = store.set_local(key.to_string(), value, ttl);
+            }),
+            None => {
+                ok = store.set_local(key.to_string(), value, ttl);
+                Apply::Newer
+            }
+        };
+        if verdict == Apply::Skip {
+            tracing::trace!(key = %transport_key, ?stamp, "stamped SET skipped as stale");
+            return Some(true);
+        }
+        Some(ok)
     }
 
     /// Resolve `transport_key` to its store and the bare key within it.
@@ -382,6 +500,11 @@ async fn handle_connection(
             }
             Err(_) => anyhow::bail!("idle for {SERVER_IDLE_TIMEOUT:?} without a complete request"),
         };
+        if request.op == OP_SHARE {
+            // A streamed answer: many messages, then the end marker.
+            serve_share(&mut stream, router, &request.key, cipher).await?;
+            continue;
+        }
         let response = serve_request(request, router)?;
         tokio::time::timeout(SERVER_WRITE_TIMEOUT, write_message(&mut stream, &response, cipher))
             .await
@@ -447,28 +570,15 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
         OP_SET_V2 => {
             let value = request.value.expect("stamped SET always carries a value");
             let stamp = request.stamp.expect("stamped SET always carries a stamp");
-            let ttl = (request.ttl_ms > 0)
-                .then(|| std::time::Duration::from_millis(request.ttl_ms.min(MAX_REMOTE_TTL_MS)));
             // Order against everything else that lands values on this node:
             // the record and the local write are one step under the key's
             // slot (`apply_if_newer`). A stale replica write (older than what
             // gossip or a later replica write already applied) is
             // acknowledged but not applied: the sender's write succeeded, it
-            // was just overtaken.
-            let mut ok = true;
-            let verdict = match router.applied.as_ref() {
-                Some(applied) => apply_if_newer(applied, &request.key, stamp, || {
-                    ok = store.set_local(key.to_string(), value, ttl);
-                }),
-                None => {
-                    ok = store.set_local(key.to_string(), value, ttl);
-                    Apply::Newer
-                }
-            };
-            if verdict == Apply::Skip {
-                tracing::trace!(key = %request.key, ?stamp, "stamped SET skipped as stale");
-                return Ok(vec![SET_OK]);
-            }
+            // was just overtaken. (`resolve` above already succeeded, so
+            // `apply_stamped` cannot answer `None` here.)
+            let ok =
+                router.apply_stamped(&request.key, value, request.ttl_ms, stamp).unwrap_or(false);
             vec![if ok { SET_OK } else { SET_REJECTED }]
         }
         OP_SET_NX => {
@@ -502,6 +612,230 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
         // which is also what a pre-conditional-ops node did.
         other => anyhow::bail!("unknown op code: {other:#04x}"),
     })
+}
+
+/// One entry of a share stream ([`OP_SHARE`]).
+#[derive(Debug, Clone)]
+pub struct ShareEntry {
+    /// The key as it travels the cluster (site-enveloped for a vhost key).
+    pub transport_key: String,
+    /// The decoded value.
+    pub value: Vec<u8>,
+    /// Remaining lifetime in milliseconds, `0` = none.
+    pub ttl_ms: u64,
+    /// The stamp the receiver orders the entry with.
+    pub stamp: Stamp,
+}
+
+/// Append one entry to a batch payload. Returns `false` (nothing appended)
+/// for an entry too large for the format.
+fn push_share_entry(out: &mut Vec<u8>, entry: &ShareEntry) -> bool {
+    let key = entry.transport_key.as_bytes();
+    let (Ok(key_len), Ok(value_len)) = (u32::try_from(key.len()), u32::try_from(entry.value.len()))
+    else {
+        return false;
+    };
+    if key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN {
+        return false;
+    }
+    out.extend_from_slice(&key_len.to_be_bytes());
+    out.extend_from_slice(key);
+    out.extend_from_slice(&value_len.to_be_bytes());
+    out.extend_from_slice(&entry.value);
+    out.extend_from_slice(&entry.ttl_ms.to_be_bytes());
+    out.extend_from_slice(&entry.stamp.write.to_be_bytes());
+    out.extend_from_slice(&entry.stamp.node_tag.to_be_bytes());
+    true
+}
+
+/// Accumulates entries into one batch message.
+struct ShareBatch {
+    /// `[SHARE_BATCH][len u32][count u32][entries…]`; `len` and `count` are
+    /// patched at [`finish`](Self::finish).
+    buf: Vec<u8>,
+    count: u32,
+    bytes: u64,
+}
+
+impl ShareBatch {
+    fn new() -> Self {
+        let mut buf = Vec::with_capacity(SHARE_BATCH_BYTES + 4096);
+        buf.push(SHARE_BATCH);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        Self { buf, count: 0, bytes: 0 }
+    }
+
+    fn push(&mut self, entry: &ShareEntry) -> bool {
+        if !push_share_entry(&mut self.buf, entry) {
+            return false;
+        }
+        self.count += 1;
+        self.bytes += entry.value.len() as u64;
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        self.buf.len() >= SHARE_BATCH_BYTES + 9
+    }
+
+    /// The finished message, or `None` when empty.
+    fn finish(mut self) -> Option<(Vec<u8>, u32, u64)> {
+        if self.count == 0 {
+            return None;
+        }
+        let len = u32::try_from(self.buf.len() - 5).ok()?;
+        self.buf[1..5].copy_from_slice(&len.to_be_bytes());
+        self.buf[5..9].copy_from_slice(&self.count.to_be_bytes());
+        Some((self.buf, self.count, self.bytes))
+    }
+}
+
+/// Parse a batch payload (`[count u32][entries…]`) into its entries.
+fn parse_share_batch(mut buf: &[u8]) -> anyhow::Result<Vec<ShareEntry>> {
+    let count = take_u32(&mut buf)? as usize;
+    let mut out = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let key_len = take_u32(&mut buf)?;
+        if key_len > MAX_KEY_LEN {
+            anyhow::bail!("key length {key_len} exceeds maximum {MAX_KEY_LEN}");
+        }
+        let transport_key = String::from_utf8(take_bytes(&mut buf, key_len as usize)?.to_vec())
+            .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
+        let value_len = take_u32(&mut buf)?;
+        if value_len > MAX_VALUE_LEN {
+            anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
+        }
+        let value = take_bytes(&mut buf, value_len as usize)?.to_vec();
+        let ttl_ms = take_u64(&mut buf)?;
+        let stamp = Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? };
+        out.push(ShareEntry { transport_key, value, ttl_ms, stamp });
+    }
+    if !buf.is_empty() {
+        anyhow::bail!("trailing bytes in share batch");
+    }
+    Ok(out)
+}
+
+/// How many share entries may wait between the store walk and the socket.
+const SHARE_QUEUE: usize = 1024;
+
+/// Answer an [`OP_SHARE`] from `requester`: stream every large value for
+/// which the requester is in the replica set, then the end marker.
+///
+/// The store walk runs on a blocking thread and feeds a bounded channel, so
+/// a share of any size holds at most [`SHARE_QUEUE`] values in flight and
+/// never a shard lock while the socket is slow. A requester that hangs up
+/// closes the channel, which ends the walk.
+async fn serve_share(
+    stream: &mut TcpStream,
+    router: &KvRouter,
+    requester: &str,
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<()> {
+    let Some(source) = router.handoff.clone() else {
+        tracing::debug!(requester, "KV share requested but this node has no handoff source");
+        return write_message(stream, &[SHARE_END], cipher).await;
+    };
+    let membership = source.membership_with(requester).await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ShareEntry>(SHARE_QUEUE);
+    let walker = {
+        let router = router.clone();
+        let requester = requester.to_string();
+        let source = Arc::clone(&source);
+        tokio::task::spawn_blocking(move || {
+            let mut sent = 0u64;
+            let mut closed = false;
+            for (site, store) in router.stores() {
+                if closed {
+                    break;
+                }
+                // The scan only enumerates candidate keys; the value and
+                // its stamp are re-read as a consistent pair per key.
+                store.scan_strings_decoded(source.large_min_len(), |key, _value, _ttl| {
+                    if closed {
+                        return;
+                    }
+                    let transport_key = crate::kv_handoff::transport_key(&site, key);
+                    // Share only what the requester is a replica for AND this
+                    // node holds authoritatively; a copy this node merely
+                    // originated may be stale (see `holds_authoritative`).
+                    if !source.replica_includes(&membership, &requester, &transport_key)
+                        || !source.holds_authoritative(&membership, &transport_key)
+                    {
+                        return;
+                    }
+                    let Some(entry) =
+                        crate::kv_handoff::stamped_entry(&router, &store, &source, &site, key)
+                    else {
+                        return;
+                    };
+                    if tx.blocking_send(entry).is_err() {
+                        closed = true;
+                    } else {
+                        sent += 1;
+                    }
+                });
+            }
+            sent
+        })
+    };
+    let mut streamed = 0u64;
+    let mut bytes = 0u64;
+    let mut batch = ShareBatch::new();
+    loop {
+        // Fill a batch from what the walk has queued; send it when it is
+        // full, or when the queue runs dry so the socket never idles waiting
+        // for a batch to fill while the walk is the slow side.
+        let entry = match rx.try_recv() {
+            Ok(e) => Some(e),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if let Some((message, count, b)) =
+                    std::mem::replace(&mut batch, ShareBatch::new()).finish()
+                {
+                    send_share(stream, &message, cipher).await?;
+                    streamed += u64::from(count);
+                    bytes += b;
+                }
+                rx.recv().await
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        };
+        let Some(entry) = entry else { break };
+        if !batch.push(&entry) {
+            tracing::warn!(key = %entry.transport_key, "KV share: entry too large for the wire; skipped");
+        }
+        if batch.is_full()
+            && let Some((message, count, b)) =
+                std::mem::replace(&mut batch, ShareBatch::new()).finish()
+        {
+            send_share(stream, &message, cipher).await?;
+            streamed += u64::from(count);
+            bytes += b;
+        }
+    }
+    if let Some((message, count, b)) = batch.finish() {
+        send_share(stream, &message, cipher).await?;
+        streamed += u64::from(count);
+        bytes += b;
+    }
+    let _ = walker.await;
+    write_message(stream, &[SHARE_END], cipher).await?;
+    tracing::info!(requester, keys = streamed, bytes, "KV warm-up share served");
+    Ok(())
+}
+
+/// Write one share message, bounded by [`SERVER_WRITE_TIMEOUT`].
+async fn send_share(
+    stream: &mut TcpStream,
+    message: &[u8],
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(SERVER_WRITE_TIMEOUT, write_message(stream, message, cipher))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("peer did not read the share within {SERVER_WRITE_TIMEOUT:?}")
+        })?
 }
 
 /// Tag an EOF on the first byte of a request as a clean close.
@@ -935,6 +1269,79 @@ impl DataPlaneClient {
         Ok(take_u8(&mut response.as_slice())? == SET_OK)
     }
 
+    /// Pull this node's share of large values from the peer at `addr`
+    /// ([`OP_SHARE`]): every entry the peer streams is handed to `apply`,
+    /// one at a time, until the end marker or `deadline`. Returns
+    /// `(entries, value bytes)` received. Uses its own connection (a share is
+    /// one long exchange, not a pooled request).
+    ///
+    /// # Errors
+    ///
+    /// Connect/I-O failure, the deadline passing mid-stream (entries applied
+    /// so far stay applied), a cipher mismatch, or a peer predating the op
+    /// (it drops the connection).
+    pub async fn share_from(
+        &self,
+        addr: SocketAddr,
+        requester_id: &str,
+        deadline: Instant,
+        mut apply: impl FnMut(ShareEntry),
+    ) -> anyhow::Result<(u64, u64)> {
+        let cipher = self.cipher.as_deref();
+        let request = encode_get_request(requester_id)?;
+        let mut message = request;
+        message[0] = OP_SHARE;
+        let mut stream = connect(addr).await.inspect_err(|_| self.trip_breaker(addr))?;
+        tokio::time::timeout_at(deadline, async {
+            write_message(&mut stream, &message, cipher).await?;
+            let mut entries = 0u64;
+            let mut bytes = 0u64;
+            loop {
+                // One message per batch: `[flag][len u32][payload]`, read
+                // whole and parsed in memory on both the sealed and the
+                // plaintext path.
+                let (flag, payload) = match cipher {
+                    Some(cipher) => {
+                        let frame = read_frame(&mut stream, cipher).await?;
+                        let (flag, rest) = frame
+                            .split_first()
+                            .ok_or_else(|| anyhow::anyhow!("empty share frame"))?;
+                        if *flag == SHARE_END {
+                            break;
+                        }
+                        let mut rest = rest;
+                        let len = take_u32(&mut rest)?;
+                        (*flag, take_bytes(&mut rest, len as usize)?.to_vec())
+                    }
+                    None => {
+                        let flag = stream.read_u8().await?;
+                        if flag == SHARE_END {
+                            break;
+                        }
+                        let len = stream.read_u32().await?;
+                        if len > MAX_SHARE_BATCH {
+                            anyhow::bail!("share batch of {len} bytes exceeds {MAX_SHARE_BATCH}");
+                        }
+                        (flag, read_exact_chunked(&mut stream, len as usize).await?)
+                    }
+                };
+                if flag != SHARE_BATCH {
+                    anyhow::bail!("unknown share flag {flag:#04x}");
+                }
+                for entry in parse_share_batch(&payload)? {
+                    entries += 1;
+                    bytes += entry.value.len() as u64;
+                    apply(entry);
+                }
+            }
+            Ok((entries, bytes))
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("KV warm-up pull from {addr} did not finish before the deadline")
+        })?
+    }
+
     /// Owner-arbitrated `SETNX`; see [`set_nx_remote`] for the contract.
     ///
     /// # Errors
@@ -1176,6 +1583,39 @@ fn take_bytes<'a>(buf: &mut &'a [u8], len: usize) -> anyhow::Result<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handoff reads a value and its stamp as one pair: with a writer
+    /// racing through `apply_stamped` (stamp n, value "n"), a reader must
+    /// never observe a value from a different write than the stamp.
+    #[test]
+    fn read_stamped_never_pairs_a_value_with_another_writes_stamp() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let applied = crate::clustered_store::new_applied_write_map();
+        let router = KvRouter::global(Arc::clone(&store)).with_applied(applied);
+        let key = "race";
+        let writer = {
+            let router = router.clone();
+            std::thread::spawn(move || {
+                for n in 1..=20_000u64 {
+                    let stamp = Stamp { write: n, node_tag: 1 };
+                    let _ = router.apply_stamped(key, n.to_string().into_bytes(), 0, stamp);
+                }
+            })
+        };
+        let mut seen = 0u64;
+        while !writer.is_finished() {
+            if let Some(((value, _ttl), stamp)) =
+                router.read_stamped(key, || store.get_with_ttl(key))
+            {
+                let v: u64 = std::str::from_utf8(&value).unwrap().parse().unwrap();
+                let s = stamp.expect("a recorded write has a stamp").write;
+                assert_eq!(v, s, "value {v} observed under stamp {s}");
+                seen += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert!(seen > 0, "the reader must have overlapped the writer");
+    }
 
     /// Spawn a data plane listener that handles a single connection.
     async fn spawn_single_handler(

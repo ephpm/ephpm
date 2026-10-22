@@ -41,8 +41,8 @@ use anyhow::Context as _;
 use ephpm_config::Config;
 use ephpm_kv::multi_tenant::MultiTenantStore;
 use ephpm_kv::snapshot::{
-    ColdReason, LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, WriteOptions,
-    load_snapshot, write_snapshot,
+    ColdReason, LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, ValueFilter,
+    WriteOptions, load_snapshot, write_snapshot,
 };
 use ephpm_kv::store::Store;
 use metrics::{counter, gauge, histogram};
@@ -74,6 +74,49 @@ pub const METRIC_LOAD_TOTAL: &str = "ephpm_kv_snapshot_load_total";
 pub const METRIC_LOAD_DURATION: &str = "ephpm_kv_snapshot_load_duration_seconds";
 /// Metric: keys restored by the last load.
 pub const METRIC_LAST_LOAD_KEYS: &str = "ephpm_kv_snapshot_last_load_keys";
+/// Metric: large KV values handed to peers (`direction="out"`, one per
+/// replica target) or pulled from them (`direction="in"`).
+pub const METRIC_HANDOFF_KEYS: &str = "ephpm_kv_handoff_keys_total";
+/// Metric: value bytes handed off, by direction.
+pub const METRIC_HANDOFF_BYTES: &str = "ephpm_kv_handoff_bytes_total";
+/// Metric: wall time of a push (`out`) or pull (`in`).
+pub const METRIC_HANDOFF_DURATION: &str = "ephpm_kv_handoff_duration_seconds";
+
+/// Record a peer handoff's outcome (metrics + one log line).
+pub fn record_handoff(direction: &'static str, report: &ephpm_cluster::HandoffReport) {
+    counter!(METRIC_HANDOFF_KEYS, "direction" => direction).increment(report.keys);
+    counter!(METRIC_HANDOFF_BYTES, "direction" => direction).increment(report.bytes);
+    histogram!(METRIC_HANDOFF_DURATION, "direction" => direction)
+        .record(report.elapsed.as_secs_f64());
+    let what = if direction == "in" { "KV warm-up pull from peers" } else { "KV handoff to peers" };
+    if report.timed_out || report.failed_peers > 0 || report.failed_writes > 0 {
+        tracing::warn!(
+            keys = report.keys,
+            bytes = report.bytes,
+            peers = report.peers,
+            failed_peers = report.failed_peers,
+            failed_writes = report.failed_writes,
+            timed_out = report.timed_out,
+            elapsed_ms = report.elapsed.as_millis() as u64,
+            "{what} finished with problems"
+        );
+    } else {
+        tracing::info!(
+            keys = report.keys,
+            bytes = report.bytes,
+            peers = report.peers,
+            elapsed_ms = report.elapsed.as_millis() as u64,
+            "{what} done"
+        );
+    }
+}
+
+/// `[kv.snapshot] load_timeout` as a duration (the default when it does
+/// not parse — `Config::validate` has already refused that case).
+#[must_use]
+pub fn load_timeout_from(config: &Config) -> Duration {
+    config.kv.snapshot.load_timeout().unwrap_or(Duration::from_secs(30))
+}
 
 /// What triggered a save (metric label + log field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +182,10 @@ pub struct KvSnapshotService {
     interval: Option<Duration>,
     on_shutdown: bool,
     load_on_start: bool,
+    /// Clustered node with peer handoff: the startup load is deferred to
+    /// [`load_after_pull`](Self::load_after_pull), which restores the snapshot
+    /// only when no alive peer was found.
+    defer_to_peers: bool,
     /// Serialises saves: a second trigger waits for (or, for the HTTP
     /// endpoint, is refused during) the one in flight.
     saving: tokio::sync::Mutex<()>,
@@ -158,6 +205,7 @@ impl std::fmt::Debug for KvSnapshotService {
             .field("interval", &self.interval)
             .field("on_shutdown", &self.on_shutdown)
             .field("load_on_start", &self.load_on_start)
+            .field("defer_to_peers", &self.defer_to_peers)
             .finish_non_exhaustive()
     }
 }
@@ -245,6 +293,7 @@ impl KvSnapshotService {
         store: Arc<Store>,
         sites: Option<MultiTenantStore>,
         node_id: Option<&str>,
+        defer_to_peers: bool,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let snap = &config.kv.snapshot;
         if !snap.enabled() {
@@ -309,6 +358,7 @@ impl KvSnapshotService {
             interval: snap.interval()?,
             on_shutdown: snap.on_shutdown,
             load_on_start: snap.load_on_start,
+            defer_to_peers,
             saving: tokio::sync::Mutex::new(()),
             last_save: std::sync::Mutex::new(None),
             last_load: std::sync::Mutex::new(None),
@@ -346,23 +396,87 @@ impl KvSnapshotService {
 
     /// Load the snapshot if `load_on_start` is set. Call once, after the
     /// stores exist and before any listener binds.
+    ///
+    /// On a clustered node with peer handoff (`defer_to_peers`) this does
+    /// **nothing**: the decision whether to restore anything from the
+    /// snapshot is taken after the peer pull, by
+    /// [`load_after_pull`](Self::load_after_pull). The reasoning, stated
+    /// plainly: a cache that serves a value another node rewrote while this
+    /// one was down is worse than a miss — sessions, lock tokens and
+    /// invalidations can all go wrong on it — and a restarted node gets the
+    /// gossip tier back from its peers over the following minutes, during
+    /// which a snapshot-restored small value would be exactly that stale
+    /// value (0.6 % of the restarted node's reads in the lab). Large values
+    /// come from the pull, stamped and current. So with peers present the
+    /// snapshot is not used at all: misses until gossip has caught up, never
+    /// stale.
     pub async fn load_at_startup(&self) -> Option<LoadReport> {
         if !self.load_on_start {
             return None;
         }
-        Some(self.load_now().await)
+        if self.defer_to_peers {
+            tracing::info!(
+                "KV snapshot load deferred until peer discovery: with alive peers present a \
+                 clustered node takes small values from gossip and large values from its peers; \
+                 the snapshot is restored only when no peer is found"
+            );
+            return None;
+        }
+        Some(self.load_with(ValueFilter::All).await)
     }
 
-    /// Load the snapshot into the live stores now, under `load_timeout`. In
-    /// object mode the object is downloaded first (within the same budget).
+    /// The deferred half of a clustered startup, after the peer pull has
+    /// run: restore the whole snapshot only when the pull found **no** alive
+    /// peer (this node is alone — a whole-cluster cold start, or the first
+    /// node up). With peers present nothing is restored, and the log says so
+    /// (`restored_small_tier=false reason=peers_present`).
+    ///
+    /// Two consequences worth knowing: a whole-cluster restart where every
+    /// node comes up at once is cold (each sees the others within a gossip
+    /// round), and a value restored by a lone node lives in that node's
+    /// store only — it is not re-published into gossip, so peers that join
+    /// later do not receive it.
+    pub async fn load_after_pull(&self, alive_peers: usize) -> Option<LoadReport> {
+        if !self.defer_to_peers || !self.load_on_start {
+            return None;
+        }
+        if alive_peers > 0 {
+            tracing::info!(
+                restored_small_tier = false,
+                restored_large_tier = false,
+                reason = "peers_present",
+                alive_peers,
+                "KV snapshot not restored: small values arrive through gossip, large values \
+                 came from the peer pull (a restored copy could be stale)"
+            );
+            return None;
+        }
+        tracing::info!(
+            restored_small_tier = true,
+            restored_large_tier = true,
+            reason = "no_peers",
+            "no alive peer found within the join wait; restoring the KV snapshot"
+        );
+        Some(self.load_with(ValueFilter::All).await)
+    }
+
+    /// Load the snapshot into the live stores now, under `load_timeout`
+    /// (every entry). In object mode the object is downloaded first (within
+    /// the same budget).
     pub async fn load_now(&self) -> LoadReport {
+        self.load_with(ValueFilter::All).await
+    }
+
+    async fn load_with(&self, filter: ValueFilter) -> LoadReport {
         let started = Instant::now();
         let deadline = started + self.load_timeout;
         let report = match &self.target {
-            Target::Local => self.load_file(deadline).await,
+            Target::Local => self.load_file(deadline, filter).await,
             Target::Object { client, key } => match self.download(client, key, deadline).await {
                 Ok(true) => {
-                    let report = self.load_file(deadline).await;
+                    let report = self.load_file(deadline, filter).await;
+                    // The object is the snapshot; the downloaded copy has
+                    // done its job.
                     let _ = std::fs::remove_file(&self.file);
                     report
                 }
@@ -407,12 +521,17 @@ impl KvSnapshotService {
         }
     }
 
-    async fn load_file(&self, deadline: Instant) -> LoadReport {
+    async fn load_file(&self, deadline: Instant, filter: ValueFilter) -> LoadReport {
         let file = self.file.clone();
         let secret = self.secret.clone();
         let store = Arc::clone(&self.store);
         let sites = self.sites.clone();
-        let opts = LoadOptions { deadline: Some(deadline), max_size: self.max_size, workers: 0 };
+        let opts = LoadOptions {
+            deadline: Some(deadline),
+            max_size: self.max_size,
+            workers: 0,
+            value_filter: filter,
+        };
         tokio::task::spawn_blocking(move || {
             let resolve = move |site: &str| -> Option<Arc<Store>> {
                 if site.is_empty() {
@@ -743,7 +862,9 @@ mod tests {
     async fn off_means_no_service() {
         let config: Config = toml::from_str("").unwrap();
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
-        assert!(KvSnapshotService::from_config(&config, store, None, None).unwrap().is_none());
+        assert!(
+            KvSnapshotService::from_config(&config, store, None, None, false).unwrap().is_none()
+        );
     }
 
     #[tokio::test]
@@ -756,10 +877,15 @@ mod tests {
         let stale = dir.path().join(".node-a.kvsnap.tmp-999-1");
         std::fs::write(&stale, b"junk").unwrap();
 
-        let svc =
-            KvSnapshotService::from_config(&config, Arc::clone(&store), None, Some("gossip-id"))
-                .unwrap()
-                .expect("enabled");
+        let svc = KvSnapshotService::from_config(
+            &config,
+            Arc::clone(&store),
+            None,
+            Some("gossip-id"),
+            false,
+        )
+        .unwrap()
+        .expect("enabled");
         assert!(!stale.exists(), "stale temp file removed");
         assert_eq!(svc.file(), dir.path().join("node-a.kvsnap"));
         assert_eq!(svc.object_url(), None);
@@ -767,7 +893,7 @@ mod tests {
         assert_eq!(report.keys(), 1);
 
         let fresh = Store::new(ephpm_kv::store::StoreConfig::default());
-        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None)
+        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None, false)
             .unwrap()
             .unwrap();
         let load = svc2.load_at_startup().await.unwrap();
@@ -785,7 +911,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with(dir.path(), "load_on_start = false\n");
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
-        let svc = KvSnapshotService::from_config(&config, store, None, None).unwrap().unwrap();
+        let svc =
+            KvSnapshotService::from_config(&config, store, None, None, false).unwrap().unwrap();
         assert!(svc.load_at_startup().await.is_none());
     }
 
@@ -804,6 +931,7 @@ mod tests {
             Arc::clone(&default),
             Some(sites.clone()),
             None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -818,6 +946,7 @@ mod tests {
             Arc::clone(&default2),
             Some(sites2.clone()),
             None,
+            false,
         )
         .unwrap()
         .unwrap();

@@ -540,6 +540,9 @@ Recorded only when `[kv.snapshot] mode != "off"` ([config](/reference/config/#kv
 | `ephpm_kv_snapshot_load_total` | counter | `outcome` (`ok`, `partial`, `cold`), `reason` | Loads, at startup or via `POST /_ephpm/kv/snapshot/load`. `reason` is `none` for `ok`; for `partial`: `timeout` (the `load_timeout` passed — what was restored stays), `corrupt_blocks` (blocks skipped), `memory_limit` (a store refused entries under `noeviction`), `unknown_site` (blocks for a site this node has no store for); for `cold`: `missing` (first start, normal — logged at INFO), `version` (written by a newer format), `corrupt` (header, trailer or index did not verify: truncated or damaged), `wrong_key` (`[kv] secret` changed), `too_large`, `io`. |
 | `ephpm_kv_snapshot_load_duration_seconds` | histogram | — | Wall time of a load. |
 | `ephpm_kv_snapshot_last_load_keys` | gauge | — | Entries restored by the last load. |
+| `ephpm_kv_handoff_keys_total` | counter | `direction` (`out`, `in`) | Clustered nodes with `peer_handoff`: large values pushed to peers at shutdown (`out`, one per replica target) and pulled from peers at startup (`in`). |
+| `ephpm_kv_handoff_bytes_total` | counter | `direction` | Value bytes handed off, by direction. |
+| `ephpm_kv_handoff_duration_seconds` | histogram | `direction` | Wall time of the push (`out`) or pull (`in`). Bounded by `load_timeout`; the log line says whether it timed out or a peer failed. |
 
 ```promql
 # A node that started cold for a reason other than "no snapshot yet".
