@@ -29,16 +29,20 @@ read them before you put it in CI.
 | You run | Needs a `php` executable? | Needs a real `composer`? |
 |---|---|---|
 | `install`, `dump-autoload` (lock in scope) | No. Without one, `install` skips the platform check (with a warning if the lock declares platform requirements) | No |
-| `update`, `require`, `remove` | **Yes**, for the platform probe ([details](#platform-requirements)) | No |
+| `update`, `require`, `remove` | **Yes**, for the platform probe ([details](#platform-requirements)). A PHP-linked `ephpm` is its own `php`, so only a **stub** build needs one installed | No |
 | Any command that is [out of scope](#fallback-to-composer) | — | Yes, or it exits `3` |
 | `--run-scripts` (on `install` or `dump-autoload`) | Whatever your scripts need | Yes, or it exits `3` |
 | `-vv`/`-vvv`, or `-v` while a plugin is active ([details](#verbosity)) | — | Yes, or it exits `3` |
 
-ePHPm's embedded PHP is **not** used for any of this. vivacity looks for `php`
-on `PATH` (or `VIVACITY_PHP`). That means the subcommand exists in every build,
+vivacity itself links no PHP, so the subcommand exists in every build,
 including stub mode (no linked PHP) and Windows, and no `composer.phar` is
-needed. But "works in every build" holds for `install` and `dump-autoload`
-only: `update`, `require` and `remove` fail on a machine that has no `php`.
+needed. For the platform probe it runs a `php` executable: `VIVACITY_PHP` if
+set. When you have not set it, a **PHP-linked** `ephpm composer` sets
+`VIVACITY_PHP` to its own executable, which answers as php-cli when vivacity
+runs it ([how](../php/#re-invoking-php_binary)), so `update`, `require` and
+`remove` work on a machine with **no PHP installed** and probe the PHP that
+ePHPm actually runs. A **stub** build falls back to `php` on `PATH`, and there
+`update`, `require` and `remove` fail on a machine that has none.
 
 ## Synopsis
 
@@ -377,10 +381,18 @@ as the flags.
 ## Platform requirements
 
 vivacity gets its platform (the `php` version, `ext-*`, `lib-*`) by running a
-probe script through **an external `php` executable**, as `$VIVACITY_PHP
-<probe.php>` if `VIVACITY_PHP` is set, otherwise `php` on `PATH`. It does
-**not** use ePHPm's embedded PHP, and it does not know which extensions your
-ePHPm build has.
+probe script through a `php` executable, as `$VIVACITY_PHP <probe.php>`
+(otherwise `php` on `PATH`). Which `php` that is depends on the build:
+
+- **PHP-linked `ephpm` (release builds):** unless you set `VIVACITY_PHP`
+  yourself (an empty value counts as unset), `ephpm composer` sets it to the path of the running `ephpm`
+  executable before vivacity starts. vivacity's `ephpm <probe.php>` then runs
+  the script on the embedded PHP CLI ([`ephpm php`](../php/#re-invoking-php_binary)),
+  so the probe reports exactly the PHP version and extensions `ephpm php -m`
+  shows, and no system PHP is needed.
+- **Stub build (no linked PHP):** `php` on `PATH`, or `VIVACITY_PHP`.
+
+Then:
 
 - **`install`:** if the probe runs, the lock is checked against it.
   Unsatisfied requirements exit `4`
@@ -396,30 +408,17 @@ ePHPm build has.
   `config.platform` set. A missing executable reads
   `Error: cannot run <php>:` followed by the operating system's error
   ("No such file or directory" on Linux and macOS, "program not found" on
-  Windows).
+  Windows). With the PHP-linked default this only happens when a
+  `VIVACITY_PHP` you set does not work; a stub build also needs a `php` on
+  `PATH`.
 - `config.platform` overrides and `--ignore-platform-req(s)` apply on top of
   the probed platform, as in Composer. `COMPOSER_IGNORE_PLATFORM_REQS` and
   `COMPOSER_IGNORE_PLATFORM_REQ` are honored on `update`, `require` and
   `remove`, but not on `install`.
 
-To have `update`/`require`/`remove` probe the PHP that ePHPm actually runs, set
-`VIVACITY_PHP` to a wrapper around [`ephpm php`](../php/). This needs a
-PHP-linked build:
-
-```bash
-# Linux / macOS
-cat > ~/bin/ephpm-php <<'EOF'
-#!/bin/sh
-exec ephpm php "$@"
-EOF
-chmod +x ~/bin/ephpm-php
-VIVACITY_PHP=~/bin/ephpm-php ephpm composer update
-```
-
-```bat
-:: Windows: ephpm-php.bat
-@"C:\path\to\ephpm.exe" php %*
-```
+To probe a different PHP — say, a system `php` whose extensions match a
+production php-fpm — set `VIVACITY_PHP` explicitly; `ephpm composer` never
+overrides a value you set.
 
 vivacity caches the probe result (`platform-probe.json` in its cache
 directory), but only for a `php` whose loaded files it can see: the binary the
@@ -430,11 +429,13 @@ loaded, the probe script itself, the `PHPRC`, `PHP_INI_SCAN_DIR`,
 `XDEBUG_MODE`, `XDEBUG_CONFIG` and `COMPOSER_ALLOW_XDEBUG` variables and the
 dynamic linker's `LD_*`/`DYLD_*` variables, and system markers such as the
 dynamic linker's cache and the package databases. Anything vivacity cannot
-see this way is probed on every run instead of cached. That includes the
-wrapper above, because the PHP it runs does not report the wrapper as its
-binary, so upgrading ePHPm or changing `[php] extensions` needs no cache
-flush. `VIVACITY_NO_PLATFORM_CACHE=1` skips the cache for that run only: it
-neither reads nor rewrites the file.
+see this way is probed on every run instead of cached. With the PHP-linked
+default the probed binary is `ephpm` itself, so when the result is cached the
+key covers the `ephpm` binary and replacing it (upgrading ePHPm) invalidates
+the entry. A wrapper script set as `VIVACITY_PHP` is never cached, because the
+PHP it runs does not report the wrapper as its binary.
+`VIVACITY_NO_PLATFORM_CACHE=1` skips the cache for that run only: it neither
+reads nor rewrites the file.
 
 What actually guards production is the runtime check. Like Composer, the
 generated autoloader includes `vendor/composer/platform_check.php`, which
@@ -523,8 +524,8 @@ support custom lists (`policy.<name>`).
   are handled natively, but because they are active, `-v` hands the command to
   Composer ([Verbosity](#verbosity)).
 - `create-project` is not supported. Use `composer create-project`, or clone
-  and run `update`. Note that `update` needs a `php`
-  ([above](#platform-requirements)).
+  and run `update` (a stub build needs a `php` for that,
+  [above](#platform-requirements)).
 
 ### WordPress
 
@@ -553,7 +554,17 @@ ephpm php composer.phar validate
 vivacity's fallback, the verbosity hand-over and `--run-scripts` look for a
 `composer` executable on `PATH`. They do not use `ephpm php composer.phar`, so
 for those you need a `composer` (or `composer.bat` on Windows) wrapper on
-`PATH`.
+`PATH`, for example:
+
+```bash
+#!/bin/sh
+exec ephpm php -d memory_limit=-1 /opt/composer/composer.phar "$@"
+```
+
+Under that wrapper Composer's `@php` script lines resolve to `PHP_BINARY`,
+which is the `ephpm` executable, and it [answers as
+php-cli](../php/#re-invoking-php_binary), so scripts such as
+`@php artisan package:discover` run on the embedded PHP with no system PHP.
 
 ## Argument passthrough
 

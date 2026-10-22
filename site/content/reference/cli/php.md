@@ -153,11 +153,10 @@ in CLI mode, but code that reads the key unconditionally must not warn. This
 matters in practice: Composer probes `$_SERVER['HOME']` / `$_SERVER['APPDATA']`
 before falling back to `getenv()`.
 
-`PHP_BINARY` is the path of the running `ephpm` executable. Note the
-consequence for tools that *re-invoke* PHP through it (PHPUnit's process
-isolation, Symfony's `PhpExecutableFinder`): the path is `ephpm`, and running
-it without the `php` subcommand is not a PHP CLI. Point such tools at a
-wrapper script that execs `ephpm php "$@"` if you need re-invocation.
+`PHP_BINARY` is the path of the running `ephpm` executable, and running that
+path the way php-cli is run (`PHP_BINARY script.php`, `PHP_BINARY -r …`, or
+bare with a program on stdin) runs PHP — see [Re-invoking
+`PHP_BINARY`](#re-invoking-php_binary) below.
 
 This applies to `ephpm php` only. In the server the process environment is
 deliberately **not** merged into a request's `$_SERVER`: `ephpm serve` is
@@ -171,6 +170,65 @@ multi-tenant, and the process environment holds cross-tenant material.
 > `executable_location` was the bare name `ephpm`, which php-src then hunted
 > for on `PATH` and did not find; Windows was unaffected because php-src asks
 > the OS there instead).
+
+### Re-invoking `PHP_BINARY`
+
+Many libraries start a second PHP process by running `PHP_BINARY` with php-cli
+arguments: spatie/async and anything built on Symfony Process
+(`PhpExecutableFinder` returns `PHP_BINARY` under the `cli` SAPI), Composer's
+`@php` script lines, PHPUnit's process isolation, parallel test runners. Under
+ePHPm `PHP_BINARY` is the `ephpm` executable — a single-binary install has no
+separate `php` file to name — so `ephpm` itself answers like php-cli when it is
+run that way. Every argument then goes to the embedded PHP CLI verbatim,
+exactly as `ephpm php <args…>`.
+
+The binary takes the php-cli role when **any** of these holds:
+
+1. **It is invoked under a php name.** If `argv[0]`'s file name is `php` or
+   `php` plus a version (`php8`, `php8.4`, `php84`; on Windows `.exe` is
+   ignored and case does not matter), it *is* php-cli for every argument, including ones that look like
+   ePHPm subcommands. This makes a symlink a complete php install:
+
+   ```bash
+   ln -s "$(command -v ephpm)" /usr/local/bin/php
+   php -v                       # PHP 8.x.y (cli) ... — the embedded PHP
+   php vendor/bin/phpunit       # no `ephpm php` prefix needed
+   ```
+
+   (On Windows, use a hard link or a copy named `php.exe`.)
+
+2. **It is a child of `ephpm php` or `ephpm composer`** and is not asked for a
+   real ePHPm subcommand. Both subcommands export `EPHPM_PHP_CLI=1` into their
+   own environment before PHP (or vivacity) starts, so every process they spawn
+   inherits it. A child `ephpm` that sees the marker treats its arguments as
+   php's — including no arguments at all (program on stdin) and `-v`, `-h`,
+   `--version`, which then mean what they mean to php. An argument that names
+   an `ephpm` subcommand (`ephpm kv …`, `ephpm cache reset`, `ephpm help`)
+   still runs that subcommand, so scripts that drive ePHPm keep working.
+
+3. **Its first argument is php-shaped**, even without the marker (a library
+   that passes `proc_open()` a replacement environment drops it): an option
+   ePHPm does not have (anything starting with `-` except `-h`, `--help`,
+   `-V`, `--version`), or an existing file that is not a subcommand name. These
+   argv shapes were usage errors before, so nothing that used to work changes
+   meaning; a typo such as `ephpm sevre` still gets ePHPm's "did you mean
+   `serve`" error.
+
+What the rules cannot recover: **bare `ephpm` without the marker** is still
+the dev server (`ephpm dev`), by contract. A tool that runs `PHP_BINARY` with
+no arguments *and* a scrubbed environment would start a server; set
+`EPHPM_PHP_CLI=1` in the environment you pass, or install the `php` symlink
+and point the tool at it. And a PHP script file whose name is exactly an ePHPm
+subcommand (`serve`, `dev`, `install`, …) must be passed with a path
+(`./serve`), as it would be under the marker rules above.
+
+The re-invoked process is a fresh `ephpm php`: it does not inherit
+`--site`/`--config`, so a child of `ephpm php --site shop …` has no tenant
+database bound.
+
+> **Added after v0.11.3.** Before, re-invoking `PHP_BINARY` reached `ephpm`'s
+> own argument parser: `PHP_BINARY script.php` was a usage error, and a bare
+> `PHP_BINARY` fed a program on stdin started the dev server.
 
 ### Ini flags
 

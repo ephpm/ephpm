@@ -48,6 +48,13 @@ use response::PhpResponse;
 /// the worker pool (`ephpm-server`'s `worker_pool`).
 pub const PHP_THREAD_STACK: usize = 8 * 1024 * 1024;
 
+/// `true` when this build links libphp (`PHP_SDK_PATH` was set, so the
+/// `php_linked` cfg is on), `false` in stub mode. `rustc-cfg` does not cross
+/// crate boundaries, so dependents that must know whether `ephpm php` can
+/// actually run PHP (e.g. before pointing another tool at this binary as its
+/// `php`) read this instead of re-probing the SDK.
+pub const PHP_LINKED: bool = cfg!(php_linked);
+
 // When PHP_SDK_PATH is set at build time, build.rs enables the `php_linked` cfg
 // and generates FFI bindings. This module includes them.
 #[cfg(php_linked)]

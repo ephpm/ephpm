@@ -24,7 +24,10 @@ const TOP_LEVEL_SECTIONS: [&str; 7] =
 ///
 /// - Read by ePHPm itself: `SERVICE_LOG_FILE` (set by the Windows service
 ///   wrapper), `FATAL_HANDLER`, `KV_PASSWORD` (`ephpm kv`/`deploy`/`cache`),
-///   `MIDDLEWARE_DIR` (middleware library search path).
+///   `MIDDLEWARE_DIR` (middleware library search path), `PHP_CLI` (the
+///   marker `ephpm php`/`ephpm composer` export so a child re-invoked through
+///   `PHP_BINARY` runs as php-cli; an `ephpm serve` started from a PHP
+///   script inherits it).
 /// - Read at **build** time by `crates/ephpm/build.rs`: `RELEASE_VERSION`.
 ///   The release workflows export it into the job environment, so binaries
 ///   started later in the same job inherit it.
@@ -52,6 +55,7 @@ const NON_CONFIG_ENV_VARS: &[&str] = &[
     "FATAL_HANDLER",
     "KV_PASSWORD",
     "MIDDLEWARE_DIR",
+    "PHP_CLI",
     "RELEASE_VERSION",
     "SESSION_SECRET",
     "PREVIEW_SESSION_SECRET",
