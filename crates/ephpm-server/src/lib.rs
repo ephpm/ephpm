@@ -514,7 +514,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     )
     .await?;
 
-    let _db_handles = start_db_proxies(
+    let db_handles = start_db_proxies(
         &config,
         cluster_handle.as_ref(),
         channel_handle.as_ref(),
@@ -524,8 +524,6 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         per_site_cluster,
     )
     .await?;
-    let _per_site_wire_handles = per_site_wire_handles;
-
     // Everything root is needed for is now done: privileged ports are bound,
     // DB proxies and per-site wire listeners are up, the generated php.ini has
     // been read at MINIT, and ACME/sqlite/vhost directories exist. Drop the
@@ -534,7 +532,33 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // race the process-wide credential change.
     privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
-    accept_loop(listeners).await
+    let served = accept_loop(listeners).await;
+
+    // Requests are drained (bounded by `[server.timeouts] shutdown`). Now close
+    // the embedded databases cleanly — deliberately NOT under that bound:
+    //
+    // 1. Stop every source of writes, so a log truncated below stays empty:
+    //    the cluster channel (statements forwarded to this node by peers), the
+    //    per-site replication drivers (replicated batches, snapshots and
+    //    handoffs applied here), and the database listeners and stream
+    //    handlers.
+    // 2. Truncate every open database's write-ahead log (`db_shutdown`),
+    //    which runs to completion.
+    if let Some(channel) = &channel_handle {
+        channel.shutdown();
+    }
+    turso_cdc::stop_replication_drivers();
+    for handle in db_handles.iter().chain(per_site_wire_handles.iter()) {
+        handle.abort();
+    }
+    let checkpoint = db_shutdown::checkpoint_all().await;
+    if !checkpoint.abandoned.is_empty() {
+        tracing::warn!(
+            sites = ?checkpoint.abandoned,
+            "exiting with un-truncated WAL on these databases"
+        );
+    }
+    served
 }
 
 /// Resolve which cluster-channel features are enabled on this node.
@@ -1343,18 +1367,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // close instead of a timeout.
     if let Some(task) = http3_task {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-    }
-
-    // Requests are drained; now leave every embedded database with an empty
-    // write-ahead log. Deliberately outside the drain deadline above: a final
-    // checkpoint runs to completion (see `db_shutdown` for its last-resort
-    // bound), so exiting never depends on WAL recovery at the next start.
-    let checkpoint = db_shutdown::checkpoint_all().await;
-    if !checkpoint.abandoned.is_empty() {
-        tracing::warn!(
-            sites = ?checkpoint.abandoned,
-            "exiting with un-truncated WAL on these databases"
-        );
     }
 
     tracing::info!(

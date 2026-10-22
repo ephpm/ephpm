@@ -3222,10 +3222,35 @@ fn spawn_per_site_stream_handler(
     }));
 }
 
+/// Cancelled once at process shutdown by [`stop_replication_drivers`].
+fn drivers_shutdown() -> &'static tokio_util::sync::CancellationToken {
+    static TOKEN: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+        std::sync::OnceLock::new();
+    TOKEN.get_or_init(tokio_util::sync::CancellationToken::new)
+}
+
+/// Stop every per-site replication driver and refuse to start new ones.
+///
+/// Process shutdown only (it is permanent): the drivers are detached, so
+/// nothing else would stop them, and a driver applying a replicated batch, a
+/// snapshot or an ownership handoff writes to its site's database — which
+/// would refill a log the final checkpoint (`db_shutdown`) just truncated.
+///
+/// Cooperative, never a mid-operation cancel: a driver leaves at its next
+/// safe point (the top of its loop, a reconnect backoff, a wait for an
+/// owner), so no engine call is dropped half-way — an abandoned statement
+/// future can leave a read lock behind that blocks the final checkpoint. The
+/// cluster channel is shut down first, which ends any in-flight replica
+/// stream after its current batch.
+pub fn stop_replication_drivers() {
+    drivers_shutdown().cancel();
+}
+
 /// Start a per-site replication driver for `site` unless one is already
 /// running. Detached (the working set is dynamic, so these do not live in
 /// the startup `handles` vec); the driver removes itself from `drivers` when
-/// it exits so a later open-event can restart it.
+/// it exits so a later open-event can restart it. Every driver ends when
+/// [`stop_replication_drivers`] runs.
 fn ensure_site_driver(
     drivers: &Arc<DashMap<String, ()>>,
     site: String,
@@ -3235,7 +3260,7 @@ fn ensure_site_driver(
     mgmt: &SiteMgmtRegistry,
     max_snapshot_bytes: u64,
 ) {
-    if !crate::router::is_valid_site_key(&site) {
+    if !crate::router::is_valid_site_key(&site) || drivers_shutdown().is_cancelled() {
         return;
     }
     // Atomic check-and-mark: hold the shard entry across the insert so the
@@ -3252,16 +3277,15 @@ fn ensure_site_driver(
     let mgmt = mgmt.clone();
     let drivers = Arc::clone(drivers);
     tokio::spawn(async move {
-        if let Err(e) = run_site_replication(
+        let run = run_site_replication(
             site.clone(),
             cluster,
             channel,
             channel_advertise,
             mgmt,
             max_snapshot_bytes,
-        )
-        .await
-        {
+        );
+        if let Err(e) = run.await {
             tracing::warn!(site = %site, "per-site replication driver exited: {e:#}");
         }
         // The site has left this node's replication set: its per-site CDC
@@ -3326,6 +3350,11 @@ async fn run_site_replication(
     let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
 
     loop {
+        // Process shutdown: leave at this safe point (see
+        // `stop_replication_drivers`).
+        if drivers_shutdown().is_cancelled() {
+            return Ok(());
+        }
         let role = role_rx.borrow().clone();
         match role {
             ElectedRole::Primary => {
@@ -3350,9 +3379,11 @@ async fn run_site_replication(
                 // applied watermark of its own while pulling the snapshot.
                 cdc_metrics::forget_applied(&site);
                 cdc_metrics::track_shipping(&site);
-                if !sample_owned_head_until_role_changes(&site, &site_mgmt.factory, &mut role_rx)
-                    .await
-                {
+                let keep_going = tokio::select! {
+                    still = sample_owned_head_until_role_changes(&site, &site_mgmt.factory, &mut role_rx) => still,
+                    () = drivers_shutdown().cancelled() => false,
+                };
+                if !keep_going {
                     return Ok(());
                 }
             }
@@ -3432,6 +3463,7 @@ async fn run_site_replication(
                             }
                         }
                         () = tokio::time::sleep(delay) => {}
+                        () = drivers_shutdown().cancelled() => return Ok(()),
                     }
                 }
             }
@@ -3439,8 +3471,13 @@ async fn run_site_replication(
                 // Owner not resolved yet — wait for the election to name one.
                 // Either way this node no longer ships the site.
                 cdc_metrics::forget_shipping(&site);
-                if role_rx.changed().await.is_err() {
-                    return Ok(());
+                tokio::select! {
+                    changed = role_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    () = drivers_shutdown().cancelled() => return Ok(()),
                 }
             }
         }

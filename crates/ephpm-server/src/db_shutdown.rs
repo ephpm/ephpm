@@ -46,6 +46,10 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// After this long the pass logs which databases it is still waiting on.
 const PROGRESS_AFTER: Duration = Duration::from_secs(3);
 
+/// How many times a log that was refilled after its checkpoint is
+/// checkpointed again before the pass accepts it.
+const MAX_VERIFY_ROUNDS: u32 = 5;
+
 /// How often the progress line repeats.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
@@ -100,11 +104,30 @@ async fn checkpoint_databases(
     let mut next_progress = started + PROGRESS_AFTER;
     tracing::debug!(databases = total, "final WAL checkpoint of the embedded databases");
 
-    while !pending.is_empty() {
+    let mut done: Vec<Pending> = Vec::with_capacity(total);
+    let mut verify_rounds = 0;
+    loop {
+        if pending.is_empty() {
+            // Verify: a straggling writer (a replicated batch that was
+            // already being applied) can refill a log after its checkpoint.
+            // Re-checkpoint any that did, a bounded number of times.
+            let refilled: Vec<Pending> =
+                done.iter().filter(|d| wal_gate::wal_file_size(&d.db_path) > 0).cloned().collect();
+            if refilled.is_empty() || verify_rounds >= MAX_VERIFY_ROUNDS {
+                break;
+            }
+            verify_rounds += 1;
+            done.retain(|d| wal_gate::wal_file_size(&d.db_path) == 0);
+            report.truncated = done.len();
+            pending = refilled;
+        }
         let mut still = Vec::with_capacity(pending.len());
         for db in pending {
             match checkpoint_once(&db.db_path).await {
-                Ok(Attempt::Done) => report.truncated += 1,
+                Ok(Attempt::Done) => {
+                    report.truncated += 1;
+                    done.push(db);
+                }
                 Ok(Attempt::Retry) => still.push(db),
                 Err(e) => {
                     // A database that cannot even be opened has nothing this
@@ -119,7 +142,7 @@ async fn checkpoint_databases(
         }
         pending = still;
         if pending.is_empty() {
-            break;
+            continue;
         }
         let now = Instant::now();
         if now.duration_since(started) >= give_up_after {

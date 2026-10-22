@@ -137,6 +137,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::ClusterHandle;
 use crate::secure_transport::ClusterCipher;
@@ -407,6 +408,9 @@ struct HandleInner {
     /// Connections the listener accepted whose driver task is still
     /// running.
     live_accepted: Arc<AtomicUsize>,
+    /// Cancelled by [`Handle::shutdown`]: stops the accept loop, ends every
+    /// connection's driver, and refuses new dials.
+    shutdown: CancellationToken,
 }
 
 struct HandlerEntry {
@@ -558,6 +562,20 @@ impl Handle {
         self.inner.live_accepted.load(Ordering::SeqCst)
     }
 
+    /// Shut the channel down for process exit: stop accepting, close every
+    /// connection (dialed and accepted — their streams then read EOF / error),
+    /// and refuse every later [`Handle::dial`]. Idempotent.
+    ///
+    /// Used at server shutdown to stop all inbound database writes that
+    /// arrive over the channel (replicated batches, forwarded statements)
+    /// before the final WAL checkpoint, so a truncated log stays empty.
+    pub fn shutdown(&self) {
+        if !self.inner.shutdown.is_cancelled() {
+            tracing::info!("cluster channel: shutting down (no new streams, closing connections)");
+        }
+        self.inner.shutdown.cancel();
+    }
+
     /// Dial `peer_addr`, complete the handshake, open a yamux stream,
     /// send the `stream_type` header, and return the stream.
     ///
@@ -576,6 +594,10 @@ impl Handle {
         peer_addr: SocketAddr,
         stream_type: &str,
     ) -> anyhow::Result<ChannelStream> {
+        anyhow::ensure!(
+            !self.inner.shutdown.is_cancelled(),
+            "cluster channel is shut down; not dialing {peer_addr}"
+        );
         let mut tcp =
             match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
                 Ok(Ok(tcp)) => tcp,
@@ -629,7 +651,14 @@ impl Handle {
         let drain_handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
         let (close_tx, close_rx) = oneshot::channel();
         let live = LiveConnection::new(&self.inner.live_dialed, "dialed");
-        tokio::spawn(drive_connection(conn, drain_handlers, peer_addr, Some(close_rx), live));
+        tokio::spawn(drive_connection(
+            conn,
+            drain_handlers,
+            peer_addr,
+            Some(close_rx),
+            self.inner.shutdown.clone(),
+            live,
+        ));
 
         let mut stream = ChannelStream::new(stream, Some(close_tx));
         write_stream_type(&mut stream, stream_type).await?;
@@ -739,11 +768,19 @@ pub async fn maybe_start(
             handlers: Arc::clone(&handlers),
             live_dialed: Arc::new(AtomicUsize::new(0)),
             live_accepted: Arc::clone(&live_accepted),
+            shutdown: CancellationToken::new(),
         }),
     };
 
     let peers = Some(Arc::clone(cluster));
-    tokio::spawn(accept_loop(listener, keys, Arc::clone(&handlers), peers, live_accepted));
+    tokio::spawn(accept_loop(
+        listener,
+        keys,
+        Arc::clone(&handlers),
+        peers,
+        live_accepted,
+        handle.inner.shutdown.clone(),
+    ));
 
     tracing::info!(
         %listen_addr,
@@ -829,6 +866,7 @@ async fn accept_loop(
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
     cluster: Option<Arc<ClusterHandle>>,
     live: Arc<AtomicUsize>,
+    shutdown: CancellationToken,
 ) {
     // Bounds concurrent *pre-authentication* work. Permits are released
     // as soon as the handshake resolves, so long-lived authenticated
@@ -836,7 +874,14 @@ async fn accept_loop(
     let handshakes = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
 
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = shutdown.cancelled() => {
+                tracing::debug!("cluster channel: accept loop stopped (channel shut down)");
+                return;
+            }
+        };
+        let (tcp, peer) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 tracing::debug!("cluster channel: accept error: {e}");
@@ -860,6 +905,7 @@ async fn accept_loop(
         let handlers = Arc::clone(&handlers);
         let cluster = cluster.clone();
         let live = Arc::clone(&live);
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let admitted = if let Some(cluster) = &cluster {
                 peer_is_cluster_member(cluster, peer.ip()).await
@@ -911,7 +957,7 @@ async fn accept_loop(
             let cfg = yamux_config();
             let conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Server);
             let live = LiveConnection::new(&live, "accepted");
-            drive_connection(conn, handlers, peer, None, live).await;
+            drive_connection(conn, handlers, peer, None, shutdown, live).await;
         });
     }
 }
@@ -1385,11 +1431,15 @@ where
 ///
 /// `_live` keeps the endpoint's live-connection gauge accurate for
 /// exactly as long as this task runs.
+///
+/// `shutdown` ([`Handle::shutdown`]) ends the driver at once; dropping the
+/// connection closes the socket, so every stream on it errors out.
 async fn drive_connection<T>(
     mut conn: yamux::Connection<T>,
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
     peer: SocketAddr,
     mut stream_gone: Option<oneshot::Receiver<()>>,
+    shutdown: CancellationToken,
     _live: LiveConnection,
 ) where
     T: FuturesAsyncRead + FuturesAsyncWrite + Unpin + Send + 'static,
@@ -1400,12 +1450,21 @@ async fn drive_connection<T>(
         // the close path takes it by value.
         let event = {
             let next = poll_next_inbound(&mut conn);
-            match stream_gone.as_mut() {
-                Some(gone) => tokio::select! {
-                    ev = next => Some(ev),
-                    _ = gone => None,
-                },
-                None => Some(next.await),
+            let gone = async {
+                match stream_gone.as_mut() {
+                    Some(gone) => {
+                        let _ = gone.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                ev = next => Some(ev),
+                () = gone => None,
+                () = shutdown.cancelled() => {
+                    tracing::debug!(%peer, "cluster channel: closing connection (channel shut down)");
+                    return;
+                }
             }
         };
         match event {
@@ -1662,6 +1721,7 @@ mod tests {
             Arc::clone(&handlers),
             None,
             Arc::new(AtomicUsize::new(0)),
+            CancellationToken::new(),
         ));
 
         // Dial as a client.
@@ -1672,7 +1732,14 @@ mod tests {
         let mut conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Client);
         let stream = poll_new_outbound(&mut conn).await.unwrap();
         let live = LiveConnection::new(&Arc::new(AtomicUsize::new(0)), "dialed");
-        tokio::spawn(drive_connection(conn, Arc::new(Mutex::new(Vec::new())), addr, None, live));
+        tokio::spawn(drive_connection(
+            conn,
+            Arc::new(Mutex::new(Vec::new())),
+            addr,
+            None,
+            CancellationToken::new(),
+            live,
+        ));
 
         let mut cs = ChannelStream::new(stream, None);
         write_stream_type(&mut cs, "cdc/default").await.expect("write type");
@@ -1706,6 +1773,7 @@ mod tests {
             Arc::clone(&handlers),
             None,
             Arc::new(AtomicUsize::new(0)),
+            CancellationToken::new(),
         ));
 
         let mut tcp = TcpStream::connect(addr).await.unwrap();
@@ -1739,6 +1807,7 @@ mod tests {
             Arc::clone(&handlers),
             None,
             Arc::new(AtomicUsize::new(0)),
+            CancellationToken::new(),
         ));
 
         // 1. Capture what a legitimate initiator puts on the wire.
@@ -2113,6 +2182,50 @@ mod tests {
             recorder.get(&dialed_key),
             recorder.get(&accepted_key)
         );
+    }
+
+    /// `Handle::shutdown` is what stops replicated batches and forwarded
+    /// statements from reaching this node's databases before the final WAL
+    /// checkpoint: open streams end on both sides, every connection is
+    /// released, and no new dial goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_closes_every_connection_and_refuses_new_dials() {
+        let handle = start_loopback_channel().await;
+        let mut rx = handle.register_exact("cdc/shutdown-check");
+        let mut dialed =
+            handle.dial(handle.listen_addr(), "cdc/shutdown-check").await.expect("dial");
+        dialed.write_all(b"x").await.unwrap();
+        dialed.flush().await.unwrap();
+        let mut accepted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .expect("dispatched stream");
+        let mut one = [0u8; 1];
+        accepted.stream.read_exact(&mut one).await.unwrap();
+
+        handle.shutdown();
+
+        // Both ends of the open stream see it end instead of waiting forever.
+        let mut sink = Vec::new();
+        let accepted_end =
+            tokio::time::timeout(Duration::from_secs(5), accepted.stream.read_to_end(&mut sink))
+                .await;
+        assert!(accepted_end.is_ok(), "the accepted stream must end on shutdown");
+        let dialed_end =
+            tokio::time::timeout(Duration::from_secs(5), dialed.read_to_end(&mut sink)).await;
+        assert!(dialed_end.is_ok(), "the dialed stream must end on shutdown");
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                handle.live_dialed_connections() == 0 && handle.live_accepted_connections() == 0
+            })
+            .await,
+            "every connection is released"
+        );
+        let Err(err) = handle.dial(handle.listen_addr(), "cdc/shutdown-check").await else {
+            panic!("a shut-down channel must refuse to dial");
+        };
+        assert!(format!("{err:#}").contains("shut down"), "{err:#}");
     }
 
     /// A dial to a port nothing listens on fails as a `connect_error`
