@@ -14,6 +14,8 @@
 //! - **[`command`]**: Redis command dispatch — translates RESP frames into
 //!   store operations.
 //! - **[`server`]**: Tokio TCP server accepting RESP connections.
+//! - **[`snapshot`]**: encrypted warm-restart snapshots — write the store to
+//!   a file at shutdown, load it at the next start.
 //!
 //! # Quick Start
 //!
@@ -34,4 +36,5 @@ pub mod expiry;
 pub mod multi_tenant;
 pub mod resp;
 pub mod server;
+pub mod snapshot;
 pub mod store;

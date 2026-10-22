@@ -10,6 +10,7 @@ Task-oriented walkthroughs for common deployments.
 - **[Laravel](laravel/)** — Laravel with embedded SQLite or MySQL passthrough.
 - **[Virtual Hosts](virtual-hosts/)** — multi-tenant directory-based hosting.
 - **[TLS / ACME](tls-acme/)** — automatic Let's Encrypt certificates, including DNS-01 wildcards across five DNS providers.
+- **[Warm restarts](kv-warm-restart/)** — keep the KV store (sessions, cache) across a restart with encrypted snapshots: systemd, Docker, Kubernetes StatefulSets.
 - **[PR Previews for Your App](pr-previews/)** — start here if you want your pull requests to get live URLs: what the environment is, what goes in `ephpm.yaml`, and how the database and KV are wired.
 - **[PR Preview Bot](preview-bot/)** — the operator side of the same system: the `switchboard` daemon + `switchboard-api` webhook receiver, wildcard TLS, and the cluster fan-out.
 - **[Clustering Setup](clustering-setup/)** — gossip-based HA with clustered SQLite.

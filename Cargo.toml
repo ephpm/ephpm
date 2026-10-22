@@ -161,6 +161,18 @@ getrandom = "0.3"
 hmac = "0.12"
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
+# KV warm-restart snapshots (crates/ephpm-kv/src/snapshot). Block compression
+# must be pure Rust — the binary links the PHP SDK's own zlib/zstd and a C
+# compressor exporting the same symbols would shadow them (see the libz-sys
+# ban in deny.toml). lz4_flex with its safe encoder/decoder has no unsafe code
+# and no dependencies at all with the `frame` feature off (the snapshot has
+# its own framing + AEAD, so the LZ4 frame format's checksums are redundant).
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+# CRC-32 for the snapshot's plaintext header and trailer (the sealed blocks
+# are integrity-checked by their AEAD tag). Already in the lock via flate2.
+crc32fast = "1"
+# Property tests for the snapshot format round-trip (dev-dependency only).
+proptest = "1"
 md5 = "0.8"
 # RSA-OAEP public-key encryption for the caching_sha2_password full-auth
 # handshake (crates/ephpm-db/src/mysql.rs). Already in the dependency graph via

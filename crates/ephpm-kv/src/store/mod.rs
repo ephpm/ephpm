@@ -247,6 +247,36 @@ impl HashEntry {
     }
 }
 
+/// One string entry copied out of the store for the snapshot writer
+/// (`crate::snapshot`). `data` is the bytes **as stored** — possibly
+/// compressed, which `compressed` records — so writing a snapshot never
+/// decodes a value.
+#[derive(Debug, Clone)]
+pub(crate) struct StringRecord {
+    pub key: String,
+    pub data: Bytes,
+    pub compressed: bool,
+    pub expires_at: Option<Instant>,
+}
+
+/// One field of a [`HashRecord`]. `expires_at` is the field's own expiry,
+/// independent of the hash's: the snapshot format carries it so a per-field
+/// TTL (`HEXPIRE`) survives a restart once the store tracks one.
+#[derive(Debug, Clone)]
+pub(crate) struct HashFieldRecord {
+    pub name: String,
+    pub value: Bytes,
+    pub expires_at: Option<Instant>,
+}
+
+/// One hash entry copied out of the store for the snapshot writer.
+#[derive(Debug, Clone)]
+pub(crate) struct HashRecord {
+    pub key: String,
+    pub fields: Vec<HashFieldRecord>,
+    pub expires_at: Option<Instant>,
+}
+
 /// Late-bound replication hook.
 ///
 /// When installed via [`Store::set_replicator`], the store's public
@@ -2111,6 +2141,172 @@ impl Store {
         }
     }
 
+    // ── Snapshot support (crate::snapshot) ───────────────────────
+
+    /// Visit every live string entry, one shard at a time.
+    ///
+    /// Each shard is copied out under its read lock into a batch of
+    /// [`StringRecord`]s — cheap, since a record holds an `Arc`-clone of the
+    /// stored bytes, not a copy — and `visit` runs **after** that lock is
+    /// released, so however long serialising a batch takes, no writer is
+    /// blocked by it. Memory is bounded by one shard's worth of records at a
+    /// time, never the whole map. Expired entries are skipped.
+    // The `raw-api` shard iterator is the only `unsafe` here; justified by the
+    // SAFETY comment on the loop (buckets are read under the shard's own lock).
+    #[allow(unsafe_code)]
+    pub(crate) fn for_each_string_shard(&self, mut visit: impl FnMut(Vec<StringRecord>)) {
+        let now = Instant::now();
+        for shard in self.data.shards() {
+            let batch: Vec<StringRecord> = {
+                let guard = shard.read();
+                let mut batch = Vec::with_capacity(guard.len());
+                // SAFETY: `bucket.as_ref()` dereferences a live bucket into a
+                // shared reference. The bucket comes from this shard's own
+                // `iter()`, and `guard` holds the shard's read lock for the
+                // whole loop, so no writer can rehash or remove entries
+                // meanwhile. The references do not escape the block: only
+                // owned clones do.
+                for bucket in unsafe { guard.iter() } {
+                    let (key, slot) = unsafe { bucket.as_ref() };
+                    let entry = slot.get();
+                    if entry.expires_at.is_some_and(|exp| exp <= now) {
+                        continue;
+                    }
+                    batch.push(StringRecord {
+                        key: key.clone(),
+                        data: entry.data.clone(),
+                        compressed: entry.compressed,
+                        expires_at: entry.expires_at,
+                    });
+                }
+                batch
+            };
+            if !batch.is_empty() {
+                visit(batch);
+            }
+        }
+    }
+
+    /// Visit every live hash entry, one shard at a time — the hash-map twin of
+    /// [`for_each_string_shard`](Self::for_each_string_shard), with the same
+    /// locking contract.
+    #[allow(unsafe_code)]
+    pub(crate) fn for_each_hash_shard(&self, mut visit: impl FnMut(Vec<HashRecord>)) {
+        let now = Instant::now();
+        for shard in self.hashes.shards() {
+            let batch: Vec<HashRecord> = {
+                let guard = shard.read();
+                let mut batch = Vec::with_capacity(guard.len());
+                // SAFETY: as in `for_each_string_shard` — the shard read lock
+                // is held for the loop and only owned clones leave it.
+                for bucket in unsafe { guard.iter() } {
+                    let (key, slot) = unsafe { bucket.as_ref() };
+                    let entry = slot.get();
+                    if entry.expires_at.is_some_and(|exp| exp <= now) {
+                        continue;
+                    }
+                    let fields = entry
+                        .fields
+                        .iter()
+                        .map(|(f, v)| HashFieldRecord {
+                            name: f.clone(),
+                            value: v.clone(),
+                            expires_at: None,
+                        })
+                        .collect();
+                    batch.push(HashRecord {
+                        key: key.clone(),
+                        fields,
+                        expires_at: entry.expires_at,
+                    });
+                }
+                batch
+            };
+            if !batch.is_empty() {
+                visit(batch);
+            }
+        }
+    }
+
+    /// Put a string entry back exactly as a snapshot recorded it: `data` is
+    /// stored as-is with its `compressed` flag, so a value the store had
+    /// compressed is **not** decoded and re-encoded on the way in.
+    ///
+    /// Node-local by design (a restore is this node rewarming its own cache,
+    /// not a write the cluster should see) and subject to the memory budget
+    /// like any other write: under `noeviction` a full store refuses the
+    /// restore and `false` is returned. The caller guarantees that
+    /// `compressed` entries were produced by this store's configured
+    /// algorithm; a snapshot taken under a different one must decode first and
+    /// come in through [`set_local`](Self::set_local).
+    pub(crate) fn restore_string(
+        &self,
+        key: String,
+        data: Bytes,
+        compressed: bool,
+        expires_at: Option<Instant>,
+    ) -> bool {
+        let now = self.now_nanos();
+        let entry = match expires_at {
+            Some(at) => Entry::with_expiry(data, key.len(), compressed, at, now),
+            None => Entry::new(data, key.len(), compressed, now),
+        };
+        let new_size = entry.mem_size;
+        let deadline = entry.expires_at;
+        let (old_size, old_had_ttl) =
+            self.data.get(&key).map_or((0, false), |old| (old.mem_size, old.expires_at.is_some()));
+        let index_growth =
+            if deadline.is_some() && !old_had_ttl { ttl_index_cost(&key) } else { 0 };
+        if !self.reserve(&key, (new_size + index_growth).saturating_sub(old_size)) {
+            return false;
+        }
+        self.ttl_index_put(&key, deadline);
+        let watch = self.watch_slot_if_any(&key);
+        let previous = self.data.insert(key, entry);
+        self.mem_add(new_size);
+        if let Some(old) = previous {
+            self.mem_sub(old.mem_size);
+        }
+        if let Some(slot) = watch {
+            slot.bump();
+        }
+        true
+    }
+
+    /// Put a hash back as a snapshot recorded it (see
+    /// [`restore_string`](Self::restore_string) for the contract). Replaces
+    /// any hash already at `key`. Fields whose own expiry has passed are
+    /// dropped; a hash left with no live field is not stored.
+    pub(crate) fn restore_hash(
+        &self,
+        key: String,
+        fields: Vec<HashFieldRecord>,
+        expires_at: Option<Instant>,
+    ) -> bool {
+        let now = Instant::now();
+        let fields: HashMap<String, Bytes> = fields
+            .into_iter()
+            .filter(|f| f.expires_at.is_none_or(|at| at > now))
+            .map(|f| (f.name, f.value))
+            .collect();
+        if fields.is_empty() {
+            return false;
+        }
+        let entry =
+            HashEntry { fields, expires_at, last_accessed: AtomicU64::new(self.now_nanos()) };
+        let new_size = entry.mem_size();
+        let old_size = self.hashes.get(&key).map_or(0, |old| old.mem_size());
+        if !self.reserve(&key, new_size.saturating_sub(old_size)) {
+            return false;
+        }
+        let previous = self.hashes.insert(key, entry);
+        self.mem_add(new_size);
+        if let Some(old) = previous {
+            self.mem_sub(old.mem_size());
+        }
+        true
+    }
+
     // ── Background maintenance ───────────────────────────────────
 
     /// Run one adaptive active-expiry cycle (Redis' `activeExpireCycle`):
@@ -2847,7 +3043,7 @@ fn compress_value(data: &[u8], config: CompressionConfig) -> Vec<u8> {
 /// caller (typically `Store::get`) receives the same `Bytes` handle it
 /// would have gotten from the fast path, so downstream code doesn't
 /// branch on the compressed/uncompressed shape.
-fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Bytes> {
+pub(crate) fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Bytes> {
     use std::io::Read;
     match algo {
         CompressionAlgo::None => unreachable!(),

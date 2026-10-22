@@ -25,11 +25,21 @@ brotli.workspace = true
 zstd.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+# Warm-restart snapshots (src/snapshot): AEAD per block + HKDF key derivation
+# (the same pure-Rust pair ephpm-cluster's secure transport uses), LZ4 block
+# compression, CRC-32 on the plaintext header/trailer, OS entropy for the
+# per-file salt.
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+lz4_flex.workspace = true
+crc32fast.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 redis.workspace = true
 tokio.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

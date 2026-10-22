@@ -123,6 +123,18 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             CDC_SNAPSHOT_BUCKETS,
         )
         .context("failed to configure cdc_snapshot_duration buckets")?
+        // KV warm-restart snapshots: a save or load is seconds for a large
+        // store, so the same wide range as the CDC snapshot bootstrap.
+        .set_buckets_for_metric(
+            Matcher::Full(crate::kv_snapshot::METRIC_SAVE_DURATION.to_string()),
+            CDC_SNAPSHOT_BUCKETS,
+        )
+        .context("failed to configure kv_snapshot_save_duration buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::kv_snapshot::METRIC_LOAD_DURATION.to_string()),
+            CDC_SNAPSHOT_BUCKETS,
+        )
+        .context("failed to configure kv_snapshot_load_duration buckets")?
         .install_recorder()
         .context("failed to install Prometheus recorder")?;
 

@@ -71,6 +71,9 @@ pub fn ephpm_binary_env() -> Option<PathBuf> {
 pub struct SingleNodeFixture {
     child: Option<Child>,
     base_url: String,
+    http_port: u16,
+    binary: PathBuf,
+    config_path: PathBuf,
     _tempdir: TempDir,
 }
 
@@ -81,6 +84,14 @@ impl SingleNodeFixture {
     /// `docroot` is the directory ephpm will serve — typically
     /// `crates/ephpm-e2e/tests/docroot` or its own scratch dir.
     pub async fn start(ephpm_binary: &Path, docroot: &Path) -> Result<Self> {
+        Self::start_with(ephpm_binary, docroot, "").await
+    }
+
+    /// [`start`](Self::start) with extra TOML appended to the generated
+    /// config. `extra_toml` may use the `{DATA_DIR}` placeholder (the
+    /// fixture's scratch data directory, already TOML-escaped), so a suite
+    /// can point a feature at a path that dies with the fixture.
+    pub async fn start_with(ephpm_binary: &Path, docroot: &Path, extra_toml: &str) -> Result<Self> {
         // Ports stay *held* by live probe sockets (see `PortReserver`) until
         // the moment this fixture spawns its child, so nothing else on the box
         // can be handed one in between.
@@ -94,7 +105,7 @@ impl SingleNodeFixture {
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).context("create data dir")?;
 
-        let config = SINGLE_NODE_TEMPLATE
+        let config = format!("{SINGLE_NODE_TEMPLATE}\n{extra_toml}\n")
             .replace("{HTTP_PORT}", &http_port.to_string())
             .replace("{MYSQL_PORT}", &mysql_port.to_string())
             .replace("{DATA_DIR}", &escape_toml(&data_dir))
@@ -103,29 +114,16 @@ impl SingleNodeFixture {
         let config_path = tmp.path().join("ephpm.toml");
         fs::write(&config_path, config).context("write config")?;
 
-        let stdout = fs::File::create(tmp.path().join("stdout.log")).context("open stdout log")?;
-        let stderr = fs::File::create(tmp.path().join("stderr.log")).context("open stderr log")?;
-
         // Hand the ports off: release the probes and spawn in the same breath.
         lease.release();
-        let mut child = Command::new(ephpm_binary)
-            .args(["serve", "--config"])
-            .arg(&config_path)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| format!("spawn ephpm ({})", ephpm_binary.display()))?;
-
-        wait_for_health(&mut child, http_port, Duration::from_secs(15)).await.with_context(|| {
-            format!(
-                "ephpm on 127.0.0.1:{http_port} never healthy — check {}",
-                tmp.path().join("stderr.log").display()
-            )
-        })?;
+        let child = spawn_serve(ephpm_binary, &config_path, tmp.path(), http_port).await?;
 
         Ok(Self {
             child: Some(child),
             base_url: format!("http://127.0.0.1:{http_port}"),
+            http_port,
+            binary: ephpm_binary.to_path_buf(),
+            config_path,
             _tempdir: tmp,
         })
     }
@@ -135,6 +133,62 @@ impl SingleNodeFixture {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Stop the node gracefully (`SIGTERM`, the same path a rolling deploy
+    /// takes) and start it again on the same ports with the same config and
+    /// data directory. Returns once the restarted node reports healthy.
+    ///
+    /// Everything a graceful stop does — draining, the WAL checkpoint, the
+    /// KV snapshot — happens before the new process starts, so a suite can
+    /// assert on what survives a restart.
+    pub async fn restart(&mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            tokio::task::spawn_blocking(move || terminate(&mut child))
+                .await
+                .map_err(|e| anyhow!("join error: {e}"))?;
+        }
+        let tmp = self._tempdir.path().to_path_buf();
+        let child = spawn_serve(&self.binary, &self.config_path, &tmp, self.http_port).await?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    /// The fixture's scratch directory (config, logs, `data/`).
+    #[must_use]
+    pub fn scratch_dir(&self) -> &Path {
+        self._tempdir.path()
+    }
+}
+
+/// Spawn `ephpm serve --config <config>` with its logs in `dir`, and wait for
+/// its health endpoint on `http_port`. Logs are opened in append mode so a
+/// restarted node's output follows the previous run's.
+async fn spawn_serve(binary: &Path, config_path: &Path, dir: &Path, http_port: u16) -> Result<Child> {
+    let stdout = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stdout.log"))
+        .context("open stdout log")?;
+    let stderr = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stderr.log"))
+        .context("open stderr log")?;
+    let mut child = Command::new(binary)
+        .args(["serve", "--config"])
+        .arg(config_path)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("spawn ephpm ({})", binary.display()))?;
+
+    wait_for_health(&mut child, http_port, Duration::from_secs(15)).await.with_context(|| {
+        format!(
+            "ephpm on 127.0.0.1:{http_port} never healthy — check {}",
+            dir.join("stderr.log").display()
+        )
+    })?;
+    Ok(child)
 }
 
 impl Drop for SingleNodeFixture {

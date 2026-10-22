@@ -188,6 +188,21 @@ impl MultiTenantStore {
         Arc::downgrade(&self.sites)
     }
 
+    /// Every site store that currently exists, with its site key — a
+    /// point-in-time copy of the registry, for the snapshot writer and the
+    /// active-expiry thread's siblings. Holds no lock after it returns.
+    #[must_use]
+    pub fn site_stores(&self) -> Vec<(String, Arc<Store>)> {
+        self.sites.iter().map(|e| (e.key().clone(), Arc::clone(e.value()))).collect()
+    }
+
+    /// Whether a store for `hostname` already exists — unlike
+    /// [`get_site_store`](Self::get_site_store), never creates one.
+    #[must_use]
+    pub fn has_site(&self, hostname: &str) -> bool {
+        self.sites.contains_key(hostname)
+    }
+
     /// Number of site stores currently active.
     #[must_use]
     pub fn site_count(&self) -> usize {

@@ -136,8 +136,24 @@ pub(crate) const INTERNAL_PREFIX: &str = "/_ephpm/";
 /// entitled to own `/metrics` when `[server.metrics] enabled = false`. When
 /// metrics ARE enabled the path is served ahead of everything, including a
 /// path the operator pointed into this namespace.
-pub(crate) const INTERNAL_ROUTES: &[&str] =
-    &["/_ephpm/health", "/_ephpm/ready", "/_ephpm/primary", "/_ephpm/requests"];
+pub(crate) const INTERNAL_ROUTES: &[&str] = &[
+    "/_ephpm/health",
+    "/_ephpm/ready",
+    "/_ephpm/primary",
+    "/_ephpm/requests",
+    KV_SNAPSHOT_ROUTE,
+    KV_SNAPSHOT_LOAD_ROUTE,
+];
+
+/// Warm-restart KV snapshot control: `GET` = status, `POST` = write a
+/// snapshot now. Gated like `/_ephpm/requests` (`[server.diagnostics]`
+/// `allow`/`token`); answered in [`Router::handle_kv_snapshot`], the one
+/// internal endpoint that accepts `POST` and the one that awaits (the write
+/// runs on a blocking thread).
+pub(crate) const KV_SNAPSHOT_ROUTE: &str = "/_ephpm/kv/snapshot";
+
+/// `POST` = load the configured snapshot into the live store now. Same gate.
+pub(crate) const KV_SNAPSHOT_LOAD_ROUTE: &str = "/_ephpm/kv/snapshot/load";
 
 /// Sub-namespace of [`INTERNAL_PREFIX`] carved out to reach the **request-phase
 /// middleware chain** instead of the reserved-namespace 404, so a mounted
@@ -826,6 +842,9 @@ pub struct Router {
     /// `Arc` and flips it on every role change (issue: primary-aware health
     /// endpoint).
     primary_view: Arc<AtomicBool>,
+    /// Warm-restart KV snapshots (`[kv.snapshot]`), for the
+    /// `/_ephpm/kv/snapshot` control endpoint. `None` = snapshots are off.
+    kv_snapshot: Option<Arc<crate::kv_snapshot::KvSnapshotService>>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -1387,6 +1406,7 @@ impl Router {
             // non-clustered). Clustered-SQLite mode replaces this with the
             // election's shared view via `with_primary_view`.
             primary_view: Arc::new(AtomicBool::new(true)),
+            kv_snapshot: None,
         };
 
         // Read every known site's override once, now: it seeds the cache (so the
@@ -2031,6 +2051,18 @@ impl Router {
     #[must_use]
     pub fn with_primary_view(mut self, primary_view: Arc<AtomicBool>) -> Self {
         self.primary_view = primary_view;
+        self
+    }
+
+    /// Attach the warm-restart snapshot service so `/_ephpm/kv/snapshot` can
+    /// report on it and trigger a save or load. `None` (snapshots off) makes
+    /// the endpoint answer 404 naming the knob.
+    #[must_use]
+    pub fn with_kv_snapshot(
+        mut self,
+        service: Option<Arc<crate::kv_snapshot::KvSnapshotService>>,
+    ) -> Self {
+        self.kv_snapshot = service;
         self
     }
 
@@ -2796,6 +2828,12 @@ impl Router {
             && !uri_path.starts_with(AUTH_NAMESPACE_PREFIX)
         {
             let client = self.internal_client(&req, remote_addr, is_tls, false);
+            if uri_path == KV_SNAPSHOT_ROUTE || uri_path == KV_SNAPSHOT_LOAD_ROUTE {
+                // The one internal endpoint that is async (a save or load
+                // runs on a blocking thread and is awaited here) and that
+                // accepts POST.
+                return Ok(self.handle_kv_snapshot(&uri_path, &method_ref, &client).await);
+            }
             return Ok(self.handle_internal(&uri_path, &method_ref, &client));
         }
 
@@ -5200,6 +5238,117 @@ impl Router {
                 ),
                 "error",
             ),
+        }
+    }
+
+    /// `/_ephpm/kv/snapshot` and `/_ephpm/kv/snapshot/load` (see
+    /// [`KV_SNAPSHOT_ROUTE`]).
+    ///
+    /// * `GET /_ephpm/kv/snapshot` — status JSON (file, last save, last load).
+    /// * `POST /_ephpm/kv/snapshot` — write a snapshot now; `200` with the
+    ///   report, `409` when one is already being written, `500` when the
+    ///   write failed (the previous snapshot is kept).
+    /// * `POST /_ephpm/kv/snapshot/load` — load the configured snapshot into
+    ///   the live store now; `200` with the report (whose `outcome` may be
+    ///   `cold`).
+    ///
+    /// With snapshots off, every method answers `404` naming the knob. Access
+    /// is the `/_ephpm/requests` gate: `[server.diagnostics] allow`/`deny`/
+    /// `token`, and on a multi-site node a credential is mandatory. The gate
+    /// is checked before the method, so an unauthorised caller learns nothing
+    /// from a `405`.
+    async fn handle_kv_snapshot(
+        &self,
+        uri_path: &str,
+        method: &hyper::Method,
+        client: &crate::internal_access::Client<'_>,
+    ) -> (Response<ServerBody>, &'static str) {
+        let Some(svc) = &self.kv_snapshot else {
+            return (
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: KV snapshots are off. Enable them with [kv.snapshot] mode = \
+                     \"local\" (and a [kv] secret).",
+                ),
+                "diagnostics",
+            );
+        };
+        match self.diagnostics_access.check(client) {
+            crate::internal_access::Verdict::Allow => {}
+            denied => return (self.diagnostics_access.deny_response(denied), "diagnostics"),
+        }
+        let is_load = uri_path == KV_SNAPSHOT_LOAD_ROUTE;
+        match (is_load, method) {
+            (false, &hyper::Method::GET) => {
+                (json_response_owned(StatusCode::OK, svc.status_json()), "diagnostics")
+            }
+            (false, &hyper::Method::POST) => {
+                match svc.try_save(crate::kv_snapshot::SaveTrigger::Request).await {
+                    Ok(Some(report)) => (
+                        json_response_owned(
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "ok": true,
+                                "file": svc.file().display().to_string(),
+                                "bytes": report.bytes,
+                                "keys": report.keys(),
+                                "sites": report.sites,
+                                "blocks": report.blocks,
+                                "elapsed_ms": report.elapsed.as_millis() as u64,
+                            })
+                            .to_string(),
+                        ),
+                        "diagnostics",
+                    ),
+                    Ok(None) => (
+                        json_response(
+                            StatusCode::CONFLICT,
+                            r#"{"ok":false,"error":"a snapshot is already being written"}"#,
+                        ),
+                        "diagnostics",
+                    ),
+                    Err(e) => (
+                        json_response_owned(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+                        ),
+                        "diagnostics",
+                    ),
+                }
+            }
+            (true, &hyper::Method::POST) => {
+                let report = svc.load_now().await;
+                (
+                    json_response_owned(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": !matches!(report.outcome, ephpm_kv::snapshot::LoadOutcome::Cold(_)),
+                            "outcome": report.outcome.label(),
+                            "reason": report.outcome.reason(),
+                            "keys": report.restored,
+                            "expired_skipped": report.expired,
+                            "refused": report.refused,
+                            "unknown_site": report.unknown_site,
+                            "blocks": report.blocks,
+                            "bad_blocks": report.bad_blocks,
+                            "unreached_blocks": report.unreached_blocks,
+                            "elapsed_ms": report.elapsed.as_millis() as u64,
+                        })
+                        .to_string(),
+                    ),
+                    "diagnostics",
+                )
+            }
+            _ => {
+                let allow = if is_load { "POST" } else { "GET, POST" };
+                let resp = Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .header("content-type", "text/plain")
+                    .header("allow", allow)
+                    .body(body::buffered(Full::new(Bytes::from_static(b"405 Method Not Allowed"))))
+                    .expect("static 405 response");
+                (resp, "error")
+            }
         }
     }
 
@@ -9124,6 +9273,16 @@ mod tests {
                         assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
                         assert!(body.contains("request_log"), "{path}: {body}");
                     }
+                }
+                // Snapshots are off on these routers: the server's own 404
+                // naming the knob, for GET and POST alike (the method is only
+                // judged once the feature is on and the caller authorised).
+                KV_SNAPSHOT_ROUTE | KV_SNAPSHOT_LOAD_ROUTE => {
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+                    assert!(body.contains("[kv.snapshot]"), "{path}: {body}");
+                    let (status, body) = probe(router, "POST", path).await;
+                    assert_eq!(status, StatusCode::NOT_FOUND, "POST {path}: {body}");
+                    assert!(body.contains("[kv.snapshot]"), "POST {path}: {body}");
                 }
                 other => panic!(
                     "INTERNAL_ROUTES gained {other} with no assertion here — pin what it must \
