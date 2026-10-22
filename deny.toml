@@ -94,8 +94,9 @@ allow-git = [
     # ePHPm fork of opensrv-mysql 0.7.0 (RUSTSEC-2026-0285 fix; see
     # [patch.crates-io] in Cargo.toml). Remove when it returns to a crates.io source.
     "https://github.com/ephpm/opensrv-mysql.git",
-    # Turso 0.8.3 + the page-1 allocation race fix (tursodatabase/turso#10117;
-    # see the turso entries in [patch.crates-io] in Cargo.toml). Remove when a
-    # Turso release carrying the fix is pinned from crates.io.
-    "https://github.com/luthermonson/turso.git",
+    # ePHPm org mirror of Turso 0.8.3 + the page-1 allocation race fix (tag
+    # v0.8.3-ephpm.1; upstream PR tursodatabase/turso#10117; see the turso
+    # entries in [patch.crates-io] in Cargo.toml). Remove when a Turso release
+    # carrying the fix is pinned from crates.io.
+    "https://github.com/ephpm/turso.git",
 ]
