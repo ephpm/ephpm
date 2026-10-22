@@ -1022,15 +1022,18 @@ fn run_php(
         }
     };
 
-    let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
-    let _ = ephpm_php::PhpRuntime::shutdown();
+    let exit_code = ephpm_php::PhpRuntime::cli_main(args);
+    if exit_code.is_ok() {
+        let _ = ephpm_php::PhpRuntime::shutdown();
+    }
     // A directly opened database: truncate its WAL now — the SDK never
     // checkpoints on drop, so otherwise every write the script made would be
-    // left in the log for the next opener to recover.
+    // left in the log for the next opener to recover. Also on a failed run:
+    // whatever the script committed before the failure is in the log too.
     if let Some((runtime, Some(offline))) = &db_runtime {
         offline.checkpoint_before_exit(runtime.handle());
     }
-    Ok(exit_code_from(exit_code))
+    Ok(exit_code_from(exit_code.context("PHP CLI failed")?))
 }
 
 /// Run the `ephpm composer` subcommand — forward argv verbatim to the embedded

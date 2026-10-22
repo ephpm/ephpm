@@ -333,7 +333,7 @@ What it does, in order:
 1. Copies the **running** binary to the install path. If you run the installed binary itself, the copy is skipped.
 2. Writes a default config **only if none exists**. Re-running `install`, for example with a newer binary, keeps your config, so re-running is the upgrade path. The generated config listens on `0.0.0.0:8080`, serves the platform's default document root, and uses `[php] mode = "per_request"`, `max_execution_time = 30`, `memory_limit = "128M"`.
 3. Creates the data and log directories. With `--user`, it also creates the directories the config writes to (see below) and hands them to the service account.
-4. Registers the service: a systemd unit (enabled, `Restart=on-failure`, output appended to the log file), a launchd daemon (`RunAtLoad`, `KeepAlive`), or a Windows auto-start service running as `LocalSystem`. On Windows it also adds `C:\Program Files\ephpm` to the system `Path`. The Windows service runs the hidden `ephpm service-run` entry point, while systemd and launchd run `ephpm serve --config <config>`.
+4. Registers the service: a systemd unit (enabled, `Restart=on-failure`, `TimeoutStopSec=180` so a graceful stop can finish its final database checkpoint, output appended to the log file), a launchd daemon (`RunAtLoad`, `KeepAlive`), or a Windows auto-start service running as `LocalSystem`. On Windows it also adds `C:\Program Files\ephpm` to the system `Path`. The Windows service runs the hidden `ephpm service-run` entry point, while systemd and launchd run `ephpm serve --config <config>`.
 5. Starts the service.
 
 `install` does not create the document root.

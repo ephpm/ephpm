@@ -33,8 +33,11 @@
 //! are recovered on the next open like any other WAL frames; nothing is lost.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::wal_gate;
@@ -42,6 +45,11 @@ use crate::wal_gate;
 /// Pause between checkpoint attempts on a database whose last attempt was
 /// blocked by a reader.
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How many databases are checkpointed at once. A truncate is mostly
+/// waiting on `fsync`, so a few in parallel overlap that wait; more would
+/// only queue on the same disk.
+const CHECKPOINT_CONCURRENCY: usize = 6;
 
 /// After this long the pass logs which databases it is still waiting on.
 const PROGRESS_AFTER: Duration = Duration::from_secs(3);
@@ -136,8 +144,8 @@ async fn checkpoint_databases(
             pending = refilled;
         }
         let mut still = Vec::with_capacity(pending.len());
-        for db in pending {
-            match checkpoint_once(&db.db_path).await {
+        for (db, outcome) in checkpoint_round(pending).await {
+            match outcome {
                 Ok(Attempt::Done) => {
                     report.truncated += 1;
                     done.push(db);
@@ -197,6 +205,42 @@ async fn checkpoint_databases(
         tracing::debug!(truncated = report.truncated, "final WAL checkpoint finished");
     }
     report
+}
+
+/// One checkpoint attempt on each of `pending`, at most
+/// [`CHECKPOINT_CONCURRENCY`] at a time, returned in completion order.
+///
+/// Each attempt is its own task: an attempt runs its engine work under
+/// `offload::engine`, whose nested `block_on` holds the polling task for
+/// the whole attempt, so attempts polled together on one task would still
+/// run one after another. A failed (panicked) task reports as an error for
+/// its database rather than losing it.
+async fn checkpoint_round(pending: Vec<Pending>) -> Vec<(Pending, anyhow::Result<Attempt>)> {
+    let permits = Arc::new(Semaphore::new(CHECKPOINT_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for db in pending.iter().cloned() {
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            // The semaphore is never closed, so `acquire_owned` cannot fail.
+            let _permit = permits.acquire_owned().await;
+            let outcome = checkpoint_once(&db.db_path).await;
+            (db, outcome)
+        });
+    }
+    let mut out = Vec::with_capacity(pending.len());
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(result) => out.push(result),
+            Err(e) => tracing::warn!("final WAL checkpoint task failed: {e}"),
+        }
+    }
+    // A task that panicked returned nothing: report its database as failed.
+    for db in pending {
+        if !out.iter().any(|(done, _)| done.db_path == db.db_path) {
+            out.push((db, Err(anyhow::anyhow!("checkpoint task failed"))));
+        }
+    }
+    out
 }
 
 /// One `PRAGMA wal_checkpoint(TRUNCATE)` against `db_path`. Opens its own

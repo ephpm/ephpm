@@ -206,17 +206,23 @@
 //!
 //! ## Engine work stays off the async workers
 //!
-//! Turso's futures do their work — page I/O, `fsync` at commit — inside
-//! `poll`, so awaiting one on a tokio worker blocks the worker. Enough of
-//! them (applies, dumps, head samples across dozens of sites) and no worker
-//! is left to turn the runtime's I/O and timer drivers: the node stopped
-//! answering HTTP and handled `SIGTERM` 20–35 s late under per-site
-//! replication load. Every engine call this module makes on a raw
+//! Turso's futures run each step's page I/O and the commit `fsync`
+//! synchronously inside `poll`, yielding only between steps, so a tokio
+//! worker polling one is held for every step as long as the disk takes.
+//! Enough of them (applies, dumps, head samples across dozens of sites)
+//! and no worker is left to turn the runtime's I/O and timer drivers: the
+//! node stopped answering HTTP and handled `SIGTERM` up to 53 s late under
+//! per-site replication load. Every engine call this module makes on a raw
 //! connection therefore runs under [`off_runtime`] (litewire's
 //! `offload::engine`, `block_in_place` on a multi-thread runtime), exactly
 //! inside the WAL-gate permit scope that already marked it; litewire does
 //! the same for `poll_batch`, `apply_batch` and its sessions. Network waits
 //! stay outside.
+//!
+//! An offloaded scope cannot be interrupted from outside: its nested
+//! `block_on` never yields to the scheduler, so a `select!` arm (the per-site
+//! replica loop's role-change arm) or a task abort takes effect only once the
+//! scope (say, a snapshot install) has finished.
 //!
 //! # Wire format (inside the yamux stream)
 //!
