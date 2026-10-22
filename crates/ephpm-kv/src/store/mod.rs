@@ -130,6 +130,26 @@ impl std::fmt::Display for OwnerUnreachable {
 
 impl std::error::Error for OwnerUnreachable {}
 
+/// What a [`Replicator`] answers when asked to intercept a read before the
+/// local map is consulted ([`Replicator::cold_read`]).
+///
+/// A node that has just (re)joined a cluster holds whatever its gossip
+/// catch-up has delivered so far, in per-peer version order — a copy of a key
+/// that is older than one a peer has already acknowledged, with nothing local
+/// to say so. Until the catch-up is complete the replicator answers reads from
+/// peers instead; afterwards it steps aside and the local map is authoritative
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdRead {
+    /// Not intercepting: serve the local map (then fetch through on a miss).
+    Warm,
+    /// A peer's current value; serve it instead of anything held locally.
+    Found(Vec<u8>),
+    /// No peer holds the key (or none could be asked): serve a miss rather
+    /// than a local copy of unknown freshness.
+    Absent,
+}
+
 /// Where a [`Replicator`] says a conditional write must be decided.
 ///
 /// `SETNX` and compare-and-delete are only atomic where they are *decided*.
@@ -564,6 +584,21 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
     fn fetch_through(&self, key: &str) -> Option<Vec<u8>> {
         let _ = key;
         None
+    }
+
+    /// Intercept a [`Store::get_through`] **before** the local map is read.
+    ///
+    /// The default answers [`ColdRead::Warm`] — never intercept — which is
+    /// correct for a replicator with no cluster behind it and for the test
+    /// doubles in this crate. A clustered implementation answers from peers
+    /// while this node is still catching up on the gossip tier after a
+    /// (re)start, because a local hit in that window can be a copy that a
+    /// peer has already superseded (see [`ColdRead`]). It is a **blocking**
+    /// call on the caller's thread when it goes to the network, bounded by the
+    /// implementation exactly like `fetch_through`.
+    fn cold_read(&self, key: &str) -> ColdRead {
+        let _ = key;
+        ColdRead::Warm
     }
 
     /// Decide where a `SETNX` on `key` is arbitrated.
@@ -1253,19 +1288,40 @@ impl Store {
     /// cached here — it carries no TTL — beyond whatever the replicator's own
     /// hot-key cache keeps.
     ///
-    /// Counts the lookup as a keyspace hit or miss (`INFO stats`).
+    /// The replicator is consulted **first** ([`Replicator::cold_read`]): a
+    /// node still catching up on the gossip tier after a (re)start answers
+    /// from its peers instead of its own map, because a local hit there can be
+    /// a copy a peer has already superseded. Once caught up that call is one
+    /// atomic load and the local map is served as before. Standalone nodes
+    /// have no replicator and skip it entirely.
+    ///
+    /// Counts the lookup as a keyspace hit or miss (`INFO stats`), whichever
+    /// path answered it.
     #[must_use]
     pub fn get_through(&self, key: &str) -> Option<Bytes> {
-        let found = self.get(key).or_else(|| {
-            let replicator = self.active_replicator()?;
-            replicator.fetch_through(key).map(Bytes::from)
-        });
+        let found = self.get_through_uncounted(key);
         if found.is_some() {
             self.stats.hit();
         } else {
             self.stats.miss();
         }
         found
+    }
+
+    /// [`get_through`](Self::get_through) without the hit/miss accounting.
+    fn get_through_uncounted(&self, key: &str) -> Option<Bytes> {
+        let replicator = self.active_replicator();
+        if let Some(rep) = &replicator {
+            match rep.cold_read(key) {
+                ColdRead::Warm => {}
+                ColdRead::Found(value) => return Some(Bytes::from(value)),
+                ColdRead::Absent => return None,
+            }
+        }
+        if let Some(local) = self.get(key) {
+            return Some(local);
+        }
+        replicator?.fetch_through(key).map(Bytes::from)
     }
 
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a
@@ -5307,6 +5363,110 @@ mod tests {
         assert_eq!(expires.len(), 1);
         assert_eq!(expires[0].0, "k");
         assert_eq!(expires[0].1, Duration::from_secs(60));
+    }
+
+    /// A replicator that intercepts reads with a fixed [`ColdRead`] answer
+    /// and counts how often it was asked.
+    #[derive(Debug)]
+    struct ColdReplicator {
+        answer: std::sync::Mutex<ColdRead>,
+        asked: AtomicUsize,
+        fetched_through: AtomicUsize,
+    }
+
+    impl ColdReplicator {
+        fn answering(answer: ColdRead) -> Arc<Self> {
+            Arc::new(Self {
+                answer: std::sync::Mutex::new(answer),
+                asked: AtomicUsize::new(0),
+                fetched_through: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl Replicator for ColdReplicator {
+        fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
+            true
+        }
+        fn replicate_remove(&self, _: &str) -> bool {
+            true
+        }
+        fn replicate_expire(&self, _: &str, _: Duration) -> bool {
+            true
+        }
+        fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
+        fn replicate_remove_published(&self, _: String) {}
+        fn fetch_through(&self, _: &str) -> Option<Vec<u8>> {
+            self.fetched_through.fetch_add(1, Ordering::SeqCst);
+            Some(b"from-cluster".to_vec())
+        }
+        fn cold_read(&self, _: &str) -> ColdRead {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.answer.lock().unwrap().clone()
+        }
+    }
+
+    /// `get_through` asks the replicator before the local map: a `Found`
+    /// answer replaces a local hit, `Absent` turns one into a miss, and
+    /// `Warm` leaves the local-then-fetch-through path exactly as it was.
+    #[test]
+    fn get_through_consults_cold_read_before_the_local_map() {
+        let s = test_store();
+        s.set_local("k".into(), b"local".to_vec(), None);
+        let rep = ColdReplicator::answering(ColdRead::Found(b"peer".to_vec()));
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert_eq!(s.get_through("k").as_deref(), Some(b"peer".as_slice()));
+        assert_eq!(s.get("k").as_deref(), Some(b"local".as_slice()), "the local map is untouched");
+
+        *rep.answer.lock().unwrap() = ColdRead::Absent;
+        assert_eq!(s.get_through("k"), None, "a local copy of unknown freshness is a miss");
+        assert_eq!(rep.fetched_through.load(Ordering::SeqCst), 0, "no fetch-through while cold");
+
+        *rep.answer.lock().unwrap() = ColdRead::Warm;
+        assert_eq!(s.get_through("k").as_deref(), Some(b"local".as_slice()));
+        assert_eq!(s.get_through("missing").as_deref(), Some(b"from-cluster".as_slice()));
+        assert_eq!(rep.fetched_through.load(Ordering::SeqCst), 1, "a warm miss fetches through");
+        assert_eq!(rep.asked.load(Ordering::SeqCst), 4, "every get_through asks once");
+    }
+
+    /// Cost of the `cold_read` consultation on the warm read path: a local
+    /// hit through `get_through` with a replicator installed (one `RwLock`
+    /// read + `Arc` clone + a virtual call answering `Warm`) against the same
+    /// read with no replicator. Prints the per-call numbers; run with
+    /// `cargo test -p ephpm-kv --release -- --ignored get_through_overhead --nocapture`.
+    #[test]
+    #[ignore = "timing-only; run by hand in release mode"]
+    fn get_through_overhead_of_the_cold_read_check() {
+        const N: u32 = 2_000_000;
+        let s = test_store();
+        s.set_local("k".into(), b"value".to_vec(), None);
+        let time = |label: &str| {
+            let started = std::time::Instant::now();
+            let mut hits = 0u32;
+            for _ in 0..N {
+                hits += u32::from(s.get_through("k").is_some());
+            }
+            let per_call = started.elapsed() / N;
+            eprintln!("{label}: {per_call:?} per get_through ({hits} hits)");
+            per_call
+        };
+        let bare = time("no replicator      ");
+        s.set_replicator(Some(ColdReplicator::answering(ColdRead::Warm) as Arc<dyn Replicator>));
+        let warm = time("replicator, Warm   ");
+        eprintln!("cold_read consultation adds {:?} per read", warm.saturating_sub(bare));
+    }
+
+    /// The default `cold_read` never intercepts, so a replicator that does not
+    /// implement it (every one before the catch-up gate) is unaffected.
+    #[test]
+    fn default_cold_read_is_warm() {
+        let s = test_store();
+        s.set_local("k".into(), b"local".to_vec(), None);
+        let rep = Arc::new(RecordingReplicator::default());
+        assert_eq!(rep.cold_read("k"), ColdRead::Warm);
+        s.set_replicator(Some(rep as Arc<dyn Replicator>));
+        assert_eq!(s.get_through("k").as_deref(), Some(b"local".as_slice()));
     }
 
     #[test]

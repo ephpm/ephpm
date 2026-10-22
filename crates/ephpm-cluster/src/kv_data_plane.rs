@@ -45,6 +45,18 @@
 //! without answering; the caller treats that, like any transport failure, as
 //! "owner unreachable" and writes nothing.
 //!
+//! ### Stamped reads
+//!
+//! - `op = 0x07` (GET-STAMPED): like GET, but the found response carries the
+//!   last-applied [`Stamp`] the peer holds for the key:
+//!   `[value_len: u32 BE][value][has_stamp: u8][write: u64 BE][node_tag: u64 BE]`
+//!   (`has_stamp = 0` with zeroed stamp fields when the peer has no record —
+//!   the key was applied before its applied map's horizon, or arrived without
+//!   one). Not found is the same sentinel as GET. A node that has just joined
+//!   asks every peer and keeps the newest stamp while it is still catching up
+//!   on the gossip tier (`ClusteredStore::cold_fetch`). A peer predating the
+//!   op drops the connection; the caller falls back to a plain GET on it.
+//!
 //! The sentinel `u32::MAX` indicates the key was not found. This is
 //! unambiguous because real values are bounded by memory limits well
 //! below 4 GiB.
@@ -198,6 +210,13 @@ const MAX_SHARE_BATCH: u32 = SHARE_BATCH_BYTES as u32 + MAX_KEY_LEN + MAX_VALUE_
 
 /// Op code for an owner-arbitrated compare-and-set (`SET ... IFEQ`).
 const OP_SET_IF_EQ: u8 = 0x06;
+
+/// Op code for a GET whose found response also carries the peer's
+/// last-applied stamp for the key (see the module docs, "Stamped reads").
+const OP_GET_STAMPED: u8 = 0x07;
+
+/// Trailer of a found GET-STAMPED response: `[has_stamp: u8][write][node_tag]`.
+const STAMP_TRAILER_LEN: usize = 1 + 8 + 8;
 
 /// SET response: success.
 const SET_OK: u8 = 0x00;
@@ -551,7 +570,7 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
              ([server] sites_dir unset); refusing it"
         );
         return Ok(match request.op {
-            OP_GET => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
+            OP_GET | OP_GET_STAMPED => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
             OP_SET_NX | OP_DEL_IF_EQ | OP_SET_IF_EQ => vec![COND_UNROUTABLE],
             _ => vec![SET_REJECTED],
         });
@@ -598,6 +617,36 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
                 response
             } else {
                 NOT_FOUND_SENTINEL.to_be_bytes().to_vec()
+            }
+        }
+        OP_GET_STAMPED => {
+            // Read the value and its stamp as ONE step: hold the key's slot in
+            // the applied map while reading the store, exactly as every write
+            // path holds it (`apply_if_newer`), so a concurrent write cannot
+            // pair an old value with a new stamp (the shape the warm-restart
+            // lab caught in a handoff build). Same lock order as the writers:
+            // applied slot, then store shard.
+            let (value, stamp) = match router.applied.as_ref() {
+                Some(applied) => {
+                    let slot = applied.get(&request.key);
+                    let value = store.get(key);
+                    (value, slot.map(|s| *s))
+                }
+                None => (store.get(key), None),
+            };
+            match value {
+                Some(value) => {
+                    let len = u32::try_from(value.len()).unwrap_or(NOT_FOUND_SENTINEL - 1);
+                    let mut response = Vec::with_capacity(4 + value.len() + STAMP_TRAILER_LEN);
+                    response.extend_from_slice(&len.to_be_bytes());
+                    response.extend_from_slice(&value);
+                    let stamp = stamp.unwrap_or(Stamp::ZERO);
+                    response.push(u8::from(stamp != Stamp::ZERO));
+                    response.extend_from_slice(&stamp.write.to_be_bytes());
+                    response.extend_from_slice(&stamp.node_tag.to_be_bytes());
+                    response
+                }
+                None => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
             }
         }
         OP_SET => {
@@ -1062,6 +1111,9 @@ enum ResponseKind {
     Status,
     /// `[value_len: u32][value]` or the not-found sentinel (GET).
     Value,
+    /// A found [`ResponseKind::Value`] followed by the stamp trailer, or the
+    /// not-found sentinel (GET-STAMPED).
+    StampedValue,
 }
 
 /// Dial `addr` within [`CONNECT_TIMEOUT`].
@@ -1088,7 +1140,7 @@ async fn exchange_on(
         }
         match kind {
             ResponseKind::Status => Ok(vec![stream.read_u8().await?]),
-            ResponseKind::Value => {
+            ResponseKind::Value | ResponseKind::StampedValue => {
                 let value_len = stream.read_u32().await?;
                 let mut response = value_len.to_be_bytes().to_vec();
                 if value_len == NOT_FOUND_SENTINEL {
@@ -1105,6 +1157,9 @@ async fn exchange_on(
                     );
                 }
                 response.extend(read_exact_chunked(stream, value_len as usize).await?);
+                if kind == ResponseKind::StampedValue {
+                    response.extend(read_exact_chunked(stream, STAMP_TRAILER_LEN).await?);
+                }
                 Ok(response)
             }
         }
@@ -1131,6 +1186,30 @@ fn decode_get_response(response: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(take_bytes(&mut buf, value_len as usize)?.to_vec()))
+}
+
+/// A value fetched with [`DataPlaneClient::fetch_stamped`], with the stamp
+/// the peer holds for it (`None` when the peer has no record of one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedValue {
+    /// The peer's current value.
+    pub value: Vec<u8>,
+    /// The peer's last-applied stamp for the key, if it still has one.
+    pub stamp: Option<Stamp>,
+}
+
+/// Decode a GET-STAMPED response: `None` for the sentinel, otherwise the
+/// value and its stamp trailer.
+fn decode_get_stamped_response(response: &[u8]) -> anyhow::Result<Option<StampedValue>> {
+    let mut buf = response;
+    let value_len = take_u32(&mut buf)?;
+    if value_len == NOT_FOUND_SENTINEL {
+        return Ok(None);
+    }
+    let value = take_bytes(&mut buf, value_len as usize)?.to_vec();
+    let has_stamp = take_u8(&mut buf)? != 0;
+    let stamp = Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? };
+    Ok(Some(StampedValue { value, stamp: has_stamp.then_some(stamp) }))
 }
 
 /// Idle connections and breaker state for one peer.
@@ -1268,6 +1347,27 @@ impl DataPlaneClient {
     pub async fn fetch(&self, addr: SocketAddr, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let response = self.exchange(addr, &encode_get_request(key)?, ResponseKind::Value).await?;
         decode_get_response(&response)
+    }
+
+    /// Fetch `key` from the peer at `addr` together with the stamp it holds
+    /// for it ([`OP_GET_STAMPED`]); `None` when it has no such key.
+    ///
+    /// A peer predating the op drops the connection without answering; that
+    /// surfaces as an error here, and the caller decides whether to fall back
+    /// to [`fetch`](Self::fetch).
+    ///
+    /// # Errors
+    ///
+    /// Connect/I-O failure, timeout, a cipher mismatch, or an old peer.
+    pub async fn fetch_stamped(
+        &self,
+        addr: SocketAddr,
+        key: &str,
+    ) -> anyhow::Result<Option<StampedValue>> {
+        let mut message = encode_get_request(key)?;
+        message[0] = OP_GET_STAMPED;
+        let response = self.exchange(addr, &message, ResponseKind::StampedValue).await?;
+        decode_get_stamped_response(&response)
     }
 
     /// Store `value` under `key` on the peer at `addr`, returning whether it
@@ -2312,6 +2412,69 @@ mod tests {
         assert_eq!(store.get("k").as_deref(), Some(b"old".as_slice()), "ungated: last arrival");
         assert!(client.store(addr, "k", b"legacy").await.unwrap());
         assert_eq!(store.get("k").as_deref(), Some(b"legacy".as_slice()));
+    }
+
+    /// A stamped GET returns the value with the stamp the peer applied it
+    /// under; a key applied without a record reports no stamp; a missing key
+    /// is the same sentinel as a plain GET. Plaintext and sealed alike.
+    #[tokio::test]
+    async fn stamped_get_carries_the_applied_stamp() {
+        for cipher in [None, Some(test_cipher("s"))] {
+            let store = Store::new(ephpm_kv::store::StoreConfig::default());
+            let applied = crate::clustered_store::new_applied_write_map();
+            let addr = spawn_router_handler(
+                KvRouter::global(Arc::clone(&store)).with_applied(Arc::clone(&applied)),
+                cipher.clone(),
+            )
+            .await;
+            let client = DataPlaneClient::new(cipher);
+            let stamp = crate::gossip_kv::StampClock::new("origin").next();
+            assert!(client.store_stamped(addr, "k", b"value", None, stamp).await.unwrap());
+            store.set_local("unstamped".into(), b"old".to_vec(), None);
+
+            assert_eq!(
+                client.fetch_stamped(addr, "k").await.unwrap(),
+                Some(StampedValue { value: b"value".to_vec(), stamp: Some(stamp) })
+            );
+            assert_eq!(
+                client.fetch_stamped(addr, "unstamped").await.unwrap(),
+                Some(StampedValue { value: b"old".to_vec(), stamp: None })
+            );
+            assert_eq!(client.fetch_stamped(addr, "missing").await.unwrap(), None);
+            // The plain GET on the same connection still works (pool reuse
+            // across response kinds).
+            assert_eq!(client.fetch(addr, "k").await.unwrap(), Some(b"value".to_vec()));
+        }
+    }
+
+    /// Without an applied map (tools, tests) a stamped GET answers with no
+    /// stamp rather than failing.
+    #[tokio::test]
+    async fn stamped_get_without_applied_map_reports_no_stamp() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        store.set_local("k".into(), b"v".to_vec(), None);
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+        let client = DataPlaneClient::new(None);
+        assert_eq!(
+            client.fetch_stamped(addr, "k").await.unwrap(),
+            Some(StampedValue { value: b"v".to_vec(), stamp: None })
+        );
+    }
+
+    #[test]
+    fn stamped_get_response_round_trips_and_rejects_truncation() {
+        let stamp = Stamp { write: 7 << crate::gossip_kv::SEQ_BITS, node_tag: 9 };
+        let mut response = 3u32.to_be_bytes().to_vec();
+        response.extend_from_slice(b"abc");
+        response.push(1);
+        response.extend_from_slice(&stamp.write.to_be_bytes());
+        response.extend_from_slice(&stamp.node_tag.to_be_bytes());
+        assert_eq!(
+            decode_get_stamped_response(&response).unwrap(),
+            Some(StampedValue { value: b"abc".to_vec(), stamp: Some(stamp) })
+        );
+        assert!(decode_get_stamped_response(&response[..response.len() - 1]).is_err());
+        assert_eq!(decode_get_stamped_response(&NOT_FOUND_SENTINEL.to_be_bytes()).unwrap(), None);
     }
 
     #[test]

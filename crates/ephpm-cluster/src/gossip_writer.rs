@@ -59,6 +59,7 @@ use crate::gossip_kv::{
     KV_PREFIX, Stamp, decode_tombstone, encode_tombstone, now_epoch_ms, set_if_newer,
     split_encoded, stamp_of,
 };
+use crate::node::KV_MARK_KEY;
 
 /// One drained batch: queued ops and queued retirements.
 type Batch = (Vec<(String, Pending)>, Vec<(String, Stamp)>);
@@ -82,8 +83,9 @@ const DRAIN_BATCH: usize = 4_096;
 /// nothing wakes it.
 const DRAIN_IDLE: Duration = Duration::from_millis(50);
 
-/// How often this node's own gossip state is swept for garbage.
-pub const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+/// How often this node's own gossip state is swept for garbage, and its
+/// catch-up mark refreshed ([`crate::node::KV_MARK_INTERVAL`] is this).
+pub const SWEEP_INTERVAL: Duration = crate::node::KV_MARK_INTERVAL;
 
 /// How long a `TS:` tombstone marker stays visible in gossip after the
 /// delete it carries, before it is chitchat-deleted (and GC'd 60 s later).
@@ -328,6 +330,11 @@ impl GossipWriter {
                     self.swept.fetch_add(swept, Ordering::Relaxed);
                     tracing::debug!(swept, "gossip KV state swept");
                 }
+                // Refresh this node's catch-up mark on the same tick: a
+                // joining peer proves it has streamed this node's whole state
+                // by receiving a mark set after it joined (see
+                // `crate::node::KV_MARK_KEY`).
+                guard.self_node_state().set(KV_MARK_KEY, now_epoch_ms().to_string());
             }
         }
     }

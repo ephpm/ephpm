@@ -26,11 +26,13 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 use ephpm_config::ClusterKvConfig;
-use ephpm_kv::store::{HashFieldState, Routed, SetIfEqOutcome, SetNxOutcome, SetTtl, Store};
+use ephpm_kv::store::{
+    ColdRead, HashFieldState, Routed, SetIfEqOutcome, SetNxOutcome, SetTtl, Store,
+};
 
 use crate::ClusterHandle;
 use crate::gossip_kv::{Stamp, expiry_ms_for};
-use crate::kv_data_plane::DataPlaneClient;
+use crate::kv_data_plane::{DataPlaneClient, StampedValue};
 use crate::node::NodeInfo;
 use crate::secure_transport::ClusterCipher;
 
@@ -63,8 +65,110 @@ pub const CONDITIONAL_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total budget for a read-through fetch of a large value from its replica
 /// set on behalf of a reader that blocks a request thread
-/// ([`ClusteredStore::fetch_through`]).
+/// ([`ClusteredStore::fetch_through`]), and for one cold read
+/// ([`ClusteredStore::cold_fetch`]).
 pub const FETCH_THROUGH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long after start the catch-up gate waits for peers to show up before
+/// it can conclude there are none: the failure detector needs two heartbeats
+/// (~2 s) to call a peer alive, and a node with no alive peer after this is
+/// the first node of its cluster (or a standalone one) with nothing to catch
+/// up on.
+pub const CATCH_UP_JOIN_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the catch-up gate re-reads membership and the peers' marks.
+const CATCH_UP_POLL: Duration = Duration::from_millis(250);
+
+/// How often the gate logs that it is still waiting.
+const CATCH_UP_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// The longest the gate stays cold. Past this it opens with a `WARN` and
+/// the node serves its own store even though gossip never proved it caught
+/// up — the state it would have been in from the first second without the
+/// gate. This bounds a stuck catch-up (a reset storm: a peer's state too big
+/// to stream within chitchat's 60 s tombstone grace, see #631) and any bug
+/// in the gate itself to a latency cost, never a permanent one.
+pub const CATCH_UP_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Gauge: `1` while this node serves small-tier reads through its peers
+/// because its gossip catch-up is not complete, `0` otherwise.
+pub const METRIC_CATCH_UP_COLD: &str = "ephpm_kv_catch_up_cold";
+
+/// Counter of reads answered through peers while cold, by `outcome`
+/// (`found`, `absent`, `unavailable`).
+pub const METRIC_COLD_READS: &str = "ephpm_kv_cold_reads_total";
+
+/// What [`ClusteredStore::cold_fetch`] found across the alive peers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdFetch {
+    /// The newest copy any peer holds (by stamp; an unstamped copy loses to
+    /// a stamped one).
+    Found(Vec<u8>),
+    /// At least one peer answered, and none holds the key.
+    Absent,
+    /// Every peer failed or timed out.
+    Unavailable,
+    /// No alive peer to ask.
+    NoPeers,
+}
+
+/// Counters of the catch-up gate ([`ClusteredStore::catch_up_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchUpStats {
+    /// Whether reads are currently served through peers.
+    pub cold: bool,
+    /// Cold reads that a peer answered with a value.
+    pub found: u64,
+    /// Cold reads no peer had the key for.
+    pub absent: u64,
+    /// Cold reads no peer could be reached for (served as a miss).
+    pub unavailable: u64,
+}
+
+/// The catch-up gate's shared state: owned by the [`ClusteredStore`] and the
+/// gate task, which holds nothing else of the store so a handle shutdown is
+/// unaffected (the task exits when the gate opens).
+struct CatchUpGate {
+    /// `true` from [`ClusteredStore::init_catch_up_gate`] until the gate
+    /// opens. The one load on every `get_through`.
+    cold: AtomicBool,
+    /// Set by the first `init_catch_up_gate`; later calls are no-ops.
+    armed: AtomicBool,
+    /// When the gate was armed: until [`CATCH_UP_JOIN_WAIT`] has passed, "no
+    /// alive peer" means "none detected yet", not "none exists".
+    armed_at: std::sync::OnceLock<Instant>,
+    /// Alive peers (this node excluded), refreshed each poll while cold, so
+    /// a cold read never takes the chitchat lock.
+    peers: parking_lot::RwLock<Vec<NodeInfo>>,
+    found: AtomicU64,
+    absent: AtomicU64,
+    unavailable: AtomicU64,
+}
+
+impl CatchUpGate {
+    fn new() -> Self {
+        Self {
+            cold: AtomicBool::new(false),
+            armed: AtomicBool::new(false),
+            armed_at: std::sync::OnceLock::new(),
+            peers: parking_lot::RwLock::new(Vec::new()),
+            found: AtomicU64::new(0),
+            absent: AtomicU64::new(0),
+            unavailable: AtomicU64::new(0),
+        }
+    }
+
+    fn open(&self) {
+        self.cold.store(false, Ordering::SeqCst);
+        metrics::gauge!(METRIC_CATCH_UP_COLD).set(0.0);
+    }
+
+    /// Whether the gate is still inside its join wait, when an empty peer
+    /// list says nothing about whether peers exist.
+    fn within_join_wait(&self) -> bool {
+        self.armed_at.get().is_some_and(|t| t.elapsed() < CATCH_UP_JOIN_WAIT)
+    }
+}
 
 /// Large-value writes waiting for a data-plane worker before new ones are
 /// shed. Each entry holds one value copy; with the default 512-byte gossip
@@ -217,6 +321,8 @@ pub struct ClusteredStore {
     large_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<LargeWrite>>,
     /// Large writes shed because that queue was full.
     large_shed: AtomicU64,
+    /// The catch-up gate (see [`ClusteredStore::init_catch_up_gate`]).
+    catch_up: Arc<CatchUpGate>,
 }
 
 /// Tracks remote fetch frequency for a single key.
@@ -290,7 +396,187 @@ impl ClusteredStore {
             replica_write_failures: Arc::new(AtomicU64::new(0)),
             large_tx: std::sync::OnceLock::new(),
             large_shed: AtomicU64::new(0),
+            catch_up: Arc::new(CatchUpGate::new()),
         })
+    }
+
+    /// Arm the catch-up gate: serve `get_through` reads from peers until this
+    /// node's gossip catch-up is complete.
+    ///
+    /// A node that (re)joins a cluster streams each peer's gossip state per
+    /// peer, in version order, one MTU per gossip exchange — tens of seconds
+    /// to minutes for a large state. Everything it materializes meanwhile is
+    /// "current as of that peer's cursor": a copy of a key that another peer
+    /// has already superseded can land first and be served as a local hit for
+    /// as long as the newer version sits further up some peer's backlog. The
+    /// live lab measured that as stale reads on a restarted node for minutes
+    /// after every restart (#631).
+    ///
+    /// While the gate is **cold**, [`Replicator::cold_read`] answers each
+    /// read by asking every alive peer for its copy *and its stamp*
+    /// ([`ClusteredStore::cold_fetch`]) and serving the newest — the
+    /// freshness of the best-informed peer, one data-plane round trip per
+    /// read. Keys this node wrote itself since it started are served locally
+    /// (read-your-writes). The gate opens when every alive peer's post-join
+    /// catch-up mark has arrived ([`crate::node::KV_MARK_KEY`]), i.e. the
+    /// local store holds every entry each peer had, or after
+    /// [`CATCH_UP_CAP`]. A node with no alive peer after
+    /// [`CATCH_UP_JOIN_WAIT`] opens at once. Idempotent; called once at
+    /// startup by the server before it serves requests.
+    ///
+    /// [`Replicator::cold_read`]: ephpm_kv::store::Replicator::cold_read
+    pub async fn init_catch_up_gate(self: &Arc<Self>) {
+        if self.catch_up.armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.catch_up.armed_at.set(Instant::now());
+        self.catch_up.cold.store(true, Ordering::SeqCst);
+        metrics::gauge!(METRIC_CATCH_UP_COLD).set(1.0);
+        tracing::info!(
+            "gossip KV catch-up gate armed: reads are served through peers until every \
+             peer's state has arrived"
+        );
+        tokio::spawn(run_catch_up_gate(
+            Arc::clone(&self.catch_up),
+            self.cluster.handle.chitchat(),
+            self.cluster.self_node().id,
+            self.cluster.started_ms(),
+        ));
+    }
+
+    /// Whether the catch-up gate is cold (reads are served through peers).
+    #[must_use]
+    pub fn is_cold(&self) -> bool {
+        self.catch_up.cold.load(Ordering::Relaxed)
+    }
+
+    /// Counters of the catch-up gate.
+    #[must_use]
+    pub fn catch_up_stats(&self) -> CatchUpStats {
+        CatchUpStats {
+            cold: self.is_cold(),
+            found: self.catch_up.found.load(Ordering::Relaxed),
+            absent: self.catch_up.absent.load(Ordering::Relaxed),
+            unavailable: self.catch_up.unavailable.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether `transport_key` was last written **by this node, in this
+    /// incarnation** according to `applied`: a cold read serves such a key
+    /// locally (read-your-writes), every other key through peers.
+    ///
+    /// The applied map is per process, so an entry carrying this node's tag is
+    /// one of this process's writes; the stamp time is checked too so a
+    /// transport that re-delivers an earlier incarnation's writes under their
+    /// original stamps could never pass as one of ours.
+    fn written_here_since_start(&self, applied: &AppliedWriteMap, transport_key: &str) -> bool {
+        applied.get(transport_key).is_some_and(|stamp| {
+            stamp.node_tag == self.cluster.node_tag()
+                && stamp.epoch_ms() >= self.cluster.started_ms()
+        })
+    }
+
+    /// The decision behind [`Replicator::cold_read`] for a transport key:
+    /// `Warm` when the gate is open or the key is this node's own write, else
+    /// the peers' answer.
+    ///
+    /// [`Replicator::cold_read`]: ephpm_kv::store::Replicator::cold_read
+    fn cold_read(
+        &self,
+        handle: &tokio::runtime::Handle,
+        applied: &AppliedWriteMap,
+        transport_key: &str,
+    ) -> ColdRead {
+        if !self.is_cold() || self.written_here_since_start(applied, transport_key) {
+            return ColdRead::Warm;
+        }
+        match block_on_cluster(handle, self.cold_fetch(transport_key)) {
+            Some(ColdFetch::Found(value)) => ColdRead::Found(value),
+            Some(ColdFetch::Absent | ColdFetch::Unavailable) => ColdRead::Absent,
+            // No alive peer yet, inside the join wait: the failure detector
+            // takes a couple of heartbeats to call a peer alive, and gossip
+            // has usually delivered a first batch of entries by then — the
+            // very copies this gate exists not to serve. A miss, not a hit.
+            Some(ColdFetch::NoPeers) if self.catch_up.within_join_wait() => {
+                self.catch_up.absent.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!(METRIC_COLD_READS, "outcome" => "absent").increment(1);
+                ColdRead::Absent
+            }
+            // Nobody to ask after the join wait (the gate is about to open),
+            // or no runtime to ask from: the local store is the best this
+            // node has.
+            Some(ColdFetch::NoPeers) | None => ColdRead::Warm,
+        }
+    }
+
+    /// Ask every alive peer for `transport_key` with the stamp it holds, and
+    /// keep the newest.
+    ///
+    /// Each peer is asked within [`FETCH_THROUGH_TIMEOUT`], all concurrently,
+    /// so the call costs one round trip. A peer predating the stamped read is
+    /// asked again with a plain GET (its copy then counts as unstamped, which
+    /// loses to any stamped copy). The result is never cached: it carries no
+    /// TTL, and the gossip applier is materializing the same keys meanwhile.
+    pub async fn cold_fetch(&self, transport_key: &str) -> ColdFetch {
+        let peers = self.catch_up.peers.read().clone();
+        // Only peers whose data port has arrived in gossip: `node_data_addr`
+        // falls back to this node's own port for a peer without one, which on
+        // a cold node is a round trip to its own empty store.
+        let targets: Vec<(String, SocketAddr)> = peers
+            .iter()
+            .filter(|n| n.data_port.is_some())
+            .filter_map(|n| node_data_addr(n, self.config.data_port).map(|a| (n.id.clone(), a)))
+            .collect();
+        if targets.is_empty() {
+            return ColdFetch::NoPeers;
+        }
+        let asks = targets.iter().map(|(id, addr)| async move {
+            let answer = tokio::time::timeout(FETCH_THROUGH_TIMEOUT, async {
+                match self.client.fetch_stamped(*addr, transport_key).await {
+                    Ok(found) => Ok(found),
+                    Err(e) => {
+                        tracing::debug!(key = transport_key, peer = %id, %e, "stamped read failed; plain GET");
+                        self.client
+                            .fetch(*addr, transport_key)
+                            .await
+                            .map(|v| v.map(|value| StampedValue { value, stamp: None }))
+                    }
+                }
+            })
+            .await;
+            match answer {
+                Ok(Ok(found)) => Some(found),
+                Ok(Err(e)) => {
+                    tracing::debug!(key = transport_key, peer = %id, %e, "cold read failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(key = transport_key, peer = %id, "cold read timed out");
+                    None
+                }
+            }
+        });
+        let answers = futures::future::join_all(asks).await;
+        let answered = answers.iter().filter(|a| a.is_some()).count();
+        let best = answers.into_iter().flatten().flatten().max_by(|a, b| a.stamp.cmp(&b.stamp));
+        let outcome = match best {
+            Some(found) => {
+                self.catch_up.found.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!(METRIC_COLD_READS, "outcome" => "found").increment(1);
+                return ColdFetch::Found(found.value);
+            }
+            None if answered > 0 => {
+                self.catch_up.absent.fetch_add(1, Ordering::Relaxed);
+                ColdFetch::Absent
+            }
+            None => {
+                self.catch_up.unavailable.fetch_add(1, Ordering::Relaxed);
+                ColdFetch::Unavailable
+            }
+        };
+        let label = if outcome == ColdFetch::Absent { "absent" } else { "unavailable" };
+        metrics::counter!(METRIC_COLD_READS, "outcome" => label).increment(1);
+        outcome
     }
 
     /// Initialize the hot key invalidation subscription.
@@ -1269,6 +1555,64 @@ impl ClusterHandle {
     }
 }
 
+/// The catch-up gate task: polls membership and the peers' marks until every
+/// alive peer is caught up (then opens the gate and exits), or the cap
+/// passes (opens with a warning).
+///
+/// Holds only the chitchat mutex and the gate — never the `ClusterHandle` or
+/// the `ClusteredStore` — so shutting either down is unaffected.
+async fn run_catch_up_gate(
+    gate: Arc<CatchUpGate>,
+    chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>,
+    self_id: String,
+    started_ms: u64,
+) {
+    let started = Instant::now();
+    let mut next_warn = started + CATCH_UP_WARN_EVERY;
+    loop {
+        tokio::time::sleep(CATCH_UP_POLL).await;
+        let (status, peers) = {
+            let guard = chitchat.lock().await;
+            (
+                crate::node::catch_up_status_locked(&guard, &self_id, started_ms),
+                crate::node::alive_peers_locked(&guard, &self_id),
+            )
+        };
+        *gate.peers.write() = peers;
+        let elapsed = started.elapsed();
+        if elapsed >= CATCH_UP_JOIN_WAIT && status.complete() {
+            gate.open();
+            tracing::info!(
+                elapsed_ms = elapsed.as_millis(),
+                peers = status.peers.len(),
+                "gossip KV catch-up complete: every peer's state has arrived; serving reads locally"
+            );
+            return;
+        }
+        if elapsed >= CATCH_UP_CAP {
+            gate.open();
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis(),
+                pending = ?status.pending(),
+                "gossip KV catch-up did not complete within the cap; serving reads locally \
+                 anyway — small-tier values on this node may be stale until gossip converges \
+                 (peers whose state is too large to stream within chitchat's tombstone grace \
+                 never converge; see #631)"
+            );
+            return;
+        }
+        if Instant::now() >= next_warn {
+            next_warn = Instant::now() + CATCH_UP_WARN_EVERY;
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis(),
+                pending = ?status.pending(),
+                "gossip KV catch-up still in progress; reads are served through peers (one \
+                 data-plane round trip each)"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Sync bridge to `ephpm_kv::store::Replicator`
 // ─────────────────────────────────────────────────────────────────────
@@ -1445,6 +1789,11 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // The global keyspace's transport key IS the key. Bounded by
         // FETCH_THROUGH_TIMEOUT inside; `None` on a shut-down runtime.
         block_on_cluster(&self.handle, self.inner.fetch_through(key)).flatten()
+    }
+
+    fn cold_read(&self, key: &str) -> ColdRead {
+        // The global keyspace's transport key IS the key.
+        self.inner.cold_read(&self.handle, &self.applied, key)
     }
 
     fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
@@ -1811,6 +2160,13 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     fn fetch_through(&self, key: &str) -> Option<Vec<u8>> {
         let transport = crate::site_namespace::encode(&self.site, key);
         block_on_cluster(&self.handle, self.inner.fetch_through(&transport)).flatten()
+    }
+
+    fn cold_read(&self, key: &str) -> ColdRead {
+        // Peers resolve the enveloped key into this site's store on their
+        // side, exactly as a fetch-through does.
+        let transport = crate::site_namespace::encode(&self.site, key);
+        self.inner.cold_read(&self.handle, &self.applied, &transport)
     }
 
     fn replicate_remove_published(&self, key: String) {

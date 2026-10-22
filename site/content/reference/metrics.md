@@ -549,6 +549,25 @@ Recorded only when `[kv.snapshot] mode != "off"` ([config](/reference/config/#kv
 increase(ephpm_kv_snapshot_load_total{outcome="cold",reason!="missing"}[1h]) > 0
 ```
 
+## KV catch-up gate
+
+Clustered KV only. A node that starts into a running cluster serves `GET` /
+`MGET` / `ephpm_kv_get` through its peers until it has streamed every peer's
+gossip-tier state ([why](/architecture/kv-store/#tier-1--gossip-backed-small-values)).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_kv_catch_up_cold` | gauge | — | `1` while the gate is cold (reads go to peers), `0` once the catch-up is complete, the cap (15 min) has passed, or no alive peer exists. |
+| `ephpm_kv_cold_reads_total` | counter | `outcome` (`found`, `absent`, `unavailable`) | Reads answered through peers while cold: a peer held the key (`found`), no peer did (`absent`, served as a miss), or no peer could be reached (`unavailable`, also a miss). |
+
+```promql
+# A node has been cold for longer than a rolling restart should take.
+ephpm_kv_catch_up_cold == 1 and (time() - process_start_time_seconds) > 300
+
+# Cold reads failing: the restarted node cannot reach its peers' data planes.
+rate(ephpm_kv_cold_reads_total{outcome="unavailable"}[1m]) > 0
+```
+
 ## Cluster channel
 
 The cluster channel is the authenticated TCP data plane between nodes (default

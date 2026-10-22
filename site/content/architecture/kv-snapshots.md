@@ -230,7 +230,11 @@ In a cluster the snapshot covers everything this node held: gossip-tier
 small values (which the live cluster re-sends anyway) and the large values
 this node owned or replicated. A snapshot-restored entry carries no write
 stamp, so any replicated write that arrives for the key — gossip catch-up or
-a data-plane push — replaces it.
+a data-plane push — replaces it. While the node's [catch-up
+gate](/architecture/kv-store/#tier-1--gossip-backed-small-values) is cold, a
+`GET` does not serve a restored entry at all: it asks the live peers and
+serves their newest copy, so a value a peer overwrote while this node was
+down is not read back from the snapshot.
 
 ### Peer handoff (`peer_handoff`, on by default)
 
@@ -306,8 +310,11 @@ p90 230 s after the newer write, 0.6 % of that node's reads under the
 lab's 1,500 rewrites/s. A cache that serves a value rewritten elsewhere
 while it was down is worse than a miss: sessions, lock tokens
 (`SETNX`/`DELIFEQ`) and invalidations can all go wrong on it. So with
-peers present the restarted node misses until gossip has caught up, and
-is never stale. Restoring large values from the snapshot was rejected for
+peers present the restarted node does not serve its own small-tier copies
+until gossip has caught up: its catch-up gate answers `GET`s through the
+peers meanwhile (the same catch-up window would otherwise serve the copies
+gossip delivered first, which can be older than what a peer already
+acknowledged — see the KV store page). Restoring large values from the snapshot was rejected for
 the same reason in a different shape: the file holds every large value
 the node *had*, including keys it is no longer a replica for, which later
 writes never reach.
