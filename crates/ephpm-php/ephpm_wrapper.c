@@ -3664,13 +3664,11 @@ PHP_METHOD(Ephpm_Worker_Envelope, bodyStream)
 }
 
 /* parsedBody(): ?array — Phase 1 returns null (form/multipart parsing is a
- * framework/adapter concern). Adapters that want native $_POST/$_FILES enable
- * worker.populate_superglobals, which drives PHP's own POST reader through the
- * (streaming) read_post callback — so form/multipart parsing still works and,
- * for large multipart uploads, PHP's rfc1867 handler spools file parts to
- * temp files rather than into memory. Note: PHP's POST reader and bodyStream()
- * share ONE incremental reader, so for a streaming request reading the body
- * both ways drains it once — pick one. */
+ * framework/adapter concern). worker.populate_superglobals does NOT provide
+ * $_POST/$_FILES: take_request() only runs php_hash_environment(), and PHP's
+ * POST reader (sapi_handle_post) needs SG(request_info).post_entry, which only
+ * sapi_activate() sets — once, at thread start. Adapters parse rawBody() /
+ * bodyStream() themselves (the WordPress adapter does). */
 PHP_METHOD(Ephpm_Worker_Envelope, parsedBody)
 {
     ZEND_PARSE_PARAMETERS_NONE();

@@ -99,8 +99,8 @@ mode simply falls off the end of its loop.
 | `headers()` | `array` | Request headers. Duplicates arrive pre-joined with `", "` (`"; "` for `Cookie`). |
 | `query()` / `cookies()` | `array` | Split on delimiters only — **not url-decoded**. Re-parse with `parse_str($vars['QUERY_STRING'], $q)` / `urldecode()` if you need decoded values or `a[]=` arrays. |
 | `rawBody()` | `string` | The request body. For streamed bodies this drains the incremental reader into a string (re-buffers — prefer `bodyStream()` for large uploads). |
-| `bodyStream()` | `resource\|false` | `false` if the stream cannot be opened. Otherwise a real readable stream over the incremental body — a multi-GB upload flows through in fixed-size reads with flat memory. The body is consumed **once**, shared between `rawBody()`, `bodyStream()`, and PHP's own POST reader: pick one. A stream resource stashed across requests reads EOF (it can never see the next request's body). |
-| `parsedBody()` | `?array` | **Always `null`** — form/multipart parsing is your job, or enable `[php.worker] populate_superglobals` and read `$_POST`/`$_FILES` natively. |
+| `bodyStream()` | `resource\|false` | `false` if the stream cannot be opened. Otherwise a real readable stream over the incremental body — a multi-GB upload flows through in fixed-size reads with flat memory. The body is consumed **once**, shared between `rawBody()` and `bodyStream()`: pick one. A stream resource stashed across requests reads EOF (it can never see the next request's body). |
+| `parsedBody()` | `?array` | **Always `null`** — form/multipart parsing is your job: read the body with `rawBody()` / `bodyStream()` and parse it (`parse_str()` for `application/x-www-form-urlencoded`, a multipart parser for uploads). `populate_superglobals` does **not** fill `$_POST`/`$_FILES`. |
 | `files()` | `array` | **Always empty** — same deal. |
 
 An `Envelope` is only valid for the iteration that returned it. If you keep
@@ -150,11 +150,14 @@ delivered with the status the handler set, not replaced by a `500`.
 
 ## Superglobals
 
-By default `$_GET`/`$_POST`/`$_SERVER` are **not** populated — adapters build
+By default `$_GET`/`$_COOKIE`/`$_SERVER` are **not** populated — adapters build
 their own request objects from the `Envelope`. Set
-`populate_superglobals = true` under `[php.worker]` for code that assumes
-native superglobals (this also makes PHP's own POST reader parse forms and
-multipart into `$_POST`/`$_FILES`, spooling file parts to disk).
+`populate_superglobals = true` under `[php.worker]` for code that reads
+`$_GET`, `$_COOKIE` and `$_SERVER` natively. `$_POST` and `$_FILES` stay
+empty either way: PHP's form and multipart parser runs only at request
+startup, which a worker iteration never goes through. Read the body from the
+`Envelope` instead (`rawBody()`, or `bodyStream()` for large uploads) and
+parse it in the adapter.
 
 ## Tuning knobs
 
