@@ -573,7 +573,10 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
     // Peer warm-up: pull this node's share of large KV values from its
-    // peers before accepting a request, bounded by `load_timeout`. The
+    // peers before accepting a request — a join wait of up to 10 s for
+    // gossip to list a peer (not shortened by `load_timeout`, since
+    // `peers == 0` is what lets the snapshot be restored), then the
+    // transfer bounded by `load_timeout`. The
     // listeners are already bound, so connections queue in the backlog (a
     // readiness probe sees "not yet", not "refused") and the pull can never
     // hold startup past the deadline.

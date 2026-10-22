@@ -276,9 +276,11 @@ A rolling deploy of a 3-node StatefulSet therefore looks like this:
    `load_timeout` passes.
 3. Repeat for `web-1`, then `web-0`.
 
-Both directions are bounded by `load_timeout` (default 30 s); size
-`terminationGracePeriodSeconds` for the drain plus the push plus the
-snapshot. A pod killed without a graceful stop pushes nothing — its keys
+The transfer in both directions is bounded by `load_timeout` (default
+30 s); a starting pod with `[cluster] join` seeds first waits up to 10 s
+for gossip to show an alive peer, and that wait is not shortened by
+`load_timeout`. Size `terminationGracePeriodSeconds` for the drain plus
+the push plus the snapshot. A pod killed without a graceful stop pushes nothing — its keys
 survive only where `replication_factor` already put them, which is why the
 default is 2.
 

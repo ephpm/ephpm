@@ -118,7 +118,9 @@ pub struct HandoffReport {
     pub keys: u64,
     /// Value bytes sent or received.
     pub bytes: u64,
-    /// Peers contacted.
+    /// Peers contacted — for a pull, the alive peers gossip listed once the
+    /// join wait was over, so `0` means "alone in the cluster" and not
+    /// "ran out of time".
     pub peers: usize,
     /// Peers that could not be reached or did not finish.
     pub failed_peers: usize,
@@ -291,17 +293,21 @@ impl PeerHandoff {
     /// received kept.
     ///
     /// `expect_peers` says the node was configured to join others (it has
-    /// seeds): the pull then first waits — up to [`PEER_DISCOVERY_WAIT`] or
-    /// the deadline, whichever is sooner — for gossip to list at least one
-    /// alive peer. Startup calls this right after the listeners bind, before
-    /// a single gossip round has completed, so without the wait a restarted
-    /// node asked nobody and warmed from nothing.
+    /// seeds): the pull then first waits — up to [`PEER_DISCOVERY_WAIT`],
+    /// the join wait — for gossip to list at least one alive peer. Startup
+    /// calls this right after the listeners bind, before a single gossip
+    /// round has completed, so without the wait a restarted node asked
+    /// nobody and warmed from nothing. The join wait is deliberately **not**
+    /// cut short by `deadline`: the deadline bounds the data transfer, while
+    /// the report's `peers` answers "was anyone alive?" — the question the
+    /// caller's snapshot decision hangs on — and a `load_timeout` of a few
+    /// milliseconds must not turn "peers present" into "alone".
     pub async fn pull(&self, deadline: Instant, expect_peers: bool) -> HandoffReport {
         let started = Instant::now();
         let self_id = self.cluster.self_node().id;
         let mut peers = self.peers().await;
         if expect_peers && peers.is_empty() {
-            let give_up = deadline.min(started + PEER_DISCOVERY_WAIT);
+            let give_up = started + PEER_DISCOVERY_WAIT;
             while peers.is_empty() && Instant::now() < give_up {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 peers = self.peers().await;
