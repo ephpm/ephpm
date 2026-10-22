@@ -224,7 +224,10 @@ exists and routing is unchanged.
   plain-object graph), which recurses purely in C and passes no checkpoint PHP
   can test. `[php] crash_containment` contains that, but it applies in
   per-request mode only and is therefore **not available in worker mode**. See
-  [Diagnosing crashes](/guides/diagnosing-crashes/).
+  [Diagnosing crashes](/guides/diagnosing-crashes/). (PHP's
+  [hard memory limit](/reference/config/#phps-hard-memory-limit) exit is a
+  different case: on Linux it *is* contained in worker mode — the request gets
+  a `500` and the worker is replaced.)
 
 ## Observability
 

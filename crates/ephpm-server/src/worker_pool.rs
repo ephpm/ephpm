@@ -616,6 +616,35 @@ fn worker_main(
                 }
                 counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
             }
+            Ok(ephpm_php::WorkerExit::Contained) => {
+                // PHP's hard memory limit called _exit(137) on this worker and
+                // the crash guard turned it into a return (Linux). The request
+                // is terminated exactly like a bailout's — nothing usable was
+                // produced — but the thread is poisoned: `run_worker` already
+                // freed its Zend heap, and worker_thread_shutdown below skips
+                // PHP teardown for it. The replacement boots from scratch.
+                let had_parked_sender =
+                    if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                        let _ = sender.send(WorkerResponse::internal_error());
+                        true
+                    } else {
+                        false
+                    };
+                let aborted_stream = ephpm_php::worker_bridge::clear_in_flight_streams();
+                if aborted_stream {
+                    counter!("ephpm_worker_stream_aborts_total").increment(1);
+                }
+                tracing::error!(
+                    worker_id,
+                    had_parked_sender,
+                    aborted_stream,
+                    "PHP worker hit the hard memory limit (memory_hard_limit_percent of \
+                     memory_limit; PHP printed the details to stderr) — contained instead of \
+                     exiting the process; request terminated, worker retired (Zend heap freed) \
+                     and replaced"
+                );
+                counter!("ephpm_worker_recycles_total", "reason" => "contained").increment(1);
+            }
             Err(e) => {
                 // run_worker refused after a successful boot — should not
                 // happen (boot implies init); recycle defensively.
@@ -652,7 +681,9 @@ fn worker_main(
     }
 
     // Free this thread's TSRM slot + booted framework so the replacement boots
-    // clean. Safe: this thread is done executing PHP.
+    // clean. Safe: this thread is done executing PHP. A no-op for the PHP side
+    // when a contained crash poisoned the thread (its heap is already freed and
+    // its TSRM entry is abandoned on purpose).
     PhpRuntime::worker_thread_shutdown();
 
     pool.state.live.fetch_sub(1, Ordering::AcqRel);

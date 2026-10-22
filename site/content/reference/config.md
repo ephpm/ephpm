@@ -662,10 +662,82 @@ alt_svc_max_age = 86400
 | `mode` | enum | `"per_request"` | Request-execution model. `"per_request"` (default) = php-fpm-shaped: full `php_request_startup`/`shutdown` per request on ePHPm's dedicated PHP thread pool. `"worker"` = persistent worker mode: boot the framework once per worker, loop over requests (Octane/RoadRunner model); worker-only knobs live in [`[php.worker]`](#phpworker). Any other value — including the pre-v0.9.0 `"fpm"` — is a **startup error naming the key**, never a silent fallback. Env: `EPHPM_PHP__MODE=worker`. |
 | `concurrency` | usize | `0` (derive) | Max PHP requests executing concurrently — the execution-pool size in **both** modes (per-request thread pool / persistent worker pool). `0` derives it: from the cgroup CPU quota when running under one (Linux), otherwise from host parallelism — clamped `[2, 32]` on **both** paths. The floor is 2, never 1: a 1-thread pool deadlocks a PHP loopback subrequest (a script HTTP-requesting its own server holds the only thread while waiting for a response that needs that thread — #461), and `--cpus 1` is a common container shape. An explicit value is used as-is, including `1`. The pool is separate from tokio's blocking pool, so capping PHP never caps static-file serving. Startup logs the effective value and its source at INFO. Env: `EPHPM_PHP__CONCURRENCY=8`. |
 | `queue_depth` | usize | `0` (= `concurrency`) | Dispatch-queue depth in front of the execution pool (both modes). A full queue applies backpressure (`overload = "wait"`) or sheds 503 (`overload = "shed"`); a starved queue becomes a 504 via the request timeout. Named `queue_depth`, not `backlog` — `backlog` collides with the TCP listen backlog an operator may also be tuning. Env: `EPHPM_PHP__QUEUE_DEPTH=64`. |
-| `crash_containment` | bool | `false` | **Experimental. Per-request mode only. Linux/macOS only** — Windows has no stack-overflow containment (the mechanism is POSIX-signal based; Windows raises SEH exceptions), so there the knob is ignored and startup logs a WARN. Contain a PHP C-stack overflow **from a deep object-graph free** instead of letting its `SIGSEGV` abort the whole process. (Runaway *recursion* does not need this: PHP's own C-stack guard catches it at the VM's call checkpoints and raises the catchable `Error: Maximum call stack size ... reached`, which is a plain `500` on every platform and in every mode. A destructor cascade passes no such checkpoint, which is what this knob is for.) The offending request is answered `500` and the pool thread that ran it is retired and replaced. **Only stack-overflow faults are contained** — heap corruption and wild writes produce the same signal but may already have damaged shared memory, so they still die with the usual fatal-signal diagnostic. Costs: each contained crash abandons the poisoned thread's PHP context (a bounded leak), and once any crash has been contained the process skips PHP module shutdown at exit. Set in worker mode it changes nothing and startup logs a WARN. Env: `EPHPM_PHP__CRASH_CONTAINMENT=true`. |
+| `crash_containment` | bool | `false` | **Experimental. Per-request mode only. Linux/macOS only** — Windows has no stack-overflow containment (the mechanism is POSIX-signal based; Windows raises SEH exceptions), so there the knob is ignored and startup logs a WARN. Contain a PHP C-stack overflow **from a deep object-graph free** instead of letting its `SIGSEGV` abort the whole process. (Runaway *recursion* does not need this: PHP's own C-stack guard catches it at the VM's call checkpoints and raises the catchable `Error: Maximum call stack size ... reached`, which is a plain `500` on every platform and in every mode. A destructor cascade passes no such checkpoint, which is what this knob is for.) The offending request is answered `500` and the pool thread that ran it is retired and replaced. **Only stack-overflow faults are contained** — heap corruption and wild writes produce the same signal but may already have damaged shared memory, so they still die with the usual fatal-signal diagnostic. Costs: each contained crash abandons the poisoned thread's PHP context (a bounded leak), and once any crash has been contained the process skips PHP module shutdown at exit. Set in worker mode it changes nothing and startup logs a WARN. Not to be confused with PHP's **hard memory limit** exit, which ePHPm contains on Linux whatever this knob says, in both modes — see [PHP's hard memory limit](#phps-hard-memory-limit). Env: `EPHPM_PHP__CRASH_CONTAINMENT=true`. |
 | `overload` | string | unset (`"wait"`; `"shed"` under `[server] preview`) | What a PHP request does when no execution slot is free. `"wait"` queues and waits — historical behaviour, where the outer `[server.timeouts] request` deadline is the only bound. `"shed"` answers `503 Service Unavailable` + `Retry-After: 1` once the request has waited `shed_after_ms`, turning overload into fast, countable errors instead of client timeouts. **Unset is not the same as `"wait"`**: it resolves to `"shed"` under `[server] preview = true` (set `"wait"` explicitly to opt out). What it bounds is the dispatch queue (`queue_depth`), which always exists, so shedding works out of the box. Startup logs which policy is in force and where it came from. Ignored in worker mode (startup WARNs). Shed responses are counted by `ephpm_php_shed_total`. An unknown value is a startup error. Env: `EPHPM_PHP__OVERLOAD=shed`. |
 | `shed_after_ms` | u64 (ms) | `0` | How long a request may wait for a PHP execution slot before `overload = "shed"` rejects it. `0` = do not wait at all — take a free slot if there is one, otherwise shed immediately (the dispatch queue, `queue_depth` slots, is already the buffer). Raise it to absorb bursts before shedding. Inert when the policy is `"wait"`. Env: `EPHPM_PHP__SHED_AFTER_MS=250`. |
 | `admission` | string | `"fifo"` | Dispatch-admission policy for the bounded queues in front of PHP execution — the per-request pool and the worker pool. `"fifo"` (**default**) admits waiters in strict arrival order via a FIFO-fair semaphore — removes the multi-lap starvation tail (worker-mode P99 280 ms → 58 ms at unchanged throughput, issue #442). `"barge"` restores the pre-fix racing admission (wait in the bounded channel's own `send()`, where a fresh request can steal a freed slot ahead of parked waiters) — work-conserving but unfair; operator escape hatch. An unknown value is a startup error. Startup logs the effective policy on the pool-started line. Env: `EPHPM_PHP__ADMISSION=barge`. |
+
+### PHP's hard memory limit
+
+Applies to PHP 8.3.36, 8.4.27, 8.5.12 and later (the fix for
+CVE-2026-109618/109619). Older SDKs keep the old behaviour: exceeding
+`memory_limit` is an immediate fatal error and a `500`.
+
+From those versions on, `memory_limit` is a *soft* limit. Going over it queues
+an out-of-memory error that PHP raises at the script's next VM instruction, so
+a single internal function call (decompressing, formatting or copying a large
+string, for example) can allocate well past `memory_limit` before the script is
+stopped. A second, **hard** limit bounds that overshoot:
+
+| Directive | Default | Meaning |
+|-----------|---------|---------|
+| `memory_hard_limit_percent` | `-1` | Hard limit as a percentage of `memory_limit` (`>= 100`). `-1` means 200%, or `memory_limit` + 1 GB when `memory_limit` is above 1 GB. |
+
+An allocation that cannot fail gracefully and would cross the hard limit makes
+PHP print `Hard memory limit of N bytes exhausted ...` to stderr and call
+`_exit(137)`. php-fpm loses one worker process that way. ePHPm runs every
+request, and every tenant, on threads of **one** process, so what happens next
+depends on the platform (startup logs which applies: an INFO line where it is
+contained, a WARN where it is not):
+
+- **Linux** (every shipped Linux binary): contained. The binary is linked with
+  `-Wl,--wrap=_exit`, and an exit with status 137 from a PHP request thread is
+  turned back into a failed request. The request is answered `500`, the
+  thread that ran it is retired without PHP teardown, its PHP memory is freed,
+  and a replacement thread (per-request mode) or worker (worker mode) takes
+  its place. This does not depend on `crash_containment`, which is about
+  C-stack overflows. Each event is logged at ERROR (`hit the hard memory
+  limit`) after PHP's own stderr line, and counted in
+  `ephpm_fpm_pool_contained_crashes_total` (per-request mode) or
+  `ephpm_worker_recycles_total{reason="contained"}` (worker mode).
+- **macOS and Windows**: **not contained.** Neither linker can wrap `_exit`, so
+  a request that crosses the hard limit ends the whole ePHPm process with exit
+  status 137. Run these platforms under a supervisor that restarts the process
+  (launchd `KeepAlive`, the Windows service's recovery actions), and do not use
+  them to host code you do not trust.
+
+What containment does not undo, on Linux: files, sockets and `flock()` locks the
+request still held are not closed (closing them would mean running the PHP
+teardown that containment skips), and once any thread has been retired this
+way the process skips PHP module shutdown when it exits. In per-request mode,
+replacing a retired thread is rate-limited (up to 500 ms) the same way it is
+after a contained stack overflow. `ephpm php` (the CLI) is not covered: there
+the hard limit ends the CLI process, like `php` does.
+
+Sizing guidance:
+
+- **Budget host memory against the hard limit, not `memory_limit`.** One
+  request can reach roughly the hard limit before it is stopped. With the
+  default that is 2 × `memory_limit` (or `memory_limit` + 1 GB above 1 GB), so
+  `concurrency` × that figure is the worst case. Serve-mode autotuning derives
+  `memory_limit` from the memory budget (see [Resource-aware
+  autotuning](#resource-aware-autotuning)); when you size by hand, keep
+  `concurrency × hard limit` within what the host or container can give PHP,
+  or the kernel's OOM killer ends the process instead.
+- `memory_hard_limit_percent` moves the cliff, it does not remove it. Raising
+  it makes hard-limit exits rarer at the cost of a higher worst-case peak per
+  request. Lowering it towards `100` stops overshooting requests sooner, and on
+  Linux that only ever costs the request. Set it server-wide with
+  `ini_overrides = [["memory_hard_limit_percent", "150"]]`.
+- Only operators set `memory_hard_limit_percent`. Upstream registers it
+  `PHP_INI_ALL`; ePHPm lowers it to system-only at startup, so `ini_set()` and
+  `ini_restore()` on it return `false` and leave the value unchanged, while
+  php.ini, `[php] ini_overrides` and a site's `ini_overrides` still apply. The
+  CLI (`ephpm php`) keeps the upstream behaviour. `memory_limit` stays
+  `PHP_INI_ALL` as upstream ships it, so a script can still raise its own soft
+  limit, and with it the hard limit (which is a percentage of it). A tenant can
+  therefore always reach the hard limit on purpose; on Linux that costs only
+  its own request.
 
 ### Where PHP errors go
 

@@ -13,6 +13,11 @@ fn main() {
     // propagate across crates, so ephpm-php setting it for itself is not
     // enough — this crate must probe and set its own.
     println!("cargo::rustc-check-cfg=cfg(php_max_exec_timers)");
+    // Set (Linux branch below) when this binary is linked with
+    // `--wrap=_exit`, i.e. PHP's hard-memory-limit exit is contained; and when
+    // the SDK's engine has that hard limit at all. Gate tests/hard_memory_limit.rs.
+    println!("cargo::rustc-check-cfg=cfg(php_exit_wrapped)");
+    println!("cargo::rustc-check-cfg=cfg(php_hard_memory_limit)");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
     // `backtrace(3)` / `backtrace_symbols_fd(3)` back the fatal-signal
@@ -219,8 +224,24 @@ fn main() {
     // delivered only to the owning PHP thread). That is the whole mechanism
     // behind native `max_execution_time` enforcement and runtime
     // `set_time_limit()`.
+    // `_exit`: PHP's hard memory limit (PHP 8.3.36 / 8.4.27 / 8.5.12+) calls
+    // `_exit(137)` from the allocator. Wrapped so that, on a guarded PHP
+    // thread, crates/ephpm-php/crash_guard.c turns it into a contained 500 and
+    // a retired thread instead of ending every tenant's server. Every other
+    // `_exit` call falls through to the real one unchanged. Harmless on SDKs
+    // that predate the hard limit (nothing in libphp then calls _exit(137)).
+    wrap_funcs.push("_exit");
     for func in &wrap_funcs {
         println!("cargo::rustc-link-arg=-Wl,--wrap={func}");
+    }
+    println!("cargo::rustc-cfg=php_exit_wrapped");
+    // Mirrors the probe in ephpm-php/build.rs (cfgs do not cross crates).
+    let zend_alloc_h = sdk_path.join("include").join("php").join("Zend").join("zend_alloc.h");
+    println!("cargo::rerun-if-changed={}", zend_alloc_h.display());
+    if std::fs::read_to_string(&zend_alloc_h)
+        .is_ok_and(|text| text.contains("zend_set_memory_hard_limit_percent"))
+    {
+        println!("cargo::rustc-cfg=php_hard_memory_limit");
     }
 
     // Force-link libphp.a + the support libs SPC built into the SDK.

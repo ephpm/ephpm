@@ -16,6 +16,8 @@ fn main() {
     // the executable instead of being linked in, so extension DLLs (Xdebug)
     // can load. See `link_php` and `src/shared.rs`.
     println!("cargo::rustc-check-cfg=cfg(php_shared)");
+    // Set when the linked engine has PHP's hard memory limit (see below).
+    println!("cargo::rustc-check-cfg=cfg(php_hard_memory_limit)");
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-changed=resolver_shim.c");
@@ -52,6 +54,30 @@ fn main() {
             .compile("ephpm_crash_guard");
     }
 
+    // PHP's hard memory limit ends in `_exit(137)`; crash_guard.c turns that
+    // into a per-thread containment on Linux, but only in a target linked with
+    // `--wrap=_exit`. The `ephpm` binary gets the flag from its own build
+    // script: rustc-link-arg reaches only the linked targets (tests, benches,
+    // examples) of the package that emits it, never a dependent crate. This
+    // gives this crate's own test targets the same link, stub mode included,
+    // so the mechanism is unit-tested without libphp and the linked tests can
+    // trigger a real hard-limit exit without ending the test process. (Not
+    // `rustc-link-arg-tests`: that one skips the lib's unit-test binary, where
+    // the stub-mode tests of the mechanism live.)
+    //
+    // The flag reaches every test binary of this package, including ones that
+    // never link the ephpm_php rlib (an integration test whose whole file is
+    // `#![cfg(php_linked)]` is empty in stub mode). Those still reference
+    // `_exit` through std, so the wrap leaves `__wrap__exit` undefined unless
+    // the crash-guard archive is on their link line too. It is pure libc, so
+    // naming it directly is safe in every binary; where the rlib already
+    // brings it in, the member is extracted only once.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo::rustc-link-arg=-Wl,--wrap=_exit");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set for build scripts"));
+        println!("cargo::rustc-link-arg={}", out_dir.join("libephpm_crash_guard.a").display());
+    }
+
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
         // No PHP SDK available — build in stub mode.
         // The Rust code uses #[cfg(php_linked)] to gate FFI calls.
@@ -77,6 +103,20 @@ fn main() {
     let has_exec_timers = php_config_has_max_exec_timers(&include_dir);
     if has_exec_timers {
         println!("cargo::rustc-cfg=php_max_exec_timers");
+    }
+
+    // Set when the SDK's engine has the hard memory limit (PHP 8.3.36 /
+    // 8.4.27 / 8.5.12+, php-src 31c0ea7d7f): `memory_limit` is then soft and an
+    // allocation past `memory_hard_limit_percent` calls `_exit(137)`. Detected
+    // from the header, not the version number, so a patched dev build counts.
+    // Lets the linked tests assert the contained outcome on a patched SDK and
+    // the plain bailout on an older one.
+    let zend_alloc_h = include_dir.join("Zend").join("zend_alloc.h");
+    println!("cargo::rerun-if-changed={}", zend_alloc_h.display());
+    if std::fs::read_to_string(&zend_alloc_h)
+        .is_ok_and(|text| text.contains("zend_set_memory_hard_limit_percent"))
+    {
+        println!("cargo::rustc-cfg=php_hard_memory_limit");
     }
 
     let shared = is_shared_sdk(&lib_dir, &target_os);

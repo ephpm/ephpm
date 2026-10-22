@@ -11,7 +11,7 @@ This document describes the threat model, trust boundaries, and security design 
 | Threat | Mitigation |
 |--------|------------|
 | PHP fatal errors crashing the host process | C wrapper with `zend_try`/`zend_catch` guards; PHP errors never unwind into Rust |
-| PHP memory exhaustion | PHP `memory_limit` INI enforced inside the runtime; Rust allocator is separate |
+| PHP memory exhaustion | PHP `memory_limit` INI enforced inside the runtime; Rust allocator is separate. On PHP 8.3.36/8.4.27/8.5.12+ the hard-limit `_exit(137)` is contained to one request on Linux, **not** on macOS/Windows — see [PHP's hard memory limit](/reference/config/#phps-hard-memory-limit) |
 | Malformed HTTP requests | hyper's strict HTTP/1.1 parser rejects protocol violations before reaching PHP |
 | Path traversal in static file serving | Canonicalize paths and reject any resolved path outside `document_root` |
 | Host-header path traversal in multi-site mode | The `Host` header is validated against a strict DNS-label allowlist before it is joined onto `sites_dir`; separators, `..` segments, NUL, and non-DNS characters are rejected with 404 before routing (independent of `trusted_hosts`) |
@@ -134,6 +134,14 @@ int ephpm_execute_script(const char *filename) {
 - PHP's memory allocator (`emalloc`/`efree`) is separate from Rust's allocator
 - `memory_limit` INI directive is enforced — PHP cannot exhaust host memory without hitting its own limit first
 - On memory limit exceeded, PHP triggers a fatal error caught by `zend_catch`
+- From PHP 8.3.36 / 8.4.27 / 8.5.12, `memory_limit` is a soft limit checked
+  between VM instructions, so one internal call can overshoot it up to the
+  hard limit (`memory_hard_limit_percent`, by default 2 × `memory_limit`, or
+  + 1 GB above 1 GB). Crossing the hard limit makes PHP call `_exit(137)`. On
+  Linux ePHPm intercepts that exit and fails only the request (500), retiring
+  its thread; on macOS and Windows it ends the whole process. Size memory
+  against the hard limit. See [PHP's hard memory
+  limit](/reference/config/#phps-hard-memory-limit).
 
 ### Execution time
 

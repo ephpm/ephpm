@@ -230,6 +230,20 @@ mod ffi {
         /// NTS builds: no-op.
         pub fn ephpm_thread_shutdown();
 
+        /// Free the Zend heap of a thread poisoned by a contained
+        /// hard-memory-limit exit (and release opcache's shared-memory lock if
+        /// the thread held it), after detaching the thread's TSRM resources so
+        /// no destructor ever runs over them. Returns 1 if the heap was freed,
+        /// 0 if it had to be kept. Linux only; the thread must make no further
+        /// PHP call.
+        #[cfg(target_os = "linux")]
+        pub fn ephpm_release_contained_heap() -> ::std::os::raw::c_int;
+
+        /// 1 if the linked engine has PHP's hard memory limit
+        /// (`memory_hard_limit_percent`), 0 otherwise. A compile-time fact
+        /// of the SDK headers; safe on any thread.
+        pub fn ephpm_engine_has_hard_memory_limit() -> ::std::os::raw::c_int;
+
         // ── CLI mode functions ──────────────────────────────────────
 
         /// Install our embed module-startup shim so the KV native functions
@@ -543,6 +557,51 @@ fn is_thread_poisoned() -> bool {
     THREAD_POISONED.with(std::cell::Cell::get)
 }
 
+/// Act on a contained crash on the current thread: poison it and, when the
+/// fault left the Zend heap consistent, give the heap back.
+///
+/// [`crash_guard::Guarded::HardMemoryLimit`] is that case: PHP checks the hard
+/// limit before the allocator modifies the heap, so the heap can be freed
+/// wholesale. The abandoned request was at least `memory_limit` large, so
+/// keeping it would make every contained request a permanent leak of that
+/// size. A contained stack overflow leaves the heap's own free lists
+/// mid-mutation, so that heap is leaked as before.
+#[cfg(php_linked)]
+fn contain_on_this_thread(kind: crash_guard::Guarded) {
+    mark_thread_poisoned();
+    #[cfg(target_os = "linux")]
+    if kind == crash_guard::Guarded::HardMemoryLimit {
+        // SAFETY: this thread was just poisoned, so nothing calls into PHP on
+        // it again (`execute`/`finish_request`/`worker_thread_shutdown` all
+        // refuse a poisoned thread and its TLS retirement guard is disarmed).
+        // The hard-limit exit happened before the allocator touched the heap,
+        // so the heap's chunk and huge-block lists are consistent; see
+        // `ephpm_release_contained_heap` in ephpm_wrapper.c.
+        let released = unsafe { ffi::ephpm_release_contained_heap() };
+        if released == 0 {
+            // Only if TSRM's private entry layout ever stops matching the
+            // mirror in the wrapper: freeing would then risk a double free, so
+            // the heap is leaked like a stack-overflow one.
+            tracing::warn!(
+                "could not detach the contained thread's TSRM entry — its Zend heap is \
+                 leaked instead of freed"
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = kind;
+}
+
+/// Short cause text for a [`PhpError::Contained`] message.
+#[cfg(php_linked)]
+fn contained_cause(kind: crash_guard::Guarded) -> &'static str {
+    if kind == crash_guard::Guarded::HardMemoryLimit {
+        "hard memory limit"
+    } else {
+        "C-stack overflow"
+    }
+}
+
 /// Work queued by [`PhpRuntime::at_request_start`], run inside the next
 /// request on this thread right after `php_request_startup()`.
 #[cfg(php_linked)]
@@ -631,19 +690,23 @@ pub enum PhpError {
     #[error("PHP script bailed out (truncated response discarded): {0}")]
     Bailout(String),
 
-    /// A request overflowed the C stack — a deep object-graph free
-    /// (`zend_object_std_dtor` ↔ `zend_objects_store_del` recursion) — and the
-    /// crash guard contained it instead of the process aborting. Produced only
-    /// when `[php] crash_containment` is active (see [`crate::crash_guard`]).
+    /// A request hit a fault that would have ended the whole process, and the
+    /// crash guard contained it to this one thread instead (see
+    /// [`crate::crash_guard`]). Two causes, named at the start of the message:
     ///
-    /// Distinct from [`Self::Bailout`] in both cause and obligation: the fault
-    /// was a hardware `SIGSEGV` recovered via `siglongjmp`, not a PHP-level
-    /// bailout, and the thread that ran it is **poisoned**. The partial response
-    /// is discarded and answered `500`, and the caller MUST retire that OS
-    /// thread without running PHP teardown on it — which is what
-    /// `ephpm-server`'s FPM pool does, and why containment is refused on tokio's
-    /// shared blocking pool.
-    #[error("PHP request contained after a C-stack overflow (thread retired): {0}")]
+    /// - a C-stack overflow — a deep object-graph free
+    ///   (`zend_object_std_dtor` ↔ `zend_objects_store_del` recursion), only
+    ///   when `[php] crash_containment` is active;
+    /// - PHP's hard memory limit (`memory_hard_limit_percent`), whose
+    ///   `_exit(137)` is intercepted on Linux whatever the configuration.
+    ///
+    /// Distinct from [`Self::Bailout`] in both cause and obligation: this was
+    /// not a PHP-level bailout but a `SIGSEGV` or an `_exit` recovered via
+    /// `siglongjmp`, and the thread that ran it is **poisoned**. The partial
+    /// response is discarded and answered `500`, and the caller MUST retire
+    /// that OS thread without running PHP teardown on it — which is what
+    /// `ephpm-server`'s FPM pool does.
+    #[error("PHP request contained (thread retired): {0}")]
     Contained(String),
 }
 
@@ -693,6 +756,16 @@ pub enum WorkerExit {
     /// stream instead of closing it cleanly
     /// ([`worker_bridge::clear_in_flight_streams`]).
     Fatal,
+    /// PHP's hard memory limit (`memory_hard_limit_percent`) called
+    /// `_exit(137)` on this worker and the crash guard contained it (Linux).
+    /// Nothing was delivered, exactly as for [`WorkerExit::Fatal`], and the
+    /// caller must terminate the request the same way.
+    ///
+    /// Unlike every other outcome the thread is **poisoned**: its Zend heap,
+    /// booted framework included, has already been freed, and
+    /// [`PhpRuntime::worker_thread_shutdown`] skips its PHP teardown. The
+    /// worker must be replaced, never resumed.
+    Contained,
 }
 
 /// Wrapper around the PHP embed SAPI with ZTS (Zend Thread Safety).
@@ -1145,6 +1218,24 @@ impl PhpRuntime {
         }
 
         Ok(())
+    }
+
+    /// Whether the linked PHP engine has the hard memory limit
+    /// (`memory_hard_limit_percent`, PHP 8.3.36 / 8.4.27 / 8.5.12+), whose
+    /// `_exit(137)` ends the process unless
+    /// [`crash_guard::exit_containment_available`]. `false` in stub mode.
+    #[must_use]
+    pub fn engine_has_hard_memory_limit() -> bool {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: returns a compile-time constant of the wrapper; touches
+            // no PHP state.
+            unsafe { ffi::ephpm_engine_has_hard_memory_limit() != 0 }
+        }
+        #[cfg(not(php_linked))]
+        {
+            false
+        }
     }
 
     /// Record the configured `max_execution_time` (seconds) that the request
@@ -1738,8 +1829,11 @@ impl PhpRuntime {
         // 3. `ephpm_run_request` — the script, shutdown functions, capture.
         //
         // Each FFI call runs through `lifecycle_call`, i.e. inside the
-        // per-thread `sigsetjmp` crash-containment region when
-        // `[php] crash_containment` is on. The deep free that overflows the
+        // per-thread `sigsetjmp` crash-containment region: always for PHP's
+        // hard-memory-limit `_exit(137)` where that is interceptable (Linux),
+        // and for C-stack overflows when `[php] crash_containment` is on. A
+        // hard-limit exit can come from any allocation in any of the three
+        // steps (request-body parsing in step 1 included). The deep free that overflows the
         // C stack can happen in the script's own `$graph = null`, a registered
         // shutdown function, or an unfinished previous request's teardown in
         // step 1 — and, for the request's own teardown, in `finish_request`,
@@ -1757,8 +1851,8 @@ impl PhpRuntime {
         });
         drop(previous);
         let ret = match begin {
-            None => return Err(Self::contained(request)),
-            Some(exec_code::OK) => {
+            Err(kind) => return Err(Self::contained(request, kind)),
+            Ok(exec_code::OK) => {
                 for task in start_tasks {
                     task();
                 }
@@ -1772,12 +1866,12 @@ impl PhpRuntime {
                     // script-path CString held in IN_FLIGHT_REQUEST.
                     unsafe { ffi::ephpm_run_request(filename_ptr) }
                 });
-                let Some(ret) = run else {
-                    return Err(Self::contained(request));
-                };
-                ret
+                match run {
+                    Ok(ret) => ret,
+                    Err(kind) => return Err(Self::contained(request, kind)),
+                }
             }
-            Some(other) => other,
+            Ok(other) => other,
         };
 
         // Retrieve the captured response from C
@@ -1906,24 +2000,24 @@ impl PhpRuntime {
 
     /// Run one PHP-lifecycle FFI call (`ephpm_begin_request`,
     /// `ephpm_run_request`, `ephpm_finish_request`), inside the per-thread
-    /// stack-overflow recovery region when `[php] crash_containment` is on.
+    /// crash-containment region when there is anything to contain.
     ///
-    /// Two shapes, selected by that master switch:
+    /// Two shapes:
     ///
-    /// - OFF (default): the bare FFI call, byte-identical to every release
-    ///   before containment existed. A C-stack overflow aborts the process via
-    ///   the fatal-signal handler, as it always has.
-    /// - ON: the same call inside the `sigsetjmp` region.
+    /// - Nothing to contain (`[php] crash_containment` off AND no hard-limit
+    ///   interception in this binary — macOS, Windows, unwrapped test
+    ///   targets): the bare FFI call, byte-identical to every release before
+    ///   containment existed.
+    /// - Otherwise: the same call inside the `sigsetjmp` region. It always
+    ///   catches PHP's hard-memory-limit `_exit(137)` where the binary can
+    ///   (Linux), and catches C-stack overflows only when `crash_containment`
+    ///   is on.
     ///
-    /// Returns `None` when a crash was contained. The thread is then already
-    /// marked poisoned: the recovery jumped out mid-object-destruction, so this
-    /// thread's ZMM free lists and `EG(objects_store)` are inconsistent. The
-    /// damage is confined to THIS thread, but it must never run PHP again nor
-    /// be torn down through `php_request_shutdown` / `ts_free_thread` (both
-    /// walk the poisoned heap and would re-crash). `mark_thread_poisoned()`
-    /// latches the refusal, disarms the TLS retirement guard, and makes process
-    /// teardown skip module shutdown; the poisoned Zend context is deliberately
-    /// leaked. Retiring the OS thread is the caller's job — see
+    /// Returns `Err` with the contained fault when one was contained, after
+    /// [`contain_on_this_thread`] has poisoned the thread (and, for the hard
+    /// limit, freed its consistent Zend heap). The thread must never run PHP
+    /// again nor be torn down through `php_request_shutdown` /
+    /// `ts_free_thread`; retiring the OS thread is the caller's job — see
     /// [`PhpError::Contained`].
     ///
     /// Nothing is allocated inside the guarded closure: on containment the
@@ -1931,33 +2025,49 @@ impl PhpRuntime {
     /// recovery point, so `call` must be exactly one FFI call whose borrowed
     /// arguments were created OUTSIDE it.
     #[cfg(php_linked)]
-    fn lifecycle_call(call: impl FnOnce() -> std::os::raw::c_int) -> Option<std::os::raw::c_int> {
-        if !crash_guard::enabled() {
-            return Some(call());
+    fn lifecycle_call(
+        call: impl FnOnce() -> std::os::raw::c_int,
+    ) -> Result<std::os::raw::c_int, crash_guard::Guarded> {
+        let catch_faults = crash_guard::enabled();
+        if !catch_faults && !crash_guard::exit_containment_available() {
+            return Ok(call());
         }
         let mut ret: std::os::raw::c_int = exec_code::BAILOUT;
-        let guarded = crash_guard::run_guarded(|| ret = call());
-        if guarded == crash_guard::Guarded::Contained {
-            mark_thread_poisoned();
-            return None;
+        let guarded = crash_guard::run_guarded(catch_faults, || ret = call());
+        if guarded.is_contained() {
+            contain_on_this_thread(guarded);
+            return Err(guarded);
         }
-        Some(ret)
+        Ok(ret)
     }
 
     /// Log a contained crash for `request` and build its error. The thread has
     /// already been poisoned by [`Self::lifecycle_call`].
     #[cfg(php_linked)]
-    fn contained(request: &PhpRequest) -> PhpError {
-        tracing::error!(
-            script = %request.script_filename.display(),
-            method = %request.method,
-            uri = %request.uri,
-            "PHP request overflowed the C stack (deep object-graph free) — \
-             contained on this thread, returning 500; the thread is poisoned \
-             and must be retired"
-        );
+    fn contained(request: &PhpRequest, kind: crash_guard::Guarded) -> PhpError {
+        if kind == crash_guard::Guarded::HardMemoryLimit {
+            tracing::error!(
+                script = %request.script_filename.display(),
+                method = %request.method,
+                uri = %request.uri,
+                "PHP request hit the hard memory limit (memory_hard_limit_percent of \
+                 memory_limit; PHP printed the details to stderr) — contained on this \
+                 thread instead of exiting the process, returning 500; the thread is \
+                 retired and its Zend heap freed"
+            );
+        } else {
+            tracing::error!(
+                script = %request.script_filename.display(),
+                method = %request.method,
+                uri = %request.uri,
+                "PHP request overflowed the C stack (deep object-graph free) — \
+                 contained on this thread, returning 500; the thread is poisoned \
+                 and must be retired"
+            );
+        }
         PhpError::Contained(format!(
-            "{} ({} {})",
+            "{}: {} ({} {})",
+            contained_cause(kind),
             request.script_filename.display(),
             request.method,
             request.uri
@@ -2006,14 +2116,25 @@ impl PhpRuntime {
                 // IN_FLIGHT_REQUEST, which is released only after this returns.
                 unsafe { ffi::ephpm_finish_request() }
             });
-            let Some(_) = finished else {
-                tracing::error!(
-                    "PHP request teardown overflowed the C stack (deep object-graph free in a \
-                     destructor) — contained on this thread; the thread is poisoned and must be \
-                     retired"
-                );
-                return Err(PhpError::Contained("request teardown (php_request_shutdown)".into()));
-            };
+            if let Err(kind) = finished {
+                if kind == crash_guard::Guarded::HardMemoryLimit {
+                    tracing::error!(
+                        "PHP request teardown (destructors / RSHUTDOWN) hit the hard memory \
+                         limit — contained on this thread instead of exiting the process; the \
+                         thread is retired and its Zend heap freed"
+                    );
+                } else {
+                    tracing::error!(
+                        "PHP request teardown overflowed the C stack (deep object-graph free in \
+                         a destructor) — contained on this thread; the thread is poisoned and \
+                         must be retired"
+                    );
+                }
+                return Err(PhpError::Contained(format!(
+                    "{}: request teardown (php_request_shutdown)",
+                    contained_cause(kind)
+                )));
+            }
             IN_FLIGHT_REQUEST.with(|slot| slot.borrow_mut().take());
             // Destructors and RSHUTDOWN handlers can use `ephpm_db_*` too; give
             // anything they left behind (an open transaction, staged results)
@@ -2354,6 +2475,17 @@ impl PhpRuntime {
             // and logged instead of incidental.)
             db_bridge::on_request_end();
 
+            // A poisoned thread (a contained crash) must never reach
+            // php_request_shutdown/ts_free_thread: they walk state the
+            // contained request left half-updated. Its TSRM entry is
+            // abandoned on purpose (see `mark_thread_poisoned`).
+            if is_thread_poisoned() {
+                tracing::debug!(
+                    "worker thread poisoned by a contained crash — PHP teardown skipped"
+                );
+                return;
+            }
+
             // Disarm the TLS guard FIRST so it cannot run a second
             // ephpm_thread_shutdown at thread exit (double ts_free_thread).
             let was_registered = THREAD_REGISTERED.with(|guard| guard.registered.replace(false));
@@ -2399,11 +2531,39 @@ impl PhpRuntime {
                 .ok_or_else(|| PhpError::ExecutionFailed("non-UTF8 worker script path".into()))?;
             let c_script = CString::new(script_str)
                 .map_err(|e| PhpError::ExecutionFailed(format!("invalid worker script: {e}")))?;
-            // SAFETY: this thread is TSRM-registered (worker_thread_init).
-            // ephpm_worker_run runs php_execute_script under a SETJMP bailout
-            // guard on this thread's own long-lived request context. The
-            // CString outlives the call.
-            let ret = unsafe { ffi::ephpm_worker_run(c_script.as_ptr()) };
+            if is_thread_poisoned() {
+                return Err(PhpError::Contained(
+                    "worker thread retired after a contained crash".into(),
+                ));
+            }
+            // PHP's hard memory limit `_exit(137)`s from the allocator, and a
+            // worker's whole life is this one call. Run it inside the crash
+            // guard so that exit retires this worker instead of the process.
+            // Stack-overflow containment stays off here: it is refused in
+            // worker mode (see `crash_guard`).
+            let mut ret: std::os::raw::c_int = -1;
+            let guarded = if crash_guard::exit_containment_available() {
+                crash_guard::run_guarded(false, || {
+                    // SAFETY: this thread is TSRM-registered
+                    // (worker_thread_init). ephpm_worker_run runs
+                    // php_execute_script under a SETJMP bailout guard on this
+                    // thread's own long-lived request context. The CString
+                    // outlives the call. Nothing is allocated in this closure,
+                    // so a contained `siglongjmp` out of it skips no Rust
+                    // destructor.
+                    ret = unsafe { ffi::ephpm_worker_run(c_script.as_ptr()) };
+                })
+            } else {
+                // SAFETY: as above.
+                ret = unsafe { ffi::ephpm_worker_run(c_script.as_ptr()) };
+                crash_guard::Guarded::Completed
+            };
+            if guarded.is_contained() {
+                // The caller (worker pool / debug lane) logs it with the
+                // worker's identity and terminates the request.
+                contain_on_this_thread(guarded);
+                return Ok(WorkerExit::Contained);
+            }
             Ok(match ret {
                 0 => WorkerExit::Clean,
                 1 => WorkerExit::ScriptExit,

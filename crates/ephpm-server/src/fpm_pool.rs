@@ -74,16 +74,19 @@
 //!   is not: it leaves the context in an unknown state, so the thread retires
 //!   (with normal PHP teardown) and a replacement is spawned.
 //!
-//! # Poison-thread retirement (`[php] crash_containment`)
+//! # Poison-thread retirement (`[php] crash_containment`, PHP's hard memory limit)
 //!
 //! Owning the threads is what makes crash containment safe, and this is the
 //! part tokio's shared blocking pool could not provide. When
 //! [`PhpRuntime::execute`] — or the request's teardown,
-//! [`PhpRuntime::finish_request`] — contains a C-stack overflow it answers
-//! [`PhpError::Contained`] and the thread's Zend context is **poisoned** — its
-//! ZMM free lists and `EG(objects_store)` were abandoned mid-mutation. This
-//! pool then, in order: delivers the 500 to the waiting request, runs **no**
-//! further job on that thread, exits the job loop, and spawns a replacement.
+//! [`PhpRuntime::finish_request`] — contains a C-stack overflow (with
+//! `[php] crash_containment`) or an `_exit(137)` from PHP's hard memory limit
+//! (always, on Linux) it answers [`PhpError::Contained`] and the thread's Zend
+//! context is **poisoned**: whatever the request was in the middle of was
+//! abandoned mid-mutation. This pool then, in order: delivers the 500 to the
+//! waiting request, runs **no** further job on that thread, exits the job
+//! loop, and spawns a replacement. Both causes count in
+//! `ephpm_fpm_pool_contained_crashes_total`; the log line names which.
 //!
 //! **A poisoned thread never runs [`PhpRuntime::worker_thread_shutdown`].**
 //! That call is `php_request_shutdown()` + `ts_free_thread()`, both of which
@@ -702,9 +705,10 @@ enum ThreadExit {
     /// A Rust panic escaped the job. The Zend context is in an unknown but not
     /// known-corrupt state, so normal PHP teardown still runs.
     Panicked,
-    /// A C-stack overflow was contained on this thread ([`PhpError::Contained`]).
-    /// The Zend context is KNOWN corrupt: teardown is skipped and the thread is
-    /// abandoned. See the module docs.
+    /// A crash was contained on this thread ([`PhpError::Contained`]): a C-stack
+    /// overflow or PHP's hard-memory-limit exit. The Zend context is KNOWN
+    /// inconsistent: teardown is skipped and the thread is abandoned. See the
+    /// module docs.
     Poisoned,
 }
 
@@ -780,9 +784,9 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize) {
                     counter!("ephpm_fpm_pool_contained_crashes_total").increment(1);
                     tracing::error!(
                         thread_id,
-                        "fpm pool thread contained a PHP C-stack overflow — 500 delivered, \
-                         thread poisoned; abandoning it (no PHP teardown) and spawning a \
-                         replacement"
+                        "fpm pool thread contained a PHP crash (C-stack overflow or hard \
+                         memory limit) — 500 delivered, thread poisoned; abandoning it (no \
+                         PHP teardown) and spawning a replacement"
                     );
                     exit = ThreadExit::Poisoned;
                     break;
@@ -796,9 +800,10 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize) {
                     counter!("ephpm_fpm_pool_contained_crashes_total").increment(1);
                     tracing::error!(
                         thread_id,
-                        "fpm pool thread contained a PHP C-stack overflow during request \
-                         teardown (response already delivered) — thread poisoned; abandoning \
-                         it (no PHP teardown) and spawning a replacement"
+                        "fpm pool thread contained a PHP crash (C-stack overflow or hard \
+                         memory limit) during request teardown (response already delivered) — \
+                         thread poisoned; abandoning it (no PHP teardown) and spawning a \
+                         replacement"
                     );
                     exit = ThreadExit::Poisoned;
                     break;

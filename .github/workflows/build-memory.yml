@@ -159,6 +159,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cargo checks out git dependencies with libgit2, which fails with
+      # "path too long" on the Turso fork's deep test-snapshot paths (#611)
+      # unless core.longpaths is set in the global git config it reads
+      # (.gitconfig under %HOME% or %USERPROFILE%). The runner image has no git
+      # CLI, so write the file directly.
+      - name: Enable git long paths
+        shell: powershell
+        run: |
+          $dirs = @($env:USERPROFILE, $env:HOME) | Where-Object { $_ } | Select-Object -Unique
+          foreach ($d in $dirs) {
+            Add-Content -Path (Join-Path $d ".gitconfig") -Encoding ascii -Value "[core]`n`tlongpaths = true"
+          }
+
       # The next three steps are lifted verbatim from release.yml's
       # build-windows. They are NOT optional here: the probe's whole purpose is
       # to reproduce the release build, and without them it does not build at

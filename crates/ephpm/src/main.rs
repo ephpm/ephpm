@@ -2098,6 +2098,26 @@ fn run_with_config(
         );
     }
 
+    // PHP's hard memory limit (PHP 8.3.36 / 8.4.27 / 8.5.12+) ends in
+    // `_exit(137)`. The crash guard contains it on Linux in both modes, with
+    // no knob; elsewhere it still ends the process. Say which, once.
+    if ephpm_php::PhpRuntime::engine_has_hard_memory_limit() {
+        if ephpm_php::crash_guard::exit_containment_available() {
+            tracing::info!(
+                "PHP hard memory limit (memory_hard_limit_percent): a request that crosses \
+                 it is contained — answered 500, its PHP thread retired — instead of ending \
+                 the process"
+            );
+        } else {
+            tracing::warn!(
+                "PHP hard memory limit (memory_hard_limit_percent) is NOT contained on this \
+                 platform: a request that crosses it ends the whole ePHPm process (exit \
+                 status 137). Budget memory against the hard limit and run under a \
+                 supervisor that restarts the process"
+            );
+        }
+    }
+
     // Now safe to create the multi-threaded tokio runtime.
     //
     // Note: [php] concurrency bounds ePHPm's own dedicated execution pool

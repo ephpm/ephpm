@@ -1196,6 +1196,110 @@ void ephpm_thread_shutdown(void) {}
 #endif /* ZTS */
 
 /*
+ * 1 if the linked engine has PHP's hard memory limit (`memory_hard_limit_percent`,
+ * PHP 8.3.36 / 8.4.27 / 8.5.12+, php-src 31c0ea7d7f), whose `_exit(137)` the
+ * crash guard contains on Linux. ZEND_HAS_OOM() arrived with the same change
+ * in all three minors, so it is the feature test.
+ */
+int ephpm_engine_has_hard_memory_limit(void)
+{
+#ifdef ZEND_HAS_OOM
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+#if defined(__linux__)
+#include "zend_extensions.h"
+
+/* opcache's "release the shared-memory lock if this thread holds it". Declared
+ * here because the SDK ships no opcache headers, and weak so that an SDK built
+ * without opcache still links (the call is then skipped). */
+extern void zend_shared_alloc_safe_unlock(void) __attribute__((weak));
+
+/*
+ * Free what a thread abandoned by a contained hard-memory-limit exit can
+ * safely give back, on that thread, before it exits.
+ *
+ * Call ONLY after crash_guard reported EPHPM_GUARD_HARD_MEMORY_LIMIT on the
+ * calling thread (never after a contained stack overflow: that one leaves the
+ * heap's own free lists mid-mutation, and walking them here would crash).
+ *
+ * Why this is safe: zend_mm_check_limit() runs at the top of the allocator's
+ * slow paths and calls zend_mm_hard_limit_error() before the heap is changed,
+ * so the chunk ring, the huge-block list and the cached chunks are consistent
+ * when _exit(137) is intercepted. A full zend_mm_shutdown() only walks those
+ * lists and munmap()s them; it runs no destructor and reads no other engine
+ * state. The thread's request was at least `memory_limit` large, so without
+ * this every contained request would leak that much address space for good.
+ *
+ * opcache takes a process-wide lock around its shared-memory writes. A request
+ * abandoned inside one would leave every other thread waiting for it, so the
+ * lock is released first; that is exactly what opcache's own request shutdown
+ * (accel_deactivate) does after a bailout. Nothing else on the abandoned stack
+ * is unwound: open streams, sockets and their flock() locks stay as they were.
+ *
+ * Afterwards this thread's AG(mm_heap) dangles. The thread must exit without
+ * any further PHP call, which the Rust side guarantees by marking it poisoned
+ * first.
+ *
+ * TSRM must also forget the thread's resources without running their
+ * destructors. The thread exits without ts_free_thread() (that would run every
+ * extension's globals destructor over the abandoned request), so its entry
+ * stays in TSRM's table. When a later thread gets the same pthread_t — glibc
+ * reuses cached thread stacks, so a replacement pool thread usually does —
+ * ts_resource_ex() treats the entry as stale and "gracefully" runs all the
+ * globals destructors on it: pcre's efree()s into this heap and
+ * alloc_globals_dtor() shuts it down a second time. So the entry's resource
+ * count is set to 0 first (ephpm_detach_thread_resources); the stale-entry
+ * path then just frees the storage array. If the entry cannot be detached
+ * safely, the heap is left alone (leaked, or freed by that stale-entry path)
+ * rather than freed twice.
+ *
+ * Returns 1 if the heap was freed, 0 if it was kept.
+ */
+
+/* Mirror of TSRM's private `struct _tsrm_tls_entry` (TSRM/TSRM.c), unchanged
+ * through PHP 8.3-8.5: the per-thread resource table that the TSRM cache
+ * pointer (`tsrm_get_ls_cache()`) points at. Never used without first checking
+ * that `thread_id` reads back as this thread, which a layout change would
+ * break. */
+typedef struct {
+    void **storage;
+    int count;
+    pthread_t thread_id;
+    void *next;
+} ephpm_tsrm_tls_entry_view;
+
+static int ephpm_detach_thread_resources(void)
+{
+    ephpm_tsrm_tls_entry_view *entry = (ephpm_tsrm_tls_entry_view *)tsrm_get_ls_cache();
+    if (entry == NULL || !pthread_equal(entry->thread_id, pthread_self())) {
+        return 0;
+    }
+    entry->count = 0;
+    return 1;
+}
+
+int ephpm_release_contained_heap(void)
+{
+    /* Only when opcache is actually loaded: its per-thread globals (which the
+     * unlock reads) exist only after the extension started up. An SDK can
+     * link opcache's objects without the extension being loaded. */
+    if (zend_shared_alloc_safe_unlock != NULL && zend_get_extension("Zend OPcache") != NULL) {
+        zend_shared_alloc_safe_unlock();
+    }
+    zend_mm_heap *heap = zend_mm_get_heap();
+    if (!ephpm_detach_thread_resources()) {
+        return 0;
+    }
+    zend_mm_shutdown(heap, /* full */ true, /* silent */ true);
+    return 1;
+}
+#endif /* __linux__ */
+
+/*
  * Whether a PHP extension (module) is loaded, by its lower-case registry
  * name ("xdebug", "opcache", ...). module_registry is a true process global
  * (not per-TSRM-thread), populated during php_embed_init(); readable from any
@@ -3636,6 +3740,35 @@ static const zend_function_entry ephpm_worker_envelope_methods[] = {
  * class from the bare shim, where EG(current_module) is NULL, segfaults. The
  * module's own `functions` table registers the namespaced free functions with
  * the same correct module context. */
+/* Take `memory_hard_limit_percent` (PHP 8.3.36 / 8.4.27 / 8.5.12, registered
+ * PHP_INI_ALL upstream) away from scripts. Crossing the hard limit ends the
+ * thread's request with _exit(137) — contained on Linux, process-fatal on
+ * macOS and Windows — so in a multi-tenant server a tenant must not be able to
+ * `ini_set()` it down to 100. Lowering the entry's `modifiable` to SYSTEM makes
+ * ini_set()/ini_restore() (ZEND_INI_USER) fail and return false, while php.ini,
+ * `[php] ini` (sapi ini_entries, applied at registration) and the per-site
+ * overrides (applied with PHP_INI_SYSTEM by ephpm_request_ini_apply) still set
+ * it.
+ *
+ * Runs from this module's MINIT, i.e. inside php_module_startup() and before
+ * zend_post_startup(): there EG(ini_directives) IS the registered table that
+ * every ZTS thread copies its own directives from (zend_copy_ini_directives),
+ * so one write covers every thread. main.c registers its entries before any
+ * module starts, so the entry exists here on a patched SDK; on an older SDK it
+ * is absent and this is a no-op. Not in `ephpm php` (g_cli_mode): the CLI runs
+ * the operator's own script, as php-cli would. */
+static void ephpm_lock_hard_limit_ini(void)
+{
+    if (g_cli_mode) {
+        return;
+    }
+    zend_ini_entry *entry = zend_hash_str_find_ptr(
+        EG(ini_directives), ZEND_STRL("memory_hard_limit_percent"));
+    if (entry) {
+        entry->modifiable = ZEND_INI_SYSTEM;
+    }
+}
+
 static PHP_MINIT_FUNCTION(ephpm_worker)
 {
     (void)type;
@@ -3655,6 +3788,8 @@ static PHP_MINIT_FUNCTION(ephpm_worker)
          * constraint. Not final, so adapters may subclass if useful. */
         ephpm_worker_envelope_ce->ce_flags |= ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES;
     }
+
+    ephpm_lock_hard_limit_ini();
 
     return SUCCESS;
 }

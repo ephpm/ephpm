@@ -686,6 +686,7 @@ fn debug_worker_main(
         Ok(ephpm_php::WorkerExit::ScriptExit) => "script_exit",
         Ok(ephpm_php::WorkerExit::ScriptFatal) => "script_fatal",
         Ok(ephpm_php::WorkerExit::Fatal) => "bailout",
+        Ok(ephpm_php::WorkerExit::Contained) => "contained",
         Err(_) => "run_failed",
     };
     counter!("ephpm_xdebug_debug_requests_total", "outcome" => outcome_label).increment(1);
@@ -708,7 +709,9 @@ fn debug_worker_main(
 
     // php_request_shutdown → Xdebug RSHUTDOWN → DBGp `stopping`; then the
     // TSRM slot is freed. Runs here, as ordinary code on this thread, so the
-    // pre-seeded strings in the bridge's thread-local are still alive.
+    // pre-seeded strings in the bridge's thread-local are still alive. After a
+    // contained hard-memory-limit exit the thread is poisoned and this skips
+    // the PHP teardown (the IDE then sees its connection drop, not `stopping`).
     PhpRuntime::worker_thread_shutdown();
     tracing::debug!(debug_worker = id, "debug worker retired");
 }
