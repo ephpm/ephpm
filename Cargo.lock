@@ -5758,7 +5758,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -5771,7 +5771,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "aegis",
  "aes",
@@ -5843,7 +5843,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -5853,7 +5853,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5863,7 +5863,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "bitflags",
  "memchr",
@@ -5877,7 +5877,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -5893,7 +5893,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5903,7 +5903,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5925,7 +5925,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.8.3"
-source = "git+https://github.com/luthermonson/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
+source = "git+https://github.com/ephpm/turso.git?rev=6bf21609da0f8cfec349323a0801f6459f4871a9#6bf21609da0f8cfec349323a0801f6459f4871a9"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",

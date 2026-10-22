@@ -138,7 +138,10 @@ possible.
 ## Page-1 allocation race (patched Turso 0.8.3)
 
 From the release after v0.12.0, ePHPm builds Turso 0.8.3 from a fork rather
-than the crates.io release: the v0.8.3 tag plus a backport of
+than the crates.io release: the org mirror
+[ephpm/turso](https://github.com/ephpm/turso) at tag
+[`v0.8.3-ephpm.1`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.1)
+(branch `ephpm/v0.8.3`) — the v0.8.3 tag plus a backport of
 [tursodatabase/turso#10117](https://github.com/tursodatabase/turso/pull/10117),
 which is not yet in a Turso release. The crate versions stay 0.8.3; the swap is
 a `[patch.crates-io]` entry in ePHPm's workspace `Cargo.toml`, and it goes away

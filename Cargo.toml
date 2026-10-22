@@ -710,8 +710,10 @@ opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "25b
 # make the first write to a fresh database file at once (a new per-site
 # database under concurrent traffic), two pagers could both allocate page 1;
 # the engine then panics (caught per statement by `catch_engine_panic`, but the
-# write fails). Fixed upstream by tursodatabase/turso#10117, not yet released.
-# The fork branch `fix/page1-allocation-race-0.8.3` is the v0.8.3 tag plus
+# write fails). Fixed upstream by PR tursodatabase/turso#10117, not yet
+# released. The pin is the ePHPm org mirror github.com/ephpm/turso, branch
+# `ephpm/v0.8.3`, annotated tag `v0.8.3-ephpm.1` (pinned below by `rev` so the
+# lock is exact; the tag names the same commit): the v0.8.3 tag plus
 # exactly two commits (the regression tests and the backported fix, which holds
 # `init_lock` across the whole page-1 write and re-checks under it); crate
 # versions stay 0.8.3 so this patch replaces the published crates in place and
@@ -719,12 +721,12 @@ opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "25b
 # Every turso crate the lockfile pulls from crates.io is patched so no
 # crates.io 0.8.3 copy remains beside the fork. Remove this block (and the
 # deny.toml allow-git entry) once a Turso release carrying #10117 is pinned.
-turso = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_core = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_ext = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_macros = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_parser = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_sdk_kit = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_sdk_kit_macros = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_sync_engine = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
-turso_sync_sdk_kit = { git = "https://github.com/luthermonson/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_core = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_ext = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_macros = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_parser = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sdk_kit_macros = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sync_engine = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
+turso_sync_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "6bf21609da0f8cfec349323a0801f6459f4871a9" }
