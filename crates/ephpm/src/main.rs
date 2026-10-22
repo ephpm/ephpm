@@ -985,7 +985,7 @@ fn run_php(
 
     // Hold the runtime for the whole PHP execution when a --site backend is
     // bound: the bridge captured its `Handle` and `block_on`s onto it from PHP.
-    let _db_runtime = match site {
+    let db_runtime = match site {
         Some(site_key) => {
             ensure_cli_tracing();
             let config_path = config.ok_or_else(|| {
@@ -1007,8 +1007,8 @@ fn run_php(
                 .thread_name("ephpm-php-db")
                 .build()
                 .context("failed to build the database runtime for `ephpm php --site`")?;
-            site_db::bind_site_db(&cfg, &site_key, runtime.handle())?;
-            Some(runtime)
+            let offline = site_db::bind_site_db(&cfg, &site_key, runtime.handle())?;
+            Some((runtime, offline))
         }
         None => {
             // `--config` alone does nothing — it only locates a site's database.
@@ -1024,6 +1024,12 @@ fn run_php(
 
     let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
+    // A directly opened database: truncate its WAL now — the SDK never
+    // checkpoints on drop, so otherwise every write the script made would be
+    // left in the log for the next opener to recover.
+    if let Some((runtime, Some(offline))) = &db_runtime {
+        offline.checkpoint_before_exit(runtime.handle());
+    }
     Ok(exit_code_from(exit_code))
 }
 

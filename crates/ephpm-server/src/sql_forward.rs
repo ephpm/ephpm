@@ -176,6 +176,7 @@ use ephpm_php::db_bridge::SiteBackendResolver;
 use litewire::backend::{
     Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, SharedBackend, Value,
 };
+use litewire::litewire_turso::offload::engine as off_runtime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1231,22 +1232,33 @@ async fn execute_with_progress<S>(
 where
     S: AsyncWriteExt + Unpin,
 {
-    let exec = execute_forwarded(conn, req);
-    tokio::pin!(exec);
-    let mut heartbeat =
-        tokio::time::interval_at(Instant::now() + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            resp = &mut exec => return Ok(resp),
-            _ = heartbeat.tick() => {
-                write_msg(stream, &SqlResponse::Progress)
-                    .await
-                    .context("forwarded-SQL: write heartbeat (client gone)")?;
+    // The whole race runs off the async workers (the statement is engine
+    // work). Offloading only the statement would not do: litewire offloads
+    // each statement itself, and from a worker that runs the statement to
+    // completion inside a `block_on` the heartbeat branch below never gets
+    // to poll — so a slow statement would go silent and the client would
+    // time out. Inside one outer `offload::engine` litewire's own calls run
+    // in place, and the statement still yields at the engine's `Pending`
+    // points, which is where the heartbeat gets its turn.
+    off_runtime(async move {
+        let exec = execute_forwarded(conn, req);
+        tokio::pin!(exec);
+        let mut heartbeat =
+            tokio::time::interval_at(Instant::now() + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                resp = &mut exec => return anyhow::Ok(resp),
+                _ = heartbeat.tick() => {
+                    write_msg(stream, &SqlResponse::Progress)
+                        .await
+                        .context("forwarded-SQL: write heartbeat (client gone)")?;
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 /// Serialize a [`BackendError`] into an [`SqlResponse::Error`], sending the
@@ -1654,6 +1666,51 @@ mod tests {
             heartbeats += 1;
         }
         assert_eq!(heartbeats, 2);
+    }
+
+    /// A stub session shaped like litewire's Turso session: the statement runs
+    /// under `offload::engine` (so on a worker it would `block_on` to
+    /// completion) and yields while it runs.
+    struct OffloadedSlowConn {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendConn for OffloadedSlowConn {
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet, BackendError> {
+            off_runtime(tokio::time::sleep(self.delay)).await;
+            Ok(ResultSet { columns: vec![], rows: vec![] })
+        }
+
+        async fn execute(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<ExecuteResult, BackendError> {
+            off_runtime(tokio::time::sleep(self.delay)).await;
+            Ok(ExecuteResult { affected_rows: 0, last_insert_rowid: None })
+        }
+    }
+
+    /// The heartbeat still flows on a multi-thread runtime, where the session
+    /// offloads its statement: the owner's whole race is offloaded, so the
+    /// statement's own offload runs in place and yields to the heartbeat
+    /// instead of running to completion in a nested `block_on`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_owner_heartbeats_while_an_offloaded_statement_runs() {
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            let conn = OffloadedSlowConn { delay: PROGRESS_INTERVAL + Duration::from_millis(700) };
+            let resp = execute_with_progress(&mut owner, &conn, query("SELECT 1")).await.unwrap();
+            assert!(matches!(resp, SqlResponse::Rows { .. }), "{resp:?}");
+        });
+        served.await.unwrap();
+        let mut heartbeats = 0;
+        while let Ok(msg) = read_msg::<_, SqlResponse>(&mut client).await {
+            assert!(matches!(msg, SqlResponse::Progress), "only heartbeats precede the reply");
+            heartbeats += 1;
+        }
+        assert_eq!(heartbeats, 1, "the heartbeat at {PROGRESS_INTERVAL:?} was not sent");
     }
 
     /// A client that vanished mid-statement ends the owner's work instead of

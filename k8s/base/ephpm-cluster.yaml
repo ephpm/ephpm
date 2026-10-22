@@ -89,6 +89,11 @@ spec:
       labels:
         app: ephpm-cluster
     spec:
+      # Room for the full shutdown: request drain ([server.timeouts] shutdown,
+      # 30 s), the final WAL checkpoint of any embedded databases (unbounded by
+      # design), and the 15 s runtime stop. Kubernetes' 30 s default SIGKILLs
+      # mid-checkpoint. See site/content/guides/clustering-setup.md.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: ephpm
           image: ephpm:dev

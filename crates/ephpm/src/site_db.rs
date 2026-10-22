@@ -172,6 +172,10 @@ fn choose_strategy(
 /// direct-open the site's Turso file (server down, single-node/per-site-single).
 /// Per-site-clustered-offline is refused inside [`choose_strategy`].
 ///
+/// Returns the opened database on the direct-open path, which the caller must
+/// [checkpoint](OfflineDatabase::checkpoint_before_exit) once PHP is done;
+/// `None` on the wire path (the server owns the file).
+///
 /// # Errors
 ///
 /// Returns an error — and registers nothing — when [`choose_strategy`] fails
@@ -180,7 +184,7 @@ pub fn bind_site_db(
     config: &Config,
     site_key: &str,
     handle: &tokio::runtime::Handle,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<OfflineDatabase>> {
     let listen =
         config.db.sqlite.as_ref().map(|s| s.proxy.mysql_listen.clone()).unwrap_or_default();
     let reachable = if listen.is_empty() { None } else { server_reachable(&listen) };
@@ -198,15 +202,57 @@ pub fn bind_site_db(
                 })?;
             ephpm_php::PhpRuntime::set_remote_db_backend(Arc::new(backend), handle.clone());
             tracing::info!(site = %user, %addr, "ephpm php --site: bound to the running server (wire)");
+            Ok(None)
         }
         Strategy::DirectOpen { path } => {
             let backend = open_direct(handle, &path)
                 .with_context(|| format!("opening site database at {path}"))?;
             ephpm_php::PhpRuntime::set_db_backend(backend, handle.clone());
             tracing::info!(path = %path, "ephpm php --site: opened local database (offline)");
+            Ok(Some(OfflineDatabase { site: site_key.to_string(), path: path.into() }))
         }
     }
-    Ok(())
+}
+
+/// How long the exit-time checkpoint of an offline database may retry a
+/// `busy` result. Nothing else has the file open, so the only thing that can
+/// hold it busy is a transaction the script left open; past this the CLI exits
+/// with the log un-truncated (recovered on the next open) and a warning.
+const OFFLINE_CHECKPOINT_GIVE_UP: Duration = Duration::from_secs(10);
+
+/// A site database `ephpm php --site` opened directly (no server running).
+///
+/// The Turso SDK has no `close()`, and dropping its handles never runs the
+/// engine's close-time checkpoint, so every write the script made would stay
+/// in the `-wal` file for the next opener to recover. The CLI therefore
+/// truncates the log explicitly before it exits.
+#[derive(Debug)]
+pub struct OfflineDatabase {
+    site: String,
+    path: std::path::PathBuf,
+}
+
+impl OfflineDatabase {
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on the database, retrying a
+    /// `busy` answer for at most [`OFFLINE_CHECKPOINT_GIVE_UP`]. Call once,
+    /// after PHP has finished; must not be called on a runtime worker
+    /// (it `block_on`s `handle`).
+    pub fn checkpoint_before_exit(&self, handle: &tokio::runtime::Handle) {
+        let report = handle.block_on(ephpm_server::db_shutdown::checkpoint_database(
+            &self.site,
+            &self.path,
+            OFFLINE_CHECKPOINT_GIVE_UP,
+        ));
+        if report.abandoned.is_empty() {
+            tracing::debug!(path = %self.path.display(), "ephpm php --site: WAL truncated");
+        } else {
+            tracing::warn!(
+                path = %self.path.display(),
+                "ephpm php --site: could not truncate the database's write-ahead log before \
+                 exit (a transaction left open?); it is recovered on the next open"
+            );
+        }
+    }
 }
 
 /// Open a Turso database file directly and return it as a shared backend for
@@ -216,10 +262,10 @@ pub fn bind_site_db(
 /// Deliberately opened **without** the server's WAL checkpoint gate
 /// (`ephpm_server::wal_gate`). The gate exists for a long-running process
 /// whose readers never go idle; this is a short-lived CLI running one PHP
-/// request with no concurrent readers, and the engine itself runs a
-/// truncating checkpoint when the last connection closes at exit. A gate task
-/// here would add a 2 s timer to a process that is usually gone before it
-/// first ticks.
+/// request with no concurrent readers. Its log is truncated once at exit by
+/// [`OfflineDatabase::checkpoint_before_exit`] instead (the SDK's handles
+/// never checkpoint on drop). A gate task here would add a 2 s timer to a
+/// process that is usually gone before it first ticks.
 ///
 /// # Errors
 ///

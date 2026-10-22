@@ -91,6 +91,20 @@ pub async fn checkpoint_all() -> CheckpointReport {
     checkpoint_databases(pending, GIVE_UP_AFTER).await
 }
 
+/// Truncate one database's write-ahead log, for a short-lived process that
+/// opened `db_path` directly and is about to exit (`ephpm php --site` in its
+/// offline mode). Same retry loop as [`checkpoint_all`], bounded by
+/// `give_up_after`; the caller drops its own handles on the file first, so
+/// nothing blocks the truncate and it normally finishes in one attempt.
+pub async fn checkpoint_database(
+    site: &str,
+    db_path: &Path,
+    give_up_after: Duration,
+) -> CheckpointReport {
+    let pending = vec![Pending { site: site.to_string(), db_path: db_path.to_path_buf() }];
+    checkpoint_databases(pending, give_up_after).await
+}
+
 async fn checkpoint_databases(
     mut pending: Vec<Pending>,
     give_up_after: Duration,
@@ -189,6 +203,9 @@ async fn checkpoint_databases(
 /// engine handle: the engine coordinates every in-process handle on one file
 /// through a shared WAL index, so a truncate here empties the log the serving
 /// factories write to.
+///
+/// The open and the truncate copy and fsync up to the whole log, so they run
+/// off the async workers (litewire's `offload::engine`).
 async fn checkpoint_once(db_path: &Path) -> anyhow::Result<Attempt> {
     use anyhow::Context as _;
 
@@ -196,17 +213,20 @@ async fn checkpoint_once(db_path: &Path) -> anyhow::Result<Attempt> {
         return Ok(Attempt::Done);
     }
     let path = db_path.to_str().context("database path is not UTF-8")?;
-    let db = turso::Builder::new_local(path).build().await.context("open for checkpoint")?;
-    let conn = db.connect().context("connect for checkpoint")?;
-    let mut rows = conn
-        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
-        .await
-        .context("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    let busy = match rows.next().await.context("read checkpoint result")? {
-        Some(row) => matches!(row.get_value(0)?, turso::Value::Integer(1)),
-        None => false,
-    };
-    drop(rows);
+    let busy = litewire::litewire_turso::offload::engine(async {
+        let db = turso::Builder::new_local(path).build().await.context("open for checkpoint")?;
+        let conn = db.connect().context("connect for checkpoint")?;
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .context("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        let busy = match rows.next().await.context("read checkpoint result")? {
+            Some(row) => matches!(row.get_value(0)?, turso::Value::Integer(1)),
+            None => false,
+        };
+        anyhow::Ok(busy)
+    })
+    .await?;
     if !busy && wal_gate::wal_file_size(db_path) == 0 {
         Ok(Attempt::Done)
     } else {
