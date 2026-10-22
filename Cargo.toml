@@ -627,9 +627,22 @@ turso = { version = "=0.8.3", default-features = false }
 # Windows reserved names) (0.19.1/0.20); Composer's global -n/-q/-v/--no-ansi
 # accepted on every command (0.21, Adelagric/vivacity#7), so the usual CI line
 # `composer install --no-dev --no-interaction --prefer-dist -o` runs.
-# vivacity-core 0.21.0 still pins `zip =2.4.2`; see the RUSTSEC ignores in
-# deny.toml.
-vivacity = { version = "=0.21.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# 0.22–0.23: symfony/flex recipes applied natively on `update` (bundles.php,
+# copied files, .env*, .gitignore, add-lines, auto-scripts, symfony.lock; the
+# configurators it does not reproduce still hand over); `install` without a
+# lock runs an update and `dump-autoload` without one reads installed.json, as
+# Composer does; lock verification is Composer's one-solve check (exit 2/4);
+# and every hand-over to real Composer is now a child process — 0.21 `exec`ed
+# on unix, replacing the ePHPm process — forwarding the original argv (0.22).
+# 0.23 prints the phpstan/rector/phpcs/package-versions installer lines on
+# stdout, runs emulated plugin listeners in Composer's activation order, and
+# ties those emulations to the plugin versions whose source was read (others
+# hand over). `vivacity::run` is unchanged (0.22 only adds a per-run git
+# answer cache that the call scopes). Linking: 0.21→0.23 changes only
+# vivacity's own six crates — no new transitive crate, no new C dep, still one
+# rustls provider. vivacity-core 0.23.0 still pins `zip =2.4.2`; see the
+# RUSTSEC ignores in deny.toml.
+vivacity = { version = "=0.23.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

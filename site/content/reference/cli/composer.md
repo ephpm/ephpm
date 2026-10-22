@@ -16,11 +16,11 @@ it hands the work to a real `composer` on `PATH` or stops with an error. The
 differences are listed [below](#differences-from-composer), and you need to
 read them before you put it in CI.
 
-> **Pinned to vivacity 0.21.0.** ePHPm pins vivacity to an exact version
-> (`=0.21.0` in the workspace `Cargo.toml`, from crates.io). Flags and behavior
-> can change when that pin moves, so this page describes 0.21.0 only. Released
+> **Pinned to vivacity 0.23.0.** ePHPm pins vivacity to an exact version
+> (`=0.23.0` in the workspace `Cargo.toml`, from crates.io). Flags and behavior
+> can change when that pin moves, so this page describes 0.23.0 only. Released
 > binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1 embeds 0.15.0,
-> and v0.11.2 through v0.12.0 embed 0.17.0; 0.21.0 ships in the first release
+> and v0.11.2 through v0.12.0 embed 0.17.0; 0.23.0 ships in the first release
 > after v0.12.0. `ephpm composer --version` prints the version your binary
 > embeds.
 
@@ -28,8 +28,8 @@ read them before you put it in CI.
 
 | You run | Needs a `php` executable? | Needs a real `composer`? |
 |---|---|---|
-| `install`, `dump-autoload` (lock in scope) | No. Without one, `install` skips the platform check (with a warning if the lock declares platform requirements) | No |
-| `update`, `require`, `remove` | **Yes**, for the platform probe ([details](#platform-requirements)). A PHP-linked `ephpm` is its own `php`, so only a **stub** build needs one installed | No |
+| `install` (with a `composer.lock` in scope), `dump-autoload` | No. Without one, `install` skips the platform check (with a warning if the lock declares platform requirements) | No |
+| `update`, `require`, `remove`, and `install` without a usable `composer.lock` (it [runs an update](#install-without-a-lock)) | **Yes**, for the platform probe ([details](#platform-requirements)). A PHP-linked `ephpm` is its own `php`, so only a **stub** build needs one installed | No |
 | Any command that is [out of scope](#fallback-to-composer) | — | Yes, or it exits `3` |
 | `--run-scripts` (on `install` or `dump-autoload`) | Whatever your scripts need | Yes, or it exits `3` |
 | `-vv`/`-vvv`, or `-v` while a plugin is active ([details](#verbosity)) | — | Yes, or it exits `3` |
@@ -42,13 +42,14 @@ set. When you have not set it, a **PHP-linked** `ephpm composer` sets
 runs it ([how](../php/#re-invoking-php_binary)), so `update`, `require` and
 `remove` work on a machine with **no PHP installed** and probe the PHP that
 ePHPm actually runs. A **stub** build falls back to `php` on `PATH`, and there
-`update`, `require` and `remove` fail on a machine that has none.
+`update`, `require` and `remove` (and an `install` with no lock, which becomes
+an update) fail on a machine that has none.
 
 ## Synopsis
 
 ```bash
 ephpm composer <COMMAND> [OPTIONS] [ARGS...]
-ephpm composer --version          # → vivacity 0.21.0
+ephpm composer --version          # → vivacity 0.23.0
 ephpm composer --help             # or: ephpm composer help <COMMAND>
 ephpm composer <COMMAND> --help
 ```
@@ -57,11 +58,11 @@ ephpm composer <COMMAND> --help
 
 | Command | Aliases | What it does |
 |---|---|---|
-| `install` | — | Installs exactly what `composer.lock` says, then generates the autoloader. **Requires an existing `composer.lock`** |
+| `install` | — | Installs exactly what `composer.lock` says, then generates the autoloader. Without a usable `composer.lock` it resolves and installs, as Composer does ([details](#install-without-a-lock)) |
 | `update [PACKAGES...]` | `upgrade` | Resolves dependencies, writes `composer.lock`, then installs. Package names may use `vendor/*` patterns, and `vendor/pkg:<constraint>` adds a temporary constraint for this run (as `--with` does) |
 | `require [PACKAGES...]` | `r` | Adds packages to `composer.json` (creating it if it is missing), then runs a partial update. Accepts `vendor/name`, `vendor/name:^1.0` and `vendor/name ^1.0` |
 | `remove [PACKAGES...]` | `rm` | Removes packages from `composer.json`, then runs a partial update. Restores `composer.json` if the update fails |
-| `dump-autoload` | `dumpautoload` | Regenerates `vendor/autoload.php` and `vendor/composer/*` from the lock and the installed state |
+| `dump-autoload` | `dumpautoload` | Regenerates `vendor/autoload.php` and `vendor/composer/*` from the lock and the installed state (from `vendor/composer/installed.json` alone when there is no lock to read) |
 
 Any other Composer command is an error. `validate`, `show`, `outdated`,
 `run-script`, `create-project`, `config`, `audit`, `why`, `fund`, `suggest`,
@@ -129,7 +130,7 @@ error: `--ansi`, Composer's `-d` short form of `--working-dir`,
 ³ Spelled `--update-with-dependencies` / `--update-with-all-dependencies` (short `-w` / `-W`). `--with-dependencies` / `--with-all-dependencies` work as aliases, except that `remove` has no `--with-dependencies`.
 ⁴ `remove -w` / `--update-with-dependencies` only prints Composer's deprecation notice. Including dependencies is already the default.
 ⁵ `dump-autoload` never delegates for plugins (it exits `3` on what it cannot dump). Its `--no-fallback` only matters for a [verbosity hand-over](#verbosity), which it turns into exit `3`.
-⁶ On `install` the flag sets the effective `preferred-install`, exactly as `config.preferred-install` would: `--prefer-dist` is what vivacity does anyway, while `--prefer-source` (or `--prefer-install source`/`auto` where it selects source) puts the affected packages [out of scope](#fallback-to-composer), so the install is handed to Composer. An invalid combination or an unknown `--prefer-install` value exits `1` with Composer's message. On `require` the three are parsed and ignored.
+⁶ On `install` the flag sets the effective `preferred-install`, exactly as `config.preferred-install` would: `--prefer-dist` is what vivacity does anyway, while `--prefer-source` (or `--prefer-install source`/`auto` where it selects source) puts the affected packages [out of scope](#fallback-to-composer), so the install is handed to Composer. An invalid combination or an unknown `--prefer-install` value exits `1` with Composer's message. On `require` they apply the same way to the install phase that follows the update: a package that would install from source hands that phase to Composer (a `composer install` carrying the flag), and an invalid combination is refused before resolving, with `composer.json` restored.
 
 A temporary constraint that is disjoint from what `composer.json` requires is
 refused with Composer's message, exit `1`.
@@ -142,7 +143,6 @@ These are parsed so Composer command lines keep working, and they do nothing:
 |---|---|---|
 | `--no-scripts` | all five | Scripts only run with `--run-scripts`. On `install` it cancels `--run-scripts` (no scripts run, and a [fallback](#fallback-to-composer) passes `--no-scripts` to Composer). On `dump-autoload` it cannot be combined with `--run-scripts` (exit `2`) |
 | `--no-audit`, `--audit-format <FORMAT>` | `--no-audit`: update, require, remove. `--audit-format`: require, remove | vivacity has no audit |
-| `--prefer-source`, `--prefer-dist`, `--prefer-install <X>` | require | vivacity always installs dist archives (on `install` they are honored, see ⁶) |
 | `-n`, `--no-interaction` | all five | vivacity never prompts |
 | `--no-ansi` | all five | vivacity never writes ANSI escapes |
 | `--no-progress` | install, update, require, remove | vivacity has no progress bar |
@@ -156,18 +156,26 @@ These exit `1` with an error rather than doing something different from Composer
 - `-m`, `--minimal-changes`, `COMPOSER_MINIMAL_CHANGES=1` and `config.update-with-minimal-changes: true` on `require` and `remove`. `update` has no `-m` (it exits `2` there), and it does not read the variable or the config key, so an `update` with either set resolves without minimal changes.
 - An alternate manifest via `COMPOSER=other.json`, on every command.
 - A root `composer.json` that Composer itself refuses (an invalid root package name, a package that requires itself, an invalid link name), on every command and before anything is written, with Composer's message.
-- `require` with `config.lock: false`, unless you also pass `--no-install`.
 
 ## Differences from Composer
 
-### `install` and `dump-autoload` need a lock
+### `install` without a lock
 
-Composer's `install` without a `composer.lock` falls back to an update.
-vivacity's does not. It exits `1` with ``Error: no composer.lock in <dir> —
-`install` needs one; run `vivacity update` to resolve and write it (…)``.
-Commit your lock, or run `ephpm composer update` first.
-`dump-autoload` also needs a `composer.lock` and exits `1` without one, while
-Composer's works from `installed.json` alone.
+As in Composer, an `install` with no usable `composer.lock` (missing, without
+a `packages` key, or ignored because `config.lock` is `false`) prints `No
+composer.lock file present.` (or `Lockfile creation is disabled in config.`)
+and runs an update instead. That update needs a `php` for the
+[platform probe](#platform-requirements), like any `update`. With
+`--check-scope` or `--run-scripts` it does not resolve natively: it exits `3`
+or hands the command to Composer ([Fallback](#fallback-to-composer)). Commit
+your lock if you want `install` to stay PHP-free.
+
+`dump-autoload` without a lock to read lays the autoloader out from
+`vendor/composer/installed.json`, as Composer does.
+
+With `config.lock: false`, every command warns that `./composer.lock is
+present but ignored` (when the file exists), resolves without the lock's packages and writes no lock,
+as Composer does.
 
 Without a `composer.json`, `install`, `update` and `dump-autoload` exit `1`
 with Composer's own message (`Composer could not find a composer.json file in
@@ -214,7 +222,14 @@ package in the lock falls into one of four groups, decided by its name:
   `dealerdirect/phpcodesniffer-composer-installer`,
   `phpstan/extension-installer`, `rector/extension-installer`,
   `wikimedia/composer-merge-plugin`, `yiisoft/yii2-composer`, `codeception/c3`
-  and `bamarni/composer-bin-plugin`. Emulation follows your
+  and `bamarni/composer-bin-plugin`. The lines these plugins print are
+  printed too, in the order Composer activates the plugins (for example
+  `phpstan/extension-installer: Extensions installed`). For
+  `phpstan/extension-installer` (1.4.0 to 1.4.3), `rector/extension-installer`
+  (0.11.0 to 0.11.2, and 1.0.0), `dealerdirect/phpcodesniffer-composer-installer` (1.0.0 to
+  1.2.1, except 1.1.0) and `composer/package-versions-deprecated`
+  (1.11.99.4 and 1.11.99.5), emulation is tied to those versions: any other
+  version is out of scope. Emulation follows your
   `config.allow-plugins` as Composer would: for example, a
   `composer/installers` that `allow-plugins` denies installs everything into
   `vendor/`, and one it does not mention at all is out of scope (Composer
@@ -251,12 +266,21 @@ whole command to Composer when one of them would change what gets resolved or
 written:
 
 - `symfony/flex`: on `require`, and on `remove` with an install. On `update`
-  (and `remove --no-install`) only when Flex would write files vivacity does
-  not emulate, such as a recipe or bundle registration for a package
-  `symfony.lock` does not record yet, removing a package it does record, an
-  `.env.dist` copy, a `package.json`/`importmap.php`
-  synchronisation, or a `flex-require` merge. That is decided before anything
-  is written
+  (and `remove --no-install`) only when Flex would do something vivacity does
+  not reproduce. `update` applies Flex **recipes** natively for packages
+  `symfony.lock` does not record yet: `config/bundles.php` (only in the exact
+  form Flex writes it), files copied from the recipe, `.env*` and PHPUnit env
+  lines, `.gitignore`, `add-lines` patches, `scripts.auto-scripts` in
+  `composer.json`, and the new `symfony.lock` entries, printed as Flex prints
+  them. It hands over instead for the `container`, `makefile`,
+  `composer-commands` and `copy-from-package` configurators, Docker
+  configuration (unless `extra.symfony.docker` is `false`), a contrib recipe
+  without `allow-contrib`, a `%generate(secret)%` value, a matching recipe
+  conflict, a non-default `root-dir`, a GitHub API endpoint, `--offline` with
+  a recipe to download, removing a package `symfony.lock` records, Flex being
+  installed by the run itself, an `.env.dist` copy, a `symfony-pack` to
+  unpack, and a `package.json`/`importmap.php` synchronisation that would
+  write. That is decided before anything is written
 - `symfony/thanks`: on `update` with an install
 - `yiisoft/yii2-composer`: with an install
 - `drupal/core-recipe-unpack`: on `require`
@@ -282,21 +306,30 @@ Composer's result for this lock. A lock is **out of scope** when:
 - `vendor-dir` / `bin-dir` settings, or install paths, that vivacity refuses
   (for example two packages mapped to the same path, or a package installed
   at the project root)
+- the project sits in a Mercurial, Fossil or Subversion working copy whose
+  tool answers (Composer would read the root version from it; vivacity reads
+  git only). The whole command is then handed over before anything is read.
+  With no such working copy this costs a few `stat` calls; if the tool is
+  missing or fails, vivacity stays native, as Composer falls back too
 
 What happens next depends on the flags:
 
 | Situation | Result |
 |---|---|
-| Default, and `composer` (`composer.bat`/`.cmd`/`.exe` on Windows) is on `PATH` | Prints the reasons on stderr (not under `-q`) and runs `composer install` itself, with `--no-scripts` (unless `--run-scripts`) and your `--no-plugins`, `--no-dev`, `--no-autoloader`, `-o`, `-a` and `--ignore-platform-req(s)` passed along. The exit code is Composer's. On Unix, `composer` **replaces** the process (`exec`) |
+| Default, and `composer` (`composer.bat`/`.cmd`/`.exe` on Windows) is on `PATH` | Prints the reasons on stderr (not under `-q`) and runs `composer` as a child process (never `exec`, so `ephpm` keeps its process) with the command line you gave, minus vivacity's own options (`--no-fallback`, `--check-scope`, `--run-scripts`; `--offline` becomes `COMPOSER_DISABLE_NETWORK=1`), plus `--no-scripts` unless you passed `--run-scripts`. The exit code is Composer's |
 | Default, and no `composer` on `PATH` | Prints the reasons and `composer not found for the fallback`, exit `3`. Nothing written |
 | `--no-fallback` | Prints the reasons, exit `3`. Nothing written |
 | `--check-scope` | Exit `0` (`this lock is installed natively`) or exit `3` with the reasons. Nothing is downloaded or written, but the [malware-list check](#security-policies) and the platform check still run first, so a lock can also exit `2` or `4` here |
 
 `update`, `require` and `remove` delegate the same way for the plugin cases
 above. They re-run the original command line under `composer`, dropping
-`--no-fallback`, `--offline` and (on `require`/`remove`) `--no-autoloader`,
-and adding `--no-scripts`. With `--no-fallback`, or without `composer` on
-`PATH`, they exit `3`.
+`--no-fallback`, `--offline` (which becomes `COMPOSER_DISABLE_NETWORK=1`) and
+(on `require`/`remove`) `--no-autoloader`, and adding `--no-scripts`. A
+`composer.json` that `require`/`remove` already edited is restored first, and
+nothing runs after Composer. When only their install phase is out of scope,
+vivacity writes the lock and hands Composer a `composer install` built from
+the same options. With `--no-fallback`, or without `composer` on `PATH`, they
+exit `3`.
 
 `dump-autoload` does not delegate for plugins. If the lock contains an unknown
 or layout-changing plugin (and `--no-plugins` is not set), it exits `3` and
@@ -339,9 +372,13 @@ vivacity has no `audit` command and does not audit after `update`/`require`.
 All of vivacity's narrative goes to **stderr**. stdout carries only
 `--help`/`--version`, `dump-autoload`'s two lines (`Generating [optimized]
 autoload files`, then `Generated … containing N classes`, as Composer prints
-them), the `codeception/c3` emulation's messages, and the hint Composer also
-prints there when an `update --with` constraint conflicts with
-`composer.json`. A successful `install` ends with a summary line such as
+them), the emulated plugins' lines (`codeception/c3`,
+`phpstan/extension-installer`, `rector/extension-installer`,
+`dealerdirect/phpcodesniffer-composer-installer`,
+`composer/package-versions-deprecated`), the hint Composer also prints there
+when an `update --with` constraint conflicts with `composer.json`, and, under
+GitHub Actions (`GITHUB_ACTIONS` set), the `::error ::` annotations Composer
+writes for an unsolvable set and similar failures. A successful `install` ends with a summary line such as
 `vivacity: 1 installed, 0 unchanged, 0 removed (…) in 0.25s`.
 
 ### Verbosity
@@ -394,9 +431,12 @@ probe script through a `php` executable, as `$VIVACITY_PHP <probe.php>`
 
 Then:
 
-- **`install`:** if the probe runs, the lock is checked against it.
-  Unsatisfied requirements exit `4`
-  (`Your lock file cannot be installed on this platform`). If the probe
+- **`install`:** if the probe runs, the lock is verified against it the way
+  Composer's installer does, in one solve that also covers the root's
+  `require`, `conflict`, `replace` and `provide`. Unsatisfied platform
+  requirements print `Your lock file does not contain a compatible set of
+  packages. Please run composer update.` and the numbered problems, exit `2`.
+  If the probe
   cannot run (no `php`, or a `VIVACITY_PHP` that does not work), the check is
   skipped and the install goes ahead. vivacity then prints
   `Warning: php not found, platform requirements were not checked` only when
@@ -413,8 +453,9 @@ Then:
   `PATH`.
 - `config.platform` overrides and `--ignore-platform-req(s)` apply on top of
   the probed platform, as in Composer. `COMPOSER_IGNORE_PLATFORM_REQS` and
-  `COMPOSER_IGNORE_PLATFORM_REQ` are honored on `update`, `require` and
-  `remove`, but not on `install`.
+  `COMPOSER_IGNORE_PLATFORM_REQ` are honored, with Composer's warning, by
+  every command that has the matching options (all five, `dump-autoload`'s
+  `platform_check.php` included).
 
 To probe a different PHP — say, a system `php` whose extensions match a
 production php-fpm — set `VIVACITY_PHP` explicitly; `ephpm composer` never
@@ -470,17 +511,18 @@ support custom lists (`policy.<name>`).
 | Code | Meaning |
 |---|---|
 | `0` | Success. Also `--help`, `--version`, `--dry-run`, and `--check-scope` on an in-scope lock |
-| `1` | Runtime error: missing `composer.lock` on `install`/`dump-autoload`, missing `composer.json`, a platform probe that cannot run on `update`/`require`/`remove`, an unsupported repository type, a refused option or manifest, local I/O failures |
-| `2` | Usage error (unknown command or option, or no command at all). Also Composer's code `2`: an unsolvable dependency set, a lock blocked by policy, or `remove` leaving the package installed |
+| `1` | Runtime error: missing `composer.json`, a lock without `packages-dev` (where Composer's locker fails), a platform probe that cannot run on `update`/`require`/`remove` (or an `install` with no lock), an unsupported repository type, a refused option or manifest, local I/O failures |
+| `2` | Usage error (unknown command or option, or no command at all). Also Composer's code `2`: an unsolvable dependency set, a lock that does not contain a compatible set of packages on `install` (unmet platform requirements included), a lock blocked by policy, or `remove` leaving the package installed |
 | `3` | Out of scope with no fallback possible (`--no-fallback`, `--check-scope`, or no `composer` on `PATH`), `--run-scripts` without `composer`, or a [verbosity hand-over](#verbosity) that cannot run. Also Composer's code `3` for a partial `update <packages>` with no `composer.lock` |
-| `4` | Platform requirements not met on `install`, or `composer.json` requires something the lock does not contain |
+| `4` | On `install`: `composer.json` requires something the lock does not contain, or the lock cannot be installed without changes (`Your lock file cannot be installed on this system without changes`) |
 | `100` | A fetch failed (a dist or repository that answers an HTTP error, is unreachable, or a local dist path that is missing), after Composer's retry policy (at most three retries, and only for the errors Composer retries, so a 404 fails at once). Composer exits `100` for the same failures |
 | other | When vivacity delegates to Composer or runs scripts, the exit code of that process |
 
 ## Environment and caches
 
 - **Composer variables honored:** `COMPOSER_HOME`, `COMPOSER_CACHE_DIR`,
-  `COMPOSER_AUTH`, `COMPOSER_NO_DEV`, `COMPOSER_PREFER_STABLE`,
+  `COMPOSER_AUTH`, `COMPOSER_NO_DEV` (any value but empty or `0`, on every
+  command including `dump-autoload`), `COMPOSER_PREFER_STABLE`,
   `COMPOSER_PREFER_LOWEST`, `COMPOSER_WITH_DEPENDENCIES`,
   `COMPOSER_WITH_ALL_DEPENDENCIES`, `COMPOSER_IGNORE_PLATFORM_REQ(S)`,
   `COMPOSER_FUND=0`, and the policy variables above. `SHELL_VERBOSITY` sets

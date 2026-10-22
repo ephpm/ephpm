@@ -12,15 +12,17 @@ ignore = [
     # above our 1.88 MSRV, so migrating is a separate change. Remove this entry
     # when ephpm-analyze moves off serde_yaml_ng.
     "RUSTSEC-2024-0449",
-    # zip 2.4.2 (pulled only by vivacity-core 0.17.0, the `ephpm composer`
-    # installer): SUID/SGID bits kept on extraction (0367), symlink targets
-    # outside the destination (0368), permissions applied through symlinks
-    # (0369). All three are in zip's own `ZipArchive::extract` /
-    # `ZipStreamReader::extract`, which vivacity never calls: its
-    # `extract::extract_zip` walks entries with `by_index`, rejects absolute
-    # and escaping symlink targets, and only ever sets mode 0o755. The fix is
-    # zip >= 9.0.0, which needs a vivacity release; remove these entries when
-    # vivacity moves to it.
+    # zip 2.4.2 (pulled only by vivacity-core, the `ephpm composer` installer;
+    # still `zip = "=2.4.2"` in vivacity 0.23.0): SUID/SGID bits kept on
+    # extraction (0367), symlink targets outside the destination (0368),
+    # permissions applied through symlinks (0369). All three are in zip's own
+    # `ZipArchive::extract` / `ZipStreamReader::extract`, which vivacity never
+    # calls: its `extract::extract_zip` walks entries with `by_index`, masks
+    # stored modes to 0o777 (no SUID/SGID/sticky), rejects absolute and
+    # escaping symlink targets and any entry written through a symlink the
+    # archive created, and applies modes only to regular files and
+    # directories. The fix is zip >= 9.0.0, which needs a vivacity release;
+    # remove these entries when vivacity moves to it.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
