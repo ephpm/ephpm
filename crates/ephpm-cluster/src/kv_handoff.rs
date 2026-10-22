@@ -271,26 +271,37 @@ impl PeerHandoff {
             }
         }
         let mut report = HandoffReport { peers: peers.len(), ..HandoffReport::default() };
+        // Every peer at once: each shares a different subset, so the pull is
+        // bounded by the slowest peer rather than the sum of all of them.
+        let mut tasks = JoinSet::new();
         for (peer, addr) in peers {
-            if Instant::now() >= deadline {
-                report.timed_out = true;
+            let client = Arc::clone(&self.client);
+            let router = self.router.clone();
+            let self_id = self_id.clone();
+            tasks.spawn(async move {
+                let result = client
+                    .share_from(addr, &self_id, deadline, |entry: ShareEntry| {
+                        if router
+                            .apply_stamped(
+                                &entry.transport_key,
+                                entry.value,
+                                entry.ttl_ms,
+                                entry.stamp,
+                            )
+                            .is_none()
+                        {
+                            tracing::debug!(key = %entry.transport_key, "pulled key is not routable here");
+                        }
+                    })
+                    .await;
+                (peer, addr, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((peer, addr, result)) = joined else {
                 report.failed_peers += 1;
                 continue;
-            }
-            let router = self.router.clone();
-            let result = self
-                .client
-                .share_from(addr, &self_id, deadline, |entry: ShareEntry| {
-                    let bytes = entry.value.len();
-                    let _ = bytes;
-                    if router
-                        .apply_stamped(&entry.transport_key, entry.value, entry.ttl_ms, entry.stamp)
-                        .is_none()
-                    {
-                        tracing::debug!(key = %entry.transport_key, "pulled key is not routable here");
-                    }
-                })
-                .await;
+            };
             match result {
                 Ok((keys, bytes)) => {
                     report.keys += keys;

@@ -160,20 +160,31 @@ const OP_DEL_IF_EQ: u8 = 0x03;
 
 /// Op code for a peer warm-up pull (`[key]` = the requester's node id, no
 /// value): the server streams back every large value for which the
-/// requester is in the replica set, as a sequence of
-/// [`SHARE_ENTRY`]-flagged messages ending with a [`SHARE_END`] message —
-/// one message (one sealed frame when encrypted) per entry, so a share of
-/// any size is bounded by one value at a time on both ends. See
+/// requester is in the replica set, as a sequence of [`SHARE_BATCH`]
+/// messages ending with a [`SHARE_END`] message. A batch message is
+/// `[SHARE_BATCH][len u32][payload]` (one sealed frame when encrypted),
+/// `payload` = `[count u32]` then `count` entries of
+/// `[key_len u32][transport_key][value_len u32][value][ttl_ms u64][write u64][node_tag u64]`,
+/// about [`SHARE_BATCH_BYTES`] per batch — so a share of any size is bounded
+/// by one batch in flight on each end, and costs a syscall per batch rather
+/// than per value (one value per message pulled 400k entries at 13 MB/s;
+/// batched, the same pull runs at the data plane's push rate). See
 /// [`crate::kv_handoff`]. A node predating this op drops the connection,
 /// which the puller reports as that peer being unable to share.
 const OP_SHARE: u8 = 0x05;
 
-/// Share stream message flag: an entry follows —
-/// `[key_len u32][transport_key][value_len u32][value][ttl_ms u64][write u64][node_tag u64]`.
-const SHARE_ENTRY: u8 = 0x01;
+/// Share stream message flag: a batch of entries follows.
+const SHARE_BATCH: u8 = 0x02;
 
 /// Share stream message flag: the stream is complete.
 const SHARE_END: u8 = 0x00;
+
+/// Target payload bytes per share batch.
+const SHARE_BATCH_BYTES: usize = 256 * 1024;
+
+/// Largest share batch a puller accepts (a batch holds at least one entry,
+/// so it can exceed the target by one value).
+const MAX_SHARE_BATCH: u32 = SHARE_BATCH_BYTES as u32 + MAX_KEY_LEN + MAX_VALUE_LEN + 64;
 
 /// SET response: success.
 const SET_OK: u8 = 0x00;
@@ -591,20 +602,17 @@ pub struct ShareEntry {
     pub stamp: Stamp,
 }
 
-/// Serialise a share entry message.
-fn encode_share_entry(entry: &ShareEntry) -> anyhow::Result<Vec<u8>> {
+/// Append one entry to a batch payload. Returns `false` (nothing appended)
+/// for an entry too large for the format.
+fn push_share_entry(out: &mut Vec<u8>, entry: &ShareEntry) -> bool {
     let key = entry.transport_key.as_bytes();
-    let key_len = u32::try_from(key.len()).map_err(|_| anyhow::anyhow!("key too long"))?;
-    if key_len > MAX_KEY_LEN {
-        anyhow::bail!("key length {key_len} exceeds maximum {MAX_KEY_LEN}");
+    let (Ok(key_len), Ok(value_len)) = (u32::try_from(key.len()), u32::try_from(entry.value.len()))
+    else {
+        return false;
+    };
+    if key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN {
+        return false;
     }
-    let value_len =
-        u32::try_from(entry.value.len()).map_err(|_| anyhow::anyhow!("value too long"))?;
-    if value_len > MAX_VALUE_LEN {
-        anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
-    }
-    let mut out = Vec::with_capacity(1 + 4 + key.len() + 4 + entry.value.len() + 24);
-    out.push(SHARE_ENTRY);
     out.extend_from_slice(&key_len.to_be_bytes());
     out.extend_from_slice(key);
     out.extend_from_slice(&value_len.to_be_bytes());
@@ -612,30 +620,80 @@ fn encode_share_entry(entry: &ShareEntry) -> anyhow::Result<Vec<u8>> {
     out.extend_from_slice(&entry.ttl_ms.to_be_bytes());
     out.extend_from_slice(&entry.stamp.write.to_be_bytes());
     out.extend_from_slice(&entry.stamp.node_tag.to_be_bytes());
+    true
+}
+
+/// Accumulates entries into one batch message.
+struct ShareBatch {
+    /// `[SHARE_BATCH][len u32][count u32][entries…]`; `len` and `count` are
+    /// patched at [`finish`](Self::finish).
+    buf: Vec<u8>,
+    count: u32,
+    bytes: u64,
+}
+
+impl ShareBatch {
+    fn new() -> Self {
+        let mut buf = Vec::with_capacity(SHARE_BATCH_BYTES + 4096);
+        buf.push(SHARE_BATCH);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        Self { buf, count: 0, bytes: 0 }
+    }
+
+    fn push(&mut self, entry: &ShareEntry) -> bool {
+        if !push_share_entry(&mut self.buf, entry) {
+            return false;
+        }
+        self.count += 1;
+        self.bytes += entry.value.len() as u64;
+        true
+    }
+
+    fn is_full(&self) -> bool {
+        self.buf.len() >= SHARE_BATCH_BYTES + 9
+    }
+
+    /// The finished message, or `None` when empty.
+    fn finish(mut self) -> Option<(Vec<u8>, u32, u64)> {
+        if self.count == 0 {
+            return None;
+        }
+        let len = u32::try_from(self.buf.len() - 5).ok()?;
+        self.buf[1..5].copy_from_slice(&len.to_be_bytes());
+        self.buf[5..9].copy_from_slice(&self.count.to_be_bytes());
+        Some((self.buf, self.count, self.bytes))
+    }
+}
+
+/// Parse a batch payload (`[count u32][entries…]`) into its entries.
+fn parse_share_batch(mut buf: &[u8]) -> anyhow::Result<Vec<ShareEntry>> {
+    let count = take_u32(&mut buf)? as usize;
+    let mut out = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let key_len = take_u32(&mut buf)?;
+        if key_len > MAX_KEY_LEN {
+            anyhow::bail!("key length {key_len} exceeds maximum {MAX_KEY_LEN}");
+        }
+        let transport_key = String::from_utf8(take_bytes(&mut buf, key_len as usize)?.to_vec())
+            .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
+        let value_len = take_u32(&mut buf)?;
+        if value_len > MAX_VALUE_LEN {
+            anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
+        }
+        let value = take_bytes(&mut buf, value_len as usize)?.to_vec();
+        let ttl_ms = take_u64(&mut buf)?;
+        let stamp = Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? };
+        out.push(ShareEntry { transport_key, value, ttl_ms, stamp });
+    }
+    if !buf.is_empty() {
+        anyhow::bail!("trailing bytes in share batch");
+    }
     Ok(out)
 }
 
-/// Parse a share stream message (after its flag byte has been checked to be
-/// [`SHARE_ENTRY`]).
-fn parse_share_entry(mut buf: &[u8]) -> anyhow::Result<ShareEntry> {
-    let key_len = take_u32(&mut buf)?;
-    if key_len > MAX_KEY_LEN {
-        anyhow::bail!("key length {key_len} exceeds maximum {MAX_KEY_LEN}");
-    }
-    let transport_key = String::from_utf8(take_bytes(&mut buf, key_len as usize)?.to_vec())
-        .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
-    let value_len = take_u32(&mut buf)?;
-    if value_len > MAX_VALUE_LEN {
-        anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
-    }
-    let value = take_bytes(&mut buf, value_len as usize)?.to_vec();
-    let ttl_ms = take_u64(&mut buf)?;
-    let stamp = Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? };
-    Ok(ShareEntry { transport_key, value, ttl_ms, stamp })
-}
-
 /// How many share entries may wait between the store walk and the socket.
-const SHARE_QUEUE: usize = 64;
+const SHARE_QUEUE: usize = 1024;
 
 /// Answer an [`OP_SHARE`] from `requester`: stream every large value for
 /// which the requester is in the replica set, then the end marker.
@@ -697,20 +755,60 @@ async fn serve_share(
     };
     let mut streamed = 0u64;
     let mut bytes = 0u64;
-    while let Some(entry) = rx.recv().await {
-        let message = encode_share_entry(&entry)?;
-        tokio::time::timeout(SERVER_WRITE_TIMEOUT, write_message(stream, &message, cipher))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("peer did not read the share within {SERVER_WRITE_TIMEOUT:?}")
-            })??;
-        streamed += 1;
-        bytes += entry.value.len() as u64;
+    let mut batch = ShareBatch::new();
+    loop {
+        // Fill a batch from what the walk has queued; send it when it is
+        // full, or when the queue runs dry so the socket never idles waiting
+        // for a batch to fill while the walk is the slow side.
+        let entry = match rx.try_recv() {
+            Ok(e) => Some(e),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if let Some((message, count, b)) =
+                    std::mem::replace(&mut batch, ShareBatch::new()).finish()
+                {
+                    send_share(stream, &message, cipher).await?;
+                    streamed += u64::from(count);
+                    bytes += b;
+                }
+                rx.recv().await
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        };
+        let Some(entry) = entry else { break };
+        if !batch.push(&entry) {
+            tracing::warn!(key = %entry.transport_key, "KV share: entry too large for the wire; skipped");
+        }
+        if batch.is_full()
+            && let Some((message, count, b)) =
+                std::mem::replace(&mut batch, ShareBatch::new()).finish()
+        {
+            send_share(stream, &message, cipher).await?;
+            streamed += u64::from(count);
+            bytes += b;
+        }
+    }
+    if let Some((message, count, b)) = batch.finish() {
+        send_share(stream, &message, cipher).await?;
+        streamed += u64::from(count);
+        bytes += b;
     }
     let _ = walker.await;
     write_message(stream, &[SHARE_END], cipher).await?;
     tracing::info!(requester, keys = streamed, bytes, "KV warm-up share served");
     Ok(())
+}
+
+/// Write one share message, bounded by [`SERVER_WRITE_TIMEOUT`].
+async fn send_share(
+    stream: &mut TcpStream,
+    message: &[u8],
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(SERVER_WRITE_TIMEOUT, write_message(stream, message, cipher))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("peer did not read the share within {SERVER_WRITE_TIMEOUT:?}")
+        })?
 }
 
 /// Tag an EOF on the first byte of a request as a clean close.
@@ -1172,52 +1270,42 @@ impl DataPlaneClient {
             let mut entries = 0u64;
             let mut bytes = 0u64;
             loop {
-                let entry = match cipher {
+                // One message per batch: `[flag][len u32][payload]`, read
+                // whole and parsed in memory on both the sealed and the
+                // plaintext path.
+                let (flag, payload) = match cipher {
                     Some(cipher) => {
                         let frame = read_frame(&mut stream, cipher).await?;
                         let (flag, rest) = frame
                             .split_first()
                             .ok_or_else(|| anyhow::anyhow!("empty share frame"))?;
-                        match *flag {
-                            SHARE_END => break,
-                            SHARE_ENTRY => parse_share_entry(rest)?,
-                            other => anyhow::bail!("unknown share flag {other:#04x}"),
+                        if *flag == SHARE_END {
+                            break;
                         }
+                        let mut rest = rest;
+                        let len = take_u32(&mut rest)?;
+                        (*flag, take_bytes(&mut rest, len as usize)?.to_vec())
                     }
-                    None => match stream.read_u8().await? {
-                        SHARE_END => break,
-                        SHARE_ENTRY => {
-                            let key_len = stream.read_u32().await?;
-                            if key_len > MAX_KEY_LEN {
-                                anyhow::bail!("key length {key_len} exceeds maximum {MAX_KEY_LEN}");
-                            }
-                            let mut key = vec![0u8; key_len as usize];
-                            stream.read_exact(&mut key).await?;
-                            let transport_key = String::from_utf8(key)
-                                .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
-                            let value_len = stream.read_u32().await?;
-                            if value_len > MAX_VALUE_LEN {
-                                anyhow::bail!(
-                                    "value length {value_len} exceeds maximum {MAX_VALUE_LEN}"
-                                );
-                            }
-                            let value = read_exact_chunked(&mut stream, value_len as usize).await?;
-                            let ttl_ms = stream.read_u64().await?;
-                            let write = stream.read_u64().await?;
-                            let node_tag = stream.read_u64().await?;
-                            ShareEntry {
-                                transport_key,
-                                value,
-                                ttl_ms,
-                                stamp: Stamp { write, node_tag },
-                            }
+                    None => {
+                        let flag = stream.read_u8().await?;
+                        if flag == SHARE_END {
+                            break;
                         }
-                        other => anyhow::bail!("unknown share flag {other:#04x}"),
-                    },
+                        let len = stream.read_u32().await?;
+                        if len > MAX_SHARE_BATCH {
+                            anyhow::bail!("share batch of {len} bytes exceeds {MAX_SHARE_BATCH}");
+                        }
+                        (flag, read_exact_chunked(&mut stream, len as usize).await?)
+                    }
                 };
-                entries += 1;
-                bytes += entry.value.len() as u64;
-                apply(entry);
+                if flag != SHARE_BATCH {
+                    anyhow::bail!("unknown share flag {flag:#04x}");
+                }
+                for entry in parse_share_batch(&payload)? {
+                    entries += 1;
+                    bytes += entry.value.len() as u64;
+                    apply(entry);
+                }
             }
             Ok((entries, bytes))
         })
