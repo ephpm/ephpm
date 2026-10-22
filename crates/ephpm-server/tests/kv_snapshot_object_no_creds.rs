@@ -27,7 +27,7 @@ fn object_mode_without_credentials_fails_at_startup() {
     config.validate().expect("the config itself is valid; credentials are an environment matter");
     let store = Store::new(StoreConfig::default());
     let err =
-        KvSnapshotService::from_config(&config, store, None, None, None).expect_err("no creds");
+        KvSnapshotService::from_config(&config, store, None, None, false).expect_err("no creds");
     let msg = format!("{err:#}");
     assert!(msg.contains("AWS_ACCESS_KEY_ID") && msg.contains("AWS_SECRET_ACCESS_KEY"), "{msg}");
 }

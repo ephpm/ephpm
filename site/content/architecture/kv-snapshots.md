@@ -277,35 +277,46 @@ write's replication in the first place. A snapshot-restored entry carries
 no stamp (fresh process), so a pulled copy from a peer that stayed online
 replaces it — the peer's is the one the cluster kept writing to.
 
-**Which tier comes from where.** On a clustered node with handoff the
-snapshot restores the **gossip tier only** (strings at or below
-`small_key_threshold`, plus hashes); the large tier comes from the pull.
-Restoring large values from the snapshot too was measured to be worse:
-the file holds every large value the node *had* — including keys it is no
-longer a replica for under the current ring — and a later write to such a
-key never reaches this node, so the pre-restart value was served until a
-gossip marker got around to deleting it (0.05–0.12 % of reads, for
-minutes, in the rolling-restart lab). The pull delivers exactly the current
-share, stamped. Only when the pull finds no alive peer at all (a
-whole-cluster restart) does a second pass restore the large tier from the
-snapshot — the file is then the only copy there is.
+**With peers present, the snapshot is not restored at all.** On a
+clustered node with handoff the startup load is deferred until the pull
+has run; if the pull found at least one alive peer, nothing is restored
+from the file (logged as `restored_small_tier=false reason=peers_present`).
+Large values come from the pull — exactly this node's current share,
+stamped. Small values arrive through gossip over the following minutes: a
+restarted node is a fresh chitchat generation and receives the gossip tier
+at roughly one 64 KB datagram per gossip round (1 s) per peer, so catching
+up on ~100k small keys takes minutes (pre-existing; in the lab a node
+restarted empty climbed from 70 % to 84 % cache hits over three minutes).
+Restoring the small tier from the snapshot was measured and rejected: it
+made the same node serve 93–95 % hits at once, but every small key that
+another node rewrote during the downtime-plus-catch-up window read as the
+*pre-restart* value on it until its gossip entry arrived — median 60 s,
+p90 230 s after the newer write, 0.6 % of that node's reads under the
+lab's 1,500 rewrites/s. A cache that serves a value rewritten elsewhere
+while it was down is worse than a miss: sessions, lock tokens
+(`SETNX`/`DELIFEQ`) and invalidations can all go wrong on it. So with
+peers present the restarted node misses until gossip has caught up, and
+is never stale. Restoring large values from the snapshot was rejected for
+the same reason in a different shape: the file holds every large value
+the node *had*, including keys it is no longer a replica for, which later
+writes never reach.
 
-**The window that remains: gossip catch-up.** A restarted node is a fresh
-chitchat generation and receives the gossip tier from its peers at roughly
-one 64 KB datagram per gossip round (1 s) per peer, so catching up on
-~100k small keys takes minutes. That is pre-existing and visible without
-any snapshot: in the lab a node restarted with an empty disk climbed from
-70 % to 84 % cache hits over three minutes. With the snapshot the same
-node serves 93–95 % hits immediately, but a small key that was rewritten
-elsewhere during the downtime-plus-catch-up window reads as the
-pre-restart value on that node until its gossip entry arrives (median
-60 s, p90 230 s after the newer write in the lab's adversarial workload
-of 1,500 rewrites/s over 160k keys; 0.6 % of that node's reads). It is a
-trade of "miss until caught up" for "warm, and briefly stale on rewritten
-keys", confined to the restarted node; non-restarted nodes stayed at
-99.6–100 % hits with no stale reads. Making a fresh node catch up faster
-(bulk gossip-state transfer over the data plane) is the follow-up that
-would close it.
+**Alone, the snapshot is restored whole.** When the pull finds no alive
+peer within the join wait (10 s) — the first node of a cold cluster, or a
+single surviving node — the file is the only copy there is, and the whole
+snapshot is loaded (`reason=no_peers`). Two consequences, plainly: a
+whole-cluster restart where every node comes up at the same time is
+**cold** (each sees the others within a gossip round) — stop all nodes and
+start one first if warmth matters; and a value restored by that lone node
+lives in its own store only — it is not re-published into gossip, so a
+node that joins afterwards does not receive it (it does receive the lone
+node's large values, through the pull).
+
+**Follow-ups that would change this.** Bulk gossip-state transfer for a
+fresh chitchat generation (so a rejoining node catches up in seconds, not
+minutes), and anti-entropy for the large tier (so a copy a non-replica
+holds is either refreshed or never served). With both, restoring a
+snapshot next to live peers would be safe again.
 
 **What it does not do.** It does not rebalance on every membership change
 (only the leaving and the joining node move data), it does not hand off

@@ -282,21 +282,25 @@ snapshot. A pod killed without a graceful stop pushes nothing — its keys
 survive only where `replication_factor` already put them, which is why the
 default is 2.
 
-Snapshots and peer handoff compose, by tier: a node that has both restores
-the gossip tier (small values and hashes) from its snapshot and takes its
-large values from the peers — the peers are what the cluster kept writing
-to, and the pull delivers exactly the keys this node is a replica for now.
-Only if no peer answers (a whole-cluster restart) are the large values
-restored from the snapshot as well.
+On a clustered node the snapshot and the peers do **not** both apply.
+With at least one alive peer, the snapshot is not restored at all: large
+values come from the peers (the pull delivers exactly the keys this node
+is a replica for now, with their write stamps) and small values arrive
+through gossip over the next minutes (about one 64 KB gossip datagram per
+second per peer), so the node misses on small keys until gossip has
+caught up — and is never stale. The log says so:
+`KV snapshot not restored ... reason="peers_present"`. Restoring the
+snapshot next to live peers was measured and rejected: it served the
+pre-restart value of every small key another node had rewritten while
+this one was down (for minutes, on that node), and a stale session, lock
+token or invalidation is worse than a miss.
 
-One window stays open on the restarted node: it rejoins gossip as a new
-member and receives the small-value tier from its peers over the next
-minutes (about one 64 KB gossip datagram per second per peer). With the
-snapshot it serves warm during that time, but a small key that another
-node rewrote while it was down reads as the pre-restart value there until
-its gossip entry arrives. Without the snapshot the same key would simply
-be a miss for the same window. If that is not acceptable for a key, give
-it a TTL or write it through the database.
+Only a node that finds no peer within the join wait (10 s) restores its
+snapshot — whole. Plainly: a whole-cluster restart where all nodes come
+up together is cold; if warmth matters, stop every node and start one
+first, then the others. A value that lone node restored stays in its own
+store (it is not re-published into gossip); the nodes that join later
+pull its large values and build the small tier from live writes.
 
 ```toml
 [kv.snapshot]

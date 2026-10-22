@@ -182,10 +182,10 @@ pub struct KvSnapshotService {
     interval: Option<Duration>,
     on_shutdown: bool,
     load_on_start: bool,
-    /// `Some(threshold)` on a clustered node with peer handoff: the startup
-    /// load restores the gossip tier only and leaves values above the
-    /// threshold to the peer pull (see [`load_at_startup`](Self::load_at_startup)).
-    large_threshold: Option<usize>,
+    /// Clustered node with peer handoff: the startup load is deferred to
+    /// [`load_after_pull`](Self::load_after_pull), which restores the snapshot
+    /// only when no alive peer was found.
+    defer_to_peers: bool,
     /// Serialises saves: a second trigger waits for (or, for the HTTP
     /// endpoint, is refused during) the one in flight.
     saving: tokio::sync::Mutex<()>,
@@ -205,7 +205,7 @@ impl std::fmt::Debug for KvSnapshotService {
             .field("interval", &self.interval)
             .field("on_shutdown", &self.on_shutdown)
             .field("load_on_start", &self.load_on_start)
-            .field("large_threshold", &self.large_threshold)
+            .field("defer_to_peers", &self.defer_to_peers)
             .finish_non_exhaustive()
     }
 }
@@ -293,7 +293,7 @@ impl KvSnapshotService {
         store: Arc<Store>,
         sites: Option<MultiTenantStore>,
         node_id: Option<&str>,
-        large_threshold: Option<usize>,
+        defer_to_peers: bool,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let snap = &config.kv.snapshot;
         if !snap.enabled() {
@@ -358,7 +358,7 @@ impl KvSnapshotService {
             interval: snap.interval()?,
             on_shutdown: snap.on_shutdown,
             load_on_start: snap.load_on_start,
-            large_threshold,
+            defer_to_peers,
             saving: tokio::sync::Mutex::new(()),
             last_save: std::sync::Mutex::new(None),
             last_load: std::sync::Mutex::new(None),
@@ -397,39 +397,67 @@ impl KvSnapshotService {
     /// Load the snapshot if `load_on_start` is set. Call once, after the
     /// stores exist and before any listener binds.
     ///
-    /// On a clustered node with peer handoff this restores the **gossip
-    /// tier only** (`ValueFilter::SmallOnly`): large values come from the
-    /// peer pull, which delivers exactly this node's current share with
-    /// write stamps. Restoring them from the snapshot too would leave
-    /// copies of keys this node is no longer a replica for — keys later
-    /// writes never reach — serving the pre-restart value until a gossip
-    /// marker got around to deleting them (0.05–0.12 % of reads stale for
-    /// minutes in the lab). [`load_large_at_startup`](Self::load_large_at_startup)
-    /// is the fallback for a pull that found no peer.
+    /// On a clustered node with peer handoff (`defer_to_peers`) this does
+    /// **nothing**: the decision whether to restore anything from the
+    /// snapshot is taken after the peer pull, by
+    /// [`load_after_pull`](Self::load_after_pull). The reasoning, stated
+    /// plainly: a cache that serves a value another node rewrote while this
+    /// one was down is worse than a miss — sessions, lock tokens and
+    /// invalidations can all go wrong on it — and a restarted node gets the
+    /// gossip tier back from its peers over the following minutes, during
+    /// which a snapshot-restored small value would be exactly that stale
+    /// value (0.6 % of the restarted node's reads in the lab). Large values
+    /// come from the pull, stamped and current. So with peers present the
+    /// snapshot is not used at all: misses until gossip has caught up, never
+    /// stale.
     pub async fn load_at_startup(&self) -> Option<LoadReport> {
         if !self.load_on_start {
             return None;
         }
-        let filter = match self.large_threshold {
-            Some(t) => ValueFilter::SmallOnly(t),
-            None => ValueFilter::All,
-        };
-        Some(self.load_with(filter).await)
+        if self.defer_to_peers {
+            tracing::info!(
+                "KV snapshot load deferred until peer discovery: with alive peers present a \
+                 clustered node takes small values from gossip and large values from its peers; \
+                 the snapshot is restored only when no peer is found"
+            );
+            return None;
+        }
+        Some(self.load_with(ValueFilter::All).await)
     }
 
-    /// The second half of a clustered startup when the peer pull found no
-    /// alive peer (a whole-cluster restart): restore the large values from
-    /// the snapshot after all. A no-op unless `load_on_start` and the
-    /// large tier was held back by [`load_at_startup`](Self::load_at_startup).
-    pub async fn load_large_at_startup(&self) -> Option<LoadReport> {
-        let threshold = self.large_threshold?;
-        if !self.load_on_start {
+    /// The deferred half of a clustered startup, after the peer pull has
+    /// run: restore the whole snapshot only when the pull found **no** alive
+    /// peer (this node is alone — a whole-cluster cold start, or the first
+    /// node up). With peers present nothing is restored, and the log says so
+    /// (`restored_small_tier=false reason=peers_present`).
+    ///
+    /// Two consequences worth knowing: a whole-cluster restart where every
+    /// node comes up at once is cold (each sees the others within a gossip
+    /// round), and a value restored by a lone node lives in that node's
+    /// store only — it is not re-published into gossip, so peers that join
+    /// later do not receive it.
+    pub async fn load_after_pull(&self, alive_peers: usize) -> Option<LoadReport> {
+        if !self.defer_to_peers || !self.load_on_start {
+            return None;
+        }
+        if alive_peers > 0 {
+            tracing::info!(
+                restored_small_tier = false,
+                restored_large_tier = false,
+                reason = "peers_present",
+                alive_peers,
+                "KV snapshot not restored: small values arrive through gossip, large values \
+                 came from the peer pull (a restored copy could be stale)"
+            );
             return None;
         }
         tracing::info!(
-            "no peer could share large KV values; restoring them from the snapshot instead"
+            restored_small_tier = true,
+            restored_large_tier = true,
+            reason = "no_peers",
+            "no alive peer found within the join wait; restoring the KV snapshot"
         );
-        Some(self.load_with(ValueFilter::LargeOnly(threshold)).await)
+        Some(self.load_with(ValueFilter::All).await)
     }
 
     /// Load the snapshot into the live stores now, under `load_timeout`
@@ -447,11 +475,9 @@ impl KvSnapshotService {
             Target::Object { client, key } => match self.download(client, key, deadline).await {
                 Ok(true) => {
                     let report = self.load_file(deadline, filter).await;
-                    // Keep the downloaded copy while the large tier may
-                    // still be wanted; the second pass removes it.
-                    if !matches!(filter, ValueFilter::SmallOnly(_)) {
-                        let _ = std::fs::remove_file(&self.file);
-                    }
+                    // The object is the snapshot; the downloaded copy has
+                    // done its job.
+                    let _ = std::fs::remove_file(&self.file);
                     report
                 }
                 Ok(false) => {
@@ -837,7 +863,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
         assert!(
-            KvSnapshotService::from_config(&config, store, None, None, None).unwrap().is_none()
+            KvSnapshotService::from_config(&config, store, None, None, false).unwrap().is_none()
         );
     }
 
@@ -856,7 +882,7 @@ mod tests {
             Arc::clone(&store),
             None,
             Some("gossip-id"),
-            None,
+            false,
         )
         .unwrap()
         .expect("enabled");
@@ -867,7 +893,7 @@ mod tests {
         assert_eq!(report.keys(), 1);
 
         let fresh = Store::new(ephpm_kv::store::StoreConfig::default());
-        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None, None)
+        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None, false)
             .unwrap()
             .unwrap();
         let load = svc2.load_at_startup().await.unwrap();
@@ -886,7 +912,7 @@ mod tests {
         let config = config_with(dir.path(), "load_on_start = false\n");
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
         let svc =
-            KvSnapshotService::from_config(&config, store, None, None, None).unwrap().unwrap();
+            KvSnapshotService::from_config(&config, store, None, None, false).unwrap().unwrap();
         assert!(svc.load_at_startup().await.is_none());
     }
 
@@ -905,7 +931,7 @@ mod tests {
             Arc::clone(&default),
             Some(sites.clone()),
             None,
-            None,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -920,7 +946,7 @@ mod tests {
             Arc::clone(&default2),
             Some(sites2.clone()),
             None,
-            None,
+            false,
         )
         .unwrap()
         .unwrap();

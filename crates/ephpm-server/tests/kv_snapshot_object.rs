@@ -281,7 +281,7 @@ async fn save_uploads_and_a_fresh_node_loads_from_the_object_alone() {
         Arc::clone(&store),
         Some(sites.clone()),
         Some("node-1"),
-        None,
+        false,
     )
     .unwrap()
     .expect("object mode enabled");
@@ -312,7 +312,7 @@ async fn save_uploads_and_a_fresh_node_loads_from_the_object_alone() {
         Arc::clone(&store2),
         Some(sites2.clone()),
         None,
-        None,
+        false,
     )
     .unwrap()
     .unwrap();
@@ -356,7 +356,7 @@ async fn a_rejected_upload_is_a_save_error_and_an_unreachable_endpoint_is_a_cold
     .unwrap();
     let store = Store::new(StoreConfig::default());
     store.set("k".into(), b"v".to_vec(), None);
-    let svc = KvSnapshotService::from_config(&config, Arc::clone(&store), None, None, None)
+    let svc = KvSnapshotService::from_config(&config, Arc::clone(&store), None, None, false)
         .unwrap()
         .unwrap();
     let err = svc.save(SaveTrigger::Request).await.expect_err("upload refused");
@@ -372,7 +372,7 @@ async fn a_rejected_upload_is_a_save_error_and_an_unreachable_endpoint_is_a_cold
         staging.path().to_string_lossy()
     ))
     .unwrap();
-    let svc = KvSnapshotService::from_config(&config, Arc::clone(&store), None, None, None)
+    let svc = KvSnapshotService::from_config(&config, Arc::clone(&store), None, None, false)
         .unwrap()
         .unwrap();
     let load = svc.load_now().await;
