@@ -1569,13 +1569,14 @@ async fn run_catch_up_gate(
 ) {
     let started = Instant::now();
     let mut next_warn = started + CATCH_UP_WARN_EVERY;
+    let mut tracker = crate::node::PeerTracker::default();
     loop {
         tokio::time::sleep(CATCH_UP_POLL).await;
         let (status, peers) = {
             let guard = chitchat.lock().await;
             (
-                crate::node::catch_up_status_locked(&guard, &self_id, started_ms),
-                crate::node::alive_peers_locked(&guard, &self_id),
+                crate::node::catch_up_status_locked(&guard, &self_id, started_ms, &mut tracker),
+                crate::node::present_peers_locked(&guard, &self_id, &mut tracker),
             )
         };
         *gate.peers.write() = peers;

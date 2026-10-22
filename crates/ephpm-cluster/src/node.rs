@@ -181,20 +181,87 @@ fn advertised_mark(state: &chitchat::NodeState) -> Option<u64> {
     state.get(KV_MARK_KEY).and_then(|s| s.parse().ok())
 }
 
-/// [`ClusterHandle::catch_up_status`] under a chitchat lock the caller holds.
+/// A node this node has heard of but whose heartbeat has not advanced for
+/// this long since it was first seen is treated as absent by the catch-up
+/// gate: the failure detector never classifies a node it has no heartbeat
+/// samples for, and a peer that is really there gossips several times a
+/// second.
+pub const SILENT_PEER_GRACE: Duration = Duration::from_secs(30);
+
+/// Which known nodes the catch-up gate treats as **present** peers.
+///
+/// The failure detector calls a peer alive only after two heartbeat samples,
+/// which under load (a restarted node drowning in 64 KB catch-up datagrams)
+/// can take tens of seconds — the live lab opened the gate after the 5 s
+/// join wait with *no* peer alive yet, on a node whose peers were plainly
+/// there. So the gate also counts a node whose relayed heartbeat has
+/// advanced since the tracker first saw it (a dead node's heartbeat is
+/// frozen in every digest), and keeps a node it has only just heard of as
+/// present for [`SILENT_PEER_GRACE`] so a silent-but-known node holds the
+/// gate rather than letting it open vacuously.
+///
+/// Generic over the heartbeat type only so the rules can be unit-tested with
+/// plain integers (chitchat's `Heartbeat` cannot be constructed outside its
+/// crate); production uses [`chitchat::Heartbeat`].
+#[derive(Debug)]
+pub(crate) struct PeerTracker<H = chitchat::Heartbeat> {
+    /// Heartbeat and time at which each node was first seen.
+    first_seen: std::collections::HashMap<ChitchatId, (H, std::time::Instant)>,
+}
+
+impl<H> Default for PeerTracker<H> {
+    fn default() -> Self {
+        Self { first_seen: std::collections::HashMap::new() }
+    }
+}
+
+impl<H: Ord + Copy> PeerTracker<H> {
+    /// Whether `id` counts as a present peer right now.
+    fn present(&mut self, id: &ChitchatId, heartbeat: H, fd_live: bool, fd_dead: bool) -> bool {
+        if fd_dead {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let (first_heartbeat, first_at) =
+            *self.first_seen.entry(id.clone()).or_insert((heartbeat, now));
+        fd_live || heartbeat > first_heartbeat || now.duration_since(first_at) < SILENT_PEER_GRACE
+    }
+}
+
+/// Every known node other than this one (any generation) that the tracker
+/// counts as present, under a chitchat lock the caller holds.
+fn present_peers<'a>(
+    guard: &'a chitchat::Chitchat,
+    self_id: &str,
+    tracker: &mut PeerTracker,
+) -> Vec<(&'a ChitchatId, &'a chitchat::NodeState)> {
+    let live: HashSet<&ChitchatId> = guard.live_nodes().collect();
+    let dead: HashSet<&ChitchatId> = guard.dead_nodes().collect();
+    guard
+        .node_states()
+        .iter()
+        .filter(|(id, _)| id.node_id != self_id)
+        .filter(|(id, state)| {
+            tracker.present(id, state.heartbeat(), live.contains(id), dead.contains(id))
+        })
+        .collect()
+}
+
+/// [`ClusterHandle::catch_up_status`] under a chitchat lock the caller holds,
+/// with `tracker` deciding which known nodes are present (see
+/// [`PeerTracker`]).
 pub(crate) fn catch_up_status_locked(
     guard: &chitchat::Chitchat,
     self_id: &str,
     started_ms: u64,
+    tracker: &mut PeerTracker,
 ) -> CatchUpStatus {
-    let peers = guard
-        .live_nodes()
-        .filter(|id| id.node_id != self_id)
-        .map(|id| {
-            let state = guard.node_state(id);
-            let seen = state.is_some_and(|s| s.max_version() > 0);
-            let publishes_marks = state.is_some_and(|s| s.get(KV_CATCH_UP_KEY).is_some());
-            let mark_ms = state.and_then(advertised_mark);
+    let peers = present_peers(guard, self_id, tracker)
+        .into_iter()
+        .map(|(id, state)| {
+            let seen = state.max_version() > 0;
+            let publishes_marks = state.get(KV_CATCH_UP_KEY).is_some();
+            let mark_ms = advertised_mark(state);
             PeerCatchUp {
                 id: id.node_id.clone(),
                 caught_up: peer_caught_up(seen, publishes_marks, mark_ms, started_ms),
@@ -207,22 +274,22 @@ pub(crate) fn catch_up_status_locked(
     CatchUpStatus { peers }
 }
 
-/// The alive peers (every alive node but this one, any generation), with
-/// their advertised ports, under a chitchat lock the caller holds. Sorted by
-/// id like [`ClusterHandle::nodes`].
-pub(crate) fn alive_peers_locked(guard: &chitchat::Chitchat, self_id: &str) -> Vec<NodeInfo> {
-    let mut peers: Vec<NodeInfo> = guard
-        .live_nodes()
-        .filter(|id| id.node_id != self_id)
-        .map(|id| {
-            let state = guard.node_state(id);
-            NodeInfo {
-                id: id.node_id.clone(),
-                gossip_addr: id.gossip_advertise_addr.to_string(),
-                state: NodeState::Alive,
-                data_port: state.and_then(advertised_data_port),
-                hrw_scheme: state.and_then(advertised_hrw_scheme),
-            }
+/// The present peers (see [`PeerTracker`]; every one but this node, any
+/// generation), with their advertised ports, under a chitchat lock the
+/// caller holds. Sorted by id like [`ClusterHandle::nodes`].
+pub(crate) fn present_peers_locked(
+    guard: &chitchat::Chitchat,
+    self_id: &str,
+    tracker: &mut PeerTracker,
+) -> Vec<NodeInfo> {
+    let mut peers: Vec<NodeInfo> = present_peers(guard, self_id, tracker)
+        .into_iter()
+        .map(|(id, state)| NodeInfo {
+            id: id.node_id.clone(),
+            gossip_addr: id.gossip_advertise_addr.to_string(),
+            state: NodeState::Alive,
+            data_port: advertised_data_port(state),
+            hrw_scheme: advertised_hrw_scheme(state),
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -366,7 +433,10 @@ impl ClusterHandle {
     pub async fn catch_up_status(&self) -> CatchUpStatus {
         let chitchat = self.handle.chitchat();
         let guard = chitchat.lock().await;
-        catch_up_status_locked(&guard, &self.self_id, self.started_ms)
+        // A fresh tracker: only the failure detector's live set counts as
+        // peers here. The gate task keeps a tracker across polls and also
+        // counts nodes whose heartbeat it has seen advance.
+        catch_up_status_locked(&guard, &self.self_id, self.started_ms, &mut PeerTracker::default())
     }
 
     /// Gracefully shut down the gossip protocol.
@@ -525,6 +595,28 @@ mod tests {
         assert!(!peer_caught_up(true, true, Some(START + margin - 1), START));
         assert!(peer_caught_up(true, true, Some(START + margin), START));
         assert!(peer_caught_up(true, true, Some(START + 60_000), START));
+    }
+
+    #[test]
+    fn peer_tracker_presence_rules() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let id = ChitchatId::new("p".into(), 0, addr);
+        let mut t = PeerTracker::<u64>::default();
+        // Dead per the failure detector: never present.
+        assert!(!t.present(&id, 5, false, true));
+        // First sighting, unclassified: present for the silent grace.
+        assert!(t.present(&id, 5, false, false));
+        // Same heartbeat, still inside the grace: present.
+        assert!(t.present(&id, 5, false, false));
+        // Heartbeat advanced: present regardless of the detector.
+        assert!(t.present(&id, 6, false, false));
+        // Live per the detector: present.
+        assert!(t.present(&id, 6, true, false));
+        // A node first seen long ago whose heartbeat never moved: absent.
+        let stale = ChitchatId::new("ghost".into(), 0, addr);
+        t.first_seen.insert(stale.clone(), (9, std::time::Instant::now() - SILENT_PEER_GRACE * 2));
+        assert!(!t.present(&stale, 9, false, false));
+        assert!(t.present(&stale, 10, false, false), "a heartbeat update revives it");
     }
 
     #[test]
