@@ -105,6 +105,31 @@
 //! first request with a connection-shaped refusal flagged `closed`. Only a real
 //! transport failure reaches the client as `owner connection closed ...`.
 //!
+//! # Every wait is bounded
+//!
+//! A forward runs on a PHP thread (`block_on`), so a wait with no bound is a
+//! wedged PHP thread — and before these bounds a stalled owner did exactly
+//! that: the thread sat in `read_msg` until the HTTP request timeout abandoned
+//! it, and the pool spawned a replacement while the stuck one never came back
+//! (stress report F6). Now:
+//!
+//! * the dial is bounded by the channel's connect and handshake timeouts;
+//! * the request write by [`FORWARD_SEND_TIMEOUT`];
+//! * the reply by [`FORWARD_REPLY_TIMEOUT`] of **silence** — the owner sends a
+//!   [`SqlResponse::Progress`] heartbeat every [`PROGRESS_INTERVAL`] while a
+//!   statement runs, so a slow statement is not cut off, only a stalled or
+//!   partitioned owner is;
+//! * on the owner, an idle stream is closed after [`OWNER_STREAM_IDLE_TIMEOUT`],
+//!   releasing its pinned database and session (and any transaction a vanished
+//!   client left open — stress report F7); clients retire idle streams first
+//!   ([`CLIENT_STREAM_MAX_IDLE`]) so they never reuse one the owner closed.
+//!
+//! Both ends' sockets also run TCP keepalive (`ephpm-cluster`), so a peer
+//! whose host died or was partitioned away is noticed in about 30 s even when
+//! nothing is in flight. A timeout is reported with connection-shaped wording,
+//! so the bridge drops the session and the next statement re-resolves the
+//! site's owner.
+//!
 //! # Both tenant routes forward
 //!
 //! [`ClusteredSiteResolver`] serves **both** ways a tenant reaches its
@@ -141,6 +166,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use ephpm_cluster::{
@@ -154,6 +180,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::site_backends::{SiteBackends, SiteOpenHook};
 
@@ -162,6 +189,58 @@ use crate::site_backends::{SiteBackends, SiteOpenHook};
 /// `SELECT` can legitimately return far more than one transaction's worth of
 /// rows.
 const MAX_MSG_LEN: u32 = 64 * 1024 * 1024;
+
+/// How long a forwarding client waits for **any** message from the owner —
+/// the reply, or a [`SqlResponse::Progress`] heartbeat — before giving up on
+/// the stream.
+///
+/// This is an *inactivity* bound, not a statement-duration bound: an owner
+/// that is still executing sends a heartbeat every [`PROGRESS_INTERVAL`], so a
+/// legitimately slow statement runs as long as it needs. What it bounds is a
+/// stalled owner (`SIGSTOP`, swapped out, partitioned with the connection
+/// still nominally open): before it, a forward blocked in `read_msg` until TCP
+/// gave up — for an idle-then-silent connection, never — and the PHP thread
+/// blocked with it until the HTTP request timeout abandoned the thread
+/// (stress report F6). Expiry is reported with connection-shaped wording, so
+/// the bridge drops the session and the next statement re-resolves the site's
+/// owner (which gossip may have moved by then).
+const FORWARD_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long writing one request into the stream may take. A healthy owner
+/// drains its stream continuously; a full send window means it stopped
+/// reading.
+const FORWARD_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an owner that is still executing a forwarded statement tells the
+/// client it is alive. Several heartbeats fit in [`FORWARD_REPLY_TIMEOUT`],
+/// so one delayed frame never trips the client's timeout.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long an owner keeps an **idle** forwarding stream open (no request
+/// from the client) before closing it and releasing what it pins: the site's
+/// backend (which defeats the `max_open_dbs` LRU) and the owner session,
+/// including any transaction a vanished client left open.
+///
+/// Generous on purpose — a forwarding session normally parks on an idle PHP
+/// thread between requests. Clients retire their own streams well before this
+/// ([`CLIENT_STREAM_MAX_IDLE`]), so an owner closing one never surprises a
+/// current client. TCP keepalive on the channel (see `ephpm-cluster`) is what
+/// detects a dead forwarder *quickly*; this is the backstop for a peer whose
+/// kernel still answers keepalive but whose session will never speak again.
+const OWNER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A client re-dials instead of reusing a stream that has been idle this long
+/// (outside a transaction), so it never writes into a stream the owner's
+/// [`OWNER_STREAM_IDLE_TIMEOUT`] may already have closed. Half the owner's
+/// bound, leaving ample margin for the two sides' clocks starting at
+/// slightly different moments.
+const CLIENT_STREAM_MAX_IDLE: Duration = Duration::from_secs(4 * 60);
+
+/// Counter: forwarded-SQL streams given up on by a timeout, by `stage`:
+/// `send` / `reply` (client side — the owner stopped reading or answering)
+/// and `owner_idle` (owner side — an idle stream closed by
+/// [`OWNER_STREAM_IDLE_TIMEOUT`]).
+const METRIC_FORWARD_TIMEOUTS: &str = "ephpm_sql_forward_timeouts_total";
 
 // ---------------------------------------------------------------------------
 // Wire protocol (length-prefixed JSON, u32 BE length).
@@ -226,10 +305,41 @@ impl From<WireColumn> for Column {
 /// A forwarded statement. `Query` expects a rowset back, `Execute` an OK — the
 /// same split the litewire [`BackendConn`] trait draws, so the owner runs the
 /// matching method and transaction/`RETURNING` semantics are preserved.
+///
+/// `progress` asks the owner to send [`SqlResponse::Progress`] heartbeats
+/// while the statement runs. Mixed-version clusters: an owner that predates
+/// the field ignores it (serde skips unknown fields) and sends no heartbeats,
+/// so on such an owner a statement that runs longer than
+/// [`FORWARD_REPLY_TIMEOUT`] fails; and an old client never sets it, so a new
+/// owner never sends an old client a frame it cannot parse.
 #[derive(Debug, Serialize, Deserialize)]
 enum SqlRequest {
-    Query { sql: String, params: Vec<WireValue> },
-    Execute { sql: String, params: Vec<WireValue> },
+    Query {
+        sql: String,
+        params: Vec<WireValue>,
+        #[serde(default)]
+        progress: bool,
+    },
+    Execute {
+        sql: String,
+        params: Vec<WireValue>,
+        #[serde(default)]
+        progress: bool,
+    },
+}
+
+impl SqlRequest {
+    fn sql(&self) -> &str {
+        match self {
+            Self::Query { sql, .. } | Self::Execute { sql, .. } => sql,
+        }
+    }
+
+    fn wants_progress(&self) -> bool {
+        match self {
+            Self::Query { progress, .. } | Self::Execute { progress, .. } => *progress,
+        }
+    }
 }
 
 /// The owner's reply to a [`SqlRequest`].
@@ -258,6 +368,10 @@ enum SqlResponse {
         #[serde(default)]
         closed: bool,
     },
+    /// "Still executing" — sent every [`PROGRESS_INTERVAL`] while a statement
+    /// whose request asked for it (`progress: true`) runs. Not a reply: the
+    /// client keeps reading. Only ever sent to a client that asked.
+    Progress,
 }
 
 async fn write_msg<W: AsyncWriteExt + Unpin, T: Serialize>(
@@ -333,7 +447,85 @@ struct RemoteProxyConn {
     channel: ChannelHandle,
     owner_addr: SocketAddr,
     stream_type: String,
-    stream: Mutex<Option<ChannelStream>>,
+    stream: Mutex<Option<OpenStream>>,
+}
+
+/// A forwarding session's open stream plus what the client tracks about it.
+struct OpenStream {
+    stream: ChannelStream,
+    /// When the last reply arrived (or the stream was dialed).
+    last_used: Instant,
+    /// Whether the last statements left an explicit transaction open on the
+    /// owner, by [`transaction_effect`]. Only consulted to decide whether an
+    /// idle stream may be quietly replaced.
+    in_transaction: bool,
+}
+
+/// Why one request/reply exchange on a forwarding stream failed.
+#[derive(Debug)]
+enum ExchangeError {
+    /// Writing the request failed.
+    Send(anyhow::Error),
+    /// Writing the request did not finish within [`FORWARD_SEND_TIMEOUT`].
+    SendTimeout,
+    /// Reading the reply failed (EOF, reset, garbage).
+    Recv(anyhow::Error),
+    /// Nothing — no reply, no heartbeat — arrived within
+    /// [`FORWARD_REPLY_TIMEOUT`].
+    ReplyTimeout,
+}
+
+/// Send `req` and wait for its reply, skipping [`SqlResponse::Progress`]
+/// heartbeats. Every wait is bounded (see [`FORWARD_REPLY_TIMEOUT`]); a
+/// heartbeat restarts the reply wait, so only a *silent* owner times out.
+async fn exchange<S>(stream: &mut S, req: &SqlRequest) -> Result<SqlResponse, ExchangeError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    match tokio::time::timeout(FORWARD_SEND_TIMEOUT, write_msg(stream, req)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(ExchangeError::Send(e)),
+        Err(_) => return Err(ExchangeError::SendTimeout),
+    }
+    loop {
+        match tokio::time::timeout(FORWARD_REPLY_TIMEOUT, read_msg::<_, SqlResponse>(stream)).await
+        {
+            Ok(Ok(SqlResponse::Progress)) => {}
+            Ok(Ok(resp)) => return Ok(resp),
+            Ok(Err(e)) => return Err(ExchangeError::Recv(e)),
+            Err(_) => return Err(ExchangeError::ReplyTimeout),
+        }
+    }
+}
+
+/// What a successfully executed statement does to the session's explicit
+/// transaction state: `Some(true)` opens one, `Some(false)` ends it, `None`
+/// leaves it as it was.
+///
+/// Deliberately coarse (leading keyword only). It is consulted for exactly one
+/// decision — may an idle stream be replaced by a fresh one? — and errs towards
+/// "in a transaction", whose only cost is keeping a stream the owner may since
+/// have closed, which then fails loudly exactly as it would have without this
+/// check. `ROLLBACK TO <savepoint>` and `RELEASE` therefore report `None`.
+fn transaction_effect(sql: &str) -> Option<bool> {
+    let mut words = sql.split_ascii_whitespace();
+    let first = words.next()?.trim_end_matches(';').to_ascii_uppercase();
+    match first.as_str() {
+        "BEGIN" | "START" | "SAVEPOINT" => Some(true),
+        "COMMIT" | "END" => Some(false),
+        "ROLLBACK" => match words.next() {
+            Some(next) if next.trim_end_matches(';').eq_ignore_ascii_case("TO") => None,
+            _ => Some(false),
+        },
+        _ => None,
+    }
+}
+
+/// Whether an open stream should be replaced by a fresh dial before it is
+/// used: it has sat idle long enough that the owner may have closed it, and no
+/// transaction would be lost by switching.
+fn should_replace_idle_stream(idle: Duration, in_transaction: bool) -> bool {
+    idle >= CLIENT_STREAM_MAX_IDLE && !in_transaction
 }
 
 impl RemoteProxyConn {
@@ -341,8 +533,22 @@ impl RemoteProxyConn {
     /// not yet open. A transport failure drops the stream (so the next call
     /// re-dials) and is reported with connection-shaped wording, which is what
     /// lets the bridge recycle the session on a genuinely dead owner.
+    ///
+    /// Bounded end to end: the dial by the channel's connect and handshake
+    /// timeouts, the exchange by [`FORWARD_SEND_TIMEOUT`] and
+    /// [`FORWARD_REPLY_TIMEOUT`]. The caller is a PHP thread (`block_on`), so
+    /// an unbounded wait here is a wedged thread.
     async fn forward(&self, req: &SqlRequest) -> Result<SqlResponse, BackendError> {
         let mut guard = self.stream.lock().await;
+        if guard.as_ref().is_some_and(|open| {
+            should_replace_idle_stream(open.last_used.elapsed(), open.in_transaction)
+        }) {
+            tracing::debug!(
+                owner = %self.owner_addr,
+                "forwarded-SQL: retiring an idle forwarding stream before reuse"
+            );
+            *guard = None;
+        }
         if guard.is_none() {
             // "connection refused" is load-bearing: it is one of the
             // bridge's connection-shaped markers (`is_connection_error`).
@@ -357,34 +563,77 @@ impl RemoteProxyConn {
                         self.owner_addr
                     ))
                 })?;
-            *guard = Some(dialed);
+            *guard = Some(OpenStream {
+                stream: dialed,
+                last_used: Instant::now(),
+                in_transaction: false,
+            });
         }
-        let stream = guard.as_mut().expect("stream was just ensured");
-        if let Err(e) = write_msg(stream, req).await {
-            *guard = None;
-            return Err(BackendError::Other(format!(
-                "error sending request to site owner {}: {e}",
-                self.owner_addr
-            )));
-        }
-        match read_msg::<_, SqlResponse>(stream).await {
+        let open = guard.as_mut().expect("stream was just ensured");
+        match exchange(&mut open.stream, req).await {
             Ok(resp) => {
-                // The owner answered and then ended the stream (it refused
-                // it): forget it so the next statement re-dials rather than
-                // failing on a closed stream.
-                if matches!(resp, SqlResponse::Error { closed: true, .. }) {
-                    *guard = None;
+                open.last_used = Instant::now();
+                match &resp {
+                    // The owner answered and then ended the stream (it refused
+                    // it): forget it so the next statement re-dials rather
+                    // than failing on a closed stream.
+                    SqlResponse::Error { closed: true, .. } => *guard = None,
+                    SqlResponse::Error { .. } | SqlResponse::Progress => {}
+                    SqlResponse::Rows { .. } | SqlResponse::Ok { .. } => {
+                        if let Some(open_now) = transaction_effect(req.sql()) {
+                            open.in_transaction = open_now;
+                        }
+                    }
                 }
                 Ok(resp)
             }
             Err(e) => {
                 *guard = None;
-                Err(BackendError::Other(format!(
-                    "owner connection closed awaiting a reply from {}: {e}",
-                    self.owner_addr
-                )))
+                Err(self.exchange_error(e))
             }
         }
+    }
+
+    /// Turn a failed exchange into the statement's error. Every arm is
+    /// connection-shaped (`connection closed` / `error sending request` are
+    /// bridge markers), so the bridge recycles the session and re-resolves the
+    /// site's owner on its next statement.
+    fn exchange_error(&self, e: ExchangeError) -> BackendError {
+        let owner = self.owner_addr;
+        BackendError::Other(match e {
+            ExchangeError::Send(e) => format!("error sending request to site owner {owner}: {e}"),
+            ExchangeError::SendTimeout => {
+                metrics::counter!(METRIC_FORWARD_TIMEOUTS, "stage" => "send").increment(1);
+                tracing::warn!(
+                    owner = %owner,
+                    timeout_secs = FORWARD_SEND_TIMEOUT.as_secs(),
+                    "forwarded-SQL: the site owner stopped reading its forwarding stream; \
+                     dropping it"
+                );
+                format!(
+                    "owner connection closed: site owner {owner} did not accept the request \
+                     within {}s (stalled or unreachable)",
+                    FORWARD_SEND_TIMEOUT.as_secs()
+                )
+            }
+            ExchangeError::Recv(e) => {
+                format!("owner connection closed awaiting a reply from {owner}: {e}")
+            }
+            ExchangeError::ReplyTimeout => {
+                metrics::counter!(METRIC_FORWARD_TIMEOUTS, "stage" => "reply").increment(1);
+                tracing::warn!(
+                    owner = %owner,
+                    timeout_secs = FORWARD_REPLY_TIMEOUT.as_secs(),
+                    "forwarded-SQL: no reply or heartbeat from the site owner; dropping the \
+                     forwarding stream"
+                );
+                format!(
+                    "owner connection closed: no reply from site owner {owner} within {}s \
+                     (the owner is stalled or partitioned; any open transaction there is lost)",
+                    FORWARD_REPLY_TIMEOUT.as_secs()
+                )
+            }
+        })
     }
 }
 
@@ -401,6 +650,7 @@ impl BackendConn for RemoteProxyConn {
         let req = SqlRequest::Query {
             sql: sql.to_string(),
             params: params.iter().map(WireValue::from).collect(),
+            progress: true,
         };
         match self.forward(&req).await? {
             SqlResponse::Rows { columns, rows } => Ok(ResultSet {
@@ -411,6 +661,10 @@ impl BackendConn for RemoteProxyConn {
             SqlResponse::Ok { .. } => Err(BackendError::Other(
                 "site owner returned an OK to a forwarded query".to_string(),
             )),
+            // exchange() consumes heartbeats; this arm exists for exhaustiveness.
+            SqlResponse::Progress => Err(BackendError::Other(
+                "site owner sent a stray heartbeat in place of a reply".to_string(),
+            )),
         }
     }
 
@@ -418,6 +672,7 @@ impl BackendConn for RemoteProxyConn {
         let req = SqlRequest::Execute {
             sql: sql.to_string(),
             params: params.iter().map(WireValue::from).collect(),
+            progress: true,
         };
         match self.forward(&req).await? {
             SqlResponse::Ok { affected_rows, last_insert_rowid } => {
@@ -426,6 +681,10 @@ impl BackendConn for RemoteProxyConn {
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
             SqlResponse::Rows { .. } => Err(BackendError::Other(
                 "site owner returned rows to a forwarded execute".to_string(),
+            )),
+            // exchange() consumes heartbeats; this arm exists for exhaustiveness.
+            SqlResponse::Progress => Err(BackendError::Other(
+                "site owner sent a stray heartbeat in place of a reply".to_string(),
             )),
         }
     }
@@ -835,6 +1094,20 @@ where
 /// Holds the site's backend `Arc` for the stream's lifetime so the registry's
 /// refcount-aware LRU cannot evict the database out from under the live owner
 /// connection; the connection is dropped before that pin.
+///
+/// # Bounded lifetime
+///
+/// A stream that stays idle (no request) for [`OWNER_STREAM_IDLE_TIMEOUT`] is
+/// closed, releasing that pin and the session — and with the session any
+/// transaction a vanished client left open, which would otherwise hold the
+/// site's write lock and fail every other writer with `database is locked`
+/// (stress report F7). A live client never notices: it retires its own idle
+/// streams after the shorter [`CLIENT_STREAM_MAX_IDLE`].
+///
+/// While a statement runs for a client that asked for it, a
+/// [`SqlResponse::Progress`] heartbeat goes out every [`PROGRESS_INTERVAL`],
+/// which is what lets the client bound its wait on a *silent* owner without
+/// bounding how long a statement may legitimately take.
 async fn serve_owner_statements<S>(
     stream: &mut S,
     registry: &SiteBackends,
@@ -846,13 +1119,28 @@ where
     let mut backend: Option<SharedBackend> = None;
     let mut conn: Option<Box<dyn BackendConn>> = None;
     loop {
-        let req: SqlRequest = match read_msg(stream).await {
-            Ok(r) => r,
-            // Clean close by the client (EOF) or a torn stream — either way this
-            // stream is done; the client re-dials for its next session.
-            Err(_) => break,
-        };
+        let req: SqlRequest =
+            match tokio::time::timeout(OWNER_STREAM_IDLE_TIMEOUT, read_msg(stream)).await {
+                Ok(Ok(r)) => r,
+                // Clean close by the client (EOF) or a torn stream — either way
+                // this stream is done; the client re-dials for its next session.
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    metrics::counter!(METRIC_FORWARD_TIMEOUTS, "stage" => "owner_idle")
+                        .increment(1);
+                    tracing::debug!(
+                        site = %site,
+                        idle_secs = OWNER_STREAM_IDLE_TIMEOUT.as_secs(),
+                        session_open = conn.is_some(),
+                        "forwarded-SQL: closing an idle forwarding stream (dropping its session \
+                         ends any transaction it held)"
+                    );
+                    break;
+                }
+            };
+        let progress = req.wants_progress();
         let resp = match open_owner_session(registry, site, &mut backend, &mut conn).await {
+            Ok(session) if progress => execute_with_progress(stream, session, req).await?,
             Ok(session) => execute_forwarded(session, req).await,
             Err(e) => {
                 tracing::info!(site = %site, "forwarded-SQL: owner session not open: {e}");
@@ -904,7 +1192,7 @@ async fn open_owner_session<'c>(
 /// [`SqlResponse::Error`] carried back to the client.
 async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlResponse {
     match req {
-        SqlRequest::Query { sql, params } => {
+        SqlRequest::Query { sql, params, .. } => {
             let params: Vec<Value> = params.into_iter().map(Value::from).collect();
             match conn.query(&sql, &params).await {
                 Ok(rs) => SqlResponse::Rows {
@@ -914,7 +1202,7 @@ async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlRespon
                 Err(e) => error_response(&e),
             }
         }
-        SqlRequest::Execute { sql, params } => {
+        SqlRequest::Execute { sql, params, .. } => {
             let params: Vec<Value> = params.into_iter().map(Value::from).collect();
             match conn.execute(&sql, &params).await {
                 Ok(ok) => SqlResponse::Ok {
@@ -922,6 +1210,40 @@ async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlRespon
                     last_insert_rowid: ok.last_insert_rowid,
                 },
                 Err(e) => error_response(&e),
+            }
+        }
+    }
+}
+
+/// [`execute_forwarded`], with a [`SqlResponse::Progress`] heartbeat written to
+/// the client every [`PROGRESS_INTERVAL`] until the statement finishes.
+///
+/// # Errors
+///
+/// Only when a heartbeat cannot be written: the client is gone, so the
+/// statement is abandoned (its future dropped) and the stream ends, which
+/// drops the session like any other disconnect.
+async fn execute_with_progress<S>(
+    stream: &mut S,
+    conn: &dyn BackendConn,
+    req: SqlRequest,
+) -> anyhow::Result<SqlResponse>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let exec = execute_forwarded(conn, req);
+    tokio::pin!(exec);
+    let mut heartbeat =
+        tokio::time::interval_at(Instant::now() + PROGRESS_INTERVAL, PROGRESS_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            resp = &mut exec => return Ok(resp),
+            _ = heartbeat.tick() => {
+                write_msg(stream, &SqlResponse::Progress)
+                    .await
+                    .context("forwarded-SQL: write heartbeat (client gone)")?;
             }
         }
     }
@@ -1141,11 +1463,13 @@ mod tests {
                 WireValue::Blob(vec![0, 1, 255]),
                 WireValue::Null,
             ],
+            progress: true,
         };
         write_msg(&mut a, &req).await.unwrap();
         let got: SqlRequest = read_msg(&mut b).await.unwrap();
         match got {
-            SqlRequest::Execute { sql, params } => {
+            SqlRequest::Execute { sql, params, progress } => {
+                assert!(progress);
                 assert_eq!(sql, "INSERT INTO t (v) VALUES (?)");
                 assert_eq!(params.len(), 3);
                 assert!(matches!(params[1], WireValue::Blob(ref bytes) if bytes == &[0, 1, 255]));
@@ -1201,9 +1525,7 @@ mod tests {
         let refusal = tokio::spawn(async move {
             refuse_stream(&mut owner, "connection refused by node n2: not the owner".into()).await;
         });
-        write_msg(&mut client, &SqlRequest::Query { sql: "SELECT 1".into(), params: vec![] })
-            .await
-            .unwrap();
+        write_msg(&mut client, &query("SELECT 1")).await.unwrap();
         match read_msg::<_, SqlResponse>(&mut client).await.unwrap() {
             SqlResponse::Error { sqlite, message, closed } => {
                 assert!(!sqlite, "a refusal is infrastructure, not SQL");
@@ -1217,6 +1539,249 @@ mod tests {
             other => panic!("expected the refusal, got {other:?}"),
         }
         refusal.await.unwrap();
+    }
+
+    fn query(sql: &str) -> SqlRequest {
+        SqlRequest::Query { sql: sql.into(), params: vec![], progress: true }
+    }
+
+    fn execute(sql: &str) -> SqlRequest {
+        SqlRequest::Execute { sql: sql.into(), params: vec![], progress: true }
+    }
+
+    /// The bounds only work as a set: several heartbeats must fit in the
+    /// client's silence budget, and clients must retire idle streams well
+    /// before owners close them.
+    #[test]
+    fn timeout_constants_are_consistent() {
+        assert!(PROGRESS_INTERVAL * 3 <= FORWARD_REPLY_TIMEOUT);
+        assert!(CLIENT_STREAM_MAX_IDLE * 2 <= OWNER_STREAM_IDLE_TIMEOUT);
+    }
+
+    /// **F6 regression.** An owner that accepts the request and then goes
+    /// silent (stopped process, partition with the connection still up) used
+    /// to block the forwarding PHP thread until TCP gave up — for an idle
+    /// connection, never. The exchange now gives up after
+    /// `FORWARD_REPLY_TIMEOUT` of silence. In-memory duplex, so the paused
+    /// clock never races real I/O.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_owner_times_out_instead_of_wedging_the_caller() {
+        let (mut client, mut owner) = tokio::io::duplex(64 * 1024);
+        let silent_owner = tokio::spawn(async move {
+            let _req: SqlRequest = read_msg(&mut owner).await.unwrap();
+            // Hold the stream open and never answer.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(owner);
+        });
+        let started = Instant::now();
+        let err = exchange(&mut client, &execute("INSERT INTO t VALUES (1)")).await.unwrap_err();
+        assert!(matches!(err, ExchangeError::ReplyTimeout), "{err:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= FORWARD_REPLY_TIMEOUT && waited < FORWARD_REPLY_TIMEOUT * 2,
+            "gave up after {waited:?}"
+        );
+        silent_owner.abort();
+    }
+
+    /// The timeout bounds *silence*, not statement duration: an owner that
+    /// keeps heartbeating may take far longer than `FORWARD_REPLY_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_keep_a_slow_statement_alive() {
+        let (mut client, mut owner) = tokio::io::duplex(64 * 1024);
+        let slow_owner = tokio::spawn(async move {
+            let _req: SqlRequest = read_msg(&mut owner).await.unwrap();
+            for _ in 0..24 {
+                tokio::time::sleep(PROGRESS_INTERVAL).await;
+                write_msg(&mut owner, &SqlResponse::Progress).await.unwrap();
+            }
+            write_msg(&mut owner, &SqlResponse::Ok { affected_rows: 1, last_insert_rowid: None })
+                .await
+                .unwrap();
+            owner
+        });
+        let started = Instant::now();
+        let resp = exchange(&mut client, &execute("UPDATE t SET x = 1")).await.unwrap();
+        assert!(matches!(resp, SqlResponse::Ok { affected_rows: 1, .. }), "{resp:?}");
+        assert!(started.elapsed() >= Duration::from_secs(120), "the statement ran 2 minutes");
+        drop(slow_owner.await.unwrap());
+    }
+
+    /// A send into a stream the owner stopped draining is bounded too.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_send_window_times_out() {
+        // A 16-byte pipe nobody reads: the request cannot be written.
+        let (mut client, _owner) = tokio::io::duplex(16);
+        let err = exchange(&mut client, &execute("INSERT INTO t VALUES (1)")).await.unwrap_err();
+        assert!(matches!(err, ExchangeError::SendTimeout), "{err:?}");
+    }
+
+    /// A stub session whose statements take `delay` (on the tokio clock).
+    struct SlowConn {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl BackendConn for SlowConn {
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet, BackendError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ResultSet { columns: vec![], rows: vec![] })
+        }
+
+        async fn execute(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<ExecuteResult, BackendError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ExecuteResult { affected_rows: 0, last_insert_rowid: None })
+        }
+    }
+
+    /// The owner half of the heartbeat: a statement that runs 12 s produces
+    /// two heartbeats (at 5 s and 10 s), then the reply is returned for the
+    /// caller to write.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_heartbeats_while_a_statement_runs() {
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let conn = SlowConn { delay: Duration::from_secs(12) };
+        let resp = execute_with_progress(&mut owner, &conn, query("SELECT 1")).await.unwrap();
+        assert!(matches!(resp, SqlResponse::Rows { .. }), "{resp:?}");
+        drop(owner);
+        let mut heartbeats = 0;
+        while let Ok(msg) = read_msg::<_, SqlResponse>(&mut client).await {
+            assert!(matches!(msg, SqlResponse::Progress), "only heartbeats precede the reply");
+            heartbeats += 1;
+        }
+        assert_eq!(heartbeats, 2);
+    }
+
+    /// A client that vanished mid-statement ends the owner's work instead of
+    /// leaving it to run against nobody.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_abandons_a_statement_whose_client_is_gone() {
+        let (mut owner, client) = tokio::io::duplex(64 * 1024);
+        drop(client);
+        let conn = SlowConn { delay: Duration::from_secs(3600) };
+        let err = execute_with_progress(&mut owner, &conn, query("SELECT 1")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("client gone"), "{err:#}");
+    }
+
+    /// Mixed versions, both directions. A request from a client that predates
+    /// `progress` parses as "no heartbeats" (so a new owner never sends an old
+    /// client a frame it cannot read); a new request still parses on an owner
+    /// that predates the field.
+    #[test]
+    fn the_progress_flag_is_compatible_with_older_peers() {
+        let old_client: SqlRequest =
+            serde_json::from_str(r#"{"Execute":{"sql":"SELECT 1","params":[]}}"#).unwrap();
+        assert!(!old_client.wants_progress());
+
+        #[derive(Deserialize)]
+        #[allow(dead_code, reason = "shape-only twin of the pre-heartbeat request")]
+        enum OldSqlRequest {
+            Query { sql: String, params: Vec<WireValue> },
+            Execute { sql: String, params: Vec<WireValue> },
+        }
+        let new_json = serde_json::to_string(&execute("SELECT 1")).unwrap();
+        let parsed: OldSqlRequest = serde_json::from_str(&new_json).unwrap();
+        assert!(matches!(parsed, OldSqlRequest::Execute { .. }));
+    }
+
+    #[test]
+    fn transaction_effect_reads_the_leading_keyword() {
+        for sql in ["BEGIN", "begin immediate", "  BEGIN TRANSACTION;", "START TRANSACTION"] {
+            assert_eq!(transaction_effect(sql), Some(true), "{sql}");
+        }
+        assert_eq!(transaction_effect("SAVEPOINT a"), Some(true));
+        for sql in ["COMMIT", "commit;", "END", "ROLLBACK", "rollback;"] {
+            assert_eq!(transaction_effect(sql), Some(false), "{sql}");
+        }
+        for sql in ["ROLLBACK TO a", "rollback to savepoint a", "RELEASE a", "SELECT 1", ""] {
+            assert_eq!(transaction_effect(sql), None, "{sql}");
+        }
+    }
+
+    /// A client replaces a stream only when it is idle long enough that the
+    /// owner may have closed it AND no transaction would be lost by it.
+    #[test]
+    fn an_idle_stream_is_replaced_only_outside_a_transaction() {
+        assert!(!should_replace_idle_stream(Duration::from_secs(10), false));
+        assert!(should_replace_idle_stream(CLIENT_STREAM_MAX_IDLE, false));
+        assert!(!should_replace_idle_stream(CLIENT_STREAM_MAX_IDLE * 10, true));
+    }
+
+    fn registry(dir: &std::path::Path) -> SiteBackends {
+        SiteBackends::new(
+            dir.to_path_buf(),
+            8,
+            ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap()
+    }
+
+    /// **F7 regression.** An owner-side stream whose client never speaks
+    /// again is closed after `OWNER_STREAM_IDLE_TIMEOUT` instead of living (and
+    /// pinning the site's database) forever. No statement is sent, so no real
+    /// I/O runs under the paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_closes_an_idle_forwarding_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry(dir.path());
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let started = Instant::now();
+        let served = tokio::spawn(async move {
+            serve_owner_statements(&mut owner, &registry, "s1").await.unwrap();
+            owner
+        });
+        let owner = served.await.unwrap();
+        let waited = started.elapsed();
+        assert!(waited >= OWNER_STREAM_IDLE_TIMEOUT, "closed after only {waited:?}");
+        drop(owner);
+        assert!(read_msg::<_, SqlResponse>(&mut client).await.is_err(), "stream ended");
+    }
+
+    /// **F7, the expensive half.** A forwarder that vanished inside a
+    /// transaction used to leave it open on the owner — holding the site's
+    /// write lock, so every other writer failed `database is locked` — until
+    /// the stream died, which for a silent peer could be never. After the idle
+    /// close the lock is released and the uncommitted row is gone.
+    ///
+    /// The statements run on the real clock (they do real file I/O); the clock
+    /// is only paused for the idle wait, when nothing but a duplex is pending.
+    #[tokio::test]
+    async fn an_idle_close_releases_a_transaction_the_client_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry(dir.path());
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let owner_registry = registry.clone();
+        let served = tokio::spawn(async move {
+            serve_owner_statements(&mut owner, &owner_registry, "s1").await.unwrap();
+        });
+
+        for sql in ["CREATE TABLE t (x INTEGER)", "BEGIN", "INSERT INTO t VALUES (1)"] {
+            let resp = exchange(&mut client, &execute(sql)).await.unwrap();
+            assert!(matches!(resp, SqlResponse::Ok { .. }), "{sql}: {resp:?}");
+        }
+
+        // The client goes silent with its transaction open.
+        tokio::time::pause();
+        tokio::time::advance(OWNER_STREAM_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the owner closes the idle stream")
+            .unwrap();
+        tokio::time::resume();
+
+        // Another writer can now take the lock, and the abandoned row was
+        // rolled back.
+        let backend = registry.get_or_open("s1").await.unwrap();
+        let other = backend.connect().await.unwrap();
+        other.execute("INSERT INTO t VALUES (2)", &[]).await.expect("write lock was released");
+        let rs = other.query("SELECT x FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows.len(), 1, "only the second writer's row survives");
+        assert!(matches!(rs.rows[0][0], Value::Integer(2)));
     }
 
     /// Mixed-version clusters: an error reply from an owner that predates the

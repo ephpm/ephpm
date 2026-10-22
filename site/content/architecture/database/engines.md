@@ -303,6 +303,18 @@ forwarded statement (the owner answers with its error instead of closing the
 stream), and the wire. A verified MySQL credential is never reported as an
 authentication failure because its database is busy or cannot be opened.
 
+**Reconnects back off, with jitter.** A replica whose CDC stream fails retries
+after a random 1–3 s, then doubles the nominal delay on each consecutive failure
+up to 20 s (±50 % jitter, so at most 30 s); a stream that stayed up for 30 s
+starts over from 2 s, and a role change (failover) interrupts the wait. Before
+this every stream retried on a fixed 2 s beat. When an owner stalled, all its
+replica streams failed in the same instant and re-dialed in the same instant.
+That burst overran the owner's 64-handshake admission cap, and every dropped
+handshake failed another stream, which re-dialed 2 s later. A stress run with
+200 sites logged 1,934 dropped handshakes in one second, and the storm continued
+after the load stopped. The cap's drops are counted as
+`ephpm_cluster_channel_handshakes_total{outcome="over_capacity"}`.
+
 Metrics for this path — batches and rows shipped and applied, subscriber
 count, applied watermark, reconnects, snapshot bytes, and a replication-lag
 gauge measured in **change-log rows, not seconds** — are in the

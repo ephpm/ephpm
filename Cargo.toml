@@ -183,6 +183,10 @@ metrics-exporter-prometheus = "0.16"
 async-channel = "2"
 libloading = "0.8"
 yamux = "0.14"
+# TCP keepalive tuning (idle time / probe interval / probe count) on cluster
+# channel sockets — tokio's `TcpStream` exposes none of it. Already in the lock
+# via tokio and hyper-util, so this is a new edge, not a new crate.
+socket2 = "0.6"
 # WebSocket framing for the native `[server.websocket]` path. `tungstenite`'s
 # default features pull in a TLS stack we already have (rustls) and a URL
 # parser only a *client* needs; ePHPm is server-side only, and hyper has

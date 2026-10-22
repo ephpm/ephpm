@@ -1311,6 +1311,21 @@ const HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION: &[&str] = &[
 /// executing script's path and would block ePHPm's invalidator too.
 const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disabled";
 
+/// How long stopping the async runtime may take after `serve` has finished
+/// its own drain. Covers the background tasks being dropped and the joins of
+/// tokio's worker and blocking-pool threads; a blocking task still running
+/// after this is left behind (the process exits around it) rather than
+/// keeping a SIGTERMed server alive until SIGKILL.
+///
+/// Database durability does not depend on this bound: `serve` runs a final
+/// `wal_checkpoint(TRUNCATE)` of every open embedded database
+/// (`ephpm_server::db_shutdown`) to completion *before* it returns, so the
+/// tasks dropped here hold no un-checkpointed state worth waiting for. It is
+/// still not tiny, so in-flight commits (observed: runtime threads parked in
+/// `jbd2_log_wait_commit`) normally finish; it only has to catch a genuinely
+/// stuck task.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Mode-dependent PHP error display/logging defaults for the generated ini.
 ///
 /// PHP's built-in default is `display_errors=1`, which renders every warning
@@ -2122,16 +2137,38 @@ fn run_with_config(
     }
     let result = rt.block_on(async { ephpm_server::serve(config, dev_mode).await });
 
-    // Drop the runtime BEFORE tearing down PHP (issue #266). Dropping joins
-    // every worker and blocking-pool thread; each PHP-registered blocking
-    // thread's TLS guard then runs php_request_shutdown + ts_free_thread on
-    // the thread itself, freeing its per-thread Zend state into its own heap.
-    // Only after that is php_embed_shutdown() safe: module shutdown's
-    // ts_free_id() walks all remaining TSRM entries on *this* thread, and any
-    // still-live worker entry would make it free another thread's
-    // request-lifetime allocations cross-heap (pcre's cached named-subpattern
-    // strings after WordPress traffic) — zend_mm_heap corrupted → SIGABRT.
-    drop(rt);
+    // Shut the runtime down BEFORE tearing down PHP (issue #266): every
+    // background task (cluster channel, replication drivers, DB listeners)
+    // is dropped at its next await and the worker and blocking-pool threads
+    // are joined first. Only after that is php_embed_shutdown() considered:
+    // module shutdown's ts_free_id() walks all remaining TSRM entries on
+    // *this* thread, and a still-live PHP thread's entry would make it free
+    // another thread's request-lifetime allocations cross-heap — zend_mm_heap
+    // corrupted → SIGABRT. PHP no longer runs on this runtime's threads (it
+    // has its own pools, whose drain `serve` already waited for), and
+    // `PhpRuntime::shutdown()` skips module teardown while any PHP-registered
+    // thread is still live, so the join is not what keeps that safe.
+    //
+    // Bounded, unlike a plain `drop(rt)`, which waits for every blocking task
+    // indefinitely: one stuck blocking call must not turn SIGTERM into a hang
+    // that only SIGKILL ends (stress report F8). `serve` has already spent
+    // the configured `[server.timeouts] shutdown` grace draining requests;
+    // this is only the tail.
+    let runtime_stop = std::time::Instant::now();
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    let stop_elapsed = runtime_stop.elapsed();
+    if stop_elapsed >= RUNTIME_SHUTDOWN_GRACE {
+        tracing::warn!(
+            grace_secs = RUNTIME_SHUTDOWN_GRACE.as_secs(),
+            "async runtime did not stop within its shutdown grace — exiting with blocking \
+             work still running"
+        );
+    } else {
+        tracing::info!(
+            elapsed_ms = u64::try_from(stop_elapsed.as_millis()).unwrap_or(u64::MAX),
+            "async runtime stopped"
+        );
+    }
 
     // Shutdown PHP runtime — all PHP threads are gone, only the main
     // thread's TSRM entry remains.

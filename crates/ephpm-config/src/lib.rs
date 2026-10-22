@@ -1049,8 +1049,10 @@ pub struct TimeoutsConfig {
     #[serde(default = "default_request_timeout")]
     pub request: u64,
 
-    /// Grace period in seconds for in-flight connections to finish during
-    /// shutdown. After this timeout, remaining connections are force-closed.
+    /// Grace period in seconds for the whole shutdown drain: in-flight
+    /// requests finish (keep-alive connections close after their current
+    /// request) and the PHP pool threads retire, all inside this one budget.
+    /// After it, remaining connections are force-closed.
     ///
     /// Default: 30 seconds.
     #[serde(default = "default_shutdown_timeout")]
