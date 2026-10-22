@@ -7,7 +7,7 @@ name: Release
 # binary's glibc floor at 2.28; see docker/Dockerfile.gha). A `container:` job
 # execs the runner's node INSIDE that container, so every JS action began to
 # silently no-op (empty checkout -> "could not find Cargo.toml"), which blocked
-# releases. Fix: the Linux jobs (setup, build-linux, build-linux-arm64) run on
+# releases. Fix: the Linux build jobs (build-linux, build-linux-arm64) run on
 # the BARE host (modern glibc -> node24 fine) and run only the build in ephpm-ci
 # via `docker run`, which preserves the 2.28 link floor. Do NOT re-add
 # `container:` to these jobs, and do NOT raise the ephpm-ci base image.
@@ -112,15 +112,15 @@ jobs:
   # docker-image (which runs on dispatch too) needs docker_matrix either way.
   setup:
     name: Derive PHP matrix
-    # NOT a `container:` job — see the node24 note in the workflow header.
-    # GitHub runs JS actions (checkout, upload-artifact) on node24, which cannot
-    # start on the ephpm-ci image's glibc 2.28 (almalinux8). In a container job
-    # the runner execs those JS actions INSIDE the container, where node24
-    # silently no-ops (empty checkout -> "could not find Cargo.toml"). So the
-    # job runs on the bare host (modern glibc, node24 fine) and only the build
-    # runs in the container via `docker run`, preserving the 2.28 link floor.
-    # Same pattern in build-linux / build-linux-arm64.
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted: this job only compiles the dependency-free xtask crate and
+    # prints a table, so it needs nothing from the self-hosted fleet and should
+    # not hold one of its few Linux x64 slots. It used to run xtask inside the
+    # ephpm-ci image via `docker run`; that bought nothing here (no binary is
+    # produced, so the image's glibc 2.28 link floor is irrelevant), and on a
+    # hosted runner it would mean pulling the whole build image to compile one
+    # small crate. The runner's preinstalled rustup provides the toolchain
+    # pinned by rust-toolchain.toml, exactly as for ci.yml's hosted Clippy job.
+    runs-on: ubuntu-latest
     outputs:
       # JSON arrays of {minor, full} (php/tailcall) and {minor, full, default}
       # (docker). See `cargo xtask php-versions --github-matrix`.
@@ -133,13 +133,9 @@ jobs:
       - name: Emit PHP build matrix from xtask PHP_SDK_VERSIONS
         id: matrix
         # xtask prints three `key=value` lines (each a single-line JSON array)
-        # to stdout; cargo progress goes to stderr. The `>>` redirect runs on the
-        # HOST, capturing the container's stdout into the host $GITHUB_OUTPUT
-        # (a container step can't write the host output file directly).
-        run: |
-          docker run --rm -v "$PWD":/w -w /w \
-            ephpm/ephpm-ci:latest \
-            cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+        # to stdout; cargo progress (and rustup's toolchain install) goes to
+        # stderr, so only the matrix lines land in $GITHUB_OUTPUT.
+        run: cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
 
   # -- Linux x86_64 binaries ---------------------------------------------------
   # arm64 lives in its own job (build-linux-arm64) so it can be throttled
@@ -943,7 +939,12 @@ jobs:
               || github.event_name == 'workflow_dispatch'
                  && inputs.publish
                  && inputs.artifacts_run_id != '') }}
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted: this job only talks to the GitHub API (list/download
+    # artifacts, create the release) and runs sha256sum -- no build, no Docker,
+    # nothing from the fleet. On the self-hosted pool it queued behind build
+    # legs at the very end of a release. collect_release_artifacts.sh needs
+    # curl, jq and unzip, all preinstalled on ubuntu-latest.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       # Needed to list this run's artifacts via the REST API (below).

@@ -664,7 +664,9 @@ jobs:
     name: Nightly Summary
     if: always()
     needs: [build-linux, build-macos, build-windows, fuzz, e2e, smoke-tests, audit]
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted: one shell step that writes a summary table from `needs`
+    # results -- no checkout, no build, nothing from the fleet.
+    runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
