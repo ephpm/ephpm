@@ -56,7 +56,7 @@ pub(super) const HASH_BASE_OVERHEAD: usize = 64;
 
 /// Bytes charged per field beyond its name and value: the `HashMap` slot
 /// (`String` + [`HashField`]) sized up for the table's load factor.
-pub(super) const HASH_FIELD_OVERHEAD: usize = 64;
+pub(super) const HASH_FIELD_OVERHEAD: usize = 96;
 
 /// Bytes charged for a hash keyed `key` with no fields.
 pub(super) const fn hash_base_cost(key: &str) -> usize {
