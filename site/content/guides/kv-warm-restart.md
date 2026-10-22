@@ -282,9 +282,21 @@ snapshot. A pod killed without a graceful stop pushes nothing — its keys
 survive only where `replication_factor` already put them, which is why the
 default is 2.
 
-Snapshots and peer handoff compose: a node that has both loads its snapshot
-first and then pulls from its peers, and a pulled value replaces a
-snapshot-restored one (the peers are what the cluster kept writing to).
+Snapshots and peer handoff compose, by tier: a node that has both restores
+the gossip tier (small values and hashes) from its snapshot and takes its
+large values from the peers — the peers are what the cluster kept writing
+to, and the pull delivers exactly the keys this node is a replica for now.
+Only if no peer answers (a whole-cluster restart) are the large values
+restored from the snapshot as well.
+
+One window stays open on the restarted node: it rejoins gossip as a new
+member and receives the small-value tier from its peers over the next
+minutes (about one 64 KB gossip datagram per second per peer). With the
+snapshot it serves warm during that time, but a small key that another
+node rewrote while it was down reads as the pre-restart value there until
+its gossip entry arrives. Without the snapshot the same key would simply
+be a miss for the same window. If that is not acceptable for a key, give
+it a TTL or write it through the database.
 
 ```toml
 [kv.snapshot]

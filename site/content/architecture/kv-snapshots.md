@@ -277,6 +277,36 @@ write's replication in the first place. A snapshot-restored entry carries
 no stamp (fresh process), so a pulled copy from a peer that stayed online
 replaces it — the peer's is the one the cluster kept writing to.
 
+**Which tier comes from where.** On a clustered node with handoff the
+snapshot restores the **gossip tier only** (strings at or below
+`small_key_threshold`, plus hashes); the large tier comes from the pull.
+Restoring large values from the snapshot too was measured to be worse:
+the file holds every large value the node *had* — including keys it is no
+longer a replica for under the current ring — and a later write to such a
+key never reaches this node, so the pre-restart value was served until a
+gossip marker got around to deleting it (0.05–0.12 % of reads, for
+minutes, in the rolling-restart lab). The pull delivers exactly the current
+share, stamped. Only when the pull finds no alive peer at all (a
+whole-cluster restart) does a second pass restore the large tier from the
+snapshot — the file is then the only copy there is.
+
+**The window that remains: gossip catch-up.** A restarted node is a fresh
+chitchat generation and receives the gossip tier from its peers at roughly
+one 64 KB datagram per gossip round (1 s) per peer, so catching up on
+~100k small keys takes minutes. That is pre-existing and visible without
+any snapshot: in the lab a node restarted with an empty disk climbed from
+70 % to 84 % cache hits over three minutes. With the snapshot the same
+node serves 93–95 % hits immediately, but a small key that was rewritten
+elsewhere during the downtime-plus-catch-up window reads as the
+pre-restart value on that node until its gossip entry arrives (median
+60 s, p90 230 s after the newer write in the lab's adversarial workload
+of 1,500 rewrites/s over 160k keys; 0.6 % of that node's reads). It is a
+trade of "miss until caught up" for "warm, and briefly stale on rewritten
+keys", confined to the restarted node; non-restarted nodes stayed at
+99.6–100 % hits with no stale reads. Making a fresh node catch up faster
+(bulk gossip-state transfer over the data plane) is the follow-up that
+would close it.
+
 **What it does not do.** It does not rebalance on every membership change
 (only the leaving and the joining node move data), it does not hand off
 hashes (they are not replicated at all), and a node killed without a
