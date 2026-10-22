@@ -323,10 +323,16 @@ jobs:
 
       # cargo checks out git dependencies with libgit2, which fails with
       # "path too long" on the Turso fork's deep test-snapshot paths (#611)
-      # unless core.longpaths is set in the user's global git config.
+      # unless core.longpaths is set in the global git config it reads
+      # (.gitconfig under %HOME% or %USERPROFILE%). The runner image has no git
+      # CLI, so write the file directly.
       - name: Enable git long paths
         shell: powershell
-        run: git config --global core.longpaths true
+        run: |
+          $dirs = @($env:USERPROFILE, $env:HOME) | Where-Object { $_ } | Select-Object -Unique
+          foreach ($d in $dirs) {
+            Add-Content -Path (Join-Path $d ".gitconfig") -Encoding ascii -Value "[core]`n`tlongpaths = true"
+          }
       - name: Install Rust toolchain
         shell: powershell
         run: |
@@ -439,10 +445,16 @@ jobs:
 
       # cargo checks out git dependencies with libgit2, which fails with
       # "path too long" on the Turso fork's deep test-snapshot paths (#611)
-      # unless core.longpaths is set in the user's global git config.
+      # unless core.longpaths is set in the global git config it reads
+      # (.gitconfig under %HOME% or %USERPROFILE%). The runner image has no git
+      # CLI, so write the file directly.
       - name: Enable git long paths
         shell: powershell
-        run: git config --global core.longpaths true
+        run: |
+          $dirs = @($env:USERPROFILE, $env:HOME) | Where-Object { $_ } | Select-Object -Unique
+          foreach ($d in $dirs) {
+            Add-Content -Path (Join-Path $d ".gitconfig") -Encoding ascii -Value "[core]`n`tlongpaths = true"
+          }
       - name: Install Rust toolchain
         shell: powershell
         run: |
