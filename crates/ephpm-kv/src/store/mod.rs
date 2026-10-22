@@ -2339,16 +2339,17 @@ impl Store {
                 for bucket in unsafe { guard.iter() } {
                     let (key, slot) = unsafe { bucket.as_ref() };
                     let entry = slot.get();
-                    if entry.expires_at.is_some_and(|exp| exp <= now) {
+                    if !entry.is_live(now) {
                         continue;
                     }
+                    // Live fields only, each with its own expiry (HEXPIRE).
                     let fields = entry
-                        .fields
-                        .iter()
-                        .map(|(f, v)| HashFieldRecord {
-                            name: f.clone(),
-                            value: v.clone(),
-                            expires_at: None,
+                        .live_parts(now)
+                        .into_iter()
+                        .map(|(name, value, expires_at)| HashFieldRecord {
+                            name,
+                            value,
+                            expires_at,
                         })
                         .collect();
                     batch.push(HashRecord {
@@ -2421,25 +2422,32 @@ impl Store {
         expires_at: Option<Instant>,
     ) -> bool {
         let now = Instant::now();
-        let fields: HashMap<String, Bytes> = fields
-            .into_iter()
-            .filter(|f| f.expires_at.is_none_or(|at| at > now))
-            .map(|f| (f.name, f.value))
-            .collect();
-        if fields.is_empty() {
+        let Some(entry) = HashEntry::from_parts(
+            &key,
+            fields.into_iter().map(|f| (f.name, f.value, f.expires_at)),
+            expires_at,
+            now,
+            self.now_nanos(),
+        ) else {
             return false;
-        }
-        let entry =
-            HashEntry { fields, expires_at, last_accessed: AtomicU64::new(self.now_nanos()) };
-        let new_size = entry.mem_size();
-        let old_size = self.hashes.get(&key).map_or(0, |old| old.mem_size());
+        };
+        let new_size = entry.mem;
+        let deadline = entry.earliest_deadline();
+        let old_size = self.hashes.get(&key).map_or(0, |old| old.mem);
         if !self.reserve(&key, new_size.saturating_sub(old_size)) {
             return false;
         }
-        let previous = self.hashes.insert(key, entry);
+        let watch = self.watch_slot_if_any(&key);
+        let previous = self.hashes.insert(key.clone(), entry);
         self.mem_add(new_size);
         if let Some(old) = previous {
-            self.mem_sub(old.mem_size());
+            self.mem_sub(old.mem);
+            lazy_drop(old);
+        }
+        // The hash TTL index drives active expiry of the key and its fields.
+        self.hash_index_restore(&key, deadline);
+        if let Some(slot) = watch {
+            slot.bump();
         }
         true
     }

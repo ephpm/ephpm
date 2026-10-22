@@ -118,6 +118,36 @@ impl HashEntry {
         }
     }
 
+    /// Rebuild a hash from its persistent state (a snapshot record): every
+    /// field with its own expiry, and the key expiry. Fields already expired
+    /// at `now` are skipped. `None` when the key itself has expired or no
+    /// field is left — such a hash does not exist.
+    pub(super) fn from_parts(
+        key: &str,
+        fields: impl IntoIterator<Item = (String, Bytes, Option<Instant>)>,
+        expires_at: Option<Instant>,
+        now: Instant,
+        now_nanos: u64,
+    ) -> Option<Self> {
+        if expires_at.is_some_and(|at| at <= now) {
+            return None;
+        }
+        let mut entry = Self::new(key, now_nanos);
+        entry.expires_at = expires_at;
+        for (name, value, field_at) in fields {
+            if field_at.is_some_and(|at| at <= now) {
+                continue;
+            }
+            entry.put_field(&name, value, field_at, now);
+        }
+        (!entry.fields.is_empty()).then_some(entry)
+    }
+
+    /// Every live field as `(name, value, expiry)`, for a snapshot.
+    pub(super) fn live_parts(&self, now: Instant) -> Vec<(String, Bytes, Option<Instant>)> {
+        self.live_fields(now).map(|(k, f)| (k.clone(), f.value.clone(), f.expires_at)).collect()
+    }
+
     /// Touch the LRU clock, with the same coarse granularity as
     /// [`super::Entry::touch`].
     pub(super) fn touch(&self, now_nanos: u64) {
@@ -453,6 +483,11 @@ impl Store {
             }
             None => self.hash_index_drop(key),
         }
+    }
+
+    /// Set `key`'s hint after replacing the whole hash (a snapshot restore).
+    pub(super) fn hash_index_restore(&self, key: &str, at: Option<Instant>) {
+        self.hash_index_set(key, at);
     }
 
     /// Drop `key`'s hint.

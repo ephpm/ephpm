@@ -168,7 +168,6 @@ const MAX_REMOTE_TTL_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
 /// Op code for an owner-arbitrated compare-and-delete.
 const OP_DEL_IF_EQ: u8 = 0x03;
 
-<<<<<<< HEAD
 /// Op code for a peer warm-up pull (`[key]` = the requester's node id, no
 /// value): the server streams back every large value for which the
 /// requester is in the replica set, as a sequence of [`SHARE_BATCH`]
