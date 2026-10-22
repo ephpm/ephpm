@@ -2302,31 +2302,52 @@ impl Store {
     ///
     /// Returns `false` only when that is impossible: `needed` alone exceeds
     /// the limit, no eligible key is left (e.g. `volatile-lru` over a store
-    /// with no TTL'd keys), or [`EVICTION_BUDGET`] ran out first.
+    /// with no TTL'd keys), or concurrent writers are filling the store as
+    /// fast as this write empties it (see below).
     ///
-    /// # Bounded by time, not by a victim count
+    /// # Bounded by work, not by a victim count or the clock
     ///
     /// This used to give up after 100 victims. With the store full of small
     /// keys, 100 victims free ~25 KB, so every larger write was refused under
     /// the *evicting* policies (155,921 refused writes under the default
     /// `allkeys-lru` in the stress run, and 69% of 64 KB writes at a 64 MB
-    /// limit). Each victim now costs `O(sample)` — see
-    /// [`next_victim`](Self::next_victim) — so evicting a few thousand small
-    /// keys for one large value takes milliseconds, and the only cap is the
-    /// time budget that keeps one write from stalling indefinitely.
+    /// limit). Each victim costs `O(sample)` — see
+    /// [`next_victim`](Self::next_victim).
+    ///
+    /// The cap then became a 50 ms wall-clock budget, which still refused
+    /// writes eviction could have satisfied: whether a write fit depended on
+    /// how often its thread was descheduled, not on the store. A 256 KiB
+    /// write into a full 1 MiB store was refused ~50% of the time on a busy
+    /// machine (the PHP worker pool keeps every core busy by design), and a
+    /// value needing more victims than 50 ms of eviction can reach — tens of
+    /// megabytes among small keys — was refused even on an idle one.
+    ///
+    /// The only thing that can keep a single write evicting forever is other
+    /// writers taking the freed room as fast as it is freed, so that is what
+    /// is bounded: once this call has itself freed the starting shortfall
+    /// plus `needed` again (at least [`EVICTION_MIN_RETRY_BYTES`]) and the
+    /// write still does not fit, it is refused. Without concurrent writers
+    /// the write fits as soon as the shortfall is freed, so this bound never
+    /// refuses a write that is alone on the store. A
+    /// run of [`EVICTION_MAX_MISSES`] consecutive candidates that were already
+    /// gone (deleted between sampling and eviction) is refused too.
     fn evict(&self, needed: usize) -> bool {
         let limit = self.config.memory_limit;
         if needed > limit {
             return false; // no amount of eviction makes this fit
         }
-        let start = Instant::now();
+        // What a lone writer must free; anything beyond it went to others.
+        let shortfall = self.mem_used().saturating_add(needed).saturating_sub(limit);
+        let give_up_after = shortfall.saturating_add(needed).max(EVICTION_MIN_RETRY_BYTES);
+        let mut freed = 0usize;
         let mut evicted = 0usize;
+        let mut misses = 0usize;
         let fitted = loop {
             if self.fits(needed) {
                 break true;
             }
-            if start.elapsed() >= EVICTION_BUDGET {
-                break self.fits(needed);
+            if freed >= give_up_after || misses >= EVICTION_MAX_MISSES {
+                break false; // others are consuming the room as it is freed
             }
             let Some(victim) = self.next_victim() else {
                 break false; // nothing eligible left
@@ -2334,11 +2355,20 @@ impl Store {
             debug!(key = %victim.key, hash = victim.hash, "evicting key");
             // Eviction is a local memory-pressure decision — replicas manage
             // their own memory — so it is never broadcast.
-            if self.evict_victim(&victim) {
-                evicted += 1;
+            match self.evict_victim(&victim) {
+                Some(bytes) => {
+                    freed = freed.saturating_add(bytes);
+                    evicted += 1;
+                    misses = 0;
+                }
+                None => misses += 1,
+            }
+            #[cfg(test)]
+            if let Some(hook) = tests::AFTER_EVICTION_STEP.get() {
+                hook(self);
             }
         };
-        trace!(evicted, needed, fitted, "eviction pass");
+        trace!(evicted, freed, needed, fitted, "eviction pass");
         fitted
     }
 
@@ -2448,23 +2478,28 @@ impl Store {
 
     /// Remove an eviction victim. Removes only the map the victim came from:
     /// a string key and a hash may share a name, and evicting one must not
-    /// take the other. Returns `true` if something was removed (a pooled
-    /// candidate may have been deleted since it was sampled).
-    fn evict_victim(&self, victim: &Victim) -> bool {
-        let removed = if victim.hash {
-            self.hash_remove(&victim.key)
-        } else if let Some((_, old)) = self.data.remove(&victim.key) {
-            self.mem_sub(old.mem_size);
-            self.ttl_index_drop(&victim.key, old.expires_at);
-            true
+    /// take the other. Returns the bytes the entry was charged, or `None` if
+    /// nothing was removed (a pooled candidate may have been deleted since it
+    /// was sampled).
+    fn evict_victim(&self, victim: &Victim) -> Option<usize> {
+        let freed = if victim.hash {
+            self.hashes.remove(&victim.key).map(|(_, old)| {
+                let size = old.mem_size();
+                self.mem_sub(size);
+                size
+            })
         } else {
-            false
+            self.data.remove(&victim.key).map(|(_, old)| {
+                self.mem_sub(old.mem_size);
+                self.ttl_index_drop(&victim.key, old.expires_at);
+                old.mem_size
+            })
         };
-        if removed {
+        if freed.is_some() {
             // Waiters observe an evicted key as deleted, as for any removal.
             self.notify_write(&victim.key);
         }
-        removed
+        freed
     }
 
     /// Next value from the store's splitmix64 generator.
@@ -2488,10 +2523,16 @@ pub const EXPIRE_ACCEPTABLE_STALE_PERCENT: usize = 10;
 /// back to eviction or refusal.
 const OOM_RECLAIM_BUDGET: Duration = Duration::from_millis(2);
 
-/// Most time one write spends evicting before it gives up and is refused.
-/// Generous: each victim costs a few microseconds, so this is thousands of
-/// victims — it exists to bound a pathological case, not to ration work.
-const EVICTION_BUDGET: Duration = Duration::from_millis(50);
+/// Floor on the bytes one write may evict before concluding that concurrent
+/// writers are taking the room as fast as it is freed (see `Store::evict`).
+/// Without it a small write that loses one race for a freed slot would be
+/// refused after a single victim.
+const EVICTION_MIN_RETRY_BYTES: usize = 64 * 1024;
+
+/// Consecutive eviction candidates that were already gone when the evictor
+/// reached them, after which the write is refused rather than resampled
+/// forever.
+const EVICTION_MAX_MISSES: usize = 1_024;
 
 /// String keys sampled per LRU eviction step (Redis' `maxmemory-samples` is
 /// 5; more suits our coarse, 100 ms LRU clock, where ties are common).
@@ -2833,7 +2874,32 @@ fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// Called by `Store::evict` after every eviction step on this thread,
+        /// so a test can make eviction slow or race it deterministically.
+        pub(super) static AFTER_EVICTION_STEP: Cell<Option<fn(&Store)>> =
+            const { Cell::new(None) };
+    }
+
+    /// Installs an [`AFTER_EVICTION_STEP`] hook for the life of the guard.
+    struct EvictionHook;
+
+    impl EvictionHook {
+        fn install(hook: fn(&Store)) -> Self {
+            AFTER_EVICTION_STEP.set(Some(hook));
+            Self
+        }
+    }
+
+    impl Drop for EvictionHook {
+        fn drop(&mut self) {
+            AFTER_EVICTION_STEP.set(None);
+        }
+    }
 
     fn test_store() -> Arc<Store> {
         Store::new(StoreConfig::default())
@@ -4092,6 +4158,51 @@ mod tests {
         }
     }
 
+    /// The test above flaked on a loaded CI runner (~50% failures with the
+    /// CPU oversubscribed): eviction gave up after 50 ms of wall-clock time,
+    /// so whether a write fit depended on how often its thread was
+    /// descheduled. Here every step is made slow on purpose — 100 µs, so the
+    /// ~1,300 victims take well over 50 ms — and the write must still land.
+    #[test]
+    fn eviction_is_not_bounded_by_wall_clock_time() {
+        let s = full_store(1024 * 1024, EvictionPolicy::AllKeysLru, None);
+        let _hook = EvictionHook::install(|_| std::thread::sleep(Duration::from_micros(100)));
+        let start = Instant::now();
+        assert!(
+            s.set("big".into(), vec![b'b'; 256 * 1024], None),
+            "a slow-but-progressing eviction refused a write that fits"
+        );
+        assert!(start.elapsed() > Duration::from_millis(50), "the hook did not slow eviction");
+        assert!(s.mem_used() <= 1024 * 1024);
+        assert_eq!(s.get("big").map(|v| v.len()), Some(256 * 1024));
+    }
+
+    /// What does bound eviction: a writer racing others that take the freed
+    /// room as fast as it is freed must be refused, not evict forever. The
+    /// hook plays a concurrent writer that, after every victim, stores 1 KiB
+    /// without evicting — more than each ~200-byte victim frees.
+    #[test]
+    fn eviction_gives_up_when_concurrent_writes_take_the_room() {
+        static STEPS: AtomicUsize = AtomicUsize::new(0);
+        let s = full_store(1024 * 1024, EvictionPolicy::AllKeysLru, None);
+        let _hook = EvictionHook::install(|s| {
+            let n = STEPS.fetch_add(1, Ordering::Relaxed);
+            let key = format!("racer{n}");
+            let entry = Entry::new(Bytes::from(vec![b'r'; 1024]), key.len(), false, s.now_nanos());
+            s.mem_add(entry.mem_size);
+            s.data.insert(key, entry);
+        });
+        assert!(
+            !s.set("big".into(), vec![b'b'; 256 * 1024], None),
+            "the write cannot fit while every victim's room is taken"
+        );
+        // The bound is ~2 × 256 KiB of freed bytes: a few thousand victims,
+        // never an unbounded loop.
+        let steps = STEPS.load(Ordering::Relaxed);
+        assert!(steps > 100 && steps < 20_000, "{steps} eviction steps");
+        assert!(s.get("big").is_none());
+    }
+
     /// A value that cannot fit even in an empty store is refused at once,
     /// without evicting anything.
     #[test]
@@ -4197,7 +4308,9 @@ mod tests {
         let s = test_store();
         s.set("both".into(), b"v".to_vec(), None);
         assert_eq!(s.hset("both", "f", b"hv".to_vec()), Some(true));
-        assert!(s.evict_victim(&Victim { key: "both".into(), hash: false, idle_rank: 1 }));
+        assert!(
+            s.evict_victim(&Victim { key: "both".into(), hash: false, idle_rank: 1 }).is_some()
+        );
         assert_eq!(s.get("both"), None);
         assert_eq!(s.hget("both", "f").as_deref(), Some(&b"hv"[..]));
     }
