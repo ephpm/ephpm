@@ -527,6 +527,9 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Arc::clone(&kv_store),
         multi_tenant_kv.clone(),
         effective_node_id.as_deref(),
+        // With peer handoff the large tier comes from the peers; the
+        // snapshot restores the gossip tier (see `load_at_startup`).
+        kv_handoff.is_some().then_some(config.cluster.kv.small_key_threshold),
     )
     .context("failed to set up KV snapshots")?;
     if let Some(svc) = &kv_snapshot {
@@ -578,6 +581,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
         let report = handoff.pull(deadline, !config.cluster.join.is_empty()).await;
         kv_snapshot::record_handoff("in", &report);
+        // Nobody to pull from (a whole-cluster restart): the snapshot's
+        // large values are the only copies there are.
+        if report.peers == 0
+            && let Some(svc) = &kv_snapshot
+        {
+            svc.load_large_at_startup().await;
+        }
     }
 
     let served = accept_loop(listeners).await;

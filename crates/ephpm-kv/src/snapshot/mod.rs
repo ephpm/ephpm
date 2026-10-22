@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use format::{FORMAT_VERSION, Header};
 pub use reader::{
     ColdReason, Inspection, LoadOptions, LoadOutcome, LoadReport, PartialReason, SiteResolver,
-    SiteSummary, VerifyReport, inspect, load_snapshot, verify,
+    SiteSummary, ValueFilter, VerifyReport, inspect, load_snapshot, verify,
 };
 pub use writer::{DEFAULT_BLOCK_TARGET, SaveReport, WriteOptions, write_snapshot};
 
@@ -320,6 +320,66 @@ mod tests {
         assert_eq!(r.outcome, LoadOutcome::Partial(PartialReason::Timeout), "{r:?}");
         assert_eq!(r.unreached_blocks, r.blocks);
         assert_eq!(dst.len(), 0);
+    }
+
+    /// The cluster split: `SmallOnly` restores strings at or below the
+    /// threshold plus every hash; `LargeOnly` the strings above it (and any
+    /// stored compressed). The two passes together restore everything once.
+    #[test]
+    fn value_filter_splits_the_tiers_exactly() {
+        use crate::snapshot::reader::ValueFilter;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.snap");
+        let src = store(CompressionAlgo::None);
+        src.set("small".into(), vec![b's'; 100], None);
+        src.set("edge".into(), vec![b'e'; 512], None);
+        src.set("large".into(), vec![b'l'; 513], None);
+        src.hset("h", "f", b"v".to_vec());
+        let stores = vec![(String::new(), Arc::clone(&src))];
+        write_snapshot(&path, SECRET, &stores, &opts()).unwrap();
+
+        let dst = store(CompressionAlgo::None);
+        let res = resolver(vec![(String::new(), Arc::clone(&dst))]);
+        let small = load_snapshot(
+            &path,
+            SECRET,
+            &res,
+            &LoadOptions { value_filter: ValueFilter::SmallOnly(512), ..LoadOptions::default() },
+        );
+        assert_eq!(small.outcome, LoadOutcome::Ok, "{small:?}");
+        assert_eq!((small.restored, small.filtered), (3, 1));
+        assert!(
+            dst.get("small").is_some() && dst.get("edge").is_some() && dst.hget("h", "f").is_some()
+        );
+        assert!(dst.get("large").is_none(), "the large tier waits for the peers");
+
+        let large = load_snapshot(
+            &path,
+            SECRET,
+            &res,
+            &LoadOptions { value_filter: ValueFilter::LargeOnly(512), ..LoadOptions::default() },
+        );
+        assert_eq!((large.restored, large.filtered), (1, 3));
+        assert_eq!(dst.get("large").map(|v| v.len()), Some(513));
+        assert_eq!(dst.len(), 4);
+
+        // A compressed string counts as large whatever its stored size.
+        let zs = store(CompressionAlgo::Zstd);
+        zs.set("zipped".into(), vec![b'z'; 4096], None);
+        let stores = vec![(String::new(), Arc::clone(&zs))];
+        write_snapshot(&path, SECRET, &stores, &opts()).unwrap();
+        let dz = store(CompressionAlgo::Zstd);
+        let res = resolver(vec![(String::new(), Arc::clone(&dz))]);
+        let r = load_snapshot(
+            &path,
+            SECRET,
+            &res,
+            &LoadOptions {
+                value_filter: ValueFilter::SmallOnly(100_000),
+                ..LoadOptions::default()
+            },
+        );
+        assert_eq!((r.restored, r.filtered), (0, 1));
     }
 
     #[test]

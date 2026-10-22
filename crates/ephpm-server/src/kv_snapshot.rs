@@ -41,8 +41,8 @@ use anyhow::Context as _;
 use ephpm_config::Config;
 use ephpm_kv::multi_tenant::MultiTenantStore;
 use ephpm_kv::snapshot::{
-    ColdReason, LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, WriteOptions,
-    load_snapshot, write_snapshot,
+    ColdReason, LoadOptions, LoadOutcome, LoadReport, SaveReport, SnapshotError, ValueFilter,
+    WriteOptions, load_snapshot, write_snapshot,
 };
 use ephpm_kv::store::Store;
 use metrics::{counter, gauge, histogram};
@@ -182,6 +182,10 @@ pub struct KvSnapshotService {
     interval: Option<Duration>,
     on_shutdown: bool,
     load_on_start: bool,
+    /// `Some(threshold)` on a clustered node with peer handoff: the startup
+    /// load restores the gossip tier only and leaves values above the
+    /// threshold to the peer pull (see [`load_at_startup`](Self::load_at_startup)).
+    large_threshold: Option<usize>,
     /// Serialises saves: a second trigger waits for (or, for the HTTP
     /// endpoint, is refused during) the one in flight.
     saving: tokio::sync::Mutex<()>,
@@ -201,6 +205,7 @@ impl std::fmt::Debug for KvSnapshotService {
             .field("interval", &self.interval)
             .field("on_shutdown", &self.on_shutdown)
             .field("load_on_start", &self.load_on_start)
+            .field("large_threshold", &self.large_threshold)
             .finish_non_exhaustive()
     }
 }
@@ -288,6 +293,7 @@ impl KvSnapshotService {
         store: Arc<Store>,
         sites: Option<MultiTenantStore>,
         node_id: Option<&str>,
+        large_threshold: Option<usize>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         let snap = &config.kv.snapshot;
         if !snap.enabled() {
@@ -352,6 +358,7 @@ impl KvSnapshotService {
             interval: snap.interval()?,
             on_shutdown: snap.on_shutdown,
             load_on_start: snap.load_on_start,
+            large_threshold,
             saving: tokio::sync::Mutex::new(()),
             last_save: std::sync::Mutex::new(None),
             last_load: std::sync::Mutex::new(None),
@@ -389,24 +396,62 @@ impl KvSnapshotService {
 
     /// Load the snapshot if `load_on_start` is set. Call once, after the
     /// stores exist and before any listener binds.
+    ///
+    /// On a clustered node with peer handoff this restores the **gossip
+    /// tier only** (`ValueFilter::SmallOnly`): large values come from the
+    /// peer pull, which delivers exactly this node's current share with
+    /// write stamps. Restoring them from the snapshot too would leave
+    /// copies of keys this node is no longer a replica for — keys later
+    /// writes never reach — serving the pre-restart value until a gossip
+    /// marker got around to deleting them (0.05–0.12 % of reads stale for
+    /// minutes in the lab). [`load_large_at_startup`](Self::load_large_at_startup)
+    /// is the fallback for a pull that found no peer.
     pub async fn load_at_startup(&self) -> Option<LoadReport> {
         if !self.load_on_start {
             return None;
         }
-        Some(self.load_now().await)
+        let filter = match self.large_threshold {
+            Some(t) => ValueFilter::SmallOnly(t),
+            None => ValueFilter::All,
+        };
+        Some(self.load_with(filter).await)
     }
 
-    /// Load the snapshot into the live stores now, under `load_timeout`. In
-    /// object mode the object is downloaded first (within the same budget).
+    /// The second half of a clustered startup when the peer pull found no
+    /// alive peer (a whole-cluster restart): restore the large values from
+    /// the snapshot after all. A no-op unless `load_on_start` and the
+    /// large tier was held back by [`load_at_startup`](Self::load_at_startup).
+    pub async fn load_large_at_startup(&self) -> Option<LoadReport> {
+        let threshold = self.large_threshold?;
+        if !self.load_on_start {
+            return None;
+        }
+        tracing::info!(
+            "no peer could share large KV values; restoring them from the snapshot instead"
+        );
+        Some(self.load_with(ValueFilter::LargeOnly(threshold)).await)
+    }
+
+    /// Load the snapshot into the live stores now, under `load_timeout`
+    /// (every entry). In object mode the object is downloaded first (within
+    /// the same budget).
     pub async fn load_now(&self) -> LoadReport {
+        self.load_with(ValueFilter::All).await
+    }
+
+    async fn load_with(&self, filter: ValueFilter) -> LoadReport {
         let started = Instant::now();
         let deadline = started + self.load_timeout;
         let report = match &self.target {
-            Target::Local => self.load_file(deadline).await,
+            Target::Local => self.load_file(deadline, filter).await,
             Target::Object { client, key } => match self.download(client, key, deadline).await {
                 Ok(true) => {
-                    let report = self.load_file(deadline).await;
-                    let _ = std::fs::remove_file(&self.file);
+                    let report = self.load_file(deadline, filter).await;
+                    // Keep the downloaded copy while the large tier may
+                    // still be wanted; the second pass removes it.
+                    if !matches!(filter, ValueFilter::SmallOnly(_)) {
+                        let _ = std::fs::remove_file(&self.file);
+                    }
                     report
                 }
                 Ok(false) => {
@@ -450,12 +495,17 @@ impl KvSnapshotService {
         }
     }
 
-    async fn load_file(&self, deadline: Instant) -> LoadReport {
+    async fn load_file(&self, deadline: Instant, filter: ValueFilter) -> LoadReport {
         let file = self.file.clone();
         let secret = self.secret.clone();
         let store = Arc::clone(&self.store);
         let sites = self.sites.clone();
-        let opts = LoadOptions { deadline: Some(deadline), max_size: self.max_size, workers: 0 };
+        let opts = LoadOptions {
+            deadline: Some(deadline),
+            max_size: self.max_size,
+            workers: 0,
+            value_filter: filter,
+        };
         tokio::task::spawn_blocking(move || {
             let resolve = move |site: &str| -> Option<Arc<Store>> {
                 if site.is_empty() {
@@ -786,7 +836,9 @@ mod tests {
     async fn off_means_no_service() {
         let config: Config = toml::from_str("").unwrap();
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
-        assert!(KvSnapshotService::from_config(&config, store, None, None).unwrap().is_none());
+        assert!(
+            KvSnapshotService::from_config(&config, store, None, None, None).unwrap().is_none()
+        );
     }
 
     #[tokio::test]
@@ -799,10 +851,15 @@ mod tests {
         let stale = dir.path().join(".node-a.kvsnap.tmp-999-1");
         std::fs::write(&stale, b"junk").unwrap();
 
-        let svc =
-            KvSnapshotService::from_config(&config, Arc::clone(&store), None, Some("gossip-id"))
-                .unwrap()
-                .expect("enabled");
+        let svc = KvSnapshotService::from_config(
+            &config,
+            Arc::clone(&store),
+            None,
+            Some("gossip-id"),
+            None,
+        )
+        .unwrap()
+        .expect("enabled");
         assert!(!stale.exists(), "stale temp file removed");
         assert_eq!(svc.file(), dir.path().join("node-a.kvsnap"));
         assert_eq!(svc.object_url(), None);
@@ -810,7 +867,7 @@ mod tests {
         assert_eq!(report.keys(), 1);
 
         let fresh = Store::new(ephpm_kv::store::StoreConfig::default());
-        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None)
+        let svc2 = KvSnapshotService::from_config(&config, Arc::clone(&fresh), None, None, None)
             .unwrap()
             .unwrap();
         let load = svc2.load_at_startup().await.unwrap();
@@ -828,7 +885,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with(dir.path(), "load_on_start = false\n");
         let store = Store::new(ephpm_kv::store::StoreConfig::default());
-        let svc = KvSnapshotService::from_config(&config, store, None, None).unwrap().unwrap();
+        let svc =
+            KvSnapshotService::from_config(&config, store, None, None, None).unwrap().unwrap();
         assert!(svc.load_at_startup().await.is_none());
     }
 
@@ -847,6 +905,7 @@ mod tests {
             Arc::clone(&default),
             Some(sites.clone()),
             None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -860,6 +919,7 @@ mod tests {
             &config,
             Arc::clone(&default2),
             Some(sites2.clone()),
+            None,
             None,
         )
         .unwrap()
