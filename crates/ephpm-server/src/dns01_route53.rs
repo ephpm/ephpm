@@ -38,10 +38,9 @@ use std::time::SystemTime;
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 
 use crate::dns01::DnsProvider;
+use crate::sigv4::{Credentials, SignInput, sign};
 use crate::tls::crypto_provider;
 
 /// Route 53 API base URL. Overridable in tests via
@@ -210,14 +209,13 @@ impl Route53Provider {
         query: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> anyhow::Result<(reqwest::StatusCode, bytes::Bytes)> {
-        let canonical_query = canonical_query_string(query);
         let payload = body.as_deref().unwrap_or(b"");
         let unix_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let (amz_date, authorization) =
-            self.sign(method.as_str(), &self.host(), path, &canonical_query, payload, unix_secs);
+        let (amz_date, authorization, canonical_query) =
+            self.sign(method.as_str(), &self.host(), path, query, payload, unix_secs);
 
         let mut url = format!("{}{path}", self.api_base);
         if !canonical_query.is_empty() {
@@ -239,42 +237,42 @@ impl Route53Provider {
         Ok((status, bytes))
     }
 
-    /// Produce the `(x-amz-date, Authorization)` header pair for a request via
-    /// AWS Signature Version 4. The signed header set is fixed at
-    /// `host;x-amz-date`.
+    /// Produce the `(x-amz-date, Authorization, canonical query)` triple for
+    /// a request via AWS Signature Version 4 ([`crate::sigv4`]). The signed
+    /// header set is `host;x-amz-date`; the payload hash is sent in the
+    /// canonical request only (Route 53 does not use
+    /// `x-amz-content-sha256`).
     fn sign(
         &self,
         method: &str,
         host: &str,
         path: &str,
-        canonical_query: &str,
+        query: &[(&str, &str)],
         payload: &[u8],
         unix_secs: u64,
-    ) -> (String, String) {
-        let (amz_date, datestamp) = aws_dates(unix_secs);
-        let canonical_uri = uri_encode(path, false);
-        let payload_hash = sha256_hex(payload);
-        let canonical_headers = format!("host:{host}\nx-amz-date:{amz_date}\n");
-        let signed_headers = "host;x-amz-date";
-
-        // The blank line between canonical headers and signed headers is the
-        // extra `\n` after `{canonical_headers}` (which itself ends in `\n`).
-        let canonical_request = format!(
-            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    ) -> (String, String, String) {
+        let creds = Credentials {
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            session_token: None,
+        };
+        let payload_hash = crate::sigv4::sha256_hex(payload);
+        let signed = sign(
+            &creds,
+            &SignInput {
+                method,
+                host,
+                path,
+                query,
+                extra_headers: &[],
+                payload_hash: &payload_hash,
+                send_content_sha256: false,
+                region: REGION,
+                service: SERVICE,
+                unix_secs,
+            },
         );
-        let scope = format!("{datestamp}/{REGION}/{SERVICE}/aws4_request");
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-            sha256_hex(canonical_request.as_bytes())
-        );
-        let key = derive_signing_key(&self.secret_access_key, &datestamp, REGION, SERVICE);
-        let signature = hex_lower(&hmac_sha256(&key, string_to_sign.as_bytes()));
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, \
-             Signature={signature}",
-            self.access_key_id
-        );
-        (amz_date, authorization)
+        (signed.amz_date, signed.authorization, signed.canonical_query)
     }
 }
 
@@ -335,99 +333,6 @@ fn build_route53_http_client() -> anyhow::Result<reqwest::Client> {
         .use_preconfigured_tls(tls)
         .build()
         .context("failed to build the Route 53 API HTTP client")
-}
-
-// ── SigV4 primitives ─────────────────────────────────────────────────────────
-
-/// `HMAC-SHA256(key, data)`.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts a key of any length");
-    mac.update(data);
-    let tag = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&tag);
-    out
-}
-
-/// Lowercase hex of `SHA-256(data)`.
-fn sha256_hex(data: &[u8]) -> String {
-    hex_lower(&Sha256::digest(data))
-}
-
-/// Lowercase hex encoding of a byte slice.
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-/// Derive the SigV4 signing key: a four-step HMAC chain over the secret,
-/// date, region, service and the literal `aws4_request`.
-fn derive_signing_key(secret: &str, datestamp: &str, region: &str, service: &str) -> [u8; 32] {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), datestamp.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
-}
-
-/// AWS URI-encoding: every byte outside the RFC 3986 unreserved set is
-/// percent-encoded (uppercase hex). `/` is preserved when `encode_slash` is
-/// false (used for the path) and encoded otherwise (used for query components).
-fn uri_encode(input: &str, encode_slash: bool) -> String {
-    let mut out = String::with_capacity(input.len());
-    for &byte in input.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            b'/' if !encode_slash => out.push('/'),
-            _ => {
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
-    }
-    out
-}
-
-/// Build the SigV4 canonical query string: each key and value URI-encoded, the
-/// pairs sorted by encoded key (then value), joined with `&`.
-fn canonical_query_string(params: &[(&str, &str)]) -> String {
-    let mut encoded: Vec<(String, String)> =
-        params.iter().map(|(k, v)| (uri_encode(k, true), uri_encode(v, true))).collect();
-    encoded.sort();
-    encoded.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
-}
-
-/// Split a Unix timestamp into the two SigV4 date strings: the amz timestamp
-/// `YYYYMMDDTHHMMSSZ` and the credential-scope date stamp `YYYYMMDD`, both UTC.
-fn aws_dates(unix_secs: u64) -> (String, String) {
-    let total = i64::try_from(unix_secs).unwrap_or(i64::MAX);
-    let days = total.div_euclid(86_400);
-    let tod = total.rem_euclid(86_400);
-    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    let (year, month, day) = civil_from_days(days);
-    (
-        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
-        format!("{year:04}{month:02}{day:02}"),
-    )
-}
-
-/// Howard Hinnant's `civil_from_days`: days since 1970-01-01 → `(year, month,
-/// day)` in the proleptic Gregorian calendar. Pure integer arithmetic, so it
-/// needs no date crate.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day of era, [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era, [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
-    let mp = (5 * doy + 2) / 153; // month, shifted so March = 0, [0, 11]
-    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 // ── XML helpers ──────────────────────────────────────────────────────────────
@@ -568,54 +473,6 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::*;
-
-    // ── Pure-function unit tests ─────────────────────────────────────────────
-
-    #[test]
-    fn uri_encode_preserves_unreserved_and_path_slash() {
-        assert_eq!(uri_encode("_acme-challenge.a.b~c", true), "_acme-challenge.a.b~c");
-        assert_eq!(uri_encode("/a/b", false), "/a/b");
-        assert_eq!(uri_encode("/a/b", true), "%2Fa%2Fb");
-        assert_eq!(uri_encode("a b+c", true), "a%20b%2Bc");
-    }
-
-    #[test]
-    fn canonical_query_is_sorted_and_encoded() {
-        let q =
-            canonical_query_string(&[("type", "TXT"), ("name", "_x.example"), ("maxitems", "1")]);
-        assert_eq!(q, "maxitems=1&name=_x.example&type=TXT");
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 19723 days after the epoch is 2024-01-01 (54*365 + 13 leap days).
-        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
-    }
-
-    #[test]
-    fn aws_dates_formats_epoch() {
-        let (amz, stamp) = aws_dates(0);
-        assert_eq!(amz, "19700101T000000Z");
-        assert_eq!(stamp, "19700101");
-    }
-
-    /// The signing-key derivation is validated against the vector AWS publishes
-    /// in "Examples of how to derive a version 4 signing key". This pins the
-    /// whole HMAC chain independently of any Route 53 request shaping.
-    #[test]
-    fn signing_key_matches_aws_documented_vector() {
-        let key = derive_signing_key(
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            "20150830",
-            "us-east-1",
-            "iam",
-        );
-        assert_eq!(
-            hex_lower(&key),
-            "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
-        );
-    }
 
     #[test]
     fn find_txt_rrset_matches_exact_name_only() {

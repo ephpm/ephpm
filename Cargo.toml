@@ -83,7 +83,7 @@ tonic = { version = "0.14", default-features = false, features = ["tls-native-ro
 # "no provider" means reqwest supplies neither a crypto provider nor a root
 # store; `otlp.rs` hands it a fully-built `rustls::ClientConfig` instead.
 # That is also why the roots are our own dependencies below.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots-no-provider", "stream"] }
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 thiserror = "2"
@@ -150,7 +150,7 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc
 serial_test = "3"
 dashmap = "6"
 parking_lot = "0.12"
-tokio-util = { version = "0.7", features = ["rt", "compat"] }
+tokio-util = { version = "0.7", features = ["rt", "compat", "io"] }
 bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"

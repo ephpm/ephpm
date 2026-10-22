@@ -183,6 +183,47 @@ The `30s` default `load_timeout` is therefore generous for stores of tens
 of millions of keys on similar hardware; the knob exists for slow disks and
 cgroup-throttled pods.
 
+## Object storage
+
+A pod whose disk does not survive it (a Deployment, a spot instance) has
+nowhere to keep a local file, so `mode = "object"` keeps the snapshot in an
+S3-compatible bucket instead: `s3://<bucket>/<prefix>/<identity>.kvsnap`.
+The file format is identical — the object *is* the file — so `inspect` and
+`verify` accept an `s3://` URL, and nothing about encryption changes: the
+bucket holds ciphertext sealed under `[kv] secret`, and the bucket's own
+server-side encryption, if any, is a second layer, not the first.
+
+A save writes the file to a staging directory, uploads it as one streamed
+`PutObject` (never held in memory; the single-PUT limit is 5 GiB, far above
+any `max_size` worth loading at startup) and deletes the staging copy. A
+load downloads the object to the staging file, loads it and deletes it; the
+download counts against `load_timeout`. The object is the only source — a
+failed download is a cold start (reason `io`), never a fallback to a stale
+local file, because "warm from last week" is worse than cold.
+
+**Identity in a Deployment.** Pod names are random, so `identity` must be
+set. The simple, correct choice is one shared identity per Deployment: every
+replica overwrites the same object at shutdown, and a replacement pod loads
+whichever replica stopped last. For a cache warm-up that is exactly right —
+any recent replica's store is a good approximation of the others'. A
+per-replica object (with the pod ordinal, say) only makes sense for a
+StatefulSet, where a PVC is the simpler answer anyway.
+
+**The client** ([`crates/ephpm-server/src/s3.rs`](https://github.com/ephpm/ephpm/blob/main/crates/ephpm-server/src/s3.rs))
+is ~300 lines over reqwest and the shared SigV4 signer (`sigv4.rs`, also
+used by the Route 53 DNS-01 provider): PUT, GET, HEAD, DELETE and
+ListObjectsV2. Not the AWS SDK and not `object_store`: both enable
+reqwest's `rustls-tls-native-roots`, which links `ring` — a second rustls
+crypto provider next to aws-lc-rs, the exact configuration that broke
+static TLS in every release up to v0.6.1 (#241). Uploads and downloads are
+signed with `UNSIGNED-PAYLOAD` (S3, MinIO, R2 and GCS all accept it), so a
+gigabyte is streamed once and hashed never; the snapshot's AEAD verifies
+every byte on load. Credentials are the standard `AWS_*` environment
+variables only. Instance-profile and web-identity (IRSA) providers are not
+implemented; mount a static key from a Secret with a least-privilege policy
+(the guide has one). Tested against an in-process mock that re-derives
+every request's signature, and against MinIO in the lab.
+
 ## Cluster
 
 In a cluster the snapshot covers everything this node held: gossip-tier
@@ -190,8 +231,7 @@ small values (which the live cluster re-sends anyway) and the large values
 this node owned or replicated. A snapshot-restored entry carries no write
 stamp, so any replicated write that arrives for the key — gossip catch-up or
 a data-plane push — replaces it. Peer handoff on shutdown and peer warm-up on
-start, and snapshots in S3-compatible object storage for ephemeral pods, are
-the next two pieces of this feature.
+start are the next piece of this feature.
 
 ## See also
 

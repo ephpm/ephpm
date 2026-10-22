@@ -150,6 +150,109 @@ Notes:
   `load_timeout` passes — the pod does not take traffic cold-while-loading.
 - **The config is a Secret** because it holds `[kv] secret`.
 
+## Kubernetes: Deployment + object storage
+
+A Deployment pod has no stable disk, so keep the snapshot in a bucket
+instead. Any S3-compatible store works: S3, Cloudflare R2, MinIO, Google
+Cloud Storage's S3 API.
+
+```toml
+[kv]
+secret = "<long random string>"
+
+[kv.snapshot]
+mode = "object"
+url = "s3://my-kv-snapshots/prod/web"   # bucket + prefix; object = prod/web/<identity>.kvsnap
+identity = "web"                        # pod names are random: one shared identity per Deployment
+# region = "us-east-1"                  # AWS default; endpoint defaults to https://s3.<region>.amazonaws.com
+```
+
+Non-AWS endpoints:
+
+```toml
+# Cloudflare R2
+endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+region = "auto"
+
+# MinIO (in-cluster)
+endpoint = "http://minio.minio.svc:9000"
+
+# Google Cloud Storage, S3-compatible API (HMAC key)
+endpoint = "https://storage.googleapis.com"
+```
+
+Credentials come **only** from the environment — `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, optionally `AWS_SESSION_TOKEN` — and startup fails
+if they are missing. Mount them from a Secret:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      terminationGracePeriodSeconds: 120   # drain + snapshot write + upload
+      containers:
+        - name: ephpm
+          image: ghcr.io/ephpm/ephpm:latest
+          args: ["serve", "--config", "/etc/ephpm/ephpm.toml"]
+          envFrom:
+            - secretRef:
+                name: kv-snapshot-s3      # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ephpm
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /_ephpm/ready, port: 8080 }
+      volumes:
+        - name: config
+          secret:
+            secretName: ephpm-config
+```
+
+With one shared `identity`, every replica overwrites the same object when it
+stops and a new pod loads whichever replica stopped last — for a cache
+warm-up, any recent replica's store is as good as its own. On a multi-site
+node the environment is visible to tenant PHP (`getenv()`), so the key must
+be scoped to this one bucket and prefix. Least privilege, AWS:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-kv-snapshots/prod/web/*" },
+    { "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-kv-snapshots",
+      "Condition": { "StringLike": { "s3:prefix": ["prod/web/*"] } } }
+  ]
+}
+```
+
+`ListBucket` is only needed by `ephpm kv snapshot list`; the server itself
+uses `PutObject`, `GetObject` and (for `rm`) `DeleteObject`. Instance
+profiles / IRSA are **not** supported — the client reads static keys only.
+The bucket holds ciphertext sealed under `[kv] secret`; bucket-side
+encryption is a second layer, not a substitute.
+
+Operations against the bucket:
+
+```bash
+ephpm kv snapshot list --config /etc/ephpm/ephpm.toml
+ephpm kv snapshot inspect s3://my-kv-snapshots/prod/web/web.kvsnap --config /etc/ephpm/ephpm.toml
+ephpm kv snapshot rm web --config /etc/ephpm/ephpm.toml
+```
+
 ## Checking on it
 
 ```bash
@@ -204,9 +307,11 @@ passwords already have.
 
 ## Limits, honestly
 
-- Local mode only, today: a pod with an **empty** disk (a Deployment
-  without a volume) starts cold. Object-storage snapshots and peer handoff
-  in a cluster are the next two pieces.
+- Peer handoff in a cluster (warming a new node from its peers, no disk or
+  bucket involved) is the next piece; until then a cluster node warms from
+  its own file or object only.
+- Object mode reads static `AWS_*` credentials only; no instance profile,
+  no IRSA, no multipart upload (one `PutObject` up to 5 GiB).
 - A snapshot is node-local. In a cluster each node writes its own; nothing
   merges them, and a restored value can be briefly stale next to a peer that
   kept serving. The next replicated write to the key corrects it.
