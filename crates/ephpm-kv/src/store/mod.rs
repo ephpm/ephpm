@@ -5396,6 +5396,15 @@ mod tests {
         }
         fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
         fn replicate_remove_published(&self, _: String) {}
+        fn replicate_hash_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+        ) -> bool {
+            let _ = apply();
+            true
+        }
         fn fetch_through(&self, _: &str) -> Option<Vec<u8>> {
             self.fetched_through.fetch_add(1, Ordering::SeqCst);
             Some(b"from-cluster".to_vec())
