@@ -576,7 +576,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // hold startup past the deadline.
     if let Some(handoff) = &kv_handoff {
         let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
-        let report = handoff.pull(deadline).await;
+        let report = handoff.pull(deadline, !config.cluster.join.is_empty()).await;
         kv_snapshot::record_handoff("in", &report);
     }
 

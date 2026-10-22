@@ -71,6 +71,11 @@ const PUSH_CONCURRENCY: usize = 16;
 /// Entries waiting between the store walk and the push tasks.
 const PUSH_QUEUE: usize = 64;
 
+/// How long a starting node with join seeds waits for gossip to list a
+/// first alive peer before pulling. A gossip round is sub-second; this is
+/// the bound for a cluster whose other nodes are all restarting at once.
+pub const PEER_DISCOVERY_WAIT: Duration = Duration::from_secs(10);
+
 /// The transport (wire) key of `key` in `site` (`""` = the global store).
 #[must_use]
 pub fn transport_key(site: &str, key: &str) -> String {
@@ -235,10 +240,36 @@ impl PeerHandoff {
     /// Pull this node's share of large values from every alive peer, applying
     /// each entry as a stamped write. Stops at `deadline` with what was
     /// received kept.
-    pub async fn pull(&self, deadline: Instant) -> HandoffReport {
+    ///
+    /// `expect_peers` says the node was configured to join others (it has
+    /// seeds): the pull then first waits — up to [`PEER_DISCOVERY_WAIT`] or
+    /// the deadline, whichever is sooner — for gossip to list at least one
+    /// alive peer. Startup calls this right after the listeners bind, before
+    /// a single gossip round has completed, so without the wait a restarted
+    /// node asked nobody and warmed from nothing.
+    pub async fn pull(&self, deadline: Instant, expect_peers: bool) -> HandoffReport {
         let started = Instant::now();
         let self_id = self.cluster.self_node().id;
-        let peers = self.peers().await;
+        let mut peers = self.peers().await;
+        if expect_peers && peers.is_empty() {
+            let give_up = deadline.min(started + PEER_DISCOVERY_WAIT);
+            while peers.is_empty() && Instant::now() < give_up {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                peers = self.peers().await;
+            }
+            if peers.is_empty() {
+                tracing::warn!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "KV warm-up pull: no alive peer appeared in gossip; warming from nothing"
+                );
+            } else {
+                tracing::debug!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    peers = peers.len(),
+                    "KV warm-up pull: gossip membership formed"
+                );
+            }
+        }
         let mut report = HandoffReport { peers: peers.len(), ..HandoffReport::default() };
         for (peer, addr) in peers {
             if Instant::now() >= deadline {

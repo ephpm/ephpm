@@ -222,7 +222,7 @@ async fn push_on_drain_and_pull_on_start_keep_large_values_available() {
     let b2 = start_node(b_ip, port, vec![seed], "ho-b").await;
     wait_alive(&[&a, &c, &b2], 3).await;
     assert_eq!(b2.local.len(), 0, "cold");
-    let report = b2.handoff.pull(tokio::time::Instant::now() + Duration::from_secs(10)).await;
+    let report = b2.handoff.pull(tokio::time::Instant::now() + Duration::from_secs(10), true).await;
     assert!(!report.timed_out && report.failed_peers == 0, "{report:?}");
     assert!(report.keys > 0, "b pulled nothing: {report:?}");
     let nodes = [a, b2, c];
@@ -292,7 +292,7 @@ async fn alone_in_the_cluster_is_a_fast_no_op() {
     let port = free_data_port();
     let a = start_node("127.0.0.1", port, vec![], "solo").await;
     let started = Instant::now();
-    let pulled = a.handoff.pull(tokio::time::Instant::now() + Duration::from_secs(5)).await;
+    let pulled = a.handoff.pull(tokio::time::Instant::now() + Duration::from_secs(5), false).await;
     let pushed = a.handoff.push(tokio::time::Instant::now() + Duration::from_secs(5)).await;
     assert_eq!((pulled.keys, pulled.peers), (0, 0));
     assert_eq!((pushed.keys, pushed.peers), (0, 0));
