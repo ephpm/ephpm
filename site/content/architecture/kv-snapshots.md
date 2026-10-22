@@ -331,7 +331,9 @@ snapshot next to live peers would be safe again.
 
 **What it does not do.** It does not rebalance on every membership change
 (only the leaving and the joining node move data), it does not hand off
-hashes (they are not replicated at all), and a node killed without a
+hashes — it does not need to: since v0.13 every hash field rides the
+gossip tier, which every node holds, so a restarted node gets hashes back
+from gossip state sync just as it gets small strings back — and a node killed without a
 graceful stop pushes nothing — its keys survive only where
 `replication_factor` already put them. The pull is a walk of every peer's
 large values per joining node: O(total large values) of CPU on each peer,

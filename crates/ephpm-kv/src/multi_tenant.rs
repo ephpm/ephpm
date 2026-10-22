@@ -376,6 +376,15 @@ mod tests {
             fn replicate_published(&self, key: String, _v: Vec<u8>, _t: Option<Duration>) {
                 self.sets.lock().unwrap().push(format!("{}:{key}", self.site));
             }
+            fn replicate_hash_field(
+                &self,
+                _key: &str,
+                _field: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
             fn replicate_remove_published(&self, key: String) {
                 self.sets.lock().unwrap().push(format!("{}:{key}", self.site));
             }
@@ -436,6 +445,15 @@ mod tests {
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
+            fn replicate_hash_field(
+                &self,
+                _key: &str,
+                _field: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
             fn replicate_remove_published(&self, _key: String) {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
@@ -493,6 +511,15 @@ mod tests {
                 true
             }
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
+            fn replicate_hash_field(
+                &self,
+                _key: &str,
+                _field: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
             fn replicate_remove_published(&self, _key: String) {}
         }
 
@@ -557,6 +584,15 @@ mod tests {
                 true
             }
             fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
+            fn replicate_hash_field(
+                &self,
+                _key: &str,
+                _field: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
             fn replicate_remove_published(&self, _key: String) {}
         }
 

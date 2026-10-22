@@ -130,7 +130,7 @@ eviction_policy = "allkeys-lru"  # noeviction, allkeys-lru, volatile-lru, allkey
 
 ## PHP Access
 
-PHP reaches the KV store three ways. The SAPI functions and the native session handler run in-process; the RESP listener is a TCP socket for existing Redis clients. All three see the same store, and with clustering on, string writes (`SET`, `DEL`, `EXPIRE`, `INCR`) are replicated by the cluster layer described below. Hash commands (`HSET`/`HDEL`) and `FLUSHDB` stay node-local — see [KV Store → replication](/architecture/kv-store/).
+PHP reaches the KV store three ways. The SAPI functions and the native session handler run in-process; the RESP listener is a TCP socket for existing Redis clients. All three see the same store, and with clustering on, string writes (`SET`, `DEL`, `EXPIRE`, `INCR`) and — since v0.13 — hash writes (`HSET`, `HDEL`, `HINCRBY`, field TTLs; replicated **per field**) are replicated by the cluster layer described below. `FLUSHDB` stays node-local — see [KV Store → replication](/architecture/kv-store/) and [KV RESP Protocol → Hashes in a cluster](/reference/kv-resp/#hashes-in-a-cluster).
 
 ### 1. Redis Protocol (RESP) — Redis-compatible for caching, not a Redis replacement
 
@@ -142,7 +142,7 @@ enabled = true
 listen = "127.0.0.1:6379"   # TCP only
 ```
 
-**What works.** Plain caching: strings with TTLs, counters, and hashes. That covers most object-cache and page-cache usage. The exact command list (`GET`/`SET` with `EX`/`PX`/`NX`/`XX`/`GET`, `MGET`/`MSET`, `INCR`/`DECR`, `EXPIRE`/`TTL`, `HSET`/`HGET`/`HGETALL` and the other basic hash commands, `KEYS`, `DBSIZE`, `FLUSHDB`, `DELIFEQ`, `AUTH`, `INFO`, …) is in [KV from PHP](/guides/kv-from-php/). Anything else returns `ERR unknown command`.
+**What works.** Plain caching: strings with TTLs, counters, and hashes (with per-field TTLs). That covers most object-cache and page-cache usage. The exact command list (`GET`/`SET` with `EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`/`NX`/`XX`/`IFEQ`/`GET`, `GETDEL`, `GETEX`, `MGET`/`MSET`, `INCR`/`DECR`, `EXPIRE`/`EXPIREAT`/`TTL`/`EXPIRETIME`, `HSET`/`HMGET`/`HINCRBY`/`HEXPIRE` and the other hash commands, `SCAN`/`HSCAN`, `KEYS`, `UNLINK`, `DBSIZE`, `FLUSHDB`, `DELIFEQ`, `AUTH`, `INFO`, …) is in the [KV RESP Protocol reference](/reference/kv-resp/). Anything else returns `ERR unknown command`.
 
 **What does not exist** — check this list before pointing a framework at the listener:
 
@@ -153,7 +153,7 @@ listen = "127.0.0.1:6379"   # TCP only
 | Sets and sorted sets | Laravel cache **tags**, leaderboards, rate limiters built on sorted sets. |
 | `MULTI`/`EXEC` | Transactions and pipelined-transaction helpers (e.g. Laravel's `RedisStore::putMany`). |
 | `EVAL`/`EVALSHA` | Lua scripts, including Laravel's atomic lock release. |
-| `SCAN`, `HMGET`, `HMSET`, `HINCRBY`, `UNLINK`, `EXPIREAT` | Clients and libraries that use them (e.g. `SCAN`-based cache clears). |
+| `INCRBYFLOAT`, `GETRANGE`/`SETRANGE`, `MSETNX`, `RANDOMKEY` | Clients and libraries that use them. |
 | Pub/sub | Broadcasting, cache-invalidation channels. |
 
 Two further traps:

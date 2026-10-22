@@ -2,13 +2,17 @@
 //!
 //! Translates parsed RESP frames into operations on the [`Store`].
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::debug;
 
 use crate::resp::Frame;
-use crate::store::{OOM_ERROR, OWNER_UNREACHABLE_ERROR, SetNxOutcome, Store};
+use crate::store::{
+    ExpireCondition, GetExpiry, KeyKind, OOM_ERROR, OWNER_UNREACHABLE_ERROR, SetIfEqOutcome,
+    SetNxOutcome, SetTtl, Store,
+};
 
 /// Error frame for a write refused by the memory budget (Redis `-OOM`).
 fn oom() -> Frame {
@@ -20,6 +24,16 @@ macro_rules! check_args {
     ($cmd:expr, $argv:expr, $n:expr) => {
         if let Err(e) = require_args($cmd, $argv, $n) {
             return e;
+        }
+    };
+}
+
+/// Early-return an arity error unless `argv` has exactly `n` elements.
+macro_rules! check_args_exact {
+    ($cmd:expr, $argv:expr, $n:expr) => {
+        if $argv.len() != $n {
+            let name = $cmd.to_ascii_lowercase();
+            return Frame::error(format!("ERR wrong number of arguments for '{name}' command"));
         }
     };
 }
@@ -278,10 +292,20 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             }
         }
 
+        "GETDEL" => {
+            check_args_exact!(cmd, argv, 1);
+            let key = key!(argv[0]);
+            store.getdel(&key).map_or(Frame::Null, Frame::bulk)
+        }
+        "GETEX" => cmd_getex(store, argv),
+
         // ── Key operations ───────────────────────────────────────
-        "DEL" => {
+        // `UNLINK` is `DEL`: removing a large hash frees it off the calling
+        // thread in both (Valkey 8's `lazyfree-lazy-user-del yes` default).
+        "DEL" | "UNLINK" => {
             if argv.is_empty() {
-                return Frame::error("ERR wrong number of arguments for 'del' command");
+                let name = cmd.to_ascii_lowercase();
+                return Frame::error(format!("ERR wrong number of arguments for '{name}' command"));
             }
             check_keys!(argv.iter());
             let removed: i64 = argv
@@ -341,6 +365,40 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             };
             let ok = store.expire(&key, ttl);
             Frame::integer(i64::from(ok))
+        }
+        "EXPIREAT" | "PEXPIREAT" => {
+            check_args!(cmd, argv, 2);
+            let key = key!(argv[0]);
+            let unit = if cmd == "EXPIREAT" { TtlUnit::Seconds } else { TtlUnit::Millis };
+            let name = cmd.to_ascii_lowercase();
+            let at = match parse_i64(argv[1]).map(|v| absolute_ttl(v, unit)) {
+                Ok(Some(at)) => at,
+                Ok(None) => {
+                    return Frame::error(format!("ERR invalid expire time in '{name}' command"));
+                }
+                Err(f) => return f,
+            };
+            match at {
+                // A time already past deletes the key, as Redis does.
+                AbsoluteTtl::Passed => {
+                    let existed = store.exists(&key);
+                    if existed {
+                        store.remove(&key);
+                    }
+                    Frame::integer(i64::from(existed))
+                }
+                AbsoluteTtl::After(ttl) => Frame::integer(i64::from(store.expire(&key, ttl))),
+            }
+        }
+        "EXPIRETIME" | "PEXPIRETIME" => {
+            check_args_exact!(cmd, argv, 1);
+            let key = key!(argv[0]);
+            match store.expire_time_ms(&key) {
+                None => Frame::integer(-2),
+                Some(-1) => Frame::integer(-1),
+                Some(ms) if cmd == "PEXPIRETIME" => Frame::integer(ms),
+                Some(ms) => Frame::integer(ms / 1000),
+            }
         }
         "TTL" => {
             check_args!(cmd, argv, 1);
@@ -409,6 +467,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             let keys = store.keys(&pattern);
             Frame::Array(keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect())
         }
+        "SCAN" => cmd_scan(store, argv),
         "DBSIZE" => Frame::integer(i64::try_from(store.len()).unwrap_or(i64::MAX)),
         "FLUSHDB" | "FLUSHALL" => {
             store.flush();
@@ -416,27 +475,102 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         }
 
         // ── Hash operations ──────────────────────────────────────
-        "HSET" => {
+        "HSET" | "HMSET" => {
             if argv.len() < 3 || argv.len().is_multiple_of(2) {
-                return Frame::error("ERR wrong number of arguments for 'hset' command");
+                let name = cmd.to_ascii_lowercase();
+                return Frame::error(format!("ERR wrong number of arguments for '{name}' command"));
             }
             let key = key!(argv[0]);
             check_keys!(argv[1..].iter().step_by(2));
-            let mut added = 0i64;
+            let pairs: Vec<(String, &[u8])> =
+                argv[1..].chunks(2).map(|pair| (str_from(pair[0]), pair[1])).collect();
+            let pairs: Vec<(&str, &[u8])> = pairs.iter().map(|(f, v)| (f.as_str(), *v)).collect();
             // Under memory pressure a refused field returns `-OOM` and stops,
             // so earlier fields may already be stored — the same best-effort
-            // contract as MSET.
-            for pair in argv[1..].chunks(2) {
-                let field = str_from(pair[0]);
-                let value = pair[1].to_vec();
-                match store.hset(&key, &field, value) {
-                    Some(true) => added += 1,
-                    Some(false) => {}
-                    None => return oom(),
+            // contract as MSET. A value too large for a clustered hash field
+            // is refused before anything is written.
+            match store.hset_many(&key, &pairs) {
+                Ok(added) if cmd == "HSET" => {
+                    Frame::integer(i64::try_from(added).unwrap_or(i64::MAX))
                 }
+                Ok(_) => Frame::ok(),
+                Err(e) => Frame::error(e.to_string()),
             }
-            Frame::integer(added)
         }
+        "HSETNX" => {
+            check_args_exact!(cmd, argv, 3);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
+            match store.hsetnx(&key, &field, argv[2]) {
+                Ok(set) => Frame::integer(i64::from(set)),
+                Err(e) => Frame::error(e.to_string()),
+            }
+        }
+        "HMGET" => {
+            check_args!(cmd, argv, 2);
+            let key = key!(argv[0]);
+            check_keys!(argv[1..].iter());
+            let fields: Vec<String> = argv[1..].iter().map(|f| str_from(f)).collect();
+            let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            Frame::Array(
+                store
+                    .hmget(&key, &fields)
+                    .into_iter()
+                    .map(|v| v.map_or(Frame::Null, Frame::bulk))
+                    .collect(),
+            )
+        }
+        "HINCRBY" => {
+            check_args_exact!(cmd, argv, 3);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
+            let delta = match parse_i64(argv[2]) {
+                Ok(v) => v,
+                Err(f) => return f,
+            };
+            match store.hincr_by(&key, &field, delta) {
+                Ok(v) => Frame::integer(v),
+                Err(e) => Frame::error(e),
+            }
+        }
+        "HINCRBYFLOAT" => {
+            check_args_exact!(cmd, argv, 3);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
+            let Some(delta) = crate::store::parse_float(argv[2]) else {
+                return Frame::error("ERR value is not a valid float");
+            };
+            match store.hincr_by_float(&key, &field, delta) {
+                Ok(v) => Frame::bulk(v.into_bytes()),
+                Err(e) => Frame::error(e),
+            }
+        }
+        "HSTRLEN" => {
+            check_args_exact!(cmd, argv, 2);
+            let key = key!(argv[0]);
+            let field = key!(argv[1]);
+            Frame::integer(i64::try_from(store.hstrlen(&key, &field)).unwrap_or(i64::MAX))
+        }
+        "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" => cmd_hexpire(store, cmd, argv),
+        "HTTL" | "HPTTL" | "HEXPIRETIME" | "HPEXPIRETIME" | "HPERSIST" => {
+            check_args!(cmd, argv, 4);
+            let key = key!(argv[0]);
+            let fields = match parse_fields(argv, 1) {
+                Ok(f) => f,
+                Err(e) => return e,
+            };
+            let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            let codes = match cmd {
+                "HPERSIST" => store.hpersist(&key, &fields),
+                "HPTTL" => store.hpttl(&key, &fields),
+                "HPEXPIRETIME" => store.hexpiretime_ms(&key, &fields),
+                // Seconds: only the non-negative values are times.
+                "HTTL" => store.hpttl(&key, &fields).into_iter().map(ms_to_secs).collect(),
+                _ => store.hexpiretime_ms(&key, &fields).into_iter().map(ms_to_secs).collect(),
+            };
+            Frame::Array(codes.into_iter().map(Frame::integer).collect())
+        }
+        "HSCAN" => cmd_hscan(store, argv),
         "HGET" => {
             check_args!(cmd, argv, 2);
             let key = key!(argv[0]);
@@ -497,10 +631,18 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
 
         // ── Server info ──────────────────────────────────────────
         "INFO" => {
-            let info = format!(
-                "# Server\r\nredis_version:7.0.0\r\nredis_mode:embedded\r\ntcp_port:6379\r\n# Memory\r\nused_memory:{}\r\n",
+            let (keys, expires, hits, misses) = store.keyspace_info();
+            let mut info = format!(
+                "# Server\r\nredis_version:7.0.0\r\nredis_mode:embedded\r\ntcp_port:6379\r\n\
+                 # Memory\r\nused_memory:{}\r\n\
+                 # Stats\r\nkeyspace_hits:{hits}\r\nkeyspace_misses:{misses}\r\n\
+                 # Keyspace\r\n",
                 store.mem_used()
             );
+            // Redis omits a database with no keys.
+            if keys > 0 {
+                let _ = write!(info, "db0:keys={keys},expires={expires},avg_ttl=0\r\n");
+            }
             Frame::bulk(info.into_bytes())
         }
 
@@ -510,11 +652,43 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Execute the SET command with options: SET key value [EX seconds|PX ms] [NX|XX] [GET].
-/// `EXAT`/`PXAT` are not implemented (they return `ERR syntax error`). As in
-/// Redis, a non-integer `EX`/`PX` value is `ERR value is not an integer or out
-/// of range`, and a non-positive or overflowing one is `ERR invalid expire time
-/// in 'set' command`; giving both `EX` and `PX` is `ERR syntax error`.
+/// The expiry option of a `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetExpiry {
+    /// No expiry option: the key is stored without one.
+    None,
+    /// Expire this long from now.
+    After(Duration),
+    /// `EXAT`/`PXAT` naming a time already past: the write happens and the
+    /// key is immediately gone, as in Redis.
+    Passed,
+    /// `KEEPTTL`.
+    Keep,
+}
+
+/// The condition of a `SET` (`NX`/`XX`/`IFEQ`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetCondition {
+    /// Unconditional.
+    None,
+    /// Only if absent.
+    Nx,
+    /// Only if present.
+    Xx,
+    /// Only while the current value equals this (Valkey 8.1 `IFEQ`).
+    IfEq(Vec<u8>),
+}
+
+/// Execute `SET key value [NX | XX | IFEQ comparison] [GET]
+/// [EX s | PX ms | EXAT unix-s | PXAT unix-ms | KEEPTTL]`.
+///
+/// As in Redis/Valkey: the expiry options are mutually exclusive, as are
+/// `NX`/`XX`/`IFEQ` (`ERR syntax error`, except the historical `NX`+`XX`
+/// message); a non-integer time is `ERR value is not an integer or out of
+/// range` and a non-positive or overflowing one `ERR invalid expire time in
+/// 'set' command`. `IFEQ` sets only while the current value equals
+/// `comparison` and never creates the key; with `GET` it replies with the
+/// value the key held before.
 fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
     if argv.len() < 2 {
         return Frame::error("ERR wrong number of arguments for 'set' command");
@@ -522,33 +696,62 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
 
     let key = key!(argv[0]);
     let val = argv[1].to_vec();
-    let mut ttl: Option<Duration> = None;
-    let mut nx = false;
-    let mut xx = false;
+    let mut expiry = SetExpiry::None;
+    let mut cond = SetCondition::None;
+    let mut nx_and_xx = false;
     let mut get = false;
 
     let mut i = 2;
     while i < argv.len() {
-        let opt = str_from(argv[i]).to_uppercase();
+        let opt = str_from(argv[i]).to_ascii_uppercase();
         match opt.as_str() {
-            "EX" | "PX" => {
-                if i + 1 >= argv.len() || ttl.is_some() {
+            "EX" | "PX" | "EXAT" | "PXAT" => {
+                if i + 1 >= argv.len() || expiry != SetExpiry::None {
                     return Frame::error("ERR syntax error");
                 }
-                let unit = if opt == "EX" { TtlUnit::Seconds } else { TtlUnit::Millis };
-                match expire_arg(argv[i + 1], unit, "set") {
-                    Ok(d) => ttl = Some(d),
-                    Err(f) => return f,
-                }
+                let unit = if opt.starts_with('E') { TtlUnit::Seconds } else { TtlUnit::Millis };
+                expiry = if opt.ends_with("AT") {
+                    match parse_i64(argv[i + 1]).map(|v| positive_absolute_ttl(v, unit)) {
+                        Ok(Some(AbsoluteTtl::After(d))) => SetExpiry::After(d),
+                        Ok(Some(AbsoluteTtl::Passed)) => SetExpiry::Passed,
+                        Ok(None) => {
+                            return Frame::error("ERR invalid expire time in 'set' command");
+                        }
+                        Err(f) => return f,
+                    }
+                } else {
+                    match expire_arg(argv[i + 1], unit, "set") {
+                        Ok(d) => SetExpiry::After(d),
+                        Err(f) => return f,
+                    }
+                };
                 i += 2;
             }
-            "NX" => {
-                nx = true;
+            "KEEPTTL" => {
+                if expiry != SetExpiry::None {
+                    return Frame::error("ERR syntax error");
+                }
+                expiry = SetExpiry::Keep;
                 i += 1;
             }
-            "XX" => {
-                xx = true;
+            "NX" | "XX" => {
+                cond = match (&cond, opt.as_str()) {
+                    (SetCondition::None, "NX") => SetCondition::Nx,
+                    (SetCondition::None, _) => SetCondition::Xx,
+                    (SetCondition::Nx, "XX") | (SetCondition::Xx, "NX") => {
+                        nx_and_xx = true;
+                        cond
+                    }
+                    _ => return Frame::error("ERR syntax error"),
+                };
                 i += 1;
+            }
+            "IFEQ" => {
+                if i + 1 >= argv.len() || cond != SetCondition::None {
+                    return Frame::error("ERR syntax error");
+                }
+                cond = SetCondition::IfEq(argv[i + 1].to_vec());
+                i += 2;
             }
             "GET" => {
                 get = true;
@@ -560,66 +763,371 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         }
     }
 
-    if nx && xx {
+    if nx_and_xx {
         return Frame::error("ERR NX and XX options at the same time are not compatible");
     }
 
-    // NX path: route through the atomic primitive so concurrent
-    // SET ... NX callers see exactly one winner. Note: the NX + GET
-    // combo still has a small window (we re-fetch the existing value
-    // after losing the race) — Redis itself returns the value as it
-    // was *before* our attempt, but exposing that requires a
-    // set-and-return-old primitive we don't have. Acceptable: NX+GET
-    // is rarely used and the value fetched here is still consistent
-    // with what's stored after the call.
-    if nx {
-        return match store.set_nx_outcome(key.clone(), val, ttl) {
-            // A memory refusal is `-OOM`, distinct from the `nil` that means
-            // "the key already existed" (#477).
-            SetNxOutcome::OutOfMemory => oom(),
-            // Clustered: the key's owner could not be reached, so nothing was
-            // written anywhere. Not `nil` — that would claim the key exists.
-            SetNxOutcome::OwnerUnreachable => Frame::error(OWNER_UNREACHABLE_ERROR),
-            SetNxOutcome::Inserted => {
-                if get {
-                    // NX+GET on a successful insert: no prior value.
-                    Frame::Null
-                } else {
-                    Frame::ok()
-                }
+    match cond {
+        SetCondition::Nx => set_nx(store, key, val, expiry, get),
+        SetCondition::IfEq(expected) => set_if_eq(store, key, &expected, val, expiry, get),
+        SetCondition::None | SetCondition::Xx => {
+            let old = store.get(&key);
+            // XX: set only if the key exists.
+            if cond == SetCondition::Xx && old.is_none() {
+                return Frame::Null;
             }
-            SetNxOutcome::Exists => {
-                if get {
-                    match store.get(&key) {
-                        Some(v) => Frame::bulk(v),
-                        None => Frame::Null,
-                    }
-                } else {
-                    Frame::Null
+            let ttl = match expiry {
+                SetExpiry::None => None,
+                SetExpiry::After(d) => Some(d),
+                SetExpiry::Keep => keep_ttl(store, &key),
+                SetExpiry::Passed => {
+                    // Written and immediately expired: the key is gone.
+                    store.remove(&key);
+                    return reply_set(get, old);
                 }
+            };
+            if !store.set(key, val, ttl) {
+                return oom();
             }
-        };
-    }
-
-    let old = store.get(&key);
-
-    // XX: Set only if the key exists
-    if xx && old.is_none() {
-        return Frame::Null;
-    }
-
-    if !store.set(key, val, ttl) {
-        return oom();
-    }
-
-    if get {
-        match old {
-            Some(v) => Frame::bulk(v),
-            None => Frame::Null,
+            reply_set(get, old)
         }
-    } else {
-        Frame::ok()
     }
+}
+
+/// `+OK`, or with `GET` the value the key held before (`nil` if none).
+fn reply_set(get: bool, old: Option<bytes::Bytes>) -> Frame {
+    if get { old.map_or(Frame::Null, Frame::bulk) } else { Frame::ok() }
+}
+
+/// The remaining TTL of `key` for `KEEPTTL` (`None` = no expiry to keep).
+fn keep_ttl(store: &Store, key: &str) -> Option<Duration> {
+    store
+        .string_expiry(key)
+        .flatten()
+        .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+        .filter(|d| !d.is_zero())
+}
+
+/// `SET ... NX`, routed through the atomic primitive so concurrent callers
+/// see exactly one winner.
+///
+/// With `GET`, a lost race re-reads the existing value: Redis returns the
+/// value as it was before the attempt, which needs a set-and-return-old
+/// primitive this store does not have. The value fetched is consistent with
+/// what is stored after the call.
+fn set_nx(store: &Store, key: String, val: Vec<u8>, expiry: SetExpiry, get: bool) -> Frame {
+    let ttl = match expiry {
+        SetExpiry::After(d) => Some(d),
+        // An absent key has no TTL to keep.
+        SetExpiry::None | SetExpiry::Keep => None,
+        SetExpiry::Passed => {
+            // Written and immediately gone: only the reply is observable.
+            return match (store.get(&key), get) {
+                (Some(v), true) => Frame::bulk(v),
+                (Some(_), false) | (None, true) => Frame::Null,
+                (None, false) => Frame::ok(),
+            };
+        }
+    };
+    match store.set_nx_outcome(key.clone(), val, ttl) {
+        // A memory refusal is `-OOM`, distinct from the `nil` that means
+        // "the key already existed" (#477).
+        SetNxOutcome::OutOfMemory => oom(),
+        // Clustered: the key's owner could not be reached, so nothing was
+        // written anywhere. Not `nil` — that would claim the key exists.
+        SetNxOutcome::OwnerUnreachable => Frame::error(OWNER_UNREACHABLE_ERROR),
+        SetNxOutcome::Inserted => {
+            if get {
+                Frame::Null
+            } else {
+                Frame::ok()
+            }
+        }
+        SetNxOutcome::Exists => {
+            if get {
+                store.get(&key).map_or(Frame::Null, Frame::bulk)
+            } else {
+                Frame::Null
+            }
+        }
+    }
+}
+
+/// `SET ... IFEQ comparison` — compare-and-set, decided by the key's owner
+/// node in a cluster.
+fn set_if_eq(
+    store: &Store,
+    key: String,
+    expected: &[u8],
+    val: Vec<u8>,
+    expiry: SetExpiry,
+    get: bool,
+) -> Frame {
+    let ttl = match expiry {
+        SetExpiry::None | SetExpiry::Passed => SetTtl::Persist,
+        SetExpiry::After(d) => SetTtl::After(d),
+        SetExpiry::Keep => SetTtl::Keep,
+    };
+    match store.set_if_eq(key.clone(), expected, val, ttl) {
+        SetIfEqOutcome::Set => {
+            if expiry == SetExpiry::Passed {
+                store.remove(&key);
+            }
+            if get { Frame::bulk(expected.to_vec()) } else { Frame::ok() }
+        }
+        SetIfEqOutcome::NotSet => {
+            if get {
+                store.get_through(&key).map_or(Frame::Null, Frame::bulk)
+            } else {
+                Frame::Null
+            }
+        }
+        SetIfEqOutcome::OutOfMemory => oom(),
+        SetIfEqOutcome::OwnerUnreachable => Frame::error(OWNER_UNREACHABLE_ERROR),
+    }
+}
+
+/// `GETEX key [EX s | PX ms | EXAT unix-s | PXAT unix-ms | PERSIST]`.
+fn cmd_getex(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
+    check_args!("GETEX", argv, 1);
+    let key = key!(argv[0]);
+    let expiry = match argv.len() {
+        1 => None,
+        2 if str_from(argv[1]).eq_ignore_ascii_case("PERSIST") => Some(GetExpiry::Persist),
+        3 => {
+            let opt = str_from(argv[1]).to_ascii_uppercase();
+            let unit = match opt.as_str() {
+                "EX" | "EXAT" => TtlUnit::Seconds,
+                "PX" | "PXAT" => TtlUnit::Millis,
+                _ => return Frame::error("ERR syntax error"),
+            };
+            if opt.ends_with("AT") {
+                match parse_i64(argv[2]).map(|v| positive_absolute_ttl(v, unit)) {
+                    Ok(Some(AbsoluteTtl::After(d))) => Some(GetExpiry::After(d)),
+                    Ok(Some(AbsoluteTtl::Passed)) => Some(GetExpiry::Delete),
+                    Ok(None) => return Frame::error("ERR invalid expire time in 'getex' command"),
+                    Err(f) => return f,
+                }
+            } else {
+                match expire_arg(argv[2], unit, "getex") {
+                    Ok(d) => Some(GetExpiry::After(d)),
+                    Err(f) => return f,
+                }
+            }
+        }
+        _ => return Frame::error("ERR syntax error"),
+    };
+    let value = match expiry {
+        None => store.get_through(&key),
+        Some(expiry) => store.getex(&key, expiry),
+    };
+    value.map_or(Frame::Null, Frame::bulk)
+}
+
+/// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`. See
+/// [`Store::scan`] for the cursor's guarantee.
+fn cmd_scan(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
+    check_args!("SCAN", argv, 1);
+    let Some(cursor) = std::str::from_utf8(argv[0]).ok().and_then(|s| s.parse::<u64>().ok()) else {
+        return Frame::error("ERR invalid cursor");
+    };
+    let (pattern, count, kind) = match scan_options(&argv[1..], true) {
+        Ok(o) => o,
+        Err(f) => return f,
+    };
+    let page = store.scan(cursor, pattern.as_deref(), count, kind);
+    Frame::Array(vec![
+        Frame::bulk(page.cursor.to_string().into_bytes()),
+        Frame::Array(page.keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect()),
+    ])
+}
+
+/// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`.
+///
+/// Returns the whole hash in one page with cursor `0` (see
+/// [`Store::hscan`]); a non-zero cursor — which this server never hands out —
+/// gets an empty final page.
+fn cmd_hscan(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
+    check_args!("HSCAN", argv, 2);
+    let key = key!(argv[0]);
+    let Some(cursor) = std::str::from_utf8(argv[1]).ok().and_then(|s| s.parse::<u64>().ok()) else {
+        return Frame::error("ERR invalid cursor");
+    };
+    let mut novalues = false;
+    let mut rest: Vec<&[u8]> = Vec::with_capacity(argv.len());
+    for arg in &argv[2..] {
+        if str_from(arg).eq_ignore_ascii_case("NOVALUES") {
+            novalues = true;
+        } else {
+            rest.push(arg);
+        }
+    }
+    let (pattern, _count, _) = match scan_options(&rest, false) {
+        Ok(o) => o,
+        Err(f) => return f,
+    };
+    let mut items = Vec::new();
+    if cursor == 0 {
+        for (field, value) in store.hscan(&key, pattern.as_deref()) {
+            items.push(Frame::bulk(field.into_bytes()));
+            if !novalues {
+                items.push(Frame::bulk(value));
+            }
+        }
+    }
+    Frame::Array(vec![Frame::bulk(b"0".to_vec()), Frame::Array(items)])
+}
+
+/// The parsed `[MATCH pattern] [COUNT count] [TYPE type]` of a scan.
+type ScanOptions = (Option<String>, usize, Option<KeyKind>);
+
+/// Parse `[MATCH pattern] [COUNT count]` (and `[TYPE type]` when `with_type`).
+fn scan_options(args: &[&[u8]], with_type: bool) -> Result<ScanOptions, Frame> {
+    let mut pattern = None;
+    let mut count = 10usize;
+    let mut kind = None;
+    let mut i = 0;
+    while i < args.len() {
+        let opt = str_from(args[i]).to_ascii_uppercase();
+        let Some(value) = args.get(i + 1) else {
+            return Err(Frame::error("ERR syntax error"));
+        };
+        match opt.as_str() {
+            "MATCH" => match std::str::from_utf8(value) {
+                Ok(p) => pattern = Some(p.to_owned()),
+                Err(_) => return Err(Frame::error(NON_UTF8_KEY_ERROR)),
+            },
+            "COUNT" => {
+                let n = parse_i64(value)?;
+                if n < 1 {
+                    return Err(Frame::error("ERR syntax error"));
+                }
+                count = usize::try_from(n).unwrap_or(usize::MAX);
+            }
+            "TYPE" if with_type => {
+                kind = Some(match str_from(value).to_ascii_lowercase().as_str() {
+                    "string" => KeyKind::String,
+                    "hash" => KeyKind::Hash,
+                    _ => KeyKind::Other,
+                });
+            }
+            _ => return Err(Frame::error("ERR syntax error")),
+        }
+        i += 2;
+    }
+    Ok((pattern, count, kind))
+}
+
+/// Largest absolute field-expiry time Redis accepts, in Unix milliseconds
+/// (`HFE_MAX_ABS_TIME_MSEC`, 2^46 - 1: year 4199).
+const HFE_MAX_ABS_TIME_MS: i64 = (1 << 46) - 1;
+
+/// `HEXPIRE`/`HPEXPIRE`/`HEXPIREAT`/`HPEXPIREAT key time [NX|XX|GT|LT]
+/// FIELDS numfields field...` (Redis 7.4).
+fn cmd_hexpire(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
+    check_args!(cmd, argv, 4);
+    let key = key!(argv[0]);
+    let name = cmd.to_ascii_lowercase();
+    let time = match parse_i64(argv[1]) {
+        Ok(t) => t,
+        Err(f) => return f,
+    };
+    if time < 0 {
+        return Frame::error("ERR invalid expire time, must be >= 0");
+    }
+    let unit_ms = if cmd.starts_with("HP") { 1 } else { 1000 };
+    let now_ms = crate::store::unix_ms_now();
+    let absolute_ms = time
+        .checked_mul(unit_ms)
+        .and_then(|t| if cmd.ends_with("AT") { Some(t) } else { now_ms.checked_add(t) });
+    let Some(absolute_ms) = absolute_ms.filter(|ms| *ms <= HFE_MAX_ABS_TIME_MS) else {
+        return Frame::error(format!("ERR invalid expire time in '{name}' command"));
+    };
+    let remaining =
+        Duration::from_millis(u64::try_from(absolute_ms.saturating_sub(now_ms)).unwrap_or(0));
+
+    let (cond, fields_at) = match str_from(argv[2]).to_ascii_uppercase().as_str() {
+        "NX" => (ExpireCondition::Nx, 3),
+        "XX" => (ExpireCondition::Xx, 3),
+        "GT" => (ExpireCondition::Gt, 3),
+        "LT" => (ExpireCondition::Lt, 3),
+        _ => (ExpireCondition::Always, 2),
+    };
+    let fields = match parse_fields(argv, fields_at) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let codes = store.hexpire(&key, &fields, remaining, cond);
+    Frame::Array(codes.into_iter().map(Frame::integer).collect())
+}
+
+/// Parse `FIELDS numfields field...` starting at `argv[at]`, with Redis'
+/// error replies.
+fn parse_fields(argv: &[&[u8]], at: usize) -> Result<Vec<String>, Frame> {
+    let keyword_ok = argv.get(at).is_some_and(|a| str_from(a).eq_ignore_ascii_case("FIELDS"));
+    if !keyword_ok {
+        return Err(Frame::error(
+            "ERR Mandatory argument FIELDS is missing or not at the right position",
+        ));
+    }
+    let Some(count) = argv.get(at + 1) else {
+        return Err(Frame::error("ERR wrong number of arguments"));
+    };
+    let n = match parse_i64(count) {
+        Ok(n) if n >= 1 => n,
+        Ok(_) => return Err(Frame::error("ERR Parameter `numFields` should be greater than 0")),
+        Err(f) => return Err(f),
+    };
+    let fields = &argv[at + 2..];
+    if usize::try_from(n).ok() != Some(fields.len()) {
+        return Err(Frame::error(
+            "ERR The `numfields` parameter must match the number of arguments",
+        ));
+    }
+    fields
+        .iter()
+        .map(|f| {
+            std::str::from_utf8(f).map(str::to_owned).map_err(|_| Frame::error(NON_UTF8_KEY_ERROR))
+        })
+        .collect()
+}
+
+/// A field-expiry reply in milliseconds as seconds; the negative codes pass
+/// through.
+fn ms_to_secs(ms: i64) -> i64 {
+    if ms < 0 { ms } else { ms / 1000 }
+}
+
+/// An absolute expire time (`EXAT`, `PXAT`, `EXPIREAT`, ...) relative to now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsoluteTtl {
+    /// In the future: expire this long from now.
+    After(Duration),
+    /// At or before now: already expired.
+    Passed,
+}
+
+/// Turn an absolute Unix time into an [`AbsoluteTtl`], or `None` when it is
+/// out of range (the seconds overflow milliseconds, or the deadline cannot be
+/// represented).
+fn absolute_ttl(when: i64, unit: TtlUnit) -> Option<AbsoluteTtl> {
+    let when_ms = match unit {
+        TtlUnit::Seconds => when.checked_mul(1000)?,
+        TtlUnit::Millis => when,
+    };
+    let remaining = when_ms.checked_sub(crate::store::unix_ms_now())?;
+    if remaining <= 0 {
+        return Some(AbsoluteTtl::Passed);
+    }
+    checked_ttl(remaining, TtlUnit::Millis).map(AbsoluteTtl::After)
+}
+
+/// [`absolute_ttl`] for `SET`/`GETEX`'s `EXAT`/`PXAT`, which — unlike
+/// `EXPIREAT` — Redis refuses for a non-positive time (`ERR invalid expire
+/// time`).
+fn positive_absolute_ttl(when: i64, unit: TtlUnit) -> Option<AbsoluteTtl> {
+    if when <= 0 { None } else { absolute_ttl(when, unit) }
 }
 
 /// The unit of an expire argument (`EX`/`EXPIRE` vs `PX`/`PEXPIRE`).
@@ -756,6 +1264,15 @@ mod tests {
             true
         }
         fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<std::time::Duration>) {}
+        fn replicate_hash_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+        ) -> bool {
+            let _ = apply();
+            true
+        }
         fn replicate_remove_published(&self, _: String) {}
         fn route_set_nx(
             &self,
@@ -1546,5 +2063,312 @@ mod tests {
         });
         let f = cmd(&s, &["INCR", "counter"]);
         assert!(is_oom(&f), "expected -OOM, got {f:?}");
+    }
+
+    // ── v0.13 command additions ──────────────────────────────────────────
+
+    fn ints(f: &Frame) -> Vec<i64> {
+        match f {
+            Frame::Array(items) => items.iter().map(|i| int(i).expect("integer")).collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    fn strs(f: &Frame) -> Vec<Option<String>> {
+        match f {
+            Frame::Array(items) => items.iter().map(|i| bulk_str(i).map(str::to_owned)).collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    fn future_secs(delta: i64) -> String {
+        (crate::store::unix_ms_now() / 1000 + delta).to_string()
+    }
+
+    #[test]
+    fn getdel_and_getex() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(bulk_str(&cmd(&s, &["GETDEL", "k"])), Some("v"));
+        assert_eq!(cmd(&s, &["GETDEL", "k"]), Frame::Null);
+        assert!(matches!(cmd(&s, &["GETDEL"]), Frame::Error(_)));
+
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(bulk_str(&cmd(&s, &["GETEX", "k", "EX", "100"])), Some("v"));
+        assert!(int(&cmd(&s, &["TTL", "k"])).unwrap() > 98);
+        assert_eq!(bulk_str(&cmd(&s, &["GETEX", "k", "PERSIST"])), Some("v"));
+        assert_eq!(int(&cmd(&s, &["TTL", "k"])), Some(-1));
+        let pxat = (crate::store::unix_ms_now() + 50_000).to_string();
+        assert_eq!(bulk_str(&cmd(&s, &["GETEX", "k", "PXAT", &pxat])), Some("v"));
+        assert!(int(&cmd(&s, &["PTTL", "k"])).unwrap() > 48_000);
+        assert_eq!(bulk_str(&cmd(&s, &["GETEX", "k"])), Some("v"));
+        // An absolute time in the past deletes the key.
+        assert_eq!(bulk_str(&cmd(&s, &["GETEX", "k", "EXAT", "1"])), Some("v"));
+        assert_eq!(cmd(&s, &["EXISTS", "k"]), Frame::integer(0));
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(
+            err_text(&cmd(&s, &["GETEX", "k", "EX", "0"])),
+            "ERR invalid expire time in 'getex' command"
+        );
+        assert_eq!(err_text(&cmd(&s, &["GETEX", "k", "FOO", "1"])), "ERR syntax error");
+        assert_eq!(cmd(&s, &["GETEX", "missing", "EX", "10"]), Frame::Null);
+    }
+
+    #[test]
+    fn set_exat_pxat_keepttl() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SET", "k", "v", "EXAT", &future_secs(100)]), Frame::ok());
+        let ttl = int(&cmd(&s, &["TTL", "k"])).unwrap();
+        assert!(ttl > 97 && ttl <= 100, "{ttl}");
+        assert_eq!(cmd(&s, &["SET", "k", "v2", "KEEPTTL"]), Frame::ok());
+        assert!(int(&cmd(&s, &["TTL", "k"])).unwrap() > 97, "KEEPTTL kept the expiry");
+        assert_eq!(cmd(&s, &["SET", "k", "v3"]), Frame::ok());
+        assert_eq!(int(&cmd(&s, &["TTL", "k"])), Some(-1), "a plain SET clears it");
+        let pxat = (crate::store::unix_ms_now() + 30_000).to_string();
+        assert_eq!(cmd(&s, &["SET", "k", "v", "PXAT", &pxat]), Frame::ok());
+        assert!(int(&cmd(&s, &["PTTL", "k"])).unwrap() > 28_000);
+        // A past absolute time: the write happens and the key is gone.
+        assert_eq!(bulk_str(&cmd(&s, &["SET", "k", "v", "EXAT", "1", "GET"])), Some("v"));
+        assert_eq!(cmd(&s, &["GET", "k"]), Frame::Null);
+        for bad in [
+            &["SET", "k", "v", "EX", "10", "KEEPTTL"][..],
+            &["SET", "k", "v", "KEEPTTL", "PX", "10"],
+            &["SET", "k", "v", "EXAT", "10", "PXAT", "10"],
+            &["SET", "k", "v", "NX", "IFEQ", "x"],
+            &["SET", "k", "v", "IFEQ"],
+        ] {
+            assert_eq!(err_text(&cmd(&s, bad)), "ERR syntax error", "{bad:?}");
+        }
+        assert_eq!(
+            err_text(&cmd(&s, &["SET", "k", "v", "EXAT", "0"])),
+            "ERR invalid expire time in 'set' command"
+        );
+    }
+
+    #[test]
+    fn set_ifeq_is_compare_and_set() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SET", "lock", "tok", "IFEQ", "tok"]), Frame::Null, "never creates");
+        assert_eq!(cmd(&s, &["GET", "lock"]), Frame::Null);
+        cmd(&s, &["SET", "lock", "tok", "EX", "10"]);
+        assert_eq!(cmd(&s, &["SET", "lock", "new", "IFEQ", "other"]), Frame::Null);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "lock"])), Some("tok"));
+        // Lock extension: same value, fresh TTL.
+        assert_eq!(cmd(&s, &["SET", "lock", "tok", "IFEQ", "tok", "EX", "100"]), Frame::ok());
+        assert!(int(&cmd(&s, &["TTL", "lock"])).unwrap() > 98);
+        assert_eq!(bulk_str(&cmd(&s, &["SET", "lock", "b", "IFEQ", "tok", "GET"])), Some("tok"));
+        assert_eq!(bulk_str(&cmd(&s, &["SET", "lock", "c", "IFEQ", "zzz", "GET"])), Some("b"));
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "lock"])), Some("b"));
+    }
+
+    #[test]
+    fn expiretime_expireat_and_unlink() {
+        let s = store();
+        assert_eq!(cmd(&s, &["EXPIRETIME", "nope"]), Frame::integer(-2));
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["PEXPIRETIME", "k"]), Frame::integer(-1));
+        let at = future_secs(500);
+        assert_eq!(cmd(&s, &["EXPIREAT", "k", &at]), Frame::integer(1));
+        assert_eq!(int(&cmd(&s, &["EXPIRETIME", "k"])).map(|v| v.to_string()), Some(at.clone()));
+        let pms = int(&cmd(&s, &["PEXPIRETIME", "k"])).unwrap();
+        assert_eq!(pms / 1000, at.parse::<i64>().unwrap());
+        assert_eq!(cmd(&s, &["PEXPIREAT", "k", "1"]), Frame::integer(1), "a past time deletes");
+        assert_eq!(cmd(&s, &["EXISTS", "k"]), Frame::integer(0));
+        assert_eq!(cmd(&s, &["EXPIREAT", "k", &at]), Frame::integer(0));
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        cmd(&s, &["HSET", "h", "f", "v"]);
+        assert_eq!(cmd(&s, &["UNLINK", "a", "b", "h", "zz"]), Frame::integer(3));
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn hash_command_family() {
+        let s = store();
+        assert_eq!(cmd(&s, &["HMSET", "h", "a", "1", "b", "2"]), Frame::ok());
+        assert_eq!(
+            strs(&cmd(&s, &["HMGET", "h", "a", "zz", "b"])),
+            vec![Some("1".into()), None, Some("2".into())]
+        );
+        assert_eq!(cmd(&s, &["HSETNX", "h", "a", "x"]), Frame::integer(0));
+        assert_eq!(cmd(&s, &["HSETNX", "h", "c", "3"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["HINCRBY", "h", "a", "41"]), Frame::integer(42));
+        assert_eq!(
+            err_text(&cmd(&s, &["HINCRBY", "h", "a", "x"])),
+            "ERR value is not an integer or out of range"
+        );
+        cmd(&s, &["HSET", "h", "s", "text"]);
+        assert_eq!(
+            err_text(&cmd(&s, &["HINCRBY", "h", "s", "1"])),
+            "ERR hash value is not an integer"
+        );
+        assert_eq!(bulk_str(&cmd(&s, &["HINCRBYFLOAT", "h", "f", "10.50"])), Some("10.5"));
+        assert_eq!(bulk_str(&cmd(&s, &["HINCRBYFLOAT", "h", "f", "0.1"])), Some("10.6"));
+        assert_eq!(bulk_str(&cmd(&s, &["HINCRBYFLOAT", "h", "f", "-5.0e3"])), Some("-4989.4"));
+        assert_eq!(
+            err_text(&cmd(&s, &["HINCRBYFLOAT", "h", "s", "1"])),
+            "ERR hash value is not a float"
+        );
+        assert_eq!(
+            err_text(&cmd(&s, &["HINCRBYFLOAT", "h", "f", "nan"])),
+            "ERR value is not a valid float"
+        );
+        assert_eq!(cmd(&s, &["HSTRLEN", "h", "s"]), Frame::integer(4));
+        assert_eq!(cmd(&s, &["HSTRLEN", "h", "nope"]), Frame::integer(0));
+        assert!(matches!(cmd(&s, &["HSETNX", "h", "a"]), Frame::Error(_)));
+        assert!(matches!(cmd(&s, &["HMSET", "h", "a"]), Frame::Error(_)));
+        assert_eq!(cmd(&s, &["TYPE", "h"]), Frame::Simple("hash".into()));
+    }
+
+    #[test]
+    fn hash_field_expiry_commands() {
+        let s = store();
+        cmd(&s, &["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+        assert_eq!(ints(&cmd(&s, &["HEXPIRE", "h", "100", "FIELDS", "2", "a", "zz"])), [1, -2]);
+        assert_eq!(ints(&cmd(&s, &["HEXPIRE", "h", "100", "NX", "FIELDS", "2", "a", "b"])), [0, 1]);
+        assert_eq!(ints(&cmd(&s, &["HEXPIRE", "h", "50", "GT", "FIELDS", "1", "a"])), [0]);
+        assert_eq!(ints(&cmd(&s, &["HEXPIRE", "h", "50", "LT", "FIELDS", "1", "a"])), [1]);
+        let ttl = ints(&cmd(&s, &["HTTL", "h", "FIELDS", "3", "a", "c", "zz"]));
+        assert!(ttl[0] > 48 && ttl[0] <= 50, "{ttl:?}");
+        assert_eq!(&ttl[1..], [-1, -2]);
+        let pttl = ints(&cmd(&s, &["HPTTL", "h", "FIELDS", "1", "b"]));
+        assert!(pttl[0] > 98_000);
+        let at = ints(&cmd(&s, &["HPEXPIRETIME", "h", "FIELDS", "1", "b"]))[0];
+        assert!(at > crate::store::unix_ms_now() + 98_000);
+        let at_s = ints(&cmd(&s, &["HEXPIRETIME", "h", "FIELDS", "1", "b"]))[0];
+        assert!((at_s - at / 1000).abs() <= 1);
+        assert_eq!(ints(&cmd(&s, &["HPERSIST", "h", "FIELDS", "3", "a", "c", "zz"])), [1, -1, -2]);
+        assert_eq!(ints(&cmd(&s, &["HPEXPIRE", "h", "0", "FIELDS", "1", "c"])), [2]);
+        assert_eq!(cmd(&s, &["HEXISTS", "h", "c"]), Frame::integer(0));
+        let past = (crate::store::unix_ms_now() / 1000 - 10).to_string();
+        assert_eq!(ints(&cmd(&s, &["HEXPIREAT", "h", &past, "FIELDS", "1", "a"])), [2]);
+        assert_eq!(ints(&cmd(&s, &["HTTL", "nokey", "FIELDS", "1", "a"])), [-2]);
+        // Argument errors, with Redis' wording.
+        assert_eq!(
+            err_text(&cmd(&s, &["HEXPIRE", "h", "10", "FIELDS", "2", "a"])),
+            "ERR The `numfields` parameter must match the number of arguments"
+        );
+        assert_eq!(
+            err_text(&cmd(&s, &["HEXPIRE", "h", "10", "FIELDS", "0", "a"])),
+            "ERR Parameter `numFields` should be greater than 0"
+        );
+        assert_eq!(
+            err_text(&cmd(&s, &["HEXPIRE", "h", "10", "NX", "XX", "FIELDS", "1", "a"])),
+            "ERR Mandatory argument FIELDS is missing or not at the right position"
+        );
+        assert_eq!(
+            err_text(&cmd(&s, &["HEXPIRE", "h", "-1", "FIELDS", "1", "a"])),
+            "ERR invalid expire time, must be >= 0"
+        );
+        assert_eq!(
+            err_text(&cmd(&s, &["HPEXPIREAT", "h", &i64::MAX.to_string(), "FIELDS", "1", "a"])),
+            "ERR invalid expire time in 'hpexpireat' command"
+        );
+    }
+
+    #[test]
+    fn hash_key_level_expiry_via_expire_and_ttl() {
+        let s = store();
+        cmd(&s, &["HSET", "h", "f", "v"]);
+        assert_eq!(cmd(&s, &["EXPIRE", "h", "100"]), Frame::integer(1));
+        assert!(int(&cmd(&s, &["TTL", "h"])).unwrap() > 98);
+        assert_eq!(cmd(&s, &["PERSIST", "h"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["TTL", "h"]), Frame::integer(-1));
+        assert_eq!(cmd(&s, &["TTL", "missing"]), Frame::integer(-2));
+    }
+
+    #[test]
+    fn scan_and_hscan() {
+        let s = store();
+        for i in 0..200 {
+            cmd(&s, &["SET", &format!("user:{i}"), "v"]);
+        }
+        cmd(&s, &["SET", "other", "v"]);
+        cmd(&s, &["HSET", "user:h", "f1", "a", "f2", "b"]);
+        let mut cursor = "0".to_string();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let Frame::Array(reply) = cmd(&s, &["SCAN", &cursor, "MATCH", "user:*", "COUNT", "5"])
+            else {
+                panic!("SCAN must reply with an array");
+            };
+            cursor = bulk_str(&reply[0]).unwrap().to_string();
+            for k in strs(&reply[1]) {
+                seen.insert(k.unwrap());
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 201);
+        assert!(!seen.contains("other"));
+        let Frame::Array(reply) = cmd(&s, &["SCAN", "0", "TYPE", "hash", "COUNT", "1000"]) else {
+            panic!("SCAN must reply with an array")
+        };
+        assert!(strs(&reply[1]).contains(&Some("user:h".into())));
+        assert_eq!(err_text(&cmd(&s, &["SCAN", "abc"])), "ERR invalid cursor");
+        assert_eq!(err_text(&cmd(&s, &["SCAN", "0", "COUNT", "0"])), "ERR syntax error");
+        assert_eq!(err_text(&cmd(&s, &["SCAN", "0", "MATCH"])), "ERR syntax error");
+
+        let Frame::Array(reply) = cmd(&s, &["HSCAN", "user:h", "0", "MATCH", "f1"]) else {
+            panic!("HSCAN must reply with an array")
+        };
+        assert_eq!(bulk_str(&reply[0]), Some("0"));
+        assert_eq!(strs(&reply[1]), vec![Some("f1".into()), Some("a".into())]);
+        let Frame::Array(reply) = cmd(&s, &["HSCAN", "user:h", "0", "NOVALUES"]) else {
+            panic!("HSCAN must reply with an array")
+        };
+        assert_eq!(strs(&reply[1]).len(), 2);
+    }
+
+    #[test]
+    fn info_reports_keyspace_and_hit_stats() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v", "EX", "100"]);
+        cmd(&s, &["GET", "k"]);
+        cmd(&s, &["GET", "missing"]);
+        let info = cmd(&s, &["INFO"]);
+        let text = bulk_str(&info).unwrap();
+        assert!(text.contains("db0:keys=1,expires=1"), "{text}");
+        assert!(text.contains("keyspace_hits:1"), "{text}");
+        assert!(text.contains("keyspace_misses:1"), "{text}");
+    }
+
+    /// A clustered hash field larger than the gossip payload is refused with
+    /// a clear error — never stored node-locally.
+    #[test]
+    fn oversized_hash_field_in_a_cluster_is_an_error() {
+        #[derive(Debug)]
+        struct Limited;
+        impl crate::store::Replicator for Limited {
+            fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
+                true
+            }
+            fn replicate_remove(&self, _: &str) -> bool {
+                true
+            }
+            fn replicate_expire(&self, _: &str, _: Duration) -> bool {
+                true
+            }
+            fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
+            fn replicate_remove_published(&self, _: String) {}
+            fn replicate_hash_field(
+                &self,
+                _: &str,
+                _: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
+            fn hash_field_value_limit(&self) -> Option<usize> {
+                Some(8)
+            }
+        }
+        let s = store();
+        s.set_replicator(Some(Arc::new(Limited)));
+        let reply = cmd(&s, &["HSET", "h", "small", "ok", "big", "0123456789"]);
+        assert!(err_text(&reply).contains("exceeds the 8-byte limit"), "{reply:?}");
+        assert_eq!(cmd(&s, &["HLEN", "h"]), Frame::integer(0), "nothing written");
+        assert_eq!(cmd(&s, &["HSET", "h", "small", "ok"]), Frame::integer(1));
     }
 }

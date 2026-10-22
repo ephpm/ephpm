@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 use ephpm_config::ClusterKvConfig;
-use ephpm_kv::store::{Routed, SetNxOutcome, Store};
+use ephpm_kv::store::{HashFieldState, Routed, SetIfEqOutcome, SetNxOutcome, SetTtl, Store};
 
 use crate::ClusterHandle;
 use crate::gossip_kv::{Stamp, expiry_ms_for};
@@ -995,6 +995,45 @@ impl ClusteredStore {
         }
     }
 
+    /// Route a compare-and-set (`SET ... IFEQ`) on `transport_key` to the same
+    /// arbiter [`route_set_nx`](Self::route_set_nx) uses. Same contract: an
+    /// owner predating the op drops the connection, which reads as
+    /// [`Routed::OwnerUnreachable`] — the write fails loudly rather than being
+    /// decided on a possibly stale local copy.
+    pub async fn route_set_if_eq(
+        &self,
+        transport_key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl: SetTtl,
+    ) -> Routed<SetIfEqOutcome> {
+        let Some(owner) = self.conditional_owner(transport_key).await else {
+            return Routed::Local;
+        };
+        let Some(addr) = node_data_addr(&owner, self.config.data_port) else {
+            tracing::warn!(key = transport_key, owner = %owner.id, "SET IFEQ owner has no data address");
+            return Routed::OwnerUnreachable;
+        };
+        let call = self.client.set_if_eq(addr, transport_key, expected, value, ttl);
+        match tokio::time::timeout(CONDITIONAL_ROUTE_TIMEOUT, call).await {
+            Ok(Ok(outcome)) => Routed::Owner(outcome),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr, %e,
+                    "SET IFEQ owner unreachable; nothing written (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+            Err(_) => {
+                tracing::warn!(
+                    key = transport_key, owner = %owner.id, %addr,
+                    "SET IFEQ owner timed out; nothing written (fail closed)"
+                );
+                Routed::OwnerUnreachable
+            }
+        }
+    }
+
     /// Check if a key exists in any tier.
     pub async fn exists(&self, key: &str) -> bool {
         self.cluster.gossip_exists(key).await || self.store.exists(key)
@@ -1419,6 +1458,31 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             .unwrap_or(Routed::OwnerUnreachable)
     }
 
+    fn route_set_if_eq(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl: SetTtl,
+    ) -> Routed<SetIfEqOutcome> {
+        block_on_cluster(&self.handle, self.inner.route_set_if_eq(key, expected, value, ttl))
+            .unwrap_or(Routed::OwnerUnreachable)
+    }
+
+    fn replicate_hash_field(
+        &self,
+        key: &str,
+        field: &str,
+        apply: &mut dyn FnMut() -> Option<HashFieldState>,
+    ) -> bool {
+        let transport = crate::hash_field::encode_key(key, field);
+        publish_hash_field(&self.inner, &self.applied, &transport, apply)
+    }
+
+    fn hash_field_value_limit(&self) -> Option<usize> {
+        Some(hash_field_value_limit(&self.inner))
+    }
+
     fn replicate_remove(&self, key: &str) -> bool {
         // Drop the local materialized copy synchronously (mirror of the
         // set path above), then propagate the removal via a gossip
@@ -1818,6 +1882,78 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         block_on_cluster(&self.handle, self.inner.route_del_if_eq(&transport, token))
             .unwrap_or(Routed::OwnerUnreachable)
     }
+
+    fn route_set_if_eq(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl: SetTtl,
+    ) -> Routed<SetIfEqOutcome> {
+        let transport = crate::site_namespace::encode(&self.site, key);
+        block_on_cluster(&self.handle, self.inner.route_set_if_eq(&transport, expected, value, ttl))
+            .unwrap_or(Routed::OwnerUnreachable)
+    }
+
+    fn replicate_hash_field(
+        &self,
+        key: &str,
+        field: &str,
+        apply: &mut dyn FnMut() -> Option<HashFieldState>,
+    ) -> bool {
+        // The site envelope is outermost, so the receiver routes to this
+        // site's store first and then decodes the field inside it.
+        let transport =
+            crate::site_namespace::encode(&self.site, &crate::hash_field::encode_key(key, field));
+        publish_hash_field(&self.inner, &self.applied, &transport, apply)
+    }
+
+    fn hash_field_value_limit(&self) -> Option<usize> {
+        Some(hash_field_value_limit(&self.inner))
+    }
+}
+
+/// The largest hash-field value that fits one gossip item: the gossip tier's
+/// payload budget less the field header.
+fn hash_field_value_limit(inner: &ClusteredStore) -> usize {
+    inner.config.small_key_threshold.saturating_sub(crate::hash_field::HEADER_LEN)
+}
+
+/// Shared body of both replicators' `replicate_hash_field`: order the field
+/// write under `transport`'s slot, run the local mutation there, and gossip
+/// the field's resulting state (or a tombstone) with the same stamp.
+///
+/// A mutation that changed nothing leaves no trace in the applied map
+/// ([`apply_if_newer_cond`]), so it cannot make this node refuse a peer's
+/// genuinely newer write to the field.
+fn publish_hash_field(
+    inner: &ClusteredStore,
+    applied: &AppliedWriteMap,
+    transport: &str,
+    apply: &mut dyn FnMut() -> Option<HashFieldState>,
+) -> bool {
+    let stamp = inner.cluster.stamp();
+    let mut ran = false;
+    let mut published = None;
+    apply_if_newer_cond(applied, transport, stamp, || {
+        ran = true;
+        published = apply();
+        published.is_some()
+    });
+    let Some(state) = published else {
+        return ran;
+    };
+    match state.value {
+        Some(value) => {
+            let (payload, expiry_ms) =
+                crate::hash_field::encode_value(&value, state.field_ttl, state.hash_ttl);
+            inner.cluster.gossip_set_queued(transport, &payload, expiry_ms, stamp);
+        }
+        None => {
+            inner.cluster.gossip_del_queued(transport, stamp);
+        }
+    }
+    true
 }
 
 /// Per-key last-applied [`Stamp`] shared between the gossip applier and
@@ -1949,10 +2085,10 @@ pub async fn start_gossip_applier_multi_tenant(
             let is_set = matches!(event, crate::gossip_kv::KvChangeEvent::Set { .. });
             let verdict = apply_if_newer(&applied, transport_key, stamp, || match event {
                 crate::gossip_kv::KvChangeEvent::Set { value, ttl, .. } => {
-                    target.set_local(key.clone(), value.to_vec(), ttl);
+                    materialize(&target, &key, Some((value, ttl)));
                 }
                 crate::gossip_kv::KvChangeEvent::Tombstone { .. } => {
-                    target.remove_local(&key);
+                    materialize(&target, &key, None);
                 }
             });
             match verdict {
@@ -2116,11 +2252,10 @@ fn verify_keys(
         };
         let verdict = apply_if_newer(applied, transport_key, winner.stamp, || match winner.value {
             Some((bytes, expiry_ms)) => {
-                target.set_local(key, bytes, crate::gossip_kv::ttl_from_expiry(expiry_ms));
+                let ttl = crate::gossip_kv::ttl_from_expiry(expiry_ms);
+                materialize(&target, &key, Some((&bytes, ttl)));
             }
-            None => {
-                target.remove_local(&key);
-            }
+            None => materialize(&target, &key, None),
         });
         // `Skip`: local already reflects the winner (or something newer).
         if verdict != Apply::Skip {
@@ -2219,6 +2354,82 @@ pub(crate) fn apply_if_newer(
     write();
     drop(guard);
     verdict
+}
+
+/// [`apply_if_newer`] for a write that may turn out to change nothing.
+///
+/// `write` runs under the key's slot exactly as in `apply_if_newer` and
+/// reports whether it changed anything. When it did not (an `HSETNX` that
+/// lost, an `HDEL` of an absent field), the slot is restored to what it held
+/// before — the previous stamp, or no record at all — so a no-op leaves no
+/// trace in the ordering. Recording the stamp of a write that published
+/// nothing would make this node refuse a peer's write to the same key that
+/// every other node accepts. Returns [`Apply::Skip`] for a no-op as for a
+/// stale write.
+pub(crate) fn apply_if_newer_cond(
+    applied: &AppliedWriteMap,
+    key: &str,
+    stamp: Stamp,
+    write: impl FnOnce() -> bool,
+) -> Apply {
+    match applied.entry(key.to_string()) {
+        dashmap::Entry::Occupied(mut prev) => {
+            let previous = *prev.get();
+            if stamp <= previous {
+                return Apply::Skip;
+            }
+            *prev.get_mut() = stamp;
+            // `prev` keeps the slot locked across the write.
+            if write() {
+                Apply::Newer
+            } else {
+                *prev.get_mut() = previous;
+                Apply::Skip
+            }
+        }
+        dashmap::Entry::Vacant(slot) => {
+            let entry = slot.insert_entry(stamp);
+            if write() {
+                Apply::FirstSeen
+            } else {
+                entry.remove();
+                Apply::Skip
+            }
+        }
+    }
+}
+
+/// Land one replicated item in `target` under the bare `key`: a hash-field
+/// item ([`crate::hash_field`]) is applied to its hash, anything else is a
+/// string key. `value` is `None` for a delete. Local only.
+fn materialize(target: &Store, key: &str, value: Option<(&[u8], Option<Duration>)>) {
+    if let Some((hash_key, field)) = crate::hash_field::decode_key(key) {
+        let state = match value {
+            Some((payload, _)) => match crate::hash_field::decode_value(payload) {
+                Some(state) => state,
+                None => {
+                    tracing::warn!(
+                        key = hash_key,
+                        field,
+                        "dropping a replicated hash field this node cannot decode (a newer \
+                         format from a peer running a later version?)"
+                    );
+                    return;
+                }
+            },
+            None => HashFieldState::deleted(),
+        };
+        target.apply_hash_field_local(hash_key, field, state);
+        return;
+    }
+    match value {
+        Some((bytes, ttl)) => {
+            target.set_local(key.to_string(), bytes.to_vec(), ttl);
+        }
+        None => {
+            target.remove_local(key);
+        }
+    }
 }
 
 /// FNV-1a-style hash for key → u64 mapping.
@@ -2735,5 +2946,56 @@ mod tests {
         assert!(w.expiry_ms > 0);
         let later = WriteStamp { stamp: clock.next(), expiry_ms: 0 };
         assert!(later.stamp > w.stamp);
+    }
+
+    // ── Hash-field replication ─────────────────────────────────────────
+
+    /// A write that changed nothing must not leave its stamp behind, or a
+    /// peer's genuinely newer write could be refused on this node alone.
+    #[test]
+    fn a_no_op_conditional_write_leaves_no_ordering_trace() {
+        let applied = new_applied_write_map();
+        assert_eq!(apply_if_newer_cond(&applied, "k", at(10, "a"), || false), Apply::Skip);
+        assert!(!applied.contains_key("k"), "a first-seen no-op must not create a record");
+
+        assert_eq!(apply_if_newer_cond(&applied, "k", at(20, "a"), || true), Apply::FirstSeen);
+        assert_eq!(apply_if_newer_cond(&applied, "k", at(30, "a"), || false), Apply::Skip);
+        assert_eq!(*applied.get("k").unwrap(), at(20, "a"), "the earlier stamp is restored");
+        // A peer write between the two is still accepted.
+        assert_eq!(should_apply(&applied, "k", at(25, "b")), Apply::Newer);
+        assert_eq!(apply_if_newer_cond(&applied, "k", at(5, "a"), || true), Apply::Skip);
+    }
+
+    /// Replicated hash-field items land in the hash (string keys stay string
+    /// keys), a tombstone deletes the field, and a per-site envelope routes
+    /// the field into that site's store.
+    #[test]
+    fn hash_field_items_materialize_into_the_right_hash() {
+        let global = Store::new(ephpm_kv::store::StoreConfig::default());
+        let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
+            Arc::clone(&global),
+            ephpm_kv::store::StoreConfig::default(),
+        );
+        let (payload, _) = crate::hash_field::encode_value(b"v", None, None);
+        let item = crate::hash_field::encode_key("h", "f");
+
+        let (target, key, _) = route_target(Some(&mt), &global, &item, "peer").unwrap();
+        materialize(&target, &key, Some((&payload, None)));
+        assert_eq!(global.hget("h", "f").as_deref(), Some(&b"v"[..]));
+        assert!(!global.is_hash(&item), "not stored under its encoded name");
+
+        let site_item = crate::site_namespace::encode("alice.test", &item);
+        let (target, key, site) = route_target(Some(&mt), &global, &site_item, "peer").unwrap();
+        assert_eq!(site.as_deref(), Some("alice.test"));
+        materialize(&target, &key, Some((&payload, None)));
+        assert_eq!(mt.get_site_store("alice.test").hget("h", "f").as_deref(), Some(&b"v"[..]));
+
+        materialize(&global, &item, None);
+        assert!(!global.exists("h"), "the tombstone deleted the only field");
+        assert_eq!(mt.get_site_store("alice.test").hlen("h"), 1, "other tenants untouched");
+
+        // A plain key is still a string.
+        materialize(&global, "plain", Some((b"x", None)));
+        assert_eq!(global.get("plain").as_deref(), Some(&b"x"[..]));
     }
 }

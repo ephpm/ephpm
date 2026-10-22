@@ -118,8 +118,8 @@ mod tests {
         default.set("k1".into(), b"v1".to_vec(), None);
         default.set("ttl".into(), b"soon".to_vec(), Some(Duration::from_secs(60)));
         default.set("gone".into(), b"x".to_vec(), Some(Duration::from_millis(1)));
-        default.hset("h", "f1", b"a".to_vec());
-        default.hset("h", "f2", b"b".to_vec());
+        default.hset("h", "f1", b"a".to_vec()).unwrap();
+        default.hset("h", "f2", b"b".to_vec()).unwrap();
         alice.set("k1".into(), b"alice".to_vec(), None);
         std::thread::sleep(Duration::from_millis(5));
 
@@ -322,6 +322,46 @@ mod tests {
         assert_eq!(dst.len(), 0);
     }
 
+    /// Hash field TTLs (`HEXPIRE`) survive a snapshot round trip with their
+    /// deadlines; a field whose TTL passes between write and load is skipped,
+    /// and a hash with no live field left is not restored at all.
+    #[test]
+    fn hash_field_ttls_round_trip_and_expired_fields_are_skipped() {
+        use crate::store::ExpireCondition;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kv.snap");
+        let src = store(CompressionAlgo::None);
+        src.hset_many("h", &[("keep", b"1"), ("long", b"2"), ("short", b"3")]).unwrap();
+        src.hexpire("h", &["long"], Duration::from_secs(100), ExpireCondition::Always);
+        src.hexpire("h", &["short"], Duration::from_millis(150), ExpireCondition::Always);
+        src.expire("h", Duration::from_secs(500));
+        src.hset("gone", "f", b"x".to_vec()).unwrap();
+        src.hexpire("gone", &["f"], Duration::from_millis(150), ExpireCondition::Always);
+        let stores = vec![(String::new(), Arc::clone(&src))];
+        write_snapshot(&path, SECRET, &stores, &opts()).unwrap();
+
+        // Let the short field TTLs pass before loading.
+        std::thread::sleep(Duration::from_millis(300));
+        let dst = store(CompressionAlgo::None);
+        let res = resolver(vec![(String::new(), Arc::clone(&dst))]);
+        let r = load_snapshot(&path, SECRET, &res, &LoadOptions::default());
+        assert_eq!(r.outcome, LoadOutcome::Ok, "{r:?}");
+
+        let mut keys = dst.hkeys("h");
+        keys.sort();
+        assert_eq!(keys, vec!["keep", "long"], "the expired field is skipped on load");
+        assert_eq!(dst.hpttl("h", &["keep"]), [-1]);
+        let long = dst.hpttl("h", &["long"])[0];
+        assert!(long > 99_000 && long <= 100_000, "field TTL restored: {long}");
+        let key_ms = dst.pttl("h").unwrap();
+        assert!(key_ms > 499_000 && key_ms <= 500_000, "key TTL restored: {key_ms}");
+        assert!(!dst.exists("gone"), "a hash whose only field expired is not restored");
+        // The restored field TTL is live state: it still expires.
+        dst.hexpire("h", &["long"], Duration::from_millis(10), ExpireCondition::Always);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(dst.hkeys("h"), vec!["keep".to_string()]);
+    }
+
     /// The cluster split: `SmallOnly` restores strings at or below the
     /// threshold plus every hash; `LargeOnly` the strings above it (and any
     /// stored compressed). The two passes together restore everything once.
@@ -334,7 +374,7 @@ mod tests {
         src.set("small".into(), vec![b's'; 100], None);
         src.set("edge".into(), vec![b'e'; 512], None);
         src.set("large".into(), vec![b'l'; 513], None);
-        src.hset("h", "f", b"v".to_vec());
+        src.hset("h", "f", b"v".to_vec()).unwrap();
         let stores = vec![(String::new(), Arc::clone(&src))];
         write_snapshot(&path, SECRET, &stores, &opts()).unwrap();
 

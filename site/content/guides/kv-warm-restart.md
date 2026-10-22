@@ -371,14 +371,17 @@ passwords already have.
 ## Limits, honestly
 
 - Peer handoff moves data only on a graceful stop and a start; it does not
-  rebalance on other membership changes, and hashes are not handed off (they
-  are not replicated at all).
+  rebalance on other membership changes. Hashes are not handed off because
+  they do not need to be: since v0.13 hash fields replicate over the gossip
+  tier to every node, so a restarted node recovers them from gossip state
+  sync like small strings.
 - Object mode reads static `AWS_*` credentials only; no instance profile,
   no IRSA, no multipart upload (one `PutObject` up to 5 GiB).
 - A snapshot is node-local. In a cluster each node writes its own; nothing
   merges them, and a restored value can be briefly stale next to a peer that
   kept serving. The next replicated write to the key corrects it.
-- Hash fields' own TTLs are carried by the format, but the store does not
-  track per-field expiry yet, so there is nothing to carry.
+- Hash fields' own TTLs (`HEXPIRE`) are saved and restored with their
+  deadlines; a field whose TTL passes between the save and the load is
+  skipped, and a hash left with no live field is not restored.
 - Windows: the shutdown snapshot runs on `Ctrl+C` and on a service stop; a
   process kill is not graceful anywhere.

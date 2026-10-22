@@ -59,14 +59,16 @@ With any of the three conditions missing, none of them are set.
 
 ## Commands
 
-Arity is checked as a minimum: extra trailing arguments are ignored rather
-than rejected. Unknown commands return `-ERR unknown command '<NAME>'`.
+Arity is checked as a minimum for most commands (extra trailing arguments are
+ignored rather than rejected); `GETDEL`, `EXPIRETIME`, `PEXPIRETIME`,
+`HSETNX`, `HINCRBY`, `HINCRBYFLOAT` and `HSTRLEN` require exactly their
+arguments, as in Redis. Unknown commands return `-ERR unknown command '<NAME>'`.
 
-**Keys, hash fields and `KEYS` patterns must be valid UTF-8** (a NUL byte is
-fine). Unlike Redis, the store cannot hold binary keys, so a command naming a
-non-UTF-8 key is refused with `-ERR invalid key: ePHPm KV keys and hash fields
-must be valid UTF-8` and changes nothing. That includes a multi-key `MSET`,
-`DEL` or `HSET` with one bad key. Values are binary-safe.
+**Keys, hash fields and `KEYS`/`SCAN` patterns must be valid UTF-8** (a NUL
+byte is fine). Unlike Redis, the store cannot hold binary keys, so a command
+naming a non-UTF-8 key is refused with `-ERR invalid key: ePHPm KV keys and hash
+fields must be valid UTF-8` and changes nothing. That includes a multi-key
+`MSET`, `DEL` or `HSET` with one bad key. Values are binary-safe.
 
 | Group | Command | Notes |
 |---|---|---|
@@ -76,32 +78,89 @@ must be valid UTF-8` and changes nothing. That includes a multi-key `MSET`,
 | | `AUTH ...` | See [Authentication](#authentication). |
 | | `QUIT` | `OK`, then the connection closes. |
 | | `COMMAND` | Stub: returns an empty array. Clients that introspect the command table learn nothing. |
-| | `INFO` | Fixed text: `redis_version:7.0.0`, `redis_mode:embedded`, `tcp_port:6379` (**always 6379**, whatever the listen port), and `used_memory`. Ignores a section argument. See the note below. |
+| | `INFO` | Fixed sections: `# Server` (`redis_version:7.0.0`, `redis_mode:embedded`, `tcp_port:6379` — **always 6379**, whatever the listen port), `# Memory` (`used_memory`), `# Stats` (`keyspace_hits`, `keyspace_misses`) and `# Keyspace` (`db0:keys=N,expires=M,avg_ttl=0`, omitted when empty). Ignores a section argument. `keyspace_hits`/`misses` count string reads (`GET`, `MGET`, `GETDEL`, `GETEX`, and PHP `ephpm_kv_get`/`mget`) and hash reads, for the store this connection is bound to, since the process started. `keys` and `expires` include expired keys not yet reclaimed, as `DBSIZE` does; `avg_ttl` is always `0`. See the note below. |
 | Strings | `GET key` | `nil` for a missing key, and also for a key that only exists as a hash. |
-| | `SET key value [EX s \| PX ms] [NX \| XX] [GET]` | `EXAT`/`PXAT`/`KEEPTTL` are `ERR syntax error`. As in Redis, an `EX`/`PX` value that is not a number is `ERR value is not an integer or out of range`, and one that is zero, negative, or so large the expiry time overflows is `ERR invalid expire time in 'set' command`; nothing is written. Giving both `EX` and `PX` is `ERR syntax error`. `NX` with `XX` is an error. |
+| | `SET key value [NX \| XX \| IFEQ comparison] [GET] [EX s \| PX ms \| EXAT unix-s \| PXAT unix-ms \| KEEPTTL]` | As in Redis: the expiry options are mutually exclusive, and so are `NX`/`XX`/`IFEQ` (`ERR syntax error`; `NX` with `XX` keeps its own error). A time that is not a number is `ERR value is not an integer or out of range`; one that is zero, negative, or so large the expiry time overflows is `ERR invalid expire time in 'set' command`; nothing is written. An `EXAT`/`PXAT` time already in the past performs the write and leaves the key expired (gone). `KEEPTTL` keeps the key's current expiry. **`IFEQ comparison`** (Valkey 8.1) sets only while the current value equals `comparison`, never creates the key, and replies `nil` when it did not set; with `GET` it replies the value the key held before. In a cluster `IFEQ` is decided by the key's owner node like `SETNX`, and an unreachable owner answers `-CLUSTERDOWN …`. |
 | | `SETEX key seconds value` | `seconds` must be positive and must not overflow, as for `SET EX`. |
 | | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` (nothing written on this node; the owner may still have applied a request that timed out). The same applies to `SET … NX`. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
+| | `GETDEL key` | Returns the value and deletes the key; `nil` if missing. The read and the delete are one atomic step on this node. In a cluster the delete then replicates; a large value held only by other nodes is fetched and deleted cluster-wide, which is not atomic across nodes. |
+| | `GETEX key [EX s \| PX ms \| EXAT unix-s \| PXAT unix-ms \| PERSIST]` | Returns the value and changes its expiry (no option: a plain `GET`). An `EXAT`/`PXAT` in the past deletes the key, as in Redis. Time errors are `ERR invalid expire time in 'getex' command`. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
 | | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. A result that would overflow is an error and leaves the value unchanged; `DECRBY key -9223372036854775808` is `ERR decrement would overflow`, as in Redis. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
 | | `APPEND`, `STRLEN` | |
-| Keys | `DEL key...` | Removes the string and the hash of that name. |
-| | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`). Owner-decided in a cluster, like `SETNX`; an unreachable owner answers `-CLUSTERDOWN …`. |
+| Keys | `DEL key...` / `UNLINK key...` | Identical. Removes the string and the hash of that name. Freeing a hash with many fields happens off the calling thread for both (Valkey 8's `lazyfree-lazy-user-del yes` behavior). |
+| | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`; extend with `SET key token IFEQ token PX ms`). Owner-decided in a cluster, like `SETNX`; an unreachable owner answers `-CLUSTERDOWN …`. |
 | | `EXISTS key...` | Counts strings and hashes. |
-| | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time in 'expire' command`; Redis would delete the key. A value so large the expiry time overflows is the same error, as in Redis. Options (`NX`/`XX`/`GT`/`LT`) are ignored. **String keys only:** on a hash it returns `0` and sets nothing. |
-| | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. String keys only: a hash reports `-2`. |
+| | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time in 'expire' command`; Redis would delete the key. A value so large the expiry time overflows is the same error, as in Redis. Options (`NX`/`XX`/`GT`/`LT`) are ignored. Works on hashes too (the whole-key expiry). |
+| | `EXPIREAT key unix-s` / `PEXPIREAT key unix-ms` | Absolute expiry. A time at or before now deletes the key and returns `1` (as in Redis). Options are ignored. |
+| | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. A hash reports (or removes) its whole-key expiry; field expiries are read with `HTTL`. |
+| | `EXPIRETIME key` / `PEXPIRETIME key` | Absolute expiry as Unix seconds / milliseconds; `-1` no expiry, `-2` missing. |
 | | `TYPE key` | `hash`, `string` or `none`. A name that holds both reports `hash`. |
 | | `RENAME old new` | **Strings only.** Renaming a hash returns `ERR no such key`. Keeps the TTL. |
-| | `KEYS pattern` | Redis glob syntax: `*`, `?`, `[abc]`, `[^abc]`, `[a-z]` and `\` escapes, matched on bytes as Redis does (`!` is not a negation marker, as in Redis). Matching takes time proportional to key length × pattern length at worst, with no exponential backtracking. Walks the whole store, but only holds each internal shard's lock long enough to copy its key names; matching runs with no lock held and off the async workers, so a slow `KEYS` does not block other clients' reads and writes. A name that is both a string and a hash is listed twice. |
+| | `KEYS pattern` | Redis glob syntax: `*`, `?`, `[abc]`, `[^abc]`, `[a-z]` and `\` escapes, matched on bytes as Redis does (`!` is not a negation marker, as in Redis). Matching takes time proportional to key length × pattern length at worst, with no exponential backtracking. Walks the whole store, but only holds each internal shard's lock long enough to copy its key names; matching runs with no lock held and off the async workers, so a slow `KEYS` does not block other clients' reads and writes. A name that is both a string and a hash is listed twice. Prefer `SCAN`. |
+| | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE string\|hash]` | Incremental iteration. **Every key present for the whole scan is returned** (exactly once — see [SCAN](#scan)); keys added or deleted during it may or may not be. `COUNT` (default 10, must be ≥ 1) is a hint: a call returns at least one whole internal shard, so a large store returns more keys per call. `TYPE` filters by type; any other type name returns nothing. A non-numeric cursor is `ERR invalid cursor`; an out-of-range one ends the scan. |
 | | `DBSIZE` | Strings plus hashes (a dual name counts twice). |
-| | `FLUSHDB` / `FLUSHALL` | Identical. Empties the store this connection is bound to (in multi-tenant mode, that site's store). |
-| Hashes | `HSET key field value [field value...]` | Returns the number of new fields. (No separate `HMSET`.) |
-| | `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS` | |
+| | `FLUSHDB` / `FLUSHALL` | Identical. Empties the store this connection is bound to (in multi-tenant mode, that site's store). Node-local in a cluster. |
+| Hashes | `HSET key field value [field value...]` / `HMSET ...` | `HSET` returns the number of new fields, `HMSET` `OK`. Clears the TTL of each field written. Not atomic under memory pressure (as `MSET`). In a cluster a value larger than the [hash-field limit](#hashes-in-a-cluster) is refused and nothing is written. |
+| | `HSETNX key field value` | `1` if set, `0` if the field existed. |
+| | `HGET`, `HMGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`, `HSTRLEN` | Expired fields are invisible to all of them. |
+| | `HINCRBY key field n` / `HINCRBYFLOAT key field x` | As in Redis, including `ERR hash value is not an integer` / `ERR hash value is not a float`, overflow and NaN/Infinity errors. The field keeps its TTL. `HINCRBYFLOAT` stores the result as plain decimal with no exponent or trailing zeros. In a cluster each increment replicates its resulting value (last writer wins per field), like `INCR`. |
+| | `HEXPIRE` / `HPEXPIRE` / `HEXPIREAT` / `HPEXPIREAT key time [NX \| XX \| GT \| LT] FIELDS n field...` | Per-field expiry (Redis 7.4). One reply per field: `-2` no such field (or no such key), `0` the `NX`/`XX`/`GT`/`LT` condition was not met, `1` set, `2` deleted because the time was `0` or in the past. `GT`/`LT` treat a field without a TTL as infinitely far. A negative time is `ERR invalid expire time, must be >= 0`; a time past year 4199 is `ERR invalid expire time in '<cmd>' command`; a `numfields` mismatch and a missing `FIELDS` keyword use Redis' error texts. |
+| | `HTTL` / `HPTTL` / `HEXPIRETIME` / `HPEXPIRETIME key FIELDS n field...` | Per field: remaining TTL (s / ms) or absolute expiry (Unix s / ms); `-1` no TTL, `-2` no such field. |
+| | `HPERSIST key FIELDS n field...` | Per field: `1` TTL removed, `-1` had none, `-2` no such field. |
+| | `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Returns the whole hash in one page with cursor `0` (`COUNT` is ignored — Redis does the same for small hashes). Clients that loop until cursor `0` work unchanged. |
 
-Hashes cannot be given a TTL (see `EXPIRE`) and, in a cluster, are **not
-replicated**: `HSET`/`HDEL` stay on the node that ran them (a warning is logged
-once per process). Use string keys for data that must expire or be visible
-cluster-wide.
+### Field expiry
+
+A hash field can carry its own TTL (`HEXPIRE` and friends), independent of the
+hash key's TTL (`EXPIRE` on the hash). An expired field disappears from every
+read the moment its deadline passes; its memory is reclaimed lazily by the next
+write to the hash and actively by the background expiry cycle. When the last
+field of a hash expires the hash itself stops existing. `HSET` clears a field's
+TTL; `HINCRBY`/`HINCRBYFLOAT` keep it. Watch versions (`ephpm_kv_wait`) advance
+when a field's value changes or a field is removed, not on TTL-only changes.
+
+### SCAN
+
+The store is split into a fixed set of internal shards, and a key always lives
+in the same shard for as long as it exists — however much the shard's table
+grows, shrinks or rehashes. The `SCAN` cursor is a shard position, and each
+call walks whole shards. That is what makes the guarantee hold under
+concurrent writes: a key present from the first call to the last is returned,
+exactly once. (A name that is both a string and a hash is returned once per
+type.)
+
+In a cluster, `SCAN` and `KEYS` list **this node's** keyspace: every hash and
+every string value at or under `[cluster.kv] small_key_threshold` is held by
+every node and is always seen; a larger string value is held only by its
+replica set and is listed only on those nodes.
+
+### Hashes in a cluster
+
+Hashes replicate across the cluster **per field**: every field is its own
+replicated item on the gossip tier, ordered last-writer-wins by its own stamp.
+Two nodes writing different fields of one hash at the same time both win; two
+nodes writing the same field converge on the later write. Field TTLs and the
+hash key's TTL travel with every field, so a node that joins later converges
+too. Every node holds every field, so hash reads never leave the node.
+
+Because a field rides a gossip datagram, a clustered hash field value is
+limited to `[cluster.kv] small_key_threshold` minus a 17-byte header (495 bytes
+at the default 512). A larger value is refused with an error naming the limit
+and nothing is written — it is never stored on one node only. Store large
+values under string keys, which have a large-value tier.
+
+Deleting a hash (`DEL`/`UNLINK`) removes it on every node and also retracts
+each field this node knows, so a node that joins later does not resurrect it.
+A field written concurrently on another node that had not reached the deleting
+node yet survives the delete, the same per-write window as everything else in
+this tier.
+
+Before v0.13, hash writes were node-local in a cluster. During a rolling
+upgrade, nodes still on an older version store replicated fields as stray
+string keys under an encoded name (unreachable, freed on restart); finish the
+upgrade before relying on clustered hashes.
 
 ### Strings and hashes do not collide
 
@@ -124,8 +183,7 @@ Any of these returns `-ERR unknown command`:
 
 - **Transactions and scripting:** `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`.
 - **Other data types:** lists (`LPUSH`, `RPOP`, `BLPOP`, ...), sets (`SADD`, `SMEMBERS`, ...), sorted sets, streams, HyperLogLog, bitmaps, geo.
-- **Iteration:** `SCAN`, `HSCAN`.
-- **Common extras:** `UNLINK`, `GETDEL`, `GETEX`, `EXPIREAT`, `PEXPIREAT`, `HMGET`, `HMSET`, `HINCRBY`, `HSETNX`, `INCRBYFLOAT`, `SETRANGE`, `GETRANGE`, `MSETNX`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`.
+- **Common extras:** `INCRBYFLOAT`, `SETRANGE`, `GETRANGE`, `MSETNX`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`, `HRANDFIELD`, `HGETDEL`/`HGETEX`/`HSETEX` (Redis 8), `SSCAN`/`ZSCAN`.
 - **Pub/sub:** `SUBSCRIBE`, `PUBLISH`, ...
 - **Server and client admin:** `CLIENT`, `CONFIG`, `HELLO`, `RESET`, `WAIT`.
 
@@ -136,8 +194,9 @@ What that means in practice:
 | Key/value cache with TTLs (`GET`/`SET EX`/`SETEX`/`DEL`) | Yes |
 | Counters and fixed-window rate limits (`INCR` + `EXPIRE`) | Yes (approximate cluster-wide when clustered: totals replicate last-writer-wins and can under-count) |
 | Session storage as a string key with a TTL | Yes |
-| Simple locks (`SET NX PX` + `DELIFEQ` to release) | Yes, but `DELIFEQ` is not a Redis command, so a client library's built-in lock release (usually a Lua `EVAL`) will not work |
-| Hash-per-object storage | Partly: `HSET`/`HGET`/`HGETALL` work, `HMGET`/`HINCRBY` do not |
+| Simple locks (`SET NX PX`, extend with `SET IFEQ PX`, release with `DELIFEQ`) | Yes, but `DELIFEQ` is not a Redis command, so a client library's built-in lock release (usually a Lua `EVAL`) will not work |
+| Hash-per-object storage, including per-field TTLs | Yes (in a cluster: field values up to the [hash-field limit](#hashes-in-a-cluster)) |
+| Iterating keys by prefix (`SCAN MATCH`) | Yes (this node's keyspace in a cluster — see [SCAN](#scan)) |
 | Anything batched in `MULTI`/`EXEC` | No |
 | Queues and job backends (lists, blocking pops, Lua) | No |
 | Tag-based cache invalidation (sets) | No |

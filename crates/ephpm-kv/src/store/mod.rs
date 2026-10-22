@@ -6,9 +6,11 @@
 
 mod entry;
 mod glob;
+mod hash;
+mod scan;
+mod strings;
 mod watch;
 
-use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::io::Write;
 use std::sync::Arc;
@@ -18,6 +20,13 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 pub use entry::Entry;
+use hash::HashEntry;
+pub use hash::{
+    HASH_NOT_FLOAT, HASH_NOT_INTEGER, HashWriteError, INCR_NAN_OR_INF, INCR_OVERFLOW, field_code,
+    format_float, parse_float,
+};
+pub use scan::{KeyKind, ScanPage};
+pub use strings::{GetExpiry, SetIfEqOutcome, SetTtl};
 use tracing::{debug, trace};
 use watch::WatchSlot;
 
@@ -212,38 +221,193 @@ impl Default for StoreConfig {
     }
 }
 
-/// A hash entry with TTL support.
-#[derive(Debug)]
-struct HashEntry {
-    /// Field → value map. Values are [`Bytes`] so `hget`/`hgetall`/
-    /// `hvals` return `Arc`-clones instead of copying every byte.
-    fields: HashMap<String, Bytes>,
-    /// Absolute expiry time, or `None` for persistent keys.
-    expires_at: Option<Instant>,
-    /// Last access, as nanoseconds since the store anchor — the hash's LRU
-    /// clock, so `allkeys-lru` can rank hashes against string keys. Atomic
-    /// for the same reason as [`Entry::last_accessed`]: reads touch it under
-    /// the shard read lock.
-    last_accessed: AtomicU64,
+/// The replicable state of one hash field after a mutation — what a
+/// [`Replicator`] fans out for it, and what [`Store::apply_hash_field_local`]
+/// applies on a peer.
+///
+/// Durations are **remaining** lifetimes measured when the state was read; a
+/// transport converts them to absolute times for the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashFieldState {
+    /// The field's value, or `None` when the field no longer exists (deleted,
+    /// expired, or the whole hash is gone) — a tombstone.
+    pub value: Option<Vec<u8>>,
+    /// The field's own remaining TTL (`HEXPIRE`), if any.
+    pub field_ttl: Option<Duration>,
+    /// The hash key's remaining TTL (`EXPIRE` on the hash), if any. Carried on
+    /// every field so a peer learns the key expiry whichever field reaches it
+    /// first.
+    pub hash_ttl: Option<Duration>,
 }
 
-impl HashEntry {
-    /// Touch the LRU clock, with the same coarse granularity as
-    /// [`Entry::touch`].
-    fn touch(&self, now_nanos: u64) {
-        let prev = self.last_accessed.load(Ordering::Relaxed);
-        if now_nanos.saturating_sub(prev) >= entry::LRU_TOUCH_GRANULARITY_NANOS {
-            self.last_accessed.store(now_nanos, Ordering::Relaxed);
+impl HashFieldState {
+    /// A tombstone: the field does not exist.
+    #[must_use]
+    pub fn deleted() -> Self {
+        Self { value: None, field_ttl: None, hash_ttl: None }
+    }
+}
+
+/// The `NX`/`XX`/`GT`/`LT` condition of an expire command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpireCondition {
+    /// No condition: always set.
+    #[default]
+    Always,
+    /// Only when there is no expiry yet.
+    Nx,
+    /// Only when there already is an expiry.
+    Xx,
+    /// Only when the new expiry is later than the current one. No expiry
+    /// counts as infinitely late, so `GT` never applies to a persistent item.
+    Gt,
+    /// Only when the new expiry is earlier than the current one. No expiry
+    /// counts as infinitely late, so `LT` always applies to a persistent item.
+    Lt,
+}
+
+impl ExpireCondition {
+    /// Whether moving from `current` to `new` expiry is allowed (`None` =
+    /// no expiry / unrepresentably far).
+    #[must_use]
+    pub fn allows(self, current: Option<Instant>, new: Option<Instant>) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Nx => current.is_none(),
+            Self::Xx => current.is_some(),
+            Self::Gt => match (current, new) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(c), Some(n)) => n > c,
+            },
+            Self::Lt => match (current, new) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(c), Some(n)) => n < c,
+            },
         }
     }
+}
 
-    fn is_expired(&self) -> bool {
-        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
+/// Current wall-clock time in Unix milliseconds.
+#[must_use]
+pub fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Translate a store deadline into Unix milliseconds (for `EXPIRETIME` and
+/// friends). Rounded to the nearest millisecond, so a deadline set from a
+/// whole Unix time (`EXPIREAT`) reads back as that time; a deadline in the
+/// past maps below now.
+#[must_use]
+pub fn instant_to_unix_ms(at: Instant) -> i64 {
+    let rounded_ms = |d: Duration| i64::try_from((d.as_nanos() + 500_000) / 1_000_000);
+    let now = Instant::now();
+    let now_ms = unix_ms_now();
+    if at >= now {
+        now_ms.saturating_add(rounded_ms(at.duration_since(now)).unwrap_or(i64::MAX))
+    } else {
+        now_ms.saturating_sub(rounded_ms(now.duration_since(at)).unwrap_or(i64::MAX))
+    }
+}
+
+/// Drop a removed value **off the calling thread** when freeing it is
+/// expensive (a hash with many fields), the way Redis' lazyfree does for
+/// `UNLINK` (and, since Valkey 8, for `DEL`).
+///
+/// Freeing a hash walks every field allocation; for a million fields that is
+/// tens of milliseconds a PHP request or a RESP connection would otherwise
+/// spend inside `DEL`. Small values are dropped inline — handing them to
+/// another thread costs more than freeing them.
+pub(crate) fn lazy_drop<T: LazyFree>(value: T) {
+    if value.free_cost() < LAZYFREE_THRESHOLD {
+        return;
+    }
+    static FREER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>> =
+        std::sync::OnceLock::new();
+    let tx = FREER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        let spawned = std::thread::Builder::new()
+            .name("ephpm-kv-lazyfree".into())
+            .spawn(move || while rx.recv().is_ok() {});
+        if spawned.is_err() {
+            tracing::debug!("lazyfree thread could not be spawned; freeing inline");
+        }
+        std::sync::Mutex::new(tx)
+    });
+    let boxed: Box<dyn Send> = Box::new(value);
+    // A poisoned lock or a dead thread hands the value back: free it inline.
+    if let Ok(tx) = tx.lock()
+        && let Err(back) = tx.send(boxed)
+    {
+        drop(back);
+    }
+}
+
+/// Number of allocations above which [`lazy_drop`] frees off-thread (Redis'
+/// `LAZYFREE_THRESHOLD`).
+const LAZYFREE_THRESHOLD: usize = 64;
+
+/// What it costs to free a value, in allocations.
+pub(crate) trait LazyFree: Send + 'static {
+    /// Approximate number of allocations dropping this frees.
+    fn free_cost(&self) -> usize;
+}
+
+impl LazyFree for HashEntry {
+    fn free_cost(&self) -> usize {
+        self.fields.len()
+    }
+}
+
+impl LazyFree for hash::HashField {
+    fn free_cost(&self) -> usize {
+        1
+    }
+}
+
+/// Keyspace hit/miss counters for `INFO stats`.
+///
+/// Striped over cache-line-padded slots, one picked per thread, so the hot
+/// read path pays a relaxed add on a line no other thread writes — a single
+/// shared counter would put every `GET` in the process on one contended cache
+/// line.
+#[derive(Debug, Default)]
+pub(crate) struct Stats {
+    hits: [PaddedCounter; STAT_STRIPES],
+    misses: [PaddedCounter; STAT_STRIPES],
+}
+
+/// Stripes per counter.
+const STAT_STRIPES: usize = 16;
+
+/// One counter on its own cache line.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct PaddedCounter(AtomicU64);
+
+impl Stats {
+    /// This thread's stripe.
+    fn stripe() -> usize {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed) % STAT_STRIPES;
+        }
+        SLOT.try_with(|s| *s).unwrap_or(0)
     }
 
-    /// Rough memory estimate.
-    fn mem_size(&self) -> usize {
-        self.fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum::<usize>() + 64
+    pub(crate) fn hit(&self) {
+        self.hits[Self::stripe()].0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn miss(&self) {
+        self.misses[Self::stripe()].0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn sum(counters: &[PaddedCounter]) -> u64 {
+        counters.iter().map(|c| c.0.load(Ordering::Relaxed)).fold(0, u64::wrapping_add)
     }
 }
 
@@ -435,6 +599,59 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
         let _ = (key, token);
         Routed::Local
     }
+
+    /// Decide where a compare-and-set (`SET key value IFEQ expected`) on `key`
+    /// is arbitrated — the same arbiter as [`route_set_nx`](Self::route_set_nx)
+    /// and [`route_del_if_eq`](Self::route_del_if_eq), with the same contract.
+    /// A clustered implementation MUST override this for the same reason.
+    fn route_set_if_eq(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl: SetTtl,
+    ) -> Routed<SetIfEqOutcome> {
+        let _ = (key, expected, value, ttl);
+        Routed::Local
+    }
+
+    /// Run **one hash-field mutation** as a replicated write and publish the
+    /// field's resulting state.
+    ///
+    /// `apply` performs the local mutation under the store's own locks and
+    /// returns the field's resulting [`HashFieldState`], or `None` when it
+    /// changed nothing (an `HSETNX` that lost, an `HDEL` of an absent field) —
+    /// in which case nothing may be published *and* the write must leave no
+    /// trace in the replicator's ordering, or a peer's genuinely newer write
+    /// could be refused here.
+    ///
+    /// An implementation orders writes **per field** (`key` + `field`), takes
+    /// that position *before* calling `apply`, and calls `apply` at most once,
+    /// while holding the position — exactly what
+    /// [`replicate_set`](Self::replicate_set) does for a string key — so the
+    /// local copy and what peers receive are the same point in that order. It
+    /// may decline to call `apply` at all when a newer write for the field has
+    /// already landed (last-writer-wins: this write lost).
+    ///
+    /// Returns whether `apply` ran.
+    ///
+    /// Required rather than defaulted, like the other publish hooks: a default
+    /// that ran `apply` without publishing would silently leave hashes
+    /// node-local in every new implementation — which is precisely how hashes
+    /// went unreplicated before this hook existed.
+    fn replicate_hash_field(
+        &self,
+        key: &str,
+        field: &str,
+        apply: &mut dyn FnMut() -> Option<HashFieldState>,
+    ) -> bool;
+
+    /// The largest value a hash field may hold and still replicate, or `None`
+    /// for no limit. Writes of larger values are refused with
+    /// [`HashWriteError::TooLargeForCluster`] rather than stored node-locally.
+    fn hash_field_value_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Thread-safe in-memory KV store.
@@ -443,6 +660,16 @@ pub struct Store {
     data: DashMap<String, Entry>,
     /// Hash values stored separately to avoid Entry enum complexity.
     hashes: DashMap<String, HashEntry>,
+    /// Hashes with something that expires — the key itself or a field —
+    /// mapped to (no later than) the earliest such deadline. The hash
+    /// counterpart of `ttl_keys`, sampled by active expiry. A hint, like
+    /// `ttl_keys`: an early one costs one wasted look, and the look corrects
+    /// it.
+    hash_ttl_keys: DashMap<String, Instant>,
+    /// Where active expiry stopped in `hash_ttl_keys`.
+    hash_expire_cursor: AtomicU64,
+    /// Keyspace hit/miss counters (`INFO stats`).
+    stats: Stats,
     /// Keys whose entries currently carry an expiry, mapped to that expiry.
     ///
     /// # Why a side index
@@ -509,6 +736,12 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("data_len", &self.data.len())
             .field("hashes_len", &self.hashes.len())
+            .field("hash_ttl_keys_len", &self.hash_ttl_keys.len())
+            .field(
+                "hash_expire_cursor",
+                &MapCursor::unpack(self.hash_expire_cursor.load(Ordering::Relaxed)),
+            )
+            .field("stats", &self.stats)
             .field("ttl_keys_len", &self.ttl_keys.len())
             .field("expire_cursor", &MapCursor::unpack(self.expire_cursor.load(Ordering::Relaxed)))
             .field("eviction_pool_len", &self.eviction_pool.try_lock().map(|p| p.len()))
@@ -530,6 +763,9 @@ impl Store {
         Arc::new(Self {
             data: DashMap::new(),
             hashes: DashMap::new(),
+            hash_ttl_keys: DashMap::new(),
+            hash_expire_cursor: AtomicU64::new(0),
+            stats: Stats::default(),
             ttl_keys: DashMap::new(),
             expire_cursor: AtomicU64::new(0),
             rng: AtomicU64::new(rng_seed()),
@@ -761,9 +997,18 @@ impl Store {
     /// Get the remaining TTL for a key in milliseconds.
     /// Returns `None` if the key doesn't exist, `Some(-1)` if no expiry,
     /// `Some(-2)` if expired/missing.
+    ///
+    /// A hash key reports its whole-key expiry (field expiries are read with
+    /// [`hpttl`](Self::hpttl)).
     #[must_use]
     pub fn pttl(&self, key: &str) -> Option<i64> {
-        let entry = self.data.get(key)?;
+        let Some(entry) = self.data.get(key) else {
+            let at = self.hash_key_expiry(key)?;
+            return Some(at.map_or(-1, |at| {
+                let remaining = at.saturating_duration_since(Instant::now());
+                i64::try_from(remaining.as_millis()).unwrap_or(i64::MAX)
+            }));
+        };
         if entry.is_expired() {
             let observed = entry.expires_at;
             drop(entry);
@@ -814,9 +1059,23 @@ impl Store {
     pub fn keys(&self, pattern: &str) -> Vec<String> {
         let pattern = (pattern != "*").then_some(pattern.as_bytes());
         let mut result = Vec::new();
+        let now = Instant::now();
         collect_keys(&self.data, |e| !e.is_expired(), pattern, &mut result);
-        collect_keys(&self.hashes, |h| !h.is_expired(), pattern, &mut result);
+        collect_keys(&self.hashes, |h| h.is_live(now), pattern, &mut result);
         result
+    }
+
+    /// The keyspace counters `INFO` reports: `(keys, keys_with_expiry,
+    /// keyspace_hits, keyspace_misses)`. Key counts include expired keys not
+    /// yet reaped, as `DBSIZE` does.
+    #[must_use]
+    pub fn keyspace_info(&self) -> (usize, usize, u64, u64) {
+        (
+            self.len(),
+            self.ttl_keys.len() + self.hash_ttl_keys.len(),
+            Stats::sum(&self.stats.hits),
+            Stats::sum(&self.stats.misses),
+        )
     }
 
     // ── Key watches (blocking wait) ──────────────────────────────
@@ -993,13 +1252,20 @@ impl Store {
     /// (a miss there means the key does not exist). The fetched value is not
     /// cached here — it carries no TTL — beyond whatever the replicator's own
     /// hot-key cache keeps.
+    ///
+    /// Counts the lookup as a keyspace hit or miss (`INFO stats`).
     #[must_use]
     pub fn get_through(&self, key: &str) -> Option<Bytes> {
-        if let Some(local) = self.get(key) {
-            return Some(local);
+        let found = self.get(key).or_else(|| {
+            let replicator = self.active_replicator()?;
+            replicator.fetch_through(key).map(Bytes::from)
+        });
+        if found.is_some() {
+            self.stats.hit();
+        } else {
+            self.stats.miss();
         }
-        let replicator = self.active_replicator()?;
-        replicator.fetch_through(key).map(Bytes::from)
+        found
     }
 
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a
@@ -1131,10 +1397,9 @@ impl Store {
     /// ignore, and an operator watching the log still wants one clear signal
     /// that the store is parked at its limit.
     ///
-    /// It also has to go quiet, for the same reason
-    /// [`Store::warn_hash_not_replicated`] does: a store sitting at the limit
-    /// refuses *every* write, and a `warn!` per write would bury the log in a
-    /// message whose content never changes.
+    /// It also has to go quiet: a store sitting at the limit refuses *every*
+    /// write, and a `warn!` per write would bury the log in a message whose
+    /// content never changes.
     fn log_write_rejected(&self, key: &str, needed: usize) {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mem_used = self.mem_used();
@@ -1461,9 +1726,26 @@ impl Store {
     /// When a [`Replicator`] is installed, the delete is delegated to it so
     /// remote copies are dropped as well. See [`Store::remove_local`] for
     /// the bypass variant.
+    ///
+    /// # Hashes in a cluster
+    ///
+    /// Peers drop a whole hash when the key's tombstone reaches them, but the
+    /// replication tier also holds each field as its own replicated item, and
+    /// those would otherwise be re-delivered (to a node that joins later, or
+    /// by a repair pass) and resurrect the hash. So deleting a hash also
+    /// publishes a tombstone for every field this node knows. A field written
+    /// concurrently on another node that had not reached this one yet is not
+    /// covered and survives the delete — per-field last-writer-wins, the same
+    /// window every write in this tier has.
     pub fn remove(&self, key: &str) -> bool {
         if let Some(rep) = self.active_replicator() {
-            return rep.replicate_remove(key);
+            let fields = self.hash_field_names(key);
+            let removed = rep.replicate_remove(key);
+            for field in &fields {
+                let mut tombstone = || Some(HashFieldState::deleted());
+                rep.replicate_hash_field(key, field, &mut tombstone);
+            }
+            return removed;
         }
         self.remove_local(key)
     }
@@ -1581,14 +1863,22 @@ impl Store {
     /// When a [`Replicator`] is installed, the TTL update is delegated so
     /// remote copies see the change. See [`Store::expire_local`] for the
     /// bypass variant.
+    ///
+    /// Applies to a hash key too (its whole-key expiry); every field is then
+    /// re-published so peers carry the new key expiry.
     pub fn expire(&self, key: &str, ttl: Duration) -> bool {
-        if let Some(rep) = self.active_replicator() {
-            return rep.replicate_expire(key, ttl);
-        }
-        self.expire_local(key, ttl)
+        let string = if let Some(rep) = self.active_replicator() {
+            rep.replicate_expire(key, ttl)
+        } else {
+            self.expire_local(key, ttl)
+        };
+        let hash = self.hash_set_key_expiry(key, Instant::now().checked_add(ttl));
+        string || hash
     }
 
-    /// Local-only expire — bypasses any installed [`Replicator`].
+    /// Local-only expire of a **string** key — bypasses any installed
+    /// [`Replicator`]. (A hash's key expiry replicates with its fields; see
+    /// [`expire`](Self::expire).)
     pub fn expire_local(&self, key: &str, ttl: Duration) -> bool {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
@@ -1608,9 +1898,17 @@ impl Store {
         }
     }
 
-    /// Remove the expiry from a key (make it persistent). Returns `false`
-    /// if the key doesn't exist.
+    /// Remove the expiry from a key (make it persistent). Returns `true` if
+    /// an expiry was removed — `false` if the key does not exist or had none.
+    /// Applies to a hash key's whole-key expiry too.
     pub fn persist(&self, key: &str) -> bool {
+        let string = self.persist_string(key);
+        let hash = self.hash_set_key_expiry(key, None);
+        string || hash
+    }
+
+    /// [`persist`](Self::persist) for the string keyspace only.
+    pub(crate) fn persist_string(&self, key: &str) -> bool {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
@@ -1885,239 +2183,6 @@ impl Store {
         }
     }
 
-    // ── Hash operations ──────────────────────────────────────────
-
-    /// Warn — **once per process** — that a hash mutation is not replicated.
-    ///
-    /// Hash values live in a separate map and have no representation in the
-    /// [`Replicator`] trait, which is string-valued (`set`/`remove`/`expire`).
-    /// So `HSET`/`HDEL` are node-local even in clustered mode. That is a
-    /// pre-existing limit of the replication tier, not a per-call failure —
-    /// but an operator who assumes "clustered KV" covers hashes needs to be
-    /// told, and silence is how the `INCR` gap survived this long. Warned once
-    /// rather than per call: a hash-heavy workload would otherwise flood the
-    /// log with a message whose content never changes.
-    fn warn_hash_not_replicated(&self, op: &'static str) {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        // Cheap relaxed load FIRST. `active_replicator` takes an `RwLock` and
-        // clones an `Arc`, so checking it first would make every HSET/HDEL pay
-        // a lock acquisition and a contended refcount bump for the entire life
-        // of the process just to decide not to log.
-        if WARNED.load(Ordering::Relaxed) || self.active_replicator().is_none() {
-            return;
-        }
-        if WARNED.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        tracing::warn!(
-            op,
-            "hash values are NOT replicated across the cluster: the KV replication tier carries \
-             string keys only (SET/DEL/EXPIRE), so HSET/HDEL stay node-local. Use string keys for \
-             data that must be cluster-visible. This warning is emitted once per process."
-        );
-    }
-
-    /// Set a field in a hash. Creates the hash if it doesn't exist.
-    ///
-    /// Returns `Some(true)` if the field was newly inserted, `Some(false)` if
-    /// an existing field was updated, and `None` if the memory budget refused
-    /// the write (the RESP layer answers `-OOM`, as for `SET`). A refused write
-    /// leaves the hash untouched.
-    ///
-    /// **Not replicated** in clustered mode — see
-    /// `warn_hash_not_replicated`.
-    pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> Option<bool> {
-        self.warn_hash_not_replicated("HSET");
-        let field_mem = field.len() + value.len() + 64;
-        // Reserve before taking the hash's shard guard (reclaiming and evicting
-        // lock arbitrary shards). HSET used to skip the budget entirely, so
-        // hashes could grow past `memory_limit` under every policy. The
-        // check is for the whole new field plus, for a new hash, its base
-        // overhead — for an overwrite that is slightly stricter than the true
-        // delta. The bytes are charged by the exact accounting below.
-        let base = if self.hashes.contains_key(key) { 0 } else { 64 };
-        if !self.reserve(key, field_mem + base) {
-            return None;
-        }
-        let value = Bytes::from(value);
-        let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
-            self.mem_add(64); // base hash overhead
-            HashEntry {
-                fields: HashMap::new(),
-                expires_at: None,
-                last_accessed: AtomicU64::new(self.now_nanos()),
-            }
-        });
-        if entry.is_expired() {
-            let old_mem = entry.mem_size();
-            entry.fields.clear();
-            entry.expires_at = None;
-            self.mem_sub(old_mem);
-        }
-        entry.touch(self.now_nanos());
-        let is_new = !entry.fields.contains_key(field);
-        if let Some(old_val) = entry.fields.insert(field.to_string(), value) {
-            // Replaced — adjust memory for the difference.
-            let old_field_mem = field.len() + old_val.len() + 64;
-            if field_mem > old_field_mem {
-                self.mem_add(field_mem - old_field_mem);
-            } else {
-                self.mem_sub(old_field_mem - field_mem);
-            }
-        } else {
-            self.mem_add(field_mem);
-        }
-        Some(is_new)
-    }
-
-    /// Get a field value from a hash.
-    ///
-    /// Returns a cheap [`Bytes`] `Arc`-clone; no memcpy of the field
-    /// value.
-    #[must_use]
-    pub fn hget(&self, key: &str, field: &str) -> Option<Bytes> {
-        let entry = self.hashes.get(key)?;
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return None;
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.get(field).cloned()
-    }
-
-    /// Delete a field from a hash.
-    ///
-    /// Returns `true` if the field existed and was removed.
-    ///
-    /// **Not replicated** in clustered mode — see
-    /// `warn_hash_not_replicated`.
-    pub fn hdel(&self, key: &str, field: &str) -> bool {
-        self.warn_hash_not_replicated("HDEL");
-        if let Some(mut entry) = self.hashes.get_mut(key) {
-            if entry.is_expired() {
-                drop(entry);
-                self.hash_remove(key);
-                return false;
-            }
-            if let Some(old_val) = entry.fields.remove(field) {
-                let freed = field.len() + old_val.len() + 64;
-                self.mem_sub(freed);
-                // Remove the hash key entirely if empty.
-                if entry.fields.is_empty() {
-                    drop(entry);
-                    self.hash_remove(key);
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Get all field-value pairs from a hash.
-    ///
-    /// Values are cheap [`Bytes`] `Arc`-clones; field names are copied
-    /// (they're `String`s, no `Arc` sharing).
-    #[must_use]
-    pub fn hgetall(&self, key: &str) -> Vec<(String, Bytes)> {
-        let Some(entry) = self.hashes.get(key) else {
-            return Vec::new();
-        };
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return Vec::new();
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    }
-
-    /// Get all field names from a hash.
-    #[must_use]
-    pub fn hkeys(&self, key: &str) -> Vec<String> {
-        let Some(entry) = self.hashes.get(key) else {
-            return Vec::new();
-        };
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return Vec::new();
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.keys().cloned().collect()
-    }
-
-    /// Get all values from a hash.
-    ///
-    /// Returned values are cheap [`Bytes`] `Arc`-clones.
-    #[must_use]
-    pub fn hvals(&self, key: &str) -> Vec<Bytes> {
-        let Some(entry) = self.hashes.get(key) else {
-            return Vec::new();
-        };
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return Vec::new();
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.values().cloned().collect()
-    }
-
-    /// Get the number of fields in a hash.
-    #[must_use]
-    pub fn hlen(&self, key: &str) -> usize {
-        let Some(entry) = self.hashes.get(key) else {
-            return 0;
-        };
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return 0;
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.len()
-    }
-
-    /// Check if a field exists in a hash.
-    #[must_use]
-    pub fn hexists(&self, key: &str, field: &str) -> bool {
-        let Some(entry) = self.hashes.get(key) else {
-            return false;
-        };
-        if entry.is_expired() {
-            drop(entry);
-            self.hash_remove(key);
-            return false;
-        }
-        entry.touch(self.now_nanos());
-        entry.fields.contains_key(field)
-    }
-
-    /// Remove a hash key entirely.
-    fn hash_remove(&self, key: &str) -> bool {
-        if let Some((_, old)) = self.hashes.remove(key) {
-            self.mem_sub(old.mem_size());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Check if a key exists as a hash.
-    #[must_use]
-    pub fn is_hash(&self, key: &str) -> bool {
-        if let Some(entry) = self.hashes.get(key) {
-            if entry.is_expired() {
-                drop(entry);
-                self.hash_remove(key);
-                return false;
-            }
-            return true;
-        }
-        false
-    }
-
     /// Remove all keys.
     /// **Node-local by design.** `flush` is an administrative reset of *this*
     /// node's map; it deliberately does not broadcast, because replicating it
@@ -2128,6 +2193,7 @@ impl Store {
     pub fn flush(&self) {
         self.data.clear();
         self.hashes.clear();
+        self.hash_ttl_keys.clear();
         self.ttl_keys.clear();
         self.mem_used.store(0, Ordering::Relaxed);
         // A flush changes every key — wake all waiters so they observe the
@@ -2273,16 +2339,17 @@ impl Store {
                 for bucket in unsafe { guard.iter() } {
                     let (key, slot) = unsafe { bucket.as_ref() };
                     let entry = slot.get();
-                    if entry.expires_at.is_some_and(|exp| exp <= now) {
+                    if !entry.is_live(now) {
                         continue;
                     }
+                    // Live fields only, each with its own expiry (HEXPIRE).
                     let fields = entry
-                        .fields
-                        .iter()
-                        .map(|(f, v)| HashFieldRecord {
-                            name: f.clone(),
-                            value: v.clone(),
-                            expires_at: None,
+                        .live_parts(now)
+                        .into_iter()
+                        .map(|(name, value, expires_at)| HashFieldRecord {
+                            name,
+                            value,
+                            expires_at,
                         })
                         .collect();
                     batch.push(HashRecord {
@@ -2355,25 +2422,32 @@ impl Store {
         expires_at: Option<Instant>,
     ) -> bool {
         let now = Instant::now();
-        let fields: HashMap<String, Bytes> = fields
-            .into_iter()
-            .filter(|f| f.expires_at.is_none_or(|at| at > now))
-            .map(|f| (f.name, f.value))
-            .collect();
-        if fields.is_empty() {
+        let Some(entry) = HashEntry::from_parts(
+            &key,
+            fields.into_iter().map(|f| (f.name, f.value, f.expires_at)),
+            expires_at,
+            now,
+            self.now_nanos(),
+        ) else {
             return false;
-        }
-        let entry =
-            HashEntry { fields, expires_at, last_accessed: AtomicU64::new(self.now_nanos()) };
-        let new_size = entry.mem_size();
-        let old_size = self.hashes.get(&key).map_or(0, |old| old.mem_size());
+        };
+        let new_size = entry.mem;
+        let deadline = entry.earliest_deadline();
+        let old_size = self.hashes.get(&key).map_or(0, |old| old.mem);
         if !self.reserve(&key, new_size.saturating_sub(old_size)) {
             return false;
         }
-        let previous = self.hashes.insert(key, entry);
+        let watch = self.watch_slot_if_any(&key);
+        let previous = self.hashes.insert(key.clone(), entry);
         self.mem_add(new_size);
         if let Some(old) = previous {
-            self.mem_sub(old.mem_size());
+            self.mem_sub(old.mem);
+            lazy_drop(old);
+        }
+        // The hash TTL index drives active expiry of the key and its fields.
+        self.hash_index_restore(&key, deadline);
+        if let Some(slot) = watch {
+            slot.bump();
         }
         true
     }
@@ -2437,6 +2511,7 @@ impl Store {
         shrink_sparse_shards(&self.data)
             + shrink_sparse_shards(&self.ttl_keys)
             + shrink_sparse_shards(&self.hashes)
+            + shrink_sparse_shards(&self.hash_ttl_keys)
     }
 
     /// The adaptive rounds of [`active_expire_cycle`](Self::active_expire_cycle).
@@ -2481,7 +2556,30 @@ impl Store {
             // deadline and survives (#478). A stale hint is pruned either way.
             self.reap_if_expired(&key, at);
         }
-        SampleRound { sampled, expired: expired_count }
+        let hashes = self.hash_expire_round(now);
+        SampleRound { sampled: sampled + hashes.sampled, expired: expired_count + hashes.expired }
+    }
+
+    /// The hash half of [`expire_round`](Self::expire_round): examine the next
+    /// [`EXPIRE_SAMPLE_KEYS`] hints of `hash_ttl_keys` and reap whatever has
+    /// expired in those hashes — whole hashes past their key expiry, and
+    /// expired fields of the rest. A hint that turns out early (a field's TTL
+    /// was extended or removed) is corrected to the hash's real earliest
+    /// deadline by the reap.
+    fn hash_expire_round(&self, now: Instant) -> SampleRound {
+        if self.hash_ttl_keys.is_empty() {
+            return SampleRound { sampled: 0, expired: 0 };
+        }
+        let mut due: Vec<String> = Vec::new();
+        let from = MapCursor::unpack(self.hash_expire_cursor.load(Ordering::Relaxed));
+        let (sampled, next) = scan_map(&self.hash_ttl_keys, from, EXPIRE_SAMPLE_KEYS, |k, at| {
+            if *at <= now {
+                due.push(k.clone());
+            }
+        });
+        self.hash_expire_cursor.store(next.pack(), Ordering::Relaxed);
+        let expired = due.into_iter().filter(|key| self.reap_hash(key)).count();
+        SampleRound { sampled, expired }
     }
 
     /// Reclaim expired keys until `needed` more bytes fit under the limit,
@@ -2751,8 +2849,10 @@ impl Store {
     fn evict_victim(&self, victim: &Victim) -> Option<usize> {
         let freed = if victim.hash {
             self.hashes.remove(&victim.key).map(|(_, old)| {
-                let size = old.mem_size();
+                let size = old.mem;
                 self.mem_sub(size);
+                self.hash_index_drop(&victim.key);
+                lazy_drop(old);
                 size
             })
         } else {
@@ -3522,6 +3622,15 @@ mod tests {
             true
         }
         fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
+        fn replicate_hash_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+        ) -> bool {
+            let _ = apply();
+            true
+        }
         fn replicate_remove_published(&self, _: String) {}
         fn route_set_nx(
             &self,
@@ -3766,7 +3875,7 @@ mod tests {
         let s = test_store();
         s.set("str:1".into(), b"a".to_vec(), None);
         s.set("str:gone".into(), b"a".to_vec(), Some(Duration::from_millis(1)));
-        s.hset("hash:1", "f", b"v".to_vec());
+        let _ = s.hset("hash:1", "f", b"v".to_vec());
         std::thread::sleep(Duration::from_millis(10));
         let mut keys = s.keys("*:*");
         keys.sort();
@@ -3930,7 +4039,7 @@ mod tests {
         assert!(s.mem_used() > 4 * 1024);
         assert_eq!(s.incr_by("ctr", 1), Ok(1));
         assert_eq!(s.set_nx_outcome("nx".into(), vec![b'z'; 2048], None), SetNxOutcome::Inserted);
-        assert_eq!(s.hset("h", "f", vec![b'h'; 2048]), Some(true));
+        assert_eq!(s.hset("h", "f", vec![b'h'; 2048]), Ok(true));
         assert!(s.set("ap".into(), b"a".to_vec(), None));
         assert_eq!(s.append("ap", &[b'b'; 2048]), Some(2049));
     }
@@ -3948,8 +4057,8 @@ mod tests {
         let mut refused = false;
         for i in 0..100 {
             match s.hset("h", &format!("f{i}"), vec![b'x'; 1024]) {
-                Some(_) => {}
-                None => {
+                Ok(_) => {}
+                Err(_) => {
                     refused = true;
                     break;
                 }
@@ -3967,7 +4076,7 @@ mod tests {
         for i in 0..40 {
             assert!(s.set(format!("s{i}"), vec![b'x'; 300], None));
         }
-        assert_eq!(s.hset("h", "f", vec![b'y'; 4096]), Some(true));
+        assert_eq!(s.hset("h", "f", vec![b'y'; 4096]), Ok(true));
         assert!(s.mem_used() <= limit);
     }
 
@@ -4557,7 +4666,7 @@ mod tests {
             });
             let mut i = 0;
             while s.mem_used() + 2_000 < 64 * 1024 {
-                assert_eq!(s.hset(&format!("h{i}"), "f", vec![b'h'; 1_000]), Some(true));
+                assert_eq!(s.hset(&format!("h{i}"), "f", vec![b'h'; 1_000]), Ok(true));
                 i += 1;
             }
             assert!(
@@ -4574,7 +4683,7 @@ mod tests {
     fn evicting_a_string_keeps_a_same_named_hash() {
         let s = test_store();
         s.set("both".into(), b"v".to_vec(), None);
-        assert_eq!(s.hset("both", "f", b"hv".to_vec()), Some(true));
+        assert_eq!(s.hset("both", "f", b"hv".to_vec()), Ok(true));
         assert!(
             s.evict_victim(&Victim { key: "both".into(), hash: false, idle_rank: 1 }).is_some()
         );
@@ -4885,15 +4994,15 @@ mod tests {
     #[test]
     fn hset_and_hget() {
         let s = test_store();
-        assert_eq!(s.hset("myhash", "field1", b"value1".to_vec()), Some(true));
+        assert_eq!(s.hset("myhash", "field1", b"value1".to_vec()), Ok(true));
         assert_eq!(s.hget("myhash", "field1").as_deref(), Some(&b"value1"[..]));
     }
 
     #[test]
     fn hset_overwrite_returns_false() {
         let s = test_store();
-        assert_eq!(s.hset("myhash", "f", b"v1".to_vec()), Some(true));
-        assert_eq!(s.hset("myhash", "f", b"v2".to_vec()), Some(false));
+        assert_eq!(s.hset("myhash", "f", b"v1".to_vec()), Ok(true));
+        assert_eq!(s.hset("myhash", "f", b"v2".to_vec()), Ok(false));
         assert_eq!(s.hget("myhash", "f").as_deref(), Some(&b"v2"[..]));
     }
 
@@ -4906,14 +5015,14 @@ mod tests {
     #[test]
     fn hget_missing_field() {
         let s = test_store();
-        s.hset("myhash", "f1", b"v".to_vec());
+        let _ = s.hset("myhash", "f1", b"v".to_vec());
         assert_eq!(s.hget("myhash", "f2"), None);
     }
 
     #[test]
     fn hdel_existing() {
         let s = test_store();
-        s.hset("h", "f", b"v".to_vec());
+        let _ = s.hset("h", "f", b"v".to_vec());
         assert!(s.hdel("h", "f"));
         assert_eq!(s.hget("h", "f"), None);
     }
@@ -4927,8 +5036,8 @@ mod tests {
     #[test]
     fn hgetall() {
         let s = test_store();
-        s.hset("h", "a", b"1".to_vec());
-        s.hset("h", "b", b"2".to_vec());
+        let _ = s.hset("h", "a", b"1".to_vec());
+        let _ = s.hset("h", "b", b"2".to_vec());
         let mut pairs = s.hgetall("h");
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
@@ -4943,8 +5052,8 @@ mod tests {
     #[test]
     fn hkeys_and_hvals() {
         let s = test_store();
-        s.hset("h", "x", b"10".to_vec());
-        s.hset("h", "y", b"20".to_vec());
+        let _ = s.hset("h", "x", b"10".to_vec());
+        let _ = s.hset("h", "y", b"20".to_vec());
         let mut keys = s.hkeys("h");
         keys.sort();
         assert_eq!(keys, vec!["x", "y"]);
@@ -4955,15 +5064,15 @@ mod tests {
     fn hlen() {
         let s = test_store();
         assert_eq!(s.hlen("h"), 0);
-        s.hset("h", "a", b"1".to_vec());
-        s.hset("h", "b", b"2".to_vec());
+        let _ = s.hset("h", "a", b"1".to_vec());
+        let _ = s.hset("h", "b", b"2".to_vec());
         assert_eq!(s.hlen("h"), 2);
     }
 
     #[test]
     fn hexists() {
         let s = test_store();
-        s.hset("h", "a", b"1".to_vec());
+        let _ = s.hset("h", "a", b"1".to_vec());
         assert!(s.hexists("h", "a"));
         assert!(!s.hexists("h", "b"));
         assert!(!s.hexists("nope", "a"));
@@ -4972,7 +5081,7 @@ mod tests {
     #[test]
     fn hash_type_detection() {
         let s = test_store();
-        s.hset("h", "f", b"v".to_vec());
+        let _ = s.hset("h", "f", b"v".to_vec());
         assert!(s.is_hash("h"));
         s.set("str".into(), b"v".to_vec(), None);
         assert!(!s.is_hash("str"));
@@ -4981,14 +5090,14 @@ mod tests {
     #[test]
     fn hash_exists_in_global_exists() {
         let s = test_store();
-        s.hset("h", "f", b"v".to_vec());
+        let _ = s.hset("h", "f", b"v".to_vec());
         assert!(s.exists("h"));
     }
 
     #[test]
     fn hash_remove_via_global_remove() {
         let s = test_store();
-        s.hset("h", "f", b"v".to_vec());
+        let _ = s.hset("h", "f", b"v".to_vec());
         assert!(s.remove("h"));
         assert!(!s.exists("h"));
     }
@@ -4997,7 +5106,7 @@ mod tests {
     fn hash_in_global_keys() {
         let s = test_store();
         s.set("str_key".into(), b"v".to_vec(), None);
-        s.hset("hash_key", "f", b"v".to_vec());
+        let _ = s.hset("hash_key", "f", b"v".to_vec());
         let mut keys = s.keys("*");
         keys.sort();
         assert_eq!(keys, vec!["hash_key", "str_key"]);
@@ -5007,14 +5116,14 @@ mod tests {
     fn hash_in_global_len() {
         let s = test_store();
         s.set("a".into(), b"1".to_vec(), None);
-        s.hset("b", "f", b"2".to_vec());
+        let _ = s.hset("b", "f", b"2".to_vec());
         assert_eq!(s.len(), 2);
     }
 
     #[test]
     fn hdel_removes_empty_hash() {
         let s = test_store();
-        s.hset("h", "only", b"v".to_vec());
+        let _ = s.hset("h", "only", b"v".to_vec());
         s.hdel("h", "only");
         assert!(!s.exists("h"));
         assert_eq!(s.len(), 0);
@@ -5023,7 +5132,7 @@ mod tests {
     #[test]
     fn flush_clears_hashes() {
         let s = test_store();
-        s.hset("h", "f", b"v".to_vec());
+        let _ = s.hset("h", "f", b"v".to_vec());
         s.flush();
         assert_eq!(s.hlen("h"), 0);
         assert!(!s.exists("h"));
@@ -5042,8 +5151,8 @@ mod tests {
         s.set("persistent".into(), b"v1".to_vec(), None);
         s.set("ttl".into(), b"v2".to_vec(), Some(Duration::from_secs(60)));
         s.set("ttl_short".into(), b"v3".to_vec(), Some(Duration::from_millis(1)));
-        s.hset("h", "f1", b"hv1".to_vec());
-        s.hset("h", "f2", b"hv2".to_vec());
+        let _ = s.hset("h", "f1", b"hv1".to_vec());
+        let _ = s.hset("h", "f2", b"hv2".to_vec());
         assert!(s.mem_used() > 0);
         assert_eq!(s.len(), 4); // 3 strings + 1 hash
 
@@ -5140,6 +5249,15 @@ mod tests {
         }
         fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) {
             self.publishes.lock().unwrap().push((key, value, ttl));
+        }
+        fn replicate_hash_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+        ) -> bool {
+            let _ = apply();
+            true
         }
         fn replicate_remove_published(&self, key: String) {
             self.removes_published.lock().unwrap().push(key);

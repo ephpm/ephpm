@@ -30,6 +30,16 @@
 //! - `op = 0x03` (DEL-IF-EQ): followed by `[token_len: u32 BE][token]`.
 //!   Response `[status: u8]`: `0x00` deleted, `0x02` not deleted (absent,
 //!   expired, or the token differs), `0x03` cannot route the key.
+//! - `op = 0x06` (SET-IF-EQ, compare-and-set): followed by
+//!   `[payload_len: u32 BE][payload][ttl_ms: u64 BE]`, where the payload is
+//!   `[ttl_mode: u8][expected_len: u32 BE][expected][new value]` and
+//!   `ttl_mode` is `0` no expiry, `1` expire `ttl_ms` from now, `2` keep the
+//!   current expiry. Response `[status: u8]`: `0x00` set, `0x01` refused for
+//!   memory, `0x02` not set (absent, expired, or the value differs), `0x03`
+//!   cannot route the key.
+//!
+//! Hash-field items ([`crate::hash_field`]) never travel over the data plane
+//! — they ride gossip — so a `SET` naming one is refused.
 //!
 //! A node predating these ops drops the connection on the unknown op code
 //! without answering; the caller treats that, like any transport failure, as
@@ -79,7 +89,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ephpm_kv::store::{SetNxOutcome, Store};
+use ephpm_kv::store::{SetIfEqOutcome, SetNxOutcome, SetTtl, Store};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -186,6 +196,9 @@ const SHARE_BATCH_BYTES: usize = 256 * 1024;
 /// so it can exceed the target by one value).
 const MAX_SHARE_BATCH: u32 = SHARE_BATCH_BYTES as u32 + MAX_KEY_LEN + MAX_VALUE_LEN + 64;
 
+/// Op code for an owner-arbitrated compare-and-set (`SET ... IFEQ`).
+const OP_SET_IF_EQ: u8 = 0x06;
+
 /// SET response: success.
 const SET_OK: u8 = 0x00;
 
@@ -201,12 +214,12 @@ const COND_UNROUTABLE: u8 = 0x03;
 
 /// Whether `op` carries a value (or token) after the key.
 fn op_has_value(op: u8) -> bool {
-    matches!(op, OP_SET | OP_SET_V2 | OP_SET_NX | OP_DEL_IF_EQ)
+    matches!(op, OP_SET | OP_SET_V2 | OP_SET_NX | OP_DEL_IF_EQ | OP_SET_IF_EQ)
 }
 
 /// Whether `op` carries a `ttl_ms` trailer after the value.
 fn op_has_ttl(op: u8) -> bool {
-    matches!(op, OP_SET_V2 | OP_SET_NX)
+    matches!(op, OP_SET_V2 | OP_SET_NX | OP_SET_IF_EQ)
 }
 
 /// Start the TCP KV data plane listener on `addr`.
@@ -539,12 +552,42 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
         );
         return Ok(match request.op {
             OP_GET => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
-            OP_SET_NX | OP_DEL_IF_EQ => vec![COND_UNROUTABLE],
+            OP_SET_NX | OP_DEL_IF_EQ | OP_SET_IF_EQ => vec![COND_UNROUTABLE],
             _ => vec![SET_REJECTED],
         });
     };
 
+    // A hash-field item is a gossip-tier object; one arriving as a data-plane
+    // SET would be stored as a string key under its encoded name.
+    if matches!(request.op, OP_SET | OP_SET_V2) && crate::hash_field::decode_key(key).is_some() {
+        tracing::warn!(key = %request.key, "KV data plane refused a SET of a hash-field item");
+        return Ok(vec![SET_REJECTED]);
+    }
+
     Ok(match request.op {
+        OP_SET_IF_EQ => {
+            let payload = request.value.expect("SET-IF-EQ request always carries a payload");
+            let Some((mode, expected, value)) = parse_set_if_eq_payload(&payload) else {
+                anyhow::bail!("malformed SET-IF-EQ payload");
+            };
+            let ttl = match mode {
+                0 => SetTtl::Persist,
+                2 => SetTtl::Keep,
+                _ => SetTtl::After(std::time::Duration::from_millis(
+                    request.ttl_ms.clamp(1, MAX_REMOTE_TTL_MS),
+                )),
+            };
+            // We are the key's owner: decide on OUR map and never re-route
+            // (see OP_SET_NX). The store's replicator publishes a success.
+            let status = match store.set_if_eq_local(key.to_string(), expected, value.to_vec(), ttl)
+            {
+                SetIfEqOutcome::Set => SET_OK,
+                SetIfEqOutcome::NotSet => COND_NOT_APPLIED,
+                SetIfEqOutcome::OutOfMemory => SET_REJECTED,
+                SetIfEqOutcome::OwnerUnreachable => COND_UNROUTABLE,
+            };
+            vec![status]
+        }
         OP_GET => {
             // Look up in the resolved store and build the response.
             if let Some(value) = store.get(key) {
@@ -1377,6 +1420,67 @@ impl DataPlaneClient {
             .await?;
         decode_del_if_eq_status(addr, key, take_u8(&mut response.as_slice())?)
     }
+
+    /// Owner-arbitrated compare-and-set (`SET key value IFEQ expected`).
+    ///
+    /// # Errors
+    ///
+    /// As [`set_nx_remote`]: a connect/refused error means nothing was
+    /// written; an error after the request was sent leaves the outcome
+    /// unknown. An owner predating the op closes the connection unanswered.
+    pub async fn set_if_eq(
+        &self,
+        addr: SocketAddr,
+        key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl: SetTtl,
+    ) -> anyhow::Result<SetIfEqOutcome> {
+        let request = encode_set_if_eq_request(key, expected, value, ttl)?;
+        let response = self.exchange(addr, &request, ResponseKind::Status).await?;
+        match take_u8(&mut response.as_slice())? {
+            SET_OK => Ok(SetIfEqOutcome::Set),
+            COND_NOT_APPLIED => Ok(SetIfEqOutcome::NotSet),
+            SET_REJECTED => Ok(SetIfEqOutcome::OutOfMemory),
+            COND_UNROUTABLE => anyhow::bail!("owner {addr} cannot route key {key:?}"),
+            other => {
+                anyhow::bail!("owner {addr} answered SET-IF-EQ with unknown status {other:#04x}")
+            }
+        }
+    }
+}
+
+/// Encode a plaintext SET-IF-EQ request message ([`OP_SET_IF_EQ`]).
+fn encode_set_if_eq_request(
+    key: &str,
+    expected: &[u8],
+    value: &[u8],
+    ttl: SetTtl,
+) -> anyhow::Result<Vec<u8>> {
+    let (mode, ttl_ms) = match ttl {
+        SetTtl::Persist => (0u8, 0u64),
+        SetTtl::After(d) => (1, u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)),
+        SetTtl::Keep => (2, 0),
+    };
+    let expected_len =
+        u32::try_from(expected.len()).map_err(|_| anyhow::anyhow!("comparison value too large"))?;
+    let mut payload = Vec::with_capacity(1 + 4 + expected.len() + value.len());
+    payload.push(mode);
+    payload.extend_from_slice(&expected_len.to_be_bytes());
+    payload.extend_from_slice(expected);
+    payload.extend_from_slice(value);
+    let mut message = encode_set_request(key, &payload)?;
+    message[0] = OP_SET_IF_EQ;
+    message.extend_from_slice(&ttl_ms.to_be_bytes());
+    Ok(message)
+}
+
+/// Split a SET-IF-EQ payload into `(ttl_mode, expected, new value)`.
+fn parse_set_if_eq_payload(mut payload: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let mode = take_u8(&mut payload).ok()?;
+    let expected_len = usize::try_from(take_u32(&mut payload).ok()?).ok()?;
+    let expected = take_bytes(&mut payload, expected_len).ok()?;
+    Some((mode, expected, payload))
 }
 
 /// Fetch a value from a remote node's KV data plane over a one-shot
