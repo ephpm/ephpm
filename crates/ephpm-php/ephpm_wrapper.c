@@ -2850,6 +2850,11 @@ typedef struct {
     long (*response_chunk)(const char *buf, size_t len);
     /* Finish the streaming response (close the body channel). */
     void (*response_end)(void);
+    /* Abandon the streaming response: the body stream failed after the
+     * headers were sent, so the body must end in an error (no terminating
+     * chunk) rather than a clean end-of-body. Completes the iteration like
+     * response_end. */
+    void (*response_abort)(void);
 } EphpmWorkerOps;
 
 static EphpmWorkerOps g_worker_ops = {0};
@@ -3465,7 +3470,28 @@ PHP_FUNCTION(ephpm_worker_send_response_stream)
         }
     }
 
-    g_worker_ops.response_end();
+    /* Did the body stop because producing it failed? A read error and a
+     * real EOF look the same to php_stream_read(), so ask the engine.
+     *
+     * On PHP 8.3.36 / 8.4.27 / 8.5.12+ (CVE-2026-109618/109619) exhausting
+     * memory_limit inside a userland stream wrapper no longer bails out
+     * through this frame: the error is delayed, reported, and the wrapper's
+     * frames unwind like exit(), so the read just returns -1 and the loop
+     * above ends as if the body were complete. EG(delayed_oom) still records
+     * it. An exception thrown out of the stream (other than exit()'s unwind
+     * marker) is the same kind of failure. Either way the status line is
+     * already on the wire, so the only honest signal left is to end the body
+     * with an error instead of the terminating chunk. A plain exit() from the
+     * wrapper stays a deliberate, clean end. */
+    bool body_failed = EG(exception) && !zend_is_unwind_exit(EG(exception));
+#ifdef ZEND_HAS_OOM
+    body_failed = body_failed || ZEND_HAS_OOM();
+#endif
+    if (body_failed && g_worker_ops.response_abort) {
+        g_worker_ops.response_abort();
+    } else {
+        g_worker_ops.response_end();
+    }
     req_in_flight = 0;
 
     /* Release the borrowed request backing storage (the Rust send_response
