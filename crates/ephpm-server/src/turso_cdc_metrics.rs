@@ -162,7 +162,8 @@ pub const METRIC_APPLY_DURATION: &str = "ephpm_cdc_apply_duration_seconds";
 /// `outcome` (`closed` / `dial_error` / `stream_error` / `watermark_error`).
 pub const METRIC_REPLICA_CONNECTS: &str = "ephpm_cdc_replica_connects_total";
 /// Counter: cold-start snapshot bootstrap outcomes. Label: `outcome`
-/// (`ok` / `skipped` / `failed`).
+/// (`ok` / `skipped` / `failed` in whole-database mode; `handoff_ok` /
+/// `handoff_new` / `handoff_blocked` for a per-site ownership handoff).
 pub const METRIC_BOOTSTRAP: &str = "ephpm_cdc_bootstrap_total";
 /// Counter: snapshot dump bytes received during bootstrap.
 pub const METRIC_SNAPSHOT_BYTES_RECEIVED: &str = "ephpm_cdc_snapshot_bytes_received_total";
@@ -443,7 +444,8 @@ pub fn record_snapshot_received(bytes: u64, elapsed: Duration) {
 
 /// Record the outcome of the cold-start bootstrap decision. `outcome` is
 /// `ok`, `skipped` (local DB already populated) or `failed` (retry budget
-/// exhausted — startup aborts).
+/// exhausted — startup aborts); per-site mode records `handoff_ok`,
+/// `handoff_new` and `handoff_blocked` (see `turso_cdc::settle_site_serving`).
 pub fn record_bootstrap(outcome: &'static str) {
     counter!(METRIC_BOOTSTRAP, "outcome" => outcome).increment(1);
 }

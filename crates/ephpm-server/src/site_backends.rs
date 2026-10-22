@@ -113,6 +113,7 @@ use ephpm_php::db_bridge::SiteBackendResolver;
 use litewire::backend::SharedBackend;
 use tokio::sync::RwLock;
 
+use crate::handoff_gate::{self, HandoffGate, SiteServeState};
 use crate::screened_backend::ScreenedBackend;
 use crate::tracked_backend::TrackedBackend;
 use crate::wal_gate::{self, WalGateSample, WalGateStatsProvider, WalGateStatsSource};
@@ -223,6 +224,11 @@ struct Inner {
     /// maintenance task is owned by the factory, so evicting a site stops
     /// its task — see `evicting_a_site_stops_its_wal_gate_task`.
     wal_gate: bool,
+    /// Per-site clustered mode's serving gate: which sites this node may serve
+    /// from its local database while it owns them. Armed only by the per-site
+    /// clustered replication plane, whose drivers settle each site; unarmed it
+    /// lets everything through. See [`crate::handoff_gate`].
+    handoff: Arc<HandoffGate>,
 }
 
 impl WalGateStatsSource for Inner {
@@ -342,8 +348,45 @@ impl SiteBackends {
                 cdc_capture,
                 on_open,
                 wal_gate,
+                handoff: Arc::new(HandoffGate::default()),
             }),
         })
+    }
+
+    /// This registry's ownership-handoff serving gate (see
+    /// [`crate::handoff_gate`]). The per-site clustered replication plane arms
+    /// it and its drivers settle sites through it.
+    pub(crate) fn handoff_gate(&self) -> &Arc<HandoffGate> {
+        &self.inner.handoff
+    }
+
+    /// Fire the site-activation hook for `site_key`, if this registry has one.
+    ///
+    /// The hook is what starts a site's per-site replication driver, and that
+    /// driver is what settles the site's [`HandoffGate`] state. A local open
+    /// fires it on its own; this is for a caller about to wait on the gate for
+    /// a site that may not have been opened (or whose driver exited) — the
+    /// downstream dedups, so firing it again is harmless.
+    pub(crate) fn announce(&self, site_key: &str) {
+        if let Some(on_open) = &self.inner.on_open {
+            on_open(site_key);
+        }
+    }
+
+    /// Wait (bounded) until `site_key` may be served from this node's local
+    /// database. Immediate when the gate is unarmed or the site is settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gate's refusal when the site's ownership handoff is still in
+    /// progress after [`handoff_gate::SERVE_WAIT`] or is blocked on an
+    /// unreachable peer.
+    pub(crate) async fn await_serveable(&self, site_key: &str) -> Result<(), String> {
+        if self.inner.handoff.state(site_key) == SiteServeState::Ready {
+            return Ok(());
+        }
+        self.announce(site_key);
+        self.inner.handoff.wait_serveable(site_key, handoff_gate::SERVE_WAIT).await
     }
 
     /// Hand this registry to the PHP bridge as a [`SiteBackendResolver`].

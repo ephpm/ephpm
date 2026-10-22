@@ -407,8 +407,20 @@ async fn a_bridge_only_node_replicates_the_site_it_forwards() {
     );
 
     // ── 3. The owner writes the tenant's only copy of its data ───────────
-    let owner_backend =
-        resolve_as_bridge(&node_a.resolver, &site).await.expect("node A resolves its own site");
+    // Retried: A owns a site it holds no copy of, so it first asks B whether
+    // B holds one (the ownership handoff) and serves the site only once it is
+    // settled — here, as a new site, once the post-start grace has passed.
+    let settle_deadline = Instant::now() + REPLICATE_TIMEOUT;
+    let owner_backend = loop {
+        match resolve_as_bridge(&node_a.resolver, &site).await {
+            Ok(backend) => break backend,
+            Err(e) => {
+                assert!(e.contains("not being served"), "unexpected resolve error: {e}");
+                assert!(Instant::now() < settle_deadline, "node A never settled the site: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
     let owner_conn = owner_backend.connect().await.expect("owner session");
     owner_conn
         .execute("CREATE TABLE bridge_marker (id INTEGER PRIMARY KEY, v TEXT NOT NULL)", &[])

@@ -163,7 +163,9 @@ fn claim_addr_if_member(claim_addr: &str, members: &[NodeInfo]) -> Option<String
 /// Every node must compute identical scores or two nodes each believe
 /// they own the same site (or neither does). The scheme is therefore
 /// advertised in gossip under [`crate::node::HRW_SCHEME_KEY`], and
-/// [`spawn_hrw_scheme_watch`] logs an error while any alive peer disagrees.
+/// [`spawn_hrw_scheme_watch`] logs an error while any alive peer disagrees
+/// and reports it to its caller, which (per-site clustered mode) stops
+/// serving sites as their owner until every peer agrees.
 ///
 /// - `1` (≤ v0.12.x, never advertised): FNV-1a over `node ‖ 0x5c ‖ site`.
 ///   Its byte-serial structure barely changed the node ranking between site
@@ -239,30 +241,72 @@ pub fn hrw_scheme_mismatches(nodes: &[NodeInfo]) -> Vec<(String, Option<u32>)> {
 /// How often [`spawn_hrw_scheme_watch`] re-checks peer schemes.
 const HRW_SCHEME_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Watch for alive peers that compute per-site ownership with a different
-/// hash scheme, logging an `ERROR` while any do.
+/// Two-consecutive-checks debounce over [`hrw_scheme_mismatches`].
 ///
-/// Mixed schemes cannot be reconciled from one side: an old node does not
-/// know the new scheme exists, so excluding it here would only make the
-/// disagreement asymmetric. The watch therefore *reports* rather than
-/// refuses, loudly, naming each offending peer. A peer is reported only
-/// after it has mismatched on two consecutive checks, so a node whose
-/// gossip state is still propagating right after it joins does not trip
-/// it. Each peer is reported once per mismatch episode (again if it clears
-/// and recurs), and recovery is logged at `INFO`.
-pub fn spawn_hrw_scheme_watch(cluster: Arc<ClusterHandle>) -> tokio::task::JoinHandle<()> {
+/// A peer counts as mismatched only once it has mismatched on two
+/// consecutive checks, so a node whose gossip state (including its advertised
+/// scheme) is still propagating right after it joins does not trip anything.
+/// A peer that stops mismatching (it matches now, or it left) clears at once.
+#[derive(Debug, Default)]
+pub struct HrwSchemeDebounce {
+    seen_once: std::collections::HashSet<String>,
+}
+
+impl HrwSchemeDebounce {
+    /// Feed one check's mismatches; returns the **confirmed** ones — those
+    /// that also mismatched on the previous check.
+    pub fn observe(&mut self, mismatches: &[(String, Option<u32>)]) -> Vec<(String, Option<u32>)> {
+        let confirmed =
+            mismatches.iter().filter(|(id, _)| self.seen_once.contains(id)).cloned().collect();
+        self.seen_once = mismatches.iter().map(|(id, _)| id.clone()).collect();
+        confirmed
+    }
+}
+
+/// Human-readable list of mismatched peers, e.g.
+/// `ephpm-1 (scheme none: pre-v0.13.0), ephpm-2 (scheme 3)`.
+#[must_use]
+pub fn describe_hrw_scheme_mismatches(mismatches: &[(String, Option<u32>)]) -> String {
+    mismatches
+        .iter()
+        .map(|(id, scheme)| match scheme {
+            Some(s) => format!("{id} (scheme {s})"),
+            None => format!("{id} (scheme none: pre-v0.13.0)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Watch for alive peers that compute per-site ownership with a different
+/// hash scheme: log an `ERROR` while any do, and hand every check's
+/// **confirmed** mismatches ([`HrwSchemeDebounce`]) to `on_check` — an empty
+/// slice once every alive peer agrees again.
+///
+/// Mixed schemes cannot be reconciled from one side: an older node does not
+/// know the new scheme exists. So the newer side is the one that must step
+/// back, and `on_check` is how the caller makes it: per-site clustered mode
+/// stops serving sites as their owner while the slice is non-empty (see
+/// `ephpm-server`'s handoff gate), which leaves the older nodes — which still
+/// agree among themselves — as the only writers. Each peer is logged once per
+/// mismatch episode (again if it clears and recurs); recovery is logged at
+/// `INFO`.
+pub fn spawn_hrw_scheme_watch<F>(
+    cluster: Arc<ClusterHandle>,
+    on_check: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(&[(String, Option<u32>)]) + Send + Sync + 'static,
+{
     tokio::spawn(async move {
-        let mut seen_once: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut debounce = HrwSchemeDebounce::default();
         let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut ticker = tokio::time::interval(HRW_SCHEME_CHECK_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let mismatches = hrw_scheme_mismatches(&cluster.nodes().await);
-            let now: std::collections::HashSet<String> =
-                mismatches.iter().map(|(id, _)| id.clone()).collect();
-            for (id, scheme) in &mismatches {
-                if seen_once.contains(id) && reported.insert(id.clone()) {
+            let confirmed = debounce.observe(&hrw_scheme_mismatches(&cluster.nodes().await));
+            for (id, scheme) in &confirmed {
+                if reported.insert(id.clone()) {
                     let advertised = scheme.map_or_else(
                         || "none (pre-v0.13.0, scheme 1)".to_string(),
                         |s| s.to_string(),
@@ -272,19 +316,18 @@ pub fn spawn_hrw_scheme_watch(cluster: Arc<ClusterHandle>) -> tokio::task::JoinH
                         peer_hrw_scheme = %advertised,
                         local_hrw_scheme = HRW_SCHEME,
                         "cluster peer computes per-site database ownership with a different hash \
-                         scheme: this node and that peer disagree on which node owns each site, so \
-                         writes can be refused or committed on a node whose writes do not replicate. \
-                         Per-site clustered mode requires every node to run the same scheme -- stop \
-                         all nodes and start them on the same ePHPm version (no rolling upgrade \
-                         across v0.13.0)"
+                         scheme: this node and that peer disagree on which node owns each site. \
+                         This node refuses to serve any site as its owner until every alive peer \
+                         runs the same scheme. Per-site clustered mode requires a full-cluster \
+                         restart onto one ePHPm version (no rolling upgrade across v0.13.0)"
                     );
                 }
             }
-            for id in reported.iter().filter(|id| !now.contains(*id)) {
+            for id in reported.iter().filter(|id| !confirmed.iter().any(|(c, _)| c == *id)) {
                 tracing::info!(peer = %id, "cluster peer's per-site ownership hash scheme now matches (or it left)");
             }
-            reported.retain(|id| now.contains(id));
-            seen_once = now;
+            reported.retain(|id| confirmed.iter().any(|(c, _)| c == id));
+            on_check(&confirmed);
         }
     })
 }
@@ -1416,6 +1459,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hrw_scheme_debounce_needs_two_consecutive_checks_and_clears_at_once() {
+        let mut d = HrwSchemeDebounce::default();
+        let legacy = vec![("ephpm-1".to_string(), None)];
+        // A joining peer whose scheme has not propagated yet: one sighting is
+        // not enough.
+        assert_eq!(d.observe(&legacy), Vec::new());
+        // Still mismatched one check later: confirmed.
+        assert_eq!(d.observe(&legacy), legacy);
+        assert_eq!(d.observe(&legacy), legacy);
+        // It agrees now (or left): cleared on the very next check.
+        assert_eq!(d.observe(&[]), Vec::new());
+        // A fresh episode needs two checks again.
+        assert_eq!(d.observe(&legacy), Vec::new());
+        assert_eq!(
+            describe_hrw_scheme_mismatches(&[
+                ("ephpm-1".into(), None),
+                ("ephpm-2".into(), Some(HRW_SCHEME + 1)),
+            ]),
+            format!("ephpm-1 (scheme none: pre-v0.13.0), ephpm-2 (scheme {})", HRW_SCHEME + 1)
+        );
     }
 
     #[test]

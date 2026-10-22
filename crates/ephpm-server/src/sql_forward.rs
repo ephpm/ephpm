@@ -761,8 +761,11 @@ impl ClusteredSiteResolver {
     ///
     /// # Errors
     ///
-    /// Returns the registry's error on the local branch, or a message naming
-    /// the site whose owner could not be addressed on the forwarding branch.
+    /// Returns the registry's error on the local branch — or, before that, the
+    /// ownership-handoff gate's refusal when this node owns the site but has
+    /// not yet pulled its data from a peer (`crate::handoff_gate`) — or a
+    /// message naming the site whose owner could not be addressed on the
+    /// forwarding branch.
     ///
     /// # Panics
     ///
@@ -773,6 +776,10 @@ impl ClusteredSiteResolver {
     pub async fn resolve_backend(&self, site: &str) -> Result<SharedBackend, String> {
         let nodes = self.cluster.nodes().await;
         if plan_serve(&nodes, &self.self_id, site, &self.note_active) == ServePlan::Local {
+            // Owning a site is not the same as holding its data: a node that
+            // has just become the owner of a site it has no copy of must pull
+            // the copy before it serves (`crate::handoff_gate`).
+            self.local.await_serveable(site).await?;
             return self.local.get_or_open(site).await.map_err(|e| format!("{e:#}"));
         }
         let owner = hrw_owner(&nodes, site).expect("non-local implies an alive HRW owner");
@@ -1167,6 +1174,10 @@ async fn open_owner_session<'c>(
 ) -> Result<&'c dyn BackendConn, BackendError> {
     if conn.is_none() {
         if backend.is_none() {
+            // An owner still pulling the site's data from a peer refuses
+            // rather than serve (and accept writes onto) an empty copy; see
+            // `crate::handoff_gate`.
+            registry.await_serveable(site).await.map_err(BackendError::Other)?;
             let opened = registry.get_or_open(site).await.map_err(|e| {
                 BackendError::Other(format!(
                     "could not open the database for site {site} on its owner: {e:#}"

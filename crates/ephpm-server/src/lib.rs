@@ -10,6 +10,7 @@ pub mod dns01_linode;
 pub mod dns01_route53;
 pub mod file_cache;
 pub mod fpm_pool;
+mod handoff_gate;
 pub mod http3;
 mod idle;
 pub mod internal_access;
@@ -2443,12 +2444,9 @@ async fn start_db_proxies(
                 "per-site clustered mode is active but its replication wiring is missing \
                  (startup ordering bug: wire_per_site_db should have produced it)",
             )?;
-            // Every node must compute site ownership with the same hash
-            // scheme; report (loudly) any peer that does not — e.g. a node
-            // still on a pre-v0.13.0 binary during a forbidden rolling upgrade.
-            if let Some(cluster) = cluster {
-                handles.push(ephpm_cluster::spawn_hrw_scheme_watch(Arc::clone(cluster)));
-            }
+            // The ownership-hash scheme watch (fail closed on a mixed-scheme
+            // cluster) is started by `start_clustered_per_site_turso`, which
+            // owns the serving gate it drives.
             turso_cdc::start_clustered_per_site_turso(
                 sqlite_config,
                 wiring.dir,
