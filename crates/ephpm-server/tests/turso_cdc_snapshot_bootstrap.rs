@@ -168,13 +168,17 @@ async fn spawn_primary(
 
     // Snapshot handler: the production serve path (including the log
     // identity the production startup establishes, issue #315).
+    //
+    // Awaited here, before any handler is spawned, as production does at
+    // startup: `ensure_log_id` writes through a raw connection with no busy
+    // timeout, so it must not run concurrently with the test's own writes.
+    let log_id = {
+        let conn = mgmt.raw_connection().expect("mgmt connection for log id");
+        ensure_log_id(&conn).await.expect("establish log id")
+    };
     let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
     let snap_mgmt = Arc::clone(&mgmt);
     handles.push(tokio::spawn(async move {
-        let log_id = {
-            let conn = snap_mgmt.raw_connection().expect("mgmt connection for log id");
-            ensure_log_id(&conn).await.expect("establish log id")
-        };
         while let Some(incoming) = snapshot_streams.recv().await {
             let mgmt = Arc::clone(&snap_mgmt);
             let log_id = log_id.clone();

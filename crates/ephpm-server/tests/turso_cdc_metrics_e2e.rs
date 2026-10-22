@@ -161,13 +161,18 @@ async fn start_channel(node_id: &str) -> (Arc<ephpm_cluster::ClusterHandle>, Cha
 
 /// Primary side: dispatch every inbound stream into the production
 /// `serve_subscriber`, which is what records the shipping metrics.
-fn spawn_primary(mgmt: Arc<Turso>, channel: &ChannelHandle) -> std::net::SocketAddr {
+///
+/// The log identity is established (awaited) before this returns, as
+/// production does at startup: `ensure_log_id` writes through a raw
+/// connection with no busy timeout, so running it in the spawned task let
+/// it race the test's own writes (`database is locked` on a slow runner).
+async fn spawn_primary(mgmt: Arc<Turso>, channel: &ChannelHandle) -> std::net::SocketAddr {
+    let log_id = {
+        let conn = mgmt.raw_connection().expect("mgmt connection for log id");
+        ensure_log_id(&conn).await.expect("establish log id")
+    };
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
     tokio::spawn(async move {
-        let log_id = {
-            let conn = mgmt.raw_connection().expect("mgmt connection for log id");
-            ensure_log_id(&conn).await.expect("establish log id")
-        };
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, .. } = incoming;
             let mgmt = Arc::clone(&mgmt);
@@ -280,7 +285,7 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     let primary_mgmt = Arc::new(Turso::open(primary_file.path().to_str().unwrap()).await.unwrap());
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
-    let primary_addr = spawn_primary(Arc::clone(&primary_mgmt), &primary_channel);
+    let primary_addr = spawn_primary(Arc::clone(&primary_mgmt), &primary_channel).await;
     let _replica = spawn_replica(Arc::clone(&replica_mgmt), primary_addr, replica_channel);
 
     // The subscriber gauge must reach 1 purely from the production
@@ -675,12 +680,13 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
 
     // Primary-side snapshot handler, running production `serve_snapshot`.
     let primary_mgmt = Arc::new(Turso::open(primary_file.path().to_str().unwrap()).await.unwrap());
+    // Log identity first, awaited, as production does (see `spawn_primary`).
+    let log_id = {
+        let conn = primary_mgmt.raw_connection().expect("mgmt connection for log id");
+        ensure_log_id(&conn).await.expect("establish log id")
+    };
     let mut snapshot_streams = primary_channel.register_exact("snapshot/default");
     tokio::spawn(async move {
-        let log_id = {
-            let conn = primary_mgmt.raw_connection().expect("mgmt connection for log id");
-            ensure_log_id(&conn).await.expect("establish log id")
-        };
         while let Some(incoming) = snapshot_streams.recv().await {
             let mgmt = Arc::clone(&primary_mgmt);
             let log_id = log_id.clone();

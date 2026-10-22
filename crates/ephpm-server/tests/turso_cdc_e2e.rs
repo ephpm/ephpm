@@ -88,24 +88,49 @@ fn pick_free_port() -> String {
     s.local_addr().unwrap().to_string()
 }
 
-/// Register the primary's `cdc/default` handler, dispatching each
-/// inbound stream into the **production** `serve_subscriber` — one
-/// `CdcTailer` per subscriber, anchored at the watermark that subscriber
-/// announces, which is what makes a reconnect resume instead of skip.
+/// The primary side of a test cluster: what a replica dials, plus a count
+/// of the subscriber streams the primary has accepted so far.
+struct Primary {
+    addr: std::net::SocketAddr,
+    accepted: tokio::sync::watch::Receiver<usize>,
+    _dispatch: tokio::task::JoinHandle<()>,
+}
+
+impl Primary {
+    /// Wait until the primary has accepted at least `n` subscriber streams
+    /// in total — the readiness signal the tests gate their writes on,
+    /// instead of sleeping and hoping the replica has dialed by then.
+    async fn wait_for_subscribers(&mut self, n: usize) {
+        tokio::time::timeout(Duration::from_secs(10), self.accepted.wait_for(|&c| c >= n))
+            .await
+            .unwrap_or_else(|_| panic!("primary did not accept subscriber #{n} within 10s"))
+            .expect("primary dispatch task exited");
+    }
+}
+
+/// Establish the primary's CDC log identity, then register its
+/// `cdc/default` handler, dispatching each inbound stream into the
+/// **production** `serve_subscriber` — one `CdcTailer` per subscriber,
+/// anchored at the watermark that subscriber announces, which is what
+/// makes a reconnect resume instead of skip.
 ///
-/// Returns the primary's channel address (what a replica dials).
-fn spawn_primary_on_channel(
-    mgmt: Arc<Turso>,
-    channel: &ChannelHandle,
-) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
+/// The log identity is established *here*, awaited, before this returns
+/// and therefore before the test issues a single write — the same order
+/// as production (`start_clustered_turso_cdc` runs `ensure_log_id` before
+/// the wire factory exists). `ensure_log_id` writes through a raw mgmt
+/// connection, which has no busy timeout: it used to run inside the
+/// spawned dispatch task, racing the test's own writes after a fixed
+/// 300 ms sleep, and on a slow CI runner the task lost that race and
+/// failed instantly with `database is locked`.
+async fn spawn_primary_on_channel(mgmt: Arc<Turso>, channel: &ChannelHandle) -> Primary {
+    let log_id = {
+        let conn = mgmt.raw_connection().expect("mgmt connection for log id");
+        ephpm_server::turso_cdc::ensure_log_id(&conn).await.expect("establish log id")
+    };
+
+    let (accepted_tx, accepted) = tokio::sync::watch::channel(0usize);
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
     let dispatch = tokio::spawn(async move {
-        // Production establishes the log identity at startup; do the same
-        // here so every subscriber gets a real Hello.
-        let log_id = {
-            let conn = mgmt.raw_connection().expect("mgmt connection for log id");
-            ephpm_server::turso_cdc::ensure_log_id(&conn).await.expect("establish log id")
-        };
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, .. } = incoming;
             let mgmt = Arc::clone(&mgmt);
@@ -115,10 +140,11 @@ fn spawn_primary_on_channel(
                     eprintln!("serve subscriber: {e:#}");
                 }
             });
+            accepted_tx.send_modify(|c| *c += 1);
         }
     });
 
-    (channel.listen_addr(), vec![dispatch])
+    Primary { addr: channel.listen_addr(), accepted, _dispatch: dispatch }
 }
 
 /// Spawn the **production** replica driver: dial, announce the local
@@ -187,13 +213,13 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end_via_channel() {
     let replica_wire = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
-    let (primary_addr, _primary_handles) =
-        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel);
+    let mut primary = spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
     let _replica_handle =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel);
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary.addr, replica_channel);
 
-    // Let the replica connect and complete the handshake.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the replica to dial in, so the writes below stream live
+    // rather than being caught up from the watermark on connect.
+    primary.wait_for_subscribers(1).await;
 
     let session = primary_wire.connect().await.unwrap();
     session
@@ -281,13 +307,12 @@ async fn replica_reconnect_via_channel_resumes_without_double_apply() {
     let replica_wire = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
-    let (primary_addr, _primary_handles) =
-        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel);
+    let mut primary = spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
 
     let first_replica =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_1);
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary.addr, replica_channel_1);
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    primary.wait_for_subscribers(1).await;
 
     let session = primary_wire.connect().await.unwrap();
     session.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await.unwrap();
@@ -311,15 +336,20 @@ async fn replica_reconnect_via_channel_resumes_without_double_apply() {
     // Kill the session. Write while nobody is subscribed — these rows
     // are produced entirely inside the reconnect gap.
     first_replica.abort();
+    // Read after the abort: the first replica's driver redials on any
+    // stream error, so the count is not necessarily 1 by now.
+    let accepted_before_reconnect = *primary.accepted.borrow();
     for i in 6..=8 {
         session.execute(&format!("INSERT INTO t VALUES ({i}, 'gap{i}')"), &[]).await.unwrap();
     }
 
     let _second_replica =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_2);
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary.addr, replica_channel_2);
 
-    // ...and after it is back, one more.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // ...and after it is back, one more. The next subscriber stream is the
+    // reconnected replica; gating on it (not a sleep) is what keeps this
+    // row genuinely on the far side of the reconnect.
+    primary.wait_for_subscribers(accepted_before_reconnect + 1).await;
     session.execute("INSERT INTO t VALUES (9, 'after')", &[]).await.unwrap();
 
     let converged = eventually_async(
