@@ -356,9 +356,9 @@ impl CdcCluster {
     ///
     /// The route is `/v2/pipeline` — litewire's `litewire-hrana` serves the
     /// Hrana 3 protocol under the sqld-compatible **v2** path, and there is no
-    /// `/v3/pipeline`. (`tests/hrana.rs` posts to `/v3/pipeline`, but only
-    /// when `EPHPM_HRANA_URL` is set, which the bare harness never sets — so
-    /// that assertion has never actually executed.)
+    /// `/v3/pipeline`. (`tests/hrana.rs` used to post to `/v3/pipeline`; it
+    /// went unnoticed until the bare harness started setting
+    /// `EPHPM_HRANA_URL`.)
     async fn sql(&self, i: usize, sql: &str) -> Result<serde_json::Value> {
         let url = format!("http://127.0.0.1:{}/v2/pipeline", self.ports[i].hrana);
         let body = json!({

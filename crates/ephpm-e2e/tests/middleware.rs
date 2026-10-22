@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ephpm_e2e::{escape_toml_str, required_env};
+use ephpm_e2e::{PortKind, PortReserver, escape_toml_str, required_env};
 
 /// The origin the mounted CORS module is configured to allow.
 const ALLOWED_ORIGIN: &str = "https://allowed.e2e.test";
@@ -250,16 +250,39 @@ fn config_with_mount(library: &str, port: u16, dir: &str) -> String {
     )
 }
 
+/// A loopback port for one throwaway `ephpm serve` in this file.
+///
+/// Never a fixed number: a fixed port collides with anything else on the host
+/// that holds it — another run of this suite included — and for
+/// [`valid_module_mount_does_not_abort_startup`] a lost port is a false
+/// failure (the server exits on the bind error, which reads as "the mount
+/// aborted startup"). The reservation is released before `serve_and_watch`
+/// spawns, so a port can still be lost in that gap; the positive-control test
+/// retries when its output blames the bind.
+fn reserve_port() -> u16 {
+    let lease = PortReserver::new().lease(&[PortKind::Tcp]).expect("reserve a loopback port");
+    let port = lease.port(0);
+    lease.release();
+    port
+}
+
+/// Whether `output` reports a listener losing its port (EADDRINUSE on Linux,
+/// macOS and Windows respectively).
+fn lost_port(output: &str) -> bool {
+    ["Address already in use", "(os error 98)", "(os error 48)", "(os error 10048)"]
+        .iter()
+        .any(|m| output.contains(m))
+}
+
 /// A mount pointing at a path that does not exist must abort startup, naming
 /// the path — not start up middleware-less.
 #[test]
 fn missing_library_path_fails_startup() {
-    let docroot = std::env::temp_dir().join("ephpm-mw-missing-docroot");
-    std::fs::create_dir_all(&docroot).expect("docroot");
+    let docroot = tempfile::Builder::new().prefix("ephpm-mw-missing-").tempdir().expect("tempdir");
     let cfg = config_with_mount(
         "/nonexistent/definitely-not-a-module.so",
-        18191,
-        &docroot.to_string_lossy(),
+        reserve_port(),
+        &docroot.path().to_string_lossy(),
     );
     let (exited, output) = serve_and_watch(&cfg, "missing", Duration::from_secs(20));
 
@@ -279,7 +302,8 @@ fn garbage_library_file_fails_startup() {
     let junk = dir.path().join("not-a-module.so");
     std::fs::write(&junk, b"\x7fELF definitely not an object file").expect("write junk");
 
-    let cfg = config_with_mount(&junk.to_string_lossy(), 18192, &dir.path().to_string_lossy());
+    let cfg =
+        config_with_mount(&junk.to_string_lossy(), reserve_port(), &dir.path().to_string_lossy());
     let (exited, output) = serve_and_watch(&cfg, "junk", Duration::from_secs(20));
 
     assert!(exited, "ephpm must exit rather than serve with an unloadable module:\n{output}");
@@ -298,20 +322,31 @@ fn garbage_library_file_fails_startup() {
 fn valid_module_mount_does_not_abort_startup() {
     let lib = escape_toml_str(&required_env("EPHPM_MIDDLEWARE_LIB"));
     let dir = tempfile::Builder::new().prefix("ephpm-mw-ok-").tempdir().expect("tempdir");
-    let cfg = format!(
-        "[server]\n\
-         listen = \"127.0.0.1:18193\"\n\
-         document_root = \"{}\"\n\
-         \n\
-         [[middleware]]\n\
-         library = \"{lib}\"\n\
-         order = 10\n\
-         config = {{ allow_origins = [\"{ALLOWED_ORIGIN}\"] }}\n",
-        escape_toml_str(&dir.path().to_string_lossy())
-    );
-    // Reuse the failure harness, then invert the expectation: a healthy mount
-    // means the process is STILL RUNNING when the budget expires.
-    let (exited, output) = serve_and_watch(&cfg, "ok", Duration::from_secs(6));
+    let mut attempts = 0;
+    let (exited, output) = loop {
+        attempts += 1;
+        let cfg = format!(
+            "[server]\n\
+             listen = \"127.0.0.1:{port}\"\n\
+             document_root = \"{docroot}\"\n\
+             \n\
+             [[middleware]]\n\
+             library = \"{lib}\"\n\
+             order = 10\n\
+             config = {{ allow_origins = [\"{ALLOWED_ORIGIN}\"] }}\n",
+            port = reserve_port(),
+            docroot = escape_toml_str(&dir.path().to_string_lossy())
+        );
+        // Reuse the failure harness, then invert the expectation: a healthy
+        // mount means the process is STILL RUNNING when the budget expires.
+        let (exited, output) = serve_and_watch(&cfg, "ok", Duration::from_secs(6));
+        // Lost the port between reserving and binding it: that says nothing
+        // about the mount, so try another rather than report it.
+        if exited && lost_port(&output) && attempts < 3 {
+            continue;
+        }
+        break (exited, output);
+    };
     assert!(
         !exited,
         "a valid middleware mount must not abort startup — ephpm exited with:\n{output}"

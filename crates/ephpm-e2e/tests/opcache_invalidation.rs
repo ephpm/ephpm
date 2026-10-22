@@ -379,8 +379,9 @@ mod helper_tests {
     fn required_env_documented() -> bool {
         // Keep required_env in the import graph so an accidental removal of
         // the helper (or its re-export) shows up as a compile error, not a
-        // silent skip. Not a runtime assertion — the presence check is at
-        // the top of the module.
+        // silent skip. Not a runtime assertion — naming the function is the
+        // presence check.
+        let _: fn(&str) -> String = required_env;
         true
     }
 }

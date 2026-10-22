@@ -111,9 +111,12 @@ async fn php_sqlite_query_works_with_hrana_enabled() {
 /// If the `EPHPM_HRANA_URL` environment variable is set, probe the Hrana
 /// HTTP endpoint directly.
 ///
-/// The Hrana v3 protocol responds to `POST /v3/pipeline` but also exposes
-/// a basic health surface. We send a simple pipeline request and check
-/// that the endpoint does not return a connection error or 404.
+/// litewire serves the Hrana 3 protocol under the sqld-compatible **v2**
+/// path, `POST /v2/pipeline`; there is no `/v3/pipeline` (see the note on
+/// `sql` in `turso_cdc.rs`). We send a simple pipeline request and check that
+/// the endpoint does not return a connection error or 404. This probe only
+/// started running once the bare harness exported `EPHPM_HRANA_URL`; until
+/// then it self-skipped, which is how the wrong route went unnoticed.
 #[tokio::test]
 async fn hrana_endpoint_responds() {
     let base_url = required_env("EPHPM_URL");
@@ -133,9 +136,9 @@ async fn hrana_endpoint_responds() {
         }
     };
 
-    // Send a minimal Hrana v3 pipeline request.
+    // Send a minimal Hrana pipeline request.
     let client = reqwest::Client::new();
-    let pipeline_url = format!("{hrana_url}/v3/pipeline");
+    let pipeline_url = format!("{hrana_url}/v2/pipeline");
     let body = serde_json::json!({
         "requests": [
             {

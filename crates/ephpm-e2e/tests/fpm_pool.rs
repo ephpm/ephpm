@@ -85,7 +85,7 @@ async fn pool_engine_is_active_per_metrics() {
             let rest = line.strip_prefix("ephpm_fpm_pool_size")?;
             // Skip HELP/TYPE lines (they have a space then a word, not a number)
             // and match the metric sample line: `ephpm_fpm_pool_size <float>`.
-            rest.trim().split_whitespace().next_back().and_then(|v| v.parse::<f64>().ok())
+            rest.split_whitespace().next_back().and_then(|v| v.parse::<f64>().ok())
         })
         .unwrap_or_else(|| {
             panic!("ephpm_fpm_pool_size not found in /metrics — pool engine is not active:\n{body}")
