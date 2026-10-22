@@ -4080,8 +4080,65 @@ typedef struct {
     /* Whether this request has a KV keyspace: 0 yes; 1 no (a multi-tenant
      * request whose Host matched no vhost), first call this request — warn;
      * 2 no, already warned. Checked before every ephpm_kv_* op.
-     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+     * The layout mirrors kv_bridge.rs: fields are only ever appended. */
     int  (*site_context)(void);
+
+    /* ── v0.13: list results, hashes, multi-key and key-space ops ──
+     * Ops returning several values stage them in a Rust thread-local list
+     * buffer and return how many (or -1 on failure); read item i with
+     * list_item() before the next KV call on this thread. Arrays cross as
+     * parallel (pointer, length) arrays of n entries. 64-bit counts are
+     * `long long` (never `long`, which is 32-bit on Windows). */
+    /* 1 present (ptr/len set), 0 null item, -1 past the end. */
+    int  (*list_item)(size_t index, const char **ptr, size_t *len);
+    /* 1 found (value via get_result), 0 missing/failure. */
+    int  (*hget)(const char *key, size_t key_len, const char *field, size_t field_len);
+    /* 1 ok (*added = fields created), 0 failure (memory, clustered value
+     * too large, no store). */
+    int  (*hset)(const char *key, size_t key_len, const char *const *fields,
+                 const size_t *field_lens, const char *const *vals, const size_t *val_lens,
+                 size_t n, long long *added);
+    int  (*hsetnx)(const char *key, size_t key_len, const char *field, size_t field_len,
+                   const char *val, size_t val_len);
+    long long (*hmget)(const char *key, size_t key_len, const char *const *fields,
+                       const size_t *field_lens, size_t n);
+    /* Stages field, value, field, value, ... */
+    long long (*hgetall)(const char *key, size_t key_len);
+    /* which: 0 = HKEYS, 1 = HVALS. */
+    long long (*hkeys_vals)(const char *key, size_t key_len, int which);
+    long long (*hdel)(const char *key, size_t key_len, const char *const *fields,
+                      const size_t *field_lens, size_t n);
+    int  (*hexists)(const char *key, size_t key_len, const char *field, size_t field_len);
+    long long (*hlen)(const char *key, size_t key_len);
+    int  (*hincr_by)(const char *key, size_t key_len, const char *field, size_t field_len,
+                     long long delta, long long *result);
+    /* Number of fields given the TTL, -1 invalid TTL / failure. */
+    long long (*hexpire)(const char *key, size_t key_len, const char *const *fields,
+                         const size_t *field_lens, size_t n, long long ttl_ms);
+    /* ms, -1 no TTL, -2 no field. */
+    long long (*hpttl)(const char *key, size_t key_len, const char *field, size_t field_len);
+    int  (*hpersist)(const char *key, size_t key_len, const char *field, size_t field_len);
+    long long (*mget)(const char *const *keys, const size_t *key_lens, size_t n);
+    int  (*mset)(const char *const *keys, const size_t *key_lens, const char *const *vals,
+                 const size_t *val_lens, size_t n, long long ttl_ms);
+    int  (*getdel)(const char *key, size_t key_len);
+    /* ttl_ms > 0 sets the TTL, 0 removes it. */
+    int  (*getex)(const char *key, size_t key_len, long long ttl_ms);
+    int  (*persist)(const char *key, size_t key_len);
+    /* ttl_ms > 0 new TTL, 0 none, -1 keep. 1 set, 0 not set, -1 clustered
+     * owner unreachable. */
+    int  (*set_if_eq)(const char *key, size_t key_len, const char *expected,
+                      size_t expected_len, const char *val, size_t val_len, long long ttl_ms);
+    long long (*append)(const char *key, size_t key_len, const char *val, size_t val_len);
+    /* Named str_len, not strlen: a libc may define strlen as a
+     * function-like macro, which would rewrite g_kv_ops.strlen(...). */
+    long long (*str_len)(const char *key, size_t key_len);
+    /* 0 none, 1 string, 2 hash. */
+    int  (*key_type)(const char *key, size_t key_len);
+    /* Stages the page's keys and returns their count; *next = next cursor
+     * (0 = done). pattern may be NULL. */
+    long long (*scan)(unsigned long long cursor, const char *pattern, size_t pattern_len,
+                      long long count, unsigned long long *next);
 } EphpmKvOps;
 
 static EphpmKvOps g_kv_ops = {0};
@@ -4461,9 +4518,12 @@ PHP_FUNCTION(ephpm_kv_flush_all)
  * dedicated worker OS thread (the intended SSE pattern — replaces
  * poll+usleep loops with zero idle CPU and sub-ms wakeup); in per-request
  * mode it parks one of the execution pool's [php] concurrency threads, so
- * keep $timeout_ms well below [server.timeouts] request there. Watches observe string keys only
- * (set/setnx/del/incr/decr/incr_by/append/expiry-reap/flush bump the
- * version; hset/hdel and TTL-only changes do not). */
+ * keep $timeout_ms well below [server.timeouts] request there. Every write
+ * that changes the key's value or removes it bumps the version — string
+ * writes, expiry reaps, flush, and (since v0.13) hash writes: a field set,
+ * incremented or deleted, or a field expiring away. On a hash key 'value' is
+ * null (a hash has no string value; read it with ephpm_kv_hgetall()).
+ * TTL-only changes (expire/persist/hexpire) do not bump. */
 PHP_FUNCTION(ephpm_kv_wait)
 {
     char *key; size_t key_len;
@@ -4495,6 +4555,643 @@ PHP_FUNCTION(ephpm_kv_wait)
         /* rc == 2: version advanced but the key is absent (deleted). */
         add_assoc_null(return_value, "value");
     }
+}
+
+/* ── v0.13: hashes, multi-key and key-space functions ───────────
+ *
+ * Arrays cross into Rust as parallel (pointer, length) arrays. Every PHP
+ * value is converted (zval_get_string, which may run __toString) and every
+ * key/field is UTF-8-checked BEFORE the Rust op is called, so no userland
+ * code — and no bailout — can run while a Rust frame is on the stack. The C
+ * arrays are emalloc'd: a fatal error mid-conversion leaks nothing past the
+ * request. */
+
+/* A list of strings converted from PHP values: owned[i] (when non-NULL) is
+ * released by ephpm_kv_strv_free. */
+typedef struct {
+    size_t n;
+    const char **ptrs;
+    size_t *lens;
+    zend_string **owned;
+} ephpm_kv_strv;
+
+static void ephpm_kv_strv_alloc(ephpm_kv_strv *v, size_t n)
+{
+    v->n = 0;
+    /* +1: emalloc(0) is legal but some callers index [0] of an empty list. */
+    v->ptrs = safe_emalloc(n + 1, sizeof(const char *), 0);
+    v->lens = safe_emalloc(n + 1, sizeof(size_t), 0);
+    v->owned = safe_emalloc(n + 1, sizeof(zend_string *), 0);
+}
+
+static void ephpm_kv_strv_push(ephpm_kv_strv *v, zend_string *s, int owned)
+{
+    v->ptrs[v->n] = ZSTR_VAL(s);
+    v->lens[v->n] = ZSTR_LEN(s);
+    v->owned[v->n] = owned ? s : NULL;
+    v->n++;
+}
+
+static void ephpm_kv_strv_free(ephpm_kv_strv *v)
+{
+    if (!v->ptrs) {
+        return;
+    }
+    for (size_t i = 0; i < v->n; i++) {
+        if (v->owned[i]) {
+            zend_string_release(v->owned[i]);
+        }
+    }
+    efree(v->ptrs);
+    efree(v->lens);
+    efree(v->owned);
+    v->ptrs = NULL;
+}
+
+/* Convert the VALUES of `ht` to a string list. With `keys_utf8`, each must
+ * be a valid KV key (warns once and fails otherwise). Returns 0 on failure,
+ * including a conversion that threw. */
+static int ephpm_kv_strv_from_values(HashTable *ht, ephpm_kv_strv *v, int keys_utf8)
+{
+    zval *zv;
+    ephpm_kv_strv_alloc(v, zend_hash_num_elements(ht));
+    ZEND_HASH_FOREACH_VAL(ht, zv) {
+        zend_string *s = zval_get_string(zv);
+        ephpm_kv_strv_push(v, s, 1);
+        if (EG(exception)) {
+            return 0;
+        }
+        if (keys_utf8 && ephpm_kv_bad_key(ZSTR_VAL(s), ZSTR_LEN(s))) {
+            return 0;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return 1;
+}
+
+/* Convert a [key => value] map: the KEYS (UTF-8 checked; an int key becomes
+ * its decimal string) into `keys`, the values into `vals`. */
+static int ephpm_kv_strv_from_map(HashTable *ht, ephpm_kv_strv *keys, ephpm_kv_strv *vals)
+{
+    zend_ulong num;
+    zend_string *skey;
+    zval *zv;
+    uint32_t n = zend_hash_num_elements(ht);
+    ephpm_kv_strv_alloc(keys, n);
+    ephpm_kv_strv_alloc(vals, n);
+    ZEND_HASH_FOREACH_KEY_VAL(ht, num, skey, zv) {
+        if (skey) {
+            ephpm_kv_strv_push(keys, skey, 0);
+        } else {
+            ephpm_kv_strv_push(keys, zend_long_to_str((zend_long)num), 1);
+        }
+        zend_string *s = zval_get_string(zv);
+        ephpm_kv_strv_push(vals, s, 1);
+        if (EG(exception)) {
+            return 0;
+        }
+        if (ephpm_kv_bad_key(keys->ptrs[keys->n - 1], keys->lens[keys->n - 1])) {
+            return 0;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return 1;
+}
+
+/* Build a PHP list (string|null per item) from the n items the last op
+ * staged. */
+static void ephpm_kv_list_result(zval *rv, long long n)
+{
+    array_init_size(rv, n > 0 && n < (long long)UINT32_MAX ? (uint32_t)n : 0);
+    for (long long i = 0; i < n; i++) {
+        const char *p; size_t l;
+        if (g_kv_ops.list_item((size_t)i, &p, &l) == 1) {
+            add_next_index_stringl(rv, p, l);
+        } else {
+            add_next_index_null(rv);
+        }
+    }
+}
+
+/* Shared prologue: the op exists, the request has a keyspace, the key is a
+ * valid KV key. Returns 0 (after the appropriate warning) when the call must
+ * fail. */
+#define EPHPM_KV_GUARD(op, key, key_len) \
+    (!g_kv_ops.op ? (ephpm_kv_warn_unwired(), 0) \
+     : ephpm_kv_no_site_context() ? 0 \
+     : ephpm_kv_bad_key((key), (key_len)) ? 0 : 1)
+
+/* ephpm_kv_hget(string $key, string $field): ?string */
+PHP_FUNCTION(ephpm_kv_hget)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hget, key, key_len)) { RETURN_NULL(); }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_NULL(); }
+    if (!g_kv_ops.hget(key, key_len, field, field_len)) { RETURN_NULL(); }
+    const char *ptr; size_t len;
+    g_kv_ops.get_result(&ptr, &len);
+    RETURN_STRINGL(ptr, len);
+}
+
+/* ephpm_kv_hset(string $key, string|array $field, ?string $value = null): int|false
+ * Single field: 1 created / 0 overwritten. Array [field => value]: number of
+ * fields created. Clears the TTL of every field written. */
+PHP_FUNCTION(ephpm_kv_hset)
+{
+    char *key; size_t key_len;
+    HashTable *map = NULL;
+    zend_string *field = NULL;
+    char *val = NULL; size_t val_len = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_ARRAY_HT_OR_STR(map, field)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING_OR_NULL(val, val_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hset, key, key_len)) { RETURN_FALSE; }
+    ephpm_kv_strv fields = {0}, vals = {0};
+    long long added = 0;
+    int ok;
+    if (field) {
+        if (!val) {
+            zend_error(E_WARNING, "%s(): a value is required when the field is a string, "
+                "so the call did nothing and returned false", get_active_function_name());
+            RETURN_FALSE;
+        }
+        if (ephpm_kv_bad_key(ZSTR_VAL(field), ZSTR_LEN(field))) { RETURN_FALSE; }
+        const char *fp = ZSTR_VAL(field), *vp = val;
+        size_t fl = ZSTR_LEN(field), vl = val_len;
+        ok = g_kv_ops.hset(key, key_len, &fp, &fl, &vp, &vl, 1, &added);
+    } else {
+        if (!ephpm_kv_strv_from_map(map, &fields, &vals)) {
+            ephpm_kv_strv_free(&fields);
+            ephpm_kv_strv_free(&vals);
+            RETURN_FALSE;
+        }
+        ok = g_kv_ops.hset(key, key_len, fields.ptrs, fields.lens, vals.ptrs, vals.lens,
+                           fields.n, &added);
+        ephpm_kv_strv_free(&fields);
+        ephpm_kv_strv_free(&vals);
+    }
+    if (!ok) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)added);
+}
+
+/* ephpm_kv_hsetnx(string $key, string $field, string $value): bool */
+PHP_FUNCTION(ephpm_kv_hsetnx)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    char *val; size_t val_len;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+        Z_PARAM_STRING(val, val_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hsetnx, key, key_len)) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.hsetnx(key, key_len, field, field_len, val, val_len) == 1);
+}
+
+/* ephpm_kv_hmget(string $key, array $fields): array|false
+ * A list aligned with $fields: string|null per field. */
+PHP_FUNCTION(ephpm_kv_hmget)
+{
+    char *key; size_t key_len;
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hmget, key, key_len)) { RETURN_FALSE; }
+    ephpm_kv_strv fields = {0};
+    if (!ephpm_kv_strv_from_values(list, &fields, 1)) {
+        ephpm_kv_strv_free(&fields);
+        RETURN_FALSE;
+    }
+    long long n = g_kv_ops.hmget(key, key_len, fields.ptrs, fields.lens, fields.n);
+    ephpm_kv_strv_free(&fields);
+    if (n < 0) { RETURN_FALSE; }
+    ephpm_kv_list_result(return_value, n);
+}
+
+/* ephpm_kv_hgetall(string $key): array|false — [field => value]. */
+PHP_FUNCTION(ephpm_kv_hgetall)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hgetall, key, key_len)) { RETURN_FALSE; }
+    long long n = g_kv_ops.hgetall(key, key_len);
+    if (n < 0) { RETURN_FALSE; }
+    array_init_size(return_value, n > 0 && n < (long long)UINT32_MAX ? (uint32_t)(n / 2) : 0);
+    for (long long i = 0; i + 1 < n; i += 2) {
+        const char *fp, *vp; size_t fl, vl;
+        if (g_kv_ops.list_item((size_t)i, &fp, &fl) != 1
+            || g_kv_ops.list_item((size_t)i + 1, &vp, &vl) != 1) {
+            continue;
+        }
+        /* symtable semantics: a numeric field name becomes an int key, as
+         * for any PHP array. */
+        add_assoc_stringl_ex(return_value, fp, fl, vp, vl);
+    }
+}
+
+/* Shared body of ephpm_kv_hkeys (which 0) and ephpm_kv_hvals (which 1). */
+static void ephpm_kv_hkeys_vals(INTERNAL_FUNCTION_PARAMETERS, int which)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hkeys_vals, key, key_len)) { RETURN_FALSE; }
+    long long n = g_kv_ops.hkeys_vals(key, key_len, which);
+    if (n < 0) { RETURN_FALSE; }
+    ephpm_kv_list_result(return_value, n);
+}
+
+/* ephpm_kv_hkeys(string $key): array|false */
+PHP_FUNCTION(ephpm_kv_hkeys) { ephpm_kv_hkeys_vals(INTERNAL_FUNCTION_PARAM_PASSTHRU, 0); }
+
+/* ephpm_kv_hvals(string $key): array|false */
+PHP_FUNCTION(ephpm_kv_hvals) { ephpm_kv_hkeys_vals(INTERNAL_FUNCTION_PARAM_PASSTHRU, 1); }
+
+/* ephpm_kv_hdel(string $key, string|array $fields): int — fields removed. */
+PHP_FUNCTION(ephpm_kv_hdel)
+{
+    char *key; size_t key_len;
+    HashTable *list = NULL;
+    zend_string *field = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_ARRAY_HT_OR_STR(list, field)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hdel, key, key_len)) { RETURN_LONG(0); }
+    long long removed;
+    if (field) {
+        if (ephpm_kv_bad_key(ZSTR_VAL(field), ZSTR_LEN(field))) { RETURN_LONG(0); }
+        const char *fp = ZSTR_VAL(field);
+        size_t fl = ZSTR_LEN(field);
+        removed = g_kv_ops.hdel(key, key_len, &fp, &fl, 1);
+    } else {
+        ephpm_kv_strv fields = {0};
+        if (!ephpm_kv_strv_from_values(list, &fields, 1)) {
+            ephpm_kv_strv_free(&fields);
+            RETURN_LONG(0);
+        }
+        removed = g_kv_ops.hdel(key, key_len, fields.ptrs, fields.lens, fields.n);
+        ephpm_kv_strv_free(&fields);
+    }
+    RETURN_LONG((zend_long)removed);
+}
+
+/* ephpm_kv_hexists(string $key, string $field): bool */
+PHP_FUNCTION(ephpm_kv_hexists)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hexists, key, key_len)) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.hexists(key, key_len, field, field_len));
+}
+
+/* ephpm_kv_hlen(string $key): int */
+PHP_FUNCTION(ephpm_kv_hlen)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hlen, key, key_len)) { RETURN_LONG(0); }
+    RETURN_LONG((zend_long)g_kv_ops.hlen(key, key_len));
+}
+
+/* ephpm_kv_hincr_by(string $key, string $field, int $delta = 1): int|false */
+PHP_FUNCTION(ephpm_kv_hincr_by)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    zend_long delta = 1;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(delta)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hincr_by, key, key_len)) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_FALSE; }
+    long long result = 0;
+    if (!g_kv_ops.hincr_by(key, key_len, field, field_len, (long long)delta, &result)) {
+        RETURN_FALSE;
+    }
+    RETURN_LONG((zend_long)result);
+}
+
+/* ephpm_kv_hexpire(string $key, string|array $fields, int $ttl): int|false
+ * Gives each field a TTL of $ttl seconds; returns how many got it. */
+PHP_FUNCTION(ephpm_kv_hexpire)
+{
+    char *key; size_t key_len;
+    HashTable *list = NULL;
+    zend_string *field = NULL;
+    zend_long ttl;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_ARRAY_HT_OR_STR(list, field)
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hexpire, key, key_len)) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_FALSE; }
+    /* ttl <= 0 gives ttl_ms 0, which the op refuses (returns -1), as for
+     * ephpm_kv_expire. */
+    long long set;
+    if (field) {
+        if (ephpm_kv_bad_key(ZSTR_VAL(field), ZSTR_LEN(field))) { RETURN_FALSE; }
+        const char *fp = ZSTR_VAL(field);
+        size_t fl = ZSTR_LEN(field);
+        set = g_kv_ops.hexpire(key, key_len, &fp, &fl, 1, ttl_ms);
+    } else {
+        ephpm_kv_strv fields = {0};
+        if (!ephpm_kv_strv_from_values(list, &fields, 1)) {
+            ephpm_kv_strv_free(&fields);
+            RETURN_FALSE;
+        }
+        set = g_kv_ops.hexpire(key, key_len, fields.ptrs, fields.lens, fields.n, ttl_ms);
+        ephpm_kv_strv_free(&fields);
+    }
+    if (set < 0) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)set);
+}
+
+/* Shared body of ephpm_kv_httl (seconds, rounded up) and ephpm_kv_hpttl. */
+static void ephpm_kv_hfield_ttl(INTERNAL_FUNCTION_PARAMETERS, int seconds)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hpttl, key, key_len)) { RETURN_LONG(-2); }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_LONG(-2); }
+    long long ms = g_kv_ops.hpttl(key, key_len, field, field_len);
+    if (ms < 0 || !seconds) { RETURN_LONG((zend_long)ms); }
+    RETURN_LONG((zend_long)((ms + 999) / 1000));
+}
+
+/* ephpm_kv_httl(string $key, string $field): int — seconds, -1, -2. */
+PHP_FUNCTION(ephpm_kv_httl) { ephpm_kv_hfield_ttl(INTERNAL_FUNCTION_PARAM_PASSTHRU, 1); }
+
+/* ephpm_kv_hpttl(string $key, string $field): int — milliseconds, -1, -2. */
+PHP_FUNCTION(ephpm_kv_hpttl) { ephpm_kv_hfield_ttl(INTERNAL_FUNCTION_PARAM_PASSTHRU, 0); }
+
+/* ephpm_kv_hpersist(string $key, string $field): bool */
+PHP_FUNCTION(ephpm_kv_hpersist)
+{
+    char *key; size_t key_len;
+    char *field; size_t field_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(field, field_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(hpersist, key, key_len)) { RETURN_FALSE; }
+    if (ephpm_kv_bad_key(field, field_len)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.hpersist(key, key_len, field, field_len));
+}
+
+/* ephpm_kv_mget(array $keys): array|false — list aligned with $keys. */
+PHP_FUNCTION(ephpm_kv_mget)
+{
+    HashTable *list;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY_HT(list)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.mget) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    ephpm_kv_strv keys = {0};
+    if (!ephpm_kv_strv_from_values(list, &keys, 1)) {
+        ephpm_kv_strv_free(&keys);
+        RETURN_FALSE;
+    }
+    long long n = g_kv_ops.mget(keys.ptrs, keys.lens, keys.n);
+    ephpm_kv_strv_free(&keys);
+    if (n < 0) { RETURN_FALSE; }
+    ephpm_kv_list_result(return_value, n);
+}
+
+/* ephpm_kv_mset(array $values, int $ttl = 0): bool — [key => value]. */
+PHP_FUNCTION(ephpm_kv_mset)
+{
+    HashTable *map;
+    zend_long ttl = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_ARRAY_HT(map)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.mset) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_FALSE; }
+    ephpm_kv_strv keys = {0}, vals = {0};
+    if (!ephpm_kv_strv_from_map(map, &keys, &vals)) {
+        ephpm_kv_strv_free(&keys);
+        ephpm_kv_strv_free(&vals);
+        RETURN_FALSE;
+    }
+    int ok = g_kv_ops.mset(keys.ptrs, keys.lens, vals.ptrs, vals.lens, keys.n, ttl_ms);
+    ephpm_kv_strv_free(&keys);
+    ephpm_kv_strv_free(&vals);
+    RETURN_BOOL(ok);
+}
+
+/* ephpm_kv_getdel(string $key): ?string */
+PHP_FUNCTION(ephpm_kv_getdel)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(getdel, key, key_len)) { RETURN_NULL(); }
+    if (!g_kv_ops.getdel(key, key_len)) { RETURN_NULL(); }
+    const char *ptr; size_t len;
+    g_kv_ops.get_result(&ptr, &len);
+    RETURN_STRINGL(ptr, len);
+}
+
+/* ephpm_kv_getex(string $key, int $ttl): ?string
+ * $ttl > 0 sets the TTL (seconds), 0 removes it. */
+PHP_FUNCTION(ephpm_kv_getex)
+{
+    char *key; size_t key_len;
+    zend_long ttl;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(getex, key, key_len)) { RETURN_NULL(); }
+    if (ttl < 0) {
+        zend_error(E_WARNING, "%s(): TTL must be >= 0 (0 removes the expiry), so the call "
+            "did nothing and returned null", get_active_function_name());
+        RETURN_NULL();
+    }
+    long long ttl_ms;
+    if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) { RETURN_NULL(); }
+    if (!g_kv_ops.getex(key, key_len, ttl_ms)) { RETURN_NULL(); }
+    const char *ptr; size_t len;
+    g_kv_ops.get_result(&ptr, &len);
+    RETURN_STRINGL(ptr, len);
+}
+
+/* ephpm_kv_persist(string $key): bool — true if a TTL was removed. */
+PHP_FUNCTION(ephpm_kv_persist)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(persist, key, key_len)) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.persist(key, key_len));
+}
+
+/* ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0): bool
+ * Compare-and-set: replace the value only while it equals $expected; never
+ * creates the key. $ttl > 0 new TTL (seconds), 0 no TTL, -1 keep the current
+ * TTL. Owner-decided in a cluster (an unreachable owner is false). The lock
+ * extension step between ephpm_kv_setnx() and ephpm_kv_del_if_eq(). */
+PHP_FUNCTION(ephpm_kv_set_if_eq)
+{
+    char *key; size_t key_len;
+    char *expected; size_t expected_len;
+    char *val; size_t val_len;
+    zend_long ttl = 0;
+    ZEND_PARSE_PARAMETERS_START(3, 4)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(expected, expected_len)
+        Z_PARAM_STRING(val, val_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(set_if_eq, key, key_len)) { RETURN_FALSE; }
+    long long ttl_ms;
+    if (ttl == -1) {
+        ttl_ms = -1;
+    } else if (ttl < 0) {
+        zend_error(E_WARNING, "%s(): TTL must be > 0 (seconds), 0 (no expiry) or -1 (keep the "
+            "current expiry), so the call did nothing and returned false",
+            get_active_function_name());
+        RETURN_FALSE;
+    } else if (!ephpm_kv_ttl_ms(ttl, &ttl_ms)) {
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(g_kv_ops.set_if_eq(key, key_len, expected, expected_len, val, val_len,
+                                   ttl_ms) == 1);
+}
+
+/* ephpm_kv_append(string $key, string $value): int|false — new length. */
+PHP_FUNCTION(ephpm_kv_append)
+{
+    char *key; size_t key_len;
+    char *val; size_t val_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(val, val_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(append, key, key_len)) { RETURN_FALSE; }
+    long long len = g_kv_ops.append(key, key_len, val, val_len);
+    if (len < 0) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)len);
+}
+
+/* ephpm_kv_strlen(string $key): int */
+PHP_FUNCTION(ephpm_kv_strlen)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(str_len, key, key_len)) { RETURN_LONG(0); }
+    RETURN_LONG((zend_long)g_kv_ops.str_len(key, key_len));
+}
+
+/* ephpm_kv_type(string $key): string — "string", "hash" or "none". */
+PHP_FUNCTION(ephpm_kv_type)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!EPHPM_KV_GUARD(key_type, key, key_len)) { RETURN_STRING("none"); }
+    switch (g_kv_ops.key_type(key, key_len)) {
+        case 1: RETURN_STRING("string");
+        case 2: RETURN_STRING("hash");
+        default: RETURN_STRING("none");
+    }
+}
+
+/* ephpm_kv_scan(int $cursor, ?string $match = null, int $count = 10): array|false
+ * One SCAN step: [int $next_cursor, array $keys]; done when $next_cursor is
+ * 0. Every key present for the whole scan is returned exactly once. */
+PHP_FUNCTION(ephpm_kv_scan)
+{
+    zend_long cursor;
+    char *match = NULL; size_t match_len = 0;
+    zend_long count = 10;
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_LONG(cursor)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING_OR_NULL(match, match_len)
+        Z_PARAM_LONG(count)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.scan) { ephpm_kv_warn_unwired(); RETURN_FALSE; }
+    if (ephpm_kv_no_site_context()) { RETURN_FALSE; }
+    if (cursor < 0) {
+        zend_error(E_WARNING, "%s(): the cursor must be >= 0 (start with 0)",
+            get_active_function_name());
+        RETURN_FALSE;
+    }
+    if (match && ephpm_kv_bad_key(match, match_len)) { RETURN_FALSE; }
+    unsigned long long next = 0;
+    long long n = g_kv_ops.scan((unsigned long long)cursor, match, match_len,
+                                (long long)count, &next);
+    if (n < 0) { RETURN_FALSE; }
+    zval keys;
+    ephpm_kv_list_result(&keys, n);
+    array_init_size(return_value, 2);
+    add_next_index_long(return_value, (zend_long)next);
+    add_next_index_zval(return_value, &keys);
 }
 
 /* ── Argument info for reflection (arginfo) ──────────────────── */
@@ -4561,6 +5258,73 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_wait, 0, 0, 3)
     ZEND_ARG_INFO(0, key)
     ZEND_ARG_INFO(0, last_version)
     ZEND_ARG_INFO(0, timeout_ms)
+ZEND_END_ARG_INFO()
+
+/* (key, field) */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_key_field, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, field)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_hset, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, field)
+    ZEND_ARG_INFO(0, value)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_hsetnx, 0, 0, 3)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, field)
+    ZEND_ARG_INFO(0, value)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_key_fields, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, fields)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_hincr_by, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, field)
+    ZEND_ARG_INFO(0, delta)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_hexpire, 0, 0, 3)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, fields)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_mget, 0, 0, 1)
+    ZEND_ARG_INFO(0, keys)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_mset, 0, 0, 1)
+    ZEND_ARG_INFO(0, values)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_key_ttl, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_set_if_eq, 0, 0, 3)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, expected)
+    ZEND_ARG_INFO(0, value)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_append, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, value)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_scan, 0, 0, 1)
+    ZEND_ARG_INFO(0, cursor)
+    ZEND_ARG_INFO(0, match)
+    ZEND_ARG_INFO(0, count)
 ZEND_END_ARG_INFO()
 
 /* ===================================================================
@@ -5808,6 +6572,33 @@ ZEND_END_ARG_INFO()
     PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl) \
     PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all) \
     PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait) \
+    /* v0.13: hashes (with per-field TTL), multi-key, compare-and-set, \
+     * and the key-space scan. */ \
+    PHP_FE(ephpm_kv_hget,      arginfo_ephpm_kv_key_field) \
+    PHP_FE(ephpm_kv_hset,      arginfo_ephpm_kv_hset) \
+    PHP_FE(ephpm_kv_hsetnx,    arginfo_ephpm_kv_hsetnx) \
+    PHP_FE(ephpm_kv_hmget,     arginfo_ephpm_kv_key_fields) \
+    PHP_FE(ephpm_kv_hgetall,   arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_hkeys,     arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_hvals,     arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_hdel,      arginfo_ephpm_kv_key_fields) \
+    PHP_FE(ephpm_kv_hexists,   arginfo_ephpm_kv_key_field) \
+    PHP_FE(ephpm_kv_hlen,      arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_hincr_by,  arginfo_ephpm_kv_hincr_by) \
+    PHP_FE(ephpm_kv_hexpire,   arginfo_ephpm_kv_hexpire) \
+    PHP_FE(ephpm_kv_httl,      arginfo_ephpm_kv_key_field) \
+    PHP_FE(ephpm_kv_hpttl,     arginfo_ephpm_kv_key_field) \
+    PHP_FE(ephpm_kv_hpersist,  arginfo_ephpm_kv_key_field) \
+    PHP_FE(ephpm_kv_mget,      arginfo_ephpm_kv_mget) \
+    PHP_FE(ephpm_kv_mset,      arginfo_ephpm_kv_mset) \
+    PHP_FE(ephpm_kv_getdel,    arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_getex,     arginfo_ephpm_kv_key_ttl) \
+    PHP_FE(ephpm_kv_persist,   arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_set_if_eq, arginfo_ephpm_kv_set_if_eq) \
+    PHP_FE(ephpm_kv_append,    arginfo_ephpm_kv_append) \
+    PHP_FE(ephpm_kv_strlen,    arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_type,      arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_scan,      arginfo_ephpm_kv_scan) \
     /* Embedded database bridge (per-thread litewire Session). \
      * ephpm_db_run is the unified entry point; the five introspection \
      * functions (columns / in_transaction / available / errno / error) \

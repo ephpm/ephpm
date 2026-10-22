@@ -63,11 +63,39 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 | `ephpm_kv_exists(string $key)` | `bool` | |
 | `ephpm_kv_incr(string $key)` / `ephpm_kv_decr(string $key)` | `int\|false` | Adds / subtracts 1. A missing key starts at 0. |
 | `ephpm_kv_incr_by(string $key, int $delta)` | `int\|false` | `$delta` may be negative. |
-| `ephpm_kv_expire(string $key, int $ttl)` | `bool` | `$ttl` in seconds. `false` if the key is missing. |
-| `ephpm_kv_ttl(string $key)` | `int` | Seconds remaining, rounded **up** (1–999 ms reads as `1`). `-1` = no expiry, `-2` = missing. |
+| `ephpm_kv_expire(string $key, int $ttl)` | `bool` | `$ttl` in seconds. `false` if the key is missing. On a hash it sets the whole-key expiry. |
+| `ephpm_kv_ttl(string $key)` | `int` | Seconds remaining, rounded **up** (1–999 ms reads as `1`). `-1` = no expiry, `-2` = missing. A hash reports its whole-key expiry. |
 | `ephpm_kv_pttl(string $key)` | `int` | Milliseconds remaining. `-1` / `-2` as above. |
+| `ephpm_kv_persist(string $key)` | `bool` | Removes the expiry (string or hash key). `true` only if there was one. *v0.13+* |
 | `ephpm_kv_flush_all()` | `bool` | Empties the store this request is scoped to. |
 | `ephpm_kv_wait(string $key, int $last_version, int $timeout_ms)` | `array\|false` | Blocking watch — see below. |
+| `ephpm_kv_mget(array $keys)` | `array\|false` | A **list** aligned with `$keys`: each element `string` or `null` (missing). One call for any number of keys. *v0.13+* |
+| `ephpm_kv_mset(array $values, int $ttl = 0)` | `bool` | `[key => value]`, one `$ttl` (seconds) for all. Values are converted to string; an int key is written as its decimal string. Not atomic under the memory limit: a refusal stops the write and returns `false` with earlier keys stored. *v0.13+* |
+| `ephpm_kv_getdel(string $key)` | `?string` | Returns the value and deletes the key, as one atomic step. *v0.13+* |
+| `ephpm_kv_getex(string $key, int $ttl)` | `?string` | Returns the value and sets its TTL: `$ttl > 0` seconds, `0` removes the TTL. `null` (nothing changed) if missing; a negative `$ttl` warns and returns `null`. *v0.13+* |
+| `ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0)` | `bool` | Compare-and-set — see [Extending a lock](#extending-a-lock-ephpm-kv-set-if-eq). `$ttl`: `> 0` new TTL, `0` none, `-1` keep the current one. *v0.13+* |
+| `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. *v0.13+* |
+| `ephpm_kv_strlen(string $key)` | `int` | Length of the value, `0` if missing. *v0.13+* |
+| `ephpm_kv_type(string $key)` | `string` | `"string"`, `"hash"` or `"none"`. *v0.13+* |
+| `ephpm_kv_scan(int $cursor, ?string $match = null, int $count = 10)` | `array\|false` | One step of a key scan: `[int $next_cursor, array $keys]` — see [Iterating keys](#iterating-keys-ephpm-kv-scan). *v0.13+* |
+| `ephpm_kv_hget(string $key, string $field)` | `?string` | `null` if the hash or field is missing. *v0.13+* |
+| `ephpm_kv_hset(string $key, string\|array $field, ?string $value = null)` | `int\|false` | `hset($k, $f, $v)` → `1` created / `0` overwritten. `hset($k, [$f => $v, ...])` → fields created. Clears each written field's TTL. *v0.13+* |
+| `ephpm_kv_hsetnx(string $key, string $field, string $value)` | `bool` | `true` only if the field did not exist. *v0.13+* |
+| `ephpm_kv_hmget(string $key, array $fields)` | `array\|false` | A **list** aligned with `$fields` (`string` or `null` each). *v0.13+* |
+| `ephpm_kv_hgetall(string $key)` | `array\|false` | `[field => value]`; `[]` for a missing hash. A numeric field name becomes an int array key, as in any PHP array. *v0.13+* |
+| `ephpm_kv_hkeys(string $key)` / `ephpm_kv_hvals(string $key)` | `array\|false` | Field names / values, as lists. *v0.13+* |
+| `ephpm_kv_hdel(string $key, string\|array $fields)` | `int` | Fields removed. Deleting the last field deletes the hash. *v0.13+* |
+| `ephpm_kv_hexists(string $key, string $field)` | `bool` | *v0.13+* |
+| `ephpm_kv_hlen(string $key)` | `int` | Live fields, `0` if missing. *v0.13+* |
+| `ephpm_kv_hincr_by(string $key, string $field, int $delta = 1)` | `int\|false` | `false` when the field is not an integer or the result overflows. Keeps the field's TTL. *v0.13+* |
+| `ephpm_kv_hexpire(string $key, string\|array $fields, int $ttl)` | `int\|false` | Gives each field a TTL of `$ttl` seconds; returns how many fields got it (missing fields are skipped). `$ttl <= 0` returns `false`, like `expire`. *v0.13+* |
+| `ephpm_kv_httl(string $key, string $field)` / `ephpm_kv_hpttl(...)` | `int` | A field's remaining TTL in seconds (rounded up) / milliseconds; `-1` no TTL, `-2` no such field. *v0.13+* |
+| `ephpm_kv_hpersist(string $key, string $field)` | `bool` | Removes a field's TTL; `true` only if it had one. *v0.13+* |
+
+Functions marked *v0.13+* do not exist on older ePHPm. A library that must
+run on several versions should check `function_exists('ephpm_kv_mget')` (and
+so on) and keep a fallback; the [ePHPm PHP packages](/reference/php-packages/)
+do exactly that.
 
 Edge cases worth knowing:
 
@@ -94,11 +122,19 @@ Edge cases worth knowing:
   keyspace, never another tenant's. In single-site mode it empties the whole
   store.
 - **No store means silent misses, not errors.** When no KV store is wired to
-  PHP, nothing throws: `get` returns `null`, `set` / `setnx` / `exists` /
-  `expire` / `del_if_eq` / `flush_all` return `false`, `incr*` return
-  `false`, `del` returns `0`, `ttl` / `pttl` return `-2`, and `wait` returns
-  `false`. The server always wires one, so in practice this is what
+  PHP, nothing throws: `get`/`getdel`/`getex`/`hget` return `null`, `set` /
+  `setnx` / `exists` / `expire` / `persist` / `del_if_eq` / `set_if_eq` /
+  `flush_all` / `mset` / `hsetnx` / `hexists` / `hpersist` return `false`,
+  `incr*`/`append`/`hset`/`hincr_by`/`hexpire` return `false`, the
+  array-returning functions (`mget`, `hmget`, `hgetall`, `hkeys`, `hvals`,
+  `scan`) return `false`, `del`/`hdel`/`hlen`/`strlen` return `0`,
+  `ttl`/`pttl`/`httl`/`hpttl` return `-2`, `type` returns `"none"`, and `wait`
+  returns `false`. The server always wires one, so in practice this is what
   [`ephpm php`](#under-ephpm-php-the-cli) sees.
+- **Hash field names follow the key rules** (UTF-8, NUL allowed); a bad field
+  name is refused with an `E_WARNING`, like a bad key. Array arguments
+  (`mget`, `mset`, `hset`, `hmget`, `hdel`, `hexpire`) are checked in full
+  before anything is written, so one bad key writes nothing.
 
 ### Under `ephpm php` (the CLI)
 
@@ -149,11 +185,45 @@ was deleted; `false` when the token differs, the key is absent, or the key
 has expired (an expired entry is treated as absent). Tokens are compared
 byte-exactly and may be binary.
 
+### Extending a lock — `ephpm_kv_set_if_eq()`
+
+```php
+ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0): bool
+```
+
+Compare-and-set (Valkey's `SET key value IFEQ expected`): replaces the value
+**only while** it currently equals `$expected`, under the same per-key shard
+lock as the compare. It never creates the key. `$ttl` is the new expiry in
+seconds; `0` removes the expiry and `-1` keeps the current one.
+
+The three primitives together make a complete lock — acquire, extend while
+working, release — none of which can touch a lock another holder has taken
+over:
+
+```php
+$token = bin2hex(random_bytes(16));
+if (ephpm_kv_setnx("lock:job", $token, 30)) {                // acquire, 30 s lease
+    try {
+        foreach ($batches as $batch) {
+            process($batch);
+            if (!ephpm_kv_set_if_eq("lock:job", $token, $token, 30)) {
+                throw new RuntimeException("lost the lock");  // someone else holds it now
+            }
+        }
+    } finally {
+        ephpm_kv_del_if_eq("lock:job", $token);               // release only if still ours
+    }
+}
+```
+
+Extending with `ephpm_kv_expire()` instead would extend whoever holds the lock
+*now* — including a new holder after your lease ran out.
+
 ### Locks in a cluster
 
-With `[cluster]` enabled, `ephpm_kv_setnx()` and `ephpm_kv_del_if_eq()` (and
-their RESP forms `SETNX`, `SET … NX`, `DELIFEQ`) are **routed to the key's
-owner node** — `hash(key) % sorted alive nodes`, the same owner the
+With `[cluster]` enabled, `ephpm_kv_setnx()`, `ephpm_kv_set_if_eq()` and
+`ephpm_kv_del_if_eq()` (and their RESP forms `SETNX`, `SET … NX`,
+`SET … IFEQ`, `DELIFEQ`) are **routed to the key's owner node** — `hash(key) % sorted alive nodes`, the same owner the
 large-value tier uses — and decided there under that node's shard lock. Every
 node's attempt on a key is therefore serialized by one lock on one node, and
 two nodes cannot both acquire it. (Before this, each node decided on its own
@@ -178,18 +248,18 @@ The guarantee, stated precisely:
   node. A larger lock value lives on `replication_factor` nodes only, and a new
   owner outside that set never learns about the lock. Keep lock tokens short
   (a 32-character hex token is plenty).
-- **Only `setnx` and `del_if_eq` are arbitrated.** `ephpm_kv_set()`,
-  `ephpm_kv_expire()`, `ephpm_kv_del()` and `incr` on a lock key (and their
-  RESP forms) are still decided on the calling node and replicated
-  last-writer-wins. They can overwrite an owner-granted lock with a stale
-  local value — for example, extending a lease with `ephpm_kv_expire()` on a
-  node whose copy still holds a previous holder's token re-publishes that old
-  token cluster-wide. Do not extend or overwrite a lock key; acquire with
-  `setnx` and release with `del_if_eq` only.
+- **Only `setnx`, `set_if_eq` and `del_if_eq` are arbitrated.**
+  `ephpm_kv_set()`, `ephpm_kv_expire()`, `ephpm_kv_del()` and `incr` on a lock
+  key (and their RESP forms) are still decided on the calling node and
+  replicated last-writer-wins. They can overwrite an owner-granted lock with a
+  stale local value — for example, extending a lease with `ephpm_kv_expire()`
+  on a node whose copy still holds a previous holder's token re-publishes that
+  old token cluster-wide. Acquire with `setnx`, extend with `set_if_eq`, and
+  release with `del_if_eq` only.
 - **An unreachable owner fails closed, with an unknown outcome.** If the owner
   does not answer within 2 seconds, the call reports failure:
-  `ephpm_kv_setnx()` returns `false`, `ephpm_kv_del_if_eq()` returns `false`,
-  and the RESP commands answer `-CLUSTERDOWN …` (never `:0`/`nil`, which would
+  `ephpm_kv_setnx()`, `ephpm_kv_set_if_eq()` and `ephpm_kv_del_if_eq()` return
+  `false`, and the RESP commands answer `-CLUSTERDOWN …` (never `:0`/`nil`, which would
   claim the key exists or the token did not match). Nothing was written on the
   calling node, but a request that timed out may still have been applied on
   the owner. From PHP, `ephpm_kv_setnx()` returns `false` both when the key
@@ -210,6 +280,85 @@ The guarantee, stated precisely:
 This is single-arbiter routing, not consensus. If you need mutual exclusion
 that survives membership changes, fence the protected resource itself (for
 example with a monotonically increasing token checked by the database).
+An owner running a version without `set_if_eq` routing drops the request,
+which reads as unreachable: `set_if_eq` returns `false` until it is upgraded.
+
+### Hashes and per-field TTL
+
+A hash keeps several fields under one key, each with its own value and —
+optionally — its own TTL. It is the natural shape for an object's attributes,
+a per-user set of flags, or a group of short-lived entries that should also be
+deletable together:
+
+```php
+ephpm_kv_hset("user:42", ["name" => "Ada", "plan" => "pro"]);   // 2 (fields created)
+ephpm_kv_hget("user:42", "name");                               // "Ada"
+ephpm_kv_hmget("user:42", ["name", "email"]);                   // ["Ada", null]
+ephpm_kv_hincr_by("user:42", "logins");                         // 1
+
+// A field that expires on its own: a one-time code valid for 5 minutes.
+ephpm_kv_hset("user:42", "otp", "839201");
+ephpm_kv_hexpire("user:42", "otp", 300);                        // 1
+ephpm_kv_httl("user:42", "otp");                                // ~300
+ephpm_kv_hpersist("user:42", "otp");                            // true (TTL removed)
+
+ephpm_kv_expire("user:42", 86400);                              // the whole hash, 1 day
+ephpm_kv_del("user:42");                                        // every field at once
+```
+
+- An expired field is gone for every read the moment its TTL passes (`hget`
+  returns `null`, `hgetall`/`hkeys`/`hlen` leave it out); its memory is
+  reclaimed by the next write to the hash or by the background expiry cycle.
+  A hash whose last field expires stops existing.
+- `ephpm_kv_hset()` clears the TTL of each field it writes;
+  `ephpm_kv_hincr_by()` keeps it. The hash key's own TTL (`ephpm_kv_expire`)
+  and the field TTLs are independent.
+- **In a cluster, hashes replicate per field** (since v0.13; before that they
+  stayed on the node that wrote them). Writes to different fields on different
+  nodes never overwrite each other. A field value is limited to
+  `[cluster.kv] small_key_threshold` minus 17 bytes (495 bytes by default);
+  `ephpm_kv_hset()` returns `false` for a larger one and writes nothing. Keep
+  large values in string keys. See
+  [KV RESP Protocol → Hashes in a cluster](/reference/kv-resp/#hashes-in-a-cluster).
+
+### Batch reads and writes — `ephpm_kv_mget()` / `ephpm_kv_mset()`
+
+Reading or writing many keys costs one call instead of one per key:
+
+```php
+[$a, $b, $missing] = ephpm_kv_mget(["cache:a", "cache:b", "cache:nope"]);  // $missing === null
+ephpm_kv_mset(["cache:a" => "1", "cache:b" => "2"], 300);                    // both expire in 300 s
+```
+
+`mget` returns a list in the order of `$keys` (not keyed by key, so numeric
+keys cannot be confused with positions). `mset` applies one TTL to every key;
+use `ephpm_kv_set()` per key when they need different ones.
+
+### Iterating keys — `ephpm_kv_scan()`
+
+```php
+$cursor = 0;
+do {
+    [$cursor, $keys] = ephpm_kv_scan($cursor, "session:*", 500);
+    foreach ($keys as $key) {
+        // ...
+    }
+} while ($cursor !== 0);
+```
+
+Start with cursor `0` and stop when the returned cursor is `0` again. Every key
+that exists for the whole scan is returned **exactly once**, however much the
+store is written meanwhile; a key created or deleted during the scan may or
+may not be. `$match` is a Redis glob (`*`, `?`, `[abc]`). `$count` is a hint:
+a step walks at least one whole internal shard, so a large store returns more
+than `$count` keys per step. A name that is both a string and a hash appears
+once per type.
+
+In a cluster `ephpm_kv_scan()` lists **this node's** keyspace — every hash and
+every string value at or under `small_key_threshold` is on every node, but a
+larger string value only on its replica nodes. Do not use it to find every key
+to delete cluster-wide (for example a cache group flush); key a group by a
+version counter instead.
 
 ### Blocking waits — `ephpm_kv_wait()`
 
@@ -229,11 +378,14 @@ Semantics you can rely on:
   always start the protocol with `$last_version = 0`: that first call
   registers the watch and returns the current value + version
   immediately (a race-free snapshot), without blocking.
-- **What bumps the version:** `set`, `setnx` (on insert), `del`,
-  `del_if_eq` (only when it actually deletes), `incr` / `decr` /
-  `incr_by`, `append` (via RESP), expiry reaping, and `flush_all`.
-  TTL-only changes (`expire`) and hash-field ops (RESP `HSET`/`HDEL`)
-  do **not**.
+- **What bumps the version:** every write that changes the key's value or
+  removes it — `set`, `mset`, `setnx` (on insert), `set_if_eq` (when it
+  sets), `del`, `getdel`, `del_if_eq` (only when it actually deletes),
+  `incr` / `decr` / `incr_by`, `append`, expiry reaping, `flush_all`, and
+  (since v0.13) hash writes: a field set, incremented or deleted, or a field
+  expiring away. On a hash key `value` is `null` (a hash has no string value;
+  read it with `ephpm_kv_hgetall()`). TTL-only changes (`expire`, `persist`,
+  `getex`, `hexpire`, `hpersist`) do **not** bump.
 - **Negative arguments clamp to 0**; `$timeout_ms = 0` is a
   non-blocking poll.
 - **Cost when unused: zero.** Writes pay a single atomic load until the

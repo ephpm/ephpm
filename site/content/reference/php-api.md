@@ -33,6 +33,16 @@ the worker functions are inert, and the database functions work only with
 `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`,
 `ephpm_kv_flush_all`, `ephpm_kv_wait`.
 
+Since v0.13: strings and keys — `ephpm_kv_mget`, `ephpm_kv_mset`,
+`ephpm_kv_getdel`, `ephpm_kv_getex`, `ephpm_kv_persist`,
+`ephpm_kv_set_if_eq`, `ephpm_kv_append`, `ephpm_kv_strlen`,
+`ephpm_kv_type`, `ephpm_kv_scan`; hashes — `ephpm_kv_hget`,
+`ephpm_kv_hset`, `ephpm_kv_hsetnx`, `ephpm_kv_hmget`, `ephpm_kv_hgetall`,
+`ephpm_kv_hkeys`, `ephpm_kv_hvals`, `ephpm_kv_hdel`, `ephpm_kv_hexists`,
+`ephpm_kv_hlen`, `ephpm_kv_hincr_by`, `ephpm_kv_hexpire`, `ephpm_kv_httl`,
+`ephpm_kv_hpttl`, `ephpm_kv_hpersist`. Code that must also run on older
+ePHPm should guard them with `function_exists()`.
+
 Signatures, return values and edge cases:
 [KV from PHP — Function reference](/guides/kv-from-php/#function-reference).
 
@@ -85,7 +95,9 @@ not exist while serving requests. See [`ephpm php`](/reference/cli/php/).
 ### IDE stubs
 
 The [`ephpm/db`](/reference/php-packages/#database-adapters) package ships
-IDE/static-analysis stubs for `ephpm_db_*`, and
+IDE/static-analysis stubs for `ephpm_db_*`,
+[`ephpm/cache`](/reference/php-packages/#cache-kv-and-session-packages) for
+every `ephpm_kv_*` function (`stubs/ephpm-kv.stub.php`), and
 [`ephpm/worker`](/reference/php-packages/#worker-mode-adapters) for the
 worker API. Never autoload a stub at runtime: the functions are native, and
 redefining them is a fatal error.
