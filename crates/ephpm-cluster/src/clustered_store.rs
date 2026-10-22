@@ -2222,7 +2222,7 @@ pub(crate) fn apply_if_newer(
 }
 
 /// FNV-1a-style hash for key → u64 mapping.
-fn hash_key(key: &str) -> u64 {
+pub(crate) fn hash_key(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
@@ -2241,7 +2241,7 @@ fn hash_key(key: &str) -> u64 {
 /// directly unit-testable with a fixed node list. `alive` MUST be sorted
 /// by a stable key (node id) by the caller for selection to be
 /// membership-stable.
-fn replica_nodes_for(alive: &[NodeInfo], key_hash: u64, factor: usize) -> Vec<NodeInfo> {
+pub(crate) fn replica_nodes_for(alive: &[NodeInfo], key_hash: u64, factor: usize) -> Vec<NodeInfo> {
     if alive.is_empty() {
         return Vec::new();
     }
@@ -2261,7 +2261,7 @@ fn replica_nodes_for(alive: &[NodeInfo], key_hash: u64, factor: usize) -> Vec<No
 /// predating the advertisement) — this node's own configured `data_port`,
 /// which is what every node assumed before. Returns `None` if the gossip
 /// address does not parse as a socket address.
-fn node_data_addr(node: &NodeInfo, local_data_port: u16) -> Option<SocketAddr> {
+pub(crate) fn node_data_addr(node: &NodeInfo, local_data_port: u16) -> Option<SocketAddr> {
     node.gossip_addr
         .parse::<SocketAddr>()
         .ok()

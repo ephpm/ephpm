@@ -230,8 +230,60 @@ In a cluster the snapshot covers everything this node held: gossip-tier
 small values (which the live cluster re-sends anyway) and the large values
 this node owned or replicated. A snapshot-restored entry carries no write
 stamp, so any replicated write that arrives for the key — gossip catch-up or
-a data-plane push — replaces it. Peer handoff on shutdown and peer warm-up on
-start are the next piece of this feature.
+a data-plane push — replaces it.
+
+### Peer handoff (`peer_handoff`, on by default)
+
+Small values (at or below `[cluster.kv] small_key_threshold`) live in the
+gossip tier and reach every node on their own; a restarted node gets them
+back from chitchat's state sync. Large values do not: they are copied to
+`replication_factor` replicas **at write time only**, and nothing
+rebalances them afterwards. A restart used to expose two gaps:
+
+1. When node A leaves, every key whose replica set contained A has one copy
+   fewer until it is next written (with `replication_factor = 1`, none).
+2. When A comes back, it is again in the replica set of ~1/N of the large
+   keys — but holds none of them, and the read-through fetch does not fetch
+   for a node that is itself a replica. Those keys miss on A until
+   rewritten.
+
+**Push on drain** closes (1): after the HTTP drain, A walks its large
+values and sends each one to the nodes that form the key's replica set
+*without A*, as stamped SETs over the data plane (`OP_SET_V2`, the same
+path a replica write takes). **Pull on start** closes (2): before serving,
+the returning node asks every alive peer for its share (`OP_SHARE`). The
+peer walks its own large values and streams back the ones whose replica
+set — computed over the peer's alive view **with the requester forced in**
+— includes the requester; forcing the requester in makes the answer
+independent of gossip timing. A share streams one value per message (one
+sealed frame when the cluster secret is set), fed from a bounded queue by a
+blocking-thread walk that holds no shard lock while the socket is slow, so
+a share of any size is bounded by a few values in flight on both ends. The
+walk itself copies each shard's entries under its read lock and visits them
+after, like the snapshot writer. Both directions are bounded by
+`load_timeout`; whatever was sent or received before the deadline stays.
+
+**Ordering.** Every handed-off value lands through the receiver's
+applied-stamp map, with the stamp the sender recorded for the key when it
+still has one (the key was written within the 600 s applied horizon), else
+a stamp that **loses to every real write**. So a write that reaches the
+receiver before, during or after the handoff — from a client, gossip or a
+replica push — is never overwritten by the older handed-off copy; the
+handoff only fills slots the receiver has no newer record for. The one way
+a handoff can install a stale value: a key the receiver wrote more than the
+horizon ago that nobody touched since, whose copy on the sender was older
+than the receiver's own — which requires the sender to have missed that
+write's replication in the first place. A snapshot-restored entry carries
+no stamp (fresh process), so a pulled copy from a peer that stayed online
+replaces it — the peer's is the one the cluster kept writing to.
+
+**What it does not do.** It does not rebalance on every membership change
+(only the leaving and the joining node move data), it does not hand off
+hashes (they are not replicated at all), and a node killed without a
+graceful stop pushes nothing — its keys survive only where
+`replication_factor` already put them. The pull is a walk of every peer's
+large values per joining node: O(total large values) of CPU on each peer,
+once per join.
 
 ## See also
 

@@ -2141,6 +2141,52 @@ impl Store {
         }
     }
 
+    /// Visit every live string entry with its **decoded** value and
+    /// remaining TTL, one shard at a time (see
+    /// [`for_each_string_shard`](Self::for_each_string_shard) for the locking
+    /// contract: no shard lock is held while `visit` runs).
+    ///
+    /// Entries whose decoded value is shorter than `min_len` bytes are
+    /// skipped **before** decoding when stored raw; a stored-compressed value
+    /// is always decoded, since its decoded length is unknown until then.
+    /// This is the cluster's "large value" walk (`peer handoff`): with the
+    /// default compression floor (1 KiB) above the default large-value
+    /// threshold (512 B), a compressed entry is large by construction.
+    pub fn scan_strings_decoded(
+        &self,
+        min_len: usize,
+        mut visit: impl FnMut(&str, Bytes, Option<Duration>),
+    ) {
+        let algo = self.config.compression.algo;
+        self.for_each_string_shard(|batch| {
+            let now = Instant::now();
+            for rec in batch {
+                let ttl = match rec.expires_at {
+                    None => None,
+                    Some(at) => {
+                        let remaining = at.saturating_duration_since(now);
+                        if remaining.is_zero() {
+                            continue;
+                        }
+                        Some(remaining)
+                    }
+                };
+                let value = if rec.compressed {
+                    match decompress_value(&rec.data, algo) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                } else {
+                    rec.data
+                };
+                if value.len() < min_len {
+                    continue;
+                }
+                visit(&rec.key, value, ttl);
+            }
+        });
+    }
+
     // ── Snapshot support (crate::snapshot) ───────────────────────
 
     /// Visit every live string entry, one shard at a time.

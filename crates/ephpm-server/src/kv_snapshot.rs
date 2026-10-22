@@ -74,6 +74,49 @@ pub const METRIC_LOAD_TOTAL: &str = "ephpm_kv_snapshot_load_total";
 pub const METRIC_LOAD_DURATION: &str = "ephpm_kv_snapshot_load_duration_seconds";
 /// Metric: keys restored by the last load.
 pub const METRIC_LAST_LOAD_KEYS: &str = "ephpm_kv_snapshot_last_load_keys";
+/// Metric: large KV values handed to peers (`direction="out"`, one per
+/// replica target) or pulled from them (`direction="in"`).
+pub const METRIC_HANDOFF_KEYS: &str = "ephpm_kv_handoff_keys_total";
+/// Metric: value bytes handed off, by direction.
+pub const METRIC_HANDOFF_BYTES: &str = "ephpm_kv_handoff_bytes_total";
+/// Metric: wall time of a push (`out`) or pull (`in`).
+pub const METRIC_HANDOFF_DURATION: &str = "ephpm_kv_handoff_duration_seconds";
+
+/// Record a peer handoff's outcome (metrics + one log line).
+pub fn record_handoff(direction: &'static str, report: &ephpm_cluster::HandoffReport) {
+    counter!(METRIC_HANDOFF_KEYS, "direction" => direction).increment(report.keys);
+    counter!(METRIC_HANDOFF_BYTES, "direction" => direction).increment(report.bytes);
+    histogram!(METRIC_HANDOFF_DURATION, "direction" => direction)
+        .record(report.elapsed.as_secs_f64());
+    let what = if direction == "in" { "KV warm-up pull from peers" } else { "KV handoff to peers" };
+    if report.timed_out || report.failed_peers > 0 || report.failed_writes > 0 {
+        tracing::warn!(
+            keys = report.keys,
+            bytes = report.bytes,
+            peers = report.peers,
+            failed_peers = report.failed_peers,
+            failed_writes = report.failed_writes,
+            timed_out = report.timed_out,
+            elapsed_ms = report.elapsed.as_millis() as u64,
+            "{what} finished with problems"
+        );
+    } else {
+        tracing::info!(
+            keys = report.keys,
+            bytes = report.bytes,
+            peers = report.peers,
+            elapsed_ms = report.elapsed.as_millis() as u64,
+            "{what} done"
+        );
+    }
+}
+
+/// `[kv.snapshot] load_timeout` as a duration (the default when it does
+/// not parse — `Config::validate` has already refused that case).
+#[must_use]
+pub fn load_timeout_from(config: &Config) -> Duration {
+    config.kv.snapshot.load_timeout().unwrap_or(Duration::from_secs(30))
+}
 
 /// What triggered a save (metric label + log field).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

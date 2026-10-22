@@ -135,6 +135,11 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             CDC_SNAPSHOT_BUCKETS,
         )
         .context("failed to configure kv_snapshot_load_duration buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::kv_snapshot::METRIC_HANDOFF_DURATION.to_string()),
+            CDC_SNAPSHOT_BUCKETS,
+        )
+        .context("failed to configure kv_handoff_duration buckets")?
         .install_recorder()
         .context("failed to install Prometheus recorder")?;
 

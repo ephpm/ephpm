@@ -253,6 +253,49 @@ ephpm kv snapshot inspect s3://my-kv-snapshots/prod/web/web.kvsnap --config /etc
 ephpm kv snapshot rm web --config /etc/ephpm/ephpm.toml
 ```
 
+## Cluster: peer handoff (rolling deploys)
+
+On a clustered node (`[cluster] enabled = true`) warm restarts need no file
+and no bucket: with `peer_handoff = true` (the default) a node that stops
+gracefully hands the large KV values it holds to the peers that take over
+their replica slots, and a node that starts pulls its share back from its
+peers before it serves. Small values (at or below
+`[cluster.kv] small_key_threshold`, the gossip tier) come back through
+gossip on their own. The details are in
+[KV snapshots → Peer handoff](/architecture/kv-snapshots/#peer-handoff-peer_handoff-on-by-default).
+
+A rolling deploy of a 3-node StatefulSet therefore looks like this:
+
+1. `web-2` gets `SIGTERM`. It drains requests, pushes its large values to
+   `web-0`/`web-1` (seconds, logged as `KV handoff to peers done
+   keys=… bytes=…`), writes its local/object snapshot if one is configured,
+   and exits.
+2. `web-2` restarts, joins gossip, pulls its share of large values from
+   `web-0` and `web-1` (`KV warm-up pull from peers done`), then opens for
+   traffic. Readiness is not reported until the pull finishes or
+   `load_timeout` passes.
+3. Repeat for `web-1`, then `web-0`.
+
+Both directions are bounded by `load_timeout` (default 30 s); size
+`terminationGracePeriodSeconds` for the drain plus the push plus the
+snapshot. A pod killed without a graceful stop pushes nothing — its keys
+survive only where `replication_factor` already put them, which is why the
+default is 2.
+
+Snapshots and peer handoff compose: a node that has both loads its snapshot
+first and then pulls from its peers, and a pulled value replaces a
+snapshot-restored one (the peers are what the cluster kept writing to).
+
+```toml
+[kv.snapshot]
+peer_handoff = true        # the default; mode may stay "off" on a cluster node
+load_timeout = "30s"       # bounds the pull on start and the push on stop
+```
+
+Metrics: `ephpm_kv_handoff_keys_total{direction}`,
+`ephpm_kv_handoff_bytes_total{direction}`,
+`ephpm_kv_handoff_duration_seconds{direction}`.
+
 ## Checking on it
 
 ```bash
@@ -307,9 +350,9 @@ passwords already have.
 
 ## Limits, honestly
 
-- Peer handoff in a cluster (warming a new node from its peers, no disk or
-  bucket involved) is the next piece; until then a cluster node warms from
-  its own file or object only.
+- Peer handoff moves data only on a graceful stop and a start; it does not
+  rebalance on other membership changes, and hashes are not handed off (they
+  are not replicated at all).
 - Object mode reads static `AWS_*` credentials only; no instance profile,
   no IRSA, no multipart upload (one `PutObject` up to 5 GiB).
 - A snapshot is node-local. In a cluster each node writes its own; nothing

@@ -3514,6 +3514,19 @@ pub struct KvSnapshotConfig {
     /// for AWS S3.
     #[serde(default)]
     pub path_style: Option<bool>,
+
+    /// Clustered nodes only (`[cluster] enabled = true`): on graceful
+    /// shutdown, push the large KV values this node holds to the nodes
+    /// that take over their replica slots; on startup, pull this node's
+    /// share of large values from its peers before serving. Independent of
+    /// `mode` — a cluster node warms from its peers with no file or bucket
+    /// at all. Small values need nothing: the gossip tier re-sends them.
+    /// Bounded by `load_timeout` on startup. Has no effect on a
+    /// non-clustered node.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub peer_handoff: bool,
 }
 
 impl Default for KvSnapshotConfig {
@@ -3531,6 +3544,7 @@ impl Default for KvSnapshotConfig {
             endpoint: None,
             region: default_kv_snapshot_region(),
             path_style: None,
+            peer_handoff: true,
         }
     }
 }

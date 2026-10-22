@@ -18,6 +18,7 @@ pub mod clustered_store;
 pub mod gossip_kv;
 pub mod gossip_writer;
 pub mod kv_data_plane;
+pub mod kv_handoff;
 pub mod node;
 pub mod reconnect;
 pub mod secure_transport;
@@ -31,6 +32,7 @@ pub use cluster_channel::{
 pub use clustered_store::{ClusteredStore, KvReplicator, SiteKvReplicator};
 pub use gossip_kv::{Stamp, StampClock, node_tag};
 pub use kv_data_plane as data_plane;
+pub use kv_handoff::{HandoffReport, HandoffSource, PeerHandoff};
 pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
 pub use reconnect::ReconnectBackoff;
 pub use secure_transport::{ClusterCipher, EncryptedUdpTransport};
