@@ -85,7 +85,10 @@ jobs:
           || (github.event.workflow_run.event == 'push'
               && github.event.workflow_run.conclusion == 'success'
               && startsWith(github.event.workflow_run.head_branch, 'v')) }}
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted, like release.yml's `setup`: it only resolves refs and
+    # compiles the dependency-free xtask crate to print a table -- no binary,
+    # no Docker, nothing from the fleet.
+    runs-on: ubuntu-latest
     outputs:
       experimental_matrix: ${{ steps.matrix.outputs.experimental_matrix }}
       experimental_tailcall_matrix: ${{ steps.matrix.outputs.experimental_tailcall_matrix }}
@@ -133,10 +136,9 @@ jobs:
           ref: ${{ steps.resolve.outputs.sha }}
       - name: Emit experimental matrices from xtask EXPERIMENTAL_PHP_VERSIONS
         id: matrix
-        run: |
-          docker run --rm -v "$PWD":/w -w /w \
-            ephpm/ephpm-ci:latest \
-            cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+        # Host cargo (toolchain from rust-toolchain.toml via the runner's
+        # rustup); progress goes to stderr, only the matrix lines to stdout.
+        run: cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
 
   # -- Linux x86_64 (glibc 2.28 floor via ephpm-ci) ---------------------------
   build-linux:
@@ -585,7 +587,9 @@ jobs:
     name: Publish pre-release
     needs: [setup, build-linux, build-linux-arm64, build-macos, build-windows, build-windows-tailcall]
     if: ${{ !cancelled() && needs.setup.outputs.do_publish == 'true' && startsWith(needs.setup.outputs.tag, 'v') }}
-    runs-on: [self-hosted, linux, x64]
+    # GitHub-hosted: downloads artifacts, runs sha256sum/sed and the GitHub
+    # API (gh, action-gh-release) -- no build, no Docker, nothing from the fleet.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
