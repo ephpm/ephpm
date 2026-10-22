@@ -195,6 +195,26 @@ impl HandoffSource {
         alive
     }
 
+    /// Whether **this** node is in the replica set of `transport_key` under
+    /// `membership` — i.e. its local copy is authoritative, not a leftover.
+    ///
+    /// A node keeps its own copy of every large value it *wrote*, replica or
+    /// not, and such an origin copy goes stale the moment another node
+    /// rewrites the key: the new value is fanned out to the key's replica
+    /// set, and the origin copy is only cleaned up by a gossip marker. A
+    /// handoff must never forward those — a restarted node that received
+    /// one served the pre-restart value for minutes in the lab.
+    #[must_use]
+    pub fn holds_authoritative(&self, membership: &[NodeInfo], transport_key: &str) -> bool {
+        self.replica_includes(membership, &self.self_id, transport_key)
+    }
+
+    /// This node's id.
+    #[must_use]
+    pub fn self_id(&self) -> &str {
+        &self.self_id
+    }
+
     /// Whether `node_id` is in the replica set of `transport_key` under
     /// `membership`.
     #[must_use]
@@ -364,6 +384,13 @@ impl PeerHandoff {
         // The ring without this node: where each key's replicas live next.
         let mut remaining: Vec<NodeInfo> = peers.iter().map(|(n, _)| n.clone()).collect();
         remaining.sort_by(|a, b| a.id.cmp(&b.id));
+        // And with it: only keys this node holds *authoritatively* (it is a
+        // current replica) are pushed. Its origin copies of keys other nodes
+        // replicate may be stale, and their real replicas lose nothing when
+        // this node leaves.
+        let mut full_ring = remaining.clone();
+        full_ring.push(self.cluster.self_node());
+        full_ring.sort_by(|a, b| a.id.cmp(&b.id));
         let addrs: std::collections::HashMap<String, SocketAddr> =
             peers.iter().map(|(n, a)| (n.id.clone(), *a)).collect();
 
@@ -392,7 +419,11 @@ impl PeerHandoff {
                         if closed {
                             return;
                         }
-                        let targets = targets_of(&transport_key(&site, key));
+                        let tk = transport_key(&site, key);
+                        if !source.holds_authoritative(&full_ring, &tk) {
+                            return;
+                        }
+                        let targets = targets_of(&tk);
                         if targets.is_empty() {
                             return;
                         }

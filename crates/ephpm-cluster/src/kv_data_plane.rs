@@ -757,7 +757,12 @@ async fn serve_share(
                         return;
                     }
                     let transport_key = crate::kv_handoff::transport_key(&site, key);
-                    if !source.replica_includes(&membership, &requester, &transport_key) {
+                    // Share only what the requester is a replica for AND this
+                    // node holds authoritatively; a copy this node merely
+                    // originated may be stale (see `holds_authoritative`).
+                    if !source.replica_includes(&membership, &requester, &transport_key)
+                        || !source.holds_authoritative(&membership, &transport_key)
+                    {
                         return;
                     }
                     let Some(entry) =

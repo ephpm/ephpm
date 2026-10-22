@@ -198,7 +198,10 @@ async fn push_on_drain_and_pull_on_start_keep_large_values_available() {
     let report = b.handoff.push(tokio::time::Instant::now() + Duration::from_secs(10)).await;
     assert!(!report.timed_out, "{report:?}");
     assert_eq!(report.failed_writes, 0, "{report:?}");
-    assert!(report.keys >= on_b.len() as u64, "{report:?}");
+    // b pushes only the keys it holds as a current replica (its origin-only
+    // copies are held by their real replicas already), so the count is not
+    // every key b held — but it is never nothing.
+    assert!(report.keys > 0, "{report:?}");
     // Every key b held now has two holders among a and c.
     let ac = [a, c];
     for key in &on_b {
