@@ -204,6 +204,26 @@
 //!   experimental — but as of v0.7.0 it is the only clustered SQLite path
 //!   (sqld was removed), no longer gated behind an opt-in flag.
 //!
+//! ## Engine work stays off the async workers
+//!
+//! Turso's futures run each step's page I/O and the commit `fsync`
+//! synchronously inside `poll`, yielding only between steps, so a tokio
+//! worker polling one is held for every step as long as the disk takes.
+//! Enough of them (applies, dumps, head samples across dozens of sites)
+//! and no worker is left to turn the runtime's I/O and timer drivers: the
+//! node stopped answering HTTP and handled `SIGTERM` up to 53 s late under
+//! per-site replication load. Every engine call this module makes on a raw
+//! connection therefore runs under [`off_runtime`] (litewire's
+//! `offload::engine`, `block_in_place` on a multi-thread runtime), exactly
+//! inside the WAL-gate permit scope that already marked it; litewire does
+//! the same for `poll_batch`, `apply_batch` and its sessions. Network waits
+//! stay outside.
+//!
+//! An offloaded scope cannot be interrupted from outside: its nested
+//! `block_on` never yields to the scheduler, so a `select!` arm (the per-site
+//! replica loop's role-change arm) or a task abort takes effect only once the
+//! scope (say, a snapshot install) has finished.
+//!
 //! # Wire format (inside the yamux stream)
 //!
 //! Length-prefixed JSON frames:
@@ -233,6 +253,7 @@ use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream, NodeInfo};
 use ephpm_config::SqliteConfig;
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
+use litewire::litewire_turso::offload::engine as off_runtime;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -580,7 +601,7 @@ pub async fn start_clustered_turso_cdc(
     let local_log_id = {
         let conn =
             mgmt_factory.raw_connection().context("CDC: open mgmt connection for log identity")?;
-        ensure_log_id(&conn).await.context("CDC: establish local log identity")?
+        off_runtime(ensure_log_id(&conn)).await.context("CDC: establish local log identity")?
     };
     tracing::info!(log_id = %local_log_id, "CDC: local log identity established");
 
@@ -995,7 +1016,7 @@ fn spawn_head_sampler(
             // collision impossible (and costs a reader slot for microseconds).
             let head = {
                 let _permit = mgmt.wal_gate_permit().await;
-                current_max_change_id(&conn).await
+                off_runtime(current_max_change_id(&conn)).await
             };
             match head {
                 Ok(head) => cdc_metrics::observe_head(DEFAULT_SITE, head),
@@ -1286,7 +1307,7 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     let watermark = {
         let _permit = factory.wal_gate_permit().await;
-        resolve_subscribe_watermark(apply_conn, &source_log_id)
+        off_runtime(resolve_subscribe_watermark(apply_conn, &source_log_id))
             .await
             .with_context(|| format!("resolve watermark for source log {source_log_id}"))
             .context(WatermarkResolution)?
@@ -1747,7 +1768,7 @@ async fn serve_snapshot_inner(
     // window. Released before the dump is written to the stream.
     let (watermark, dump) = {
         let _permit = mgmt.wal_gate_permit().await;
-        produce_snapshot(&conn).await.context("snapshot: produce dump")?
+        off_runtime(produce_snapshot(&conn)).await.context("snapshot: produce dump")?
     };
 
     let header = SnapshotHeader {
@@ -2241,7 +2262,9 @@ async fn maybe_bootstrap_cold_replica(
 
     let cold = {
         let _permit = mgmt.wal_gate_permit().await;
-        local_db_is_cold(&conn).await.context("snapshot bootstrap: cold-start check")?
+        off_runtime(local_db_is_cold(&conn))
+            .await
+            .context("snapshot bootstrap: cold-start check")?
     };
     if !cold {
         cdc_metrics::record_bootstrap("skipped");
@@ -2389,7 +2412,7 @@ async fn fetch_and_apply_snapshot_on(
         fetch_snapshot(primary_addr, channel, max_snapshot_bytes, snapshot_stream).await?;
     {
         let _permit = factory.wal_gate_permit().await;
-        apply_snapshot(conn, &header, &dump).await?;
+        off_runtime(apply_snapshot(conn, &header, &dump)).await?;
     }
     // Only counted once the dump is durably applied: bytes received into
     // a buffer that then failed validation are not a bootstrap.
@@ -2838,7 +2861,7 @@ impl SiteMgmtRegistry {
             let conn = factory
                 .raw_connection()
                 .with_context(|| format!("open mgmt connection for site {site}"))?;
-            ensure_log_id(&conn)
+            off_runtime(ensure_log_id(&conn))
                 .await
                 .with_context(|| format!("establish CDC log identity for site {site}"))?
         };
@@ -3523,7 +3546,7 @@ async fn sample_owned_head_until_role_changes(
                 let Some(c) = conn.as_ref() else { continue };
                 let head = {
                     let _permit = factory.wal_gate_permit().await;
-                    current_max_change_id(c).await
+                    off_runtime(current_max_change_id(c)).await
                 };
                 match head {
                     Ok(head) => cdc_metrics::observe_head(site, head),
@@ -3584,7 +3607,7 @@ async fn take_ownership_handoff(
     };
     let cold = {
         let _permit = factory.wal_gate_permit().await;
-        local_db_is_cold(&conn).await
+        off_runtime(local_db_is_cold(&conn)).await
     };
     match cold {
         // Not cold: we already hold this site's data, nothing to pull.
@@ -3763,7 +3786,7 @@ async fn replicate_site_once(
 
     let lineage = {
         let _permit = factory.wal_gate_permit().await;
-        site_data_lineage(&conn, own_log_id).await?
+        off_runtime(site_data_lineage(&conn, own_log_id)).await?
     };
     if let ReplicaAction::Bootstrap { discard_local } =
         plan_replica_attempt(force_reset, lineage.as_deref())
@@ -3815,7 +3838,7 @@ async fn bootstrap_site_from(
     // connection, no busy timeout — see `subscribe_and_consume`).
     {
         let _permit = factory.wal_gate_permit().await;
-        install_snapshot(conn, &header, &dump, discard_local)
+        off_runtime(install_snapshot(conn, &header, &dump, discard_local))
             .await
             .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
     }

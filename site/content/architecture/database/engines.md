@@ -34,9 +34,30 @@ files open in place — see the migration note.
 
 ## The Turso engine
 
-Turso Database is Turso's ground-up Rust rewrite of SQLite: native async
-I/O instead of blocking C calls on a thread pool, and MVCC concurrent
-writes instead of a single writer guarded by `busy_timeout`.
+Turso Database is Turso's ground-up Rust rewrite of SQLite, with an `async`
+Rust API and an experimental MVCC mode for concurrent writers (ePHPm does
+not enable it; writers are serialized by the write lock and `busy_timeout`,
+as in SQLite).
+
+The `async` API is async in name only. Each step of a statement — its VDBE
+work, the page reads and writes it needs, and the `fsync` at commit — runs
+as ordinary blocking calls inside `poll`; the future yields only between
+steps, so a worker polling it is held for every step as long as the disk
+takes. ePHPm therefore never awaits engine work on one of tokio's async
+worker threads. Every engine call runs through
+litewire's `offload::engine`, which moves it off the worker with
+`block_in_place` before it starts (the worker's queued tasks continue on
+another thread). Without that, a few dozen replicated sites' applies,
+snapshot dumps and checkpoints could occupy every worker, and with no worker
+free to poll sockets and timers the whole server stalled: HTTP connections,
+cluster heartbeats, even the `SIGTERM` handler. PHP's `ephpm_db_*` calls
+already ran the engine on the PHP thread itself and are unaffected.
+
+One engine behaviour to know when sizing: a statement waiting for another
+connection's write lock does not sleep. The engine re-polls it immediately
+until the lock frees or the 5 s busy timeout expires, so each waiting
+statement keeps one thread at 100% CPU for that time. Heavy write
+contention on one database shows up as CPU, not as idle waiting.
 
 ePHPm reaches it through litewire's `turso` backend, which is compiled into
 every standard ePHPm build — **there is no cargo feature, sqld binary, or

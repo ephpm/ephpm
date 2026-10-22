@@ -133,6 +133,26 @@ join = ["ephpm-headless.default.svc.cluster.local:7946"]
 
 `StatefulSet` + headless `Service` works well. With `node_id` unset, the generated id starts with the pod name (`ephpm-0-…`), so the lowest-numbered pod tends to win the election — but ids compare as strings (`ephpm-10` sorts before `ephpm-2`), so set `node_id` explicitly if the primary's identity matters. There is no Helm chart; the worked manifests live in [`k8s/base/`](https://github.com/ephpm/ephpm/tree/main/k8s/base) — [`ephpm-cluster.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-cluster.yaml) is the clustered StatefulSet + headless Service the E2E suite runs against, and [`ephpm-single.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-single.yaml) is its single-node counterpart. They are test fixtures rather than a packaged release artifact, so treat them as a starting point.
 
+### Give pods time to close their databases
+
+Kubernetes sends `SIGKILL` `terminationGracePeriodSeconds` (default **30 s**) after `SIGTERM`. A node with embedded SQLite (`[db.sqlite]`) needs longer than that to stop cleanly:
+
+1. Requests drain, bounded by `[server.timeouts] shutdown` (default 30 s on its own).
+2. Every open database's write-ahead log gets a final `wal_checkpoint(TRUNCATE)`. This runs to completion **outside** that bound, because it is what spares the next start a WAL recovery. Its length depends on how much was written since the last checkpoint and on disk sync latency. In a 3-node per-site cluster (60 sites) stopped while its peers stayed under full write load on one shared disk, it took 45–74 s, and whole-process exit took 50–77 s.
+3. The async runtime gets at most 15 s more.
+
+A `SIGKILL` during step 2 loses no committed data: the engine recovers the log on the next open, the same as after a crash. But the next start then pays for that recovery on every database whose log was left full. For clustered deployments with an embedded database, set the grace period to cover all three steps with room to spare:
+
+```yaml
+spec:
+  template:
+    spec:
+      # [server.timeouts] shutdown (30) + final checkpoint + runtime stop (15)
+      terminationGracePeriodSeconds: 120
+```
+
+Watch the `closing embedded databases` lines in the pod's log (INFO once the checkpoint passes 3 s) to see what your workload actually needs.
+
 ## Verify the cluster
 
 Watch the logs on each node — gossip membership changes are logged at `info` level as nodes discover each other and the SQLite primary is elected:

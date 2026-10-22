@@ -86,9 +86,15 @@ fn read_write_path_entry(dir: &std::path::Path) -> String {
 }
 
 /// Render the systemd unit file body. `owner` is `None` for the historical
-/// root-with-no-sandboxing unit (byte-identical to the pre-`--user` output)
+/// root-with-no-sandboxing unit (the pre-`--user` output plus `TimeoutStopSec`)
 /// or `Some` to run the service as a dedicated non-root user/group — see
 /// [`owner_directives`].
+///
+/// `TimeoutStopSec` raises systemd's 90 s default before it sends `SIGKILL`:
+/// a graceful stop drains requests for up to `[server.timeouts] shutdown`
+/// (30 s default), then checkpoints every embedded database outside that
+/// budget (measured at 45–74 s under load), then gives the runtime up to
+/// 15 s. 180 s covers that with room to spare.
 fn unit_body(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     format!(
         "[Unit]\n\
@@ -101,6 +107,7 @@ Type=simple\n\
 ExecStart={binary} serve --config {config}\n\
 Restart=on-failure\n\
 RestartSec=2s\n\
+TimeoutStopSec=180\n\
 LimitNOFILE=65536\n\
 {owner_directives}\
 StandardOutput=append:{log}\n\
@@ -353,5 +360,14 @@ mod tests {
         assert_eq!(log_source(false), LogSource::Journal);
         let body = unit_body(&test_paths(), None);
         assert!(body.contains("StandardOutput=append:/var/log/ephpm/ephpm.log"));
+    }
+
+    #[test]
+    fn unit_gives_a_graceful_stop_time_to_close_databases() {
+        // systemd's 90 s default would SIGKILL mid final-checkpoint.
+        let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
+        for owner in [None, Some(&owner)] {
+            assert!(unit_body(&test_paths(), owner).contains("\nTimeoutStopSec=180\n"));
+        }
     }
 }

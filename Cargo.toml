@@ -224,7 +224,20 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 4c84c8034770 — busy databases report as busy (litewire#51).
+# litewire @ 3e64c5132c87 — engine work runs off the async workers (litewire#52,
+# docs + slow-statement WARN in #53). Turso's async API runs each step's page
+# I/O and the commit fsync synchronously inside `poll` (yielding only between
+# steps), so every session statement, CDC poll/apply and WAL-gate checkpoint
+# held a tokio worker per step for as long as the disk took; with enough of
+# them in flight no worker turned the I/O/timer drivers and the whole runtime
+# stalled (SIGTERM handled up to 53 s late in the per-site replication lab). New `litewire_turso::offload::engine` (`block_in_place` on
+# a multi-thread runtime, in place otherwise; nested calls run in place) wraps
+# all of them, and ePHPm uses it for its own raw-connection engine work. Also
+# moves litewire's lockfile past RUSTSEC-2026-0381/0382 (no effect here: ePHPm
+# has its own lockfile). turso stays =0.8.3; ePHPm's lockfile changes only the
+# litewire crates' source rev.
+#
+# Previous pin 4c84c8034770 — busy databases report as busy (litewire#51).
 # Two misleading errors from a 3-node per-site clustered stress run while one
 # site held a 3,000-row write transaction. (1) `enable_cdc_on_connect` ran
 # `PRAGMA capture_data_changes_conn('full')` inside `Backend::connect`, and
@@ -550,7 +563,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "4c84c803477072587966673d466ca4975096a619", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "3e64c5132c87efd8291b5f34ff44ce48df01e1cb", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
