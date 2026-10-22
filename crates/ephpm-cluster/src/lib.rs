@@ -35,6 +35,6 @@ pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
 pub use reconnect::ReconnectBackoff;
 pub use secure_transport::{ClusterCipher, EncryptedUdpTransport};
 pub use sqlite_election::{
-    ElectedRole, HRW_SCHEME, SqliteElection, hrw_owner, hrw_scheme_mismatches, per_site_primary,
-    spawn_hrw_scheme_watch,
+    ElectedRole, HRW_SCHEME, HrwSchemeDebounce, SqliteElection, describe_hrw_scheme_mismatches,
+    hrw_owner, hrw_scheme_mismatches, per_site_primary, spawn_hrw_scheme_watch,
 };

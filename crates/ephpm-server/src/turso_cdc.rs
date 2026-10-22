@@ -257,6 +257,7 @@ use litewire::litewire_turso::offload::engine as off_runtime;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::handoff_gate::{HandoffGate, SiteServeState};
 use crate::wal_gate::{self, WalGateSample, WalGateStatsSource};
 use crate::{tracked_backend, turso_cdc_metrics as cdc_metrics};
 
@@ -1675,6 +1676,19 @@ struct SnapshotHeader {
     /// it as its source log so a later failover to a *different* log is
     /// detected and the cursor is not misapplied.
     log_id: String,
+    /// **"I hold no copy of this site."** Set by a per-site node asked for a
+    /// `snapshot/<site>` it has no database file for: it answers with this
+    /// header and an immediate end marker instead of creating an empty
+    /// database just to dump it (see [`serve_no_copy`]).
+    ///
+    /// Backward compatible both ways. Omitted from the wire when `false`, so a
+    /// normal header is byte-identical to an older node's; an older receiver
+    /// ignores the unknown field and sees an empty dump, which every receiver
+    /// already treats as carrying no data. And an older *server* never sets it
+    /// but answers an unknown site with an empty dump, which the ownership
+    /// handoff classifies the same way ([`snapshot_declares_a_table`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    no_copy: bool,
 }
 
 /// Spawn the primary-side snapshot server. The handler is registered
@@ -1755,8 +1769,8 @@ pub async fn serve_snapshot(
 
 /// Body of [`serve_snapshot`]. Returns the watermark and the dump size in
 /// bytes so the caller can record both without measuring twice.
-async fn serve_snapshot_inner(
-    stream: &mut ChannelStream,
+async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
     mgmt: &Turso,
     local_log_id: &str,
 ) -> anyhow::Result<(i64, u64)> {
@@ -1775,6 +1789,7 @@ async fn serve_snapshot_inner(
         watermark,
         total_len: dump.len() as u64,
         log_id: local_log_id.to_string(),
+        no_copy: false,
     };
     write_snapshot_header(stream, &header).await?;
 
@@ -1785,6 +1800,25 @@ async fn serve_snapshot_inner(
     write_snapshot_chunk(stream, &[]).await?;
     stream.flush().await?;
     Ok((watermark, dump.len() as u64))
+}
+
+/// Answer a `snapshot/<site>` request for a site this node holds no copy of:
+/// a [`SnapshotHeader`] with `no_copy` set, then the end marker.
+///
+/// The point is what this does **not** do. Serving a real snapshot resolves
+/// the site's mgmt factory, and opening a Turso factory creates the database
+/// file. A cold new owner asks every alive peer in turn
+/// ([`settle_site_serving`]), so answering by dumping would leave an empty
+/// `<site>.db` on every node it asked — and an empty file on disk then looks
+/// like a site this node holds (`scan_existing_sites` starts a replication
+/// driver for it at the next boot).
+async fn serve_no_copy<S: AsyncWriteExt + Unpin>(stream: &mut S) -> anyhow::Result<()> {
+    let header =
+        SnapshotHeader { watermark: 0, total_len: 0, log_id: String::new(), no_copy: true };
+    write_snapshot_header(stream, &header).await?;
+    write_snapshot_chunk(stream, &[]).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Produce a logical dump of the current DB state plus the aligned
@@ -2443,12 +2477,35 @@ async fn fetch_snapshot(
     max_snapshot_bytes: u64,
     snapshot_stream: &str,
 ) -> anyhow::Result<(SnapshotHeader, String, u64)> {
-    let mut stream = channel
-        .dial(primary_addr, snapshot_stream)
-        .await
-        .with_context(|| format!("snapshot: dial {primary_addr}"))?;
+    let (mut stream, header) = open_snapshot(primary_addr, channel, snapshot_stream).await?;
+    let (dump, received) = read_snapshot_body(&mut stream, &header, max_snapshot_bytes).await?;
+    Ok((header, dump, received))
+}
 
+/// Dial `addr` on `snapshot_stream` and read the snapshot header — the part of
+/// a fetch during which the peer produces its dump. Split from the body read so
+/// a caller can bound it (the ownership handoff's per-peer probe) without
+/// bounding how long a large body may take to arrive.
+async fn open_snapshot(
+    addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    snapshot_stream: &str,
+) -> anyhow::Result<(ChannelStream, SnapshotHeader)> {
+    let mut stream = channel
+        .dial(addr, snapshot_stream)
+        .await
+        .with_context(|| format!("snapshot: dial {addr}"))?;
     let header = read_snapshot_header(&mut stream).await.context("snapshot: read header")?;
+    Ok((stream, header))
+}
+
+/// Read a snapshot body after its `header`, enforcing `max_snapshot_bytes`.
+/// Returns the dump and the number of body bytes received.
+async fn read_snapshot_body<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    header: &SnapshotHeader,
+    max_snapshot_bytes: u64,
+) -> anyhow::Result<(String, u64)> {
     anyhow::ensure!(
         header.total_len <= max_snapshot_bytes,
         "snapshot: peer announced {} bytes, above the [db.sqlite.replication] \
@@ -2464,7 +2521,7 @@ async fn fetch_snapshot(
     let mut body = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
     let mut received: u64 = 0;
     loop {
-        let chunk = read_snapshot_chunk(&mut stream).await.context("snapshot: read chunk")?;
+        let chunk = read_snapshot_chunk(stream).await.context("snapshot: read chunk")?;
         if chunk.is_empty() {
             break; // end marker
         }
@@ -2478,7 +2535,7 @@ async fn fetch_snapshot(
         body.extend_from_slice(&chunk);
     }
     let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
-    Ok((header, dump, received))
+    Ok((dump, received))
 }
 
 // ---------------------------------------------------------------------------
@@ -2725,11 +2782,17 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 //
 // HRW ownership is recomputed from live membership, so it moves whenever
 // membership changes — a node *joining* is enough. Ownership on its own moves
-// no bytes, so two things make a move safe:
+// no bytes, so these make a move safe:
 //
-// - The new owner **pulls** the site from the previous owner
-//   (`take_ownership_handoff`, HRW over the alive set minus self) when its own
-//   copy is cold, before serving.
+// - The new owner **pulls** the site when its own copy is cold, before it
+//   serves (`settle_site_serving`). It asks every alive peer in HRW rank order
+//   — the previous owner first — until one answers with a dump that declares a
+//   table, and until then the serving path refuses the site
+//   (`crate::handoff_gate`). A peer without a copy answers `no_copy` and
+//   creates nothing (`SiteMgmtRegistry::existing`, `serve_no_copy`). The site
+//   starts empty only when every alive peer has answered "no copy" from a
+//   membership view past the startup grace; a peer that cannot answer keeps it
+//   refused and retried, because serving empty would fork the data.
 // - The old owner never *discards* data to bootstrap from someone else. Its
 //   database's `site_data_lineage` names it as the data's origin, so it tails
 //   rather than resets; and even a justified reset refuses a snapshot that
@@ -2769,6 +2832,13 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 struct SiteMgmt {
     factory: Arc<Turso>,
     log_id: String,
+    /// Serializes the two things that may seed a cold copy of this site: the
+    /// ownership handoff ([`settle_site_serving`], while live HRW names this
+    /// node the owner) and the replica bootstrap ([`replicate_site_once`],
+    /// while the election names another node). The two follow different views
+    /// of ownership and can briefly overlap; each re-checks the local copy
+    /// under this lock, so a cold copy is seeded once, not twice.
+    seed: tokio::sync::Mutex<()>,
 }
 
 /// Per-site lock guarding that one site's opened-or-not [`SiteMgmt`].
@@ -2843,6 +2913,43 @@ impl SiteMgmtRegistry {
         if let Some(existing) = guard.as_ref() {
             return Ok(Arc::clone(existing));
         }
+        self.open_into(site, &mut guard).await
+    }
+
+    /// The mgmt factory for `site` **only if this node holds the site's
+    /// database** — already open here, or present on disk. `None` otherwise,
+    /// and in that case nothing is created: opening a factory creates the
+    /// file, which is exactly what answering a snapshot request for a site
+    /// this node has never held must not do (see [`serve_no_copy`]).
+    ///
+    /// Fast-fails on a transient `database is locked`, like
+    /// [`ensure`](Self::ensure).
+    async fn existing(&self, site: &str) -> anyhow::Result<Option<Arc<SiteMgmt>>> {
+        anyhow::ensure!(
+            crate::router::is_valid_site_key(site),
+            "refusing to open a mgmt factory for an invalid site key: {site:?}"
+        );
+        let slot = self.slot(site);
+        let mut guard = slot.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        // Checked under the slot lock, which every mgmt open of this site
+        // takes, so no open here can create the file between this check and
+        // the decision. (The serving registry may create it concurrently; then
+        // this node is the site's owner and opening it is correct.)
+        if !self.dir.join(format!("{site}.db")).exists() {
+            return Ok(None);
+        }
+        self.open_into(site, &mut guard).await.map(Some)
+    }
+
+    /// Open the mgmt factory for `site` into its (locked, empty) slot.
+    async fn open_into(
+        &self,
+        site: &str,
+        guard: &mut tokio::sync::MutexGuard<'_, Option<Arc<SiteMgmt>>>,
+    ) -> anyhow::Result<Arc<SiteMgmt>> {
         let path = self.dir.join(format!("{site}.db"));
         let path_str = path
             .to_str()
@@ -2865,8 +2972,8 @@ impl SiteMgmtRegistry {
                 .await
                 .with_context(|| format!("establish CDC log identity for site {site}"))?
         };
-        let mgmt = Arc::new(SiteMgmt { factory, log_id });
-        *guard = Some(Arc::clone(&mgmt));
+        let mgmt = Arc::new(SiteMgmt { factory, log_id, seed: tokio::sync::Mutex::new(()) });
+        **guard = Some(Arc::clone(&mgmt));
         Ok(mgmt)
     }
 }
@@ -2956,11 +3063,12 @@ fn site_from_stream(stream_type: &str, prefix: &str) -> Option<String> {
 ///   would replicate the wrong sequence.
 /// - **Snapshot** (`snapshot/<site>`) is served by the owner, *and* by any node
 ///   to the site's current owner. That second case is the ownership handoff
-///   ([`take_ownership_handoff`]): when HRW re-homes a site to a node that
-///   holds none of its data, the node that does hold it is by definition not
-///   the owner any more, so an owner-only gate would refuse the very transfer
-///   that makes the move safe. The requester must be the current owner, which
-///   is a membership-derived fact no peer can assert for itself.
+///   ([`settle_site_serving`]): when HRW re-homes a site to a node that holds
+///   none of its data, the node that does hold it is by definition not the
+///   owner any more, so an owner-only gate would refuse the very transfer that
+///   makes the move safe. The requester must be the current owner, which is a
+///   membership-derived fact no peer can assert for itself. A node holding no
+///   copy answers `no_copy` rather than creating the site's database.
 async fn stream_is_authorized(
     cluster: &ephpm_cluster::ClusterHandle,
     self_id: &str,
@@ -3112,6 +3220,28 @@ pub async fn start_clustered_per_site_turso(
     // site's HRW owner) runs them against the site's LOCAL backend — capturing
     // writes into CDC, which then replicate to every replica. Registered up
     // front so any site this node owns is served, opened on demand.
+    // From here on a site is served locally only once its driver has settled
+    // it — the local copy holds data, or a peer's copy was pulled into it, or
+    // no peer has one (`crate::handoff_gate`, `settle_site_serving`).
+    let gate = Arc::clone(registry.handoff_gate());
+    gate.arm();
+
+    // Every node must compute site ownership with the same hash scheme. While
+    // an alive peer confirmably does not (a pre-v0.13.0 node during a
+    // forbidden rolling upgrade), this node serves no site as its owner: the
+    // older node cannot know the new scheme exists, so only this side can step
+    // back, and stepping back leaves one writer per site (see
+    // `HandoffGate::set_scheme_block`).
+    {
+        let gate = Arc::clone(&gate);
+        handles.push(ephpm_cluster::spawn_hrw_scheme_watch(
+            Arc::clone(cluster),
+            move |confirmed| {
+                gate.set_scheme_block(scheme_block_reason(confirmed));
+            },
+        ));
+    }
+
     crate::sql_forward::spawn_owner_sql_handler(
         channel,
         Arc::clone(cluster),
@@ -3124,22 +3254,18 @@ pub async fn start_clustered_per_site_turso(
     // a driver for one site (startup scan vs. the live open-event stream).
     let drivers: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
 
+    let ctx = SiteDriverCtx {
+        cluster: Arc::clone(cluster),
+        channel: channel.clone(),
+        channel_advertise,
+        mgmt: mgmt.clone(),
+        max_snapshot_bytes,
+        gate,
+        plane_started: tokio::time::Instant::now(),
+    };
     let start_driver = {
-        let cluster = Arc::clone(cluster);
-        let channel = channel.clone();
-        let mgmt = mgmt.clone();
         let drivers = Arc::clone(&drivers);
-        move |site: String| {
-            ensure_site_driver(
-                &drivers,
-                site,
-                &cluster,
-                &channel,
-                channel_advertise,
-                &mgmt,
-                max_snapshot_bytes,
-            );
-        }
+        move |site: String| ensure_site_driver(&drivers, site, &ctx)
     };
 
     // Warm working set already on disk.
@@ -3220,8 +3346,25 @@ fn spawn_per_site_stream_handler(
                     );
                     return;
                 }
-                let site_mgmt = match mgmt.ensure(&site).await {
-                    Ok(m) => m,
+                // A CDC stream is only ever served by the site's owner, which
+                // serves the site and may open (create) its database. A
+                // snapshot can be asked of ANY node — a cold new owner probes
+                // every alive peer — so it must not create the file of a site
+                // this node never held; it answers "no copy" instead.
+                let opened = match kind {
+                    StreamKind::Cdc => mgmt.ensure(&site).await.map(Some),
+                    StreamKind::Snapshot => mgmt.existing(&site).await,
+                };
+                let site_mgmt = match opened {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        let mut stream = stream;
+                        match serve_no_copy(&mut stream).await {
+                            Ok(()) => tracing::debug!(peer = %peer, site = %site, "per-site snapshot: holding no copy of the site; answered no-copy"),
+                            Err(e) => tracing::info!(peer = %peer, site = %site, "per-site snapshot: no-copy answer failed: {e:#}"),
+                        }
+                        return;
+                    }
                     Err(e) => {
                         tracing::warn!(site = %site, "per-site {}: cannot open mgmt factory: {e:#}", kind.label());
                         return;
@@ -3274,15 +3417,7 @@ pub fn stop_replication_drivers() {
 /// the startup `handles` vec); the driver removes itself from `drivers` when
 /// it exits so a later open-event can restart it. Every driver ends when
 /// [`stop_replication_drivers`] runs.
-fn ensure_site_driver(
-    drivers: &Arc<DashMap<String, ()>>,
-    site: String,
-    cluster: &Arc<ephpm_cluster::ClusterHandle>,
-    channel: &ephpm_cluster::ChannelHandle,
-    channel_advertise: SocketAddr,
-    mgmt: &SiteMgmtRegistry,
-    max_snapshot_bytes: u64,
-) {
+fn ensure_site_driver(drivers: &Arc<DashMap<String, ()>>, site: String, ctx: &SiteDriverCtx) {
     if !crate::router::is_valid_site_key(&site) || drivers_shutdown().is_cancelled() {
         return;
     }
@@ -3295,20 +3430,10 @@ fn ensure_site_driver(
         }
     }
 
-    let cluster = Arc::clone(cluster);
-    let channel = channel.clone();
-    let mgmt = mgmt.clone();
+    let ctx = ctx.clone();
     let drivers = Arc::clone(drivers);
     tokio::spawn(async move {
-        let run = run_site_replication(
-            site.clone(),
-            cluster,
-            channel,
-            channel_advertise,
-            mgmt,
-            max_snapshot_bytes,
-        );
-        if let Err(e) = run.await {
+        if let Err(e) = run_site_replication(site.clone(), ctx).await {
             tracing::warn!(site = %site, "per-site replication driver exited: {e:#}");
         }
         // The site has left this node's replication set: its per-site CDC
@@ -3331,19 +3456,38 @@ fn ensure_site_driver(
 /// Returns an error only on a *permanent* failure to open the site's mgmt
 /// factory (a transient `database is locked` is retried indefinitely). Stream
 /// failures are retried internally.
-async fn run_site_replication(
-    site: String,
-    cluster: Arc<ephpm_cluster::ClusterHandle>,
-    channel: ephpm_cluster::ChannelHandle,
-    channel_advertise: SocketAddr,
-    mgmt: SiteMgmtRegistry,
-    max_snapshot_bytes: u64,
-) -> anyhow::Result<()> {
+async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Result<()> {
+    let SiteDriverCtx {
+        cluster,
+        channel,
+        channel_advertise,
+        mgmt,
+        max_snapshot_bytes,
+        gate,
+        plane_started,
+    } = ctx;
     // Open the mgmt factory with retry: a first-open write-lock race with the
     // cdc-on wire factory must not kill the driver permanently (Bug 1).
     let site_mgmt = acquire_site_mgmt(&mgmt, &site)
         .await
         .with_context(|| format!("open mgmt for site {site}"))?;
+
+    // Settle the serving gate alongside the election: it follows live HRW
+    // ownership (what the serving path follows), not the election's role,
+    // which lags it by up to the startup grace. Ends once the site is settled
+    // (or at shutdown); the driver does not wait for it, but does not outlive
+    // it either — a restarted driver starts its own. Aborting it is safe: its
+    // engine work runs in offloaded scopes, which an abort on the server's
+    // multi-thread runtime cannot cut short (it lands at the next await).
+    let _settle = AbortOnDrop(tokio::spawn(settle_site_serving(
+        site.clone(),
+        Arc::clone(&cluster),
+        channel.clone(),
+        Arc::clone(&site_mgmt),
+        gate,
+        max_snapshot_bytes,
+        plane_started,
+    )));
 
     // Per-site election: publishes THIS node's channel address as owner while
     // it is the site's HRW owner (so replicas can dial it), and names the
@@ -3365,10 +3509,6 @@ async fn run_site_replication(
     // "replica is authoritative-from-owner"). Cleared on any clean attempt or
     // role change.
     let mut force_reset = false;
-    // The ownership-handoff pull is attempted at most once per driver: it is
-    // only meaningful for a node that starts owning a site it has no data for,
-    // and re-running it later would race live writes.
-    let mut took_handoff = false;
     // Reconnect pacing for this site's replica stream; see the failure arm.
     let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
 
@@ -3382,24 +3522,14 @@ async fn run_site_replication(
         match role {
             ElectedRole::Primary => {
                 // We own this site; owner-side handlers serve replicas.
-                // Nothing to drive until the role changes — except the one
-                // case where becoming the owner is not enough: we may have
-                // been handed a site whose data lives on another node.
+                // Nothing to drive until the role changes. (Becoming the owner
+                // of a site whose data lives on another node is handled by
+                // `settle_site_serving`, which follows live ownership rather
+                // than this role and keeps the site unserved until it has
+                // pulled the data.)
                 force_reset = false;
-                if !took_handoff {
-                    took_handoff = true;
-                    take_ownership_handoff(
-                        &site,
-                        &cluster,
-                        &channel,
-                        &site_mgmt.factory,
-                        max_snapshot_bytes,
-                    )
-                    .await;
-                }
                 // Metrics: this node now ships the site and is nobody's
-                // replica of it. Cleared after the handoff, which records an
-                // applied watermark of its own while pulling the snapshot.
+                // replica of it.
                 cdc_metrics::forget_applied(&site);
                 cdc_metrics::track_shipping(&site);
                 let keep_going = tokio::select! {
@@ -3439,7 +3569,7 @@ async fn run_site_replication(
                         }
                         false
                     }
-                    res = replicate_site_once(&site, owner, &channel, &site_mgmt.factory, &site_mgmt.log_id, max_snapshot_bytes, force_reset) => {
+                    res = replicate_site_once(&site, owner, &channel, &site_mgmt, max_snapshot_bytes, force_reset) => {
                         match res {
                             Ok(()) => {
                                 force_reset = false;
@@ -3557,117 +3687,435 @@ async fn sample_owned_head_until_role_changes(
     }
 }
 
-/// The node that owned `site` before this one: the HRW owner among the alive
-/// members **excluding self**.
-///
-/// HRW ownership is a pure function of `(site, alive set)`, so removing this
-/// node from the set reconstructs exactly who owned the site immediately before
-/// this node joined (or before this node's score started counting). That makes
-/// the previous owner derivable with no extra state and identically on every
-/// node. `None` when this node is the only member.
-fn previous_owner_of(nodes: &[NodeInfo], self_id: &str, site: &str) -> Option<NodeInfo> {
-    let others: Vec<NodeInfo> = nodes.iter().filter(|n| n.id != self_id).cloned().collect();
-    ephpm_cluster::hrw_owner(&others, site).cloned()
+/// The node-wide serving refusal for one scheme-watch check: `Some(peers)`
+/// while any alive peer is confirmed to run a different ownership-hash scheme,
+/// `None` once all agree.
+fn scheme_block_reason(confirmed: &[(String, Option<u32>)]) -> Option<String> {
+    (!confirmed.is_empty()).then(|| ephpm_cluster::describe_hrw_scheme_mismatches(confirmed))
 }
 
-/// Pull `site`'s data from its previous owner when this node has just become
-/// the owner of a site it holds nothing for.
+/// Aborts the task it holds when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Everything a per-site driver needs, cloned into each one by
+/// [`ensure_site_driver`].
+#[derive(Clone)]
+struct SiteDriverCtx {
+    cluster: Arc<ephpm_cluster::ClusterHandle>,
+    channel: ephpm_cluster::ChannelHandle,
+    channel_advertise: SocketAddr,
+    mgmt: SiteMgmtRegistry,
+    max_snapshot_bytes: u64,
+    /// The serving registry's handoff gate, armed by
+    /// [`start_clustered_per_site_turso`]; settled per site by
+    /// [`settle_site_serving`].
+    gate: Arc<HandoffGate>,
+    /// When the replication plane started. "No alive peer holds a copy" is
+    /// only trusted once [`HANDOFF_SETTLE_GRACE`] has passed since then.
+    plane_started: tokio::time::Instant,
+}
+
+/// How long after the replication plane starts before "no alive peer holds a
+/// copy of this site" is taken to mean the site is genuinely new.
 ///
-/// # Why this exists
+/// Right after boot the membership view holds only the peers gossip has found
+/// so far — possibly none — and a peer it has not found yet may hold the only
+/// copy. Concluding "new site" then would serve an empty database over data
+/// that exists. The same reasoning, and the same duration, as the election's
+/// startup grace (heartbeat + claim TTL).
+const HANDOFF_SETTLE_GRACE: Duration = Duration::from_secs(15);
+
+/// Bound on one handoff probe's dial and snapshot header — the part during
+/// which the peer produces its dump. A peer that does not answer within it is
+/// treated as unreachable (it may hold the data), not as holding no copy. The
+/// body that follows is not bounded by this.
+const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an unsettled site that this node does not own re-checks whether
+/// its copy has warmed up (a replica bootstrap) or ownership has moved here.
+/// One `sqlite_schema` count per tick, only while the site is unsettled.
+const HANDOFF_OWNERSHIP_RECHECK: Duration = Duration::from_secs(2);
+
+/// Log a still-blocked handoff at `WARN` again after this many retries with an
+/// unchanged reason (every change of reason is logged at once).
+const HANDOFF_BLOCKED_WARN_EVERY: u32 = 10;
+
+/// The alive peers that could hold a copy of `site`, in the order a cold new
+/// owner should ask them: HRW rank over the alive members **excluding self**.
 ///
-/// HRW re-homes a site whenever membership changes — a node merely *joining* is
-/// enough. Ownership is what decides who serves the site's writes and who ships
-/// its CDC, but ownership on its own moves no bytes: a node that becomes owner
-/// of a site it has never held would serve an empty database and ship an empty
-/// CDC log, while the node that actually has the data sits there as a replica
-/// with nothing to tail. The site's data is not lost (the replica refuses to
-/// discard it for a degenerate snapshot — see
-/// [`snapshot_may_replace_local_data`]), but the tenant sees an empty database
-/// and replication is stuck. This closes the loop: **an ownership move pulls
-/// the data with it.**
-///
-/// Best-effort by construction. It runs only when the local database is cold —
-/// so it can never overwrite anything — and any failure (no previous owner, an
-/// unreachable one, a previous owner that is itself empty because the site is
-/// genuinely new) is logged and the node carries on as the owner of an empty
-/// database, which is the correct outcome for a site nobody has data for.
-async fn take_ownership_handoff(
+/// The first entry is the node that owned the site before this one *under the
+/// current ownership hash* (HRW is a pure function of `(site, alive set)`), so
+/// in the ordinary case — a node joining, or a node dying and its sites moving
+/// to the next-ranked replica — the first probe finds the data. It is not
+/// enough on its own: after a change of ownership hash (v0.13.0's scheme 2,
+/// with a full-cluster restart) the node the new hash ranks second need not
+/// hold the site at all, while the node the *old* hash made its owner does.
+/// Asking every alive peer in rank order finds that copy wherever it is.
+fn handoff_candidates(nodes: &[NodeInfo], self_id: &str, site: &str) -> Vec<NodeInfo> {
+    let mut remaining: Vec<NodeInfo> = nodes
+        .iter()
+        .filter(|n| n.id != self_id && n.state == ephpm_cluster::NodeState::Alive)
+        .cloned()
+        .collect();
+    let mut ranked = Vec::with_capacity(remaining.len());
+    // Repeatedly take the HRW winner of what is left: the canonical scoring and
+    // tie-break, with no second implementation of either.
+    while let Some(winner) = ephpm_cluster::hrw_owner(&remaining, site).map(|n| n.id.clone()) {
+        let Some(idx) = remaining.iter().position(|n| n.id == winner) else { break };
+        ranked.push(remaining.swap_remove(idx));
+    }
+    ranked
+}
+
+/// One peer's answer to a handoff probe.
+enum PeerProbe {
+    /// The peer sent a snapshot that declares at least one table.
+    Data { header: SnapshotHeader, dump: String, received: u64 },
+    /// The peer holds no copy: an explicit `no_copy` answer, or (from an older
+    /// node, or a node whose copy is still cold) a dump with no tables.
+    NoCopy,
+    /// No usable answer — the peer may hold the data. Carries the reason.
+    Unreachable(String),
+}
+
+/// Ask the peer at `addr` for its copy of `site`.
+async fn probe_peer(
+    addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
     site: &str,
+) -> PeerProbe {
+    let stream_type = snapshot_stream_type(site);
+    let opened =
+        tokio::time::timeout(HANDOFF_PROBE_TIMEOUT, open_snapshot(addr, channel, &stream_type))
+            .await;
+    let (mut stream, header) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => return PeerProbe::Unreachable(format!("{e:#}")),
+        Err(_) => {
+            return PeerProbe::Unreachable(format!(
+                "no snapshot header within {}s",
+                HANDOFF_PROBE_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    if header.no_copy {
+        return PeerProbe::NoCopy;
+    }
+    match read_snapshot_body(&mut stream, &header, max_snapshot_bytes).await {
+        Ok((dump, received)) if snapshot_declares_a_table(&dump) => {
+            PeerProbe::Data { header, dump, received }
+        }
+        Ok(_) => PeerProbe::NoCopy,
+        Err(e) => PeerProbe::Unreachable(format!("{e:#}")),
+    }
+}
+
+/// The outcome of asking the candidates in turn.
+struct PeerSearch {
+    /// The first peer (in candidate order) that answered with data, and what
+    /// it sent.
+    found: Option<(NodeInfo, SnapshotHeader, String, u64)>,
+    /// `(peer id, reason)` for every peer asked that gave no usable answer.
+    unreachable: Vec<(String, String)>,
+}
+
+/// Ask `candidates` in order until one answers with data.
+///
+/// Generic over the probe so the search order and its stopping rule are
+/// unit-testable without a cluster.
+async fn search_peers_for_copy<F, Fut>(candidates: &[NodeInfo], mut probe: F) -> PeerSearch
+where
+    F: FnMut(&NodeInfo) -> Fut,
+    Fut: std::future::Future<Output = PeerProbe>,
+{
+    let mut unreachable = Vec::new();
+    for peer in candidates {
+        match probe(peer).await {
+            PeerProbe::Data { header, dump, received } => {
+                return PeerSearch {
+                    found: Some((peer.clone(), header, dump, received)),
+                    unreachable,
+                };
+            }
+            PeerProbe::NoCopy => {}
+            PeerProbe::Unreachable(reason) => unreachable.push((peer.id.clone(), reason)),
+        }
+    }
+    PeerSearch { found: None, unreachable }
+}
+
+/// What a cold owner does when no peer answered with data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffVerdict {
+    /// Every alive peer answered that it holds no copy, and membership has had
+    /// time to converge: the site is genuinely new. Serve it empty.
+    NewSite,
+    /// Every peer known so far holds no copy, but it is too soon after startup
+    /// to trust that the membership view is complete. Wait and ask again.
+    AwaitMembership,
+    /// At least one peer could not answer, and it may hold the data. Refuse to
+    /// serve, and retry.
+    Blocked,
+}
+
+/// Decide a cold owner's next step once no peer has answered with data.
+///
+/// The asymmetry is deliberate. Serving an empty database while a copy may
+/// exist does not fail anywhere: the tenant's first write lands on the empty
+/// copy, makes it "warm", and from then on the site has two histories and no
+/// later step reconciles them. Refusing fails loudly and costs only the
+/// unreachable peer's downtime. So only a complete set of negative answers —
+/// from a membership view old enough to trust — licenses serving empty.
+fn handoff_verdict(unreachable: usize, past_grace: bool) -> HandoffVerdict {
+    if unreachable > 0 {
+        HandoffVerdict::Blocked
+    } else if past_grace {
+        HandoffVerdict::NewSite
+    } else {
+        HandoffVerdict::AwaitMembership
+    }
+}
+
+/// One settle attempt's result.
+enum SettleRound {
+    /// The site may be served from this node's copy.
+    Settled,
+    /// This node's copy is cold but it does not own the site; nothing to
+    /// settle until one of those changes.
+    NotOwner,
+    /// Too soon after startup to conclude "new site"; ask again after the wait.
+    AwaitMembership(Duration),
+    /// Cannot settle now; the reason is what a refused request is told.
+    Blocked(String),
+}
+
+/// Settle `site`'s serving-gate state, then return. Runs alongside the site's
+/// replication driver (see [`crate::handoff_gate`] for why the gate exists).
+///
+/// # The rule
+///
+/// A site may be served from this node's database once:
+///
+/// - the local copy holds data (a warm restart, a replica that bootstrapped, a
+///   node that created the site), or
+/// - this node owns the site by live HRW, its copy is cold, and a peer's copy
+///   has been pulled into it — the peers are asked in HRW rank order
+///   ([`handoff_candidates`]), every alive one if need be, and the first that
+///   answers with a dump declaring a table wins; or
+/// - every alive peer answered that it holds no copy, from a membership view
+///   at least [`HANDOFF_SETTLE_GRACE`] old: the site is genuinely new and
+///   starts empty.
+///
+/// If some peer could not answer, the site stays unserved
+/// ([`SiteServeState::Blocked`] — requests refused with the reason, `WARN`
+/// logged, `ephpm_cdc_bootstrap_total{outcome="handoff_blocked"}` counted)
+/// and the round is retried with backoff. See [`handoff_verdict`] for why
+/// refusing beats serving empty.
+///
+/// # Safety of the pull
+///
+/// The copy is installed with the same fetch → vet → apply order as every
+/// other bootstrap, onto a copy re-checked cold **inside** the install scope
+/// and under the site's seed lock ([`SiteMgmt::seed`]), so it can never land
+/// on data: nothing else writes a cold, unsettled copy (the serving path is
+/// gated, and the replica bootstrap takes the same lock). Members gossip does
+/// not report alive are not asked and not waited for — HRW already treats
+/// them as gone.
+async fn settle_site_serving(
+    site: String,
+    cluster: Arc<ephpm_cluster::ClusterHandle>,
+    channel: ephpm_cluster::ChannelHandle,
+    site_mgmt: Arc<SiteMgmt>,
+    gate: Arc<HandoffGate>,
+    max_snapshot_bytes: u64,
+    plane_started: tokio::time::Instant,
+) {
+    let self_id = cluster.self_node().id;
+    let mut conn: Option<turso::Connection> = None;
+    let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
+    let mut blocked_rounds: u32 = 0;
+    let mut last_reason: Option<String> = None;
+    loop {
+        if drivers_shutdown().is_cancelled() {
+            return;
+        }
+        let round_started = tokio::time::Instant::now();
+        let round = match conn.as_ref() {
+            Some(c) => {
+                settle_round(
+                    &site,
+                    &self_id,
+                    &cluster,
+                    &channel,
+                    &site_mgmt,
+                    c,
+                    max_snapshot_bytes,
+                    plane_started.elapsed() >= HANDOFF_SETTLE_GRACE,
+                )
+                .await
+            }
+            None => match site_mgmt.factory.raw_connection() {
+                Ok(c) => {
+                    conn = Some(c);
+                    continue;
+                }
+                Err(e) => SettleRound::Blocked(format!("cannot open the local database: {e:#}")),
+            },
+        };
+        let delay = match round {
+            SettleRound::Settled => {
+                if blocked_rounds > 0 {
+                    tracing::info!(
+                        site = %site,
+                        retries = blocked_rounds,
+                        "ownership handoff unblocked; serving the site"
+                    );
+                }
+                gate.set(&site, SiteServeState::Ready);
+                return;
+            }
+            SettleRound::NotOwner => {
+                gate.set(&site, SiteServeState::Pending);
+                backoff.reset();
+                blocked_rounds = 0;
+                last_reason = None;
+                HANDOFF_OWNERSHIP_RECHECK
+            }
+            SettleRound::AwaitMembership(wait) => {
+                gate.set(&site, SiteServeState::Pending);
+                wait
+            }
+            SettleRound::Blocked(reason) => {
+                blocked_rounds = blocked_rounds.saturating_add(1);
+                cdc_metrics::record_bootstrap("handoff_blocked");
+                if last_reason.as_deref() != Some(reason.as_str())
+                    || blocked_rounds.is_multiple_of(HANDOFF_BLOCKED_WARN_EVERY)
+                {
+                    tracing::warn!(
+                        site = %site,
+                        retries = blocked_rounds,
+                        "ownership handoff blocked: this node owns the site but holds no copy of \
+                         its data, and a peer that may hold it did not answer; refusing to serve \
+                         the site (an empty copy would fork its data) and retrying: {reason}"
+                    );
+                } else {
+                    tracing::debug!(site = %site, retries = blocked_rounds, "ownership handoff still blocked: {reason}");
+                }
+                gate.set(&site, SiteServeState::Blocked(reason.clone()));
+                last_reason = Some(reason);
+                backoff.record_attempt(round_started.elapsed());
+                backoff.next_delay()
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = drivers_shutdown().cancelled() => return,
+        }
+    }
+}
+
+/// One attempt of [`settle_site_serving`].
+#[allow(clippy::too_many_arguments)]
+async fn settle_round(
+    site: &str,
+    self_id: &str,
     cluster: &ephpm_cluster::ClusterHandle,
     channel: &ephpm_cluster::ChannelHandle,
-    factory: &Turso,
+    site_mgmt: &SiteMgmt,
+    conn: &turso::Connection,
     max_snapshot_bytes: u64,
-) {
-    let conn = match factory.raw_connection() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(site = %site, "ownership handoff: cannot open a connection: {e:#}");
-            return;
-        }
-    };
+    past_grace: bool,
+) -> SettleRound {
+    let factory = &*site_mgmt.factory;
     let cold = {
         let _permit = factory.wal_gate_permit().await;
-        off_runtime(local_db_is_cold(&conn)).await
+        off_runtime(local_db_is_cold(conn)).await
     };
     match cold {
-        // Not cold: we already hold this site's data, nothing to pull.
-        Ok(false) => return,
+        Ok(false) => return SettleRound::Settled,
         Ok(true) => {}
-        Err(e) => {
-            tracing::warn!(site = %site, "ownership handoff: cold-start check failed: {e:#}");
-            return;
-        }
+        Err(e) => return SettleRound::Blocked(format!("cold-start check failed: {e:#}")),
     }
 
     let nodes = cluster.nodes().await;
-    let self_id = cluster.self_node().id;
-    let Some(previous) = previous_owner_of(&nodes, &self_id, site) else {
-        // Sole member: nobody could have held the site before us.
-        return;
-    };
-    let Some(addr) = crate::sql_forward::member_channel_addr(&previous) else {
-        tracing::warn!(
-            site = %site,
-            previous_owner = %previous.id,
-            "ownership handoff: the previous owner's gossip address is unusable; \
-             serving this site from an empty local database"
-        );
-        return;
-    };
+    if ephpm_cluster::hrw_owner(&nodes, site).is_none_or(|owner| owner.id != self_id) {
+        return SettleRound::NotOwner;
+    }
 
-    tracing::info!(
-        site = %site,
-        previous_owner = %previous.id,
-        %addr,
-        "ownership handoff: this node now owns a site it holds no data for; pulling a \
-         snapshot from the previous owner before serving it"
-    );
-    match bootstrap_site_from(
-        factory,
-        &conn,
-        site,
-        addr,
-        channel,
-        max_snapshot_bytes,
-        // Cold by the check above, so there is nothing to discard — and
-        // passing `false` also means a degenerate snapshot is accepted here,
-        // which is correct: an empty dump onto an empty database is a no-op.
-        false,
-        &snapshot_stream_type(site),
-    )
-    .await
-    {
-        Ok(watermark) => tracing::info!(
-            site = %site,
-            previous_owner = %previous.id,
-            watermark,
-            "ownership handoff complete; this node now serves the site's own data"
-        ),
-        Err(e) => tracing::warn!(
-            site = %site,
-            previous_owner = %previous.id,
-            "ownership handoff failed; serving this site from an empty local database until \
-             the previous owner is reachable or ownership moves back: {e:#}"
+    let candidates = handoff_candidates(&nodes, self_id, site);
+    let search = search_peers_for_copy(&candidates, |peer| {
+        let addr = crate::sql_forward::member_channel_addr(peer);
+        async move {
+            match addr {
+                Some(addr) => probe_peer(addr, channel, max_snapshot_bytes, site).await,
+                None => PeerProbe::Unreachable("its gossip address is unusable".to_string()),
+            }
+        }
+    })
+    .await;
+
+    if let Some((peer, header, dump, received)) = search.found {
+        let started = std::time::Instant::now();
+        let installed = {
+            let _seed = site_mgmt.seed.lock().await;
+            let _permit = factory.wal_gate_permit().await;
+            off_runtime(async {
+                // Re-checked inside the scope: a replica bootstrap may have
+                // seeded the copy while the snapshot was in flight.
+                if !local_db_is_cold(conn).await? {
+                    return anyhow::Ok(false);
+                }
+                install_snapshot(conn, &header, &dump, false).await?;
+                Ok(true)
+            })
+            .await
+        };
+        return match installed {
+            Ok(true) => {
+                cdc_metrics::record_snapshot_received(received, started.elapsed());
+                cdc_metrics::record_bootstrap("handoff_ok");
+                tracing::info!(
+                    site = %site,
+                    source = %peer.id,
+                    watermark = header.watermark,
+                    source_rank = candidates.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
+                    "ownership handoff complete: pulled the site's data from a peer before serving it"
+                );
+                SettleRound::Settled
+            }
+            Ok(false) => SettleRound::Settled,
+            Err(e) => {
+                SettleRound::Blocked(format!("installing the copy from {} failed: {e:#}", peer.id))
+            }
+        };
+    }
+
+    match handoff_verdict(search.unreachable.len(), past_grace) {
+        HandoffVerdict::NewSite => {
+            cdc_metrics::record_bootstrap("handoff_new");
+            tracing::info!(
+                site = %site,
+                peers_asked = candidates.len(),
+                "ownership handoff: no alive peer holds a copy of this site; it is new and starts \
+                 from an empty database"
+            );
+            SettleRound::Settled
+        }
+        HandoffVerdict::AwaitMembership => SettleRound::AwaitMembership(HANDOFF_OWNERSHIP_RECHECK),
+        HandoffVerdict::Blocked => SettleRound::Blocked(
+            search
+                .unreachable
+                .iter()
+                .map(|(id, reason)| format!("peer {id}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; "),
         ),
     }
 }
@@ -3777,34 +4225,41 @@ async fn replicate_site_once(
     site: &str,
     owner: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
-    factory: &Turso,
-    own_log_id: &str,
+    site_mgmt: &SiteMgmt,
     max_snapshot_bytes: u64,
     force_reset: bool,
 ) -> anyhow::Result<()> {
+    let factory = &*site_mgmt.factory;
     let conn = factory.raw_connection().context("per-site replica: open apply connection")?;
 
-    let lineage = {
-        let _permit = factory.wal_gate_permit().await;
-        off_runtime(site_data_lineage(&conn, own_log_id)).await?
-    };
-    if let ReplicaAction::Bootstrap { discard_local } =
-        plan_replica_attempt(force_reset, lineage.as_deref())
     {
-        let bconn =
-            factory.raw_connection().context("per-site replica: open snapshot connection")?;
-        bootstrap_site_from(
-            factory,
-            &bconn,
-            site,
-            owner,
-            channel,
-            max_snapshot_bytes,
-            discard_local,
-            &snapshot_stream_type(site),
-        )
-        .await
-        .with_context(|| format!("per-site snapshot bootstrap for {site}"))?;
+        // Decide and seed under the seed lock, so an ownership handoff running
+        // concurrently cannot seed the same cold copy in between (see
+        // `SiteMgmt::seed`). Released before the tail, which runs for as long
+        // as the stream stays up.
+        let _seed = site_mgmt.seed.lock().await;
+        let lineage = {
+            let _permit = factory.wal_gate_permit().await;
+            off_runtime(site_data_lineage(&conn, &site_mgmt.log_id)).await?
+        };
+        if let ReplicaAction::Bootstrap { discard_local } =
+            plan_replica_attempt(force_reset, lineage.as_deref())
+        {
+            let bconn =
+                factory.raw_connection().context("per-site replica: open snapshot connection")?;
+            bootstrap_site_from(
+                factory,
+                &bconn,
+                site,
+                owner,
+                channel,
+                max_snapshot_bytes,
+                discard_local,
+                &snapshot_stream_type(site),
+            )
+            .await
+            .with_context(|| format!("per-site snapshot bootstrap for {site}"))?;
+        }
     }
 
     let mut stream = channel
@@ -3834,6 +4289,13 @@ async fn bootstrap_site_from(
     let started = std::time::Instant::now();
     let (header, dump, received) =
         fetch_snapshot(source, channel, max_snapshot_bytes, snapshot_stream).await?;
+    // A `no_copy` answer carries no log identity to record as this copy's
+    // lineage; there is nothing to seed from yet, so retry later.
+    anyhow::ensure!(
+        !header.no_copy,
+        "{source} holds no copy of site {site} yet (it has not opened the site's database); \
+         retrying"
+    );
     // Fetched outside the permit (a network wait); installed inside it (raw
     // connection, no busy timeout — see `subscribe_and_consume`).
     {
@@ -4144,8 +4606,12 @@ mod tests {
     async fn snapshot_codec_header_chunks_end_marker_roundtrip() {
         let (mut client, mut server) = tokio::io::duplex(1 << 20);
 
-        let header =
-            SnapshotHeader { watermark: 42, total_len: 11, log_id: "snap-log-id".to_string() };
+        let header = SnapshotHeader {
+            watermark: 42,
+            total_len: 11,
+            log_id: "snap-log-id".to_string(),
+            no_copy: false,
+        };
         let chunk_a = b"hello ".to_vec();
         let chunk_b = b"world".to_vec();
 
@@ -4609,7 +5075,12 @@ mod tests {
         conn.execute("INSERT INTO posts (title) VALUES ('irreplaceable')", ()).await.unwrap();
 
         // What a node that has never held the site serves: a valid, empty dump.
-        let header = SnapshotHeader { watermark: 0, total_len: 0, log_id: "peer-log".into() };
+        let header = SnapshotHeader {
+            watermark: 0,
+            total_len: 0,
+            log_id: "peer-log".into(),
+            no_copy: false,
+        };
         assert!(
             validate_snapshot_dump("").is_ok(),
             "precondition: an empty dump passes the statement allowlist — which is exactly \
@@ -4671,45 +5142,233 @@ mod tests {
         assert!(snapshot_may_replace_local_data("", false).is_ok());
     }
 
-    /// The previous owner of a site is HRW over the alive set *without this
-    /// node* — derivable identically on every node with no extra state, which
-    /// is what lets an ownership move pull the data with it.
-    #[test]
-    fn previous_owner_is_hrw_without_self() {
-        let node = |id: &str, ip: &str| {
-            ephpm_cluster::NodeInfo::new(id, format!("{ip}:7946"), ephpm_cluster::NodeState::Alive)
-        };
-        let before = [node("ephpm-0", "10.0.0.1"), node("ephpm-1", "10.0.0.2")];
-        let after =
-            [node("ephpm-0", "10.0.0.1"), node("ephpm-1", "10.0.0.2"), node("ephpm-2", "10.0.0.3")];
+    fn alive(id: &str, ip: &str) -> ephpm_cluster::NodeInfo {
+        ephpm_cluster::NodeInfo::new(id, format!("{ip}:7946"), ephpm_cluster::NodeState::Alive)
+    }
 
-        // Find a site the joiner takes over — the case the handoff exists for.
+    /// The handoff asks the previous owner first — HRW over the alive set
+    /// *without this node*, derivable identically on every node with no extra
+    /// state — and then every other alive peer in rank order, never itself and
+    /// never a member gossip does not report alive.
+    #[test]
+    fn handoff_candidates_rank_every_alive_peer_previous_owner_first() {
+        let before = [alive("ephpm-0", "10.0.0.1"), alive("ephpm-1", "10.0.0.2")];
+        let mut after = vec![
+            alive("ephpm-0", "10.0.0.1"),
+            alive("ephpm-1", "10.0.0.2"),
+            alive("ephpm-2", "10.0.0.3"),
+            alive("ephpm-3", "10.0.0.4"),
+        ];
+        after.push(ephpm_cluster::NodeInfo::new(
+            "ephpm-dead",
+            "10.0.0.9:7946",
+            ephpm_cluster::NodeState::Dead,
+        ));
+
+        // A site the joiner takes over — the case the handoff exists for.
         let moved = (0..500)
             .map(|i| format!("site-{i:03}"))
-            .find(|s| {
-                ephpm_cluster::hrw_owner(&after, s).unwrap().id == "ephpm-2"
-                    && ephpm_cluster::hrw_owner(&before, s).is_some()
-            })
-            .expect("some site must land on the joining node");
+            .find(|s| ephpm_cluster::hrw_owner(&after, s).unwrap().id == "ephpm-2")
+            .expect("some site must land on ephpm-2");
 
+        let ranked = handoff_candidates(&after, "ephpm-2", &moved);
+        let ids: Vec<&str> = ranked.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "every alive peer, minus self and the dead member: {ids:?}");
+        assert!(!ids.contains(&"ephpm-2") && !ids.contains(&"ephpm-dead"), "{ids:?}");
+
+        // Rank 1 is exactly HRW over the alive set excluding the new owner...
+        let others: Vec<_> = after.iter().filter(|n| n.id != "ephpm-2").cloned().collect();
+        assert_eq!(ids[0], ephpm_cluster::hrw_owner(&others, &moved).unwrap().id);
+        // ...and each later rank is HRW over what is left.
+        let rest: Vec<_> = others.iter().filter(|n| n.id != ids[0]).cloned().collect();
+        assert_eq!(ids[1], ephpm_cluster::hrw_owner(&rest, &moved).unwrap().id);
+
+        // In the ordinary join case the old owner is among them (a join moves
+        // a site only to the joiner, so the old owner is HRW of the old set).
         let old = ephpm_cluster::hrw_owner(&before, &moved).unwrap().id.clone();
-        let previous = previous_owner_of(&after, "ephpm-2", &moved).unwrap();
+        assert!(ids.contains(&old.as_str()));
+
+        // A probed peer's channel address is derived from gossip membership,
+        // never from an attacker-shapeable claim.
         assert_eq!(
-            previous.id, old,
-            "the previous owner is exactly HRW over the set excluding the new owner"
-        );
-        // Its channel address is derived from gossip membership, never from an
-        // attacker-shapeable claim.
-        assert_eq!(
-            crate::sql_forward::member_channel_addr(&previous),
+            crate::sql_forward::member_channel_addr(&ranked[0]),
             Some(
-                format!("{}:7948", previous.gossip_addr.split(':').next().unwrap())
+                format!("{}:7948", ranked[0].gossip_addr.split(':').next().unwrap())
                     .parse()
                     .unwrap()
             )
         );
-        // A sole member has no previous owner.
-        assert!(previous_owner_of(&before[..1], "ephpm-0", &moved).is_none());
+
+        // A sole member has nobody to ask.
+        assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
+    }
+
+    /// **Mixed-scheme cluster fails closed.** A confirmed peer on another
+    /// ownership-hash scheme (a pre-v0.13.0 node advertises none) refuses
+    /// owner-serving of every site, settled ones included; once every peer
+    /// agrees, serving resumes without a restart.
+    #[tokio::test]
+    async fn a_mixed_scheme_cluster_refuses_owner_serving_until_all_agree() {
+        let gate = HandoffGate::default();
+        gate.arm();
+        gate.set("shop.test", SiteServeState::Ready);
+        let mut debounce = ephpm_cluster::HrwSchemeDebounce::default();
+        let legacy = vec![("ephpm-old".to_string(), None)];
+
+        // First sighting (a node whose gossip is still propagating): no flap.
+        gate.set_scheme_block(scheme_block_reason(&debounce.observe(&legacy)));
+        gate.wait_serveable("shop.test", Duration::ZERO).await.expect("not yet confirmed");
+
+        // Confirmed on the second check: refused, naming the peer.
+        gate.set_scheme_block(scheme_block_reason(&debounce.observe(&legacy)));
+        let err = gate.wait_serveable("shop.test", Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.contains("ephpm-old") && err.contains("pre-v0.13.0"), "{err}");
+
+        // The old node is upgraded (or leaves): serving resumes.
+        gate.set_scheme_block(scheme_block_reason(&debounce.observe(&[])));
+        gate.wait_serveable("shop.test", Duration::ZERO).await.expect("all peers agree again");
+    }
+
+    fn data_probe(log_id: &str) -> PeerProbe {
+        PeerProbe::Data {
+            header: SnapshotHeader {
+                watermark: 7,
+                total_len: 0,
+                log_id: log_id.to_string(),
+                no_copy: false,
+            },
+            dump: "CREATE TABLE t (a);".to_string(),
+            received: 19,
+        }
+    }
+
+    /// **The v0.13.0 hash-change gap.** After an ownership-hash change the
+    /// node the new hash ranks second need not hold the site; the copy sits on
+    /// whichever node the old hash made its owner. The search must get past a
+    /// rank-2 "no copy" (and an unreachable peer) and take rank 3's data —
+    /// and stop there.
+    #[tokio::test]
+    async fn the_search_takes_the_first_peer_with_data_not_the_runner_up() {
+        let peers = [
+            alive("rank-2", "10.0.0.2"),
+            alive("rank-3", "10.0.0.3"),
+            alive("rank-4", "10.0.0.4"),
+            alive("rank-5", "10.0.0.5"),
+        ];
+        let mut asked = Vec::new();
+        let search = search_peers_for_copy(&peers, |peer| {
+            asked.push(peer.id.clone());
+            let answer = match peer.id.as_str() {
+                "rank-2" => PeerProbe::NoCopy,
+                "rank-3" => PeerProbe::Unreachable("connection refused".into()),
+                "rank-4" => data_probe("log-of-rank-4"),
+                _ => panic!("the search must stop at the first peer with data"),
+            };
+            async move { answer }
+        })
+        .await;
+
+        assert_eq!(asked, ["rank-2", "rank-3", "rank-4"]);
+        let (peer, header, dump, _) = search.found.expect("rank 4 holds the data");
+        assert_eq!(peer.id, "rank-4");
+        assert_eq!(header.log_id, "log-of-rank-4");
+        assert!(snapshot_declares_a_table(&dump));
+        assert_eq!(search.unreachable, [("rank-3".to_string(), "connection refused".to_string())]);
+    }
+
+    /// Nobody holds a copy: the search asks everyone and finds nothing; the
+    /// verdict then depends only on whether anyone failed to answer.
+    #[tokio::test]
+    async fn the_search_asks_every_peer_when_none_has_data() {
+        let peers = [alive("a", "10.0.0.2"), alive("b", "10.0.0.3")];
+        let mut asked = 0;
+        let search = search_peers_for_copy(&peers, |_| {
+            asked += 1;
+            async { PeerProbe::NoCopy }
+        })
+        .await;
+        assert_eq!(asked, 2);
+        assert!(search.found.is_none() && search.unreachable.is_empty());
+    }
+
+    /// Serving empty is licensed only by a complete set of "no copy" answers
+    /// from a membership view old enough to trust; one silent peer blocks.
+    #[test]
+    fn handoff_verdict_never_serves_empty_past_a_silent_peer() {
+        assert_eq!(handoff_verdict(0, true), HandoffVerdict::NewSite);
+        assert_eq!(handoff_verdict(0, false), HandoffVerdict::AwaitMembership);
+        assert_eq!(handoff_verdict(1, true), HandoffVerdict::Blocked);
+        assert_eq!(handoff_verdict(3, false), HandoffVerdict::Blocked);
+    }
+
+    /// `no_copy` is wire-compatible in both directions: a normal header omits
+    /// it (byte-identical to an older node's), an older node's header parses
+    /// with it `false`, and an older receiver ignores it.
+    #[test]
+    fn the_no_copy_flag_is_compatible_with_older_peers() {
+        #[derive(Serialize, Deserialize)]
+        struct OldSnapshotHeader {
+            watermark: i64,
+            total_len: u64,
+            log_id: String,
+        }
+        let normal =
+            SnapshotHeader { watermark: 3, total_len: 9, log_id: "l".into(), no_copy: false };
+        let json = serde_json::to_string(&normal).unwrap();
+        assert!(!json.contains("no_copy"), "{json}");
+
+        let old = serde_json::to_vec(&OldSnapshotHeader {
+            watermark: 3,
+            total_len: 9,
+            log_id: "l".into(),
+        })
+        .unwrap();
+        let parsed: SnapshotHeader = serde_json::from_slice(&old).unwrap();
+        assert!(!parsed.no_copy);
+
+        let refusal =
+            SnapshotHeader { watermark: 0, total_len: 0, log_id: String::new(), no_copy: true };
+        let parsed_by_old: OldSnapshotHeader =
+            serde_json::from_slice(&serde_json::to_vec(&refusal).unwrap()).unwrap();
+        assert_eq!(parsed_by_old.total_len, 0, "an older receiver sees an empty dump");
+    }
+
+    /// **A peer asked for a site it never held must not create its database.**
+    /// Opening a Turso factory creates the file, so the snapshot handler asks
+    /// the registry for an *existing* copy only and answers "no copy" — which
+    /// reads back as a `no_copy` header followed straight by the end marker.
+    #[tokio::test]
+    async fn answering_a_snapshot_for_an_unknown_site_creates_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SiteMgmtRegistry::new(dir.path().to_path_buf());
+        let site = "never-held.test";
+        let path = dir.path().join(format!("{site}.db"));
+
+        assert!(registry.existing(site).await.unwrap().is_none());
+        assert!(!path.exists(), "asking about an unknown site must not create its database");
+
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        serve_no_copy(&mut server).await.unwrap();
+        let header = read_snapshot_header(&mut client).await.unwrap();
+        assert!(header.no_copy);
+        let (dump, received) = read_snapshot_body(&mut client, &header, 1 << 20).await.unwrap();
+        assert!(dump.is_empty() && received == 0);
+        assert!(!path.exists());
+
+        // A site this node does hold is served as before.
+        {
+            let t = Turso::open(path.to_str().unwrap()).await.unwrap();
+            let conn = t.raw_connection().unwrap();
+            conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY)", ()).await.unwrap();
+        }
+        let held = registry.existing(site).await.unwrap().expect("an on-disk site is held");
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        serve_snapshot_inner(&mut server, &held.factory, &held.log_id).await.unwrap();
+        let header = read_snapshot_header(&mut client).await.unwrap();
+        assert!(!header.no_copy);
+        assert_eq!(header.log_id, held.log_id);
+        let (dump, _) = read_snapshot_body(&mut client, &header, 1 << 20).await.unwrap();
+        assert!(snapshot_declares_a_table(&dump), "{dump}");
     }
 
     #[test]

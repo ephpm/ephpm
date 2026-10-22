@@ -305,7 +305,8 @@ every healthy node. See
 [`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only)
 for the ownership-move rules. Every node must use the same ownership hash: v0.13.0
 changed it, so a per-site cluster upgrades to v0.13.0 with a full-cluster restart
-(see [Clustering setup](/guides/clustering-setup/)).
+(see [Clustering setup](/guides/clustering-setup/)). While a peer runs a different
+scheme, a v0.13.0 node refuses to serve any site as its owner.
 
 Full detail on the engine, including its Beta-upstream limits and file-format
 compatibility, is in [Database engines](/architecture/database/engines/).
