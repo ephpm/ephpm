@@ -573,26 +573,47 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
     // Peer warm-up: pull this node's share of large KV values from its
-    // peers before accepting a request — a join wait of up to 10 s for
-    // gossip to list a peer (not shortened by `load_timeout`, since
-    // `peers == 0` is what lets the snapshot be restored), then the
-    // transfer bounded by `load_timeout`. The
-    // listeners are already bound, so connections queue in the backlog (a
-    // readiness probe sees "not yet", not "refused") and the pull can never
-    // hold startup past the deadline.
-    if let Some(handoff) = &kv_handoff {
+    // peers — a join wait of up to 10 s for gossip to list a peer (not
+    // shortened by `load_timeout`, since `peers == 0` is what lets the
+    // snapshot be restored), then the transfer bounded by `load_timeout`.
+    // It runs *concurrently with the accept loop*, not before it: holding
+    // the first request back for the ~2 s the transfer takes roughly
+    // doubled the node's downtime per restart, and the lab measured
+    // 1.3–1.7x the small-tier stale reads of a plain restart from that
+    // alone (the gossip tier's own catch-up is what goes stale; longer
+    // downtime widens it). Serving during the pull is safe by
+    // construction: every pulled entry lands through the stamped-write
+    // path, so a request racing the pull sees a miss — never an older
+    // value — exactly what a node with handoff off would serve.
+    let warm_up = kv_handoff.as_ref().map(|handoff| {
+        let handoff = Arc::clone(handoff);
+        let snapshot = kv_snapshot.clone();
         let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
-        let report = handoff.pull(deadline, !config.cluster.join.is_empty()).await;
-        kv_snapshot::record_handoff("in", &report);
-        // Alone (no alive peer within the join wait): the snapshot is the
-        // only copy there is, so restore it. With peers present nothing is
-        // restored from it — gossip and the pull are the sources.
-        if let Some(svc) = &kv_snapshot {
-            svc.load_after_pull(report.peers).await;
-        }
-    }
+        let expect_peers = !config.cluster.join.is_empty();
+        tokio::spawn(async move {
+            let report = handoff.pull(deadline, expect_peers).await;
+            kv_snapshot::record_handoff("in", &report);
+            // Alone (no alive peer within the join wait): the snapshot is
+            // the only copy there is, so restore it. With peers present
+            // nothing is restored from it — gossip and the pull are the
+            // sources.
+            if let Some(svc) = &snapshot {
+                svc.load_after_pull(report.peers).await;
+            }
+        })
+    });
 
     let served = accept_loop(listeners).await;
+
+    // A drain that begins before the warm-up finished: abandon the pull
+    // rather than push while still pulling (both walk the same stores and
+    // the peers are about to take over this node's slots anyway).
+    if let Some(warm_up) = warm_up
+        && !warm_up.is_finished()
+    {
+        warm_up.abort();
+        tracing::info!("shutdown began before the KV warm-up pull finished; pull abandoned");
+    }
 
     // Requests are drained. Hand this node's large KV values to the peers
     // that take over their replica slots — while gossip still lists this

@@ -250,15 +250,26 @@ rebalances them afterwards. A restart used to expose two gaps:
 **Push on drain** closes (1): after the HTTP drain, A walks its large
 values and sends each one to the nodes that form the key's replica set
 *without A*, as stamped SETs over the data plane (`OP_SET_V2`, the same
-path a replica write takes). **Pull on start** closes (2): before serving,
-the returning node asks every alive peer for its share (`OP_SHARE`). The
-peer walks its own large values and streams back the ones whose replica
-set — computed over the peer's alive view **with the requester forced in**
-— includes the requester; forcing the requester in makes the answer
-independent of gossip timing. A share streams one value per message (one
-sealed frame when the cluster secret is set), fed from a bounded queue by a
-blocking-thread walk that holds no shard lock while the socket is slow, so
-a share of any size is bounded by a few values in flight on both ends. The
+path a replica write takes). **Pull on start** closes (2): as soon as
+gossip lists a peer (up to a 10 s join wait), the returning node asks every
+alive peer for its share (`OP_SHARE`), **while already serving** — the
+pull runs beside the accept loop, not before it. Holding the first request
+back for the ~2 s the transfer takes was measured to make things worse:
+it doubled the node's downtime per restart, and the gossip tier's own
+catch-up window (see below) widened with it to 1.3–1.7× the stale reads of
+a plain restart. Serving during the pull is safe because every pulled
+entry lands through the stamped-write path: a request racing the pull sees
+a miss, never an older value, which is exactly what a node without handoff
+serves. The peer walks its own large values and streams back the ones
+whose replica set — computed over the peer's alive view **with the
+requester forced in** — includes the requester, and only keys the peer
+holds as a *current replica* (a leftover copy from an earlier membership
+is never forwarded; it could be stale). Forcing the requester in makes the
+answer independent of gossip timing. A share streams batches of entries
+(~256 KiB per message, one sealed frame each when the cluster secret is
+set), fed from a bounded queue by a blocking-thread walk that holds no
+shard lock while the socket is slow, so a share of any size is bounded by
+a few batches in flight on both ends; the puller asks all peers at once. The
 walk itself copies each shard's entries under its read lock and visits them
 after, like the snapshot writer. Both directions are bounded by
 `load_timeout`; whatever was sent or received before the deadline stays.

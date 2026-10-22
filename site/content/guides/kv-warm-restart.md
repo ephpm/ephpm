@@ -270,10 +270,12 @@ A rolling deploy of a 3-node StatefulSet therefore looks like this:
    `web-0`/`web-1` (seconds, logged as `KV handoff to peers done
    keys=… bytes=…`), writes its local/object snapshot if one is configured,
    and exits.
-2. `web-2` restarts, joins gossip, pulls its share of large values from
-   `web-0` and `web-1` (`KV warm-up pull from peers done`), then opens for
-   traffic. Readiness is not reported until the pull finishes or
-   `load_timeout` passes.
+2. `web-2` restarts, opens for traffic at once, and in the background
+   joins gossip and pulls its share of large values from `web-0` and
+   `web-1` (`KV warm-up pull from peers done`, typically a couple of
+   seconds). A request that arrives before its key has been pulled is a
+   miss, not a stale hit. Readiness is reported when the listeners are
+   bound, as without handoff.
 3. Repeat for `web-1`, then `web-0`.
 
 The transfer in both directions is bounded by `load_timeout` (default
