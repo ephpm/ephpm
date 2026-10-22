@@ -38,8 +38,8 @@ engine, which is what v0.7.0 ships:
 
 | Before v0.7.0 | With the Turso engine (v0.7.0) |
 |---|---|
-| SQLite C via FFI, blocking calls on tokio's pool | Rust-native engine, native async I/O |
-| Single writer; per-connection WAL + busy_timeout | MVCC concurrent writes |
+| SQLite C via FFI, blocking calls on tokio's pool | Rust-native engine with an `async` API; its I/O still runs as blocking calls inside each poll |
+| Single writer; per-connection WAL + busy_timeout | Unchanged: single writer, WAL, 5 s busy timeout. Turso's experimental MVCC mode is not enabled, and the tenant SQL screen refuses `PRAGMA journal_mode` assignments that would switch to it |
 | Clustering via the sqld **sidecar** (child process, health checks, binary extraction) | **In-process CDC** feeding ePHPm's own replication layer — no sidecar at all |
 
 The last row is the strategic one. ePHPm already owns gossip membership,

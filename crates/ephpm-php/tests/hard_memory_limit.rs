@@ -78,8 +78,12 @@ fn run_on_fresh_thread(name: &'static str, body: &'static str) -> Result<PhpResp
     run_on_fresh_thread_with_ini(name, body, &[])
 }
 
-/// [`run_on_fresh_thread`] with per-request INI overrides applied the way the
-/// router applies a site's `ini_overrides` (`PhpRuntime::set_request_ini`).
+/// [`run_on_fresh_thread`] with per-request INI values set through
+/// `PhpRuntime::set_request_ini` — the `PHP_INI_SYSTEM`-stage channel the
+/// router uses for its derived per-vhost keys (`open_basedir`, temp/session
+/// dirs, `auto_prepend_file`). No operator config reaches it with other keys;
+/// here it stands in for an operator-level setting (php.ini /
+/// `[php] ini_overrides`) without restarting the engine.
 fn run_on_fresh_thread_with_ini(
     name: &'static str,
     body: &'static str,
@@ -168,9 +172,9 @@ fn hard_limit_in_a_shutdown_function_is_contained() {
     assert_still_serving();
 }
 
-/// An operator lowering `memory_hard_limit_percent` to 100 (a site's
-/// `ini_overrides`) makes the hard limit equal the soft one — still one
-/// thread, not the process.
+/// `memory_hard_limit_percent` lowered to 100 (as an operator can with
+/// `[php] ini_overrides`; set here per request) makes the hard limit equal the
+/// soft one — still one thread, not the process.
 #[cfg(php_hard_memory_limit)]
 #[test]
 #[serial]
@@ -187,7 +191,9 @@ fn hard_limit_lowered_to_the_soft_limit_is_contained() {
 /// Upstream registers `memory_hard_limit_percent` as `PHP_INI_ALL`; ePHPm
 /// lowers it to system-only at startup so a tenant script cannot move another
 /// tenant's process-wide cliff. `ini_set()` must fail and leave the value
-/// alone, while the operator's per-site override still applies.
+/// alone, while a value set at `PHP_INI_SYSTEM` stage (here via
+/// `set_request_ini`; in production via php.ini / `[php] ini_overrides`)
+/// still applies.
 #[cfg(php_hard_memory_limit)]
 #[test]
 #[serial]
@@ -212,9 +218,9 @@ fn scripts_cannot_change_the_hard_limit_percent() {
         PROBE,
         &[("memory_hard_limit_percent", "150")],
     )
-    .expect("probe request with a site override");
+    .expect("probe request with a system-stage value");
     let out = text(&resp);
-    assert_eq!(out, "150|false|150|150", "the site override must still apply");
+    assert_eq!(out, "150|false|150|150", "a PHP_INI_SYSTEM-stage value must still apply");
 }
 
 /// Resident set size of this process, in bytes (`VmRSS` in `/proc/self/status`).

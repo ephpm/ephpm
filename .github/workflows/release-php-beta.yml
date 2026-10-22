@@ -1,8 +1,18 @@
 name: Release (PHP beta, experimental)
 
 # EXPERIMENTAL, NON-GATING lane for building ephpm against an upstream PHP
-# PRE-RELEASE (beta/RC) SDK — today PHP 8.6.0beta1 (see xtask
-# EXPERIMENTAL_PHP_VERSIONS). This workflow is deliberately SEPARATE from
+# PRE-RELEASE (beta/RC) SDK listed in xtask EXPERIMENTAL_PHP_VERSIONS.
+#
+# CURRENTLY A NO-OP: that table is empty. The only published pre-release SDK
+# (php-sdk v8.6.0beta1) predates the php-src fix for CVE-2026-109618/109619
+# (no memory_hard_limit_percent), so this lane would otherwise publish a
+# vulnerable v<tag>-php8.6.0beta1 after every stable release. With the table
+# empty the experimental matrices are `[]`, every build job and the publish job
+# are skipped, and the run ends green. To re-enable it, pin a pre-release SDK
+# that carries the fix (8.6.0RC4 or later) in EXPERIMENTAL_PHP_VERSIONS — see
+# the comment there.
+#
+# This workflow is deliberately SEPARATE from
 # release.yml so that:
 #
 #   * a stable `v*` tag release never builds, gates on, or ships a beta binary;
@@ -586,7 +596,9 @@ jobs:
   publish:
     name: Publish pre-release
     needs: [setup, build-linux, build-linux-arm64, build-macos, build-windows, build-windows-tailcall]
-    if: ${{ !cancelled() && needs.setup.outputs.do_publish == 'true' && startsWith(needs.setup.outputs.tag, 'v') }}
+    # The matrix check keeps an empty EXPERIMENTAL_PHP_VERSIONS a clean no-op:
+    # without it this job would run with no archives and fail the run.
+    if: ${{ !cancelled() && needs.setup.outputs.do_publish == 'true' && startsWith(needs.setup.outputs.tag, 'v') && needs.setup.outputs.experimental_matrix != '[]' }}
     # GitHub-hosted: downloads artifacts, runs sha256sum/sed and the GitHub
     # API (gh, action-gh-release) -- no build, no Docker, nothing from the fleet.
     runs-on: ubuntu-latest

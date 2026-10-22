@@ -132,16 +132,32 @@ int ephpm_execute_script(const char *filename) {
 ### Memory
 
 - PHP's memory allocator (`emalloc`/`efree`) is separate from Rust's allocator
-- `memory_limit` INI directive is enforced — PHP cannot exhaust host memory without hitting its own limit first
-- On memory limit exceeded, PHP triggers a fatal error caught by `zend_catch`
-- From PHP 8.3.36 / 8.4.27 / 8.5.12, `memory_limit` is a soft limit checked
-  between VM instructions, so one internal call can overshoot it up to the
-  hard limit (`memory_hard_limit_percent`, by default 2 × `memory_limit`, or
-  + 1 GB above 1 GB). Crossing the hard limit makes PHP call `_exit(137)`. On
-  Linux ePHPm intercepts that exit and fails only the request (500), retiring
-  its thread; on macOS and Windows it ends the whole process. Size memory
-  against the hard limit. See [PHP's hard memory
-  limit](/reference/config/#phps-hard-memory-limit).
+- `memory_limit` bounds one request's Zend heap, but it does **not** guarantee
+  that PHP cannot exhaust host memory:
+  - It is `PHP_INI_ALL`, so a script can raise its own limit
+    (`ini_set('memory_limit', '-1')` removes it).
+  - Memory outside the Zend heap (extension and library `malloc`s) is not
+    counted against it.
+  - Every request runs in one process, so the bound that matters to the host is
+    `concurrency` × the per-request ceiling below, not one request's limit.
+- From PHP 8.3.36 / 8.4.27 / 8.5.12, `memory_limit` is a **soft** limit:
+  exceeding it queues an out-of-memory error that PHP raises at the script's
+  next VM instruction (the "interrupt"), so one internal call can allocate well
+  past it first. The fatal error then unwinds through the wrapper's
+  `zend_try`/`zend_catch` like any other and the request gets a `500`. On
+  older SDKs exceeding `memory_limit` is an immediate fatal error.
+- The overshoot is bounded by the **hard** limit, `memory_hard_limit_percent`
+  (by default 2 × `memory_limit`, or `memory_limit` + 1 GB above 1 GB). An
+  allocation that would cross it makes PHP call `_exit(137)`:
+  - **Linux:** ePHPm intercepts that exit and fails only the request (`500`),
+    retiring its thread and freeing its Zend heap. Containment does not run
+    PHP's request teardown, so files, sockets and `flock()` locks the request
+    held stay open until the process restarts. Enough contained requests that
+    held many descriptors can run the process out of file descriptors.
+  - **macOS and Windows:** the exit is not contained and ends the whole ePHPm
+    process.
+- Size host memory against the hard limit, not `memory_limit`. See [PHP's hard
+  memory limit](/reference/config/#phps-hard-memory-limit).
 
 ### Execution time
 
