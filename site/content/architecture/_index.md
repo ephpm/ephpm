@@ -319,7 +319,7 @@ password = "changeme"                 # admin UI auth (separate from node API au
 **Implemented:**
 - Single-node in-memory KV store using DashMap (lock-sharded concurrent hash map)
 - RESP2 protocol server accepting Redis-compatible clients
-- ~40 Redis commands across strings, keys, hashes, and connection (see [KV from PHP](/guides/kv-from-php/) for the full table). `SCAN`, `HMSET`, `HMGET`, lists, sets, transactions and pub/sub are **not** implemented.
+- ~65 Redis commands across strings, keys (including `SCAN`), hashes (including per-field TTLs), and connection (see the [KV RESP Protocol reference](/reference/kv-resp/) for the full table). Lists, sets, transactions, scripting and pub/sub are **not** implemented.
 - **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`
 - The same SAPI mechanism also carries the **embedded-database bridge** — `ephpm_db_query()` / `ephpm_db_execute()` (v0.6.3), documented in [Database from PHP](/guides/db-from-php/)
 - Hash store (separate DashMap) — `HGET` / `HSET` / `HGETALL` family

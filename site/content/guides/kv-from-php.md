@@ -298,14 +298,14 @@ $count = $redis->incr('page:views');
 
 | Group | Commands |
 |-------|----------|
-| Strings | `GET`, `SET`, `SETEX`, `MGET`, `MSET`, `SETNX`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `GETSET` |
-| Keys | `DEL`, `DELIFEQ`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `PTTL`, `TYPE`, `KEYS`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `RENAME` |
-| Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS` |
+| Strings | `GET`, `SET` (`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`, `NX`/`XX`/`IFEQ`, `GET`), `SETEX`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `SETNX`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `GETSET` |
+| Keys | `DEL`, `UNLINK`, `DELIFEQ`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `TYPE`, `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `RENAME` |
+| Hashes | `HSET`, `HMSET`, `HSETNX`, `HGET`, `HMGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`, `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN`, `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST` |
 | Connection | `PING`, `ECHO`, `SELECT`, `QUIT`, `COMMAND`, `INFO`, `AUTH` |
 
 `DELIFEQ key token` is an ePHPm-specific compare-and-delete (not a standard Redis command): it deletes `key` only while its value equals `token`, returning `:1`/`:0`. It is the safe lock-release primitive — reach it over RESP with a raw command (e.g. Predis `$redis->executeRaw(['DELIFEQ', $key, $token])`), or, from in-process PHP, just call `ephpm_kv_del_if_eq()` above. It is a dedicated command rather than a `DEL key IFEQ token` variant because `DEL` is variadic over keys, where a positional marker would be ambiguous with a key named `IFEQ`.
 
-Not implemented: lists, sets, sorted sets, transactions (`MULTI`/`EXEC`), scripting (`EVAL`), `SCAN`, pub/sub, and common extras such as `UNLINK`, `HMGET` and `HINCRBY`. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis. Note that `INFO` reports `redis_version:7.0.0`, so clients that branch on the server version will assume Redis 7. The [KV RESP Protocol reference](/reference/kv-resp/) lists every command's behavior and where it differs from Redis.
+Not implemented: lists, sets, sorted sets, transactions (`MULTI`/`EXEC`), scripting (`EVAL`), pub/sub, and extras such as `INCRBYFLOAT`, `GETRANGE` and `MSETNX`. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis. Note that `INFO` reports `redis_version:7.0.0`, so clients that branch on the server version will assume Redis 7. The [KV RESP Protocol reference](/reference/kv-resp/) lists every command's behavior and where it differs from Redis.
 
 ### Multi-tenant note
 

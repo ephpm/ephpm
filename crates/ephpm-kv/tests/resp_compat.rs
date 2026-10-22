@@ -1089,3 +1089,58 @@ async fn hmac_auth_missing_password_arg_rejected() {
         "expected wrong number of arguments error, got: {msg}"
     );
 }
+
+// ── v0.13 additions through a real client ────────────────────────────────────
+
+#[tokio::test]
+async fn scan_iterator_visits_every_key() {
+    let server = TestServer::start().await;
+    let mut con = server.con().await;
+    for i in 0..300 {
+        let _: () = con.set(format!("scan:{i}"), i).await.unwrap();
+    }
+    let _: () = con.set("other", 1).await.unwrap();
+    let mut seen = std::collections::HashSet::new();
+    {
+        let mut iter = con.scan_match::<_, String>("scan:*").await.unwrap();
+        while let Some(key) = iter.next_item().await {
+            seen.insert(key);
+        }
+    }
+    assert_eq!(seen.len(), 300);
+}
+
+#[tokio::test]
+async fn hash_field_ttl_and_new_hash_commands() {
+    let server = TestServer::start().await;
+    let mut con = server.con().await;
+    let _: () =
+        redis::cmd("HSET").arg("h").arg(&["a", "1", "b", "2"]).query_async(&mut con).await.unwrap();
+    let codes: Vec<i64> = redis::cmd("HEXPIRE")
+        .arg("h")
+        .arg(100)
+        .arg("FIELDS")
+        .arg(2)
+        .arg("a")
+        .arg("zz")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(codes, [1, -2]);
+    let ttls: Vec<i64> = redis::cmd("HTTL")
+        .arg("h")
+        .arg("FIELDS")
+        .arg(1)
+        .arg("a")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert!(ttls[0] > 98);
+    let vals: Vec<Option<String>> = con.hget("h", &["a", "nope", "b"]).await.unwrap();
+    assert_eq!(vals, [Some("1".into()), None, Some("2".into())]);
+    let n: i64 = con.hincr("h", "n", 5).await.unwrap();
+    assert_eq!(n, 5);
+    let v: Option<String> =
+        redis::cmd("GETDEL").arg("missing").query_async(&mut con).await.unwrap();
+    assert_eq!(v, None);
+}

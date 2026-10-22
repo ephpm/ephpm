@@ -149,7 +149,8 @@ fn accounted_memory_tracks_the_heap_the_store_holds() {
             none(),
             Box::new(|s| {
                 for i in 0..20_000 {
-                    s.hset(&format!("h:{}", i % 100), &format!("field:{i}"), vec![b'v'; 50]);
+                    let _ =
+                        s.hset(&format!("h:{}", i % 100), &format!("field:{i}"), vec![b'v'; 50]);
                 }
             }),
         ),

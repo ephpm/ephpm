@@ -17,6 +17,7 @@ pub mod cluster_channel;
 pub mod clustered_store;
 pub mod gossip_kv;
 pub mod gossip_writer;
+pub mod hash_field;
 pub mod kv_data_plane;
 pub mod kv_handoff;
 pub mod node;

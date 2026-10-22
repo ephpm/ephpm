@@ -36,7 +36,7 @@ Why a built-in KV? PHP apps want a cache. The default answer is "run Redis." Tha
 └──────────────┘      └──────────────┘    └──────────────────────┘
 ```
 
-Hash entries are kept in a separate map from string entries. Unlike Redis, the two do not exclude each other: there is no `WRONGTYPE` error, and one name can hold a string and a hash at the same time (`GET` on a hash name returns nil, `TYPE` reports `hash`). TTLs, `RENAME` and cluster replication apply to the string map only. See [KV RESP Protocol](/reference/kv-resp/#strings-and-hashes-do-not-collide).
+Hash entries are kept in a separate map from string entries. Unlike Redis, the two do not exclude each other: there is no `WRONGTYPE` error, and one name can hold a string and a hash at the same time (`GET` on a hash name returns nil, `TYPE` reports `hash`). `RENAME` applies to the string map only. A hash has a whole-key TTL (`EXPIRE` on the hash) and every field can carry its own TTL (`HEXPIRE`); a hash's earliest deadline is kept in a TTL index of its own, which active expiry samples alongside the string TTL index, so expired fields are reclaimed without being read. In a cluster hashes replicate **per field** over the gossip tier — see [KV RESP Protocol → Hashes in a cluster](/reference/kv-resp/#hashes-in-a-cluster) and [Strings and hashes do not collide](/reference/kv-resp/#strings-and-hashes-do-not-collide).
 
 ## Storage
 
