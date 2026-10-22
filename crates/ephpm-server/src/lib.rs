@@ -13,6 +13,7 @@ pub mod fpm_pool;
 pub mod http3;
 mod idle;
 pub mod internal_access;
+pub mod kv_snapshot;
 pub mod metrics;
 pub mod metrics_listener;
 pub mod middleware;
@@ -499,6 +500,22 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // `with_primary_view`) and the election (via `start_db_proxies`).
     let primary_view = Arc::new(AtomicBool::new(true));
 
+    // Warm-restart KV snapshots: load before any listener opens, so the first
+    // request served is served warm. Bounded by `[kv.snapshot] load_timeout`;
+    // a file that does not verify is ignored (cold start), never fatal.
+    let kv_snapshot = kv_snapshot::KvSnapshotService::from_config(
+        &config,
+        Arc::clone(&kv_store),
+        multi_tenant_kv.clone(),
+        effective_node_id.as_deref(),
+    )
+    .context("failed to set up KV snapshots")?;
+    if let Some(svc) = &kv_snapshot {
+        svc.load_at_startup().await;
+    }
+    let kv_snapshot_periodic =
+        kv_snapshot.as_ref().and_then(kv_snapshot::KvSnapshotService::spawn_periodic);
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -510,6 +527,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         request_log,
         per_site_db_wire,
         Arc::clone(&primary_view),
+        kv_snapshot.clone(),
         dev_mode,
     )
     .await?;
@@ -533,6 +551,18 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
     let served = accept_loop(listeners).await;
+
+    // Requests are drained. Write the warm-restart KV snapshot first — it
+    // reflects the last request served, and it needs nothing below to still
+    // be running. A periodic save that is mid-flight finishes first (the
+    // service serialises saves); the periodic task is stopped so it cannot
+    // start another.
+    if let Some(task) = kv_snapshot_periodic {
+        task.abort();
+    }
+    if let Some(svc) = &kv_snapshot {
+        svc.save_at_shutdown().await;
+    }
 
     // Requests are drained (bounded by `[server.timeouts] shutdown`). Now close
     // the embedded databases cleanly — deliberately NOT under that bound:
@@ -668,6 +698,9 @@ async fn bind_listeners(
     // (active-passive LB routing). Constant `true` for a standalone node; the
     // CDC election path flips it in clustered mode.
     primary_view: Arc<AtomicBool>,
+    // Warm-restart KV snapshots, for the `/_ephpm/kv/snapshot` control
+    // endpoint. `None` when `[kv.snapshot] mode = "off"`.
+    kv_snapshot: Option<Arc<kv_snapshot::KvSnapshotService>>,
     // `ephpm dev`: lifts the multi-site credential requirement on the
     // internal endpoints (see `Router::with_dev_mode_access`).
     dev_mode: bool,
@@ -959,6 +992,7 @@ async fn bind_listeners(
         .with_node_id(node_id)
         .with_db_health(db_health)
         .with_primary_view(primary_view)
+        .with_kv_snapshot(kv_snapshot)
         .with_websocket(websocket)
         .with_request_log(request_log)
         .with_dev_mode_access(dev_mode)

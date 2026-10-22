@@ -1076,6 +1076,25 @@ Notable gaps, all deliberate:
 | `max_input_buffer` | usize (bytes) | `1048576` (1 MiB) | Per-connection input buffer cap (like Redis `client-query-buffer-limit`). Not counted against `[kv] memory_limit`. |
 | `idle_timeout_secs` | u64 | `300` | Close RESP connections idle this long, freeing their buffers. `0` = never. |
 
+### `[kv.snapshot]`
+
+Warm-restart snapshots: an encrypted copy of every live key (default store and every per-site store) written at graceful shutdown and loaded at the next start, so a restarted node serves warm instead of cold. **A cache warm-up, not durability** — nothing is written between snapshots, and a snapshot that does not verify is ignored (cold start). Design and format: [KV snapshots](/architecture/kv-snapshots/); setup: [Warm restarts](/guides/kv-warm-restart/).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"off"` | `off` or `local` (a file under `path`). Any other value fails startup naming the two. `local` **requires `[kv] secret`** — every snapshot is sealed with a key derived from it (HKDF-SHA256 + ChaCha20-Poly1305 per block); there is no plaintext mode, since a snapshot holds every site's keys and sessions. Changing the secret makes existing snapshots unreadable: the next start is cold, logged at WARN with reason `wrong_key`. |
+| `path` | string | (none) | Directory the snapshot lives in; **required** for `mode = "local"`, created at startup if missing. The file is `<path>/<identity>.kvsnap`, written beside it as `.<identity>.kvsnap.tmp-<pid>-<n>` and renamed into place, so a reader only ever sees a complete file. Leftover temporary files are removed at startup. |
+| `identity` | string | (derived) | File-name stem of this instance's snapshot. Defaults to `[cluster] node_id` when set, else the host name — stable for a VM, a systemd unit or a Kubernetes StatefulSet pod. A Deployment pod's host name is random, so set this explicitly there. Must be a plain name (no `/`, `\`). |
+| `on_shutdown` | bool | `true` | Write a snapshot during graceful shutdown, after the HTTP drain. Not bounded by `[server.timeouts] shutdown`; its own last-resort bound is 5 minutes, past which the process exits with the previous snapshot in place. |
+| `load_on_start` | bool | `true` | Load the snapshot before the listeners open. |
+| `interval` | string | `"0"` | Also write a snapshot every this often while running (`"15m"`, `"1h"`); `"0"` = never. A periodic snapshot is what survives a crash or `SIGKILL`, at the cost of a CPU/disk burst each time. Integer + `ms`, `s`, `m` or `h`. |
+| `load_timeout` | string | `"30s"` | Stop loading after this long and start with whatever was restored (reported as `partial`, reason `timeout`). Same format as `interval`. |
+| `max_size` | string | `"1GB"` | Largest snapshot to write or load. A write that would exceed it is abandoned (the previous file is kept); a file over it is not loaded. Bytes, or `KB`/`MB`/`GB` (1024-based). |
+
+What a load does with a file, in order: header (magic, version, CRC) → key check (is this `[kv] secret`?) → trailer and index → data blocks in parallel. Any failure before the data blocks means **nothing** is restored. A data block that fails to authenticate is skipped and counted (`partial`, reason `corrupt_blocks`); every other block still loads, because each one is independently sealed. Entries past their expiry are never restored. The outcome is logged and recorded in `ephpm_kv_snapshot_load_total{outcome,reason}` — see [Metrics → KV snapshots](/reference/metrics/#kv-snapshots).
+
+Control endpoint: `GET`/`POST /_ephpm/kv/snapshot` and `POST /_ephpm/kv/snapshot/load`, gated like `/_ephpm/requests` — see [HTTP endpoints](/reference/http-endpoints/#server-owned-paths) and [`ephpm kv snapshot`](/reference/cli/kv/#snapshot).
+
 ## `[cluster]`
 
 | Key | Type | Default | Description |

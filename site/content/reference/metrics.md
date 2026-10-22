@@ -527,6 +527,25 @@ labels have a fixed, small set of values (`stream`: 2, `status`: 2, `role`: 2,
 labels** — a label per replica would scale series count with cluster size and
 churn a new series on every pod replacement.
 
+## KV snapshots
+
+Recorded only when `[kv.snapshot] mode != "off"` ([config](/reference/config/#kvsnapshot)). Nothing is pre-seeded: a series appears on the first save or load.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_kv_snapshot_save_total` | counter | `outcome` (`ok`, `error`), `trigger` (`shutdown`, `interval`, `request`) | Snapshot writes. An `error` means the previous file was kept; the log line names the cause (I/O, or `max_size` exceeded). |
+| `ephpm_kv_snapshot_save_duration_seconds` | histogram | — | Wall time of a write, including the `fsync` and rename. |
+| `ephpm_kv_snapshot_last_save_bytes` | gauge | — | Size of the last successfully written snapshot. |
+| `ephpm_kv_snapshot_last_save_keys` | gauge | — | Entries (strings + hashes, every site) in the last successfully written snapshot. |
+| `ephpm_kv_snapshot_load_total` | counter | `outcome` (`ok`, `partial`, `cold`), `reason` | Loads, at startup or via `POST /_ephpm/kv/snapshot/load`. `reason` is `none` for `ok`; for `partial`: `timeout` (the `load_timeout` passed — what was restored stays), `corrupt_blocks` (blocks skipped), `memory_limit` (a store refused entries under `noeviction`), `unknown_site` (blocks for a site this node has no store for); for `cold`: `missing` (first start, normal — logged at INFO), `version` (written by a newer format), `corrupt` (header, trailer or index did not verify: truncated or damaged), `wrong_key` (`[kv] secret` changed), `too_large`, `io`. |
+| `ephpm_kv_snapshot_load_duration_seconds` | histogram | — | Wall time of a load. |
+| `ephpm_kv_snapshot_last_load_keys` | gauge | — | Entries restored by the last load. |
+
+```promql
+# A node that started cold for a reason other than "no snapshot yet".
+increase(ephpm_kv_snapshot_load_total{outcome="cold",reason!="missing"}[1h]) > 0
+```
+
 ## Cluster channel
 
 The cluster channel is the authenticated TCP data plane between nodes (default

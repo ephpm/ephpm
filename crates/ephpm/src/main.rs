@@ -42,6 +42,7 @@ mod dev_xdebug;
 mod exec_sandbox;
 mod ext_ini;
 mod fatal_signal;
+mod kv_snapshot_cli;
 mod php_personality;
 mod service;
 mod site_db;
@@ -467,6 +468,14 @@ enum KvSubcommand {
     Ttl { key: String },
     /// Check the connection
     Ping,
+    /// Warm-restart snapshots ([kv.snapshot]): inspect/verify a file, or ask
+    /// a running server to save/load/report. Uses the server's HTTP control
+    /// endpoint, not the RESP listener, so --host/--port/--password do not
+    /// apply.
+    Snapshot {
+        #[command(subcommand)]
+        command: kv_snapshot_cli::KvSnapshotCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -536,6 +545,12 @@ fn run() -> anyhow::Result<ExitCode> {
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
             ensure_cli_tracing();
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
+        }
+        // Snapshot operations are blocking (file I/O, a blocking HTTP
+        // client) and must run outside the tokio runtime the RESP commands
+        // use.
+        Some(Commands::Kv { subcommand: KvSubcommand::Snapshot { command }, .. }) => {
+            kv_snapshot_cli::run(command)
         }
         Some(Commands::Kv { host, port, password, user, subcommand }) => {
             let auth = KvAuth::resolve(user, password)?;
@@ -2349,6 +2364,10 @@ async fn run_kv(
         KvSubcommand::Del { keys } => kv_del(host, port, auth, &keys).await,
         KvSubcommand::Incr { key, by } => kv_incr(host, port, auth, &key, by).await,
         KvSubcommand::Ttl { key } => kv_ttl(host, port, auth, &key).await,
+        // Dispatched before the runtime is built (see `run`); unreachable here.
+        KvSubcommand::Snapshot { .. } => {
+            anyhow::bail!("kv snapshot is dispatched without a runtime")
+        }
     }
 }
 

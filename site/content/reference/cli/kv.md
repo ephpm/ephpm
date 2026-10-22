@@ -121,9 +121,52 @@ key does not exist
 
 All three exit `0`.
 
+### `snapshot`
+
+Warm-restart snapshot operations ([`[kv.snapshot]`](/reference/config/#kvsnapshot)). These do **not** use the RESP listener, so `--host`/`--port`/`--password`/`--user` do not apply: the file subcommands read a snapshot directly, and the server subcommands call the running server's `/_ephpm/kv/snapshot` [control endpoint](/reference/http-endpoints/#server-owned-paths), which is gated like `/_ephpm/requests` (`[server.diagnostics] allow`/`token`; a token is mandatory on a multi-site server).
+
+```bash
+ephpm kv snapshot inspect <FILE> [--config PATH] [--json]
+ephpm kv snapshot verify  <FILE>  --config PATH
+ephpm kv snapshot save    [--url URL] [--token TOKEN] [--config PATH]
+ephpm kv snapshot load    [--url URL] [--token TOKEN] [--config PATH]
+ephpm kv snapshot status  [--url URL] [--token TOKEN] [--config PATH]
+```
+
+**`inspect <FILE>`** prints the plaintext header — format version, when and by which node it was written, whether it is multi-tenant, the cipher/KDF/compression ids and the file size. It never decrypts a value. With `--config` (read for `[kv] secret`) it also opens the sealed index and lists, per site, the number of blocks, entries and plaintext bytes. `--json` prints the same as one JSON document.
+
+```bash
+$ ephpm kv snapshot inspect /var/lib/ephpm/kv/web-1.kvsnap --config /etc/ephpm/ephpm.toml
+file:              /var/lib/ephpm/kv/web-1.kvsnap
+format:            v1
+created:           2026-10-22T14:03:11Z (unix ms 1792764191000)
+written by:        web-1
+multi-tenant:      yes
+sealed with:       ChaCha20-Poly1305 / HKDF-SHA256 / block compression lz4
+size:              48213776 bytes
+blocks:            41
+entries:           212044
+plaintext bytes:   97611230
+
+site                                       blocks      entries  plaintext bytes
+(default)                                       2         1203          3115201
+blog.example.com                               39       210841         94496029
+```
+
+**`verify <FILE> --config PATH`** authenticates and decodes every block (what a load would do, without restoring anything) and reports `ok: … N blocks, M entries verified` or lists the block indexes that failed.
+
+**`save`**, **`load`**, **`status`** talk to a running server. `--url` is the server's base URL (`http://127.0.0.1:8080`); with `--config` instead, the URL is derived from `[server] listen` (an unspecified bind such as `0.0.0.0` becomes `127.0.0.1`) and the token from `[server.diagnostics] token`. `save` asks the server to write its snapshot now and prints the report; `load` asks it to load the configured snapshot into the live store; `status` prints the status document (file, last save, last load).
+
+```bash
+ephpm kv snapshot save --config /etc/ephpm/ephpm.toml
+ephpm kv snapshot status --url http://10.0.1.5:8080 --token "$DIAG_TOKEN"
+```
+
+Exit status for `snapshot`: `0` success; `1` usage, I/O, connection or server error (`4xx`/`5xx`, including `409` when a save is already running); `2` the file is not a usable snapshot (`inspect` could not read it, or `verify` found bad blocks).
+
 ## Exit status
 
-`0` when the server answers normally, including `(nil)` from `get`, `(empty)` from `keys`, and `key does not exist` from `ttl`. `1` when the server answers with an error (`-ERR`, `-NOAUTH`, …), printed as `error: ...` on stderr. A connection failure, an authentication failure, or an invalid `--host` also prints `error: ...` and exits `1`.
+`0` when the server answers normally, including `(nil)` from `get`, `(empty)` from `keys`, and `key does not exist` from `ttl`. `1` when the server answers with an error (`-ERR`, `-NOAUTH`, …), printed as `error: ...` on stderr. A connection failure, an authentication failure, or an invalid `--host` also prints `error: ...` and exits `1`. See [`snapshot`](#snapshot) for that subcommand's codes.
 
 ## Common patterns
 

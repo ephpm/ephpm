@@ -187,6 +187,8 @@ If you outgrow it, the RESP listener means swapping back to standalone Redis is 
 
 ## See also
 
+- [KV snapshots](/architecture/kv-snapshots/) — the encrypted warm-restart snapshot format and lifecycle (`[kv.snapshot]`)
+
 - [KV from PHP](/guides/kv-from-php/) — the SAPI and RESP APIs
 - [`ephpm kv` CLI](/reference/cli/kv/) — debug the live store
 - [Architecture → Clustering](/architecture/clustering/) — gossip, key ownership, data plane replication

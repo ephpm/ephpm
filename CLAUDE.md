@@ -156,6 +156,21 @@ There is deliberately no smaller DB concurrency cap than tokio's blocking pool (
 
 The `TrackedBackend` wrapper in `ephpm-server/src/tracked_backend.rs` wraps any litewire backend to record query stats. Disable with `[db.analysis] query_stats = false`.
 
+## Architecture: KV warm-restart snapshots
+
+`[kv.snapshot]` (v0.13.0) writes an encrypted copy of every live KV entry (default store + every per-site store) at graceful shutdown and loads it before the listeners open, so a restart serves warm. **A cache warm-up, not durability** — never document it as anything else. Format, crypto, writer and loader live in `crates/ephpm-kv/src/snapshot/`; the server lifecycle (startup load under `load_timeout`, shutdown save after the HTTP drain, `interval` saves, the `/_ephpm/kv/snapshot` control endpoint, metrics) in `crates/ephpm-server/src/kv_snapshot.rs`; the CLI in `crates/ephpm/src/kv_snapshot_cli.rs` (`ephpm kv snapshot inspect|verify|save|load|status`). Design page: `site/content/architecture/kv-snapshots.md`.
+
+Invariants to keep:
+
+- **Always encrypted, fail closed.** `mode != "off"` requires `[kv] secret`; `Config::validate` refuses otherwise. Per-file key = HKDF-SHA256(salt = random per file, ikm = secret, info `ephpm-kv-snapshot/v1/file-key`); ChaCha20-Poly1305 per block with the full header + block sequence as AAD; a header key-check tag distinguishes `wrong_key` from `corrupt` before any data is touched. The secret is never written or logged. Same primitives as `ephpm-cluster`'s transport — do not introduce a second AEAD.
+- **Per-site blocks.** A block holds one site's entries, with the site key inside the sealed payload *and* the sealed index; the loader refuses a mismatch. A tenant's keys can never load into another store.
+- **Atomic replace.** Temp file beside the destination → `fsync` → rename → directory `fsync` (Unix). The trailer is written last; a file without a valid trailer never loads. Stale `.<identity>.kvsnap.tmp-*` files are removed at startup.
+- **Load never blocks startup forever and never fails it.** Header/trailer/index failure → `cold` (nothing restored); a bad data block → skipped and counted (`partial`); the deadline stops the workers with what was restored kept. Outcomes are the `ephpm_kv_snapshot_load_total{outcome,reason}` labels and nothing else.
+- **Pure-Rust block compression** (`lz4_flex`, no `frame` feature): the binary links the PHP SDK's zlib/zstd, so no C compressor may export those symbols. CRC-32 (`crc32fast`, already in the lock) only on the plaintext header/trailer — the AEAD tag covers the blocks.
+- **Blocking work off the runtime.** Every save/load runs under `spawn_blocking`; the shutdown save is bounded by its own 5-minute last resort, not `[server.timeouts] shutdown`.
+- **Entry encoding is extensible** (type byte, flags, reserved `ext` block, payload length so unknown types are skipped; hash fields carry an optional per-field expiry). Adding a field means a new flag or `ext` content, not a new format version; a new major version must be refused by old readers (`UnsupportedVersion`).
+- Stores restore through `Store::restore_string` / `restore_hash` (crate-private): bytes go in as stored (compressed flag kept) when the value algorithm matches the target store's, else decoded and re-encoded via `set_local`. Restores are node-local and never replicate.
+
 ## Critical Conventions
 
 - **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The `php_linked` cfg is set by `ephpm-php/build.rs` when `PHP_SDK_PATH` env var is present. Stub mode must always compile and pass tests without it.

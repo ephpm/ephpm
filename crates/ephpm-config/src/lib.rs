@@ -3395,6 +3395,10 @@ pub struct KvConfig {
     /// Redis-compatible RESP protocol listener.
     #[serde(default)]
     pub redis_compat: KvRedisCompatConfig,
+
+    /// Warm-restart snapshots (`[kv.snapshot]`).
+    #[serde(default)]
+    pub snapshot: KvSnapshotConfig,
 }
 
 impl Default for KvConfig {
@@ -3407,9 +3411,201 @@ impl Default for KvConfig {
             compression_min_size: default_kv_compression_min_size(),
             secret: None,
             redis_compat: KvRedisCompatConfig::default(),
+            snapshot: KvSnapshotConfig::default(),
         }
     }
 }
+
+/// Warm-restart snapshots of the KV store (`[kv.snapshot]`).
+///
+/// A snapshot is an encrypted copy of every live key (default store and
+/// every per-site store) written at graceful shutdown and loaded at the next
+/// start, so a restarted node serves warm instead of cold. It is a **cache
+/// warm-up, not durability**: nothing is written between snapshots, and a
+/// snapshot that cannot be verified is ignored (the node starts cold).
+///
+/// Every snapshot is sealed with a key derived from `[kv] secret`
+/// (HKDF-SHA256; the secret itself is never written). There is no
+/// unencrypted mode: a snapshot holds every tenant's keys and sessions, so
+/// `mode != "off"` without `[kv] secret` is a startup error.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct KvSnapshotConfig {
+    /// `"off"` (default) or `"local"` (a file under `path`). Anything else is
+    /// rejected by [`Config::validate`] at startup.
+    #[serde(default = "default_kv_snapshot_mode")]
+    pub mode: String,
+
+    /// Directory the snapshot file lives in. **Required** for `mode =
+    /// "local"`; created at startup if missing. The file is
+    /// `<path>/<identity>.kvsnap`, written beside it as a temporary file and
+    /// renamed into place, so a reader only ever sees a complete snapshot.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Name of this instance's snapshot (the file stem). Defaults to
+    /// `[cluster] node_id` when that is set, otherwise the host name — stable
+    /// for a VM, a systemd unit, or a Kubernetes StatefulSet pod. A
+    /// Deployment pod has a random host name, so set this explicitly (every
+    /// replica may share one identity; the last writer's snapshot wins).
+    #[serde(default)]
+    pub identity: Option<String>,
+
+    /// Write a snapshot during graceful shutdown (after request draining).
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub on_shutdown: bool,
+
+    /// Load the snapshot at startup, before the listeners open.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub load_on_start: bool,
+
+    /// Also write a snapshot periodically while running, e.g. `"15m"`. `"0"`
+    /// (default) disables periodic snapshots. A periodic snapshot is what
+    /// survives a crash or `SIGKILL`, at the cost of a CPU and disk burst
+    /// each time. Format: an integer with `ms`, `s`, `m` or `h`.
+    #[serde(default = "default_kv_snapshot_interval")]
+    pub interval: String,
+
+    /// Give up loading after this long and start with whatever was restored
+    /// so far. Format as `interval`.
+    ///
+    /// Default: `"30s"`.
+    #[serde(default = "default_kv_snapshot_load_timeout")]
+    pub load_timeout: String,
+
+    /// Largest snapshot to write or load. A write that would exceed it is
+    /// abandoned (the previous snapshot is kept); a file over it is not
+    /// loaded. Bytes, or `KB` / `MB` / `GB` (1024-based).
+    ///
+    /// Default: `"1GB"`.
+    #[serde(default = "default_kv_snapshot_max_size")]
+    pub max_size: String,
+}
+
+impl Default for KvSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_kv_snapshot_mode(),
+            path: None,
+            identity: None,
+            on_shutdown: true,
+            load_on_start: true,
+            interval: default_kv_snapshot_interval(),
+            load_timeout: default_kv_snapshot_load_timeout(),
+            max_size: default_kv_snapshot_max_size(),
+        }
+    }
+}
+
+impl KvSnapshotConfig {
+    /// Whether snapshots are on at all (`mode != "off"`).
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.mode != "off"
+    }
+
+    /// The periodic interval, or `None` when disabled.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable `interval`.
+    pub fn interval(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        let d = parse_duration_knob("[kv.snapshot] interval", &self.interval)?;
+        Ok((!d.is_zero()).then_some(d))
+    }
+
+    /// The load deadline.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable `load_timeout`.
+    pub fn load_timeout(&self) -> Result<std::time::Duration, ConfigError> {
+        parse_duration_knob("[kv.snapshot] load_timeout", &self.load_timeout)
+    }
+
+    /// `max_size` in bytes.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable `max_size`.
+    pub fn max_size_bytes(&self) -> Result<u64, ConfigError> {
+        parse_size_knob("[kv.snapshot] max_size", &self.max_size)
+    }
+}
+
+/// Parse a duration knob: an integer followed by `ms`, `s`, `m` or `h`; a
+/// bare `0` means zero.
+fn parse_duration_knob(knob: &str, value: &str) -> Result<std::time::Duration, ConfigError> {
+    let s = value.trim();
+    let bad = || {
+        ConfigError::Validation(format!(
+            "{knob} must be an integer with a unit (ms, s, m, h) such as \"30s\", or \"0\", got {value:?}"
+        ))
+    };
+    if s == "0" {
+        return Ok(std::time::Duration::ZERO);
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().map_err(|_| bad())?;
+    let mult_ms: u64 = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => return Err(bad()),
+    };
+    n.checked_mul(mult_ms).map(std::time::Duration::from_millis).ok_or_else(bad)
+}
+
+/// Parse a byte-size knob: bytes, or a number with `KB` / `MB` / `GB`
+/// (case-insensitive, 1024-based).
+fn parse_size_knob(knob: &str, value: &str) -> Result<u64, ConfigError> {
+    let s = value.trim();
+    let bad = || {
+        ConfigError::Validation(format!(
+            "{knob} must be a byte count or a number with KB, MB or GB such as \"1GB\", got {value:?}"
+        ))
+    };
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().map_err(|_| bad())?;
+    let mult: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "KB" | "K" => 1 << 10,
+        "MB" | "M" => 1 << 20,
+        "GB" | "G" => 1 << 30,
+        _ => return Err(bad()),
+    };
+    n.checked_mul(mult).ok_or_else(bad)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_kv_snapshot_mode() -> String {
+    "off".to_string()
+}
+
+fn default_kv_snapshot_interval() -> String {
+    "0".to_string()
+}
+
+fn default_kv_snapshot_load_timeout() -> String {
+    "30s".to_string()
+}
+
+fn default_kv_snapshot_max_size() -> String {
+    "1GB".to_string()
+}
+
+/// Every accepted `[kv.snapshot] mode` value.
+const KV_SNAPSHOT_MODES: [&str; 2] = ["off", "local"];
 
 impl KvConfig {
     /// Why a single-site RESP listener must refuse to start, if it must.
@@ -4910,6 +5106,54 @@ impl Config {
                 KV_COMPRESSION_ALGOS.join(", "),
                 self.kv.compression,
             )));
+        }
+
+        // [kv.snapshot]: the mode selects a feature, so a typo must not come
+        // up as "off" with every health check green. A snapshot holds every
+        // tenant's keys, so it is never written unencrypted — the secret it
+        // is sealed with is required up front rather than failing at the
+        // first shutdown, when it is too late to fix.
+        {
+            let snap = &self.kv.snapshot;
+            if !KV_SNAPSHOT_MODES.contains(&snap.mode.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "[kv.snapshot] mode must be one of {}, got \"{}\"",
+                    KV_SNAPSHOT_MODES.join(", "),
+                    snap.mode,
+                )));
+            }
+            if snap.enabled() {
+                if !self.kv.secret_is_set() {
+                    return Err(ConfigError::Validation(format!(
+                        "[kv.snapshot] mode = \"{}\" requires [kv] secret: snapshots are always \
+                         encrypted with a key derived from it (there is no plaintext mode, since a \
+                         snapshot holds every site's keys and sessions). Set [kv] secret (e.g. \
+                         `openssl rand -base64 32`) or set [kv.snapshot] mode = \"off\".",
+                        snap.mode,
+                    )));
+                }
+                if snap.path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    return Err(ConfigError::Validation(format!(
+                        "[kv.snapshot] mode = \"{}\" requires [kv.snapshot] path (the directory the \
+                         snapshot file is written to)",
+                        snap.mode,
+                    )));
+                }
+                if let Some(id) = snap.identity.as_deref()
+                    && (id.trim().is_empty()
+                        || id.contains(['/', '\\', '\0'])
+                        || id == "."
+                        || id == "..")
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "[kv.snapshot] identity must be a plain file-name stem (no path separators), \
+                         got {id:?}"
+                    )));
+                }
+            }
+            snap.interval()?;
+            snap.load_timeout()?;
+            snap.max_size_bytes()?;
         }
 
         // [cluster.kv] replication_mode: the cluster parser treats anything
@@ -8691,6 +8935,9 @@ listen = "0.0.0.0:8080"
             ("[db.analysis]", "[db.analysis]\nbogus_key = 1\n", "bogus_key"),
             ("[kv]", "[kv]\nbogus_key = 1\n", "bogus_key"),
             ("[kv.redis_compat]", "[kv.redis_compat]\nbogus_key = 1\n", "bogus_key"),
+            // A misspelt `on_shutdown` must not silently leave snapshots on
+            // their default.
+            ("[kv.snapshot]", "[kv.snapshot]\non_shutdwon = false\n", "on_shutdwon"),
             ("[php]", "[php]\nmemory_limits = \"256M\"\n", "memory_limits"),
             // A misspelt `debug_workers` must not silently leave the Xdebug
             // debug lane at its default.
@@ -10200,6 +10447,74 @@ multi_tenant_hardening = false
         assert!(msg.contains("allkey-lru"), "the error must name the bad value: {msg}");
         for policy in KV_EVICTION_POLICIES {
             assert!(msg.contains(policy), "the error must list {policy}: {msg}");
+        }
+    }
+
+    // `[kv.snapshot]` selects a feature by mode string and seals every file
+    // with `[kv] secret`; both have to fail closed at validation time.
+
+    #[test]
+    fn kv_snapshot_defaults_are_off_and_validate() {
+        let cfg = Config::default_config().unwrap();
+        assert_eq!(cfg.kv.snapshot.mode, "off");
+        assert!(!cfg.kv.snapshot.enabled());
+        assert_eq!(cfg.kv.snapshot.interval().unwrap(), None);
+        assert_eq!(cfg.kv.snapshot.load_timeout().unwrap(), std::time::Duration::from_secs(30));
+        assert_eq!(cfg.kv.snapshot.max_size_bytes().unwrap(), 1 << 30);
+        cfg.validate().expect("defaults validate");
+    }
+
+    #[test]
+    fn kv_snapshot_mode_typo_is_rejected_naming_the_values() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.snapshot.mode = "locl".to_string();
+        let err = cfg.validate().expect_err("a typo must not mean off").to_string();
+        assert!(err.contains("locl") && err.contains("off") && err.contains("local"), "{err}");
+    }
+
+    #[test]
+    fn kv_snapshot_local_requires_secret_and_path() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.snapshot.mode = "local".to_string();
+        cfg.kv.snapshot.path = Some("/var/lib/ephpm/kv".to_string());
+        let err = cfg.validate().expect_err("no secret → refuse").to_string();
+        assert!(err.contains("[kv] secret"), "{err}");
+
+        cfg.kv.secret = Some("s3cret".to_string());
+        cfg.kv.snapshot.path = None;
+        let err = cfg.validate().expect_err("no path → refuse").to_string();
+        assert!(err.contains("[kv.snapshot] path"), "{err}");
+
+        cfg.kv.snapshot.path = Some("/var/lib/ephpm/kv".to_string());
+        cfg.validate().expect("secret + path validate");
+
+        cfg.kv.snapshot.identity = Some("../other".to_string());
+        let err = cfg.validate().expect_err("identity with a separator → refuse").to_string();
+        assert!(err.contains("identity"), "{err}");
+    }
+
+    #[test]
+    fn kv_snapshot_duration_and_size_knobs_parse_or_fail_loudly() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.snapshot.interval = "15m".to_string();
+        cfg.kv.snapshot.load_timeout = "1500ms".to_string();
+        cfg.kv.snapshot.max_size = "512mb".to_string();
+        cfg.validate().expect("valid units");
+        assert_eq!(cfg.kv.snapshot.interval().unwrap(), Some(std::time::Duration::from_secs(900)));
+        assert_eq!(cfg.kv.snapshot.load_timeout().unwrap(), std::time::Duration::from_millis(1500));
+        assert_eq!(cfg.kv.snapshot.max_size_bytes().unwrap(), 512 << 20);
+
+        for (field, bad) in
+            [("interval", "15"), ("interval", "1d"), ("load_timeout", "soon"), ("max_size", "1TB")]
+        {
+            let mut cfg = Config::default_config().unwrap();
+            match field {
+                "interval" => cfg.kv.snapshot.interval = bad.to_string(),
+                "load_timeout" => cfg.kv.snapshot.load_timeout = bad.to_string(),
+                _ => cfg.kv.snapshot.max_size = bad.to_string(),
+            }
+            let err = cfg.validate().expect_err("bad unit → refuse").to_string();
+            assert!(err.contains(field) && err.contains(bad), "{field}={bad}: {err}");
         }
     }
 

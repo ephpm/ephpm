@@ -311,11 +311,18 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// skips there (issue #433). Its config is `[db.mysql]`, which must NOT live on
 /// any shared or `[db.sqlite]` node (#288/#295), hence self-managed.
 ///
+/// `kv_snapshot_restart` is here because it is a process-lifecycle test: it
+/// stops its node gracefully (the path that writes the warm-restart KV
+/// snapshot) and starts it again on the same ports and data directory, which
+/// no shared node could survive. Its `[kv.snapshot]` config lives in the
+/// suite's own template (`SingleNodeFixture::start_with`), per #288/#295.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
 /// fixtures, and a suite that gets it starts spawning real processes.
-const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy"];
+const SELF_MANAGED_SUITES: &[&str] =
+    &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy", "kv_snapshot_restart"];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///
