@@ -158,34 +158,135 @@ fn claim_addr_if_member(claim_addr: &str, members: &[NodeInfo]) -> Option<String
     member_hosts_contain(known, &claim_host).then(|| claim_addr.to_string())
 }
 
-/// Rendezvous-hash (HRW) score for placing `site` on the node named
-/// `node_id`; higher wins.
+/// Version of the per-site ownership hash ([`hrw_score`]) this binary uses.
 ///
-/// A stable 64-bit FNV-1a over `node_id`, a fixed domain separator, and
-/// `site`. It deliberately does **not** use `std`'s hasher (whose seed and
-/// implementation are not contractually stable across builds): every node
-/// must compute the identical score so they independently agree on a
-/// site's owner with no coordination.
-#[must_use]
-fn hrw_score(node_id: &str, site: &str) -> u64 {
+/// Every node must compute identical scores or two nodes each believe
+/// they own the same site (or neither does). The scheme is therefore
+/// advertised in gossip under [`crate::node::HRW_SCHEME_KEY`], and
+/// [`spawn_hrw_scheme_watch`] logs an error while any alive peer disagrees.
+///
+/// - `1` (≤ v0.12.x, never advertised): FNV-1a over `node ‖ 0x5c ‖ site`.
+///   Its byte-serial structure barely changed the node ranking between site
+///   keys that differ only in a short suffix, so `s001…s1000` over nodes
+///   `n1/n2/n3` all landed on `n2` (cluster stress report, finding F9).
+/// - `2` (v0.13.0+): node and site hashed independently, each avalanched,
+///   combined, and avalanched again — see [`hrw_score`].
+///
+/// Bumping it moves most sites' owners, so a cluster in per-site mode must
+/// be upgraded all at once (stop every node, then start them), never rolled.
+pub const HRW_SCHEME: u32 = 2;
+
+/// 64-bit FNV-1a over `bytes`, starting from the standard offset basis
+/// XORed with `seed` (a per-input domain separator).
+fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    /// Domain separator between `node_id` and `site`, so
-    /// `hrw_score("ab", "c")` differs from `hrw_score("a", "bc")`.
-    const SEP: u64 = 0x5c;
+    bytes
+        .iter()
+        .fold(FNV_OFFSET ^ seed, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME))
+}
 
-    let mut hash = FNV_OFFSET;
-    for &byte in node_id.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash ^= SEP;
-    hash = hash.wrapping_mul(FNV_PRIME);
-    for &byte in site.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+/// The `splitmix64` finalizer (Stafford's "Mix13"): a bijection on `u64`
+/// with full avalanche — flipping any input bit flips each output bit with
+/// probability ~1/2. This is what FNV-1a alone lacks.
+const fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Rendezvous-hash (HRW) score for placing `site` on the node named
+/// `node_id`; higher wins. Scheme [`HRW_SCHEME`] `2`.
+///
+/// `mix64(mix64(fnv1a(NODE, node_id)) ^ mix64(fnv1a(SITE, site)))`: each
+/// input is hashed on its own (with distinct seeds, so the split between
+/// the two strings is unambiguous) and avalanched, and the combination is
+/// avalanched again. The result is that, for a fixed site, the ranking of
+/// nodes behaves like an independent random permutation per site — even for
+/// keys like `s001`/`s002` that differ in one trailing byte. For a fixed
+/// site, distinct node hashes give distinct scores (`mix64` is a bijection),
+/// so ties need an FNV collision between node ids.
+///
+/// Pure integer arithmetic on the UTF-8 bytes: identical on every platform,
+/// architecture, endianness and Rust version. It deliberately does **not**
+/// use `std`'s hasher (whose seed and algorithm are not contractually
+/// stable): every node must compute the identical score so they
+/// independently agree on a site's owner with no coordination. Golden
+/// values are pinned in the tests; changing them requires bumping
+/// [`HRW_SCHEME`].
+#[must_use]
+fn hrw_score(node_id: &str, site: &str) -> u64 {
+    /// Domain seeds (ASCII "node" / "site").
+    const NODE_SEED: u64 = 0x6e6f_6465;
+    const SITE_SEED: u64 = 0x7369_7465;
+    mix64(
+        mix64(fnv1a64(NODE_SEED, node_id.as_bytes())) ^ mix64(fnv1a64(SITE_SEED, site.as_bytes())),
+    )
+}
+
+/// Alive peers whose advertised ownership-hash scheme differs from this
+/// binary's [`HRW_SCHEME`], as `(node id, advertised scheme)`. `None` means
+/// the peer advertises no scheme — a pre-v0.13.0 node (scheme `1`).
+#[must_use]
+pub fn hrw_scheme_mismatches(nodes: &[NodeInfo]) -> Vec<(String, Option<u32>)> {
+    nodes
+        .iter()
+        .filter(|n| n.state == NodeState::Alive && n.hrw_scheme != Some(HRW_SCHEME))
+        .map(|n| (n.id.clone(), n.hrw_scheme))
+        .collect()
+}
+
+/// How often [`spawn_hrw_scheme_watch`] re-checks peer schemes.
+const HRW_SCHEME_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Watch for alive peers that compute per-site ownership with a different
+/// hash scheme, logging an `ERROR` while any do.
+///
+/// Mixed schemes cannot be reconciled from one side: an old node does not
+/// know the new scheme exists, so excluding it here would only make the
+/// disagreement asymmetric. The watch therefore *reports* rather than
+/// refuses, loudly, naming each offending peer. A peer is reported only
+/// after it has mismatched on two consecutive checks, so a node whose
+/// gossip state is still propagating right after it joins does not trip
+/// it. Each peer is reported once per mismatch episode (again if it clears
+/// and recurs), and recovery is logged at `INFO`.
+pub fn spawn_hrw_scheme_watch(cluster: Arc<ClusterHandle>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen_once: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ticker = tokio::time::interval(HRW_SCHEME_CHECK_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let mismatches = hrw_scheme_mismatches(&cluster.nodes().await);
+            let now: std::collections::HashSet<String> =
+                mismatches.iter().map(|(id, _)| id.clone()).collect();
+            for (id, scheme) in &mismatches {
+                if seen_once.contains(id) && reported.insert(id.clone()) {
+                    let advertised = scheme.map_or_else(
+                        || "none (pre-v0.13.0, scheme 1)".to_string(),
+                        |s| s.to_string(),
+                    );
+                    tracing::error!(
+                        peer = %id,
+                        peer_hrw_scheme = %advertised,
+                        local_hrw_scheme = HRW_SCHEME,
+                        "cluster peer computes per-site database ownership with a different hash \
+                         scheme: this node and that peer disagree on which node owns each site, so \
+                         writes can be refused or committed on a node whose writes do not replicate. \
+                         Per-site clustered mode requires every node to run the same scheme -- stop \
+                         all nodes and start them on the same ePHPm version (no rolling upgrade \
+                         across v0.13.0)"
+                    );
+                }
+            }
+            for id in reported.iter().filter(|id| !now.contains(*id)) {
+                tracing::info!(peer = %id, "cluster peer's per-site ownership hash scheme now matches (or it left)");
+            }
+            reported.retain(|id| now.contains(id));
+            seen_once = now;
+        }
+    })
 }
 
 /// The HRW (rendezvous-hashing) owner of `site` among the **alive** nodes
@@ -1179,17 +1280,160 @@ mod tests {
         assert!(all.iter().any(|n| n.id == new_owner.id));
     }
 
+    /// Pinned scores for scheme 2. Every node in a cluster must compute these
+    /// exact values; if this test fails the ownership hash changed, which moves
+    /// most sites' owners cluster-wide — bump `HRW_SCHEME` and document the
+    /// full-restart upgrade, or revert the change.
     #[test]
-    fn hrw_owner_distributes_sites_across_nodes() {
-        // Over many sites, ownership should not collapse onto one node —
-        // otherwise the "spread tenants across the cluster" premise fails.
-        let nodes = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..200 {
-            let site = format!("site-{i:03}");
-            seen.insert(hrw_owner(&nodes, &site).unwrap().id.clone());
+    fn hrw_score_golden_values() {
+        assert_eq!(HRW_SCHEME, 2);
+        let golden: [(&str, &str, u64); 6] = [
+            ("ephpm-0", "site-a", 0x4067_9543_9596_884b),
+            ("n1", "s001", 0x9c62_00df_68bf_5530),
+            ("n2", "s001", 0xe5a6_f9cd_2428_4cc4),
+            ("node-a", "blog.example.com", 0x2f42_a838_3a3c_be3e),
+            ("", "", 0x439d_3b40_66b4_9f37),
+            ("ephpm-2", "tenant-42", 0x19d6_c637_c00d_8cc3),
+        ];
+        for (node, site, want) in golden {
+            assert_eq!(hrw_score(node, site), want, "hrw_score({node:?}, {site:?})");
         }
-        assert!(seen.len() >= 2, "HRW must spread sites across more than one node: {seen:?}");
+    }
+
+    /// Node-id naming schemes operators actually use.
+    fn node_ids(naming: usize, k: usize) -> Vec<String> {
+        (0..k)
+            .map(|i| match naming {
+                0 => format!("n{}", i + 1),
+                1 => format!("ephpm-{i}"),
+                2 => format!("node-{}", char::from(b'a' + u8::try_from(i).unwrap())),
+                _ => {
+                    ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"][i].to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// Site-key families with a shared prefix and a short varying suffix —
+    /// the shape that collapsed scheme 1 (F9) — plus one higher-entropy family.
+    fn site_families() -> Vec<(&'static str, Vec<String>)> {
+        let letters = |i: usize| {
+            let (hi, lo) = (i / 26, i % 26);
+            let lo = char::from(b'a' + u8::try_from(lo).unwrap());
+            if hi == 0 {
+                lo.to_string()
+            } else {
+                format!("{}{lo}", char::from(b'a' + u8::try_from(hi - 1).unwrap()))
+            }
+        };
+        vec![
+            ("sNNN", (1..=1000).map(|i| format!("s{i:03}")).collect()),
+            ("siteN", (1..=1000).map(|i| format!("site{i}")).collect()),
+            ("pr-N", (1..=1000).map(|i| format!("pr-{i}")).collect()),
+            ("tenant-a..", (0..702).map(|i| format!("tenant-{}", letters(i))).collect()),
+            ("blogN.example.com", (1..=1000).map(|i| format!("blog{i}.example.com")).collect()),
+        ]
+    }
+
+    /// The F9 regression: over 2–7 nodes and every naming / key family above,
+    /// each node owns within ±30 % of an even share. (Scheme 1 put 1000/1000
+    /// of `s001…s1000` on `n2` of `n1/n2/n3`, and 0 sites on some nodes in
+    /// most other combinations.) With ≥ 702 keys the binomial standard
+    /// deviation at 7 nodes is ~9 % of the mean, so the bound is > 3σ — a
+    /// sound hash cannot flake it, and the inputs are fixed anyway.
+    #[test]
+    fn hrw_owner_balances_shared_prefix_site_keys() {
+        for (family, sites) in site_families() {
+            for naming in 0..4 {
+                for k in 2..=7 {
+                    let ids = node_ids(naming, k);
+                    let nodes: Vec<NodeInfo> = ids.iter().map(|id| alive(id)).collect();
+                    let mut counts = std::collections::HashMap::<&str, usize>::new();
+                    for site in &sites {
+                        *counts.entry(hrw_owner(&nodes, site).unwrap().id.as_str()).or_default() +=
+                            1;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let even = sites.len() as f64 / k as f64;
+                    for id in &ids {
+                        let got = counts.get(id.as_str()).copied().unwrap_or(0);
+                        #[allow(clippy::cast_precision_loss)]
+                        let ratio = got as f64 / even;
+                        assert!(
+                            (0.7..=1.3).contains(&ratio),
+                            "{family} over {ids:?}: {id} owns {got} of {} (even {even:.0}); \
+                             all: {counts:?}",
+                            sites.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The HRW minimal-disruption property, exhaustively over the same inputs:
+    /// removing a node moves **only** that node's sites, each to the node that
+    /// ranked second for it (a warm replica) — and adding a node moves sites
+    /// **only onto** the new node.
+    #[test]
+    fn hrw_membership_change_moves_only_the_affected_nodes_sites() {
+        for (family, sites) in site_families() {
+            for naming in 0..4 {
+                for k in 3..=7 {
+                    let ids = node_ids(naming, k);
+                    let full: Vec<NodeInfo> = ids.iter().map(|id| alive(id)).collect();
+                    let before: Vec<&str> =
+                        sites.iter().map(|s| hrw_owner(&full, s).unwrap().id.as_str()).collect();
+                    for gone in &ids {
+                        let survivors: Vec<NodeInfo> =
+                            full.iter().filter(|n| &n.id != gone).cloned().collect();
+                        let mut moved = 0usize;
+                        for (site, old) in sites.iter().zip(&before) {
+                            let new = hrw_owner(&survivors, site).unwrap().id.as_str();
+                            if old == gone {
+                                moved += 1;
+                                // The runner-up over the full set.
+                                let runner_up = full
+                                    .iter()
+                                    .filter(|n| &n.id != gone)
+                                    .max_by_key(|n| (hrw_score(&n.id, site), n.id.as_str()))
+                                    .unwrap();
+                                assert_eq!(new, runner_up.id, "{family}: {site} after {gone} left");
+                            } else {
+                                assert_eq!(
+                                    new, *old,
+                                    "{family} over {ids:?}: {site} moved off {old} when {gone} \
+                                     (not its owner) left"
+                                );
+                            }
+                        }
+                        assert!(moved > 0, "{family}: {gone} owned nothing over {ids:?}");
+                        // Read the other way round (survivors -> full), the
+                        // same comparison shows a join moves sites only onto
+                        // the joiner: every site either kept its owner or
+                        // went to `gone`.
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hrw_scheme_mismatch_detection() {
+        let mut current = alive("ephpm-0");
+        current.hrw_scheme = Some(HRW_SCHEME);
+        let legacy = alive("ephpm-1"); // pre-v0.13.0: advertises nothing
+        let mut future = alive("ephpm-2");
+        future.hrw_scheme = Some(HRW_SCHEME + 1);
+        let mut dead_legacy = dead("ephpm-3");
+        dead_legacy.hrw_scheme = None;
+
+        assert_eq!(hrw_scheme_mismatches(std::slice::from_ref(&current)), Vec::new());
+        assert_eq!(
+            hrw_scheme_mismatches(&[current, legacy, future, dead_legacy]),
+            vec![("ephpm-1".to_string(), None), ("ephpm-2".to_string(), Some(HRW_SCHEME + 1))],
+            "alive peers with a missing or different scheme are reported; dead ones are not"
+        );
     }
 
     // ----- Ownership converges on live membership (PR #416 blocker 3) -----

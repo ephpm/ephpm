@@ -29,14 +29,37 @@ pub struct NodeInfo {
     /// predates the advertisement; callers then assume their own
     /// `[cluster.kv] data_port`, which is what every node did before.
     pub data_port: Option<u16>,
+    /// The per-site ownership hash scheme the node advertises in its gossip
+    /// state ([`HRW_SCHEME_KEY`]). `None` for a node that predates the
+    /// advertisement (≤ v0.12.x, which used scheme `1`). See
+    /// [`crate::sqlite_election::HRW_SCHEME`].
+    pub hrw_scheme: Option<u32>,
 }
 
 impl NodeInfo {
-    /// A node known only by id and gossip address — no advertised data port.
+    /// A node known only by id and gossip address — no advertised data port
+    /// and no advertised ownership-hash scheme.
     #[must_use]
     pub fn new(id: impl Into<String>, gossip_addr: impl Into<String>, state: NodeState) -> Self {
-        Self { id: id.into(), gossip_addr: gossip_addr.into(), state, data_port: None }
+        Self {
+            id: id.into(),
+            gossip_addr: gossip_addr.into(),
+            state,
+            data_port: None,
+            hrw_scheme: None,
+        }
     }
+}
+
+/// Chitchat key under which a node advertises the per-site ownership hash
+/// scheme it computes ([`crate::sqlite_election::HRW_SCHEME`]), so a node
+/// can detect peers that would disagree with it on every site's owner.
+/// Outside the `kv:` prefix so the KV applier never sees it.
+pub const HRW_SCHEME_KEY: &str = "ephpm:hrw_scheme";
+
+/// Read a node's advertised ownership-hash scheme from its gossip state.
+fn advertised_hrw_scheme(state: &chitchat::NodeState) -> Option<u32> {
+    state.get(HRW_SCHEME_KEY).and_then(|s| s.parse().ok())
 }
 
 /// Chitchat key under which a node advertises its KV data plane port.
@@ -105,22 +128,17 @@ impl ClusterHandle {
 
         let mut nodes = Vec::with_capacity(live_ids.len() + dead_ids.len());
 
-        for id in &live_ids {
-            nodes.push(NodeInfo {
-                id: id.node_id.clone(),
-                gossip_addr: id.gossip_advertise_addr.to_string(),
-                state: NodeState::Alive,
-                data_port: guard.node_state(id).and_then(advertised_data_port),
-            });
-        }
-
-        for id in &dead_ids {
-            nodes.push(NodeInfo {
-                id: id.node_id.clone(),
-                gossip_addr: id.gossip_advertise_addr.to_string(),
-                state: NodeState::Dead,
-                data_port: guard.node_state(id).and_then(advertised_data_port),
-            });
+        for (ids, state) in [(&live_ids, NodeState::Alive), (&dead_ids, NodeState::Dead)] {
+            for id in ids {
+                let node_state = guard.node_state(id);
+                nodes.push(NodeInfo {
+                    id: id.node_id.clone(),
+                    gossip_addr: id.gossip_advertise_addr.to_string(),
+                    state,
+                    data_port: node_state.and_then(advertised_data_port),
+                    hrw_scheme: node_state.and_then(advertised_hrw_scheme),
+                });
+            }
         }
 
         // Include self if not already in live/dead sets (always alive).
@@ -142,6 +160,7 @@ impl ClusterHandle {
             gossip_addr: self.gossip_addr.to_string(),
             state: NodeState::Alive,
             data_port: Some(self.data_port),
+            hrw_scheme: Some(crate::sqlite_election::HRW_SCHEME),
         }
     }
 
@@ -250,7 +269,16 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
     // Advertise where this node's KV data plane can be reached, so peers
     // dial the port this node actually listens on rather than their own.
     let data_port = config.kv.data_port;
-    handle.chitchat().lock().await.self_node_state().set(KV_DATA_PORT_KEY, data_port.to_string());
+    // Also advertise the per-site ownership hash scheme, so a peer running a
+    // different one is detected (`spawn_hrw_scheme_watch`) instead of
+    // silently disagreeing on every site's owner.
+    {
+        let chitchat = handle.chitchat();
+        let mut guard = chitchat.lock().await;
+        let state = guard.self_node_state();
+        state.set(KV_DATA_PORT_KEY, data_port.to_string());
+        state.set(HRW_SCHEME_KEY, crate::sqlite_election::HRW_SCHEME.to_string());
+    }
 
     tracing::info!(
         %node_id,
