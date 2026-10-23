@@ -1793,10 +1793,11 @@ pub struct MetricsConfig {
     #[serde(default)]
     pub token: Option<String>,
 
-    /// Serve the metrics endpoint — and `/_ephpm/requests` — on this separate
+    /// Serve the metrics endpoint — and `/_ephpm/requests` and the KV
+    /// snapshot controls `/_ephpm/kv/snapshot[/load]` — on this separate
     /// address (e.g. `"127.0.0.1:9100"`) instead of the main listener. When
-    /// set, neither is answered on the main listener (the metrics path falls
-    /// through to the application there; `/_ephpm/requests` answers `404`
+    /// set, none is answered on the main listener (the metrics path falls
+    /// through to the application there; the `/_ephpm/` ones answer `404`
     /// naming this knob). Health, readiness and primary probes stay on the
     /// main listener. The ACL and token still apply on this listener.
     ///
@@ -1884,9 +1885,15 @@ pub struct DiagnosticsConfig {
     #[serde(default)]
     pub deny: Vec<String>,
 
-    /// Bearer token for `/_ephpm/requests`. Same semantics as
+    /// Bearer token for `/_ephpm/requests` and the KV snapshot controls
+    /// (`/_ephpm/kv/snapshot[/load]`). Same semantics as
     /// [`MetricsConfig::token`], including the multi-site requirement. Not
     /// required for the probes.
+    ///
+    /// The state-changing snapshot calls (`POST /_ephpm/kv/snapshot`,
+    /// `POST /_ephpm/kv/snapshot/load`) need a credential on **every** node,
+    /// single-site included: with this unset (and no mTLS metrics listener)
+    /// they are refused with `403`.
     ///
     /// Env override: `EPHPM_SERVER__DIAGNOSTICS__TOKEN`.
     ///

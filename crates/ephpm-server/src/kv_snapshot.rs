@@ -186,6 +186,9 @@ pub struct KvSnapshotService {
     /// [`load_after_pull`](Self::load_after_pull), which restores the snapshot
     /// only when no alive peer was found.
     defer_to_peers: bool,
+    /// Object mode with no `path`: the private staging directory this
+    /// process created, removed when the service is dropped.
+    _staging: Option<PrivateStagingDir>,
     /// Serialises saves: a second trigger waits for (or, for the HTTP
     /// endpoint, is refused during) the one in flight.
     saving: tokio::sync::Mutex<()>,
@@ -308,24 +311,42 @@ impl KvSnapshotService {
             .as_bytes()
             .to_vec();
         let identity = resolve_identity(config);
-        let (dir, target) = if snap.is_object() {
+        let (dir, target, staging) = if snap.is_object() {
             let (client, prefix) = object_client_from_config(config)?;
-            let dir = snap
-                .path
-                .as_deref()
-                .map_or_else(|| std::env::temp_dir().join("ephpm-kv-snapshot"), PathBuf::from);
-            (dir, Target::Object { client: Arc::new(client), key: object_key(&prefix, &identity) })
+            let target =
+                Target::Object { client: Arc::new(client), key: object_key(&prefix, &identity) };
+            match snap.path.as_deref() {
+                Some(path) => (PathBuf::from(path), target, None),
+                // No `path`: stage in a fresh private directory, never a
+                // predictable shared one. A fixed `$TMPDIR/ephpm-kv-snapshot`
+                // could be pre-created (or symlinked) by another local user
+                // before this process — still root, ahead of the privilege
+                // drop — downloaded into it.
+                None => {
+                    let staging = PrivateStagingDir::create(&std::env::temp_dir())
+                        .context("creating the [kv.snapshot] staging directory")?;
+                    (staging.path().to_path_buf(), target, Some(staging))
+                }
+            }
         } else {
             let dir = PathBuf::from(
                 snap.path.as_deref().context("[kv.snapshot] mode = \"local\" requires path")?,
             );
-            (dir, Target::Local)
+            (dir, Target::Local, None)
         };
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating [kv.snapshot] directory {}", dir.display()))?;
         let file = dir.join(format!("{identity}.{SNAPSHOT_EXTENSION}"));
         remove_stale_temp_files(&dir, &identity);
         let node_id = node_id.map_or_else(|| identity.clone(), str::to_string);
+        if config.server.diagnostics.token.as_deref().is_none_or(|t| t.trim().is_empty()) {
+            tracing::info!(
+                "[server.diagnostics] token is unset: POST /_ephpm/kv/snapshot and \
+                 /_ephpm/kv/snapshot/load (`ephpm kv snapshot save|load`) are refused until it \
+                 is set (or the controls are reached over an mTLS [server.metrics] listen); \
+                 periodic and shutdown saves are unaffected"
+            );
+        }
         match &target {
             Target::Local => tracing::info!(
                 file = %file.display(),
@@ -359,6 +380,7 @@ impl KvSnapshotService {
             on_shutdown: snap.on_shutdown,
             load_on_start: snap.load_on_start,
             defer_to_peers,
+            _staging: staging,
             saving: tokio::sync::Mutex::new(()),
             last_save: std::sync::Mutex::new(None),
             last_load: std::sync::Mutex::new(None),
@@ -370,6 +392,22 @@ impl KvSnapshotService {
     #[must_use]
     pub fn file(&self) -> &Path {
         &self.file
+    }
+
+    /// The paths this service keeps writing to after startup — the snapshot
+    /// (or staging) directory and, when it exists, the snapshot file — for
+    /// the privilege drop to hand to the serving user. Not recursive: the
+    /// directory may be an operator-chosen path that holds other files.
+    #[must_use]
+    pub fn runtime_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(dir) = self.file.parent() {
+            out.push(dir.to_path_buf());
+        }
+        if self.file.exists() {
+            out.push(self.file.clone());
+        }
+        out
     }
 
     /// `s3://bucket/key` in object mode.
@@ -793,6 +831,65 @@ impl KvSnapshotService {
 
 /// Remove `.<identity>.kvsnap.tmp-*` files a crashed or timed-out writer left
 /// in `dir`. They are never loadable (no trailer), only wasted space.
+/// A staging directory this process created for itself: a fresh,
+/// unpredictable name under the system temp directory, made with `mkdir`
+/// (which fails rather than following anything already at that path) and
+/// mode `0700` on Unix. Removed on drop.
+///
+/// Object mode only needs the staging file for the duration of one transfer,
+/// and the object is authoritative, so nothing is lost by not reusing a
+/// previous process's directory. A process killed without dropping the
+/// service leaves its directory behind (ciphertext only); set
+/// `[kv.snapshot] path` for a stable location instead.
+#[derive(Debug)]
+struct PrivateStagingDir {
+    path: PathBuf,
+}
+
+impl PrivateStagingDir {
+    /// Create `<base>/ephpm-kv-snapshot-<pid>-<random>`.
+    fn create(base: &Path) -> std::io::Result<Self> {
+        let pid = std::process::id();
+        let mut last_err = None;
+        for _ in 0..16 {
+            let mut raw = [0u8; 8];
+            getrandom::fill(&mut raw).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let nonce = u64::from_le_bytes(raw);
+            let path = base.join(format!("ephpm-kv-snapshot-{pid}-{nonce:016x}"));
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            // Windows: the system temp dir is already per-user.
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::other("no staging directory name free")))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateStagingDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(dir = %self.path.display(), "could not remove KV snapshot staging dir: {e}");
+        }
+    }
+}
+
 fn remove_stale_temp_files(dir: &Path, identity: &str) {
     let prefix = format!(".{identity}.{SNAPSHOT_EXTENSION}.tmp-");
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -904,6 +1001,29 @@ mod tests {
         assert_eq!(status["last_load"]["outcome"], "ok");
         assert_eq!(status["last_load"]["written_by"], "gossip-id");
         assert!(status["file_bytes"].as_u64().unwrap() > 0);
+    }
+
+    /// The object-mode staging directory (no `path`) is fresh, private and
+    /// removed on drop — never a predictable shared path another local user
+    /// could pre-create or symlink before startup.
+    #[test]
+    fn private_staging_dir_is_fresh_private_and_removed_on_drop() {
+        let base = tempfile::tempdir().unwrap();
+        let a = PrivateStagingDir::create(base.path()).unwrap();
+        let b = PrivateStagingDir::create(base.path()).unwrap();
+        assert_ne!(a.path(), b.path(), "unpredictable, per-call names");
+        let meta = std::fs::symlink_metadata(a.path()).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::write(a.path().join("x.kvsnap"), b"sealed").unwrap();
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists(), "removed with its contents on drop");
+        assert!(b.path().exists());
     }
 
     #[tokio::test]

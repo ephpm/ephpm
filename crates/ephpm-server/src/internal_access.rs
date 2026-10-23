@@ -1,6 +1,7 @@
 //! Access policy for the **data-bearing** internal endpoints: the Prometheus
-//! endpoint (`[server.metrics] path`, default `/metrics`) and the request
-//! timeline (`/_ephpm/requests`).
+//! endpoint (`[server.metrics] path`, default `/metrics`), the request
+//! timeline (`/_ephpm/requests`) and the KV snapshot controls
+//! (`/_ephpm/kv/snapshot`, `/_ephpm/kv/snapshot/load`).
 //!
 //! # Why these two, and not the probes
 //!
@@ -36,6 +37,19 @@
 //! certificate on the mTLS metrics listener (`client_ca`). So on a multi-site
 //! node (outside `ephpm dev`) these endpoints are refused with `403` until one
 //! of those credentials is configured — see [`InternalAccess::new`].
+//!
+//! # State-changing endpoints: a credential everywhere
+//!
+//! `POST /_ephpm/kv/snapshot` (write a snapshot now) and
+//! `POST /_ephpm/kv/snapshot/load` (overwrite live keys with the snapshot's
+//! values) are not reads. An open default is acceptable for "who can see my
+//! counters", not for "who can roll every session and lock token back". Their
+//! policy is built with [`InternalAccess::credential_always`]: a credential is
+//! required on **every** node, single-site included, and `ephpm dev` does not
+//! lift it. With no `[server.diagnostics] token` (and no mTLS metrics
+//! listener) they are refused with `403` — fail closed; the periodic and
+//! shutdown saves, which need no HTTP call, keep working. The read-only
+//! `GET /_ephpm/kv/snapshot` status keeps the `/_ephpm/requests` gate.
 //!
 //! # Evaluation order
 //!
@@ -133,6 +147,9 @@ pub struct InternalAccess {
     /// Multi-site: a credential (token, or a verified client certificate) is
     /// mandatory.
     require_credential: bool,
+    /// Why a credential is mandatory, for the `403` body. `None` = the
+    /// multi-site reason ("every tenant's PHP can reach this listener").
+    credential_reason: Option<&'static str>,
 }
 
 /// Redacts the token, like the config structs it is built from.
@@ -145,6 +162,7 @@ impl std::fmt::Debug for InternalAccess {
             .field("deny_all", &self.deny_all)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("require_credential", &self.require_credential)
+            .field("credential_reason", &self.credential_reason)
             .finish()
     }
 }
@@ -173,7 +191,28 @@ impl InternalAccess {
             deny_all,
             token: token.map(|t| t.trim().as_bytes().to_vec().into_boxed_slice()),
             require_credential,
+            credential_reason: None,
         }
+    }
+
+    /// Build a policy that demands a credential **on every node**, single-site
+    /// included, for an endpoint that changes server state (the KV snapshot
+    /// `save`/`load` controls). The IP ACL still applies on top; `reason`
+    /// is the sentence the `403` gives when no credential is configured.
+    ///
+    /// Unlike [`Self::new`]'s multi-site requirement, `ephpm dev` does not
+    /// lift this one: callers never pass it to [`Self::set_require_credential`].
+    #[must_use]
+    pub fn credential_always(
+        section: &'static str,
+        allow: &[String],
+        deny: &[String],
+        token: Option<&str>,
+        reason: &'static str,
+    ) -> Self {
+        let mut policy = Self::new(section, allow, deny, token, true);
+        policy.credential_reason = Some(reason);
+        policy
     }
 
     /// Override the multi-site credential requirement (`ephpm dev` lifts it).
@@ -286,12 +325,18 @@ impl InternalAccess {
             ),
             Verdict::CredentialRequired => (
                 StatusCode::FORBIDDEN,
-                format!(
-                    "403 Forbidden: on a multi-site node this endpoint is served only with a \
-                     credential, because every tenant's PHP can reach this listener. Set \
-                     {section} token (or serve it on an mTLS [server.metrics] listen with \
-                     client_ca)."
-                ),
+                match self.credential_reason {
+                    Some(reason) => format!(
+                        "403 Forbidden: {reason} Set {section} token (or serve it on an mTLS \
+                         [server.metrics] listen with client_ca)."
+                    ),
+                    None => format!(
+                        "403 Forbidden: on a multi-site node this endpoint is served only with \
+                         a credential, because every tenant's PHP can reach this listener. Set \
+                         {section} token (or serve it on an mTLS [server.metrics] listen with \
+                         client_ca)."
+                    ),
+                },
             ),
             Verdict::Forbidden | Verdict::Allow => (
                 StatusCode::FORBIDDEN,
@@ -518,6 +563,31 @@ mod tests {
         assert_eq!(tok.check(&client("127.0.0.1", &h)), Verdict::Unauthorized);
         let right = headers(&[("authorization", "Bearer t")]);
         assert_eq!(tok.check(&client("127.0.0.1", &right)), Verdict::Allow);
+    }
+
+    /// The state-changing policy needs a credential with no `sites_dir` in
+    /// sight, keeps the ACL on top, and says why in its own words.
+    #[test]
+    fn credential_always_refuses_without_a_credential_and_explains_why() {
+        let h = HeaderMap::new();
+        let none =
+            InternalAccess::credential_always("[server.diagnostics]", &[], &[], None, "BECAUSE.");
+        assert!(none.requires_credential());
+        assert_eq!(none.check(&client("127.0.0.1", &h)), Verdict::CredentialRequired);
+        let r = none.deny_response(Verdict::CredentialRequired);
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        let acl = InternalAccess::credential_always(
+            "[server.diagnostics]",
+            &strings(&["10.0.0.0/8"]),
+            &[],
+            Some("t"),
+            "BECAUSE.",
+        );
+        let right = headers(&[("authorization", "Bearer t")]);
+        assert_eq!(acl.check(&client("10.0.0.1", &right)), Verdict::Allow);
+        assert_eq!(acl.check(&client("203.0.113.9", &right)), Verdict::Forbidden);
+        assert_eq!(acl.check(&client("10.0.0.1", &h)), Verdict::Unauthorized);
     }
 
     #[test]

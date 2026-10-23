@@ -7,10 +7,14 @@
 //!   `[kv] secret`) it also opens the index and prints per-site totals.
 //!   `verify` authenticates and decodes every block.
 //! * **Against a running server**: `save`, `load` and `status` call the
-//!   server's `/_ephpm/kv/snapshot` endpoint, which is gated like
-//!   `/_ephpm/requests` (`[server.diagnostics] allow`/`token`). The URL and
-//!   token come from `--url`/`--token`, or from `--config` (`[server] listen`
-//!   and `[server.diagnostics] token`).
+//!   server's `/_ephpm/kv/snapshot` endpoint. `status` is gated like
+//!   `/_ephpm/requests` (`[server.diagnostics] allow`/`token`); `save` and
+//!   `load` change the live store and need `[server.diagnostics] token` on
+//!   every server, single-site included (or a verified client certificate on
+//!   an mTLS metrics listener, which this CLI does not present). The URL and
+//!   token come from `--url`/`--token`, or from `--config` (`[server.metrics]
+//!   listen` when set, else `[server] listen`; and `[server.diagnostics]
+//!   token`).
 //!
 //! Exit status: `0` success; `1` usage, I/O, connection or server error;
 //! `2` the snapshot is unusable (`verify` found bad blocks, or `inspect`
@@ -82,11 +86,13 @@ pub enum KvSnapshotCommand {
 #[derive(Args, Debug, Clone)]
 pub struct ServerTarget {
     /// Base URL of the server, e.g. http://127.0.0.1:8080. Defaults to
-    /// [server] listen from --config.
+    /// [server.metrics] listen from --config when set (the controls move
+    /// there), else [server] listen.
     #[arg(long)]
     url: Option<String>,
     /// Bearer token for [server.diagnostics] token. Defaults to the value in
-    /// --config. Required on a multi-site server.
+    /// --config. Required for save and load on every server, and for status
+    /// on a multi-site server.
     #[arg(long)]
     token: Option<String>,
     /// Config file to take the URL and token from.
@@ -410,7 +416,7 @@ fn call(target: &ServerTarget, method: &str, path: &str) -> anyhow::Result<ExitC
     let config = target.config.as_deref().map(load_config).transpose()?;
     let base = match (&target.url, &config) {
         (Some(url), _) => url.trim_end_matches('/').to_string(),
-        (None, Some(cfg)) => url_from_listen(&cfg.server.listen),
+        (None, Some(cfg)) => base_url_from_config(cfg),
         (None, None) => anyhow::bail!("pass --url http://host:port or --config <ephpm.toml>"),
     };
     let token = target
@@ -455,6 +461,21 @@ fn call(target: &ServerTarget, method: &str, path: &str) -> anyhow::Result<ExitC
     } else {
         eprintln!("error: {method} {url}: HTTP {status}\n{pretty}");
         Ok(ExitCode::FAILURE)
+    }
+}
+
+/// Where the snapshot controls are served for `config`: the separate metrics
+/// listener when `[server.metrics] listen` is set (`https://` when it has a
+/// certificate) — the controls move there with the other diagnostics —
+/// otherwise the main `[server] listen`.
+fn base_url_from_config(config: &Config) -> String {
+    let metrics = &config.server.metrics;
+    match &metrics.listen {
+        Some(listen) => {
+            let url = url_from_listen(listen);
+            if metrics.tls_cert.is_some() { url.replacen("http://", "https://", 1) } else { url }
+        }
+        None => url_from_listen(&config.server.listen),
     }
 }
 
@@ -520,6 +541,17 @@ fn format_unix_ms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_follows_the_metrics_listener_when_set() {
+        let mut config = Config::default_config().unwrap();
+        config.server.listen = "0.0.0.0:8080".to_string();
+        assert_eq!(base_url_from_config(&config), "http://127.0.0.1:8080");
+        config.server.metrics.listen = Some("127.0.0.1:9100".to_string());
+        assert_eq!(base_url_from_config(&config), "http://127.0.0.1:9100");
+        config.server.metrics.tls_cert = Some("/etc/ephpm/m.pem".into());
+        assert_eq!(base_url_from_config(&config), "https://127.0.0.1:9100");
+    }
 
     #[test]
     fn listen_to_url_maps_unspecified_binds_to_loopback() {

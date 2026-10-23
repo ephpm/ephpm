@@ -3,9 +3,9 @@
 //! Many servers keep their observability endpoints off the public port:
 //! Caddy's admin API on `localhost:2019`, Envoy's admin listener, Traefik's
 //! metrics entrypoint, RoadRunner's metrics plugin address. With `listen` set,
-//! ePHPm does the same: the metrics path and `/_ephpm/requests` are served
-//! **only** here (see [`Router::handle_metrics_listener`]) and not on the main
-//! listener. Health, readiness and primary probes stay on the main listener,
+//! ePHPm does the same: the metrics path, `/_ephpm/requests` and the KV
+//! snapshot controls (`/_ephpm/kv/snapshot[/load]`) are served **only** here
+//! (see [`Router::handle_metrics_listener`]) and not on the main listener. Health, readiness and primary probes stay on the main listener,
 //! where load balancers and kubelets already look for them.
 //!
 //! Optionally HTTPS (`tls_cert`/`tls_key`), and optionally **mutual TLS**
@@ -143,7 +143,7 @@ where
         let router = Arc::clone(&router);
         async move {
             Ok::<_, std::convert::Infallible>(
-                router.handle_metrics_listener(&req, peer, is_tls, mtls),
+                router.handle_metrics_listener(req, peer, is_tls, mtls).await,
             )
         }
     });

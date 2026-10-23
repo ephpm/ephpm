@@ -326,9 +326,21 @@ ephpm kv snapshot verify  /var/lib/ephpm/kv/web-1.kvsnap --config /etc/ephpm/eph
 ```
 
 The server commands use the `/_ephpm/kv/snapshot`
-[control endpoint](/reference/http-endpoints/#server-owned-paths), which is
-gated like `/_ephpm/requests`: on a multi-site node set
-`[server.diagnostics] token` and pass it (or `--config`, which reads it).
+[control endpoint](/reference/http-endpoints/#server-owned-paths). `status` is
+gated like `/_ephpm/requests`. `save` and `load` change the live store — a load
+rolls every key in the snapshot back to its snapshot value, sessions and lock
+tokens included — so they need `[server.diagnostics] token` on **every** node,
+single-site included; without it they are refused with `403`. Set the token
+and pass it (or `--config`, which reads it):
+
+```toml
+[server.diagnostics]
+token = "a-long-random-string"   # required for `ephpm kv snapshot save|load`
+```
+
+Periodic (`interval`) and shutdown saves need no token. With
+`[server.metrics] listen` set, the controls are served on that listener only
+(`--config` follows it).
 
 Metrics: `ephpm_kv_snapshot_save_total{outcome,trigger}`,
 `ephpm_kv_snapshot_load_total{outcome,reason}` and friends — see

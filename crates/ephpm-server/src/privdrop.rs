@@ -37,18 +37,20 @@ use ephpm_config::Config;
 ///
 /// A no-op when `run_as_user` is unset. On Unix, when set and the process is
 /// running as root, this binds nothing new — it `chown`s the runtime-writable
-/// directories, then permanently drops supplementary groups, gid, and uid, and
-/// verifies the drop actually took (fails closed if euid is still 0).
+/// directories (plus each of `extra_paths`, non-recursively — the KV
+/// snapshot directory and file), then permanently drops supplementary groups,
+/// gid, and uid, and verifies the drop actually took (fails closed if euid is
+/// still 0).
 ///
 /// # Errors
 ///
-/// Returns an error if the target user/group cannot be resolved, if any
-/// `set*id` syscall fails, or if the post-drop identity is not the requested
-/// one (a failed drop must never be mistaken for a successful one).
+/// Returns an error if the target user/group cannot be resolved, if a chown
+/// or any `set*id` syscall fails, or if the post-drop identity is not the
+/// requested one (a failed drop must never be mistaken for a successful one).
 #[cfg(unix)]
 // The real/effective uid/gid names are intentionally parallel here.
 #[allow(clippy::similar_names)]
-pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
+pub fn drop_privileges(config: &Config, extra_paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
     let Some(user_spec) = config.server.run_as_user.as_deref() else {
         // Group without user is meaningless — warn so it is never silent.
         if config.server.run_as_group.is_some() {
@@ -98,6 +100,11 @@ pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
     // a missing optional directory is not fatal, but a chown failure on a
     // directory that exists is surfaced.
     chown_runtime_dirs(config, uid, gid)?;
+    // Caller-supplied paths (the KV snapshot directory and file): each one
+    // itself only, never recursively, and never through a symlink.
+    for path in extra_paths {
+        lchown(path, uid, gid).with_context(|| format!("failed to chown {}", path.display()))?;
+    }
 
     drop_to_user(uid, gid)?;
 
@@ -186,7 +193,7 @@ pub fn drop_to_user(uid: u32, gid: u32) -> anyhow::Result<()> {
 /// Never fails on non-Unix — the `run_as_*` knobs are ignored with a WARN.
 /// (The `Result` shape matches the Unix implementation.)
 #[cfg(not(unix))]
-pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
+pub fn drop_privileges(config: &Config, _extra_paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
     if config.server.run_as_user.is_some() || config.server.run_as_group.is_some() {
         tracing::warn!(
             "[server] run_as_user / run_as_group are set but privilege dropping is \
@@ -393,6 +400,6 @@ mod tests {
         // touching credentials, regardless of whether the test runs as root.
         let config = Config::default_config().expect("default config");
         assert!(config.server.run_as_user.is_none());
-        drop_privileges(&config).expect("no-op drop must succeed");
+        drop_privileges(&config, &[]).expect("no-op drop must succeed");
     }
 }
