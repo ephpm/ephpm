@@ -266,9 +266,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "APPEND" => {
             check_args!(cmd, argv, 2);
             let key = key!(argv[0]);
-            match store.append(&key, argv[1]) {
-                Some(new_len) => Frame::integer(i64::try_from(new_len).unwrap_or(i64::MAX)),
-                None => oom(),
+            match store.try_append(&key, argv[1]) {
+                Ok(new_len) => Frame::integer(i64::try_from(new_len).unwrap_or(i64::MAX)),
+                Err(e) => Frame::error(e.to_string()),
             }
         }
         "STRLEN" => {
@@ -2370,5 +2370,45 @@ mod tests {
         assert!(err_text(&reply).contains("exceeds the 8-byte limit"), "{reply:?}");
         assert_eq!(cmd(&s, &["HLEN", "h"]), Frame::integer(0), "nothing written");
         assert_eq!(cmd(&s, &["HSET", "h", "small", "ok"]), Frame::integer(1));
+    }
+
+    /// APPEND on a cluster node with no copy of a large key held elsewhere is
+    /// an error reply, not a create that would replace the value everywhere.
+    #[test]
+    fn append_to_a_key_held_elsewhere_is_an_error() {
+        #[derive(Debug)]
+        struct HeldElsewhere;
+        impl crate::store::Replicator for HeldElsewhere {
+            fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
+                panic!("APPEND must not write when the key is held elsewhere");
+            }
+            fn replicate_remove(&self, _: &str) -> bool {
+                true
+            }
+            fn replicate_expire(&self, _: &str, _: Duration) -> bool {
+                true
+            }
+            fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {}
+            fn replicate_remove_published(&self, _: String) {}
+            fn replicate_hash_field(
+                &self,
+                _: &str,
+                _: &str,
+                apply: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+            ) -> bool {
+                let _ = apply();
+                true
+            }
+            fn fetch_through(&self, _: &str) -> Option<Vec<u8>> {
+                Some(b"the real large value".to_vec())
+            }
+        }
+        let s = store();
+        s.set_replicator(Some(Arc::new(HeldElsewhere)));
+        assert_eq!(
+            err_text(&cmd(&s, &["APPEND", "big", "x"])),
+            crate::store::APPEND_HELD_ELSEWHERE_ERROR
+        );
+        assert_eq!(s.get("big"), None, "nothing created locally");
     }
 }
