@@ -10,6 +10,9 @@ pub mod dns01_linode;
 pub mod dns01_route53;
 pub mod file_cache;
 pub mod fpm_pool;
+pub mod framing;
+#[cfg(test)]
+mod framing_conn_tests;
 mod handoff_gate;
 pub mod http3;
 mod idle;
@@ -1896,10 +1899,14 @@ fn hyper_max_buf_size(configured: usize) -> usize {
 
 /// Serve an HTTP connection over any transport (`TcpStream` or `TlsStream`).
 ///
-/// Uses [`auto::Builder`] which negotiates HTTP/1.1 or HTTP/2 based on the
-/// ALPN protocol agreed during the TLS handshake. Plain (non-TLS) connections
-/// always use HTTP/1.1, since h2c (HTTP/2 cleartext) is not supported by
-/// browsers.
+/// Uses [`auto::Builder`], which serves HTTP/2 when the connection opens with
+/// the HTTP/2 preface and HTTP/1.1 otherwise. Over TLS that follows the ALPN
+/// protocol; on a plain listener it means h2c with prior knowledge is accepted
+/// too (browsers never use it, but `curl --http2-prior-knowledge` does).
+///
+/// Every request first passes [`framing::reject`] (request smuggling), and an
+/// HTTP/1.x request framed by `Transfer-Encoding` gets `Connection: close` on
+/// its response — see [`framing::must_close_after`].
 ///
 /// When `settings.idle_timeout` is non-zero, the stream is wrapped in an
 /// activity-tracking adapter and the connection future is raced against an
@@ -1915,9 +1922,22 @@ async fn serve_connection<I>(
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = hyper::service::service_fn(move |req| {
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
-        async move { router.handle(req, remote_addr, is_tls).await }
+        async move {
+            // Ambiguous framing is refused before routing, middleware, the
+            // reverse proxy or PHP can see the request (request smuggling —
+            // see `framing`).
+            if let Some(rejected) = framing::reject(&req, remote_addr) {
+                return Ok::<_, hyper::Error>(rejected);
+            }
+            let close_after = framing::must_close_after(&req);
+            let mut response = router.handle(req, remote_addr, is_tls).await?;
+            if close_after {
+                framing::mark_connection_close(&mut response);
+            }
+            Ok(response)
+        }
     });
 
     let tracker = idle::ActivityTracker::new();
@@ -1978,6 +1998,9 @@ async fn serve_connection<I>(
 async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, settings: ConnSettings) {
     let io = TokioIo::new(stream);
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        // The redirect echoes `Host` into `Location`, so it needs the same
+        // single-unambiguous-Host guarantee as the main listener.
+        let rejected = framing::reject(&req, remote_addr);
         let host = req
             .headers()
             .get("host")
@@ -1988,6 +2011,9 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
             req.uri().path_and_query().map_or("/", http::uri::PathAndQuery::as_str).to_owned();
 
         async move {
+            if let Some(rejected) = rejected {
+                return Ok(rejected);
+            }
             let location = format!("https://{host}{path_and_query}");
             Ok::<_, hyper::Error>(
                 Response::builder()

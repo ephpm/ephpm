@@ -3811,6 +3811,9 @@ impl Router {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
+        // Shapes the 400 for a body that fails to read (`Connection: close`
+        // on HTTP/1.x only).
+        let req_version = req.version();
         // The body's own exact length, when the transport knows it without a
         // Content-Length header — notably `0` for a request that carries no
         // body at all (an HTTP/1 GET with neither Content-Length nor
@@ -3840,10 +3843,7 @@ impl Router {
                         .record(bytes.len() as f64);
                     Some(bytes)
                 }
-                Err(()) => {
-                    counter!("ephpm_http_body_overflow_total").increment(1);
-                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
-                }
+                Err(rejected) => return *rejected,
             }
         } else {
             None
@@ -3987,13 +3987,9 @@ impl Router {
                     let taken = req.take().expect("request present for buffered worker body");
                     match http_body_util::Limited::new(taken, cap).collect().await {
                         Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(_) => {
-                            counter!("ephpm_http_body_overflow_total").increment(1);
+                        Err(err) => {
                             return apply_response_headers(
-                                error_response(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "413 Payload Too Large",
-                                ),
+                                body_read_failure(&*err, req_version),
                                 &mw_response_headers,
                             );
                         }
@@ -4002,7 +3998,12 @@ impl Router {
                     let taken = req.take().expect("request present for buffered worker body");
                     match taken.collect().await {
                         Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(_) => Vec::new(),
+                        Err(err) => {
+                            return apply_response_headers(
+                                body_read_failure(&err, req_version),
+                                &mw_response_headers,
+                            );
+                        }
                     }
                 };
                 #[allow(clippy::cast_precision_loss)]
@@ -4037,14 +4038,26 @@ impl Router {
             // The streaming cap tripped mid-body: whatever the worker made of
             // the truncated body, the request as sent was over the limit — the
             // client gets a 413, exactly as the Content-Length pre-check would
-            // have produced.
-            if let Some(flag) = body_overflow
-                && flag.load(std::sync::atomic::Ordering::Acquire)
-            {
-                return apply_response_headers(
-                    error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
-                    &mw_response_headers,
-                );
+            // have produced. A body that failed to *read* (malformed chunked
+            // framing, a reset stream) reached the worker as a short body
+            // ending in a clean EOF; the request as sent was malformed, so the
+            // client gets a 400 rather than whatever PHP made of the fragment.
+            if let Some(outcome) = body_overflow {
+                match outcome.load(std::sync::atomic::Ordering::Acquire) {
+                    STREAM_BODY_OVERFLOW => {
+                        return apply_response_headers(
+                            error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                            &mw_response_headers,
+                        );
+                    }
+                    STREAM_BODY_FAILED => {
+                        return apply_response_headers(
+                            crate::framing::bad_request(req_version),
+                            &mw_response_headers,
+                        );
+                    }
+                    _ => {}
+                }
             }
             return apply_response_headers(resp, &mw_response_headers);
         }
@@ -4063,10 +4076,9 @@ impl Router {
                 let taken = req.take().expect("request present for fpm body");
                 match http_body_util::Limited::new(taken, cap).collect().await {
                     Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(_) => {
-                        counter!("ephpm_http_body_overflow_total").increment(1);
+                    Err(err) => {
                         return apply_response_headers(
-                            error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                            body_read_failure(&*err, req_version),
                             &mw_response_headers,
                         );
                     }
@@ -4075,7 +4087,15 @@ impl Router {
                 let taken = req.take().expect("request present for fpm body");
                 match taken.collect().await {
                     Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(_) => Vec::new(),
+                    // A body that failed to read (malformed chunked framing, an
+                    // HTTP/3 body disagreeing with its Content-Length, a reset
+                    // stream) used to run PHP with an empty body.
+                    Err(err) => {
+                        return apply_response_headers(
+                            body_read_failure(&err, req_version),
+                            &mw_response_headers,
+                        );
+                    }
                 }
             };
             #[allow(clippy::cast_precision_loss)]
@@ -4810,23 +4830,31 @@ impl Router {
 
     /// Collect the full request body into a `Vec<u8>`, enforcing
     /// `max_body_size` (the same cap the fpm/worker buffered paths apply):
-    /// `Err(())` when the cap is exceeded (the caller turns it into a 413),
-    /// `Ok` otherwise. Used to buffer the body up front for middleware
+    /// `Err` carries the response to send instead: a 413 when the cap is
+    /// exceeded, a 400 when the body fails to read (see
+    /// [`body_read_failure`]). Used to buffer the body up front for middleware
     /// (`[server.request] middleware_body_limit`); the same bytes are then
     /// handed to PHP, so the body still arrives intact.
-    async fn collect_body_capped<B>(&self, req: Request<B>) -> Result<Vec<u8>, ()>
+    async fn collect_body_capped<B>(
+        &self,
+        req: Request<B>,
+    ) -> Result<Vec<u8>, Box<Response<ServerBody>>>
     where
         B: RequestBody,
     {
+        let version = req.version();
         if self.max_body_size > 0 {
             let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
             http_body_util::Limited::new(req, cap)
                 .collect()
                 .await
                 .map(|c| c.to_bytes().to_vec())
-                .map_err(|_| ())
+                .map_err(|err| Box::new(body_read_failure(&*err, version)))
         } else {
-            req.collect().await.map(|c| c.to_bytes().to_vec()).map_err(|_| ())
+            req.collect()
+                .await
+                .map(|c| c.to_bytes().to_vec())
+                .map_err(|err| Box::new(body_read_failure(&err, version)))
         }
     }
 
@@ -6666,6 +6694,28 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<ServerBody
         .expect("static error response")
 }
 
+/// The response for a request body that could not be read in full.
+///
+/// Only an [`http_body_util::LengthLimitError`] — the body really exceeded
+/// `max_body_size` — is a `413`. Every other read error means the request as
+/// sent was malformed (invalid chunked framing such as a bad or overflowing
+/// chunk size, an HTTP/3 body that disagrees with its `Content-Length`) or was
+/// cut off; that is a `400` with `Connection: close` on HTTP/1.x, since the
+/// connection's framing can no longer be trusted. Before this, every such
+/// error was reported as `413 Payload Too Large`, and on an uncapped path the
+/// request ran PHP with an empty body.
+fn body_read_failure(
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+    version: http::Version,
+) -> Response<ServerBody> {
+    if err.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+        counter!("ephpm_http_body_overflow_total").increment(1);
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+    }
+    tracing::debug!(%err, "request body read failed; answering 400");
+    crate::framing::bad_request(version)
+}
+
 /// Why a PHP-bound request was answered 503 without ever running PHP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShedReason {
@@ -6840,6 +6890,15 @@ fn worker_body_should_stream(
     threshold > 0 && content_length.or(body_exact_len).is_none_or(|len| len >= threshold)
 }
 
+/// [`stream_request_body`] outcome: the body streamed (or is still streaming)
+/// normally.
+const STREAM_BODY_OK: u8 = 0;
+/// [`stream_request_body`] outcome: the body exceeded `max_body_size` (413).
+const STREAM_BODY_OVERFLOW: u8 = 1;
+/// [`stream_request_body`] outcome: the body failed to read — malformed
+/// chunked framing, a reset stream (400).
+const STREAM_BODY_FAILED: u8 = 2;
+
 /// Stream a hyper request body into a [`WorkerBody::Streaming`] (Phase 3).
 ///
 /// Spawns a task that reads the `Incoming` body frame-by-frame and forwards
@@ -6852,7 +6911,7 @@ fn stream_request_body<B: RequestBody>(
     req: Request<B>,
     content_length: Option<u64>,
     max_body_size: u64,
-) -> (ephpm_php::worker_bridge::WorkerBody, Arc<std::sync::atomic::AtomicBool>) {
+) -> (ephpm_php::worker_bridge::WorkerBody, Arc<std::sync::atomic::AtomicU8>) {
     use http_body_util::BodyExt;
 
     let (tx, rx) =
@@ -6863,7 +6922,7 @@ fn stream_request_body<B: RequestBody>(
     // Content-Length pre-check can't see chunked / lying clients, so the cap
     // is enforced on the actual bytes; the router turns the flag into a 413
     // regardless of what the worker produced from the truncated body.
-    let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflow = Arc::new(std::sync::atomic::AtomicU8::new(STREAM_BODY_OK));
     let overflow_task = Arc::clone(&overflow);
 
     tokio::spawn(async move {
@@ -6877,7 +6936,8 @@ fn stream_request_body<B: RequestBody>(
                         }
                         total = total.saturating_add(data.len() as u64);
                         if max_body_size > 0 && total > max_body_size {
-                            overflow_task.store(true, std::sync::atomic::Ordering::Release);
+                            overflow_task
+                                .store(STREAM_BODY_OVERFLOW, std::sync::atomic::Ordering::Release);
                             counter!("ephpm_http_body_overflow_total").increment(1);
                             tracing::warn!(
                                 total,
@@ -6897,7 +6957,11 @@ fn stream_request_body<B: RequestBody>(
                     // Non-data frames (trailers) are ignored for the body.
                 }
                 Some(Err(e)) => {
-                    tracing::debug!(%e, "request body stream error — ending body");
+                    // Recorded before `tx` drops, so the worker's EOF is
+                    // ordered after it and the router answers 400 instead of
+                    // passing off a truncated body as complete.
+                    overflow_task.store(STREAM_BODY_FAILED, std::sync::atomic::Ordering::Release);
+                    tracing::debug!(%e, "request body stream error — ending body, answering 400");
                     break;
                 }
                 None => break, // clean EOF

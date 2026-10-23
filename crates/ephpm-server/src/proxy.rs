@@ -46,9 +46,11 @@
 //! The original `Host` is preserved. `X-Forwarded-For` is set to the resolved
 //! client IP (the inbound proxy chain has already been collapsed to that IP by
 //! `[server.security] trusted_proxies`), `X-Forwarded-Proto` to the client-facing
-//! scheme, and `X-Forwarded-Host` to the original `Host`. Hop-by-hop headers are
-//! stripped in both directions (except the upgrade headers on the WebSocket
-//! path).
+//! scheme, and `X-Forwarded-Host` to the original `Host`. Hop-by-hop headers —
+//! the fixed RFC set plus any field the message's own `Connection` header names
+//! — are stripped in both directions (except the upgrade headers on the
+//! WebSocket path). Requests with ambiguous framing never get here: the
+//! listener's `framing` check refuses them first.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -83,6 +85,7 @@ type ProxyReqBody = UnsyncBoxBody<Bytes, std::io::Error>;
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
+    "proxy-connection",
     "proxy-authenticate",
     "proxy-authorization",
     "te",
@@ -323,7 +326,7 @@ fn build_forward_headers(
 ) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(src.len() + 3);
     for (name, value) in src {
-        if is_hop_by_hop(name.as_str(), keep_upgrade) {
+        if is_hop_by_hop_in(src, name.as_str(), keep_upgrade) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -350,6 +353,27 @@ fn is_hop_by_hop(name: &str, keep_upgrade: bool) -> bool {
         return false;
     }
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// [`is_hop_by_hop`], plus any field the message's own `Connection` header
+/// nominates as hop-by-hop (RFC 9110 §7.6.1: a proxy MUST remove those too).
+/// Without this a client could mark e.g. `Content-Length` or an auth header
+/// as connection-specific and still have it reach the upstream.
+fn is_hop_by_hop_in(headers: &HeaderMap, name: &str, keep_upgrade: bool) -> bool {
+    if is_hop_by_hop(name, keep_upgrade) {
+        return true;
+    }
+    if keep_upgrade
+        && (name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("upgrade"))
+    {
+        return false;
+    }
+    headers.get_all(http::header::CONNECTION).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|&b| b == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(name.as_bytes()))
+    })
 }
 
 /// Insert a header, replacing any existing value, ignoring an unparseable value.
@@ -408,7 +432,7 @@ async fn proxy_http<B: RequestBody>(
     let mut response = Response::builder().status(parts.status);
     if let Some(dst) = response.headers_mut() {
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop(name.as_str(), false) {
+            if !is_hop_by_hop_in(&parts.headers, name.as_str(), false) {
                 dst.append(name.clone(), value.clone());
             }
         }
@@ -493,7 +517,7 @@ async fn proxy_upgrade<B: RequestBody>(
         let mut response = Response::builder().status(parts.status);
         if let Some(dst) = response.headers_mut() {
             for (name, value) in &parts.headers {
-                if !is_hop_by_hop(name.as_str(), false) {
+                if !is_hop_by_hop_in(&parts.headers, name.as_str(), false) {
                     dst.append(name.clone(), value.clone());
                 }
             }
@@ -663,6 +687,35 @@ mod tests {
         assert!(!is_hop_by_hop("Upgrade", true));
         assert!(is_hop_by_hop("Transfer-Encoding", true));
         assert!(!is_hop_by_hop("Content-Type", false));
+        assert!(is_hop_by_hop("Proxy-Connection", false));
+    }
+
+    #[test]
+    fn fields_nominated_by_connection_are_not_forwarded() {
+        let mut src = HeaderMap::new();
+        src.insert("host", HeaderValue::from_static("app.example.com"));
+        src.insert("connection", HeaderValue::from_static("close, X-Secret ,content-length"));
+        src.insert("x-secret", HeaderValue::from_static("1"));
+        src.insert("content-length", HeaderValue::from_static("0"));
+        src.insert("x-kept", HeaderValue::from_static("1"));
+        let addr: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+
+        let out = build_forward_headers(&src, "app.example.com", addr, false, false);
+        assert!(out.get("x-secret").is_none());
+        assert!(out.get("content-length").is_none());
+        assert!(out.get("connection").is_none());
+        assert_eq!(out.get("x-kept").unwrap(), "1");
+
+        // The WebSocket tunnel keeps the upgrade pair even though `Connection:
+        // Upgrade` nominates `Upgrade`.
+        let mut ws = HeaderMap::new();
+        ws.insert("connection", HeaderValue::from_static("keep-alive, Upgrade"));
+        ws.insert("upgrade", HeaderValue::from_static("websocket"));
+        ws.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        let out = build_forward_headers(&ws, "app.example.com", addr, false, true);
+        assert_eq!(out.get("upgrade").unwrap(), "websocket");
+        assert!(out.get("connection").is_some());
+        assert!(out.get("keep-alive").is_none());
     }
 
     #[test]

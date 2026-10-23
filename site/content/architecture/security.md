@@ -13,6 +13,7 @@ This document describes the threat model, trust boundaries, and security design 
 | PHP fatal errors crashing the host process | C wrapper with `zend_try`/`zend_catch` guards; PHP errors never unwind into Rust |
 | PHP memory exhaustion | PHP `memory_limit` INI enforced inside the runtime; Rust allocator is separate. On PHP 8.3.36/8.4.27/8.5.12+ the hard-limit `_exit(137)` is contained to one request on Linux, **not** on macOS/Windows — see [PHP's hard memory limit](/reference/config/#phps-hard-memory-limit) |
 | Malformed HTTP requests | hyper's strict HTTP/1.1 parser rejects protocol violations before reaching PHP |
+| HTTP request smuggling (ambiguous message framing) | A framing check runs before routing, middleware, the reverse proxy and PHP: `Content-Length` + `Transfer-Encoding`, any coding but a single `chunked`, a missing or repeated `Host`, and a `Host` that contradicts the request target are refused with `400` + `Connection: close`; a malformed chunked body is `400`; every `Transfer-Encoding` request closes its connection after the response. See [HTTP request framing](#http-request-framing-request-smuggling) |
 | Path traversal in static file serving | Canonicalize paths and reject any resolved path outside `document_root` |
 | Host-header path traversal in multi-site mode | The `Host` header is validated against a strict DNS-label allowlist before it is joined onto `sites_dir`; separators, `..` segments, NUL, and non-DNS characters are rejected with 404 before routing (independent of `trusted_hosts`) |
 | Slowloris / slow-read attacks | hyper's `header_read_timeout` plus tokio-level timeouts from `[server.timeouts]` (no tower middleware is involved) |
@@ -44,7 +45,41 @@ The controls that exist today, in one place:
 - **Deploy-manifest deny** — a request whose path contains a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json` (case-insensitive, any position) is refused per `deploy_manifests` (`deny`=403 — the default, `ignore`=404, `allow`). A deploy manifest is deployment metadata — build commands, enabled services, the seed sequence — and an application deployed with its document root at the repository root would otherwise serve it verbatim. Deploy tooling is expected to keep the manifest out of a served directory; this is the independent server-side guarantee that a manifest is not *servable* however the site was laid down. It applies to every virtual host in multi-site mode, runs before any filesystem lookup (so it leaks no existence information), and is deliberately independent of `hidden_files` — `hidden_files = "allow"` does not re-open it. It is **not** a general secret-file scanner: it knows these three names and nothing else, so an application's other deployment metadata (`Dockerfile`, `.github/`, framework config) still needs `blocked_paths` or a document root that does not contain it
 - **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, `..` path segments, and invalid UTF-8 are rejected with 400
 - **Literal `\` in a request path is rejected with 400** — on Windows a backslash is a real path separator once the URI path is joined onto a document root, so `/wp-content\.htaccess` opened the same file `/wp-content/.htaccess` does while presenting to every URI-level gate as a single segment starting with `w`. That bypassed `hidden_files` and `blocked_paths` (measured: `GET /wp-content\.htaccess` → 200 with the dotfile's contents, `GET /vendor\x.txt` → 200 through a `blocked_paths = ["/vendor/*"]` rule). The refusal is at the single point every request path is decoded, so `hidden_files`, `deploy_manifests`, `blocked_paths` and the PHP-execution allowlist are all covered rather than one gate at a time, and it applies on **every** platform so a rule an operator verifies on Linux behaves identically on Windows. The encoded spelling `%5C` has always been rejected; this makes the literal spelling agree. Cost: a file whose name literally contains a backslash (legal on Unix) is not servable — it was already unreachable via a conforming client, since `\` is not a valid URI path character and browsers rewrite it to `/`
+- **HTTP request framing check** — refuses requests whose length or virtual host a proxy in front of ePHPm could read differently; see [the next section](#http-request-framing-request-smuggling)
 - **Encrypted cluster transport** — with `[cluster] secret` set, all inter-node traffic is authenticated and sealed with ChaCha20-Poly1305 keys derived per plane via HKDF-SHA256: gossip UDP, the KV data plane, and (when clustered SQLite is in use) the mutual-handshake [cluster channel](/architecture/clustering/#cluster-channel-tcp-opt-in) carrying Turso CDC replication with per-session keys. Clustering fails closed when the secret is empty. Symmetric PSK, not mTLS — see [Clustering → Inter-Node Security](/architecture/clustering/#2-inter-node-security).
+
+### HTTP request framing (request smuggling)
+
+Request smuggling needs a proxy in front of ePHPm (a CDN, load balancer, or nginx) and ePHPm to disagree about where one request ends and the next begins, or about which virtual host a request is for. hyper parses HTTP/1.1 strictly, but where RFC 9112 leaves the choice to the server it is lenient, and a front proxy may choose differently. Since v0.13.1 ePHPm checks every request **before** routing, middleware, the [reverse proxy](/guides/reverse-proxy/) and PHP see it. The check covers the main listeners, the HTTP→HTTPS redirect listener and HTTP/3.
+
+**HTTP/1.x.** A request is refused with `400 Bad Request` and `Connection: close` if any of these is true:
+
+| Request | Before v0.13.1 | Now |
+|---|---|---|
+| Both `Content-Length` and `Transfer-Encoding` | `200`. TE framed the body and the connection stayed open. When `Content-Length` came first, both headers reached PHP. | `400`, connection closed |
+| `Transfer-Encoding` that is not exactly one `chunked` coding: `gzip, chunked`, `, chunked`, `chunked, chunked`, `gzip` + `chunked` on two lines | `200`. hyper checks only the last coding, so PHP received a body still in the inner coding. | `400`, connection closed |
+| `Transfer-Encoding` whose last coding is not `chunked` (`chunked, identity`, `identity`, `xchunked`, `chunked,`) | `400` from hyper | unchanged (`400` from hyper, connection closed) |
+| `Transfer-Encoding` on HTTP/1.0 | `400` from hyper | unchanged |
+| Conflicting or non-numeric `Content-Length` (`3` and `4`, `3, 4`, `+3`) | `400` from hyper | unchanged. Identical repeated values are one length and are served. |
+| obs-fold continuation lines, a space before the colon | `400` from hyper | unchanged |
+| HTTP/1.1 without `Host` | `200` | `400` |
+| More than one `Host` | `200`. The first one picked the virtual host. | `400` |
+| Absolute-form target whose authority differs from `Host` (`GET http://b/ HTTP/1.1` + `Host: a`) | `200`. ePHPm routed on `Host` and a proxy on the URI. | `400`. Matching values (compared case-insensitively, port included) are served. |
+| Invalid chunked body: a bad or overflowing chunk size, a bare LF in a chunk extension, missing CRLF after a chunk | `413 Payload Too Large`. With `max_body_size = 0`, PHP ran with an **empty** body. | `400`, connection closed. Worker mode answers `400` too when the body was streaming into the worker. |
+
+**One case cannot be refused.** When `Transfer-Encoding` comes **before** `Content-Length` in the header block, hyper drops the `Content-Length` before ePHPm sees the request. That request is framed by `Transfer-Encoding`, which RFC 9112 §6.3 permits only if the server closes the connection after responding. So **every HTTP/1.x request that carries `Transfer-Encoding` gets `Connection: close`** on its response. Bytes a `Content-Length`-honouring front end treated as part of that body are therefore never parsed as a second request. The cost is that chunked uploads do not reuse their connection. Browsers never send chunked request bodies.
+
+Only `413` now means the body exceeded `max_body_size`. Rejections are counted in [`ephpm_http_framing_rejected_total{reason}`](/reference/metrics/#http) and logged at DEBUG. Malformed chunked bodies are not counted there, because they fail while the body is read, not at the framing check.
+
+**Reverse proxy.** Hop-by-hop fields (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`) are not forwarded. Neither is any field the message's own `Connection` header names (RFC 9110 §7.6.1). The upstream request is re-framed by ePHPm's HTTP client from a body whose length has already been validated.
+
+**HTTP/2** (over TLS via ALPN, and as h2c with prior knowledge on a plain listener). There is no `Transfer-Encoding` framing. The `h2` crate refuses connection-specific fields (`Connection`, `Transfer-Encoding`, `Keep-Alive`, `Proxy-Connection`, `Upgrade`, and `TE` other than `trailers`). It also checks `Content-Length` against the DATA frames and resets the stream on a mismatch. On top of that, ePHPm refuses more than one `Host`, and a `Host` that differs from `:authority`, with `400`.
+
+**HTTP/3** (`[server.http3]`). The `h3` crate (0.0.8) refuses a `Host` that contradicts `:authority`. It does **not** refuse connection-specific fields or check `Content-Length` against the DATA frames, so ePHPm does both:
+- Those fields get `400`.
+- A body that runs past, or ends short of, its declared `Content-Length` gets `400`. Before v0.13.1 it reached PHP with a `CONTENT_LENGTH` that did not match the bytes PHP read.
+
+HTTP/2 and HTTP/3 streams are framed independently, so a malformed request there cannot desynchronise the requests that follow it.
 
 ---
 
@@ -83,7 +118,7 @@ The controls that exist today, in one place:
 
 ### Boundary rules
 
-1. **Internet → Rust**: All input is untrusted. hyper validates HTTP framing. ePHPm enforces size limits on headers and bodies before any allocation.
+1. **Internet → Rust**: All input is untrusted. hyper parses HTTP framing, and ePHPm's [framing check](#http-request-framing-request-smuggling) refuses the cases hyper leaves ambiguous. ePHPm enforces size limits on headers and bodies before any allocation.
 2. **Rust → PHP**: The request is mapped to `$_SERVER`, `php://input`, etc. through SAPI callbacks. Rust controls what PHP sees — raw socket data never reaches PHP directly.
 3. **PHP → Upstream**: PHP application code connects to databases and caches. When `[db.mysql]` / `[db.postgres]` (the [DB proxy](/architecture/database/db-proxy/)) or `[db.sqlite]` (embedded) is configured, **ePHPm does intercept these connections** — it terminates the wire protocol in Rust, pools upstream connections, and parses every statement for [query stats](/architecture/query-stats/). Two consequences worth knowing:
    - **Your SQL is normalized and exported.** Literals are replaced with `?`, the result is truncated to 64 characters and emitted as the `digest` Prometheus label, and slow queries are logged at WARN. Parameter *values* are never included — the normalizer strips them — but table, column, and query shape are visible to anyone who can read `/metrics` or the logs. "Anyone who can read `/metrics`" can be broad: the endpoint answers for every `Host` and is matched before `trusted_hosts`, `blocked_paths` and middleware, and on a single-site node its IP ACL is open by default. On a multi-site node it (and `/_ephpm/requests`) answers `403` until a `token` or an mTLS listener is configured. See [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first) for what they reveal and how to restrict them.
