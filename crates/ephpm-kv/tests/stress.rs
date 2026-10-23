@@ -46,6 +46,11 @@ impl TestServer {
         let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(config);
+        // Active expiry belongs to the store, not the RESP listener (#599):
+        // `serve_on` starts no reaper, so start it here as `ephpm-server`'s
+        // `start_kv_service` does. The thread holds only a weak reference and
+        // exits once the server task (the last strong owner) is aborted.
+        ephpm_kv::expiry::spawn(&store, None).expect("failed to start KV active expiry");
         let handle = tokio::spawn(async move {
             server::serve_on(
                 store,
@@ -93,6 +98,9 @@ impl HmacTestServer {
 
         let store = Store::new(StoreConfig::default());
         let mt = MultiTenantStore::new(Arc::clone(&store), StoreConfig::default());
+        // As in `TestServer`: expiry is started with the stores, covering
+        // every per-site store too.
+        ephpm_kv::expiry::spawn(&store, Some(&mt)).expect("failed to start KV active expiry");
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
             server::serve_on(
@@ -204,9 +212,12 @@ async fn ttl_expiry_under_load() {
     let initial: i64 = redis::cmd("DBSIZE").query_async(&mut con).await.unwrap();
     assert_dbsize(initial, TTL_KEY_COUNT, "TTL keys initial");
 
-    // Poll until all keys are expired. The reaper runs every 1s with a sample
-    // size of 100, so we need to give it enough cycles. Maximum TTL is ~1s,
-    // plus reaper delay — 10s total timeout is very generous.
+    // Poll until all keys are expired. Nothing reads these keys, so lazy
+    // expiry never removes them and DBSIZE (like Redis') keeps counting them
+    // until the active-expiry thread reaps them. It wakes every
+    // `ACTIVE_EXPIRE_INTERVAL` (100 ms) and keeps sampling while most of its
+    // sample is expired, so all 200 go within a tick or two of the last
+    // deadline (~1 s). 10 s is a generous bound.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;

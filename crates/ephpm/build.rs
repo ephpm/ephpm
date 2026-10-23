@@ -67,6 +67,16 @@ fn main() {
     //
     // This must be in the binary crate's build.rs because rustc-link-arg
     // only takes effect for binary/cdylib targets, not library crates.
+    //
+    // Linux/macOS emit these as `rustc-link-arg-bins`, NOT `rustc-link-arg`:
+    // the latter also reaches this package's integration tests
+    // (tests/*.rs), which only spawn the built binary and link no ephpm-php
+    // code. There `--wrap=_exit` left `__wrap__exit` undefined (std's
+    // `Command::spawn` calls `_exit`), so every PHP-linked
+    // `cargo test`/`nextest` run died at link time and executed zero tests
+    // (#615 -> v0.13.0 audit H1). `-bins` still covers the binary's own
+    // unit-test target, which does link ephpm-php and with it the
+    // crash-guard archive that defines `__wrap__exit`.
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
         return;
     };
@@ -111,11 +121,11 @@ fn main() {
         // zend_signal_startup but typically only delivers it under
         // max_execution_time, which ephpm never sets — it bounds a request
         // at the tokio layer via [server.timeouts] request instead.
-        println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
+        println!("cargo::rustc-link-arg-bins={}", lib_dir.join("libphp.a").display());
         for static_lib in macos_static_libs() {
             let archive = lib_dir.join(format!("lib{static_lib}.a"));
             if archive.exists() {
-                println!("cargo::rustc-link-arg={}", archive.display());
+                println!("cargo::rustc-link-arg-bins={}", archive.display());
             }
         }
         // ICU on macOS is built against libc++ (Apple's C++ stdlib);
@@ -127,7 +137,7 @@ fn main() {
         // Order matters: must come AFTER the static archives so ld64
         // sees the unresolved references first, then resolves them
         // from libc++.
-        println!("cargo::rustc-link-arg=-lc++");
+        println!("cargo::rustc-link-arg-bins=-lc++");
 
         // The PHP 8.5 SDK's sqlite objects call __isPlatformVersionAtLeast
         // (clang emits it for `if (@available(macOS ...))` guards; the
@@ -144,7 +154,7 @@ fn main() {
             let resource_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let builtins = Path::new(&resource_dir).join("lib/darwin/libclang_rt.osx.a");
             if builtins.exists() {
-                println!("cargo::rustc-link-arg={}", builtins.display());
+                println!("cargo::rustc-link-arg-bins={}", builtins.display());
             } else {
                 println!(
                     "cargo::warning=libclang_rt.osx.a not found under {resource_dir}; \
@@ -170,7 +180,7 @@ fn main() {
         // binary, so the load failed with "symbol not found in flat
         // namespace". `-export_dynamic` both exports the symbols and keeps
         // them live through dead-stripping.
-        println!("cargo::rustc-link-arg=-Wl,-export_dynamic");
+        println!("cargo::rustc-link-arg-bins=-Wl,-export_dynamic");
         return;
     }
 
@@ -232,7 +242,7 @@ fn main() {
     // that predate the hard limit (nothing in libphp then calls _exit(137)).
     wrap_funcs.push("_exit");
     for func in &wrap_funcs {
-        println!("cargo::rustc-link-arg=-Wl,--wrap={func}");
+        println!("cargo::rustc-link-arg-bins=-Wl,--wrap={func}");
     }
     println!("cargo::rustc-cfg=php_exit_wrapped");
     // Mirrors the probe in ephpm-php/build.rs (cfgs do not cross crates).
@@ -259,17 +269,17 @@ fn main() {
     // Wrapping in --start-group/--end-group forces multi-pass symbol
     // resolution: PHP's static archives have circular dependencies
     // (libphp.a → libz.a → ...; libcurl → libssl; libxml2 → libz; etc.).
-    println!("cargo::rustc-link-arg=-Wl,-Bstatic");
-    println!("cargo::rustc-link-arg=-Wl,--start-group");
-    println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
+    println!("cargo::rustc-link-arg-bins=-Wl,-Bstatic");
+    println!("cargo::rustc-link-arg-bins=-Wl,--start-group");
+    println!("cargo::rustc-link-arg-bins={}", lib_dir.join("libphp.a").display());
     for static_lib in linux_static_libs() {
         let archive = lib_dir.join(format!("lib{static_lib}.a"));
         if archive.exists() {
-            println!("cargo::rustc-link-arg={}", archive.display());
+            println!("cargo::rustc-link-arg-bins={}", archive.display());
         }
     }
-    println!("cargo::rustc-link-arg=-Wl,--end-group");
-    println!("cargo::rustc-link-arg=-Wl,-Bdynamic");
+    println!("cargo::rustc-link-arg-bins=-Wl,--end-group");
+    println!("cargo::rustc-link-arg-bins=-Wl,-Bdynamic");
 
     // Export the binary's own symbols (the Zend/TSRM API baked in from
     // libphp.a) into the dynamic symbol table. Shared PHP extensions loaded
@@ -280,7 +290,7 @@ fn main() {
     // packages are NTS-only as of 2026-07) are the compatibility target.
     // Harmless on a fully static custom build (no dynamic symbol table to
     // populate — dlopen is unavailable there anyway).
-    println!("cargo::rustc-link-arg=-Wl,--export-dynamic");
+    println!("cargo::rustc-link-arg-bins=-Wl,--export-dynamic");
 }
 
 /// Return `true` when the SDK's `php_config.h` declares

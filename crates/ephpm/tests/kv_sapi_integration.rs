@@ -1,193 +1,128 @@
-//! Integration tests for KV store SAPI functions.
+//! End-to-end: the real `ephpm` binary wires the `ephpm_kv_*` SAPI functions
+//! to its embedded KV store.
 //!
-//! Spins up ephpm with the KV store enabled, executes PHP test code that calls
-//! the `ephpm_kv_*` native functions, and validates the results via HTTP responses.
+//! The functions' semantics are covered in-process by
+//! `crates/ephpm-php/tests/kv_functions.rs`. This test checks the one thing
+//! that suite cannot: that `serve()` actually installs the store behind them,
+//! so a script running in the shipped binary gets real answers instead of the
+//! "KV store not wired" failure values. It drives `tests/php/kv_sapi_test.php`
+//! through HTTP.
 //!
-//! Requires: `cargo xtask release` (PHP linked)
+//! Needs a PHP-linked build (`PHP_SDK_PATH` set); against a stub binary it
+//! fails loudly rather than passing vacuously, hence `#[ignore]`.
 //!
-//! Run with: cargo nextest run -p ephpm --run-ignored all
+//! Run with: `cargo nextest run -p ephpm --test kv_sapi_integration --run-ignored all`
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::io::{BufRead as _, BufReader};
+use std::net::TcpListener;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-/// Helper to wait for a port to be listening.
-fn wait_for_port(port: u16, timeout_secs: u64) -> bool {
-    let start = std::time::Instant::now();
-    loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        if start.elapsed() > Duration::from_secs(timeout_secs) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
+const BIN: &str = env!("CARGO_BIN_EXE_ephpm");
+
+fn pick_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+    port
+}
+
+/// A running `ephpm` child plus every line it has written to stdout/stderr.
+struct Server {
+    child: Child,
+    port: u16,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-/// Install the rustls crypto provider reqwest will look for.
-///
-/// The dev-dependency uses `rustls-tls-webpki-roots-no-provider` so it cannot
-/// drag a second crypto provider into the graph (#241); the cost is that
-/// reqwest panics with "No provider set" unless a process default exists. Go
-/// through the server's own entry point rather than naming a provider here,
-/// so the test client and the server can never disagree.
-fn init_crypto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
-}
-
-/// Helper to make HTTP GET request and parse JSON response.
-async fn get_json(url: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    init_crypto();
-    let resp = reqwest::get(url).await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-
-    if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, body).into());
+impl Server {
+    fn start(config: &Path, port: u16) -> Self {
+        let mut child = Command::new(BIN)
+            .arg("serve")
+            .arg("--config")
+            .arg(config)
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ephpm");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for pipe in [
+            Box::new(child.stdout.take().expect("stdout")) as Box<dyn std::io::Read + Send>,
+            Box::new(child.stderr.take().expect("stderr")),
+        ] {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    eprintln!("ephpm: {line}");
+                    log.lock().unwrap().push(line);
+                }
+            });
+        }
+        let server = Self { child, port, log };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !server.log.lock().unwrap().iter().any(|l| l.contains("HTTP listening")) {
+            assert!(Instant::now() < deadline, "ephpm did not log 'HTTP listening' within 20s");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        server
     }
 
-    serde_json::from_str(&body).map_err(|e| format!("JSON parse error: {}", e).into())
+    fn get(&self, path: &str) -> (u16, String) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let resp = reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{}{path}", self.port))
+                .send()
+                .await
+                .expect("GET");
+            let status = resp.status().as_u16();
+            (status, resp.text().await.expect("body"))
+        })
+    }
 }
 
-/// Create a temporary config file with KV store enabled.
-fn create_test_config(port: u16, docroot: &str) -> (tempfile::NamedTempFile, String) {
-    use std::io::Write;
+#[test]
+#[ignore = "needs a PHP-linked build (PHP_SDK_PATH)"]
+fn kv_sapi_functions_reach_the_embedded_store() {
+    let docroot = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/php");
+    let docroot = docroot.canonicalize().expect("tests/php docroot");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("ephpm.toml");
+    let port = pick_port();
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"127.0.0.1:{port}\"\ndocument_root = {docroot:?}\n\n\
+             [php]\nconcurrency = 2\n"
+        ),
+    )
+    .expect("write config");
 
-    let config_content = format!(
-        r#"[server]
-listen = "127.0.0.1:{port}"
-document_root = "{docroot}"
-index_files = ["index.php", "kv_sapi_test.php"]
-
-[php]
-max_execution_time = 30
-memory_limit = "128M"
-
-[kv]
-enabled = true
-listen = "127.0.0.1:6379"
-"#
+    let server = Server::start(&config, port);
+    let (status, body) = server.get("/kv_sapi_test.php?test=all");
+    assert!(
+        !body.contains("ePHPm Stub"),
+        "the ephpm binary under test is a stub build — build with PHP_SDK_PATH set"
     );
-
-    let mut f = tempfile::NamedTempFile::new().expect("failed to create temp config");
-    f.write_all(config_content.as_bytes()).expect("failed to write config");
-    f.flush().expect("failed to flush config");
-
-    (f, config_content)
-}
-
-/// Find the ephpm binary (built with `cargo xtask release`).
-fn find_ephpm_binary() -> PathBuf {
-    // Try common locations after `cargo xtask release`
-    let candidates = [
-        PathBuf::from("target/x86_64-unknown-linux-gnu/release/ephpm"),
-        PathBuf::from("target/release/ephpm"),
-        PathBuf::from("./ephpm"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
+    let result: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("non-JSON response ({e}), status {status}: {body}"));
+    assert_eq!(status, 200, "kv_sapi_test.php failed: {result}");
+    assert_eq!(result["passed"], true, "kv_sapi_test.php failed: {result}");
+    for check in ["set_get", "del", "exists", "incr", "expire"] {
+        assert_eq!(result["details"][check], "PASS", "{check} did not run: {result}");
     }
-
-    panic!("ephpm binary not found. Run `cargo xtask release` first. Checked: {:?}", candidates);
-}
-
-#[tokio::test]
-#[ignore = "requires cargo xtask release (PHP linked)"]
-async fn kv_sapi_set_get() {
-    let port = 9876;
-    let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
-
-    let (_config_file, _config) = create_test_config(port, docroot);
-    let ephpm = find_ephpm_binary();
-
-    // Spawn ephpm server
-    let mut child = Command::new(&ephpm)
-        .arg("--config")
-        .arg(_config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn ephpm");
-
-    // Wait for server to start
-    assert!(wait_for_port(port as u16, 5), "ephpm server failed to start on port {}", port);
-
-    // Run test and clean up
-    let result = get_json(&format!("http://127.0.0.1:{}/kv_sapi_test.php?test=set_get", port))
-        .await
-        .expect("request failed");
-
-    child.kill().ok();
-    child.wait().ok();
-
-    assert_eq!(
-        result["passed"],
-        true,
-        "test failed: {}",
-        result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires cargo xtask release (PHP linked)"]
-async fn kv_sapi_del() {
-    let port = 9877;
-    let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
-
-    let (_config_file, _config) = create_test_config(port, docroot);
-    let ephpm = find_ephpm_binary();
-
-    let mut child = Command::new(&ephpm)
-        .arg("--config")
-        .arg(_config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn ephpm");
-
-    assert!(wait_for_port(port as u16, 5), "ephpm failed to start");
-
-    let result = get_json(&format!("http://127.0.0.1:{}/kv_sapi_test.php?test=del", port))
-        .await
-        .expect("request failed");
-
-    child.kill().ok();
-    child.wait().ok();
-
-    assert_eq!(result["passed"], true, "test failed");
-}
-
-#[tokio::test]
-#[ignore = "requires cargo xtask release (PHP linked)"]
-async fn kv_sapi_all() {
-    let port = 9878;
-    let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
-
-    let (_config_file, _config) = create_test_config(port, docroot);
-    let ephpm = find_ephpm_binary();
-
-    let mut child = Command::new(&ephpm)
-        .arg("--config")
-        .arg(_config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn ephpm");
-
-    assert!(wait_for_port(port as u16, 5), "ephpm failed to start");
-
-    let result = get_json(&format!("http://127.0.0.1:{}/kv_sapi_test.php?test=all", port))
-        .await
-        .expect("request failed");
-
-    child.kill().ok();
-    child.wait().ok();
-
-    assert_eq!(result["passed"], true, "test failed: {:?}", result.get("error"));
 }

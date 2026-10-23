@@ -182,8 +182,31 @@ async fn gossip_del_removes_key() {
     handle.shutdown().await;
 }
 
+/// Gossip round length `start_gossip` configures (`ChitchatConfig::gossip_interval`
+/// in `ephpm-cluster/src/node.rs`). chitchat re-evaluates liveness once per round.
+const GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Worst-case time for a survivor to mark a silent peer dead, derived from the
+/// failure-detector settings `start_gossip` uses (`FailureDetectorConfig::default()`).
+///
+/// `ClusterHandle::shutdown` stops gossiping but sends no leave message, so a
+/// departure is only ever noticed by chitchat's phi-accrual detector. Its phi
+/// is `elapsed_since_last_heartbeat / mean_interval`, where the mean is
+/// additively smoothed towards `initial_interval` (5 s) with a weight of five
+/// samples. A peer that joined a moment ago has only one or two ~1 s samples,
+/// so its mean is ~4.3 s and it is declared dead after
+/// `phi_threshold` (8) × ~4.3 s ≈ 35 s of silence — not the ~8 s a long-lived
+/// peer (mean → 1 s) gets. The mean can never exceed `initial_interval` while
+/// heartbeats arrive every round, so `phi_threshold × initial_interval` (40 s)
+/// bounds detection; add one round for the next liveness evaluation and one
+/// for the last heartbeat's delivery.
+fn departure_detection_bound() -> Duration {
+    let fd = chitchat::FailureDetectorConfig::default();
+    fd.initial_interval.mul_f64(fd.phi_threshold) + 2 * GOSSIP_INTERVAL
+}
+
 #[tokio::test]
-#[ignore = "failure detection timing depends on chitchat's phi-accrual detector, may take 15-30s"]
+#[ignore = "waits out chitchat's phi-accrual detector for a freshly joined peer (~35 s)"]
 async fn node_departure_detected() {
     let addr1 = free_udp_addr();
     let addr2 = free_udp_addr();
@@ -207,19 +230,36 @@ async fn node_departure_detected() {
     // Shut down the departing node.
     handle2.shutdown().await;
 
-    // Wait for the failure detector to notice. chitchat's default failure
-    // detector may take several seconds with default intervals.
+    // Wait for the failure detector to notice (see `departure_detection_bound`
+    // for where the bound comes from — there is no leave message to speed it up).
+    let bound = departure_detection_bound();
+    let shut_down_at = tokio::time::Instant::now();
+    let deadline = shut_down_at + bound;
     let mut departed = false;
-    for _ in 0..40 {
+    while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let count = handle1.live_node_count().await;
-        if count <= 1 {
+        if handle1.live_node_count().await <= 1 {
             departed = true;
             break;
         }
     }
 
-    assert!(departed, "survivor should detect departing node within 10 seconds");
+    assert!(
+        departed,
+        "survivor should detect the departing node within {bound:?} (phi_threshold x \
+         initial_interval + 2 gossip rounds)"
+    );
+    eprintln!("departure detected after {:?}", shut_down_at.elapsed());
+
+    // Detected, not forgotten: the departed node stays known as Dead until
+    // chitchat's dead-node grace period garbage-collects it.
+    let nodes = handle1.nodes().await;
+    let departed_node = nodes.iter().find(|n| n.id == "departing");
+    assert_eq!(
+        departed_node.map(|n| n.state),
+        Some(NodeState::Dead),
+        "departed node should be reported Dead, got {nodes:?}"
+    );
 
     handle1.shutdown().await;
 }

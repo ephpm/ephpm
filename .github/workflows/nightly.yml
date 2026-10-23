@@ -4,11 +4,13 @@
 # across all supported PHP versions and architectures, plus the E2E test suite.
 #
 # Gating policy: the nightly's overall pass/fail signal is driven by the
-# release-path Build jobs only (build-linux, build-macos, build-windows).
-# Everything else -- the in-build `Run ignored integration tests` step, the
-# fuzz / e2e / smoke-tests / audit jobs -- is "best-effort" with
-# continue-on-error so individual failures don't mask the release signal.
-# Failures still surface on the run page; only the summary check ignores them.
+# Build jobs (build-linux, build-macos, build-windows). On Linux and macOS a
+# Build job also runs the PHP-linked workspace test suite AFTER uploading its
+# artifact, and goes red when any linked test fails or when the suite executed
+# zero tests (`Report PHP-linked tests`); per-leg counts land in the Nightly
+# Summary. The fuzz / e2e / smoke-tests / audit jobs are "best-effort" with
+# continue-on-error so individual failures don't mask that signal. Failures
+# still surface on the run page; only the summary check ignores them.
 # Re-tighten by removing continue-on-error and re-adding the job to the
 # nightly-summary fail gate.
 
@@ -90,27 +92,6 @@ jobs:
             "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
             sh -euc 'cargo xtask release ${{ matrix.php }}'
 
-      - name: Run ignored integration tests
-        # Auxiliary -- does not gate the release path. Currently broken due to
-        # a libphp+libxml2 link-order issue when building debug test binaries
-        # (release builds dodge it via --gc-sections). Tracked as a separate
-        # task; meanwhile keep running it so we can observe the error change.
-        # Runs in ephpm-ci via `docker run`; the SDK downloaded by the build
-        # above and target/ are read back through the /w bind mount.
-        continue-on-error: true
-        run: |
-          docker run --rm -v "$PWD":/w -w /w \
-            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
-            sh -euc '
-              # Linux SDK cache dirs carry the -gnu libc suffix (see
-              # xtask::php_sdk_libc_suffix).
-              PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name "*-${{ matrix.arch.sdk }}-gnu" | head -1)
-              test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
-              PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
-                --target ${{ matrix.arch.triple }} \
-                --workspace --run-ignored ignored-only
-            '
-
       - name: Verify binary
         # cargo xtask release passes the gnu triple explicitly on Linux
         # (glibc-dynamic binary, dlopen-capable), so the artifact lives
@@ -131,6 +112,49 @@ jobs:
         with:
           name: ephpm-php${{ matrix.php }}-${{ matrix.arch.sdk }}
           path: target/${{ matrix.arch.triple }}/release/ephpm
+
+      - name: Run PHP-linked tests
+        # The whole workspace test suite against the real libphp, ignored
+        # tests included (`--run-ignored all`): PR/main CI is stub-only, so
+        # this is the only place hard_memory_limit, request_startup_failure,
+        # kv_functions, exit_semantics, sessions, db_bridge, ... execute.
+        # Runs after the artifact upload so a test failure never costs the
+        # E2E/smoke jobs their binary. continue-on-error only so the report
+        # step below always gets the log; that step is what fails the job --
+        # on any failed test AND on zero tests executed (link failure, missing
+        # SDK), which is how a `--wrap=_exit` link error hid every linked test
+        # for weeks behind continue-on-error (v0.13.0 audit H1).
+        # Runs in ephpm-ci via `docker run`; the SDK downloaded by the build
+        # above and target/ are read back through the /w bind mount.
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_TERM_COLOR=always \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            bash -uo pipefail -c '
+              # Linux SDK cache dirs carry the -gnu libc suffix (see
+              # xtask::php_sdk_libc_suffix).
+              PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name "*-${{ matrix.arch.sdk }}-gnu" | head -1)
+              test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
+              PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
+                --target ${{ matrix.arch.triple }} \
+                --workspace --run-ignored all --no-fail-fast 2>&1 | tee linked-tests.log
+            '
+
+      - name: Report PHP-linked tests
+        if: always()
+        run: |
+          bash .github/scripts/linked-test-report.sh linked-tests.log \
+            "PHP ${{ matrix.php }} ${{ matrix.arch.sdk }}" \
+            "linked-tests-php${{ matrix.php }}-${{ matrix.arch.sdk }}.tsv"
+
+      - name: Upload PHP-linked test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linked-tests-php${{ matrix.php }}-${{ matrix.arch.sdk }}
+          path: linked-tests-php${{ matrix.php }}-${{ matrix.arch.sdk }}.tsv
+          if-no-files-found: ignore
 
   build-macos:
     name: Build (PHP ${{ matrix.php }}, macos-aarch64)
@@ -189,30 +213,6 @@ jobs:
         # toolchain required.
         run: cargo xtask release ${{ matrix.php }}
 
-      - name: Run ignored integration tests
-        # Auxiliary -- does not gate the release path. See build-linux's
-        # equivalent step for context.
-        continue-on-error: true
-        run: |
-          cargo install cargo-nextest --locked || true
-          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-macos-aarch64' | head -1)
-          test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
-          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
-
-      - name: Free disk after the test build
-        # Every PHP-linked debug test binary carries its own copy of libphp +
-        # ICU, so the step above fills the macOS VM's disk. The job then went
-        # red in rust-cache's post step (ENOSPC writing the runner's _diag
-        # log) with the release binary already built and uploaded. The
-        # release binary lives in target/aarch64-apple-darwin, not
-        # target/debug, so dropping the test build loses nothing this job
-        # still needs. `df` before/after so the headroom is in the log.
-        if: always()
-        run: |
-          df -h . || true
-          rm -rf target/debug
-          df -h . || true
-
       - name: Verify binary
         run: |
           FILE="target/aarch64-apple-darwin/release/ephpm"
@@ -225,6 +225,65 @@ jobs:
         with:
           name: ephpm-php${{ matrix.php }}-macos-aarch64
           path: target/aarch64-apple-darwin/release/ephpm
+
+      - name: Free disk before the test build
+        # The macOS VM has ~41 GiB. The fat-LTO release build's intermediates
+        # (deps/, build/, incremental/) plus a PHP-linked debug test build
+        # (every linked test binary carries its own libphp + ICU) do not fit
+        # together: the test link died with `ld: write() failed, errno=28`
+        # (ENOSPC) on every leg. The release binary is already uploaded, so
+        # everything under the release target dir can go.
+        run: |
+          df -h . || true
+          rm -rf target/aarch64-apple-darwin
+          df -h . || true
+
+      - name: Install cargo-nextest
+        # Prebuilt binary: `cargo install` compiled it from source every run.
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          cargo nextest --version
+
+      - name: Run PHP-linked tests
+        # See build-linux's step of the same name: whole workspace, ignored
+        # tests included; the report step below is what fails the job.
+        # CARGO_PROFILE_DEV_STRIP keeps the ~dozens of linked test binaries
+        # small enough for the VM's disk (panic messages survive; file:line
+        # in backtraces does not).
+        continue-on-error: true
+        env:
+          CARGO_PROFILE_DEV_STRIP: debuginfo
+        run: |
+          set -o pipefail
+          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-macos-aarch64' | head -1)
+          test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
+          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored all --no-fail-fast \
+            2>&1 | tee linked-tests.log
+
+      - name: Report PHP-linked tests
+        if: always()
+        run: |
+          bash .github/scripts/linked-test-report.sh linked-tests.log \
+            "PHP ${{ matrix.php }} macos-aarch64" \
+            "linked-tests-php${{ matrix.php }}-macos-aarch64.tsv"
+
+      - name: Upload PHP-linked test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linked-tests-php${{ matrix.php }}-macos-aarch64
+          path: linked-tests-php${{ matrix.php }}-macos-aarch64.tsv
+          if-no-files-found: ignore
+
+      - name: Free disk after the test build
+        # Leave room for rust-cache's post step: it went red with ENOSPC
+        # writing the runner's _diag log when the test build filled the disk.
+        if: always()
+        run: |
+          df -h . || true
+          rm -rf target/debug
+          df -h . || true
 
   build-windows:
     name: Build (PHP ${{ matrix.php }}, windows-x86_64)
@@ -682,6 +741,34 @@ jobs:
     # results -- no checkout, no build, nothing from the fleet.
     runs-on: ubuntu-latest
     steps:
+      - name: Download PHP-linked test reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: linked-tests-*
+          path: linked-tests
+          merge-multiple: true
+
+      - name: PHP-linked test results
+        # One row per Build leg (written by .github/scripts/linked-test-report.sh).
+        # A leg with no row never reached its test step (build failure or a
+        # dead runner) -- its Build job is already red.
+        run: |
+          {
+            echo "## PHP-linked test suite"
+            echo ""
+            echo "| Leg | Status | Run | Passed | Failed | Skipped |"
+            echo "|-----|--------|-----|--------|--------|---------|"
+            if ls linked-tests/*.tsv >/dev/null 2>&1; then
+              sort linked-tests/*.tsv | while IFS=$'\t' read -r leg status ran passed failed skipped; do
+                echo "| $leg | $status | $ran | $passed | $failed | $skipped |"
+              done
+            else
+              echo "| (no leg reported) | NOT RUN | 0 | 0 | 0 | 0 |"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check results
         run: |
           echo "## Nightly Build Results" >> "$GITHUB_STEP_SUMMARY"
@@ -696,12 +783,13 @@ jobs:
           echo "| Smoke tests | ${{ needs.smoke-tests.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Dependency audit | ${{ needs.audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
 
-          # Gate only on the release-path Build jobs. Fuzz, E2E, Smoke, and
-          # Audit are marked continue-on-error and are tracked separately;
-          # their failures show on the run page but don't fail the nightly.
+          # Gate only on the Build jobs (release build + PHP-linked tests).
+          # Fuzz, E2E, Smoke, and Audit are marked continue-on-error and are
+          # tracked separately; their failures show on the run page but don't
+          # fail the nightly.
           if [[ "${{ needs.build-linux.result }}" == "failure" ]] || \
              [[ "${{ needs.build-macos.result }}" == "failure" ]] || \
              [[ "${{ needs.build-windows.result }}" == "failure" ]]; then
-            echo "::error::One or more release-path Build jobs failed"
+            echo "::error::One or more Build jobs failed (release build or PHP-linked tests -- see the tables above)"
             exit 1
           fi
