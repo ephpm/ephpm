@@ -653,7 +653,7 @@ upstream = "http://127.0.0.1:8000"
 
 **Streaming and WebSockets.** Both directions stream unbuffered (uploads, SSE, large downloads). An RFC 6455 WebSocket **upgrade** on a matched rule is tunnelled to the upstream (raw byte passthrough), distinct from the native WebSocket *termination* of `[server.websocket]`.
 
-**Forwarded headers.** The original `Host` is preserved. `X-Forwarded-For` is set to the resolved client IP (the inbound proxy chain has already been collapsed to that IP by `[server.security] trusted_proxies`), `X-Forwarded-Proto` to the client-facing scheme, and `X-Forwarded-Host` to the original `Host`. Hop-by-hop headers are stripped in both directions.
+**Forwarded headers.** The original `Host` is preserved. `X-Forwarded-For` is set to the resolved client IP (the inbound proxy chain has already been collapsed to that IP by `[server.security] trusted_proxies`), `X-Forwarded-Proto` to the client-facing scheme, and `X-Forwarded-Host` to the original `Host`. Hop-by-hop headers are stripped in both directions, together with any header the message's own `Connection` field names. Requests with ambiguous framing are refused with `400` before they reach the proxy (see [HTTP request framing](/architecture/security/#http-request-framing-request-smuggling)).
 
 **Not in v1 (documented as out of scope):** load balancing, multiple upstreams per route, health checks, retries, circuit breaking, dynamic upstreams, response-body/redirect rewriting, canary/percentage routing — and, specifically, **`https://` upstreams** (terminate TLS at this instance and proxy plaintext to a loopback backend) and **request-path rewriting** (the original request path is forwarded unchanged; there is no prefix strip/prepend). These are v2+.
 

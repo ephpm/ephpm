@@ -280,13 +280,24 @@ async fn handle_request(
 
     let (send, recv) = stream.split();
 
-    // No request-side normalization is needed: h3 already stamps
-    // `Version::HTTP_3` (so `$_SERVER['SERVER_PROTOCOL']` reads `HTTP/3.0`)
-    // and treats connection-specific request fields as a stream error before
-    // we ever see them. The response side is where h3 leaves work for us —
-    // see `strip_forbidden_response_headers`.
+    // h3 stamps `Version::HTTP_3` (so `$_SERVER['SERVER_PROTOCOL']` reads
+    // `HTTP/3.0`) and refuses a `Host` that contradicts `:authority`, but it
+    // does NOT reject connection-specific request fields (`Transfer-Encoding`,
+    // `Connection`, ...) or check `Content-Length` against the DATA frames
+    // (RFC 9114 §4.1.2 / §4.2). The first is `framing::reject`; the second is
+    // `H3RequestBody`'s declared-length enforcement.
+    if let Some(rejected) = crate::framing::reject(&request, remote_addr) {
+        let result = send_response(send, rejected).await;
+        histogram!("ephpm_http3_request_duration_seconds").record(started.elapsed().as_secs_f64());
+        return result;
+    }
+    let declared_len = request
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let (parts, ()) = request.into_parts();
-    let request = Request::from_parts(parts, H3RequestBody::new(recv));
+    let request = Request::from_parts(parts, H3RequestBody::new(recv, declared_len));
 
     let response = router
         .handle(request, remote_addr, true)
@@ -381,11 +392,20 @@ pub struct H3RequestBody {
     stream: h3::server::RequestStream<H3RecvStream, Bytes>,
     /// Set once the peer signals end-of-stream, so later polls stay `None`.
     finished: bool,
+    /// Bytes still owed by the request's `Content-Length`, when it declared
+    /// one. RFC 9114 §4.1.2: DATA that overruns it, or a stream that ends short
+    /// of it, makes the request malformed. h3 does not check this, so the body
+    /// does — the error surfaces as a 400 from the router's body read, and PHP
+    /// never sees a `CONTENT_LENGTH` that disagrees with the bytes it reads.
+    remaining: Option<u64>,
 }
 
 impl H3RequestBody {
-    fn new(stream: h3::server::RequestStream<H3RecvStream, Bytes>) -> Self {
-        Self { stream, finished: false }
+    fn new(
+        stream: h3::server::RequestStream<H3RecvStream, Bytes>,
+        declared_len: Option<u64>,
+    ) -> Self {
+        Self { stream, finished: false, remaining: declared_len }
     }
 }
 
@@ -413,11 +433,27 @@ impl Body for H3RequestBody {
         match this.stream.poll_recv_data(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(Some(mut buf))) => {
-                let remaining = buf.remaining();
-                Poll::Ready(Some(Ok(Frame::data(buf.copy_to_bytes(remaining)))))
+                let len = buf.remaining();
+                if let Some(remaining) = this.remaining.as_mut() {
+                    match remaining.checked_sub(len as u64) {
+                        Some(left) => *remaining = left,
+                        None => {
+                            this.finished = true;
+                            return Poll::Ready(Some(Err(H3BodyError(
+                                "request body exceeds its Content-Length".to_owned(),
+                            ))));
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(Frame::data(buf.copy_to_bytes(len)))))
             }
             Poll::Ready(Ok(None)) => {
                 this.finished = true;
+                if this.remaining.is_some_and(|left| left > 0) {
+                    return Poll::Ready(Some(Err(H3BodyError(
+                        "request body ended before its Content-Length".to_owned(),
+                    ))));
+                }
                 Poll::Ready(None)
             }
             Poll::Ready(Err(err)) => {
@@ -432,8 +468,10 @@ impl Body for H3RequestBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        // QUIC gives no framing-level length; `Content-Length`, when the client
-        // sent one, is already enforced by the router's own body cap.
+        // QUIC gives no framing-level length. A declared `Content-Length` is
+        // enforced in `poll_frame` (and capped by the router's body limit), but
+        // is not advertised as exact: a lying client is reported as an error,
+        // which an exact hint would contradict.
         SizeHint::default()
     }
 }

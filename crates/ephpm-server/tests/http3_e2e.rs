@@ -418,3 +418,76 @@ async fn rejects_a_client_without_the_h3_alpn() {
 
     server.stop().await;
 }
+
+/// RFC 9114 §4.2: connection-specific fields make an HTTP/3 request malformed.
+/// `h3` 0.0.8 accepts them, so ePHPm's framing check must refuse them before
+/// the router (and PHP, which would see `HTTP_TRANSFER_ENCODING`) runs.
+#[tokio::test]
+async fn rejects_connection_specific_request_fields() {
+    let dir = tempfile::tempdir().expect("docroot");
+    std::fs::write(dir.path().join("hello.txt"), b"x").expect("write file");
+    let server = TestServer::start(dir.path(), 10 * 1024 * 1024);
+
+    for (name, value) in [("transfer-encoding", "chunked"), ("connection", "close"), ("te", "gzip")]
+    {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(server.uri("/hello.txt"))
+            .header(name, value)
+            .body(())
+            .expect("build request");
+        let (response, _) = server.request(request, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}: {value}");
+    }
+
+    // `te: trailers` is the one permitted form.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(server.uri("/hello.txt"))
+        .header("te", "trailers")
+        .body(())
+        .expect("build request");
+    assert_eq!(server.request(request, None).await.0.status(), StatusCode::OK);
+
+    server.stop().await;
+}
+
+/// RFC 9114 §4.1.2: DATA that disagrees with `Content-Length` makes the
+/// request malformed. `h3` does not check it; `H3RequestBody` does, and the
+/// router answers 400 rather than handing PHP a `CONTENT_LENGTH` that does not
+/// match the body it reads.
+#[tokio::test]
+async fn rejects_a_body_that_disagrees_with_its_content_length() {
+    let dir = tempfile::tempdir().expect("docroot");
+    std::fs::write(dir.path().join("index.php"), "<?php echo \"ok\";").expect("write");
+    let _ = ephpm_php::PhpRuntime::init_with_ini_file(None);
+    let server = TestServer::start(dir.path(), 10 * 1024 * 1024);
+
+    for (declared, body) in [("10", &b"abc"[..]), ("2", b"abcdef")] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(server.uri("/index.php"))
+            .header("content-length", declared)
+            .body(())
+            .expect("build request");
+        let (response, _) = server.request(request, Some(Bytes::from_static(body))).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "declared {declared}, sent {}",
+            body.len()
+        );
+    }
+
+    // Control: an honest length is served.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(server.uri("/index.php"))
+        .header("content-length", "3")
+        .body(())
+        .expect("build request");
+    let (response, _) = server.request(request, Some(Bytes::from_static(b"abc"))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    server.stop().await;
+}

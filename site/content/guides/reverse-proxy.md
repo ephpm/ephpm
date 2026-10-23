@@ -84,7 +84,7 @@ The upstream sees a correct client view:
 | `X-Forwarded-Proto` | `https` or `http`, the client-facing scheme |
 | `X-Forwarded-Host` | the client's original `Host` |
 
-Hop-by-hop headers (`Connection`, `Transfer-Encoding`, …) are stripped in both directions, per RFC 7230.
+Hop-by-hop headers (`Connection`, `Transfer-Encoding`, `Proxy-Connection`, …) are stripped in both directions, along with any header the message's own `Connection` field names (RFC 9110 §7.6.1). Requests with ambiguous framing never reach the proxy: they are refused with `400` first (see [HTTP request framing](/architecture/security/#http-request-framing-request-smuggling)).
 
 ### Proxies and the `/metrics` / `/_ephpm/requests` ACL
 
