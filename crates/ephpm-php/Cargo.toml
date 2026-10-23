@@ -39,7 +39,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
-# kv_functions tests compare a PHP script's JSON output.
+# kv_functions tests compare a PHP script's JSON output. Not redundant with
+# the build-dependency above: build-dependencies are invisible to tests.
 serde_json.workspace = true
 tempfile.workspace = true
 # db_bridge recycle tests: mock Backend/BackendConn impls (litewire's

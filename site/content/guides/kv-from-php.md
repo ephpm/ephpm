@@ -75,14 +75,14 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 | `ephpm_kv_getex(string $key, int $ttl)` | `?string` | Returns the value and sets its TTL: `$ttl > 0` seconds, `0` removes the TTL. `null` (nothing changed) if missing; a negative `$ttl` warns and returns `null`. *v0.13+* |
 | `ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0)` | `bool` | Compare-and-set — see [Extending a lock](#extending-a-lock-ephpm-kv-set-if-eq). `$ttl`: `> 0` new TTL, `0` none, `-1` keep the current one. *v0.13+* |
 | `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. *v0.13+* |
-| `ephpm_kv_strlen(string $key)` | `int` | Length of the value, `0` if missing. *v0.13+* |
-| `ephpm_kv_type(string $key)` | `string` | `"string"`, `"hash"` or `"none"`. *v0.13+* |
+| `ephpm_kv_strlen(string $key)` | `int` | Length of the value, `0` if missing. Node-local in a cluster (see [Iterating keys](#iterating-keys-ephpm-kv-scan)). *v0.13+* |
+| `ephpm_kv_type(string $key)` | `string` | `"string"`, `"hash"` or `"none"`. Node-local in a cluster, like `strlen`. *v0.13+* |
 | `ephpm_kv_scan(int $cursor, ?string $match = null, int $count = 10)` | `array\|false` | One step of a key scan: `[int $next_cursor, array $keys]` — see [Iterating keys](#iterating-keys-ephpm-kv-scan). *v0.13+* |
 | `ephpm_kv_hget(string $key, string $field)` | `?string` | `null` if the hash or field is missing. *v0.13+* |
-| `ephpm_kv_hset(string $key, string\|array $field, ?string $value = null)` | `int\|false` | `hset($k, $f, $v)` → `1` created / `0` overwritten. `hset($k, [$f => $v, ...])` → fields created. Clears each written field's TTL. *v0.13+* |
+| `ephpm_kv_hset(string $key, string\|array $field, ?string $value = null)` | `int\|false` | `hset($k, $f, $v)` → `1` created / `0` overwritten. `hset($k, [$f => $v, ...])` → fields created; passing a third argument with the array form warns and returns `false`. Clears each written field's TTL. The array form is **not atomic under the memory limit**: if a later field is refused, earlier ones stay written and the call returns `false` (as `mset`). *v0.13+* |
 | `ephpm_kv_hsetnx(string $key, string $field, string $value)` | `bool` | `true` only if the field did not exist. *v0.13+* |
 | `ephpm_kv_hmget(string $key, array $fields)` | `array\|false` | A **list** aligned with `$fields` (`string` or `null` each). *v0.13+* |
-| `ephpm_kv_hgetall(string $key)` | `array\|false` | `[field => value]`; `[]` for a missing hash. A numeric field name becomes an int array key, as in any PHP array. *v0.13+* |
+| `ephpm_kv_hgetall(string $key)` | `array\|false` | `[field => value]`; `[]` for a missing hash. A numeric field name (`"42"`) becomes an **int** array key, as in any PHP array — see the note under [Hashes](#hashes-and-per-field-ttl). *v0.13+* |
 | `ephpm_kv_hkeys(string $key)` / `ephpm_kv_hvals(string $key)` | `array\|false` | Field names / values, as lists. *v0.13+* |
 | `ephpm_kv_hdel(string $key, string\|array $fields)` | `int` | Fields removed. Deleting the last field deletes the hash. *v0.13+* |
 | `ephpm_kv_hexists(string $key, string $field)` | `bool` | *v0.13+* |
@@ -196,6 +196,12 @@ Compare-and-set (Valkey's `SET key value IFEQ expected`): replaces the value
 lock as the compare. It never creates the key. `$ttl` is the new expiry in
 seconds; `0` removes the expiry and `-1` keeps the current one.
 
+> **Always pass the TTL when extending a lease.** `$ttl` defaults to `0`,
+> which **removes** the expiry: `ephpm_kv_set_if_eq($k, $tok, $tok)` turns a
+> 30-second lock into one that never expires, so a holder that then crashes
+> holds it forever. Extend with `ephpm_kv_set_if_eq($k, $tok, $tok, 30)` (or
+> `-1` to keep the current expiry).
+
 The three primitives together make a complete lock — acquire, extend while
 working, release — none of which can touch a lock another holder has taken
 over:
@@ -306,6 +312,19 @@ ephpm_kv_expire("user:42", 86400);                              // the whole has
 ephpm_kv_del("user:42");                                        // every field at once
 ```
 
+- **Numeric field names come back as int keys from `ephpm_kv_hgetall()`.**
+  PHP turns the string `"42"` into the array key `42`, so under
+  `declare(strict_types=1)` passing that key straight back to a function
+  that takes a `string` field is a `TypeError`. Cast it:
+
+  ```php
+  declare(strict_types=1);
+  foreach (ephpm_kv_hgetall("cart:7") as $field => $qty) {
+      ephpm_kv_hdel("cart:7", (string) $field);   // $field may be int 42
+  }
+  ```
+
+  `ephpm_kv_hkeys()` returns the names as strings and has no such issue.
 - An expired field is gone for every read the moment its TTL passes (`hget`
   returns `null`, `hgetall`/`hkeys`/`hlen` leave it out); its memory is
   reclaimed by the next write to the hash or by the background expiry cycle.
@@ -358,7 +377,10 @@ In a cluster `ephpm_kv_scan()` lists **this node's** keyspace — every hash and
 every string value at or under `small_key_threshold` is on every node, but a
 larger string value only on its replica nodes. Do not use it to find every key
 to delete cluster-wide (for example a cache group flush); key a group by a
-version counter instead.
+version counter instead. `ephpm_kv_type()`, `ephpm_kv_exists()` and
+`ephpm_kv_strlen()` are node-local in the same way: for a large value held
+only by other nodes they report `"none"` / `false` / `0`, while
+`ephpm_kv_get()` and `ephpm_kv_mget()` fetch it from those nodes.
 
 ### Blocking waits — `ephpm_kv_wait()`
 

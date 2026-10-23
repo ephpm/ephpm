@@ -4723,6 +4723,15 @@ PHP_FUNCTION(ephpm_kv_hset)
                 "so the call did nothing and returned false", get_active_function_name());
             RETURN_FALSE;
         }
+    } else if (val) {
+        /* Map form takes its values from the array; a third argument would
+         * be silently ignored, which hides a caller's mistake. */
+        zend_error(E_WARNING, "%s(): the value argument must be omitted when the fields are "
+            "given as an array, so the call did nothing and returned false",
+            get_active_function_name());
+        RETURN_FALSE;
+    }
+    if (field) {
         if (ephpm_kv_bad_key(ZSTR_VAL(field), ZSTR_LEN(field))) { RETURN_FALSE; }
         const char *fp = ZSTR_VAL(field), *vp = val;
         size_t fl = ZSTR_LEN(field), vl = val_len;

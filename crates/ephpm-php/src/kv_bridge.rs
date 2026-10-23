@@ -597,12 +597,7 @@ unsafe extern "C" fn kv_get(
             // an exiting thread. Without the buffer there is nowhere to hand
             // the value to C, so report a miss rather than returning 1 with a
             // stale/empty buffer behind it.
-            let staged = KV_GET_BUF.try_with(|buf| {
-                let mut buf = buf.borrow_mut();
-                buf.clear();
-                buf.extend_from_slice(&val);
-            });
-            i32::from(staged.is_ok())
+            i32::from(stage_value(&val))
         }
         None => 0,
     }
@@ -866,14 +861,7 @@ unsafe extern "C" fn kv_wait(
     // documented contract says `*new_version` is untouched when this returns
     // 0 — so the write below must not happen on the degraded path.
     let rc = match value {
-        Some(val) => {
-            let staged = KV_GET_BUF.try_with(|buf| {
-                let mut buf = buf.borrow_mut();
-                buf.clear();
-                buf.extend_from_slice(&val);
-            });
-            if staged.is_ok() { 1 } else { 0 }
-        }
+        Some(val) => i32::from(stage_value(&val)),
         None => 2,
     };
     if rc == 0 {
@@ -916,6 +904,8 @@ where
             let mut buf = buf.borrow_mut();
             buf.data.clear();
             buf.items.clear();
+            trim_retained(&mut buf.data);
+            trim_retained(&mut buf.items);
             for item in items {
                 let staged = item.map(|bytes| {
                     let bytes = bytes.as_ref();
@@ -938,9 +928,27 @@ fn stage_value(value: &[u8]) -> bool {
         .try_with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
+            trim_retained(&mut buf);
             buf.extend_from_slice(value);
         })
         .is_ok()
+}
+
+/// Capacity a per-thread staging buffer keeps between calls. One large value
+/// (or list) grows a buffer to its size; without this, every PHP thread that
+/// ever read a big value would hold that much memory for the rest of the
+/// process. Called after `clear()` and before the next fill, so the shrink
+/// never discards bytes C has yet to copy.
+#[cfg(php_linked)]
+const STAGING_RETAIN_BYTES: usize = 1024 * 1024;
+
+/// Shrink a cleared staging buffer back to [`STAGING_RETAIN_BYTES`].
+#[cfg(php_linked)]
+fn trim_retained<T>(buf: &mut Vec<T>) {
+    let keep = STAGING_RETAIN_BYTES / std::mem::size_of::<T>().max(1);
+    if buf.capacity() > keep {
+        buf.shrink_to(keep);
+    }
 }
 
 /// Borrow `n` UTF-8 strings passed as parallel `(pointer, length)` arrays;
@@ -1435,7 +1443,9 @@ unsafe extern "C" fn kv_strlen(
     key_len: usize,
 ) -> std::os::raw::c_longlong {
     let (store, key) = store_and_key!(key, key_len, 0);
-    store.get_through(key).map_or(0, |v| std::os::raw::c_longlong::try_from(v.len()).unwrap_or(0))
+    // Node-local, like RESP STRLEN (and `type`/`exists`): no read-through to
+    // the replica set for a large value held only by other nodes.
+    store.get(key).map_or(0, |v| std::os::raw::c_longlong::try_from(v.len()).unwrap_or(0))
 }
 
 #[cfg(php_linked)]

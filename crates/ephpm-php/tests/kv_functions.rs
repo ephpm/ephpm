@@ -280,9 +280,40 @@ fn bad_arguments_fail_with_their_failure_values() {
             @ephpm_kv_mset([$bad => 'v']),
             @ephpm_kv_getex('kvf:x', -1),
             @ephpm_kv_hdel('kvf:x', [$bad]),
+            // Map form with a stray third argument: refused, not ignored.
+            @ephpm_kv_hset('kvf:x', ['f' => 'v'], 'extra'),
             ephpm_kv_exists('kvf:x'),
         ]);
         "#,
     );
-    assert_eq!(out, "[null,false,false,false,false,null,0,false]");
+    assert_eq!(out, "[null,false,false,false,false,null,0,false,false]");
+}
+
+/// `ephpm_kv_wait()` wakes on a hash write to the key, with a `null` value
+/// (a hash has no string value), and not on a field TTL change.
+#[test]
+#[serial]
+fn wait_wakes_on_hash_writes() {
+    let out = php(
+        "wait_hash",
+        r"
+        $k = 'kvf:wait:h';
+        ephpm_kv_del($k);
+        $snap = ephpm_kv_wait($k, 0, 0);
+        $v0 = $snap['version'];
+        ephpm_kv_hset($k, 'f', 'v');
+        $w1 = ephpm_kv_wait($k, $v0, 0);
+        ephpm_kv_hexpire($k, 'f', 100);
+        $w2 = ephpm_kv_wait($k, $w1['version'], 0);
+        ephpm_kv_hdel($k, 'f');
+        $w3 = ephpm_kv_wait($k, $w1['version'], 0);
+        echo json_encode([
+            $w1 !== false && $w1['version'] > $v0,
+            $w1['value'],
+            $w2,
+            $w3 !== false && $w3['version'] > $w1['version'],
+        ]);
+        ",
+    );
+    assert_eq!(out, "[true,null,false,true]");
 }
