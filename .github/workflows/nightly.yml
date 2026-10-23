@@ -20,6 +20,15 @@ on:
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: >-
+          Which Build legs to run. "linux" skips macOS and Windows (e.g. to
+          leave the single macOS runner slot to a release). Scheduled runs
+          always run everything.
+        type: choice
+        options: [all, linux]
+        default: all
 
 env:
   CARGO_TERM_COLOR: always
@@ -179,6 +188,7 @@ jobs:
 
   build-macos:
     name: Build (PHP ${{ matrix.php }}, macos-aarch64)
+    if: ${{ inputs.platforms != 'linux' }}
     # Apple Silicon only -- the php-sdk release does not publish macos-x86_64.
     runs-on: [self-hosted, macos, arm64]
     strategy:
@@ -308,6 +318,7 @@ jobs:
 
   build-windows:
     name: Build (PHP ${{ matrix.php }}, windows-x86_64)
+    if: ${{ inputs.platforms != 'linux' }}
     # Native Windows build on the self-hosted Windows runner (same fleet as
     # php-sdk). Replaces the previous cargo-xwin cross-compile-from-Linux
     # path, which kept hitting case-sensitivity / transitive-include gaps
