@@ -140,6 +140,16 @@ script can raise it to. Check these before upgrading:
 
 Details: [`memory_limit` and `memory_limit_max`](/reference/config/#php).
 
+It also tightens HTTP request parsing:
+
+- **HTTP request framing is stricter (request smuggling).** The following are now `400` (with `Connection: close`):
+  - `Content-Length` together with `Transfer-Encoding`;
+  - any `Transfer-Encoding` other than a single `chunked`;
+  - an HTTP/1.1 request without `Host`, or with two;
+  - an absolute-form target whose authority differs from `Host`.
+
+  A malformed chunked body is `400`, no longer `413`. Every request sent with `Transfer-Encoding` closes its connection after the response. Details: [HTTP request framing](/architecture/security/#http-request-framing-request-smuggling).
+
 ## Upgrading from 0.6.x
 
 v0.7.0 replaced the embedded SQLite engine: the rusqlite (SQLite C engine)
