@@ -46,6 +46,11 @@ impl TestServer {
         let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(config);
+        // Active expiry belongs to the store, not the RESP listener (#599):
+        // `serve_on` starts no reaper, so start it here as `ephpm-server`'s
+        // `start_kv_service` does. The thread holds only a weak reference and
+        // exits once the server task (the last strong owner) is aborted.
+        ephpm_kv::expiry::spawn(&store, None).expect("failed to start KV active expiry");
         let handle = tokio::spawn(async move {
             server::serve_on(
                 store,
@@ -93,6 +98,9 @@ impl HmacTestServer {
 
         let store = Store::new(StoreConfig::default());
         let mt = MultiTenantStore::new(Arc::clone(&store), StoreConfig::default());
+        // As in `TestServer`: expiry is started with the stores, covering
+        // every per-site store too.
+        ephpm_kv::expiry::spawn(&store, Some(&mt)).expect("failed to start KV active expiry");
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
             server::serve_on(
@@ -186,10 +194,13 @@ async fn ttl_expiry_under_load() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    // Set keys with TTLs between 200ms and 1000ms.
+    // Set keys with TTLs between 2 s and 2.8 s. The floor must outlast the
+    // SET loop plus the DBSIZE check below: with the active-expiry thread
+    // running, a 200 ms floor let the reaper take the first keys before the
+    // "all present" check on a loaded arm64 runner (158 of 200 seen).
     for i in 0..TTL_KEY_COUNT {
         let key = format!("ttl:{i}");
-        let ms = 200 + (i * 4); // 200ms..996ms
+        let ms = 2_000 + (i * 4); // 2000ms..2796ms
         let _: () = redis::cmd("SET")
             .arg(&key)
             .arg(format!("val{i}"))
@@ -204,9 +215,12 @@ async fn ttl_expiry_under_load() {
     let initial: i64 = redis::cmd("DBSIZE").query_async(&mut con).await.unwrap();
     assert_dbsize(initial, TTL_KEY_COUNT, "TTL keys initial");
 
-    // Poll until all keys are expired. The reaper runs every 1s with a sample
-    // size of 100, so we need to give it enough cycles. Maximum TTL is ~1s,
-    // plus reaper delay — 10s total timeout is very generous.
+    // Poll until all keys are expired. Nothing reads these keys, so lazy
+    // expiry never removes them and DBSIZE (like Redis') keeps counting them
+    // until the active-expiry thread reaps them. It wakes every
+    // `ACTIVE_EXPIRE_INTERVAL` (100 ms) and keeps sampling while most of its
+    // sample is expired, so all 200 go within a tick or two of the last
+    // deadline (~2.8 s). 10 s is a generous bound.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;

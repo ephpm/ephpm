@@ -301,24 +301,33 @@ fn link_php(lib_dir: &Path, target_os: &str, shared: bool) {
         link_windows_static_deps(lib_dir);
     } else {
         // Unix: static-php-cli emits `lib<name>.a`; link the known support
-        // libs in dependency order (single-pass ld needs deps last).
+        // libs in dependency order: every archive before the archives it calls
+        // into, because GNU ld scans each archive once. rust-lld (the default
+        // linker on x86_64-unknown-linux-gnu since Rust 1.90) re-scans archives
+        // and forgave a wrong order, so only aarch64, which links with the
+        // system GNU ld, showed it: libcurl was listed after libssl/libcrypto
+        // and libzip after liblzma, and every aarch64 PHP-linked test binary
+        // failed to link (undefined `SSL_alert_desc_string_long`, `OCSP_*_str`,
+        // `lzma_code`). Keep it topological when adding a lib.
         println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
         for static_lib in &[
-            // High-level extension support libs first; they reference the
-            // lower-level libs below.
-            "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv",
-            "charset", "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp",
-            "sqlite3",
-            // PostgreSQL libs (pdo_pgsql). Order: libpq depends on pgcommon
-            // and pgport.
-            "pq", "pgcommon", "pgport",
-            // Readline / line-editing ecosystem (pulled in by pdo_sqlite and
-            // a few CLI-facing extensions on the embed build).
-            "edit", "ncurses", "menu", "form", "panel", "tic",
-            // ICU — needed by the intl extension. Order matters: i18n →
-            // uc → data, with io/tu as auxiliary modules that may pull
-            // from any of them.
-            "icui18n", "icuuc", "icudata", "icuio", "icutu",
+            // Highest-level consumers first.
+            "curl", // -> ssl, crypto, z
+            // PostgreSQL (pdo_pgsql): libpq -> pgcommon, pgport, ssl, crypto.
+            "pq", "pgcommon", "pgport", //
+            "zip",    // -> crypto, lzma, bz2, z
+            "ssl", "crypto", // ssl -> crypto
+            "exslt", "xslt", // exslt -> xslt -> xml2
+            "gd", "freetype", "png16", "jpeg", // gd -> freetype, png, jpeg; png -> z
+            "xml2", // -> lzma, iconv, z (and ICU, below)
+            "lzma", "bz2", "z", //
+            "sodium", "onig", "gmp", "sqlite3", //
+            "intl", "iconv", "charset", // gettext intl -> iconv -> charset
+            // Readline / line-editing ecosystem (pulled in by pdo_sqlite and a
+            // few CLI-facing extensions on the embed build); all -> ncurses.
+            "edit", "menu", "form", "panel", "tic", "ncurses",
+            // ICU, needed by the intl extension: io/tu -> i18n -> uc -> data.
+            "icuio", "icutu", "icui18n", "icuuc", "icudata",
             // libstdc++ last: ICU is C++ and references std::* / __cxa_*
             // symbols that only the C++ runtime provides.
             "stdc++",

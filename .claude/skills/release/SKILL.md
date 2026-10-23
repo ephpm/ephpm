@@ -8,6 +8,7 @@ description: Cut and shepherd an ephpm release (tag, CI matrix, publish, verify)
 ## 1. Pre-flight (do NOT tag until all pass)
 
 - `main` is green: latest CI **and E2E** runs on main succeeded (`gh run list --branch main --limit 4`).
+- PHP-linked tests pass on the exact SHA you will tag. PR/main CI is **stub-only**; the linked suite (hard memory limit, request-startup failure, `ephpm_kv_*`/`ephpm_db_*`, sessions, exit semantics, ...) runs only in Nightly. If the last Nightly is not on that SHA, dispatch it (`gh workflow run Nightly --ref main`) and wait. Its Nightly Summary "PHP-linked test suite" table must show every Linux and macOS leg `passed` with a non-zero `Run` count. A leg that is `NOT RUN` means the suite never built or linked, so it is a blocker and not a skip: that is exactly how a link error hid every linked test from #615 until v0.13.0. Windows has no linked test leg yet.
 - Runner fleet can serve the whole matrix: Linux x64 + arm64, **macOS arm64** (native runners), **Windows x64** (ephemerd). A dead leg doesn't fail the release - it parks it forever, because the `Create Release` job `needs:` every build job. See the `triage-ci` skill for runner checks.
 - Docs version pins bumped on main first (grep `site/content/` + `docs/` + `examples/` for `ephpm/ephpm:vX` image pins and `ePHPm X.Y.Z` banners).
 - Confirm the version with the user (patch vs minor is their call).

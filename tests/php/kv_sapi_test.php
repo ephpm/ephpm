@@ -82,14 +82,14 @@ function test_exists(&$result) {
 
     // EXISTS existing
     $exists = ephpm_kv_exists('exists:key');
-    if ($exists !== 1) {
-        throw new Exception("EXISTS for present key should return 1, got {$exists}");
+    if ($exists !== true) {
+        throw new Exception("EXISTS for present key should return true, got " . var_export($exists, true));
     }
 
     // EXISTS missing
     $missing = ephpm_kv_exists('does:not:exist');
-    if ($missing !== 0) {
-        throw new Exception("EXISTS for missing key should return 0, got {$missing}");
+    if ($missing !== false) {
+        throw new Exception("EXISTS for missing key should return false, got " . var_export($missing, true));
     }
 
     $result['details']['exists'] = 'PASS';
@@ -97,19 +97,19 @@ function test_exists(&$result) {
 
 function test_incr(&$result) {
     // INCR on new key
-    $val1 = ephpm_kv_incr('counter:test', 1);
+    $val1 = ephpm_kv_incr('counter:test');
     if ($val1 !== 1) {
         throw new Exception("INCR on new key should return 1, got {$val1}");
     }
 
-    // INCR again
-    $val2 = ephpm_kv_incr('counter:test', 5);
+    // INCRBY
+    $val2 = ephpm_kv_incr_by('counter:test', 5);
     if ($val2 !== 6) {
         throw new Exception("INCR by 5 on value 1 should return 6, got {$val2}");
     }
 
-    // INCR with negative
-    $val3 = ephpm_kv_incr('counter:test', -2);
+    // INCRBY with negative
+    $val3 = ephpm_kv_incr_by('counter:test', -2);
     if ($val3 !== 4) {
         throw new Exception("INCR by -2 on value 6 should return 4, got {$val3}");
     }
@@ -121,10 +121,10 @@ function test_expire(&$result) {
     // SET with TTL via separate EXPIRE call
     ephpm_kv_set('expire:key', 'value');
 
-    // EXPIRE (set TTL to 60 seconds)
-    $ok = ephpm_kv_expire('expire:key', 60000);  // milliseconds
-    if ($ok !== 1) {
-        throw new Exception("EXPIRE on existing key should return 1, got {$ok}");
+    // EXPIRE (TTL in seconds)
+    $ok = ephpm_kv_expire('expire:key', 60);
+    if ($ok !== true) {
+        throw new Exception("EXPIRE on existing key should return true, got " . var_export($ok, true));
     }
 
     // PTTL should return a value > 0 and <= 60000
@@ -134,9 +134,9 @@ function test_expire(&$result) {
     }
 
     // EXPIRE on missing key
-    $notfound = ephpm_kv_expire('missing:key', 10000);
-    if ($notfound !== 0) {
-        throw new Exception("EXPIRE on missing key should return 0, got {$notfound}");
+    $notfound = ephpm_kv_expire('missing:key', 10);
+    if ($notfound !== false) {
+        throw new Exception("EXPIRE on missing key should return false, got " . var_export($notfound, true));
     }
 
     $result['details']['expire'] = 'PASS';

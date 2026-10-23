@@ -2489,6 +2489,15 @@ impl PhpRuntime {
             // Disarm the TLS guard FIRST so it cannot run a second
             // ephpm_thread_shutdown at thread exit (double ts_free_thread).
             let was_registered = THREAD_REGISTERED.with(|guard| guard.registered.replace(false));
+            // Never registered (init refused before reaching TSRM, e.g.
+            // `NotInitialized`, or this thread already retired): there is no
+            // TSRM entry, so `EG()` in ephpm_thread_shutdown would dereference
+            // an unallocated slot and SIGSEGV. The debug lane's startup-failure
+            // path calls this unconditionally; nothing to tear down.
+            if !was_registered {
+                tracing::debug!("worker thread was never TSRM-registered — nothing to shut down");
+                return;
+            }
             // SAFETY: called on a TSRM-registered worker thread that is done
             // executing PHP. ephpm_thread_shutdown runs php_request_shutdown +
             // ts_free_thread and frees the thread-local capture buffers.
@@ -2499,9 +2508,7 @@ impl PhpRuntime {
             // php_request_shutdown(), which can block for a long time (an
             // Xdebug session ending waits for the IDE to acknowledge
             // `stopping`): the #266 cross-thread teardown hazard.
-            if was_registered {
-                LIVE_PHP_THREADS.fetch_sub(1, Ordering::AcqRel);
-            }
+            LIVE_PHP_THREADS.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!("worker thread PHP context shut down");
         }
     }
@@ -2981,6 +2988,10 @@ mod tests {
         assert!(PhpRuntime::shutdown().is_ok());
     }
 
+    /// Stub-only: asserts the placeholder page stub mode serves. A PHP-linked
+    /// build really executes the (nonexistent) script instead; real execution
+    /// is covered by the linked integration tests under `tests/`.
+    #[cfg(not(php_linked))]
     #[test]
     #[serial]
     fn test_stub_execute_returns_stub_html() {

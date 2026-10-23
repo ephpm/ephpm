@@ -387,22 +387,35 @@ impl KvRouter {
     ///
     /// `None` from `read` means there is nothing to send; the stamp is
     /// `None` when the key has no record within the applied horizon.
+    ///
+    /// `read` may run more than once (see the no-record case below).
     pub fn read_stamped<T>(
         &self,
         transport_key: &str,
-        read: impl FnOnce() -> Option<T>,
+        read: impl Fn() -> Option<T>,
     ) -> Option<(T, Option<Stamp>)> {
-        match self.applied.as_ref() {
-            Some(applied) => {
-                // Lock order: applied slot, then (inside `read`) the store's
-                // shard — the same order `apply_if_newer` uses.
-                let slot = applied.get(transport_key);
-                let stamp = slot.as_ref().map(|s| **s);
+        let Some(applied) = self.applied.as_ref() else {
+            return read().map(|v| (v, None));
+        };
+        loop {
+            // Lock order: applied slot, then (inside `read`) the store's
+            // shard — the same order `apply_if_newer` uses.
+            if let Some(slot) = applied.get(transport_key) {
+                let stamp = *slot;
                 let value = read()?;
                 drop(slot);
-                Some((value, stamp))
+                return Some((value, Some(stamp)));
             }
-            None => read().map(|v| (v, None)),
+            // No record, so there is no slot to hold: a key's FIRST stamped
+            // write can insert its slot and land its value between the lookup
+            // above and `read` (#640). `apply_if_newer` inserts the slot before
+            // writing, so if the key still has no record after the read, the
+            // value cannot be a stamped write's; if a record appeared, retry
+            // under its slot.
+            let value = read()?;
+            if !applied.contains_key(transport_key) {
+                return Some((value, None));
+            }
         }
     }
 

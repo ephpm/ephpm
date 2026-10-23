@@ -702,6 +702,10 @@ pub struct Router {
     ///
     /// [`PhpConfig::effective_concurrency`]: ephpm_config::PhpConfig::effective_concurrency
     fpm_pool: Option<Arc<crate::fpm_pool::FpmPool>>,
+    /// Unit-test builds only: retires `fpm_pool`'s threads when the router is
+    /// dropped. See [`TestPoolReaper`].
+    #[cfg(test)]
+    _pool_reaper: Option<TestPoolReaper>,
     /// Per-vhost eBPF network policy handle. `None` unless
     /// `[server.tenant_network] ebpf_policy = true`. When `None`, no tag is
     /// written on the request path and the whole feature is zero-cost. When
@@ -1122,6 +1126,38 @@ fn scan_sites_dir(
     sites
 }
 
+/// Unit-test teardown for a router's execution pool: drains it and waits for
+/// every pool thread to retire when the owning [`Router`] is dropped.
+///
+/// `serve()` drains the pool and waits for every thread to release its TSRM
+/// slot before PHP teardown; a test router never runs `serve()`, so without
+/// this its pool threads outlive the test. In a PHP-linked build they are real
+/// PHP threads, and a short test returns while they are still inside
+/// `ts_resource()` / `php_request_startup()`. The test binary's `exit()` then
+/// runs libphp's and OpenSSL's atexit teardown under them, and the process
+/// died with SIGSEGV after the test had already reported `ok` (~30 router
+/// tests, every linked run). A field rather than `impl Drop for Router`
+/// because `Router::share` moves fields out with struct-update syntax.
+#[cfg(test)]
+struct TestPoolReaper(Arc<crate::fpm_pool::FpmPool>);
+
+#[cfg(test)]
+impl Drop for TestPoolReaper {
+    fn drop(&mut self) {
+        self.0.drain();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.0.live_count() != 0 {
+            if Instant::now() >= deadline {
+                // Bounded so a wedged thread fails loudly instead of hanging
+                // the test binary; never panic while already unwinding.
+                assert!(std::thread::panicking(), "test router's fpm pool threads never retired");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 impl Router {
     /// Build the router.
     ///
@@ -1379,6 +1415,8 @@ impl Router {
             worker_pool,
             // Wired by `serve()` via `with_debug_lane` (worker mode + xdebug).
             debug_lane: None,
+            #[cfg(test)]
+            _pool_reaper: fpm_pool.clone().map(TestPoolReaper),
             fpm_pool,
             // Wired by `serve()` via `with_tenant_ebpf` only when
             // `[server.tenant_network] ebpf_policy = true` (Linux multi-tenant).

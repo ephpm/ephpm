@@ -1599,7 +1599,21 @@ mod tests {
                 if let Some(wait) = at.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
-                d.try_push(i).unwrap();
+                // Offered load, not a capacity check: on a slow or shared host
+                // (the arm64 nightly node, three legs at once) the 8 workers
+                // can fall behind at 5000 jobs/s and the 64-slot queue fills.
+                // Back off and retry instead of failing the measurement.
+                let mut job = i;
+                loop {
+                    match d.try_push(job) {
+                        Ok(()) => break,
+                        Err(TryPushError::Full(j)) => {
+                            job = j;
+                            std::thread::yield_now();
+                        }
+                        Err(TryPushError::Closed(_)) => panic!("dispatcher closed mid-window"),
+                    }
+                }
             }
             std::thread::sleep(window.saturating_sub(start.elapsed()));
         }

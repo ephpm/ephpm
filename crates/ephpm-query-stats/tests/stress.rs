@@ -3,6 +3,7 @@
 //! All tests are `#[ignore]` — they run only during nightly CI where
 //! longer execution times are acceptable.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -99,9 +100,15 @@ fn concurrent_recording_accuracy() {
     }
 }
 
-/// Single-threaded: normalize 100,000 realistic SQL queries and assert
-/// throughput exceeds 50,000 queries/second (conservative baseline to
-/// catch accidental O(n^2) regressions).
+/// Single-threaded: normalize 100,000 realistic SQL queries (throughput is
+/// reported, not asserted), then check that normalization time grows
+/// linearly with query length -- the O(n^2) regression this test guards
+/// against.
+///
+/// An absolute queries/second floor (formerly 50,000/s) measured the host,
+/// not the normalizer: a debug build on the arm64 nightly node, which runs
+/// three PHP legs side by side, did 49,470/s and failed. Comparing two
+/// lengths on the same machine cancels the machine out.
 #[test]
 #[ignore = "nightly CI only — benchmarks normalization throughput"]
 fn normalization_throughput() {
@@ -152,11 +159,42 @@ fn normalization_throughput() {
 
     #[allow(clippy::cast_precision_loss)] // 100_000 is well within f64 precision
     let throughput = queries.len() as f64 / elapsed.as_secs_f64();
+    eprintln!("normalization throughput: {throughput:.0} queries/sec ({elapsed:?})");
+
+    // Length scaling: 8x the query length must cost well under 64x the time
+    // (what quadratic would cost); linear is ~8x. Best of several runs per
+    // length so a scheduler hiccup cannot fail it.
+    let query_of = |terms: usize| -> String {
+        let mut sql = String::from("SELECT * FROM t WHERE id = 1");
+        for i in 0..terms {
+            write!(sql, " AND col_{} = 'value {i}' OR n = {i}", i % 7).expect("String write");
+        }
+        sql
+    };
+    let best_of = |sql: &str| -> Duration {
+        (0..15)
+            .map(|_| {
+                let start = Instant::now();
+                for _ in 0..20 {
+                    let _ = normalize(sql);
+                }
+                start.elapsed()
+            })
+            .min()
+            .expect("non-empty")
+    };
+    let short = query_of(250);
+    let long = query_of(2_000);
+    let (t_short, t_long) = (best_of(&short), best_of(&long));
+    let ratio = t_long.as_secs_f64() / t_short.as_secs_f64();
+    eprintln!(
+        "normalize {} bytes: {t_short:?}, {} bytes: {t_long:?} (x{ratio:.1})",
+        short.len(),
+        long.len()
+    );
     assert!(
-        throughput > 50_000.0,
-        "normalization throughput too low: {throughput:.0} queries/sec \
-         (elapsed {elapsed:?} for {} queries). Possible O(n^2) regression.",
-        queries.len()
+        ratio < 24.0,
+        "normalizing an 8x longer query took x{ratio:.1} as long ({t_short:?} -> {t_long:?});          linear is ~x8, quadratic ~x64. Possible O(n^2) regression."
     );
 }
 
