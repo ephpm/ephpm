@@ -105,6 +105,51 @@ pub enum SetNxOutcome {
     OwnerUnreachable,
 }
 
+/// Error text for an `APPEND` refused because its key is a large value held
+/// only by other cluster nodes (see [`Store::try_append`]).
+pub const APPEND_HELD_ELSEWHERE_ERROR: &str = "ERR APPEND to a large value this node does not \
+     hold is not supported in a cluster (it would replace the value cluster-wide): run it on a \
+     node that holds the key, or rewrite it with SET";
+
+/// Why [`Store::try_append`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendError {
+    /// The memory budget refused the write (Redis `-OOM`).
+    OutOfMemory,
+    /// Clustered only: `key` is a large value held by other nodes and not
+    /// this one. See [`Store::try_append`].
+    HeldElsewhere,
+}
+
+impl std::fmt::Display for AppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OutOfMemory => OOM_ERROR,
+            Self::HeldElsewhere => APPEND_HELD_ELSEWHERE_ERROR,
+        })
+    }
+}
+
+impl std::error::Error for AppendError {}
+
+/// Warn once per process that an `APPEND` was refused because its key lives
+/// on other nodes, then log further refusals at DEBUG. The PHP bridge only
+/// sees `false`, so the operator needs one clear line saying why.
+fn log_append_held_elsewhere(key: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        debug!(key, "APPEND refused: large value held only by other nodes");
+        return;
+    }
+    tracing::warn!(
+        key,
+        "APPEND refused: the key is a large value held only by other cluster nodes, and \
+         creating it from the appended bytes alone would replace that value everywhere. RESP \
+         clients get an error and ephpm_kv_append() returns false. Further refusals are logged \
+         at DEBUG."
+    );
+}
+
 /// Redis Cluster-style error returned when a conditional write (`SETNX`,
 /// `SET … NX`, `DELIFEQ`) cannot reach the cluster node that owns its key.
 ///
@@ -2165,7 +2210,32 @@ impl Store {
     /// of an existing one — and the RESP layer maps that to Redis `-OOM`
     /// instead of falsely answering with a length (#477). A refused append
     /// leaves the existing value untouched.
+    ///
+    /// In a cluster, an append that would *create* the key first checks that
+    /// it is not a large value held only by other nodes; such an append is
+    /// refused (`None`) — see [`try_append`](Self::try_append) for the reason.
     pub fn append(&self, key: &str, value: &[u8]) -> Option<usize> {
+        self.try_append(key, value).ok()
+    }
+
+    /// [`append`](Self::append), telling the two refusals apart.
+    ///
+    /// # Errors
+    ///
+    /// [`AppendError::OutOfMemory`] when the memory budget refuses the write,
+    /// and, in a cluster, [`AppendError::HeldElsewhere`] when this node has no
+    /// copy of `key` but its replica set does (a value above
+    /// `small_key_threshold` lives on `replication_factor` nodes only).
+    /// Creating the key from the appended bytes alone there would replace the
+    /// real value cluster-wide — data loss — and reading it through first
+    /// would drop its TTL (a read-through carries none), so the append is
+    /// refused instead. Run it on a node that holds the key, or rewrite the
+    /// value with `SET`.
+    pub fn try_append(&self, key: &str, value: &[u8]) -> Result<usize, AppendError> {
+        self.append_inner(key, value)
+    }
+
+    fn append_inner(&self, key: &str, value: &[u8]) -> Result<usize, AppendError> {
         // Make room for the growth BEFORE taking the entry guard: reclaiming
         // and evicting lock arbitrary shards, possibly this key's. An append to
         // a live key used to grow it in place with no budget check at all, so
@@ -2175,7 +2245,7 @@ impl Store {
         // bytes actually charged are the exact delta computed under the guard.
         let live = self.data.get(key).is_some_and(|e| !e.is_expired());
         if live && !self.reserve(key, value.len()) {
-            return None;
+            return Err(AppendError::OutOfMemory);
         }
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
@@ -2225,17 +2295,28 @@ impl Store {
                 if let Some(value) = published_value {
                     self.replicate_published_value(key, value, published_expiry);
                 }
-                return Some(final_len);
+                return Ok(final_len);
             }
+        }
+
+        // No local copy. In a cluster that is not proof of absence: a large
+        // value lives on its replica set only. `fetch_through` costs nothing
+        // when this node is itself a replica (a miss there is authoritative)
+        // and otherwise asks the replicas, bounded.
+        if let Some(rep) = self.active_replicator()
+            && rep.fetch_through(key).is_some()
+        {
+            log_append_held_elsewhere(key);
+            return Err(AppendError::HeldElsewhere);
         }
 
         let len = value.len();
         if self.set(key.to_string(), value.to_vec(), None) {
-            Some(len)
+            Ok(len)
         } else {
             // Create refused for memory — report it rather than claiming a
             // length for a value that was never stored.
-            None
+            Err(AppendError::OutOfMemory)
         }
     }
 

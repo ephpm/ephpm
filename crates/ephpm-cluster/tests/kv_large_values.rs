@@ -256,3 +256,47 @@ async fn delete_of_a_large_value_reaches_everyone() {
     }
     shutdown_all(nodes).await;
 }
+
+/// APPEND on a node with no copy of a large key must not create the key from
+/// the appended bytes alone — that write would replicate and replace the
+/// real value cluster-wide. It is refused instead, and the value survives.
+/// On a node that holds a copy, APPEND works and replicates as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_to_a_large_value_held_elsewhere_is_refused_not_destructive() {
+    use ephpm_kv::store::AppendError;
+    let Some(nodes) = three_nodes().await else { return };
+    // Find a key with a node outside its replica set holding no copy (RF 2
+    // of 3, written from node 0, so some key leaves one node empty-handed).
+    let mut found = None;
+    for i in 0..12 {
+        let key = format!("big:append:{i}");
+        let value = large("append");
+        assert!(nodes[0].local.set(key.clone(), value.clone(), None));
+        wait_everywhere(&nodes, &key, Some(&value), Duration::from_secs(10)).await;
+        if let Some(idx) = nodes.iter().position(|n| n.local.get(&key).is_none()) {
+            found = Some((key, value, idx));
+            break;
+        }
+    }
+    let (key, value, outsider) = found.expect("with RF=2 of 3 some node holds no copy");
+
+    let refused = nodes[outsider].local.try_append(&key, b"-tail");
+    assert_eq!(refused, Err(AppendError::HeldElsewhere));
+    // Nothing changed anywhere, and the outsider still has no local copy.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_everywhere(&nodes, &key, Some(&value), Duration::from_secs(5)).await;
+    assert!(nodes[outsider].local.get(&key).is_none());
+
+    // A node that holds the key appends normally, and everyone sees it.
+    let holder = nodes.iter().position(|n| n.local.get(&key).is_some()).expect("a holder");
+    let new_len = nodes[holder].local.try_append(&key, b"-tail").expect("append on a holder");
+    let mut want = value.clone();
+    want.extend_from_slice(b"-tail");
+    assert_eq!(new_len, want.len());
+    wait_everywhere(&nodes, &key, Some(&want), Duration::from_secs(10)).await;
+
+    // A key that exists nowhere is still created by APPEND, from any node.
+    assert_eq!(nodes[outsider].local.try_append("big:append:new", b"abc"), Ok(3));
+    wait_everywhere(&nodes, "big:append:new", Some(b"abc"), Duration::from_secs(10)).await;
+    shutdown_all(nodes).await;
+}
