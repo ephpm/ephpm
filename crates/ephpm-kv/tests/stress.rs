@@ -194,10 +194,13 @@ async fn ttl_expiry_under_load() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    // Set keys with TTLs between 200ms and 1000ms.
+    // Set keys with TTLs between 2 s and 2.8 s. The floor must outlast the
+    // SET loop plus the DBSIZE check below: with the active-expiry thread
+    // running, a 200 ms floor let the reaper take the first keys before the
+    // "all present" check on a loaded arm64 runner (158 of 200 seen).
     for i in 0..TTL_KEY_COUNT {
         let key = format!("ttl:{i}");
-        let ms = 200 + (i * 4); // 200ms..996ms
+        let ms = 2_000 + (i * 4); // 2000ms..2796ms
         let _: () = redis::cmd("SET")
             .arg(&key)
             .arg(format!("val{i}"))
@@ -217,7 +220,7 @@ async fn ttl_expiry_under_load() {
     // until the active-expiry thread reaps them. It wakes every
     // `ACTIVE_EXPIRE_INTERVAL` (100 ms) and keeps sampling while most of its
     // sample is expired, so all 200 go within a tick or two of the last
-    // deadline (~1 s). 10 s is a generous bound.
+    // deadline (~2.8 s). 10 s is a generous bound.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
