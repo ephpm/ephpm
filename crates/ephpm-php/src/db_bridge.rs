@@ -83,6 +83,20 @@
 //! worker thread. Scripts should still `COMMIT`/`ROLLBACK` explicitly —
 //! the automatic rollback is a safety net, not an API.
 //!
+//! # Named locks end with the request
+//!
+//! MySQL's `GET_LOCK()` locks belong to the *connection* that took them and
+//! are released when it closes. Over the wire that is the end of the PHP
+//! process's `pdo_mysql` connection; here the connection is the thread's
+//! session, which outlives the request — so [`on_request_end`] releases
+//! every named lock the session still holds (`RELEASE_ALL_LOCKS()`), and a
+//! bridge lock lives at most for the request that took it. A script that
+//! wants a lock to outlive its request must use `pdo_mysql`, whose
+//! connection it controls. Whether `GET_LOCK()` is available at all depends
+//! on the backend the server registered (ephpm-server's `user_locks`
+//! module): a backend without a lock scope makes the functions fail with a
+//! clear error rather than granting a lock that excludes nothing.
+//!
 //! # Session recycling on connection failure
 //!
 //! A thread's session holds its `BackendConn` indefinitely. If the
@@ -1674,13 +1688,15 @@ pub fn on_request_end() {
     // #300). Unconditional — parked sessions exist whether or not this process
     // has a bridge registered, and it costs one relaxed load when empty.
     drain_parked_sessions();
-    rollback_abandoned_on(DB_BRIDGE.get());
+    end_request_on(DB_BRIDGE.get());
 }
 
-/// The rollback half of [`on_request_end`] against an explicit bridge. Split
-/// out for the same reason as [`run_on`]: unit tests drive a locally-built
-/// [`DbBridge`] rather than the process-wide, set-once [`DB_BRIDGE`].
-fn rollback_abandoned_on(bridge: Option<&DbBridge>) {
+/// The session half of [`on_request_end`] against an explicit bridge: roll
+/// back an abandoned transaction, then release any named locks the request
+/// left held. Split out for the same reason as [`run_on`]: unit tests drive a
+/// locally-built [`DbBridge`] rather than the process-wide, set-once
+/// [`DB_BRIDGE`].
+fn end_request_on(bridge: Option<&DbBridge>) {
     let Some(bridge) = bridge else {
         return;
     };
@@ -1688,41 +1704,77 @@ fn rollback_abandoned_on(bridge: Option<&DbBridge>) {
     // `ephpm_worker_send_response` native, so a shutdown function can too. A
     // destroyed cell means `HeldCell::drop` has already parked the session —
     // the rollback is moot, and the parked session's connection abandons the
-    // transaction when the next request drains the graveyard.
+    // transaction (and releases its locks) when the next request drains the
+    // graveyard.
     let _ = DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
         let Some(held) = slot.as_mut() else {
             return;
         };
-        if !held.session.in_transaction {
+        if held.session.in_transaction {
+            tracing::warn!(
+                "PHP script left a database transaction open at request end — rolling it back \
+                 (scripts must COMMIT or ROLLBACK before the request finishes)"
+            );
+            // block_on is legal here for the same reason as the query path:
+            // request teardown runs on a PHP worker OS thread or the tokio
+            // execution pool, never on an async task (module docs,
+            // `Async boundary`). On success Session::query clears
+            // `in_transaction` itself.
+            //
+            // Panic-guarded: worker mode reaches this from inside an
+            // `extern "C"` PHP native (see "Engine panic containment").
+            match catch_engine_panic(|| bridge.handle.block_on(held.session.query("ROLLBACK", &[])))
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "rollback of the abandoned transaction failed — dropping the session so \
+                         the next request reconnects with clean state"
+                    );
+                    // Dropping the session drops its connection, and the
+                    // connection's locks with it.
+                    *slot = None;
+                    return;
+                }
+                Err(panic) => {
+                    tracing::error!(
+                        panic = %panic,
+                        "embedded database engine panicked rolling back an abandoned \
+                         transaction — discarding this thread's session"
+                    );
+                    discard_after_panic(slot.take());
+                    return;
+                }
+            }
+        }
+        // Named locks are connection-scoped on MySQL; the bridge's connection
+        // is the thread's, so the request is the lifetime they get here
+        // (module docs, "Named locks end with the request"). `may_hold` is a
+        // cheap flag — a session that never locked anything pays nothing.
+        if !held.session.may_hold_user_locks() {
             return;
         }
-        tracing::warn!(
-            "PHP script left a database transaction open at request end — rolling it back \
-             (scripts must COMMIT or ROLLBACK before the request finishes)"
-        );
-        // block_on is legal here for the same reason as the query path:
-        // request teardown runs on a PHP worker OS thread or the tokio
-        // execution pool, never on an async task (module docs,
-        // `Async boundary`). On success Session::query clears
-        // `in_transaction` itself.
-        //
-        // Panic-guarded: worker mode reaches this from inside an `extern "C"`
-        // PHP native (see "Engine panic containment").
-        match catch_engine_panic(|| bridge.handle.block_on(held.session.query("ROLLBACK", &[]))) {
-            Ok(Ok(_)) => {}
+        match catch_engine_panic(|| bridge.handle.block_on(held.session.release_user_locks())) {
+            Ok(Ok(released)) => {
+                tracing::debug!(
+                    released,
+                    "released the named locks (GET_LOCK) a PHP request left held at its end"
+                );
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
-                    "rollback of the abandoned transaction failed — dropping the session so \
-                     the next request reconnects with clean state"
+                    "releasing a request's named locks failed — dropping the session so its \
+                     connection (and the locks with it) goes away"
                 );
                 *slot = None;
             }
             Err(panic) => {
                 tracing::error!(
                     panic = %panic,
-                    "embedded database engine panicked rolling back an abandoned transaction — \
+                    "embedded database engine panicked releasing a request's named locks — \
                      discarding this thread's session"
                 );
                 discard_after_panic(slot.take());
@@ -3016,7 +3068,7 @@ mod recycle_tests {
 
 // ── Engine panic containment tests ──────────────────────────────────────
 //
-// Drive the real `run_on` / `rollback_abandoned_on` over a backend whose
+// Drive the real `run_on` / `end_request_on` over a backend whose
 // connections panic on demand — the shape of Turso's
 // `turso_assert!(!self.db_initialized())` in `maybe_allocate_page1`, which the
 // stress run hit with concurrent first writes on a brand-new file.
@@ -3223,7 +3275,7 @@ mod panic_tests {
         assert!(in_transaction());
 
         flags.panic_on_query.store(true, Ordering::SeqCst);
-        rollback_abandoned_on(Some(&bridge));
+        end_request_on(Some(&bridge));
         assert!(!held_session_exists(), "the panicked session must not be kept");
         assert!(!in_transaction());
 
@@ -3672,6 +3724,77 @@ mod per_site_tests {
             handle,
             cache: Arc::new(TranslateCache::default()),
         }
+    }
+
+    /// A bridge over a lock-scoped backend, plus the registry the scope
+    /// lives in, so a test can observe what the session holds.
+    fn locked_turso_bridge(
+        path: &std::path::Path,
+    ) -> (DbBridge, Arc<litewire::backend::UserLockRegistry>) {
+        let registry = litewire::backend::UserLockRegistry::new();
+        let scoped: SharedBackend =
+            Arc::new(litewire::backend::UserLockScoped::new(open_turso(path), &registry, "tenant"));
+        let handle = TEST_RT.get().expect("runtime").handle().clone();
+        let bridge = DbBridge {
+            source: BackendSource::Single(scoped),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        };
+        (bridge, registry)
+    }
+
+    /// **Named locks end with the request.** The bridge's session outlives the
+    /// request, so a `GET_LOCK()` the script never released must be released
+    /// at request end — and the session must stay usable afterwards.
+    ///
+    /// Serialized: `on_request_end()`-shaped teardown drains the global
+    /// session graveyard the teardown tests assert on.
+    #[test]
+    #[serial]
+    fn request_end_releases_named_locks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (bridge, registry) = locked_turso_bridge(&dir.path().join("locks.db"));
+
+        assert_eq!(run(&bridge, "SELECT GET_LOCK('job', 0) AS got"), RunStatus::Rows);
+        with_cell(0, 0, |v| assert_eq!(v, Some(&Value::Integer(1))));
+        finish();
+        assert_eq!(registry.held_in("tenant"), 1, "the session holds the lock");
+
+        // A request that never released: request end does it.
+        end_request_on(Some(&bridge));
+        assert_eq!(registry.held_in("tenant"), 0, "released at request end");
+        assert!(held_session_exists(), "the session itself is kept for the next request");
+
+        // Nothing to release is a no-op, and the session still works.
+        end_request_on(Some(&bridge));
+        assert_eq!(run(&bridge, "SELECT IS_FREE_LOCK('job') AS free"), RunStatus::Rows);
+        with_cell(0, 0, |v| assert_eq!(v, Some(&Value::Integer(1))));
+        finish();
+
+        // `DO RELEASE_LOCK(...)` — the Sendy release shape — is an OK, not rows.
+        assert_eq!(run(&bridge, "SELECT GET_LOCK('job', 0)"), RunStatus::Rows);
+        finish();
+        assert_eq!(run(&bridge, "DO RELEASE_LOCK('job')"), RunStatus::Ok);
+        assert!(!had_rowset());
+        assert_eq!(registry.held_in("tenant"), 0);
+        reset_staged();
+    }
+
+    /// A backend with no lock scope makes `GET_LOCK()` an error, never a 1.
+    #[test]
+    fn get_lock_on_an_unscoped_backend_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = single_turso_bridge(&dir.path().join("plain.db"));
+        assert_eq!(run(&bridge, "SELECT GET_LOCK('job', 0)"), RunStatus::Err);
+        with_error(|e| {
+            let (_, _, msg) = e.expect("an error must be staged");
+            assert!(msg.contains("named locks"), "got: {msg}");
+        });
+        reset_staged();
+    }
+
+    fn held_session_exists() -> bool {
+        DB_HELD.with(|cell| cell.0.borrow().is_some())
     }
 
     /// With a tenant context the same bridge reports available.
