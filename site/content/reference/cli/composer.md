@@ -20,9 +20,8 @@ read them before you put it in CI.
 > (`=0.23.0` in the workspace `Cargo.toml`, from crates.io). Flags and behavior
 > can change when that pin moves, so this page describes 0.23.0 only. Released
 > binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1 embeds 0.15.0,
-> and v0.11.2 through v0.12.0 embed 0.17.0; 0.23.0 ships in the first release
-> after v0.12.0. `ephpm composer --version` prints the version your binary
-> embeds.
+> and v0.11.2 through v0.12.0 embed 0.17.0; 0.23.0 ships in v0.13.0.
+> `ephpm composer --version` prints the version your binary embeds.
 
 ## What needs PHP or Composer
 

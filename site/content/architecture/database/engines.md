@@ -98,7 +98,7 @@ Two honest caveats:
 
 ## Turso 0.8.2 → 0.8.3
 
-The release after v0.12.0 moves the engine to Turso 0.8.3
+v0.13.0 moves the engine to Turso 0.8.3
 ([litewire#47](https://github.com/ephpm/litewire/pull/47)). This fixes a
 whole-database-loss bug, so **upgrade off 0.8.2**. The file format and the CDC
 log schema (`turso_cdc_version` = `v2`) did not change, so no dump/reload is
@@ -137,7 +137,7 @@ possible.
 
 ## Page-1 allocation race (patched Turso 0.8.3)
 
-From the release after v0.12.0, ePHPm builds Turso 0.8.3 from a fork rather
+From v0.13.0, ePHPm builds Turso 0.8.3 from a fork rather
 than the crates.io release: the org mirror
 [ephpm/turso](https://github.com/ephpm/turso) at tag
 [`v0.8.3-ephpm.1`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.1)
@@ -160,7 +160,7 @@ the unpatched crates.io 0.8.3 and passes against the fork.
 ## WAL growth under load, and the checkpoint gate
 
 Found by the WAL-growth stress runs of 2026-10-17/18 (ePHPm on Turso 0.8.3)
-and fixed in the release after v0.12.0 ([litewire#49](https://github.com/ephpm/litewire/pull/49)).
+and fixed in v0.13.0 ([litewire#49](https://github.com/ephpm/litewire/pull/49)).
 
 Turso checkpoints like SQLite: a passive auto-checkpoint copies
 write-ahead-log frames into the main file once the log holds ~1000

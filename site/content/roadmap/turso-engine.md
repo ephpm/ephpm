@@ -84,7 +84,7 @@ black-box sidecar ever was.
 > **Status: SHIPPED, 2026-07; became the default and only engine in
 > v0.7.0.** litewire has a `litewire-turso` backend (engine pinned
 > `turso =0.7.2` as of v0.7.1, `turso =0.8.2` in v0.12.0 (ephpm#535),
-> `turso =0.8.3` from the release after v0.12.0 (litewire#47) — built from a
+> `turso =0.8.3` from v0.13.0 (litewire#47) — built from a
 > fork of the v0.8.3 tag carrying the page-1 allocation race fix
 > (tursodatabase/turso#10117; org mirror `ephpm/turso`, tag
 > `v0.8.3-ephpm.1`) via ePHPm's `[patch.crates-io]`) and ePHPm
@@ -241,7 +241,7 @@ path is a **single ordered stream** with no schema-sync side channel.
   identity refuses the reclaim and falls through to the normal grace +
   election; a genuine fast restart with unchanged data still reclaims
   immediately.
-- **Transactions larger than one poll window replicate (post-v0.12.0,
+- **Transactions larger than one poll window replicate (v0.13.0,
   litewire#48).** litewire's `CdcTailer::poll_batch` read `turso_cdc` in
   a 1024-row window and answered "nothing pending" when that window held
   no COMMIT row. A committed transaction with 1024+ row changes never has
@@ -265,7 +265,7 @@ path is a **single ordered stream** with no schema-sync side channel.
   The lag is measured in **change-log rows, not seconds**; a time-based
   lag is listed under "still deferred" below because it needs a wire
   change, not a calculation.
-- **Bounded WAL under constant readers (post-v0.12.0, litewire#49) — a
+- **Bounded WAL under constant readers (v0.13.0, litewire#49) — a
   workaround, not configurable.** Was a known issue from the 2026-10-17/18
   stress runs: Turso 0.8.3 never rewinds its write-ahead log while any
   reader is active, and under constant load one always is, so the `-wal`
