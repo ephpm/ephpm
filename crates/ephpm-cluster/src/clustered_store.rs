@@ -958,6 +958,58 @@ impl ClusteredStore {
         (marker, self.new_write(ttl))
     }
 
+    /// A stamp for this node's write to `transport_key`, strictly above every
+    /// write to it this node has already applied (`applied`'s record).
+    ///
+    /// Every replicated write a replicator originates is stamped here or via
+    /// [`new_write_after`](Self::new_write_after) /
+    /// [`new_large_write_after`](Self::new_large_write_after). A write is
+    /// usually computed from what this node holds — a read-modify-write after
+    /// [`Replicator::resolve_for_update`] installed a peer's copy, an `EXPIRE`
+    /// or `DEL` of a value that just replicated in — and that write must win
+    /// over the version it read. The wall clock alone does not guarantee it:
+    /// within one millisecond the peer's sequence can be ahead of this
+    /// node's, and the write would be stamped below what it replaced and
+    /// discarded by last-writer-wins on every node, this one included.
+    ///
+    /// [`Replicator::resolve_for_update`]: ephpm_kv::store::Replicator::resolve_for_update
+    #[must_use]
+    pub fn stamp_after_applied(&self, applied: &AppliedWriteMap, transport_key: &str) -> Stamp {
+        // Copy the record out: the slot guard must not be held across the
+        // clock update (or anything else).
+        let seen = applied.get(transport_key).map(|s| *s);
+        self.cluster.stamp_after(seen)
+    }
+
+    /// [`new_write`](Self::new_write), stamped above `applied`'s record for
+    /// `transport_key` (see [`stamp_after_applied`](Self::stamp_after_applied)).
+    #[must_use]
+    pub fn new_write_after(
+        &self,
+        applied: &AppliedWriteMap,
+        transport_key: &str,
+        ttl: Option<Duration>,
+    ) -> WriteStamp {
+        WriteStamp {
+            stamp: self.stamp_after_applied(applied, transport_key),
+            expiry_ms: expiry_ms_for(ttl),
+        }
+    }
+
+    /// [`new_large_write`](Self::new_large_write), both stamps above
+    /// `applied`'s record for `transport_key` (see
+    /// [`stamp_after_applied`](Self::stamp_after_applied)).
+    #[must_use]
+    pub fn new_large_write_after(
+        &self,
+        applied: &AppliedWriteMap,
+        transport_key: &str,
+        ttl: Option<Duration>,
+    ) -> (Stamp, WriteStamp) {
+        let marker = self.stamp_after_applied(applied, transport_key);
+        (marker, self.new_write(ttl))
+    }
+
     /// Set a value, routing through the appropriate tier.
     ///
     /// Returns whether this node's own copy was written. Small values are
@@ -1961,7 +2013,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             // echo of this write from gossip, a concurrent local writer or a
             // peer's write racing this one cannot leave the local copy and
             // the recorded stamp disagreeing.
-            let w = self.inner.new_write(ttl);
+            let w = self.inner.new_write_after(&self.applied, &key, ttl);
             let verdict = apply_if_newer(&self.applied, &key, w.stamp, || {
                 store.set_local(key.clone(), value.clone(), ttl);
             });
@@ -1980,7 +2032,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // replica set (F-8) — and the replica fan-out goes through the
         // bounded data-plane queue (or is awaited in `sync` mode). Same
         // one-step record + local write as the small path.
-        let (marker, w) = self.inner.new_large_write(ttl);
+        let (marker, w) = self.inner.new_large_write_after(&self.applied, &key, ttl);
         let mut local_ok = true;
         let verdict = apply_if_newer(&self.applied, &key, w.stamp, || {
             local_ok = store.set_local(key.clone(), value.clone(), ttl);
@@ -2005,7 +2057,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // broadcast key's contract is "readable from every node's raw local
         // Store", and the node that wrote it is one of those nodes — the
         // caller (ACME certificate issuance) reads its own write back.
-        let w = self.inner.new_write(ttl);
+        let w = self.inner.new_write_after(&self.applied, &key, ttl);
         // Same last-writer-wins bookkeeping as `replicate_set`, at every
         // size: the record and the local write are one step.
         let store = &self.inner.store;
@@ -2121,7 +2173,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // tombstone. Record our own stamp in the applied map so a
         // slow echo of THIS tombstone through gossip does not clobber a
         // follow-up SET we later accept locally.
-        let stamp = self.inner.cluster.stamp();
+        let stamp = self.inner.stamp_after_applied(&self.applied, key);
         let store = &self.inner.store;
         let verdict = apply_if_newer(&self.applied, key, stamp, || {
             store.remove_local(key);
@@ -2150,7 +2202,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // gossip echo of THIS publish from clobbering a newer local value that
         // lands before the echo arrives.
         if value.len() <= self.inner.config.small_key_threshold {
-            let w = self.inner.new_write(ttl);
+            let w = self.inner.new_write_after(&self.applied, &key, ttl);
             if apply_if_newer(&self.applied, &key, w.stamp, || {}) == Apply::Skip {
                 // Overtaken by a newer write for this key: not published.
                 return;
@@ -2158,7 +2210,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             self.inner.cluster.gossip_set_queued(&key, &value, w.expiry_ms, w.stamp);
             return;
         }
-        let (marker, w) = self.inner.new_large_write(ttl);
+        let (marker, w) = self.inner.new_large_write_after(&self.applied, &key, ttl);
         if apply_if_newer(&self.applied, &key, w.stamp, || {}) == Apply::Skip {
             return;
         }
@@ -2180,7 +2232,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // broadcast. Record our own stamp first so a slow gossip echo of
         // THIS tombstone cannot clobber a follow-up SET we later accept
         // locally, then fan the tombstone out on the gossip tier only.
-        let stamp = self.inner.cluster.stamp();
+        let stamp = self.inner.stamp_after_applied(&self.applied, &key);
         if apply_if_newer(&self.applied, &key, stamp, || {}) == Apply::Skip {
             return;
         }
@@ -2196,7 +2248,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         // origin's newer stamp wins, and the peer takes whatever
         // expiry the origin last stamped. That's what session refresh
         // needs; a shorter-wins rule would break lazy_write.
-        let w = self.inner.new_write(Some(ttl));
+        let w = self.inner.new_write_after(&self.applied, key, Some(ttl));
         // Record OUR own stamp and apply the new expiry in one step, so a
         // slower echo of the same expiry update from gossip (or a racing
         // newer write) cannot leave the local copy and the record at odds.
@@ -2359,7 +2411,7 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         let transport = crate::site_namespace::encode(&self.site, &key);
         let local = &self.local;
         if value.len() <= self.inner.config.small_key_threshold {
-            let w = self.inner.new_write(ttl);
+            let w = self.inner.new_write_after(&self.applied, &transport, ttl);
             let verdict = apply_if_newer(&self.applied, &transport, w.stamp, || {
                 local.set_local(key.clone(), value.clone(), ttl);
             });
@@ -2371,7 +2423,7 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         }
         // Large value: this site's own copy under the bare key, the fan-out
         // under the transport key (see `KvReplicator::replicate_set`).
-        let (marker, w) = self.inner.new_large_write(ttl);
+        let (marker, w) = self.inner.new_large_write_after(&self.applied, &transport, ttl);
         let mut local_ok = true;
         let verdict = apply_if_newer(&self.applied, &transport, w.stamp, || {
             local_ok = local.set_local(key.clone(), value.clone(), ttl);
@@ -2395,8 +2447,8 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     }
 
     fn replicate_remove(&self, key: &str) -> bool {
-        let stamp = self.inner.cluster.stamp();
         let transport = crate::site_namespace::encode(&self.site, key);
+        let stamp = self.inner.stamp_after_applied(&self.applied, &transport);
         let local = &self.local;
         let verdict = apply_if_newer(&self.applied, &transport, stamp, || {
             local.remove_local(key);
@@ -2415,14 +2467,14 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // the cluster-wide fan-out is left to do.
         let transport = crate::site_namespace::encode(&self.site, &key);
         if value.len() <= self.inner.config.small_key_threshold {
-            let w = self.inner.new_write(ttl);
+            let w = self.inner.new_write_after(&self.applied, &transport, ttl);
             if apply_if_newer(&self.applied, &transport, w.stamp, || {}) == Apply::Skip {
                 return;
             }
             self.inner.cluster.gossip_set_queued(&transport, &value, w.expiry_ms, w.stamp);
             return;
         }
-        let (marker, w) = self.inner.new_large_write(ttl);
+        let (marker, w) = self.inner.new_large_write_after(&self.applied, &transport, ttl);
         if apply_if_newer(&self.applied, &transport, w.stamp, || {}) == Apply::Skip {
             return;
         }
@@ -2484,8 +2536,8 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // value recreated on this node between `del_if_eq`'s removal and this
         // broadcast survives. Record the stamp keyed by the TRANSPORT key,
         // then gossip the per-site tombstone only.
-        let stamp = self.inner.cluster.stamp();
         let transport = crate::site_namespace::encode(&self.site, &key);
+        let stamp = self.inner.stamp_after_applied(&self.applied, &transport);
         if apply_if_newer(&self.applied, &transport, stamp, || {}) == Apply::Skip {
             return;
         }
@@ -2495,8 +2547,8 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
     fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
         // Same shape as the global path: update locally, then re-broadcast the
         // unchanged value with the new expiry so peers converge on it.
-        let w = self.inner.new_write(Some(ttl));
         let transport = crate::site_namespace::encode(&self.site, key);
+        let w = self.inner.new_write_after(&self.applied, &transport, Some(ttl));
         let local = &self.local;
         let mut ok = false;
         let verdict = apply_if_newer(&self.applied, &transport, w.stamp, || {
@@ -2598,7 +2650,7 @@ fn publish_hash_field(
     transport: &str,
     apply: &mut dyn FnMut() -> Option<HashFieldState>,
 ) -> bool {
-    let stamp = inner.cluster.stamp();
+    let stamp = inner.stamp_after_applied(applied, transport);
     let mut ran = false;
     let mut published = None;
     apply_if_newer_cond(applied, transport, stamp, || {

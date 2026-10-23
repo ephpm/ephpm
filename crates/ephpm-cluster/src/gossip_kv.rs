@@ -186,6 +186,19 @@ impl StampClock {
             }
         }
     }
+
+    /// Advance this clock past `seen` (a hybrid-logical-clock receive): every
+    /// stamp issued after this call has a strictly greater
+    /// [`Stamp::write`] than `seen.write`, so it beats `seen` whatever the two
+    /// nodes' tags are.
+    ///
+    /// Without it, a node that installs a peer's write and then writes the
+    /// same key **within the same millisecond** can issue a smaller stamp than
+    /// the one it just read (the peer's per-millisecond sequence ran ahead of
+    /// this node's), and last-writer-wins silently discards the newer write.
+    pub fn observe(&self, seen: Stamp) {
+        self.last.fetch_max(seen.write, Ordering::AcqRel);
+    }
 }
 
 /// Encode a binary value with an absolute expiry and its write stamp into
@@ -400,6 +413,17 @@ impl ClusterHandle {
     /// copy is written, and carries that stamp on every transport.
     #[must_use]
     pub fn stamp(&self) -> Stamp {
+        self.clock.next()
+    }
+
+    /// Issue the next write stamp, strictly above `seen` when given — the
+    /// stamp for a write that must order after a write this node has already
+    /// applied (see [`StampClock::observe`]).
+    #[must_use]
+    pub fn stamp_after(&self, seen: Option<Stamp>) -> Stamp {
+        if let Some(seen) = seen {
+            self.clock.observe(seen);
+        }
         self.clock.next()
     }
 
@@ -832,6 +856,27 @@ mod tests {
         // Many stamps in one millisecond ride the sequence bits, not the
         // clock: the millisecond part moves at most by the elapsed time.
         assert!(prev.epoch_ms() <= now_epoch_ms() + 1);
+    }
+
+    /// A write stamped after observing a peer's stamp beats it, even when the
+    /// peer's sequence for the current millisecond is ahead of this clock's
+    /// and the peer's tag sorts higher — the same-millisecond read-then-write
+    /// that made a GETEX/GETDEL on a non-holder lose to the value it read.
+    #[test]
+    fn observed_stamp_is_always_beaten() {
+        let clock = StampClock::new("n");
+        let peer = Stamp { write: (now_epoch_ms() << SEQ_BITS) + 5, node_tag: u64::MAX };
+        // Unobserved, this clock's next stamp in the same millisecond loses.
+        let blind = StampClock::new("n").next();
+        if blind.epoch_ms() == peer.epoch_ms() {
+            assert!(blind < peer);
+        }
+        clock.observe(peer);
+        let mine = clock.next();
+        assert!(mine > peer, "{mine:?} must beat the observed {peer:?}");
+        // Observing an older stamp never moves the clock backwards.
+        clock.observe(Stamp { write: 1, node_tag: 0 });
+        assert!(clock.next() > mine);
     }
 
     /// Same `write`, different nodes: the tag breaks the tie, the same way
