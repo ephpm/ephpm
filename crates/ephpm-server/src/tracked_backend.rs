@@ -70,6 +70,16 @@ impl BackendConn for TrackedConn {
         // so prepare-time describes don't pollute the digest table.
         self.inner.describe_columns(sql).await
     }
+
+    /// Named-lock operations are session state, not SQL: nothing to digest,
+    /// and a decorator that swallowed them would make the connection it wraps
+    /// refuse `GET_LOCK()` (litewire's default). Forward untouched.
+    async fn user_lock(
+        &self,
+        op: &litewire::backend::user_lock::UserLockOp,
+    ) -> Result<litewire::backend::user_lock::UserLockReply, BackendError> {
+        self.inner.user_lock(op).await
+    }
 }
 
 #[async_trait::async_trait]

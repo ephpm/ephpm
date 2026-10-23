@@ -270,3 +270,56 @@ async fn tenant_cannot_switch_journal_mode_over_the_wire() {
     let rows: Vec<i64> = a2.query("SELECT id FROM t").await.expect("select");
     assert_eq!(rows, vec![1]);
 }
+
+/// `SELECT <lock expr>` as `Option<i64>` (`None` = SQL NULL).
+async fn lock_int(conn: &mut Conn, sql: &str) -> Option<i64> {
+    conn.query_first::<Option<i64>, _>(sql).await.expect("lock statement").expect("one row")
+}
+
+/// MySQL named locks are scoped **per site**: a tenant's `job` lock excludes
+/// that tenant's other connections and is invisible to — and cannot block —
+/// every other tenant. And it dies with the connection that holds it.
+#[tokio::test]
+async fn named_locks_are_scoped_per_site_and_die_with_the_connection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (auth, port) = start(tmp.path().to_path_buf()).await;
+
+    let mut a1 = connect(port, SITE_A, &auth.password_for(SITE_A)).await.expect("site-a #1");
+    let mut a2 = connect(port, SITE_A, &auth.password_for(SITE_A)).await.expect("site-a #2");
+    let mut b = connect(port, SITE_B, &auth.password_for(SITE_B)).await.expect("site-b");
+
+    // Sendy's exact statement.
+    assert_eq!(
+        lock_int(&mut a1, r#"SELECT GET_LOCK("sendy_campaign_send_1", 0) AS lock_status"#).await,
+        Some(1)
+    );
+    assert_eq!(
+        lock_int(&mut a2, r#"SELECT GET_LOCK("sendy_campaign_send_1", 0) AS lock_status"#).await,
+        Some(0),
+        "a second worker of the SAME site must not proceed"
+    );
+    // Site B: a different namespace entirely.
+    assert_eq!(lock_int(&mut b, "SELECT IS_FREE_LOCK('sendy_campaign_send_1')").await, Some(1));
+    assert_eq!(lock_int(&mut b, "SELECT IS_USED_LOCK('sendy_campaign_send_1')").await, None);
+    assert_eq!(
+        lock_int(&mut b, r#"SELECT GET_LOCK("sendy_campaign_send_1", 0) AS lock_status"#).await,
+        Some(1),
+        "another site's lock of the same name must not block this site"
+    );
+    // B releasing its own lock does nothing to A's.
+    b.query_drop(r#"DO RELEASE_LOCK("sendy_campaign_send_1")"#).await.expect("release");
+    assert_eq!(lock_int(&mut a2, "SELECT IS_FREE_LOCK('sendy_campaign_send_1')").await, Some(0));
+
+    // The holder's connection goes away without releasing (a killed worker):
+    // the next attempt on the same site acquires.
+    drop(a1);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        lock_int(&mut a2, r#"SELECT GET_LOCK("sendy_campaign_send_1", 10) AS lock_status"#).await,
+        Some(1)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "freed on disconnect, not at the timeout"
+    );
+}

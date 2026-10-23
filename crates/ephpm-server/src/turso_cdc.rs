@@ -748,7 +748,15 @@ pub async fn start_clustered_turso_cdc(
     // with the PHP `ephpm_db_*` bridge so in-process queries hit the same
     // tracked backend as wire clients.
     let tracked = tracked_backend::TrackedBackend::new(wire_factory, query_stats.clone());
-    spawn_litewire_serve(sqlite_config, crate::share_backend_with_php(tracked), handles);
+    // MySQL named locks: granted on the primary only (node-local there, which
+    // is cluster-wide because the primary is the single writer); a replica
+    // refuses them rather than hand out a lock that excludes nothing beyond
+    // its own node. See `crate::user_locks`.
+    let locked = crate::user_locks::PrimaryOnlyUserLocks::new(
+        Arc::new(tracked) as litewire::backend::SharedBackend,
+        Arc::clone(&is_primary),
+    );
+    spawn_litewire_serve(sqlite_config, crate::share_backend_with_php(locked), handles);
 
     // Kick off role-appropriate work for the initial role.
     let initial_driver =

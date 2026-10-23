@@ -236,7 +236,15 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 3e64c5132c87 — engine work runs off the async workers (litewire#52,
+# litewire @ fcc4f63fe5dd — MySQL named locks (litewire#54): GET_LOCK() & co. and
+# `DO`, with MySQL 8 semantics, released when the holding connection ends. New
+# `BackendConn::user_lock` hook (refuses unless the backend was given a lock
+# scope — `UserLockScoped` / `scoped_conn`), `Session::may_hold_user_locks` /
+# `release_user_locks`, `Prepared::param_count`; the MySQL frontend now writes
+# a session error's own code to the wire. Wired in ePHPm by `user_locks.rs`,
+# `site_backends` (per-site scope) and `sql_forward` (owner-side locks).
+#
+# Previous pin 3e64c5132c87 — engine work runs off the async workers (litewire#52,
 # docs + slow-statement WARN in #53). Turso's async API runs each step's page
 # I/O and the commit fsync synchronously inside `poll` (yielding only between
 # steps), so every session statement, CDC poll/apply and WAL-gate checkpoint
@@ -575,7 +583,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "3e64c5132c87efd8291b5f34ff44ce48df01e1cb", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "fcc4f63fe5ddb1b7f1114eb4205b569a7a4ee0ef", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
