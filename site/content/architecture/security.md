@@ -134,8 +134,11 @@ int ephpm_execute_script(const char *filename) {
 - PHP's memory allocator (`emalloc`/`efree`) is separate from Rust's allocator
 - `memory_limit` bounds one request's Zend heap, but it does **not** guarantee
   that PHP cannot exhaust host memory:
-  - It is `PHP_INI_ALL`, so a script can raise its own limit
-    (`ini_set('memory_limit', '-1')` removes it).
+  - It is `PHP_INI_ALL`, so a script can change its own limit. ePHPm bounds
+    a raise with `[php] memory_limit_max` (default: the `memory_limit` the
+    server started with): `ini_set('memory_limit', '-1')`, or any value above
+    the ceiling, returns `false` and leaves the limit as it was. Before
+    v0.13.1 there was no ceiling and `-1` removed the limit.
   - Memory outside the Zend heap (extension and library `malloc`s) is not
     counted against it.
   - Every request runs in one process, so the bound that matters to the host is

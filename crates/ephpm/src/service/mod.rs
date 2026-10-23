@@ -204,7 +204,7 @@ pub fn default_config_toml(document_root: &Path) -> String {
     let document_root_str = document_root.display().to_string();
     let escaped = document_root_str.replace('\\', "\\\\");
     format!(
-        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"per_request\"\nmax_execution_time = 30\nmemory_limit = \"128M\"\n"
+        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"per_request\"\nmax_execution_time = 30\n"
     )
 }
 
@@ -799,7 +799,9 @@ mod tests {
         assert!(toml.contains("document_root = \"/var/www/html\""));
         assert!(toml.contains("[php]"));
         assert!(toml.contains("mode = \"per_request\""));
-        assert!(toml.contains("memory_limit = \"128M\""));
+        // No memory_limit: an explicit one is honoured as written in serve mode,
+        // so the template leaves the per-request limit to the autotune.
+        assert!(!toml.contains("memory_limit"));
         assert!(toml.contains("max_execution_time = 30"));
     }
 
@@ -820,7 +822,7 @@ mod tests {
         config.validate().expect("generated config must pass validate()");
         assert_eq!(config.php.mode, ephpm_config::PhpMode::PerRequest);
         assert_eq!(config.php.max_execution_time, 30);
-        assert_eq!(config.php.memory_limit, "128M");
+        assert_eq!(config.php.memory_limit, None);
     }
 
     #[test]

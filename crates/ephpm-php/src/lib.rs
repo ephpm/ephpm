@@ -244,6 +244,24 @@ mod ffi {
         /// of the SDK headers; safe on any thread.
         pub fn ephpm_engine_has_hard_memory_limit() -> ::std::os::raw::c_int;
 
+        /// Record `[php] memory_limit_max` (PHP quantity syntax; NULL = the
+        /// startup `memory_limit`) for the module-startup hook that bounds
+        /// runtime raises of `memory_limit`. Must be called BEFORE
+        /// `php_embed_init()`. The string is copied; the pointer need not
+        /// outlive the call. Returns 0 on success, -1 on allocation failure.
+        pub fn ephpm_set_memory_limit_max(
+            value: *const ::std::os::raw::c_char,
+        ) -> ::std::os::raw::c_int;
+
+        /// The startup `memory_limit` and the enforced ceiling, in bytes,
+        /// as found by the module-startup hook. Returns 1 when a ceiling is
+        /// enforced, 0 when none is. Reads process globals written once
+        /// during module startup; safe on any thread afterwards.
+        pub fn ephpm_memory_limit_bounds(
+            startup_bytes: *mut ::std::os::raw::c_ulonglong,
+            ceiling_bytes: *mut ::std::os::raw::c_ulonglong,
+        ) -> ::std::os::raw::c_int;
+
         // ── CLI mode functions ──────────────────────────────────────
 
         /// Install our embed module-startup shim so the KV native functions
@@ -645,11 +663,25 @@ pub struct PhpAbi {
     pub default_extension_dir: Option<String>,
 }
 
+/// The `memory_limit` bounds the engine enforces (see
+/// [`PhpRuntime::memory_limit_bounds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimitBounds {
+    /// The `memory_limit` PHP started with, in bytes (`u64::MAX` = `-1`).
+    pub startup_bytes: u64,
+    /// The ceiling a runtime raise may not exceed, in bytes.
+    pub ceiling_bytes: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PhpError {
     /// PHP module initialization (`php_embed_init`) failed.
     #[error("PHP runtime failed to initialize")]
     InitFailed,
+
+    /// A startup setting handed to the engine could not be applied.
+    #[error("invalid PHP startup setting: {0}")]
+    InvalidSetting(String),
 
     /// A shared-engine build's runtime files (the `ext` directory beside the
     /// executable) are missing or unusable. See [`shared`].
@@ -1235,6 +1267,67 @@ impl PhpRuntime {
         #[cfg(not(php_linked))]
         {
             false
+        }
+    }
+
+    /// Set the ceiling on runtime raises of `memory_limit`
+    /// (`[php] memory_limit_max`, PHP quantity syntax, `"-1"` = none).
+    ///
+    /// `None` makes the ceiling the `memory_limit` PHP starts with. Must be
+    /// called before [`PhpRuntime::init`] / [`PhpRuntime::init_with_ini_file`]:
+    /// the hook that enforces it is installed during module startup. Not
+    /// applied in CLI mode. A no-op in stub mode.
+    ///
+    /// # Errors
+    ///
+    /// [`PhpError::InvalidSetting`] if `value` contains a NUL byte or could not be
+    /// stored.
+    pub fn set_memory_limit_max(value: Option<&str>) -> Result<(), PhpError> {
+        #[cfg(php_linked)]
+        {
+            let owned = value.map(std::ffi::CString::new).transpose().map_err(|_| {
+                PhpError::InvalidSetting("[php] memory_limit_max contains a NUL byte".into())
+            })?;
+            let ptr = owned.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+            // SAFETY: `ptr` is NULL or a NUL-terminated string that outlives the
+            // call; the C side copies it with malloc and touches no PHP state, so
+            // no longjmp can occur. Called on the single-threaded startup path
+            // before php_embed_init(), so nothing reads the global concurrently.
+            let rc = unsafe { ffi::ephpm_set_memory_limit_max(ptr) };
+            if rc != 0 {
+                return Err(PhpError::InvalidSetting(
+                    "could not store [php] memory_limit_max (out of memory)".into(),
+                ));
+            }
+        }
+        #[cfg(not(php_linked))]
+        {
+            let _ = value;
+        }
+        Ok(())
+    }
+
+    /// The startup `memory_limit` and the enforced runtime ceiling, in bytes,
+    /// or `None` when no ceiling is enforced (`-1`, CLI mode, stub mode, or
+    /// before [`PhpRuntime::init`]). A startup `memory_limit` of `-1` reads as
+    /// `u64::MAX`.
+    #[must_use]
+    pub fn memory_limit_bounds() -> Option<MemoryLimitBounds> {
+        #[cfg(php_linked)]
+        {
+            let mut startup: ::std::os::raw::c_ulonglong = 0;
+            let mut ceiling: ::std::os::raw::c_ulonglong = 0;
+            // SAFETY: both pointers are valid for writes for the duration of the
+            // call; the C side only copies two process globals written once
+            // during module startup and touches no PHP state.
+            let active =
+                unsafe { ffi::ephpm_memory_limit_bounds(&raw mut startup, &raw mut ceiling) };
+            (active != 0)
+                .then_some(MemoryLimitBounds { startup_bytes: startup, ceiling_bytes: ceiling })
+        }
+        #[cfg(not(php_linked))]
+        {
+            None
         }
     }
 

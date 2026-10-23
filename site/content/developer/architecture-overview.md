@@ -643,8 +643,10 @@ pub struct ServerConfig {
 pub struct PhpConfig {
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time: u32,
-    #[serde(default = "default_memory_limit")]
-    pub memory_limit: String,
+    #[serde(default)]
+    pub memory_limit: Option<String>,      // unset = derived in serve, 128M in dev
+    #[serde(default)]
+    pub memory_limit_max: Option<String>,  // ceiling on runtime raises; unset = startup memory_limit
     #[serde(default)]
     pub ini_file: Option<PathBuf>,  // path to custom php.ini (applied before ini_overrides)
     #[serde(default)]
@@ -656,7 +658,6 @@ fn default_index_files() -> Vec<String> {
 }
 
 fn default_max_execution_time() -> u32 { 30 }
-fn default_memory_limit() -> String { "128M".into() }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, figment::Error> {

@@ -322,9 +322,22 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   node, single-site included. See
   [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
 - **PostgreSQL/PDO persistence** — see §3.
-- **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`
-  and OOM the shared process (another availability, not confidentiality, gap).
-  On PHP 8.3.36/8.4.27/8.5.12+ a tenant can also deliberately cross PHP's
+- **`ini_set` of resource limits.** *Upgrading to v0.13.1:* runtime raises
+  above `memory_limit_max` are now refused, and an explicit
+  `[php] memory_limit` is now honoured in serve mode, so a server configured
+  with `memory_limit = "128M"` refuses WordPress admin's raise to `256M` — set
+  `memory_limit_max = "512M"` to allow it (one WARN is logged per refused
+  raise). See [Upgrading to v0.13.1](/getting-started/install/#upgrading-to-v0131).
+  A tenant cannot raise `memory_limit` above
+  [`[php] memory_limit_max`](/reference/config/#php), which defaults to the
+  `memory_limit` the server started with: `ini_set('memory_limit', '-1')` and
+  any raise above the ceiling return `false` and leave the limit unchanged
+  (through v0.13.0 there was no ceiling, so a tenant could lift its limit and
+  OOM the shared process). Lowering it, and raising it back up to the ceiling,
+  still work. The ceiling is server-wide, like every INI setting. Size it with
+  the next point in mind: `concurrency` × the hard limit of the ceiling is the
+  worst case. On PHP 8.3.36/8.4.27/8.5.12+ a tenant can still deliberately
+  cross PHP's
   [hard memory limit](/reference/config/#phps-hard-memory-limit), whose
   `_exit(137)` ePHPm contains to that request on Linux but which ends the whole
   process on macOS and Windows. What a tenant cannot do is move that limit
