@@ -53,6 +53,10 @@ jobs:
             # Plenty of headroom on the WSL2 x64 runner -- keep
             # profile.release's fat LTO.
             lto: fat
+            # PHP-linked debug test build: cargo's default parallelism and
+            # profile.dev debuginfo (line tables) fit here.
+            test_jobs: default
+            test_debug: line-tables-only
           - runner: arm64
             image: latest-arm64
             triple: aarch64-unknown-linux-gnu
@@ -60,6 +64,12 @@ jobs:
             # Quoted so YAML doesn't fold it to the boolean `false`
             # (cargo's `lto = false` means "thin-local", not "off").
             lto: "off"
+            # The PHP-linked debug test build at default parallelism was
+            # SIGKILLed (exit 137, OOM) compiling the workspace crates on the
+            # arm64 node, which also runs the three PHP legs side by side.
+            # Fewer jobs and no debuginfo bound its memory.
+            test_jobs: 2
+            test_debug: none
     steps:
       - uses: actions/checkout@v4
 
@@ -130,6 +140,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/w -w /w \
             -e CARGO_TERM_COLOR=always \
+            -e CARGO_BUILD_JOBS="${{ matrix.arch.test_jobs }}" \
+            -e CARGO_PROFILE_DEV_DEBUG="${{ matrix.arch.test_debug }}" \
             "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
             bash -uo pipefail -c '
               # Linux SDK cache dirs carry the -gnu libc suffix (see
