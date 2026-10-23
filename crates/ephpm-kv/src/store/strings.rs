@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use super::{Entry, Routed, Store, decompress_value, instant_to_unix_ms, ttl_index_cost};
+use super::{
+    Entry, KeyUnavailable, Routed, Store, decompress_value, instant_to_unix_ms, ttl_index_cost,
+};
 
 /// The expiry a conditional `SET` leaves on the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,11 +62,19 @@ impl Store {
     ///
     /// Locally the read and the removal are one step under the key's shard
     /// lock, so two concurrent `GETDEL`s cannot both get the value. In a
-    /// cluster the removal is then published as a tombstone; a large value
-    /// held only by other nodes is fetched through and deleted cluster-wide,
-    /// which is not atomic across nodes (last-writer-wins, like every write
-    /// in that tier).
-    pub fn getdel(&self, key: &str) -> Option<Bytes> {
+    /// cluster the local copy is first made current
+    /// ([`prepare_update`](Self::prepare_update)) — a node catching up after a
+    /// restart takes its peers' newest copy, and a large value held only by
+    /// other nodes is installed from its replica set — and the removal is
+    /// then published as a tombstone. Not atomic across nodes
+    /// (last-writer-wins, like every write in that tier).
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] when the key's current value could not be
+    /// established; nothing was deleted.
+    pub fn getdel(&self, key: &str) -> Result<Option<Bytes>, KeyUnavailable> {
+        self.prepare_update_for("getdel", key)?;
         if let Some((_, old)) = self.data.remove_if(key, |_, e| !e.is_expired()) {
             self.mem_sub(old.mem_size);
             self.ttl_index_drop(key, old.expires_at);
@@ -75,29 +85,37 @@ impl Store {
                 rep.replicate_remove_published(key.to_string());
             }
             self.stats.hit();
-            return if old.compressed {
+            return Ok(if old.compressed {
                 decompress_value(&old.data, self.config.compression.algo)
             } else {
                 Some(old.data)
-            };
+            });
         }
-        if self.active_replicator().is_none() {
-            self.stats.miss();
-            return None;
-        }
-        // Clustered: a large value may live on other nodes only.
-        let value = self.get_through(key)?;
-        self.remove(key);
-        Some(value)
+        self.stats.miss();
+        Ok(None)
     }
 
     /// `GETEX`: read a string key and change its expiry.
     ///
     /// Returns the value, or `None` (and changes nothing) when the key does
     /// not exist. The expiry change goes through the replicated paths
-    /// (`expire`, `persist`, `remove`), so peers follow it.
-    pub fn getex(&self, key: &str, expiry: GetExpiry) -> Option<Bytes> {
-        let value = self.get_through(key)?;
+    /// (`expire`, `persist`, `remove`), so peers follow it. In a cluster the
+    /// local copy is first made current
+    /// ([`prepare_update`](Self::prepare_update)), so a TTL change on a large
+    /// value this node did not hold reaches its replica set instead of being
+    /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] when the key's current value could not be
+    /// established; nothing was changed.
+    pub fn getex(&self, key: &str, expiry: GetExpiry) -> Result<Option<Bytes>, KeyUnavailable> {
+        self.prepare_update_for("getex", key)?;
+        let Some(value) = self.get(key) else {
+            self.stats.miss();
+            return Ok(None);
+        };
+        self.stats.hit();
         match expiry {
             GetExpiry::After(ttl) => {
                 if let Some(rep) = self.active_replicator() {
@@ -113,7 +131,7 @@ impl Store {
                 self.remove(key);
             }
         }
-        Some(value)
+        Ok(Some(value))
     }
 
     /// The expiry of a live **string** key: `Some(None)` = no expiry, `None`
@@ -239,9 +257,9 @@ mod tests {
     fn getdel_returns_and_removes() {
         let s = store();
         s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
-        assert_eq!(s.getdel("k").as_deref(), Some(&b"v"[..]));
+        assert_eq!(s.getdel("k").unwrap().as_deref(), Some(&b"v"[..]));
         assert_eq!(s.get("k"), None);
-        assert_eq!(s.getdel("k"), None);
+        assert_eq!(s.getdel("k"), Ok(None));
         assert_eq!(s.mem_used(), 0);
     }
 
@@ -250,16 +268,16 @@ mod tests {
         let s = store();
         s.set("k".into(), b"v".to_vec(), None);
         assert_eq!(
-            s.getex("k", GetExpiry::After(Duration::from_secs(30))).as_deref(),
+            s.getex("k", GetExpiry::After(Duration::from_secs(30))).unwrap().as_deref(),
             Some(&b"v"[..])
         );
         let ms = s.pttl("k").unwrap();
         assert!(ms > 29_000 && ms <= 30_000);
-        s.getex("k", GetExpiry::Persist);
+        s.getex("k", GetExpiry::Persist).unwrap();
         assert_eq!(s.pttl("k"), Some(-1));
-        assert_eq!(s.getex("k", GetExpiry::Delete).as_deref(), Some(&b"v"[..]));
+        assert_eq!(s.getex("k", GetExpiry::Delete).unwrap().as_deref(), Some(&b"v"[..]));
         assert_eq!(s.get("k"), None);
-        assert_eq!(s.getex("missing", GetExpiry::Persist), None);
+        assert_eq!(s.getex("missing", GetExpiry::Persist), Ok(None));
     }
 
     #[test]

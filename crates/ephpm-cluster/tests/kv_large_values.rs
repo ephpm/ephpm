@@ -257,46 +257,136 @@ async fn delete_of_a_large_value_reaches_everyone() {
     shutdown_all(nodes).await;
 }
 
-/// APPEND on a node with no copy of a large key must not create the key from
-/// the appended bytes alone — that write would replicate and replace the
-/// real value cluster-wide. It is refused instead, and the value survives.
-/// On a node that holds a copy, APPEND works and replicates as before.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn append_to_a_large_value_held_elsewhere_is_refused_not_destructive() {
-    use ephpm_kv::store::AppendError;
-    let Some(nodes) = three_nodes().await else { return };
-    // Find a key with a node outside its replica set holding no copy (RF 2
-    // of 3, written from node 0, so some key leaves one node empty-handed).
-    let mut found = None;
-    for i in 0..12 {
-        let key = format!("big:append:{i}");
-        let value = large("append");
-        assert!(nodes[0].local.set(key.clone(), value.clone(), None));
-        wait_everywhere(&nodes, &key, Some(&value), Duration::from_secs(10)).await;
+/// Write a fresh large key from node 0 until some node holds no copy of it
+/// (RF 2 of 3, and the writer always keeps one, so one of nodes 1-2 is left
+/// out for some key). Returns `(key, value, outsider index)`.
+async fn outsider_key(
+    nodes: &[Node; 3],
+    tag: &str,
+    ttl: Option<Duration>,
+) -> (String, Vec<u8>, usize) {
+    for i in 0..24 {
+        let key = format!("big:{tag}:{i}");
+        let value = large(&key);
+        assert!(nodes[0].local.set(key.clone(), value.clone(), ttl));
+        wait_everywhere(nodes, &key, Some(&value), Duration::from_secs(10)).await;
         if let Some(idx) = nodes.iter().position(|n| n.local.get(&key).is_none()) {
-            found = Some((key, value, idx));
-            break;
+            return (key, value, idx);
         }
     }
-    let (key, value, outsider) = found.expect("with RF=2 of 3 some node holds no copy");
+    panic!("with RF=2 of 3 some node must hold no copy of some key");
+}
 
-    let refused = nodes[outsider].local.try_append(&key, b"-tail");
-    assert_eq!(refused, Err(AppendError::HeldElsewhere));
-    // Nothing changed anywhere, and the outsider still has no local copy.
+/// The nodes that hold a local copy of `key`.
+fn holders(nodes: &[Node; 3], key: &str) -> Vec<usize> {
+    (0..nodes.len()).filter(|&i| nodes[i].local.get(key).is_some()).collect()
+}
+
+/// Read-modify-writes on a node outside a large value's replica set used to
+/// see "no local copy" as "absent": APPEND replaced the value cluster-wide
+/// with the appended tail (#636 then refused it), INCR created a counter
+/// over it, GETEX/EXPIRE dropped the TTL change, GETDEL deleted nothing on
+/// the holders. They now take the replica set's copy (value, TTL and stamp)
+/// first and run on it, so the result is what the same command gives on a
+/// holder, and it replicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_modify_writes_on_a_non_holder_run_on_the_replica_copy() {
+    use ephpm_kv::store::GetExpiry;
+    let Some(nodes) = three_nodes().await else { return };
+
+    // INCR: the value is not an integer — the error a holder gives, and the
+    // value survives everywhere instead of becoming "1".
+    let (key, value, outsider) = outsider_key(&nodes, "incr", None).await;
+    let err = nodes[outsider].local.incr_by(&key, 1).expect_err("a large value is not a counter");
+    assert!(err.contains("not an integer"), "{err}");
     tokio::time::sleep(Duration::from_millis(500)).await;
     wait_everywhere(&nodes, &key, Some(&value), Duration::from_secs(5)).await;
-    assert!(nodes[outsider].local.get(&key).is_none());
 
-    // A node that holds the key appends normally, and everyone sees it.
-    let holder = nodes.iter().position(|n| n.local.get(&key).is_some()).expect("a holder");
-    let new_len = nodes[holder].local.try_append(&key, b"-tail").expect("append on a holder");
+    // APPEND: appends to the real value (keeping its TTL) and replicates.
+    let (key, value, outsider) =
+        outsider_key(&nodes, "append", Some(Duration::from_secs(600))).await;
     let mut want = value.clone();
     want.extend_from_slice(b"-tail");
-    assert_eq!(new_len, want.len());
+    assert_eq!(nodes[outsider].local.try_append(&key, b"-tail"), Ok(want.len()));
     wait_everywhere(&nodes, &key, Some(&want), Duration::from_secs(10)).await;
+    for h in holders(&nodes, &key) {
+        let pttl = nodes[h].local.pttl(&key).expect("held");
+        assert!(pttl > 500_000, "{}: the TTL survived the append, pttl={pttl}", nodes[h].name);
+    }
+
+    // GETEX with a TTL: the expiry reaches the holders, and the key expires
+    // everywhere.
+    let (key, value, outsider) = outsider_key(&nodes, "getex", None).await;
+    let got = nodes[outsider].local.getex(&key, GetExpiry::After(Duration::from_secs(2)));
+    assert_eq!(got.expect("resolvable").as_deref(), Some(value.as_slice()));
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    wait_everywhere(&nodes, &key, None, Duration::from_secs(5)).await;
+
+    // GETDEL: returns the value and deletes it everywhere.
+    let (key, value, outsider) = outsider_key(&nodes, "getdel", None).await;
+    let got = nodes[outsider].local.getdel(&key).expect("resolvable");
+    assert_eq!(got.as_deref(), Some(value.as_slice()));
+    wait_everywhere(&nodes, &key, None, Duration::from_secs(10)).await;
 
     // A key that exists nowhere is still created by APPEND, from any node.
     assert_eq!(nodes[outsider].local.try_append("big:append:new", b"abc"), Ok(3));
     wait_everywhere(&nodes, "big:append:new", Some(b"abc"), Duration::from_secs(10)).await;
+    shutdown_all(nodes).await;
+}
+
+/// When no replica answers, a non-holder cannot tell "absent" from "held
+/// elsewhere", so a read-modify-write is refused (`TRYAGAIN`) rather than
+/// computed from nothing — #636 only checked APPEND, and treated a timeout
+/// as "absent", so the create then replaced the value when the partition
+/// healed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_modify_writes_on_a_non_holder_are_refused_when_no_replica_answers() {
+    use ephpm_kv::store::{AppendError, KEY_UNAVAILABLE_ERROR};
+    let Some(nodes) = three_nodes().await else { return };
+    // Find an outsider WITHOUT reading through it: it must hold no pooled
+    // data-plane connection to the holders, whose per-connection tasks
+    // outlive the accept loop aborted below.
+    let mut found = None;
+    for i in 0..24 {
+        let key = format!("big:partition:{i}");
+        let value = large(&key);
+        assert!(nodes[0].local.set(key.clone(), value.clone(), None));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while holders(&nodes, &key).len() < 2 {
+            assert!(Instant::now() < deadline, "{key} did not reach its replicas");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if holders(&nodes, &key).len() == 2 {
+            let outsider = (0..3).find(|i| nodes[*i].local.get(&key).is_none()).expect("one left");
+            found = Some((key, value, outsider));
+            break;
+        }
+    }
+    let (key, value, outsider) = found.expect("with RF=2 of 3 some node holds no copy");
+    // Cut the outsider off from the replicas' data planes; gossip still calls
+    // them alive, so they are still the replica set.
+    for h in holders(&nodes, &key) {
+        nodes[h].data_plane.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(nodes[outsider].local.incr_by(&key, 1), Err(KEY_UNAVAILABLE_ERROR.to_string()));
+    assert_eq!(nodes[outsider].local.try_append(&key, b"x"), Err(AppendError::Unavailable));
+    assert!(nodes[outsider].local.getdel(&key).is_err());
+    assert!(nodes[outsider].local.try_expire(&key, Duration::from_secs(5)).is_err());
+    // Nothing was created on the outsider, and the holders still hold the
+    // value untouched.
+    assert!(nodes[outsider].local.get(&key).is_none());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for h in holders(&nodes, &key) {
+        assert_eq!(
+            nodes[h].local.get(&key).as_deref(),
+            Some(value.as_slice()),
+            "{}",
+            nodes[h].name
+        );
+        assert_eq!(nodes[h].local.pttl(&key), Some(-1), "{}", nodes[h].name);
+    }
     shutdown_all(nodes).await;
 }

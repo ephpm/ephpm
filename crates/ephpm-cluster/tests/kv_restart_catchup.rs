@@ -78,6 +78,19 @@ impl Node {
 /// plane listener, `ClusteredStore` + `KvReplicator` sharing one applied map,
 /// the gossip applier, and the catch-up gate.
 async fn start_node(name: &str, gossip_port: u16, data_port: u16, seeds: Vec<String>) -> Node {
+    start_node_with(name, gossip_port, data_port, seeds, true).await
+}
+
+/// [`start_node`]; with `serve_data = false` the data port is a black hole:
+/// it accepts connections and never reads or answers — a peer that is alive
+/// to gossip but stalled on the data plane.
+async fn start_node_with(
+    name: &str,
+    gossip_port: u16,
+    data_port: u16,
+    seeds: Vec<String>,
+    serve_data: bool,
+) -> Node {
     let kv = ClusterKvConfig {
         small_key_threshold: THRESHOLD,
         replication_factor: 2,
@@ -102,11 +115,21 @@ async fn start_node(name: &str, gossip_port: u16, data_port: u16, seeds: Vec<Str
     let applied = ephpm_cluster::clustered_store::new_applied_write_map();
     let data_addr: SocketAddr = format!("127.0.0.1:{data_port}").parse().expect("data addr");
     let router = KvRouter::global(Arc::clone(&local)).with_applied(Arc::clone(&applied));
-    let data_plane = tokio::spawn(async move {
-        if let Err(e) = ephpm_cluster::data_plane::serve_router(router, data_addr, None).await {
-            eprintln!("data plane failed on {data_addr}: {e}");
-        }
-    });
+    let data_plane = if serve_data {
+        tokio::spawn(async move {
+            if let Err(e) = ephpm_cluster::data_plane::serve_router(router, data_addr, None).await {
+                eprintln!("data plane failed on {data_addr}: {e}");
+            }
+        })
+    } else {
+        let listener = tokio::net::TcpListener::bind(data_addr).await.expect("bind black hole");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    };
 
     let clustered = ClusteredStore::new(Arc::clone(&local), Arc::clone(&handle), kv, None);
     clustered.init_catch_up_gate().await;
@@ -336,5 +359,163 @@ async fn cold_node_reads_own_writes_locally_and_everything_else_through_peers() 
     assert_eq!(r.local.get_through("nowhere"), None);
 
     r.shutdown().await;
+    a.shutdown().await;
+}
+
+/// Fill `node` with incompressible entries so a peer joining it takes many
+/// gossip exchanges (tens of seconds) to catch up — the cold window the
+/// tests below act in. Linux only, like the test above.
+fn bury(node: &Node) {
+    for i in 0..FILLER {
+        assert!(node.local.set(format!("filler:{i}"), noise(i, FILLER_LEN), None));
+    }
+}
+
+/// While a restarted node is still catching up, its local copies may be
+/// missing or superseded. Read-modify-writes used to compute from them and
+/// publish a fresh stamp that won everywhere — an `INCR` on a counter not yet
+/// received reset it to 1 cluster-wide; an `HINCRBY` likewise; a TTL'd
+/// counter lost its TTL. They now resolve the key (or field) through the
+/// peers first, so the result is what a caught-up node computes, and the
+/// value replicates back. Whole-hash reads are refused while cold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_node_read_modify_writes_resolve_through_peers() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: 64 KB gossip datagrams need Linux loopback buffers");
+        return;
+    }
+    let (ga, gr) = (free_port(false), free_port(false));
+    let (da, dr) = (free_port(true), free_port(true));
+    let a = start_node("rmw-a", ga, da, vec![]).await;
+    let seed = a.handle.self_node().gossip_addr.clone();
+    assert!(wait_until(|| !a.clustered.is_cold(), Duration::from_secs(10)).await, "a opens alone");
+    assert!(a.local.set("ctr".into(), b"41".to_vec(), Some(Duration::from_secs(600))));
+    assert!(a.local.set("s".into(), b"abc".to_vec(), None));
+    a.local.hset("h", "f", b"v".to_vec()).unwrap();
+    a.local.hset("h", "c", b"10".to_vec()).unwrap();
+    bury(&a);
+
+    let r = start_node("rmw-r", gr, dr, vec![seed]).await;
+    wait_alive(&[&a, &r], 2, Duration::from_secs(15)).await;
+    // Until A's data port has arrived in gossip a cold read is a deliberate
+    // miss; wait for A to answer one.
+    let answers = wait_until(
+        || !r.clustered.is_cold() || r.local.get_through("s").as_deref() == Some(b"abc".as_slice()),
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(answers, "A must answer cold reads: {:?}", r.clustered.catch_up_stats());
+    if !r.clustered.is_cold() {
+        eprintln!("gate opened before the assertions ran; nothing to check while cold");
+        r.shutdown().await;
+        a.shutdown().await;
+        return;
+    }
+
+    // Reads that return a value come from the peer too, not only GET.
+    assert!(r.local.exists_through("ctr"));
+    assert_eq!(r.local.strlen_through("s"), 3);
+    let pttl = r.local.pttl_through("ctr").expect("exists");
+    assert!(pttl > 500_000, "the peer's TTL: {pttl}");
+    // INCR continues the cluster's counter (and keeps its TTL).
+    assert_eq!(r.local.incr_by("ctr", 1), Ok(42));
+    assert!(r.local.pttl("ctr").expect("held now") > 500_000, "TTL kept");
+    // APPEND appends to the cluster's value.
+    assert_eq!(r.local.try_append("s", b"d"), Ok(4));
+    // Hash fields: per-field reads and writes resolve through the peers.
+    assert!(r.local.prepare_hash_fields("h", &["f", "c"]).is_ok());
+    assert_eq!(r.local.hget("h", "f").as_deref(), Some(b"v".as_slice()));
+    assert_eq!(r.local.hincr_by("h", "c", 5), Ok(15));
+    // A command over the whole hash cannot know which fields exist yet.
+    assert!(r.clustered.is_cold(), "still cold: the assertions above ran inside the window");
+    assert!(r.local.prepare_hash_whole("h").is_err());
+    // So is a key-expiry change of a hash — refused, and resolving the name
+    // as a string (no peer holds one) must not discard the local hash.
+    assert!(r.local.try_expire("h", Duration::from_secs(60)).is_err());
+    assert_eq!(r.local.hget("h", "f").as_deref(), Some(b"v".as_slice()), "hash kept");
+    // A key nobody holds is created from scratch, as on a caught-up node.
+    assert_eq!(r.local.incr_by("fresh", 1), Ok(1));
+
+    // Everything replicated back with the cluster's history intact.
+    for (key, want) in [("ctr", &b"42"[..]), ("s", b"abcd"), ("fresh", b"1")] {
+        assert!(
+            wait_until(|| a.local.get(key).as_deref() == Some(want), Duration::from_secs(15)).await,
+            "{key} must reach A as {:?}, got {:?}",
+            String::from_utf8_lossy(want),
+            a.local.get(key)
+        );
+    }
+    assert!(
+        wait_until(
+            || a.local.hget("h", "c").as_deref() == Some(b"15".as_slice()),
+            Duration::from_secs(15)
+        )
+        .await,
+        "h.c must reach A as 15"
+    );
+    assert!(a.local.pttl("ctr").expect("held") > 500_000, "the counter kept its TTL on A");
+
+    r.shutdown().await;
+    a.shutdown().await;
+}
+
+/// A peer that is alive to gossip but stalled on the data plane (accepts,
+/// never answers) used to cost every cold read the full fetch budget, for
+/// as long as the node stayed cold. After a few timeouts the data-plane
+/// client's stall breaker skips it, and cold reads are answered by the
+/// healthy peer at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_reads_skip_a_stalled_peer_after_repeated_timeouts() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: 64 KB gossip datagrams need Linux loopback buffers");
+        return;
+    }
+    let (ga, gs, gr) = (free_port(false), free_port(false), free_port(false));
+    let (da, ds, dr) = (free_port(true), free_port(true), free_port(true));
+    let a = start_node("stall-a", ga, da, vec![]).await;
+    let seed = a.handle.self_node().gossip_addr.clone();
+    let s = start_node_with("stall-s", gs, ds, vec![seed.clone()], false).await;
+    wait_alive(&[&a, &s], 2, Duration::from_secs(15)).await;
+    assert!(a.local.set("k".into(), b"v".to_vec(), None));
+    bury(&a);
+
+    let r = start_node("stall-r", gr, dr, vec![seed]).await;
+    wait_alive(&[&a, &s, &r], 3, Duration::from_secs(20)).await;
+    let budget = ephpm_cluster::clustered_store::FETCH_THROUGH_TIMEOUT;
+    let mut durations = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while durations.len() < 8 && Instant::now() < deadline {
+        if !r.clustered.is_cold() {
+            break;
+        }
+        let started = Instant::now();
+        let got = r.local.get_through("k");
+        let took = started.elapsed();
+        if got.as_deref() == Some(b"v".as_slice()) {
+            durations.push(took);
+        } else {
+            // A's data port has not arrived in gossip yet.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    if durations.len() < 8 {
+        eprintln!("gate opened before the reads ran ({durations:?}); nothing to check while cold");
+    } else {
+        eprintln!("cold read durations: {durations:?}");
+        // Reads made while A's data port was still unknown may already have
+        // tripped the breaker; at most the threshold's worth are slow.
+        let slow = durations.iter().filter(|d| **d >= budget / 2).count();
+        assert!(
+            slow <= ephpm_cluster::data_plane::PEER_STALL_THRESHOLD as usize,
+            "the stalled peer must stop costing reads their budget: {durations:?}"
+        );
+        assert!(
+            durations[5..].iter().all(|d| *d < budget / 4),
+            "after the breaker trips the stalled peer is skipped: {durations:?}"
+        );
+    }
+
+    r.shutdown().await;
+    s.shutdown().await;
     a.shutdown().await;
 }

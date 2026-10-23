@@ -2506,6 +2506,19 @@ async fn read_snapshot_body<R: AsyncReadExt + Unpin>(
     header: &SnapshotHeader,
     max_snapshot_bytes: u64,
 ) -> anyhow::Result<(String, u64)> {
+    read_snapshot_body_within(stream, header, max_snapshot_bytes, None).await
+}
+
+/// [`read_snapshot_body`], failing when no chunk arrives within
+/// `chunk_timeout` (`None` = wait indefinitely). Bounds the **gap between
+/// chunks**, not the whole body, so a large dump arriving steadily is never
+/// cut off while a peer that stops sending is.
+async fn read_snapshot_body_within<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    header: &SnapshotHeader,
+    max_snapshot_bytes: u64,
+    chunk_timeout: Option<Duration>,
+) -> anyhow::Result<(String, u64)> {
     anyhow::ensure!(
         header.total_len <= max_snapshot_bytes,
         "snapshot: peer announced {} bytes, above the [db.sqlite.replication] \
@@ -2521,7 +2534,19 @@ async fn read_snapshot_body<R: AsyncReadExt + Unpin>(
     let mut body = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
     let mut received: u64 = 0;
     loop {
-        let chunk = read_snapshot_chunk(stream).await.context("snapshot: read chunk")?;
+        let chunk = match chunk_timeout {
+            None => read_snapshot_chunk(stream).await,
+            Some(limit) => {
+                tokio::time::timeout(limit, read_snapshot_chunk(stream)).await.map_err(|_| {
+                    anyhow::anyhow!(
+                        "the peer stopped sending: no snapshot chunk for {}s after {received} \
+                         body bytes",
+                        limit.as_secs()
+                    )
+                })?
+            }
+        }
+        .context("snapshot: read chunk")?;
         if chunk.is_empty() {
             break; // end marker
         }
@@ -3737,6 +3762,15 @@ const HANDOFF_SETTLE_GRACE: Duration = Duration::from_secs(15);
 /// body that follows is not bounded by this.
 const HANDOFF_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on the gap between two chunks of a handoff probe's snapshot body.
+/// The body itself may take as long as it takes to arrive; a peer that stops
+/// sending mid-body (alive to gossip, its channel connection kept open by
+/// keepalive) used to hold the probe — and so the site, `Pending` — forever,
+/// with no `WARN`. It now counts as unreachable for this round: the next
+/// peer is asked, and if none has the data the site is reported blocked and
+/// retried, like any unreachable peer.
+const HANDOFF_BODY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How often an unsettled site that this node does not own re-checks whether
 /// its copy has warmed up (a replica bootstrap) or ownership has moved here.
 /// One `sqlite_schema` count per tick, only while the site is unsettled.
@@ -3808,12 +3842,35 @@ async fn probe_peer(
     if header.no_copy {
         return PeerProbe::NoCopy;
     }
-    match read_snapshot_body(&mut stream, &header, max_snapshot_bytes).await {
+    probe_body(&mut stream, header, max_snapshot_bytes, site, addr, HANDOFF_BODY_STALL_TIMEOUT)
+        .await
+}
+
+/// The body half of [`probe_peer`]: read the dump with a per-chunk stall
+/// bound and classify it. A stall is logged at `WARN` here — the peer is
+/// alive to gossip, so nothing else would say why the site is waiting.
+async fn probe_body<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    header: SnapshotHeader,
+    max_snapshot_bytes: u64,
+    site: &str,
+    addr: SocketAddr,
+    stall: Duration,
+) -> PeerProbe {
+    match read_snapshot_body_within(stream, &header, max_snapshot_bytes, Some(stall)).await {
         Ok((dump, received)) if snapshot_declares_a_table(&dump) => {
             PeerProbe::Data { header, dump, received }
         }
         Ok(_) => PeerProbe::NoCopy,
-        Err(e) => PeerProbe::Unreachable(format!("{e:#}")),
+        Err(e) => {
+            tracing::warn!(
+                site = %site,
+                peer = %addr,
+                "ownership handoff: reading the site's snapshot from a peer failed; asking the \
+                 next peer (the site stays unserved until one answers): {e:#}"
+            );
+            PeerProbe::Unreachable(format!("{e:#}"))
+        }
     }
 }
 
@@ -5289,6 +5346,38 @@ mod tests {
         .await;
         assert_eq!(asked, 2);
         assert!(search.found.is_none() && search.unreachable.is_empty());
+    }
+
+    /// A peer that sends the snapshot header and part of the body, then goes
+    /// quiet with the connection held open, used to pin the probe — and the
+    /// site, `Pending` — forever. The body read now gives up after the stall
+    /// bound and reports the peer unreachable, so the search moves on to the
+    /// next peer (and the round is reported blocked if none has the data).
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stalls_mid_body_is_unreachable_not_pending_forever() {
+        let (mut peer, mut local) = tokio::io::duplex(1 << 16);
+        let header = SnapshotHeader {
+            watermark: 7,
+            total_len: 1000,
+            log_id: "stalling-log".to_string(),
+            no_copy: false,
+        };
+        write_snapshot_header(&mut peer, &header).await.unwrap();
+        write_snapshot_chunk(&mut peer, b"CREATE TABLE t(x);").await.unwrap();
+        peer.flush().await.unwrap();
+        // ...and nothing more: `peer` stays open, like a stalled channel.
+
+        let got = read_snapshot_header(&mut local).await.unwrap();
+        let addr: SocketAddr = "10.0.0.9:7000".parse().unwrap();
+        let stall = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let probe = probe_body(&mut local, got, 1 << 20, "site-a", addr, stall).await;
+        let PeerProbe::Unreachable(reason) = probe else {
+            panic!("a stalled body must make the peer unreachable");
+        };
+        assert!(reason.contains("stopped sending"), "{reason}");
+        assert!(started.elapsed() >= stall, "it waited the stall bound, not less");
+        drop(peer);
     }
 
     /// Serving empty is licensed only by a complete set of "no copy" answers

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use dashmap::{DashMap, DashSet};
 use ephpm_config::ClusterKvConfig;
 use ephpm_kv::store::{
-    ColdRead, HashFieldState, Routed, SetIfEqOutcome, SetNxOutcome, SetTtl, Store,
+    ColdRead, HashFieldState, Resolved, Routed, SetIfEqOutcome, SetNxOutcome, SetTtl, Store,
 };
 
 use crate::ClusterHandle;
@@ -102,14 +102,27 @@ pub const METRIC_COLD_READS: &str = "ephpm_kv_cold_reads_total";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColdFetch {
     /// The newest copy any peer holds (by stamp; an unstamped copy loses to
-    /// a stamped one).
-    Found(Vec<u8>),
+    /// a stamped one), with its stamp and remaining TTL.
+    Found(StampedValue),
     /// At least one peer answered, and none holds the key.
     Absent,
     /// Every peer failed or timed out.
     Unavailable,
     /// No alive peer to ask.
     NoPeers,
+}
+
+/// What [`ClusteredStore::replica_lookup`] found on a key's replica set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplicaLookup {
+    /// This node is a replica, or the only node alive: its own map answers.
+    NotNeeded,
+    /// The newest copy a replica holds.
+    Found(StampedValue),
+    /// At least one replica answered, and none holds the key.
+    Absent,
+    /// No replica answered.
+    Unavailable,
 }
 
 /// Counters of the catch-up gate ([`ClusteredStore::catch_up_stats`]).
@@ -491,7 +504,7 @@ impl ClusteredStore {
             return ColdRead::Warm;
         }
         match block_on_cluster(handle, self.cold_fetch(transport_key)) {
-            Some(ColdFetch::Found(value)) => ColdRead::Found(value),
+            Some(ColdFetch::Found(found)) => ColdRead::Found { value: found.value, ttl: found.ttl },
             Some(ColdFetch::Absent | ColdFetch::Unavailable) => ColdRead::Absent,
             // No alive peer yet, inside the join wait: the failure detector
             // takes a couple of heartbeats to call a peer alive, and gossip
@@ -515,9 +528,21 @@ impl ClusteredStore {
     /// Each peer is asked within [`FETCH_THROUGH_TIMEOUT`], all concurrently,
     /// so the call costs one round trip. A peer predating the stamped read is
     /// asked again with a plain GET (its copy then counts as unstamped, which
-    /// loses to any stamped copy). The result is never cached: it carries no
-    /// TTL, and the gossip applier is materializing the same keys meanwhile.
+    /// loses to any stamped copy). The result is never cached: the gossip
+    /// applier is materializing the same keys meanwhile.
+    ///
+    /// A peer that times out is reported to the data-plane client's stall
+    /// breaker ([`DataPlaneClient::record_stall`]); once tripped it is skipped
+    /// (fails fast) for the cooldown, so a peer that accepts connections but
+    /// never answers stops costing every cold read the full budget.
     pub async fn cold_fetch(&self, transport_key: &str) -> ColdFetch {
+        self.cold_fetch_with(transport_key, true).await
+    }
+
+    /// [`cold_fetch`](Self::cold_fetch); with `allow_plain = false` an answer
+    /// only counts when it came over the stamped read (hash fields: a peer
+    /// predating it would answer "absent" for every field).
+    async fn cold_fetch_with(&self, transport_key: &str, allow_plain: bool) -> ColdFetch {
         let peers = self.catch_up.peers.read().clone();
         // Only peers whose data port has arrived in gossip: `node_data_addr`
         // falls back to this node's own port for a peer without one, which on
@@ -530,40 +555,12 @@ impl ClusteredStore {
         if targets.is_empty() {
             return ColdFetch::NoPeers;
         }
-        let asks = targets.iter().map(|(id, addr)| async move {
-            let answer = tokio::time::timeout(FETCH_THROUGH_TIMEOUT, async {
-                match self.client.fetch_stamped(*addr, transport_key).await {
-                    Ok(found) => Ok(found),
-                    Err(e) => {
-                        tracing::debug!(key = transport_key, peer = %id, %e, "stamped read failed; plain GET");
-                        self.client
-                            .fetch(*addr, transport_key)
-                            .await
-                            .map(|v| v.map(|value| StampedValue { value, stamp: None }))
-                    }
-                }
-            })
-            .await;
-            match answer {
-                Ok(Ok(found)) => Some(found),
-                Ok(Err(e)) => {
-                    tracing::debug!(key = transport_key, peer = %id, %e, "cold read failed");
-                    None
-                }
-                Err(_) => {
-                    tracing::debug!(key = transport_key, peer = %id, "cold read timed out");
-                    None
-                }
-            }
-        });
-        let answers = futures::future::join_all(asks).await;
-        let answered = answers.iter().filter(|a| a.is_some()).count();
-        let best = answers.into_iter().flatten().flatten().max_by(|a, b| a.stamp.cmp(&b.stamp));
+        let (best, answered) = self.ask_stamped(&targets, transport_key, allow_plain).await;
         let outcome = match best {
             Some(found) => {
                 self.catch_up.found.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!(METRIC_COLD_READS, "outcome" => "found").increment(1);
-                return ColdFetch::Found(found.value);
+                return ColdFetch::Found(found);
             }
             None if answered > 0 => {
                 self.catch_up.absent.fetch_add(1, Ordering::Relaxed);
@@ -577,6 +574,264 @@ impl ClusteredStore {
         let label = if outcome == ColdFetch::Absent { "absent" } else { "unavailable" };
         metrics::counter!(METRIC_COLD_READS, "outcome" => label).increment(1);
         outcome
+    }
+
+    /// Ask every `(peer id, data address)` in `targets` for `transport_key`
+    /// over the stamped read, concurrently, each within
+    /// [`FETCH_THROUGH_TIMEOUT`]. Returns the newest copy found (stamped beats
+    /// unstamped) and how many peers answered at all.
+    async fn ask_stamped(
+        &self,
+        targets: &[(String, SocketAddr)],
+        transport_key: &str,
+        allow_plain: bool,
+    ) -> (Option<StampedValue>, usize) {
+        let asks = targets.iter().map(|(id, addr)| async move {
+            let answer = tokio::time::timeout(FETCH_THROUGH_TIMEOUT, async {
+                match self.client.fetch_stamped(*addr, transport_key).await {
+                    Ok(found) => Ok(found),
+                    Err(e) if allow_plain => {
+                        tracing::debug!(key = transport_key, peer = %id, %e, "stamped read failed; plain GET");
+                        self.client.fetch(*addr, transport_key).await.map(|v| {
+                            v.map(|value| StampedValue { value, stamp: None, ttl: None })
+                        })
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+            match answer {
+                Ok(Ok(found)) => Some(found),
+                Ok(Err(e)) => {
+                    tracing::debug!(key = transport_key, peer = %id, %e, "peer read failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(key = transport_key, peer = %id, "peer read timed out");
+                    self.client.record_stall(*addr);
+                    None
+                }
+            }
+        });
+        let answers = futures::future::join_all(asks).await;
+        let answered = answers.iter().filter(|a| a.is_some()).count();
+        let best = answers.into_iter().flatten().flatten().max_by(|a, b| a.stamp.cmp(&b.stamp));
+        (best, answered)
+    }
+
+    /// Land a peer's copy of a key locally exactly as the gossip applier
+    /// would: through the applied map with the peer's stamp, so a newer write
+    /// this node already holds is not regressed. `bare_key` is the key in
+    /// `local` (a hash-field item's encoded name for a field).
+    fn install_peer_copy(
+        local: &Store,
+        applied: &AppliedWriteMap,
+        bare_key: &str,
+        transport_key: &str,
+        found: &StampedValue,
+    ) {
+        let write = || materialize(local, bare_key, Some((&found.value, found.ttl)));
+        match found.stamp {
+            Some(stamp) => {
+                apply_if_newer(applied, transport_key, stamp, write);
+            }
+            // An unstamped copy (a peer predating the stamped read) is the
+            // newest only when no peer had a stamped one.
+            None => write(),
+        }
+    }
+
+    /// Drop the local copy of a key that no peer holds any more — unless a
+    /// write for it landed here since `seen` (the applied stamp read before
+    /// the peers were asked), which then wins. Under the key's applied slot,
+    /// the same lock order as every writer.
+    fn drop_stale_copy(
+        local: &Store,
+        applied: &AppliedWriteMap,
+        bare_key: &str,
+        transport_key: &str,
+        seen: Option<Stamp>,
+    ) {
+        // A hash field's item deletes that field; a string key drops the
+        // string only — `materialize`'s delete is `remove_local`, which would
+        // also discard a (separately replicated) hash of the same name.
+        let discard = || {
+            if crate::hash_field::decode_key(bare_key).is_some() {
+                materialize(local, bare_key, None);
+            } else {
+                local.remove_string_local(bare_key);
+            }
+        };
+        match applied.entry(transport_key.to_string()) {
+            dashmap::Entry::Occupied(slot) => {
+                if seen == Some(*slot.get()) {
+                    discard();
+                }
+            }
+            dashmap::Entry::Vacant(_slot) => {
+                if seen.is_none() {
+                    discard();
+                }
+            }
+        }
+    }
+
+    /// The decision behind [`Replicator::resolve_for_update`] for one string
+    /// key: make `local`'s copy of `bare_key` (`transport_key` on the wire)
+    /// current, or answer [`Resolved::Unavailable`].
+    ///
+    /// - **Catching up** (gate cold, and not this node's own write): ask
+    ///   every alive peer ([`cold_fetch`](Self::cold_fetch)); install the
+    ///   newest copy, or drop a local copy no peer holds; `Unavailable` when no
+    ///   peer answered (or none is known yet inside the join wait).
+    /// - **Warm, no local copy**: a large value lives on its replica set only,
+    ///   so ask the replicas ([`replica_lookup`](Self::replica_lookup)) and
+    ///   install what they hold; `Unavailable` when none answered. Free when
+    ///   this node is itself a replica or the only node alive.
+    /// - **Warm, local copy**: current as it is (a small key is on every node,
+    ///   and a node holding a large value holds the replica-set copy or its
+    ///   own write).
+    ///
+    /// [`Replicator::resolve_for_update`]: ephpm_kv::store::Replicator::resolve_for_update
+    fn resolve_for_update(
+        &self,
+        handle: &tokio::runtime::Handle,
+        applied: &AppliedWriteMap,
+        local: &Store,
+        bare_key: &str,
+        transport_key: &str,
+        held: bool,
+    ) -> Resolved {
+        if self.is_cold() && !self.written_here_since_start(applied, transport_key) {
+            let seen = applied.get(transport_key).map(|s| *s);
+            match block_on_cluster(handle, self.cold_fetch(transport_key)) {
+                Some(ColdFetch::Found(found)) => {
+                    Self::install_peer_copy(local, applied, bare_key, transport_key, &found);
+                    return Resolved::Current;
+                }
+                Some(ColdFetch::Absent) => {
+                    Self::drop_stale_copy(local, applied, bare_key, transport_key, seen);
+                    return Resolved::Current;
+                }
+                Some(ColdFetch::NoPeers) if !self.catch_up.within_join_wait() => {
+                    // Nobody to ask after the join wait: this node is alone,
+                    // and its copy is the cluster's.
+                }
+                Some(ColdFetch::Unavailable | ColdFetch::NoPeers) | None => {
+                    return Resolved::Unavailable;
+                }
+            }
+        }
+        if held {
+            return Resolved::Current;
+        }
+        match block_on_cluster(handle, self.replica_lookup(transport_key)) {
+            Some(ReplicaLookup::Found(found)) => {
+                Self::install_peer_copy(local, applied, bare_key, transport_key, &found);
+                Resolved::Current
+            }
+            Some(ReplicaLookup::Unavailable) => Resolved::Unavailable,
+            // `None`: no way to block from this thread (a current-thread
+            // runtime — tests only; production callers are PHP threads and
+            // tokio multi-thread workers): proceed on the local copy as before.
+            Some(ReplicaLookup::Absent | ReplicaLookup::NotNeeded) | None => Resolved::Current,
+        }
+    }
+
+    /// Ask `transport_key`'s replica set for a copy this node does not hold.
+    ///
+    /// [`ReplicaLookup::NotNeeded`] when this node is one of the replicas (a
+    /// miss here is authoritative, modulo in-flight replication) or the only
+    /// node alive. Otherwise every replica is asked concurrently within
+    /// [`FETCH_THROUGH_TIMEOUT`] over the stamped read, so a value found
+    /// arrives with its TTL and stamp; the hot-key cache is bypassed (it can
+    /// still hold a value deleted cluster-wide).
+    async fn replica_lookup(&self, transport_key: &str) -> ReplicaLookup {
+        let alive = self.alive_nodes().await;
+        if alive.len() <= 1 {
+            return ReplicaLookup::NotNeeded;
+        }
+        let self_id = self.cluster.self_node().id;
+        let replicas =
+            replica_nodes_for(&alive, hash_key(transport_key), self.config.replication_factor);
+        if replicas.iter().any(|n| n.id == self_id) {
+            return ReplicaLookup::NotNeeded;
+        }
+        let targets: Vec<(String, SocketAddr)> = replicas
+            .iter()
+            .filter_map(|n| node_data_addr(n, self.config.data_port).map(|a| (n.id.clone(), a)))
+            .collect();
+        let (best, answered) = self.ask_stamped(&targets, transport_key, true).await;
+        match best {
+            Some(found) => ReplicaLookup::Found(found),
+            None if answered > 0 => ReplicaLookup::Absent,
+            None => ReplicaLookup::Unavailable,
+        }
+    }
+
+    /// The decision behind [`Replicator::resolve_hash_fields`]: while
+    /// catching up, resolve each named field through the peers exactly as
+    /// [`resolve_for_update`](Self::resolve_for_update) resolves a string key
+    /// (all fields concurrently, one round trip). `transport` maps a field's
+    /// bare item key to its wire key. Hash fields are small (gossip tier), so
+    /// a warm node's copy is current.
+    ///
+    /// Only answers over the stamped read count: a peer predating it would
+    /// answer "absent" for every field.
+    ///
+    /// [`Replicator::resolve_hash_fields`]: ephpm_kv::store::Replicator::resolve_hash_fields
+    fn resolve_hash_fields(
+        &self,
+        handle: &tokio::runtime::Handle,
+        applied: &AppliedWriteMap,
+        local: &Store,
+        key: &str,
+        fields: &[&str],
+        transport: impl Fn(&str) -> String,
+    ) -> Resolved {
+        if !self.is_cold() {
+            return Resolved::Current;
+        }
+        let items: Vec<(String, String, Option<Stamp>)> = fields
+            .iter()
+            .map(|field| {
+                let bare = crate::hash_field::encode_key(key, field);
+                let wire = transport(&bare);
+                let seen = applied.get(&wire).map(|s| *s);
+                (bare, wire, seen)
+            })
+            .filter(|(_, wire, _)| !self.written_here_since_start(applied, wire))
+            .collect();
+        if items.is_empty() {
+            return Resolved::Current;
+        }
+        let asks = items.iter().map(|(_, wire, _)| self.cold_fetch_with(wire, false));
+        let Some(answers) = block_on_cluster(handle, futures::future::join_all(asks)) else {
+            return Resolved::Unavailable;
+        };
+        let mut resolved = Resolved::Current;
+        for ((bare, wire, seen), answer) in items.iter().zip(answers) {
+            match answer {
+                ColdFetch::Found(found) => {
+                    Self::install_peer_copy(local, applied, bare, wire, &found);
+                }
+                ColdFetch::Absent => Self::drop_stale_copy(local, applied, bare, wire, *seen),
+                ColdFetch::NoPeers if !self.catch_up.within_join_wait() => {}
+                ColdFetch::Unavailable | ColdFetch::NoPeers => resolved = Resolved::Unavailable,
+            }
+        }
+        resolved
+    }
+
+    /// The decision behind [`Replicator::resolve_hash_whole`]: refused while
+    /// catching up. Which fields a hash has cannot be learned without asking
+    /// every peer for every field (deleted fields leave no trace a peer could
+    /// list), and a union of the peers' field lists would resurrect deleted
+    /// ones — so a whole-hash read or key-expiry change waits for the gate.
+    ///
+    /// [`Replicator::resolve_hash_whole`]: ephpm_kv::store::Replicator::resolve_hash_whole
+    fn resolve_hash_whole(&self) -> Resolved {
+        if self.is_cold() { Resolved::Unavailable } else { Resolved::Current }
     }
 
     /// Initialize the hot key invalidation subscription.
@@ -1015,6 +1270,7 @@ impl ClusteredStore {
                 }
                 Err(_) => {
                     tracing::debug!(key = transport_key, replica = %node.id, %addr, "fetch-through timed out");
+                    self.client.record_stall(addr);
                     break;
                 }
             }
@@ -1797,6 +2053,32 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         self.inner.cold_read(&self.handle, &self.applied, key)
     }
 
+    fn resolve_for_update(&self, key: &str, held_locally: bool) -> Resolved {
+        self.inner.resolve_for_update(
+            &self.handle,
+            &self.applied,
+            &self.inner.store,
+            key,
+            key,
+            held_locally,
+        )
+    }
+
+    fn resolve_hash_fields(&self, key: &str, fields: &[&str]) -> Resolved {
+        self.inner.resolve_hash_fields(
+            &self.handle,
+            &self.applied,
+            &self.inner.store,
+            key,
+            fields,
+            str::to_string,
+        )
+    }
+
+    fn resolve_hash_whole(&self, _key: &str) -> Resolved {
+        self.inner.resolve_hash_whole()
+    }
+
     fn route_set_nx(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Routed<SetNxOutcome> {
         // The global keyspace's transport key IS the key.
         block_on_cluster(&self.handle, self.inner.route_set_nx(key, value, ttl))
@@ -2168,6 +2450,33 @@ impl ephpm_kv::store::Replicator for SiteKvReplicator {
         // side, exactly as a fetch-through does.
         let transport = crate::site_namespace::encode(&self.site, key);
         self.inner.cold_read(&self.handle, &self.applied, &transport)
+    }
+
+    fn resolve_for_update(&self, key: &str, held_locally: bool) -> Resolved {
+        let transport = crate::site_namespace::encode(&self.site, key);
+        self.inner.resolve_for_update(
+            &self.handle,
+            &self.applied,
+            &self.local,
+            key,
+            &transport,
+            held_locally,
+        )
+    }
+
+    fn resolve_hash_fields(&self, key: &str, fields: &[&str]) -> Resolved {
+        self.inner.resolve_hash_fields(
+            &self.handle,
+            &self.applied,
+            &self.local,
+            key,
+            fields,
+            |bare| crate::site_namespace::encode(&self.site, bare),
+        )
+    }
+
+    fn resolve_hash_whole(&self, _key: &str) -> Resolved {
+        self.inner.resolve_hash_whole()
     }
 
     fn replicate_remove_published(&self, key: String) {

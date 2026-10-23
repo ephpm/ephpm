@@ -551,14 +551,17 @@ increase(ephpm_kv_snapshot_load_total{outcome="cold",reason!="missing"}[1h]) > 0
 
 ## KV catch-up gate
 
-Clustered KV only. A node that starts into a running cluster serves `GET` /
-`MGET` / `ephpm_kv_get` through its peers until it has streamed every peer's
-gossip-tier state ([why](/architecture/kv-store/#tier-1--gossip-backed-small-values)).
+Clustered KV only. A node that starts into a running cluster serves reads
+(`GET`/`MGET`/`ephpm_kv_get`, `EXISTS`, `STRLEN`, `TTL`, per-field hash reads)
+through its peers, and resolves every read-modify-write through them first,
+until it has streamed every peer's gossip-tier state
+([why](/architecture/kv-store/#tier-1--gossip-backed-small-values)).
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_kv_catch_up_cold` | gauge | — | `1` while the gate is cold (reads go to peers), `0` once the catch-up is complete, the cap (15 min) has passed, or no alive peer exists. |
-| `ephpm_kv_cold_reads_total` | counter | `outcome` (`found`, `absent`, `unavailable`) | Reads answered through peers while cold: a peer held the key (`found`), no peer did (`absent`, served as a miss), or no peer could be reached (`unavailable`, also a miss). |
+| `ephpm_kv_cold_reads_total` | counter | `outcome` (`found`, `absent`, `unavailable`) | Keys (or hash fields) asked of the peers while cold, by reads and by read-modify-writes resolving a key first: a peer held it (`found`), no peer did (`absent`; a read is a miss), or no peer could be reached (`unavailable`; a read is a miss, a read-modify-write is refused with `TRYAGAIN` / `false`). |
+| `ephpm_kv_data_plane_breaker_trips_total` | counter | `cause` (`connect`, `stall`) | A peer's KV data plane was put in cooldown: a connect failed (`connect`, 2 s), or it accepted connections but timed out three exchanges in a row (`stall`, 15 s — logged at `WARN` once per stalled spell). Calls to it fail fast meanwhile instead of each waiting out its budget. Any node, cold or not. |
 
 ```promql
 # A node has been cold for longer than a rolling restart should take.
@@ -566,6 +569,9 @@ ephpm_kv_catch_up_cold == 1 and (time() - process_start_time_seconds) > 300
 
 # Cold reads failing: the restarted node cannot reach its peers' data planes.
 rate(ephpm_kv_cold_reads_total{outcome="unavailable"}[1m]) > 0
+
+# A peer is alive to gossip but stalled on the data plane.
+increase(ephpm_kv_data_plane_breaker_trips_total{cause="stall"}[5m]) > 0
 ```
 
 ## Cluster channel

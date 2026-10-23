@@ -138,6 +138,21 @@ const POOL_IDLE_PER_PEER: usize = 8;
 /// for this long.
 pub const PEER_BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
 
+/// Consecutive timed-out exchanges after which a peer that still **accepts**
+/// connections is treated as stalled ([`DataPlaneClient::record_stall`]).
+/// The connect breaker never sees such a peer: its accept queue answers, and
+/// every read then waits out its full budget — sequentially per key on a
+/// node catching up after a restart, so a page with hundreds of KV reads
+/// against one hung peer took hundreds of times that budget.
+pub const PEER_STALL_THRESHOLD: u32 = 3;
+
+/// How long a stalled peer is skipped before one exchange is tried again. A
+/// further timeout re-trips at once (the count is only reset by a success).
+pub const PEER_STALL_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Counter of breaker trips, labelled `cause` = `connect` | `stall`.
+pub const METRIC_BREAKER_TRIPS: &str = "ephpm_kv_data_plane_breaker_trips_total";
+
 /// Sentinel value indicating "key not found" in the wire protocol.
 const NOT_FOUND_SENTINEL: u32 = u32::MAX;
 
@@ -215,8 +230,15 @@ const OP_SET_IF_EQ: u8 = 0x06;
 /// last-applied stamp for the key (see the module docs, "Stamped reads").
 const OP_GET_STAMPED: u8 = 0x07;
 
-/// Trailer of a found GET-STAMPED response: `[has_stamp: u8][write][node_tag]`.
-const STAMP_TRAILER_LEN: usize = 1 + 8 + 8;
+/// Trailer of a found GET-STAMPED response:
+/// `[has_stamp: u8][write: u64][node_tag: u64][ttl_ms: u64]`, `ttl_ms` the
+/// value's remaining lifetime (`0` = no expiry). For a hash-field transport
+/// key the value is the field's replicated encoding ([`crate::hash_field`]),
+/// which carries its own expiries, and `ttl_ms` is `0`.
+///
+/// Never shipped in a release with a shorter trailer: the TTL was added before
+/// v0.13.0, together with the read-modify-write resolution that needs it.
+const STAMP_TRAILER_LEN: usize = 1 + 8 + 8 + 8;
 
 /// SET response: success.
 const SET_OK: u8 = 0x00;
@@ -626,16 +648,35 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
             // pair an old value with a new stamp (the shape the warm-restart
             // lab caught in a handoff build). Same lock order as the writers:
             // applied slot, then store shard.
+            //
+            // A hash-field transport key is answered from the hash: the
+            // field's replicated encoding, value and expiries together, so the
+            // asking node can land it exactly as the gossip applier would.
+            let read = || -> Option<(Vec<u8>, Option<std::time::Duration>)> {
+                match crate::hash_field::decode_key(key) {
+                    Some((hash_key, field)) => {
+                        let state = store.hash_field_state(hash_key, field);
+                        let value = state.value?;
+                        let (payload, _) = crate::hash_field::encode_value(
+                            &value,
+                            state.field_ttl,
+                            state.hash_ttl,
+                        );
+                        Some((payload, None))
+                    }
+                    None => store.get_with_ttl(key).map(|(v, ttl)| (v.to_vec(), ttl)),
+                }
+            };
             let (value, stamp) = match router.applied.as_ref() {
                 Some(applied) => {
                     let slot = applied.get(&request.key);
-                    let value = store.get(key);
+                    let value = read();
                     (value, slot.map(|s| *s))
                 }
-                None => (store.get(key), None),
+                None => (read(), None),
             };
             match value {
-                Some(value) => {
+                Some((value, ttl)) => {
                     let len = u32::try_from(value.len()).unwrap_or(NOT_FOUND_SENTINEL - 1);
                     let mut response = Vec::with_capacity(4 + value.len() + STAMP_TRAILER_LEN);
                     response.extend_from_slice(&len.to_be_bytes());
@@ -644,6 +685,11 @@ fn serve_request(request: Request, router: &KvRouter) -> anyhow::Result<Vec<u8>>
                     response.push(u8::from(stamp != Stamp::ZERO));
                     response.extend_from_slice(&stamp.write.to_be_bytes());
                     response.extend_from_slice(&stamp.node_tag.to_be_bytes());
+                    // At least 1 ms for a live value with an expiry, so "no
+                    // expiry" (0) is never confused with "about to expire".
+                    let ttl_ms =
+                        ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1));
+                    response.extend_from_slice(&ttl_ms.to_be_bytes());
                     response
                 }
                 None => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
@@ -1196,6 +1242,9 @@ pub struct StampedValue {
     pub value: Vec<u8>,
     /// The peer's last-applied stamp for the key, if it still has one.
     pub stamp: Option<Stamp>,
+    /// The value's remaining lifetime on the peer (`None` = no expiry, or a
+    /// plain `GET` answer that does not carry one).
+    pub ttl: Option<std::time::Duration>,
 }
 
 /// Decode a GET-STAMPED response: `None` for the sentinel, otherwise the
@@ -1209,7 +1258,9 @@ fn decode_get_stamped_response(response: &[u8]) -> anyhow::Result<Option<Stamped
     let value = take_bytes(&mut buf, value_len as usize)?.to_vec();
     let has_stamp = take_u8(&mut buf)? != 0;
     let stamp = Stamp { write: take_u64(&mut buf)?, node_tag: take_u64(&mut buf)? };
-    Ok(Some(StampedValue { value, stamp: has_stamp.then_some(stamp) }))
+    let ttl_ms = take_u64(&mut buf)?;
+    let ttl = (ttl_ms > 0).then(|| std::time::Duration::from_millis(ttl_ms));
+    Ok(Some(StampedValue { value, stamp: has_stamp.then_some(stamp), ttl }))
 }
 
 /// Idle connections and breaker state for one peer.
@@ -1217,8 +1268,13 @@ fn decode_get_stamped_response(response: &[u8]) -> anyhow::Result<Option<Stamped
 struct PeerState {
     /// Connections that completed their last exchange cleanly, ready to reuse.
     idle: Vec<TcpStream>,
-    /// Set after a failed connect; dialling is skipped until it passes.
+    /// Set after a failed connect, or once a stalled peer has timed out
+    /// [`PEER_STALL_THRESHOLD`] exchanges in a row; dialling is skipped until
+    /// it passes.
     unreachable_until: Option<Instant>,
+    /// Exchanges with this peer that timed out since the last one that
+    /// completed.
+    stalls: u32,
 }
 
 /// A client for peers' KV data planes with per-peer connection reuse and a
@@ -1271,12 +1327,65 @@ impl DataPlaneClient {
     }
 
     /// Return a healthy connection to the pool, closing it if the pool is full.
+    /// A completed exchange also clears the peer's stall count.
     fn checkin(&self, addr: SocketAddr, stream: TcpStream) {
         let mut peers = self.peers.lock();
         let state = peers.entry(addr).or_default();
+        state.stalls = 0;
         if state.idle.len() < POOL_IDLE_PER_PEER {
             state.idle.push(stream);
         }
+    }
+
+    /// Record that an exchange with `addr` timed out — inside the client
+    /// ([`REQUEST_TIMEOUT`]) or under a caller's own, shorter budget (a cold
+    /// read's or fetch-through's [`crate::clustered_store::FETCH_THROUGH_TIMEOUT`],
+    /// which cancels the exchange before the client's own timeout can fire).
+    ///
+    /// After [`PEER_STALL_THRESHOLD`] in a row the peer is skipped for
+    /// [`PEER_STALL_COOLDOWN`]: calls fail fast with a cooldown error instead
+    /// of each waiting out its budget, logged at `WARN` once per stalled
+    /// spell and counted in [`METRIC_BREAKER_TRIPS`] (`cause="stall"`).
+    pub fn record_stall(&self, addr: SocketAddr) {
+        let (tripped, stalls) = {
+            let mut peers = self.peers.lock();
+            let state = peers.entry(addr).or_default();
+            state.stalls = state.stalls.saturating_add(1);
+            // Whatever was idle is suspect too.
+            state.idle.clear();
+            let tripped = state.stalls >= PEER_STALL_THRESHOLD;
+            if tripped {
+                state.unreachable_until = Some(Instant::now() + PEER_STALL_COOLDOWN);
+            }
+            (tripped, state.stalls)
+        };
+        if !tripped {
+            return;
+        }
+        metrics::counter!(METRIC_BREAKER_TRIPS, "cause" => "stall").increment(1);
+        if stalls == PEER_STALL_THRESHOLD {
+            tracing::warn!(
+                peer = %addr,
+                stalls,
+                cooldown_secs = PEER_STALL_COOLDOWN.as_secs(),
+                "KV data plane peer accepts connections but does not answer: skipping it for \
+                 the cooldown instead of waiting on every request (it is retried after the \
+                 cooldown; a completed exchange clears this)"
+            );
+        } else {
+            tracing::debug!(peer = %addr, stalls, "KV data plane peer still stalled");
+        }
+    }
+
+    /// Whether `addr` is currently skipped by a breaker (observability and
+    /// tests).
+    #[must_use]
+    pub fn in_cooldown(&self, addr: SocketAddr) -> bool {
+        self.peers
+            .lock()
+            .get(&addr)
+            .and_then(|s| s.unreachable_until)
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Record a failed connect so the next [`PEER_BREAKER_COOLDOWN`] of calls
@@ -1287,6 +1396,8 @@ impl DataPlaneClient {
         state.unreachable_until = Some(Instant::now() + PEER_BREAKER_COOLDOWN);
         // Whatever was idle is suspect too.
         state.idle.clear();
+        drop(peers);
+        metrics::counter!(METRIC_BREAKER_TRIPS, "cause" => "connect").increment(1);
     }
 
     /// Number of idle connections currently pooled for `addr` (observability
@@ -1321,7 +1432,10 @@ impl DataPlaneClient {
                     self.checkin(addr, stream);
                     return Ok(response);
                 }
-                Err(e) if is_exchange_timeout(&e) => return Err(e),
+                Err(e) if is_exchange_timeout(&e) => {
+                    self.record_stall(addr);
+                    return Err(e);
+                }
                 Err(e) => {
                     tracing::debug!(%addr, %e, "pooled KV data plane connection failed; redialling");
                 }
@@ -1334,7 +1448,15 @@ impl DataPlaneClient {
                 return Err(e);
             }
         };
-        let response = exchange_on(&mut stream, message, kind, cipher).await?;
+        let response = match exchange_on(&mut stream, message, kind, cipher).await {
+            Ok(response) => response,
+            Err(e) => {
+                if is_exchange_timeout(&e) {
+                    self.record_stall(addr);
+                }
+                return Err(e);
+            }
+        };
         self.checkin(addr, stream);
         Ok(response)
     }
@@ -2434,17 +2556,91 @@ mod tests {
 
             assert_eq!(
                 client.fetch_stamped(addr, "k").await.unwrap(),
-                Some(StampedValue { value: b"value".to_vec(), stamp: Some(stamp) })
+                Some(StampedValue { value: b"value".to_vec(), stamp: Some(stamp), ttl: None })
             );
             assert_eq!(
                 client.fetch_stamped(addr, "unstamped").await.unwrap(),
-                Some(StampedValue { value: b"old".to_vec(), stamp: None })
+                Some(StampedValue { value: b"old".to_vec(), stamp: None, ttl: None })
             );
             assert_eq!(client.fetch_stamped(addr, "missing").await.unwrap(), None);
             // The plain GET on the same connection still works (pool reuse
             // across response kinds).
             assert_eq!(client.fetch(addr, "k").await.unwrap(), Some(b"value".to_vec()));
         }
+    }
+
+    /// A stamped GET carries the value's remaining TTL, and answers a
+    /// hash-field transport key from the hash with the field's replicated
+    /// encoding (value and expiries), so a node resolving a field can land it
+    /// exactly as gossip would. Plaintext and sealed alike.
+    #[tokio::test]
+    async fn stamped_get_carries_the_ttl_and_answers_hash_fields() {
+        for cipher in [None, Some(test_cipher("s"))] {
+            let store = Store::new(ephpm_kv::store::StoreConfig::default());
+            let applied = crate::clustered_store::new_applied_write_map();
+            let addr = spawn_router_handler(
+                KvRouter::global(Arc::clone(&store)).with_applied(Arc::clone(&applied)),
+                cipher.clone(),
+            )
+            .await;
+            let client = DataPlaneClient::new(cipher);
+            store.set_local("ttl".into(), b"v".to_vec(), Some(std::time::Duration::from_secs(60)));
+            let got = client.fetch_stamped(addr, "ttl").await.unwrap().expect("found");
+            let ttl = got.ttl.expect("an expiring value reports its TTL");
+            assert!(
+                ttl > std::time::Duration::from_secs(55)
+                    && ttl <= std::time::Duration::from_secs(60)
+            );
+
+            store.hset("h", "f", b"field".to_vec()).unwrap();
+            let transport = crate::hash_field::encode_key("h", "f");
+            let got = client.fetch_stamped(addr, &transport).await.unwrap().expect("field found");
+            let state = crate::hash_field::decode_value(&got.value).expect("field encoding");
+            assert_eq!(state.value.as_deref(), Some(&b"field"[..]));
+            assert_eq!(got.ttl, None, "a field carries its expiries in its encoding");
+            let missing = crate::hash_field::encode_key("h", "nope");
+            assert_eq!(client.fetch_stamped(addr, &missing).await.unwrap(), None);
+        }
+    }
+
+    /// A peer that accepts connections but never answers trips the stall
+    /// breaker after [`PEER_STALL_THRESHOLD`] timed-out exchanges (here cut
+    /// short by the caller's own budget, as a cold read's is): further calls
+    /// fail fast instead of each waiting out a budget. A completed exchange
+    /// clears the count.
+    #[tokio::test]
+    async fn a_peer_that_accepts_but_never_answers_is_skipped_after_repeated_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = DataPlaneClient::new(None);
+        for i in 1..=PEER_STALL_THRESHOLD {
+            assert!(!client.in_cooldown(addr), "not tripped after {} stalls", i - 1);
+            let read = tokio::time::timeout(Duration::from_millis(100), client.fetch(addr, "k"));
+            assert!(read.await.is_err(), "the black hole never answers");
+            client.record_stall(addr);
+        }
+        assert!(client.in_cooldown(addr));
+        let started = std::time::Instant::now();
+        assert!(client.fetch(addr, "k").await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(100), "skipped, not waited on");
+        hole.abort();
+
+        // A healthy exchange clears the stall count: two stalls then a success
+        // then two more do not trip.
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let good = spawn_multi_handler(Arc::clone(&store), None).await;
+        client.record_stall(good);
+        client.record_stall(good);
+        assert_eq!(client.fetch(good, "k").await.unwrap(), None);
+        client.record_stall(good);
+        client.record_stall(good);
+        assert!(!client.in_cooldown(good));
     }
 
     /// Without an applied map (tools, tests) a stamped GET answers with no
@@ -2457,7 +2653,7 @@ mod tests {
         let client = DataPlaneClient::new(None);
         assert_eq!(
             client.fetch_stamped(addr, "k").await.unwrap(),
-            Some(StampedValue { value: b"v".to_vec(), stamp: None })
+            Some(StampedValue { value: b"v".to_vec(), stamp: None, ttl: None })
         );
     }
 
@@ -2469,9 +2665,14 @@ mod tests {
         response.push(1);
         response.extend_from_slice(&stamp.write.to_be_bytes());
         response.extend_from_slice(&stamp.node_tag.to_be_bytes());
+        response.extend_from_slice(&1500u64.to_be_bytes());
         assert_eq!(
             decode_get_stamped_response(&response).unwrap(),
-            Some(StampedValue { value: b"abc".to_vec(), stamp: Some(stamp) })
+            Some(StampedValue {
+                value: b"abc".to_vec(),
+                stamp: Some(stamp),
+                ttl: Some(std::time::Duration::from_millis(1500)),
+            })
         );
         assert!(decode_get_stamped_response(&response[..response.len() - 1]).is_err());
         assert_eq!(decode_get_stamped_response(&NOT_FOUND_SENTINEL.to_be_bytes()).unwrap(), None);

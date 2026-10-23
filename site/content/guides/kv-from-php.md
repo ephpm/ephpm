@@ -74,7 +74,7 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 | `ephpm_kv_getdel(string $key)` | `?string` | Returns the value and deletes the key, as one atomic step. *v0.13+* |
 | `ephpm_kv_getex(string $key, int $ttl)` | `?string` | Returns the value and sets its TTL: `$ttl > 0` seconds, `0` removes the TTL. `null` (nothing changed) if missing; a negative `$ttl` warns and returns `null`. *v0.13+* |
 | `ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0)` | `bool` | Compare-and-set — see [Extending a lock](#extending-a-lock-ephpm-kv-set-if-eq). `$ttl`: `> 0` new TTL, `0` none, `-1` keep the current one. *v0.13+* |
-| `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. In a cluster, returns `false` (and logs a warning once) on a node that has no copy of a large value held by other nodes, rather than replacing that value with the appended bytes — see [`APPEND`](/reference/kv-resp/#commands). *v0.13+* |
+| `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. In a cluster, a large value held only by other nodes is taken from them and appended to (as on a holder); `false` (logged once) when they cannot be reached, rather than replacing that value with the appended bytes — see [Read-modify-writes in a cluster](/reference/kv-resp/#read-modify-writes-in-a-cluster). *v0.13+* |
 | `ephpm_kv_strlen(string $key)` | `int` | Length of the value, `0` if missing. Node-local in a cluster (see [Iterating keys](#iterating-keys-ephpm-kv-scan)). *v0.13+* |
 | `ephpm_kv_type(string $key)` | `string` | `"string"`, `"hash"` or `"none"`. Node-local in a cluster, like `strlen`. *v0.13+* |
 | `ephpm_kv_scan(int $cursor, ?string $match = null, int $count = 10)` | `array\|false` | One step of a key scan: `[int $next_cursor, array $keys]` — see [Iterating keys](#iterating-keys-ephpm-kv-scan). *v0.13+* |
@@ -378,9 +378,37 @@ every string value at or under `small_key_threshold` is on every node, but a
 larger string value only on its replica nodes. Do not use it to find every key
 to delete cluster-wide (for example a cache group flush); key a group by a
 version counter instead. `ephpm_kv_type()`, `ephpm_kv_exists()` and
-`ephpm_kv_strlen()` are node-local in the same way: for a large value held
-only by other nodes they report `"none"` / `false` / `0`, while
-`ephpm_kv_get()` and `ephpm_kv_mget()` fetch it from those nodes.
+`ephpm_kv_strlen()` are node-local in the same way once a node has caught up
+with its peers: for a large value held only by other nodes they report
+`"none"` / `false` / `0`, while `ephpm_kv_get()` and `ephpm_kv_mget()` fetch it
+from those nodes.
+
+### A node that has just (re)started
+
+A node that starts into a running cluster spends tens of seconds to minutes
+streaming its peers' state, and until it has, its own copies may be stale or
+missing ([why](/architecture/kv-store/#tier-1--gossip-backed-small-values)).
+Meanwhile:
+
+- `ephpm_kv_get`/`mget`, `exists`, `strlen`, `ttl`/`pttl`, `type` of a string
+  key, and the per-field hash reads (`hget`, `hmget`, `hexists`, `hpttl`)
+  answer from the peers' newest copy, and as a miss when no peer answers.
+- Read-modify-writes — `incr*`/`decr*`, `append`, `getdel`, `getex`, `expire`,
+  `persist`, `hset`, `hsetnx`, `hincr_by`, `hexpire`, `hpersist` — take the
+  peers' newest copy first and then run, so a counter continues instead of
+  restarting at `1` on every node. With no peer reachable they return
+  `false` and change nothing (logged at `WARN` once); retry. A large value
+  held only by other nodes is handled the same way on any node, restarted or
+  not.
+- `ephpm_kv_hgetall()`, `hkeys()`, `hvals()` return `false`, and
+  `ephpm_kv_hlen()` returns `0`, until the node has caught up: which fields a
+  hash has cannot be established from the peers without resurrecting deleted
+  ones.
+- `ephpm_kv_hdel()` always deletes, also on peers that hold a field this node
+  has not received yet.
+
+See [Read-modify-writes in a cluster](/reference/kv-resp/#read-modify-writes-in-a-cluster)
+for the RESP view of the same rules.
 
 ### Blocking waits — `ephpm_kv_wait()`
 
