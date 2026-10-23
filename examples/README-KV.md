@@ -40,6 +40,19 @@ curl http://localhost:8080/kv-sapi-basic.php
 - `ephpm_kv_pttl(key)` — Get remaining TTL in milliseconds (-1 = no expiry, -2 = missing)
 - `ephpm_kv_flush_all()` — Delete all keys
 - `ephpm_kv_wait(key, last_version, timeout_ms)` — Block until `key` is written again (or the timeout elapses). Returns `['value' => string|null, 'version' => int]` on change, `false` on timeout. Start with `last_version = 0` to register the watch and get a race-free snapshot.
+- `ephpm_kv_del_if_eq(key, token)` — Delete only while the value equals `token` (safe lock release)
+
+Since ePHPm v0.13 (guard with `function_exists()` if you also run older versions):
+
+- `ephpm_kv_mget(keys)` / `ephpm_kv_mset([key => value][, ttl_seconds])` — many keys in one call (`mget` returns a list aligned with `keys`, `null` for a miss)
+- `ephpm_kv_getdel(key)`, `ephpm_kv_getex(key, ttl_seconds)` (0 removes the TTL), `ephpm_kv_persist(key)`
+- `ephpm_kv_set_if_eq(key, expected, value[, ttl_seconds])` — compare-and-set (extend a lock you still hold)
+- `ephpm_kv_append(key, value)`, `ephpm_kv_strlen(key)`, `ephpm_kv_type(key)`
+- `ephpm_kv_scan(cursor[, match[, count]])` — returns `[next_cursor, keys]`; start at 0, stop when the cursor is 0
+- Hashes: `ephpm_kv_hset(key, field, value)` or `ephpm_kv_hset(key, [field => value])`, `ephpm_kv_hget`, `ephpm_kv_hmget`, `ephpm_kv_hgetall`, `ephpm_kv_hkeys`, `ephpm_kv_hvals`, `ephpm_kv_hdel`, `ephpm_kv_hexists`, `ephpm_kv_hlen`, `ephpm_kv_hsetnx`, `ephpm_kv_hincr_by`
+- Per-field TTL: `ephpm_kv_hexpire(key, field_or_fields, ttl_seconds)`, `ephpm_kv_httl`, `ephpm_kv_hpttl`, `ephpm_kv_hpersist`
+
+The full reference, with return values and cluster behavior, is the [KV from PHP guide](../site/content/guides/kv-from-php.md#function-reference).
 
 **Pros:**
 - Zero-copy, direct access to embedded store

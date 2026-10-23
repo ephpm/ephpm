@@ -329,9 +329,248 @@ pub struct EphpmKvOps {
     /// checks it before every `ephpm_kv_*` op and fails the call on non-zero.
     /// See `kv_site_context`.
     ///
-    /// Must stay LAST-appended: the layout mirrors `ephpm_wrapper.c`'s
-    /// `EphpmKvOps`.
+    /// The layout mirrors `ephpm_wrapper.c`'s `EphpmKvOps`: fields are only
+    /// ever appended, below this one.
     pub site_context: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
+
+    // ── v0.13: list results, hashes, multi-key and key-space ops ───────
+    //
+    // Ops that return several values stage them in a thread-local list
+    // buffer (see `stage_list`) and return how many items they staged, or
+    // -1 on failure; the C side reads each item with `list_item` right after,
+    // on the same thread. Arrays of keys/fields/values cross as parallel
+    // `(pointer, length)` arrays of `n` entries.
+    /// Item `index` of the last staged list: `1` with `*ptr`/`*len` set, `0`
+    /// for a null item, `-1` past the end.
+    pub list_item: Option<
+        unsafe extern "C" fn(
+            index: usize,
+            ptr: *mut *const std::os::raw::c_char,
+            len: *mut usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HGET`: `1` found (value in the get buffer), `0` missing/failure.
+    pub hget: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HSET` of `n` field/value pairs: `1` with `*added` = fields created,
+    /// `0` failure (refused for memory, clustered value too large, no store).
+    pub hset: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            fields: *const *const std::os::raw::c_char,
+            field_lens: *const usize,
+            vals: *const *const std::os::raw::c_char,
+            val_lens: *const usize,
+            n: usize,
+            added: *mut std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HSETNX`: `1` set, `0` existed or failure.
+    pub hsetnx: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+            val: *const std::os::raw::c_char,
+            val_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HMGET`: stages `n` items (null for a missing field); `-1` failure.
+    pub hmget: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            fields: *const *const std::os::raw::c_char,
+            field_lens: *const usize,
+            n: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HGETALL`: stages field, value, field, value, ...; returns the item
+    /// count (twice the field count); `-1` failure.
+    pub hgetall: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HKEYS` (`which` = 0) or `HVALS` (`which` = 1): stages the items;
+    /// `-1` failure.
+    pub hkeys_vals: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            which: std::os::raw::c_int,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HDEL` of `n` fields: the number removed (`0` on failure).
+    pub hdel: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            fields: *const *const std::os::raw::c_char,
+            field_lens: *const usize,
+            n: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HEXISTS`: `1` / `0`.
+    pub hexists: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HLEN`: live fields (`0` for missing / failure).
+    pub hlen: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HINCRBY`: `1` with `*result` set, `0` failure (non-integer field,
+    /// overflow, refused write).
+    pub hincr_by: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+            delta: std::os::raw::c_longlong,
+            result: *mut std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `HEXPIRE` of `n` fields to `ttl_ms` (> 0): the number of fields given
+    /// the TTL; `-1` for an invalid TTL or failure.
+    pub hexpire: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            fields: *const *const std::os::raw::c_char,
+            field_lens: *const usize,
+            n: usize,
+            ttl_ms: std::os::raw::c_longlong,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HPTTL` of one field: milliseconds, `-1` no TTL, `-2` no field.
+    pub hpttl: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `HPERSIST` of one field: `1` a TTL was removed, `0` otherwise.
+    pub hpersist: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            field: *const std::os::raw::c_char,
+            field_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `MGET` of `n` keys: stages `n` items (null for a missing key); `-1`
+    /// failure.
+    pub mget: Option<
+        unsafe extern "C" fn(
+            keys: *const *const std::os::raw::c_char,
+            key_lens: *const usize,
+            n: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `MSET` of `n` pairs with one TTL (`0` = none): `1` all stored, `0`
+    /// failure (a refusal stops the write; earlier pairs stay).
+    pub mset: Option<
+        unsafe extern "C" fn(
+            keys: *const *const std::os::raw::c_char,
+            key_lens: *const usize,
+            vals: *const *const std::os::raw::c_char,
+            val_lens: *const usize,
+            n: usize,
+            ttl_ms: std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `GETDEL`: `1` found (value in the get buffer), `0` missing/failure.
+    pub getdel: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `GETEX`: `ttl_ms` > 0 sets the TTL, `0` removes it. `1` found (value
+    /// in the get buffer), `0` missing/failure.
+    pub getex: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            ttl_ms: std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `PERSIST` (strings and hashes): `1` a TTL was removed.
+    pub persist: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// Compare-and-set (`SET ... IFEQ`). `ttl_ms` > 0 new TTL, `0` none,
+    /// `-1` keep. `1` set, `0` not set (mismatch, absent, refused), `-1`
+    /// clustered owner unreachable.
+    pub set_if_eq: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            expected: *const std::os::raw::c_char,
+            expected_len: usize,
+            val: *const std::os::raw::c_char,
+            val_len: usize,
+            ttl_ms: std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+    /// `APPEND`: the new length, `-1` failure.
+    pub append: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+            val: *const std::os::raw::c_char,
+            val_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `STRLEN`: `0` for missing / failure.
+    pub str_len: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_longlong,
+    >,
+    /// `TYPE`: `0` none, `1` string, `2` hash.
+    pub key_type: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            key_len: usize,
+        ) -> std::os::raw::c_int,
+    >,
+    /// One `SCAN` step from `cursor`; `pattern` may be NULL. Stages the keys
+    /// and returns their count, writing the next cursor (`0` = done) to
+    /// `*next`; `-1` failure.
+    pub scan: Option<
+        unsafe extern "C" fn(
+            cursor: std::os::raw::c_ulonglong,
+            pattern: *const std::os::raw::c_char,
+            pattern_len: usize,
+            count: std::os::raw::c_longlong,
+            next: *mut std::os::raw::c_ulonglong,
+        ) -> std::os::raw::c_longlong,
+    >,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -358,12 +597,7 @@ unsafe extern "C" fn kv_get(
             // an exiting thread. Without the buffer there is nowhere to hand
             // the value to C, so report a miss rather than returning 1 with a
             // stale/empty buffer behind it.
-            let staged = KV_GET_BUF.try_with(|buf| {
-                let mut buf = buf.borrow_mut();
-                buf.clear();
-                buf.extend_from_slice(&val);
-            });
-            i32::from(staged.is_ok())
+            i32::from(stage_value(&val))
         }
         None => 0,
     }
@@ -627,14 +861,7 @@ unsafe extern "C" fn kv_wait(
     // documented contract says `*new_version` is untouched when this returns
     // 0 — so the write below must not happen on the degraded path.
     let rc = match value {
-        Some(val) => {
-            let staged = KV_GET_BUF.try_with(|buf| {
-                let mut buf = buf.borrow_mut();
-                buf.clear();
-                buf.extend_from_slice(&val);
-            });
-            if staged.is_ok() { 1 } else { 0 }
-        }
+        Some(val) => i32::from(stage_value(&val)),
         None => 2,
     };
     if rc == 0 {
@@ -644,6 +871,621 @@ unsafe extern "C" fn kv_wait(
     // our C wrapper code (PHP_FUNCTION(ephpm_kv_wait)).
     unsafe { *new_version = std::os::raw::c_longlong::try_from(version).unwrap_or(i64::MAX) };
     rc
+}
+
+// ── v0.13 ops: list buffer, hashes, multi-key, key space ───────────────
+
+/// A staged list result: every item's bytes back to back in `data`, and per
+/// item its `(offset, len)` — `None` for a null item.
+#[cfg(php_linked)]
+#[derive(Default)]
+struct ListBuf {
+    data: Vec<u8>,
+    items: Vec<Option<(usize, usize)>>,
+}
+
+#[cfg(php_linked)]
+thread_local! {
+    /// The last list result of this thread (see [`EphpmKvOps::list_item`]).
+    static KV_LIST_BUF: RefCell<ListBuf> = RefCell::new(ListBuf::default());
+}
+
+/// Stage `items` as this thread's list result and return how many there
+/// are, or `-1` when the buffer is gone (thread teardown, issue #269) — the
+/// caller must then report failure rather than a list C cannot read.
+#[cfg(php_linked)]
+fn stage_list<I, B>(items: I) -> std::os::raw::c_longlong
+where
+    I: IntoIterator<Item = Option<B>>,
+    B: AsRef<[u8]>,
+{
+    KV_LIST_BUF
+        .try_with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.data.clear();
+            buf.items.clear();
+            trim_retained(&mut buf.data);
+            trim_retained(&mut buf.items);
+            for item in items {
+                let staged = item.map(|bytes| {
+                    let bytes = bytes.as_ref();
+                    let at = buf.data.len();
+                    buf.data.extend_from_slice(bytes);
+                    (at, bytes.len())
+                });
+                buf.items.push(staged);
+            }
+            std::os::raw::c_longlong::try_from(buf.items.len()).unwrap_or(-1)
+        })
+        .unwrap_or(-1)
+}
+
+/// Stage one value in the get buffer (the `get_result` contract). `false`
+/// when the buffer is gone.
+#[cfg(php_linked)]
+fn stage_value(value: &[u8]) -> bool {
+    KV_GET_BUF
+        .try_with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            trim_retained(&mut buf);
+            buf.extend_from_slice(value);
+        })
+        .is_ok()
+}
+
+/// Capacity a per-thread staging buffer keeps between calls. One large value
+/// (or list) grows a buffer to its size; without this, every PHP thread that
+/// ever read a big value would hold that much memory for the rest of the
+/// process. Called after `clear()` and before the next fill, so the shrink
+/// never discards bytes C has yet to copy.
+#[cfg(php_linked)]
+const STAGING_RETAIN_BYTES: usize = 1024 * 1024;
+
+/// Shrink a cleared staging buffer back to [`STAGING_RETAIN_BYTES`].
+#[cfg(php_linked)]
+fn trim_retained<T>(buf: &mut Vec<T>) {
+    let keep = STAGING_RETAIN_BYTES / std::mem::size_of::<T>().max(1);
+    if buf.capacity() > keep {
+        buf.shrink_to(keep);
+    }
+}
+
+/// Borrow `n` UTF-8 strings passed as parallel `(pointer, length)` arrays;
+/// `None` if any is not UTF-8 or the arrays are NULL with `n > 0`.
+///
+/// # Safety
+///
+/// `ptrs` and `lens` must each point to `n` readable entries, and every
+/// `ptrs[i]` to `lens[i]` readable bytes, all valid for `'a`.
+#[cfg(php_linked)]
+unsafe fn str_list<'a>(
+    ptrs: *const *const std::os::raw::c_char,
+    lens: *const usize,
+    n: usize,
+) -> Option<Vec<&'a str>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if ptrs.is_null() || lens.is_null() {
+        return None;
+    }
+    // Safety: the caller guarantees `n` entries in each array.
+    let (ptrs, lens) =
+        unsafe { (std::slice::from_raw_parts(ptrs, n), std::slice::from_raw_parts(lens, n)) };
+    ptrs.iter()
+        .zip(lens)
+        // Safety: each pointer covers its length, per the caller.
+        .map(|(p, l)| unsafe { key_arg(*p, *l) })
+        .collect()
+}
+
+/// Borrow `n` byte strings passed as parallel `(pointer, length)` arrays.
+///
+/// # Safety
+///
+/// As [`str_list`].
+#[cfg(php_linked)]
+unsafe fn bytes_list<'a>(
+    ptrs: *const *const std::os::raw::c_char,
+    lens: *const usize,
+    n: usize,
+) -> Option<Vec<&'a [u8]>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if ptrs.is_null() || lens.is_null() {
+        return None;
+    }
+    // Safety: the caller guarantees `n` entries in each array.
+    let (ptrs, lens) =
+        unsafe { (std::slice::from_raw_parts(ptrs, n), std::slice::from_raw_parts(lens, n)) };
+    ptrs.iter()
+        .zip(lens)
+        .map(|(p, l)| {
+            if p.is_null() && *l > 0 {
+                return None;
+            }
+            if *l == 0 {
+                return Some(&[][..]);
+            }
+            // Safety: `p` covers `l` readable bytes, per the caller.
+            Some(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), *l) })
+        })
+        .collect()
+}
+
+/// Borrow one value passed as `(pointer, length)`.
+///
+/// # Safety
+///
+/// `ptr` must point to `len` readable bytes valid for `'a` (or be NULL with
+/// `len == 0`).
+#[cfg(php_linked)]
+unsafe fn bytes_arg<'a>(ptr: *const std::os::raw::c_char, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        return &[];
+    }
+    // Safety: per the caller.
+    unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }
+}
+
+/// Resolve the store and a key, or return `$fail` from the enclosing op.
+#[cfg(php_linked)]
+macro_rules! store_and_key {
+    ($key:expr, $len:expr, $fail:expr) => {{
+        // Safety: every op's `key` points to `key_len` bytes of a PHP string
+        // parameter, valid for the duration of the call.
+        let Some(key) = (unsafe { key_arg($key, $len) }) else {
+            return $fail;
+        };
+        let Some(store) = effective_store() else {
+            return $fail;
+        };
+        (store, key)
+    }};
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_list_item(
+    index: usize,
+    ptr: *mut *const std::os::raw::c_char,
+    len: *mut usize,
+) -> std::os::raw::c_int {
+    KV_LIST_BUF
+        .try_with(|buf| {
+            let buf = buf.borrow();
+            match buf.items.get(index) {
+                Some(Some((at, n))) => {
+                    // Safety: `ptr`/`len` are valid out-pointers from our C
+                    // code; the buffer is not touched until the next staging
+                    // call on this thread, which C makes only after it has
+                    // copied every item.
+                    unsafe {
+                        *ptr = buf.data.as_ptr().add(*at).cast();
+                        *len = *n;
+                    }
+                    1
+                }
+                Some(None) => 0,
+                None => -1,
+            }
+        })
+        .unwrap_or(-1)
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hget(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of a PHP string parameter.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    match store.hget(key, field) {
+        Some(v) => i32::from(stage_value(&v)),
+        None => 0,
+    }
+}
+
+#[cfg(php_linked)]
+#[allow(clippy::too_many_arguments, reason = "a C ABI: parallel arrays plus an out-pointer")]
+unsafe extern "C" fn kv_hset(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    vals: *const *const std::os::raw::c_char,
+    val_lens: *const usize,
+    n: usize,
+    added: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: the C side passes `n` entries in each array, each covering
+    // its length, valid for this call.
+    let (Some(fields), Some(vals)) =
+        (unsafe { str_list(fields, field_lens, n) }, unsafe { bytes_list(vals, val_lens, n) })
+    else {
+        return 0;
+    };
+    let pairs: Vec<(&str, &[u8])> = fields.into_iter().zip(vals).collect();
+    match store.hset_many(key, &pairs) {
+        Ok(count) => {
+            // Safety: `added` points to a `long long` local in our C code.
+            unsafe { *added = std::os::raw::c_longlong::try_from(count).unwrap_or(i64::MAX) };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hsetnx(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `field`/`val` point to their lengths of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    let val = unsafe { bytes_arg(val, val_len) };
+    i32::from(store.hsetnx(key, field, val) == Ok(true))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hmget(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -1);
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return -1;
+    };
+    stage_list(store.hmget(key, &fields))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hgetall(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -1);
+    let pairs = store.hgetall(key);
+    stage_list(pairs.iter().flat_map(|(f, v)| [Some(f.as_bytes()), Some(v.as_ref())]))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hkeys_vals(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    which: std::os::raw::c_int,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -1);
+    if which == 0 {
+        stage_list(store.hkeys(key).iter().map(|k| Some(k.as_bytes())))
+    } else {
+        stage_list(store.hvals(key).iter().map(|v| Some(v.as_ref())))
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hdel(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return 0;
+    };
+    std::os::raw::c_longlong::try_from(store.hdel_many(key, &fields)).unwrap_or(i64::MAX)
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hexists(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    i32::from(store.hexists(key, field))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hlen(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    std::os::raw::c_longlong::try_from(store.hlen(key)).unwrap_or(i64::MAX)
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hincr_by(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+    delta: std::os::raw::c_longlong,
+    result: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    match store.hincr_by(key, field, delta) {
+        Ok(v) => {
+            // Safety: `result` points to a `long long` local in our C code.
+            unsafe { *result = v };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hexpire(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -1);
+    // Positive and representable only; `checked_ttl` keeps `Instant + ttl`
+    // from overflowing.
+    let Some(ttl) = ephpm_kv::command::checked_ttl(ttl_ms, ephpm_kv::command::TtlUnit::Millis)
+    else {
+        return -1;
+    };
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return -1;
+    };
+    let codes = store.hexpire(key, &fields, ttl, ephpm_kv::store::ExpireCondition::Always);
+    let set = codes.iter().filter(|c| **c == ephpm_kv::store::field_code::UPDATED).count();
+    std::os::raw::c_longlong::try_from(set).unwrap_or(i64::MAX)
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hpttl(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -2);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return -2;
+    };
+    store.hpttl(key, &[field]).first().copied().unwrap_or(-2)
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_hpersist(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    let codes = store.hpersist(key, &[field]);
+    i32::from(codes.first() == Some(&ephpm_kv::store::field_code::UPDATED))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_mget(
+    keys: *const *const std::os::raw::c_char,
+    key_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    let Some(store) = effective_store() else {
+        return -1;
+    };
+    // Safety: `n` entries per array, each covering its length.
+    let Some(keys) = (unsafe { str_list(keys, key_lens, n) }) else {
+        return -1;
+    };
+    // Through the cluster, like `get`: a large value held by other nodes is
+    // fetched rather than reported missing.
+    stage_list(keys.iter().map(|k| store.get_through(k)))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_mset(
+    keys: *const *const std::os::raw::c_char,
+    key_lens: *const usize,
+    vals: *const *const std::os::raw::c_char,
+    val_lens: *const usize,
+    n: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let Some(store) = effective_store() else {
+        return 0;
+    };
+    let Ok(ttl) = optional_ttl(ttl_ms) else {
+        return 0;
+    };
+    // Safety: `n` entries per array, each covering its length. Every key is
+    // checked before anything is written.
+    let (Some(keys), Some(vals)) =
+        (unsafe { str_list(keys, key_lens, n) }, unsafe { bytes_list(vals, val_lens, n) })
+    else {
+        return 0;
+    };
+    for (key, val) in keys.into_iter().zip(vals) {
+        if !store.set(key.to_string(), val.to_vec(), ttl) {
+            return 0;
+        }
+    }
+    1
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_getdel(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    match store.getdel(key) {
+        Some(v) => i32::from(stage_value(&v)),
+        None => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_getex(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    let expiry = match optional_ttl(ttl_ms) {
+        Ok(Some(ttl)) => ephpm_kv::store::GetExpiry::After(ttl),
+        Ok(None) if ttl_ms == 0 => ephpm_kv::store::GetExpiry::Persist,
+        _ => return 0,
+    };
+    match store.getex(key, expiry) {
+        Some(v) => i32::from(stage_value(&v)),
+        None => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_persist(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    i32::from(store.persist(key))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_set_if_eq(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    expected: *const std::os::raw::c_char,
+    expected_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    let ttl = match ttl_ms {
+        -1 => ephpm_kv::store::SetTtl::Keep,
+        0 => ephpm_kv::store::SetTtl::Persist,
+        ms => match ephpm_kv::command::checked_ttl(ms, ephpm_kv::command::TtlUnit::Millis) {
+            Some(d) => ephpm_kv::store::SetTtl::After(d),
+            None => return 0,
+        },
+    };
+    // Safety: both point to their lengths of PHP string data.
+    let (expected, val) = unsafe { (bytes_arg(expected, expected_len), bytes_arg(val, val_len)) };
+    set_if_eq_rc(store.set_if_eq(key.to_string(), expected, val.to_vec(), ttl))
+}
+
+/// C return code for `set_if_eq`: `1` set, `0` not set (mismatch, absent,
+/// refused for memory), `-1` clustered owner unreachable (outcome unknown).
+#[cfg_attr(not(php_linked), allow(dead_code))]
+fn set_if_eq_rc(outcome: ephpm_kv::store::SetIfEqOutcome) -> std::os::raw::c_int {
+    use ephpm_kv::store::SetIfEqOutcome;
+    match outcome {
+        SetIfEqOutcome::Set => 1,
+        SetIfEqOutcome::OwnerUnreachable => -1,
+        SetIfEqOutcome::NotSet | SetIfEqOutcome::OutOfMemory => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_append(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, -1);
+    // Safety: `val` points to `val_len` bytes of PHP string data.
+    let val = unsafe { bytes_arg(val, val_len) };
+    store.append(key, val).map_or(-1, |n| std::os::raw::c_longlong::try_from(n).unwrap_or(-1))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_strlen(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    // Node-local, like RESP STRLEN (and `type`/`exists`): no read-through to
+    // the replica set for a large value held only by other nodes.
+    store.get(key).map_or(0, |v| std::os::raw::c_longlong::try_from(v.len()).unwrap_or(0))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_key_type(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (store, key) = store_and_key!(key, key_len, 0);
+    if store.is_hash(key) { 2 } else { i32::from(store.exists(key)) }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_scan(
+    cursor: std::os::raw::c_ulonglong,
+    pattern: *const std::os::raw::c_char,
+    pattern_len: usize,
+    count: std::os::raw::c_longlong,
+    next: *mut std::os::raw::c_ulonglong,
+) -> std::os::raw::c_longlong {
+    let Some(store) = effective_store() else {
+        return -1;
+    };
+    let pattern = if pattern.is_null() {
+        None
+    } else {
+        // Safety: `pattern` points to `pattern_len` bytes of PHP string data.
+        match unsafe { key_arg(pattern, pattern_len) } {
+            Some(p) => Some(p),
+            None => return -1,
+        }
+    };
+    let count = usize::try_from(count.max(1)).unwrap_or(1);
+    let page = store.scan(cursor, pattern, count, None);
+    let staged = stage_list(page.keys.iter().map(|k| Some(k.as_bytes())));
+    if staged >= 0 {
+        // Safety: `next` points to an `unsigned long long` local in our C
+        // code.
+        unsafe { *next = page.cursor };
+    }
+    staged
 }
 
 // ── Static ops table ────────────────────────────────────────────────────
@@ -665,6 +1507,30 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     wait: Some(kv_wait),
     del_if_eq: Some(kv_del_if_eq),
     site_context: Some(kv_site_context),
+    list_item: Some(kv_list_item),
+    hget: Some(kv_hget),
+    hset: Some(kv_hset),
+    hsetnx: Some(kv_hsetnx),
+    hmget: Some(kv_hmget),
+    hgetall: Some(kv_hgetall),
+    hkeys_vals: Some(kv_hkeys_vals),
+    hdel: Some(kv_hdel),
+    hexists: Some(kv_hexists),
+    hlen: Some(kv_hlen),
+    hincr_by: Some(kv_hincr_by),
+    hexpire: Some(kv_hexpire),
+    hpttl: Some(kv_hpttl),
+    hpersist: Some(kv_hpersist),
+    mget: Some(kv_mget),
+    mset: Some(kv_mset),
+    getdel: Some(kv_getdel),
+    getex: Some(kv_getex),
+    persist: Some(kv_persist),
+    set_if_eq: Some(kv_set_if_eq),
+    append: Some(kv_append),
+    str_len: Some(kv_strlen),
+    key_type: Some(kv_key_type),
+    scan: Some(kv_scan),
 };
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -1132,7 +1998,7 @@ mod tests {
         let store = init_store();
         store.set("bridge_flush_a".into(), b"v1".to_vec(), None);
         store.set("bridge_flush_b".into(), b"v2".to_vec(), Some(Duration::from_secs(60)));
-        store.hset("bridge_flush_h", "f", b"v".to_vec());
+        store.hset("bridge_flush_h", "f", b"v".to_vec()).unwrap();
 
         // Safety: no arguments; effective_store() falls back to global.
         let ok = unsafe { kv_flush_all() };

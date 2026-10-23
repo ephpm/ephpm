@@ -29,7 +29,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Single-node SQLite | **Implemented** | `litewire` + the Turso engine in-process; `pdo_mysql` clients connect transparently |
 | Clustered SQLite | **Implemented — experimental** | `litewire` + in-process Turso CDC replication over the cluster channel (no sqld sidecar) |
 | Primary election | **Implemented** | Gossip KV tier (`kv:sqlite:primary`), lowest ordinal wins, TTL heartbeat |
-| KV store (single-node) | **Implemented** | RESP2 server (~30 Redis commands), TTL/expiry, DashMap-backed, SAPI bridge for zero-overhead PHP access |
+| KV store (single-node) | **Implemented** | RESP2 server (~65 Redis commands incl. SCAN and hash field TTLs), TTL/expiry, DashMap-backed, SAPI bridge (39 `ephpm_kv_*` functions) for zero-overhead PHP access |
 | KV store (clustering) | **Implemented** | Gossip discovery, `hash % nodes` key ownership, large-value replication (owner + N-1 replicas, async/sync, write-time only) |
 | KV compression | **Implemented** | gzip / zstd / brotli for stored values |
 | Clustering / gossip | **Implemented** | SWIM via `chitchat` in `ephpm-cluster` |
@@ -320,7 +320,7 @@ password = "changeme"                 # admin UI auth (separate from node API au
 - Single-node in-memory KV store using DashMap (lock-sharded concurrent hash map)
 - RESP2 protocol server accepting Redis-compatible clients
 - ~65 Redis commands across strings, keys (including `SCAN`), hashes (including per-field TTLs), and connection (see the [KV RESP Protocol reference](/reference/kv-resp/) for the full table). Lists, sets, transactions, scripting and pub/sub are **not** implemented.
-- **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`
+- **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_del_if_eq`, `ephpm_kv_exists`, `ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`, and since v0.13 the multi-key (`mget`/`mset`), compare-and-set (`set_if_eq`), `getdel`/`getex`/`persist`, `scan` and hash (`hset`, `hget`, `hmget`, `hgetall`, `hincr_by`, `hexpire`, ...) functions — see [KV from PHP](/guides/kv-from-php/#function-reference)
 - The same SAPI mechanism also carries the **embedded-database bridge** — `ephpm_db_query()` / `ephpm_db_execute()` (v0.6.3), documented in [Database from PHP](/guides/db-from-php/)
 - Hash store (separate DashMap) — `HGET` / `HSET` / `HGETALL` family
 - Transparent value compression — gzip / zstd / brotli, threshold-gated
