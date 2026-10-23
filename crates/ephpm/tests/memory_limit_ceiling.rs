@@ -69,7 +69,7 @@ impl Server {
         }
     }
 
-    fn get(&self, path: &str) -> (u16, String) {
+    fn try_get(&self, path: &str, timeout: Duration) -> Result<(u16, String), reqwest::Error> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -78,26 +78,30 @@ impl Server {
             .expect("tokio runtime");
         rt.block_on(async {
             let resp = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .build()
                 .expect("client")
                 .get(format!("http://127.0.0.1:{}{path}", self.port))
                 .send()
-                .await
-                .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+                .await?;
             let status = resp.status().as_u16();
-            (status, resp.text().await.expect("body"))
+            Ok((status, resp.text().await?))
         })
     }
 
-    /// `true` when the binary actually executes PHP.
+    fn get(&self, path: &str) -> (u16, String) {
+        self.try_get(path, Duration::from_secs(30)).unwrap_or_else(|e| panic!("GET {path}: {e}"))
+    }
+
+    /// `true` when the binary actually executes PHP. A stub build answers the
+    /// probe with something else, or (worker mode) not at all.
     fn php_is_linked(&self, probe: &str) -> bool {
-        let (_, body) = self.get(probe);
-        if body.contains("php-alive") {
-            true
-        } else {
-            eprintln!("binary is not PHP-linked (stub build) — skipping");
-            false
+        match self.try_get(probe, Duration::from_secs(10)) {
+            Ok((_, body)) if body.contains("php-alive") => true,
+            _ => {
+                eprintln!("binary is not PHP-linked (stub build) — skipping");
+                false
+            }
         }
     }
 }

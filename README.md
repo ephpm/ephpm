@@ -118,7 +118,9 @@ index_files = ["index.php", "index.html"]
 
 [php]
 mode = "per_request"
-memory_limit = "128M"
+memory_limit = "128M"         # per request; unset = autotuned (max 1024M) in serve
+memory_limit_max = "512M"     # ceiling on a script's ini_set('memory_limit', ...);
+                              # unset = memory_limit (raises above it are refused)
 max_execution_time = 30       # inner PHP deadline (default). Natively enforced
                               # on Linux ZTS builds (catchable fatal → HTTP 500,
                               # wall-clock, set_time_limit()-able); not enforced

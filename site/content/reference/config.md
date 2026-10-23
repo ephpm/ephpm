@@ -669,6 +669,16 @@ alt_svc_max_age = 86400
 
 ## `[php]`
 
+> **Upgrading to v0.13.1 — `memory_limit` changes.** An explicit
+> `[php] memory_limit` is now honoured in `ephpm serve` (configs that say
+> `"128M"`, including old `ephpm install` / Windows service configs, now really
+> get 128M per request instead of the autotuned value). A script's raise above
+> `memory_limit_max` — default: the starting `memory_limit` — is refused, so
+> WordPress admin's raise to `256M` fails under `memory_limit = "128M"`; set
+> `memory_limit_max = "512M"` to allow it. The autotuned limit is capped at
+> `1024M`. Each refused raise logs one WARN. See
+> [Upgrading to v0.13.1](/getting-started/install/#upgrading-to-v0131).
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_execution_time` | u32 (sec) | `30` | PHP `max_execution_time` per request (`0` = unlimited). Natively enforced on Linux ZTS builds (per-thread execution timers): exceeding it raises the catchable "Maximum execution time exceeded" fatal (HTTP 500, shutdown functions run, output flushed), is wall-clock (`sleep()` counts), and is overridable at runtime with `set_time_limit()`. `[server.timeouts] request` is the outer hard 504 backstop — keep this below it. Not natively enforced on macOS/Windows (no per-thread timers); there the request timeout is the only ceiling. |

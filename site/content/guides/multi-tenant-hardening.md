@@ -322,7 +322,13 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   node, single-site included. See
   [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
 - **PostgreSQL/PDO persistence** — see §3.
-- **`ini_set` of resource limits.** A tenant cannot raise `memory_limit` above
+- **`ini_set` of resource limits.** *Upgrading to v0.13.1:* runtime raises
+  above `memory_limit_max` are now refused, and an explicit
+  `[php] memory_limit` is now honoured in serve mode, so a server configured
+  with `memory_limit = "128M"` refuses WordPress admin's raise to `256M` — set
+  `memory_limit_max = "512M"` to allow it (one WARN is logged per refused
+  raise). See [Upgrading to v0.13.1](/getting-started/install/#upgrading-to-v0131).
+  A tenant cannot raise `memory_limit` above
   [`[php] memory_limit_max`](/reference/config/#php), which defaults to the
   `memory_limit` the server started with: `ini_set('memory_limit', '-1')` and
   any raise above the ceiling return `false` and leave the limit unchanged
