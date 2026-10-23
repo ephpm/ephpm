@@ -118,6 +118,16 @@ impl BackendConn for ScreenedConn {
         screen_sql(sql).map_err(|o| refuse(&o))?;
         self.inner.describe_columns(sql).await
     }
+
+    /// Named-lock operations carry no SQL to screen (the name is validated by
+    /// litewire's session layer); forward untouched so the connection keeps
+    /// its lock scope.
+    async fn user_lock(
+        &self,
+        op: &litewire::backend::user_lock::UserLockOp,
+    ) -> Result<litewire::backend::user_lock::UserLockReply, BackendError> {
+        self.inner.user_lock(op).await
+    }
 }
 
 #[litewire::async_trait]

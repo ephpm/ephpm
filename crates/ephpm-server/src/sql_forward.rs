@@ -163,6 +163,49 @@
 //! Connection-lifetime semantics (resolve-at-connect, and what an ownership
 //! move does to an open connection) are documented on
 //! [`crate::site_wire_auth`].
+//!
+//! # Named locks (`GET_LOCK()` & co.)
+//!
+//! MySQL's named locks are session state, so in this mode they must live
+//! where the site's sessions live: **on the owner**. A non-owner forwards each
+//! lock operation as a [`SqlRequest::Lock`] over the same pinned stream its
+//! statements use ([`RemoteProxyConn`] implements
+//! [`BackendConn::user_lock`] by forwarding), and the owner runs it on the
+//! stream's own backend connection — a connection the site registry scoped to
+//! the site's lock namespace ([`crate::site_backends`]). Two connections for
+//! one site therefore exclude each other wherever they landed: the owner's
+//! local `pdo_mysql` and bridge sessions and every forwarded stream share one
+//! lock table, keyed by site, on the owner.
+//!
+//! **Release is the stream's lifetime.** The owner-side connection — and with
+//! it the `LockSession` holding the locks — is dropped when the forwarding
+//! stream ends, on every path: the client's connection closed (its
+//! `RemoteProxyConn` drops the stream, which closes the channel connection),
+//! the client's node died (TCP keepalive / reset ends the stream), the
+//! [`OWNER_STREAM_IDLE_TIMEOUT`], or a transport error mid-reply. The client
+//! never has to send a release for a lock it can no longer release.
+//!
+//! **Ownership moves.** Ownership follows live membership, so it can move
+//! while locks are held. The locks do not move with it: the old owner's
+//! sessions keep theirs until they end, and the new owner starts with an empty
+//! table for the site. What keeps this from granting two holders is that the
+//! old owner **refuses the pinned stream** once it is no longer the owner — it
+//! re-checks HRW ownership before serving a request ([`OWNER_RECHECK_INTERVAL`]
+//! at most, and always before a lock operation), and on loss drops the
+//! stream's session (releasing its locks), answers with a connection-shaped
+//! refusal flagged `closed`, and ends the stream. The holder's next statement
+//! therefore fails loudly and it must reconnect, at which point it resolves the
+//! new owner, where the lock is free and must be taken again. The window this
+//! leaves is a holder that issues **no** statement across the move: it keeps
+//! believing it holds a lock the new owner can grant to someone else, until
+//! its next statement fails. Side effects it performs during that window
+//! outside the database are not protected — no lock survives its server, and
+//! the same is true of MySQL across a failover. Ownership moves only on
+//! membership change (a node joining or dying), not in steady state.
+//!
+//! An owner that dies takes every lock for the sites it owned with it, exactly
+//! as a MySQL server restart would; clients get a connection error on their
+//! next statement and re-resolve.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -173,6 +216,7 @@ use ephpm_cluster::{
     ChannelHandle, ChannelStream, ClusterHandle, IncomingStream, NodeInfo, hrw_owner,
 };
 use ephpm_php::db_bridge::SiteBackendResolver;
+use litewire::backend::user_lock::{LockTimeout, UserLockOp, UserLockReply};
 use litewire::backend::{
     Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, SharedBackend, Value,
 };
@@ -243,6 +287,14 @@ const CLIENT_STREAM_MAX_IDLE: Duration = Duration::from_secs(4 * 60);
 /// [`OWNER_STREAM_IDLE_TIMEOUT`]).
 const METRIC_FORWARD_TIMEOUTS: &str = "ephpm_sql_forward_timeouts_total";
 
+/// How long an owner may serve a pinned stream between two re-checks of its
+/// HRW ownership of the site. Ownership is gated at stream accept, but it can
+/// move while the stream is open (membership change); re-checking per
+/// request bounds how long a demoted owner keeps serving — and keeps granting
+/// named locks — to this interval. A lock operation is always re-checked (see
+/// the module docs, "Named locks").
+const OWNER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // Wire protocol (length-prefixed JSON, u32 BE length).
 // ---------------------------------------------------------------------------
@@ -303,16 +355,66 @@ impl From<WireColumn> for Column {
     }
 }
 
+/// Wire twin of litewire's [`UserLockOp`]. `timeout` carries MySQL's own
+/// convention (`< 0` forever, `0` one attempt, `> 0` seconds) so the message
+/// is self-describing and version-stable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WireLockOp {
+    Get { name: String, timeout: i64 },
+    Release { name: String },
+    ReleaseAll,
+    IsFree { name: String },
+    IsUsed { name: String },
+}
+
+impl From<&UserLockOp> for WireLockOp {
+    fn from(op: &UserLockOp) -> Self {
+        match op {
+            UserLockOp::Get { name, timeout } => Self::Get {
+                name: name.clone(),
+                timeout: match timeout {
+                    LockTimeout::Forever => -1,
+                    LockTimeout::Immediate => 0,
+                    LockTimeout::Wait(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+                },
+            },
+            UserLockOp::Release { name } => Self::Release { name: name.clone() },
+            UserLockOp::ReleaseAll => Self::ReleaseAll,
+            UserLockOp::IsFree { name } => Self::IsFree { name: name.clone() },
+            UserLockOp::IsUsed { name } => Self::IsUsed { name: name.clone() },
+        }
+    }
+}
+
+impl From<WireLockOp> for UserLockOp {
+    fn from(op: WireLockOp) -> Self {
+        match op {
+            WireLockOp::Get { name, timeout } => {
+                Self::Get { name, timeout: LockTimeout::from_seconds(timeout) }
+            }
+            WireLockOp::Release { name } => Self::Release { name },
+            WireLockOp::ReleaseAll => Self::ReleaseAll,
+            WireLockOp::IsFree { name } => Self::IsFree { name },
+            WireLockOp::IsUsed { name } => Self::IsUsed { name },
+        }
+    }
+}
+
 /// A forwarded statement. `Query` expects a rowset back, `Execute` an OK — the
 /// same split the litewire [`BackendConn`] trait draws, so the owner runs the
 /// matching method and transaction/`RETURNING` semantics are preserved.
+/// `Lock` is a named-lock operation (module docs, "Named locks"), run on the
+/// stream's owner-side connection and answered with [`SqlResponse::Lock`].
 ///
 /// `progress` asks the owner to send [`SqlResponse::Progress`] heartbeats
 /// while the statement runs. Mixed-version clusters: an owner that predates
 /// the field ignores it (serde skips unknown fields) and sends no heartbeats,
 /// so on such an owner a statement that runs longer than
 /// [`FORWARD_REPLY_TIMEOUT`] fails; and an old client never sets it, so a new
-/// owner never sends an old client a frame it cannot parse.
+/// owner never sends an old client a frame it cannot parse. An owner that
+/// predates `Lock` cannot parse it at all and ends the stream, which the
+/// client reports as a connection error — a `GET_LOCK` fails rather than
+/// pretends.
 #[derive(Debug, Serialize, Deserialize)]
 enum SqlRequest {
     Query {
@@ -327,19 +429,33 @@ enum SqlRequest {
         #[serde(default)]
         progress: bool,
     },
+    Lock {
+        op: WireLockOp,
+        #[serde(default)]
+        progress: bool,
+    },
 }
 
 impl SqlRequest {
+    /// The statement's SQL; empty for a lock operation (which touches no
+    /// transaction state).
     fn sql(&self) -> &str {
         match self {
             Self::Query { sql, .. } | Self::Execute { sql, .. } => sql,
+            Self::Lock { .. } => "",
         }
     }
 
     fn wants_progress(&self) -> bool {
         match self {
-            Self::Query { progress, .. } | Self::Execute { progress, .. } => *progress,
+            Self::Query { progress, .. }
+            | Self::Execute { progress, .. }
+            | Self::Lock { progress, .. } => *progress,
         }
+    }
+
+    fn is_lock(&self) -> bool {
+        matches!(self, Self::Lock { .. })
     }
 }
 
@@ -373,6 +489,11 @@ enum SqlResponse {
     /// whose request asked for it (`progress: true`) runs. Not a reply: the
     /// client keeps reading. Only ever sent to a client that asked.
     Progress,
+    /// The answer to a [`SqlRequest::Lock`]: the integer MySQL would return,
+    /// or `None` for `NULL`.
+    Lock {
+        value: Option<i64>,
+    },
 }
 
 async fn write_msg<W: AsyncWriteExt + Unpin, T: Serialize>(
@@ -579,7 +700,9 @@ impl RemoteProxyConn {
                     // it): forget it so the next statement re-dials rather
                     // than failing on a closed stream.
                     SqlResponse::Error { closed: true, .. } => *guard = None,
-                    SqlResponse::Error { .. } | SqlResponse::Progress => {}
+                    SqlResponse::Error { .. }
+                    | SqlResponse::Progress
+                    | SqlResponse::Lock { .. } => {}
                     SqlResponse::Rows { .. } | SqlResponse::Ok { .. } => {
                         if let Some(open_now) = transaction_effect(req.sql()) {
                             open.in_transaction = open_now;
@@ -659,10 +782,29 @@ impl BackendConn for RemoteProxyConn {
                 rows: rows.into_iter().map(|r| r.into_iter().map(Value::from).collect()).collect(),
             }),
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
-            SqlResponse::Ok { .. } => Err(BackendError::Other(
-                "site owner returned an OK to a forwarded query".to_string(),
+            SqlResponse::Ok { .. } | SqlResponse::Lock { .. } => Err(BackendError::Other(
+                "site owner returned a non-rowset reply to a forwarded query".to_string(),
             )),
             // exchange() consumes heartbeats; this arm exists for exhaustiveness.
+            SqlResponse::Progress => Err(BackendError::Other(
+                "site owner sent a stray heartbeat in place of a reply".to_string(),
+            )),
+        }
+    }
+
+    /// Forward a named-lock operation to the owner, where it runs on this
+    /// stream's own connection — so the lock is held by, and released with,
+    /// the owner-side session this stream pins (module docs, "Named locks").
+    /// A transport failure is an error, never a `0`/`NULL`: the caller must
+    /// not mistake "could not ask" for "not granted".
+    async fn user_lock(&self, op: &UserLockOp) -> Result<UserLockReply, BackendError> {
+        let req = SqlRequest::Lock { op: WireLockOp::from(op), progress: true };
+        match self.forward(&req).await? {
+            SqlResponse::Lock { value } => Ok(value),
+            SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
+            SqlResponse::Rows { .. } | SqlResponse::Ok { .. } => Err(BackendError::Other(
+                "site owner returned a statement reply to a forwarded lock operation".to_string(),
+            )),
             SqlResponse::Progress => Err(BackendError::Other(
                 "site owner sent a stray heartbeat in place of a reply".to_string(),
             )),
@@ -680,8 +822,8 @@ impl BackendConn for RemoteProxyConn {
                 Ok(ExecuteResult { affected_rows, last_insert_rowid })
             }
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
-            SqlResponse::Rows { .. } => Err(BackendError::Other(
-                "site owner returned rows to a forwarded execute".to_string(),
+            SqlResponse::Rows { .. } | SqlResponse::Lock { .. } => Err(BackendError::Other(
+                "site owner returned a non-OK reply to a forwarded execute".to_string(),
             )),
             // exchange() consumes heartbeats; this arm exists for exhaustiveness.
             SqlResponse::Progress => Err(BackendError::Other(
@@ -1064,7 +1206,30 @@ async fn serve_forwarded_sql(
     }
 
     tracing::debug!(peer = %peer, site = %site, "forwarded-SQL: serving owner session");
-    serve_owner_statements(&mut stream, registry, site).await
+    let ownership = OwnershipCheck { cluster, self_id, site };
+    serve_owner_statements(&mut stream, registry, site, Some(&ownership)).await
+}
+
+/// What [`serve_owner_statements`] needs to re-check, while a stream is open,
+/// that this node still owns the site it is serving.
+struct OwnershipCheck<'a> {
+    cluster: &'a ClusterHandle,
+    self_id: &'a str,
+    site: &'a str,
+}
+
+impl OwnershipCheck<'_> {
+    /// Is this node the site's HRW owner right now?
+    async fn still_owner(&self) -> bool {
+        let nodes = self.cluster.nodes().await;
+        hrw_owner(&nodes, self.site).is_some_and(|n| n.id == *self.self_id)
+    }
+}
+
+/// Whether a request on an open stream must re-verify ownership first: always
+/// for a lock operation, otherwise once per [`OWNER_RECHECK_INTERVAL`].
+fn ownership_recheck_due(req: &SqlRequest, last_checked: Instant) -> bool {
+    req.is_lock() || last_checked.elapsed() >= OWNER_RECHECK_INTERVAL
 }
 
 /// How long a refused stream waits for the client's first request before
@@ -1116,16 +1281,30 @@ where
 /// [`SqlResponse::Progress`] heartbeat goes out every [`PROGRESS_INTERVAL`],
 /// which is what lets the client bound its wait on a *silent* owner without
 /// bounding how long a statement may legitimately take.
+///
+/// # Ownership is re-checked while the stream is open
+///
+/// The accept-time HRW gate in [`serve_forwarded_sql`] admits the stream; this
+/// loop re-verifies it (`ownership`, when given) at most every
+/// [`OWNER_RECHECK_INTERVAL`] and before **every** lock operation. A node that
+/// has lost the site refuses the request with a connection-shaped error
+/// flagged `closed`, drops the session — releasing the named locks it held and
+/// any open transaction — and ends the stream, so the client re-resolves the
+/// site's current owner. This is what makes "the pinned old owner refuses"
+/// true at statement granularity, which the named-lock semantics rely on (see
+/// the module docs).
 async fn serve_owner_statements<S>(
     stream: &mut S,
     registry: &SiteBackends,
     site: &str,
+    ownership: Option<&OwnershipCheck<'_>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let mut backend: Option<SharedBackend> = None;
     let mut conn: Option<Box<dyn BackendConn>> = None;
+    let mut ownership_checked = Instant::now();
     loop {
         let req: SqlRequest =
             match tokio::time::timeout(OWNER_STREAM_IDLE_TIMEOUT, read_msg(stream)).await {
@@ -1146,6 +1325,37 @@ where
                     break;
                 }
             };
+        if let Some(check) = ownership
+            && ownership_recheck_due(&req, ownership_checked)
+        {
+            if !check.still_owner().await {
+                tracing::warn!(
+                    site = %site,
+                    session_open = conn.is_some(),
+                    "forwarded-SQL: ownership of the site moved away while a stream was pinned \
+                     here; refusing the request and dropping the stream's session (its named \
+                     locks and any open transaction are released)"
+                );
+                // Session before the pin (see the end of the loop).
+                drop(conn.take());
+                drop(backend.take());
+                let _ = write_msg(
+                    stream,
+                    &SqlResponse::Error {
+                        sqlite: false,
+                        message: format!(
+                            "connection refused by node {}: it is no longer the owner of site \
+                             {site} (ownership moved); reconnect to reach the current owner",
+                            check.self_id
+                        ),
+                        closed: true,
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            ownership_checked = Instant::now();
+        }
         let progress = req.wants_progress();
         let resp = match open_owner_session(registry, site, &mut backend, &mut conn).await {
             Ok(session) if progress => execute_with_progress(stream, session, req).await?,
@@ -1224,6 +1434,13 @@ async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlRespon
                 Err(e) => error_response(&e),
             }
         }
+        // On the stream's own connection, which the site registry scoped to
+        // the site's lock namespace: the lock is held by this session and
+        // released when the stream ends.
+        SqlRequest::Lock { op, .. } => match conn.user_lock(&UserLockOp::from(op)).await {
+            Ok(value) => SqlResponse::Lock { value },
+            Err(e) => error_response(&e),
+        },
     }
 }
 
@@ -1497,7 +1714,7 @@ mod tests {
                 assert_eq!(params.len(), 3);
                 assert!(matches!(params[1], WireValue::Blob(ref bytes) if bytes == &[0, 1, 255]));
             }
-            SqlRequest::Query { .. } => panic!("expected Execute"),
+            SqlRequest::Query { .. } | SqlRequest::Lock { .. } => panic!("expected Execute"),
         }
 
         let resp = SqlResponse::Rows {
@@ -1566,6 +1783,50 @@ mod tests {
 
     fn query(sql: &str) -> SqlRequest {
         SqlRequest::Query { sql: sql.into(), params: vec![], progress: true }
+    }
+
+    /// A lock operation round-trips with MySQL's timeout convention intact,
+    /// and its reply distinguishes `NULL` from an integer.
+    #[tokio::test]
+    async fn lock_request_and_reply_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        for (op, secs) in [
+            (UserLockOp::Get { name: "job".into(), timeout: LockTimeout::Forever }, -1),
+            (UserLockOp::Get { name: "job".into(), timeout: LockTimeout::Immediate }, 0),
+            (
+                UserLockOp::Get {
+                    name: "job".into(),
+                    timeout: LockTimeout::Wait(Duration::from_secs(7)),
+                },
+                7,
+            ),
+        ] {
+            let req = SqlRequest::Lock { op: WireLockOp::from(&op), progress: true };
+            assert!(req.is_lock());
+            assert_eq!(req.sql(), "", "a lock op has no SQL and no transaction effect");
+            assert_eq!(transaction_effect(req.sql()), None);
+            write_msg(&mut a, &req).await.unwrap();
+            let got: SqlRequest = read_msg(&mut b).await.unwrap();
+            let SqlRequest::Lock { op: wire, progress } = got else { panic!("expected Lock") };
+            assert!(progress);
+            assert!(matches!(&wire, WireLockOp::Get { timeout, .. } if *timeout == secs));
+            assert_eq!(UserLockOp::from(wire), op);
+        }
+        for value in [Some(1), Some(0), None] {
+            write_msg(&mut a, &SqlResponse::Lock { value }).await.unwrap();
+            let got: SqlResponse = read_msg(&mut b).await.unwrap();
+            assert!(matches!(got, SqlResponse::Lock { value: v } if v == value));
+        }
+    }
+
+    /// A lock operation always re-checks ownership; statements do so once per
+    /// interval.
+    #[test]
+    fn lock_operations_always_recheck_ownership() {
+        let lock = SqlRequest::Lock { op: WireLockOp::ReleaseAll, progress: false };
+        assert!(ownership_recheck_due(&lock, Instant::now()));
+        assert!(!ownership_recheck_due(&query("SELECT 1"), Instant::now()));
+        assert!(ownership_recheck_due(&query("SELECT 1"), Instant::now() - OWNER_RECHECK_INTERVAL));
     }
 
     fn execute(sql: &str) -> SqlRequest {
@@ -1800,7 +2061,7 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let started = Instant::now();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &registry, "s1").await.unwrap();
+            serve_owner_statements(&mut owner, &registry, "s1", None).await.unwrap();
             owner
         });
         let owner = served.await.unwrap();
@@ -1825,7 +2086,7 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let owner_registry = registry.clone();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &owner_registry, "s1").await.unwrap();
+            serve_owner_statements(&mut owner, &owner_registry, "s1", None).await.unwrap();
         });
 
         for sql in ["CREATE TABLE t (x INTEGER)", "BEGIN", "INSERT INTO t VALUES (1)"] {
