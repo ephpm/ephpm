@@ -74,7 +74,7 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 | `ephpm_kv_getdel(string $key)` | `?string` | Returns the value and deletes the key, as one atomic step. *v0.13+* |
 | `ephpm_kv_getex(string $key, int $ttl)` | `?string` | Returns the value and sets its TTL: `$ttl > 0` seconds, `0` removes the TTL. `null` (nothing changed) if missing; a negative `$ttl` warns and returns `null`. *v0.13+* |
 | `ephpm_kv_set_if_eq(string $key, string $expected, string $value, int $ttl = 0)` | `bool` | Compare-and-set — see [Extending a lock](#extending-a-lock-ephpm-kv-set-if-eq). `$ttl`: `> 0` new TTL, `0` none, `-1` keep the current one. *v0.13+* |
-| `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. *v0.13+* |
+| `ephpm_kv_append(string $key, string $value)` | `int\|false` | New length. Creates the key if missing. In a cluster, returns `false` (and logs a warning once) on a node that has no copy of a large value held by other nodes, rather than replacing that value with the appended bytes — see [`APPEND`](/reference/kv-resp/#commands). *v0.13+* |
 | `ephpm_kv_strlen(string $key)` | `int` | Length of the value, `0` if missing. Node-local in a cluster (see [Iterating keys](#iterating-keys-ephpm-kv-scan)). *v0.13+* |
 | `ephpm_kv_type(string $key)` | `string` | `"string"`, `"hash"` or `"none"`. Node-local in a cluster, like `strlen`. *v0.13+* |
 | `ephpm_kv_scan(int $cursor, ?string $match = null, int $count = 10)` | `array\|false` | One step of a key scan: `[int $next_cursor, array $keys]` — see [Iterating keys](#iterating-keys-ephpm-kv-scan). *v0.13+* |
