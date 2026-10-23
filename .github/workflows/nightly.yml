@@ -23,6 +23,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # nextest filter for the PHP-linked test runs below. The ephpm-db
+  # integration binaries need real MySQL/PostgreSQL backends (*_TEST_URL),
+  # which only db-integration.yml provisions. Here they either refused to
+  # skip (macOS, where CI is set) or passed vacuously (Linux, inside
+  # `docker run`), so exclude them and let nextest count them as skipped.
+  LINKED_TEST_FILTER: >-
+    not (package(ephpm-db) & binary(/^(caching_sha2_auth|pg_proxy_integration|proxy_integration)$/))
 
 jobs:
   # -- 1. Full release builds ------------------------------------------------
@@ -142,6 +149,7 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_BUILD_JOBS="${{ matrix.arch.test_jobs }}" \
             -e CARGO_PROFILE_DEV_DEBUG="${{ matrix.arch.test_debug }}" \
+            -e LINKED_TEST_FILTER \
             "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
             bash -uo pipefail -c '
               # Linux SDK cache dirs carry the -gnu libc suffix (see
@@ -150,7 +158,8 @@ jobs:
               test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
               PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
                 --target ${{ matrix.arch.triple }} \
-                --workspace --run-ignored all --no-fail-fast 2>&1 | tee linked-tests.log
+                --workspace --run-ignored all --no-fail-fast \
+                -E "$LINKED_TEST_FILTER" 2>&1 | tee linked-tests.log
             '
 
       - name: Report PHP-linked tests
@@ -271,7 +280,7 @@ jobs:
           PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-macos-aarch64' | head -1)
           test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
           PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored all --no-fail-fast \
-            2>&1 | tee linked-tests.log
+            -E "$LINKED_TEST_FILTER" 2>&1 | tee linked-tests.log
 
       - name: Report PHP-linked tests
         if: always()
