@@ -29,7 +29,14 @@ mode = "local"
 path = "{DATA_DIR}/kv"
 identity = "e2e-node"
 load_timeout = "20s"
+
+[server.diagnostics]
+token = "e2e-diag-token"
 "#;
+
+/// `[server.diagnostics] token` from [`SNAPSHOT_CONFIG`]: the save/load
+/// `POST`s need it on every node, single-site included.
+const DIAG_TOKEN: &str = "e2e-diag-token";
 
 fn resolve_docroot() -> PathBuf {
     if let Some(dir) = std::env::var_os("EPHPM_DOCROOT") {
@@ -49,7 +56,14 @@ async fn kv(base_url: &str, query: &str) -> String {
 
 async fn snapshot_status(base_url: &str) -> serde_json::Value {
     let url = format!("{base_url}/_ephpm/kv/snapshot");
-    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    // With a diagnostics token configured, the status needs it too (the
+    // `/_ephpm/requests` rule).
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(DIAG_TOKEN)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     assert_eq!(resp.status().as_u16(), 200, "GET {url}");
     resp.json().await.expect("status JSON")
 }
@@ -80,11 +94,23 @@ async fn keys_survive_a_graceful_restart_with_their_ttls() {
     assert_eq!(kv(&base, "op=incr&key=snap:counter").await, "1");
     assert_eq!(kv(&base, "op=incr&key=snap:counter").await, "2");
 
+    // The save is a state-changing call: without the diagnostics token it is
+    // refused even on this single-site node, and nothing is written.
+    for path in ["/_ephpm/kv/snapshot", "/_ephpm/kv/snapshot/load"] {
+        let resp = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .send()
+            .await
+            .expect("unauthenticated POST");
+        assert_eq!(resp.status().as_u16(), 401, "POST {path} without the token");
+    }
+
     // Save on demand through the control endpoint: a snapshot while serving
     // must be allowed, and the restart below must overwrite it with a newer
     // one that also carries the key written after it.
     let resp = reqwest::Client::new()
         .post(format!("{base}/_ephpm/kv/snapshot"))
+        .bearer_auth(DIAG_TOKEN)
         .send()
         .await
         .expect("POST snapshot");

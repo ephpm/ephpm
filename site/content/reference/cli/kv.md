@@ -123,7 +123,7 @@ All three exit `0`.
 
 ### `snapshot`
 
-Warm-restart snapshot operations ([`[kv.snapshot]`](/reference/config/#kvsnapshot)). These do **not** use the RESP listener, so `--host`/`--port`/`--password`/`--user` do not apply: the file subcommands read a snapshot directly, and the server subcommands call the running server's `/_ephpm/kv/snapshot` [control endpoint](/reference/http-endpoints/#server-owned-paths), which is gated like `/_ephpm/requests` (`[server.diagnostics] allow`/`token`; a token is mandatory on a multi-site server).
+Warm-restart snapshot operations ([`[kv.snapshot]`](/reference/config/#kvsnapshot)). These do **not** use the RESP listener, so `--host`/`--port`/`--password`/`--user` do not apply: the file subcommands read a snapshot directly, and the server subcommands call the running server's `/_ephpm/kv/snapshot` [control endpoint](/reference/http-endpoints/#server-owned-paths). `status` is gated like `/_ephpm/requests` (`[server.diagnostics] allow`/`token`; a token is mandatory on a multi-site server). `save` and `load` change the live store, so they need `[server.diagnostics] token` on **every** server, single-site included — without one configured the server refuses them with `403`.
 
 ```bash
 ephpm kv snapshot inspect <FILE|s3://bucket/key> [--config PATH] [--json]
@@ -169,7 +169,7 @@ web-1                                          47990112 2026-10-22T14:02:58.000Z
 
 **`rm <IDENTITY> --config PATH`** deletes one snapshot (object or file) by identity; exits `1` when there is none.
 
-**`save`**, **`load`**, **`status`** talk to a running server. `--url` is the server's base URL (`http://127.0.0.1:8080`); with `--config` instead, the URL is derived from `[server] listen` (an unspecified bind such as `0.0.0.0` becomes `127.0.0.1`) and the token from `[server.diagnostics] token`. `save` asks the server to write its snapshot now and prints the report; `load` asks it to load the configured snapshot into the live store; `status` prints the status document (file, last save, last load).
+**`save`**, **`load`**, **`status`** talk to a running server. `--url` is the server's base URL (`http://127.0.0.1:8080`); with `--config` instead, the URL is derived from `[server.metrics] listen` when that is set (the controls move to the metrics listener with the other diagnostics; `https://` when it has `tls_cert`), else from `[server] listen` (an unspecified bind such as `0.0.0.0` becomes `127.0.0.1`), and the token from `[server.diagnostics] token`. The CLI presents no client certificate, so against an mTLS metrics listener use the token. `save` asks the server to write its snapshot now and prints the report; `load` asks it to load the configured snapshot into the live store; `status` prints the status document (file, last save, last load).
 
 ```bash
 ephpm kv snapshot save --config /etc/ephpm/ephpm.toml

@@ -575,7 +575,10 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // whole process to the unprivileged uid (if configured) before we accept a
     // single request. No PHP has run yet, so no request-carrying thread can
     // race the process-wide credential change.
-    privdrop::drop_privileges(&config).context("failed to drop privileges")?;
+    // The KV snapshot directory (and the staging dir in object mode) is
+    // written by the periodic and shutdown saves, i.e. after the drop.
+    let snapshot_paths = kv_snapshot.as_ref().map(|svc| svc.runtime_paths()).unwrap_or_default();
+    privdrop::drop_privileges(&config, &snapshot_paths).context("failed to drop privileges")?;
 
     // Peer warm-up: pull this node's share of large KV values from its
     // peers — a join wait of up to 10 s for gossip to list a peer (not

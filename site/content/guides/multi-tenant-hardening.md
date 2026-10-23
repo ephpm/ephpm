@@ -316,7 +316,10 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   either is unconfigured. The limit: the token is a shared secret. A tenant
   that can read the config file, or the environment variable it came from, can
   use it. Keep it out of anything tenant PHP can read; `open_basedir` (§1) is
-  what stops tenant PHP reading the config file. See
+  what stops tenant PHP reading the config file. The KV snapshot controls
+  (`/_ephpm/kv/snapshot[/load]`, node-wide like the others) follow the same
+  rule, and their state-changing `POST`s need the diagnostics token on every
+  node, single-site included. See
   [access to internal endpoints](/reference/config/#access-to-internal-endpoints).
 - **PostgreSQL/PDO persistence** — see §3.
 - **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`

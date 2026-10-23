@@ -135,7 +135,12 @@ leaves a temporary file the next start removes. A write that would exceed
 
 The server writes at graceful shutdown (after the HTTP drain, so the file
 reflects the last request served), every `interval` if set, and on `POST
-/_ephpm/kv/snapshot`. Saves are serialised; the shutdown save is not bounded
+/_ephpm/kv/snapshot`. That `POST` and `POST /_ephpm/kv/snapshot/load` change
+the live store (a load rolls every key in the snapshot back to its snapshot
+value), so unlike the read-only status they require a credential —
+`[server.diagnostics] token`, or a verified mTLS client certificate on
+`[server.metrics] listen` — on every node, single-site included, and are
+refused `403` without one. Saves are serialised; the shutdown save is not bounded
 by `[server.timeouts] shutdown` — that budget is for draining — but by its
 own last-resort five minutes. All of it runs on blocking threads, never on a
 tokio worker, for the same reason the engine work in `db_shutdown` does.
@@ -193,7 +198,10 @@ The file format is identical — the object *is* the file — so `inspect` and
 bucket holds ciphertext sealed under `[kv] secret`, and the bucket's own
 server-side encryption, if any, is a second layer, not the first.
 
-A save writes the file to a staging directory, uploads it as one streamed
+A save writes the file to a staging directory (`[kv.snapshot] path`, or —
+when unset — a fresh private `0700` directory per process under the system
+temp dir, never a predictable shared name another local user could pre-create
+or symlink before startup), uploads it as one streamed
 `PutObject` (never held in memory; the single-PUT limit is 5 GiB, far above
 any `max_size` worth loading at startup) and deletes the staging copy. A
 load downloads the object to the staging file, loads it and deletes it; the

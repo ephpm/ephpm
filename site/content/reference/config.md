@@ -228,7 +228,7 @@ are escaped and cannot inject forged log lines.
 | `allow` | array of strings | `[]` (allow all) | IP ACL allowlist: client addresses (CIDR, or a bare IP for one host) allowed to read the metrics endpoint. Empty allows every address. Clients outside the list get `403`. An invalid entry fails startup. Limits network exposure only. See [access to internal endpoints](#access-to-internal-endpoints). |
 | `deny` | array of strings | `[]` | IP ACL denylist (CIDR or bare IP). A match gets `403`, even when `allow` also matches: deny wins. An invalid entry fails startup. |
 | `token` | string | (none) | Bearer token. When set, a scrape must send `Authorization: Bearer <token>` or get `401`. **Required on a multi-site node** (`sites_dir` set) unless the mTLS listener below is used; without it the endpoint answers `403`. Must not be empty. Env override: `EPHPM_SERVER__METRICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
-| `listen` | string | (none) | Serve the metrics endpoint **and** `/_ephpm/requests` on this separate `IP:port` (e.g. `"127.0.0.1:9100"`) instead of the main listener. When set, the main listener no longer answers either one: the metrics path becomes an ordinary application path there, and `/_ephpm/requests` answers `404` naming this key. Health, readiness and primary probes stay on the main listener. The ACL and token still apply. A bind failure fails startup. |
+| `listen` | string | (none) | Serve the metrics endpoint, `/_ephpm/requests` **and** the KV snapshot controls (`/_ephpm/kv/snapshot[/load]`) on this separate `IP:port` (e.g. `"127.0.0.1:9100"`) instead of the main listener. When set, the main listener no longer answers them: the metrics path becomes an ordinary application path there, and the `/_ephpm/` ones answer `404` naming this key. Health, readiness and primary probes stay on the main listener. The ACL and token still apply. A bind failure fails startup. |
 | `tls_cert` / `tls_key` | path | (none) | PEM certificate chain and key, which serve the `listen` listener over HTTPS. They must be set together, and both require `listen`. |
 | `client_ca` | path | (none) | PEM CA bundle for **mutual TLS** on the `listen` listener. Every client must present a certificate signed by one of these CAs, or the TLS handshake fails. Requires `tls_cert`/`tls_key`. A verified client certificate counts as the credential a multi-site node requires. Any certificate that chains to this bundle is accepted, so use a CA dedicated to scrapers, not one that also signs tenant or cluster certificates. |
 
@@ -246,8 +246,11 @@ are escaped and cannot inject forged log lines.
 >    [Scraping with Prometheus](/reference/metrics/#scraping-with-prometheus).
 >
 > An mTLS `[server.metrics] listen` also works instead of a token.
-> Single-site nodes are unaffected: the IP ACL defaults to open and no token
-> is required.
+> Single-site nodes are unaffected for these two read endpoints: the IP ACL
+> defaults to open and no token is required. The KV snapshot **write**
+> controls (`POST /_ephpm/kv/snapshot`, `POST /_ephpm/kv/snapshot/load`) are
+> different — they need `[server.diagnostics] token` (or mTLS) on **every**
+> node, single-site included; see [state-changing endpoints](#state-changing-endpoints-kv-snapshot-controls).
 
 `/metrics` and `/_ephpm/*` are answered **before** `trusted_hosts`,
 `blocked_paths`, site resolution and middleware, because Kubernetes probes and
@@ -292,6 +295,29 @@ ERROR. The server still starts. Refusing to start would take every tenant's
 site offline over an observability setting, while the 403 already keeps the
 data in. `ephpm dev` is exempt, because all of its sites belong to the
 developer.
+
+#### State-changing endpoints: KV snapshot controls
+
+`POST /_ephpm/kv/snapshot` (write a snapshot now) and
+`POST /_ephpm/kv/snapshot/load` (load the snapshot **over** the live store —
+every key in it is rolled back to its snapshot value: sessions, lock tokens,
+rate-limit windows) are writes, not reads. An open default is not acceptable
+for them, so they need a **credential on every node**, single-site included,
+and `ephpm dev` does not lift it:
+
+- `[server.diagnostics] token`, sent as `Authorization: Bearer <token>`, or
+- a client certificate verified by an mTLS `[server.metrics] listen`.
+
+With neither configured they answer `403` naming the setting — fail closed.
+Periodic (`interval`) and shutdown (`on_shutdown`) saves do not go through
+HTTP and are unaffected. The `[server.diagnostics]` IP ACL applies on top.
+The read-only `GET /_ephpm/kv/snapshot` status keeps the `/_ephpm/requests`
+rules (open on single-site by default, credential on multi-site). A tenant's
+own credentials (`DB_PASSWORD`, its KV password) are derived from `[kv]
+secret`, not from this token, and are refused. With `[server.metrics] listen`
+set, all three move to that listener with the other diagnostics (the main
+listener answers `404` naming the key), so a private mTLS port leaves no
+public write path.
 
 The probes `/_ephpm/health`, `/_ephpm/ready` and `/_ephpm/primary` are never
 restricted, in either mode. Load balancers and kubelets send no credentials,
@@ -357,9 +383,11 @@ instead (see the table) — it still never reaches the application.
 | `/_ephpm/ready` | GET | `200`/`503` — readiness (PHP initialized, workers booted, DB proxies connected). Open to every client; the DB upstream address in a `503` reason is shown only to clients the `[server.diagnostics]` IP ACL admits (everyone by default). |
 | `/_ephpm/primary` | GET | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a clustered-SQLite replica. Open to every client. |
 | `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. Subject to `[server.diagnostics]` `allow`/`deny`/`token` (`403`/`401`); requires a token on a multi-site node; moves to the metrics listener when `[server.metrics] listen` is set — see [access to internal endpoints](#access-to-internal-endpoints). |
+| `/_ephpm/kv/snapshot` | GET, POST | KV snapshot status (`GET`) / save now (`POST`); `404` naming `[kv.snapshot] mode` when snapshots are off. `GET` follows the `/_ephpm/requests` rules; `POST` needs `[server.diagnostics] token` (or mTLS) on every node. Moves to the metrics listener with `[server.metrics] listen` — see [state-changing endpoints](#state-changing-endpoints-kv-snapshot-controls). |
+| `/_ephpm/kv/snapshot/load` | POST | Load the snapshot into the live store now. Same credential rule as `POST /_ephpm/kv/snapshot`. |
 | `/_ephpm/auth/…` | any | **Carved out for auth middleware.** Not answered by the server directly: after `trusted_hosts` and vhost resolution it is handed to the global `[[middleware]]` request-phase chain, so an auth module (e.g. the `github-auth` issuer's `/_ephpm/auth/github/login` and `/callback`) can serve it. If no mounted module responds, or no chain is mounted, the answer is `404`. It never reaches your application, and a per-site `[preview_auth]` gate is not run on it. |
 | any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
-| any of the above except `/_ephpm/auth/…` | not GET | `405` with `Allow: GET`. |
+| any of the above except `/_ephpm/auth/…` | not an allowed method | `405` with `Allow` naming the allowed method(s) — `GET` for all but the two snapshot paths (`GET, POST` / `POST`), whose access check runs before the method check. |
 
 These endpoints (all but `/_ephpm/auth/…`) answer for every `Host`, ahead of
 `trusted_hosts`, `blocked_paths` and middleware. The probes need no
@@ -381,7 +409,7 @@ itself. Pointing `path` *into* `/_ephpm/` works — metrics are matched first.
 | `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"`. The transport is chosen by `OTEL_EXPORTER_OTLP_PROTOCOL` — **http/protobuf** by default (`/v1/traces` appended when missing, conventional port 4318) or **grpc** (used as-is, no path appended, conventional port 4317). Exports one `http.request` **server** span per request (attrs: `http.request.method`, `url.path`, `http.response.status_code`, plus `error.type` on a 5xx and `ephpm.site` in multi-site mode) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. A 5xx sets the span status to `ERROR`; a 4xx does not, per OTel HTTP semantic conventions for server spans. Requires a binary built with the `otlp` cargo feature. **Official release binaries and the Docker image have it** (`cargo xtask release` builds with it); a plain `cargo build` does not, and there a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs (verified — thread count is identical to a binary without the feature). Both `http://` and `https://` endpoints are supported on both transports — see the notes below. |
 | `allow` | array of strings | `[]` (allow all) | IP ACL allowlist for `/_ephpm/requests` (others get `403`). Also decides who sees the DB upstream address in a `503` `/_ephpm/ready` body. Same syntax as `[server.metrics] allow`; empty allows everyone. Never restricts the probe status. See [access to internal endpoints](#access-to-internal-endpoints). |
 | `deny` | array of strings | `[]` | IP ACL denylist for `/_ephpm/requests`; deny wins over allow. |
-| `token` | string | (none) | Bearer token for `/_ephpm/requests` (`401` without it). **Required on a multi-site node**, unless the timeline is served on an mTLS `[server.metrics] listen`. Not required by the probes. Must not be empty. Env override: `EPHPM_SERVER__DIAGNOSTICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
+| `token` | string | (none) | Bearer token for `/_ephpm/requests` and the KV snapshot controls (`401` without it). **Required on a multi-site node**, unless the timeline is served on an mTLS `[server.metrics] listen`. **Required on every node for `POST /_ephpm/kv/snapshot` and `POST /_ephpm/kv/snapshot/load`** (`ephpm kv snapshot save`/`load`): unset, those answer `403` — see [state-changing endpoints](#state-changing-endpoints-kv-snapshot-controls). Not required by the probes. Must not be empty. Env override: `EPHPM_SERVER__DIAGNOSTICS__TOKEN`, but on a multi-site node set it in the config file instead: tenant PHP shares the process environment (`getenv()`), and startup warns. |
 | `otlp_protocol` | string | (none → `http/protobuf`) | OTLP wire protocol for `otlp_endpoint`: `"grpc"` or `"http/protobuf"`. `"http/json"` is rejected at startup. The standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` env vars take precedence over this knob. Setting it without an endpoint logs a startup warning and does nothing. Env override: `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`. |
 
 **OTLP transport selection.** `OTEL_EXPORTER_OTLP_PROTOCOL` (or
@@ -1087,7 +1115,7 @@ Warm-restart snapshots: an encrypted copy of every live key (default store and e
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mode` | string | `"off"` | `off`, `local` (a file under `path`) or `object` (an S3-compatible object, see `url`). Any other value fails startup naming the three. Both modes **require `[kv] secret`** — every snapshot is sealed with a key derived from it (HKDF-SHA256 + ChaCha20-Poly1305 per block); there is no plaintext mode, since a snapshot holds every site's keys and sessions. Changing the secret makes existing snapshots unreadable: the next start is cold, logged at WARN with reason `wrong_key`. |
-| `path` | string | (none) | `local`: directory the snapshot lives in; **required**, created at startup if missing. The file is `<path>/<identity>.kvsnap`, written beside it as `.<identity>.kvsnap.tmp-<pid>-<n>` and renamed into place, so a reader only ever sees a complete file. Leftover temporary files are removed at startup. `object`: optional staging directory for the file while it is being uploaded or after it is downloaded (default: `ephpm-kv-snapshot` under the system temp dir); the staging copy is deleted after each save and load. |
+| `path` | string | (none) | `local`: directory the snapshot lives in; **required**, created at startup if missing. The file is `<path>/<identity>.kvsnap`, written beside it as `.<identity>.kvsnap.tmp-<pid>-<n>` and renamed into place, so a reader only ever sees a complete file. Leftover temporary files are removed at startup. `object`: optional staging directory for the file while it is being uploaded or after it is downloaded. Unset, each process creates a fresh private directory under the system temp dir (`ephpm-kv-snapshot-<pid>-<random>`, mode `0700` on Unix, removed when the server stops) — never a predictable shared path another local user could pre-create or symlink. The staging copy is deleted after each save and load. With `[server] run_as_user`, the snapshot/staging directory is handed to that user before the privilege drop. |
 | `identity` | string | (derived) | File-name stem (or object name) of this instance's snapshot. Defaults to `[cluster] node_id` when set, else the host name — stable for a VM, a systemd unit or a Kubernetes StatefulSet pod. A Deployment pod's host name is random, so set this explicitly there; every replica may share one identity (the last writer's snapshot is the one a replacement loads). Must be a plain name (no `/`, `\`). |
 | `url` | string | (none) | `object`: `s3://<bucket>[/<prefix>]` — **required** in object mode, refused in any other. The object is `<prefix>/<identity>.kvsnap`. Credentials come from the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) environment variables, never from this file; **startup fails when they are unset**. Instance-profile / IRSA credential providers are not implemented. |
 | `endpoint` | string | (AWS S3) | `object`: the S3-compatible endpoint origin — `https://<account>.r2.cloudflarestorage.com`, `http://minio.internal:9000`, `https://storage.googleapis.com`. Default `https://s3.<region>.amazonaws.com`. Must carry a scheme. |
@@ -1104,7 +1132,7 @@ In object mode a save writes the file to the staging directory, uploads it as on
 
 What a load does with a file, in order: header (magic, version, CRC) → key check (is this `[kv] secret`?) → trailer and index → data blocks in parallel. Any failure before the data blocks means **nothing** is restored. A data block that fails to authenticate is skipped and counted (`partial`, reason `corrupt_blocks`); every other block still loads, because each one is independently sealed. Entries past their expiry are never restored. The outcome is logged and recorded in `ephpm_kv_snapshot_load_total{outcome,reason}` — see [Metrics → KV snapshots](/reference/metrics/#kv-snapshots).
 
-Control endpoint: `GET`/`POST /_ephpm/kv/snapshot` and `POST /_ephpm/kv/snapshot/load`, gated like `/_ephpm/requests` — see [HTTP endpoints](/reference/http-endpoints/#server-owned-paths) and [`ephpm kv snapshot`](/reference/cli/kv/#snapshot).
+Control endpoint: `GET`/`POST /_ephpm/kv/snapshot` and `POST /_ephpm/kv/snapshot/load`. `GET` (status) is gated like `/_ephpm/requests`. The two `POST`s change the live store — a load rolls every key in the snapshot back to its snapshot value — so they need `[server.diagnostics] token` (or mTLS) on **every** node, single-site included, and answer `403` without one; periodic and shutdown saves are unaffected. With `[server.metrics] listen` set they are served on that listener only. See [state-changing endpoints](#state-changing-endpoints-kv-snapshot-controls), [HTTP endpoints](/reference/http-endpoints/#server-owned-paths) and [`ephpm kv snapshot`](/reference/cli/kv/#snapshot).
 
 ## `[cluster]`
 

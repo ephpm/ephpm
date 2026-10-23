@@ -145,14 +145,16 @@ pub(crate) const INTERNAL_ROUTES: &[&str] = &[
     KV_SNAPSHOT_LOAD_ROUTE,
 ];
 
-/// Warm-restart KV snapshot control: `GET` = status, `POST` = write a
-/// snapshot now. Gated like `/_ephpm/requests` (`[server.diagnostics]`
-/// `allow`/`token`); answered in [`Router::handle_kv_snapshot`], the one
-/// internal endpoint that accepts `POST` and the one that awaits (the write
-/// runs on a blocking thread).
+/// Warm-restart KV snapshot control: `GET` = status (gated like
+/// `/_ephpm/requests`), `POST` = write a snapshot now (a credential —
+/// `[server.diagnostics] token` or mTLS — is required on every node).
+/// Answered in [`Router::handle_kv_snapshot`], the one internal endpoint that
+/// accepts `POST` and the one that awaits (the write runs on a blocking
+/// thread). Moves to the metrics listener with `[server.metrics] listen`.
 pub(crate) const KV_SNAPSHOT_ROUTE: &str = "/_ephpm/kv/snapshot";
 
-/// `POST` = load the configured snapshot into the live store now. Same gate.
+/// `POST` = load the configured snapshot into the live store now. A
+/// credential is required on every node, as for `POST` [`KV_SNAPSHOT_ROUTE`].
 pub(crate) const KV_SNAPSHOT_LOAD_ROUTE: &str = "/_ephpm/kv/snapshot/load";
 
 /// Sub-namespace of [`INTERNAL_PREFIX`] carved out to reach the **request-phase
@@ -628,6 +630,12 @@ pub struct Router {
     /// Who may read `/_ephpm/requests`, and whose IP ACL gates
     /// `/_ephpm/ready`'s upstream detail (`[server.diagnostics]`).
     diagnostics_access: crate::internal_access::InternalAccess,
+    /// Who may call the state-changing KV snapshot controls (`POST
+    /// /_ephpm/kv/snapshot`, `POST /_ephpm/kv/snapshot/load`): the
+    /// `[server.diagnostics]` ACL and token, with a credential required on
+    /// **every** node (see [`crate::internal_access::InternalAccess::credential_always`]).
+    /// Never lifted by `ephpm dev`.
+    kv_snapshot_control_access: crate::internal_access::InternalAccess,
     /// `false` when `[server.metrics] listen` moves the metrics endpoint and
     /// `/_ephpm/requests` to their own listener: the main listener then does
     /// not answer them (see [`Router::handle_metrics_listener`]).
@@ -1338,6 +1346,14 @@ impl Router {
                 &config.server.diagnostics.deny,
                 config.server.diagnostics.token.as_deref(),
                 config.server.sites_dir.is_some(),
+            ),
+            kv_snapshot_control_access: crate::internal_access::InternalAccess::credential_always(
+                "[server.diagnostics]",
+                &config.server.diagnostics.allow,
+                &config.server.diagnostics.deny,
+                config.server.diagnostics.token.as_deref(),
+                "this endpoint changes the live KV store (a snapshot save or load), so it is \
+                 served only with a credential, on every node.",
             ),
             internal_on_main: config.server.metrics.listen.is_none(),
             limiter,
@@ -2832,7 +2848,7 @@ impl Router {
                 // The one internal endpoint that is async (a save or load
                 // runs on a blocking thread and is awaited here) and that
                 // accepts POST.
-                return Ok(self.handle_kv_snapshot(&uri_path, &method_ref, &client).await);
+                return Ok(self.handle_kv_snapshot(&uri_path, &method_ref, &client, false).await);
             }
             return Ok(self.handle_internal(&uri_path, &method_ref, &client));
         }
@@ -4963,27 +4979,33 @@ impl Router {
     /// Serve one request on the separate metrics listener
     /// (`[server.metrics] listen`).
     ///
-    /// That listener answers exactly two paths — the metrics path and
-    /// `/_ephpm/requests` — under the same access policies as on the main
-    /// listener, plus the connection's mTLS status (`mtls_verified`, a client
-    /// certificate verified against `client_ca`), which counts as the
-    /// credential a multi-site node requires. Everything else is `404`: no
-    /// application, no static files, no probes (those stay on the main
-    /// listener, where load balancers expect them).
+    /// That listener answers the metrics path, `/_ephpm/requests` and the KV
+    /// snapshot controls (`/_ephpm/kv/snapshot`, `/_ephpm/kv/snapshot/load`)
+    /// under the same access policies as on the main listener, plus the
+    /// connection's mTLS status (`mtls_verified`, a client certificate
+    /// verified against `client_ca`), which counts as the credential a
+    /// multi-site node — and every snapshot `POST` — requires. Everything
+    /// else is `404`: no application, no static files, no probes (those stay
+    /// on the main listener, where load balancers expect them).
     ///
     /// # Panics
     ///
     /// Never in practice: the only builder call assembles a fixed `405` from
     /// constant, valid header values.
-    pub fn handle_metrics_listener<B>(
+    pub async fn handle_metrics_listener<B: Send>(
         &self,
-        req: &Request<B>,
+        req: Request<B>,
         remote_addr: SocketAddr,
         is_tls: bool,
         mtls_verified: bool,
     ) -> Response<ServerBody> {
         use crate::internal_access::Verdict;
 
+        let path = req.uri().path();
+        if path == KV_SNAPSHOT_ROUTE || path == KV_SNAPSHOT_LOAD_ROUTE {
+            let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
+            return self.handle_kv_snapshot(path, req.method(), &client, true).await.0;
+        }
         if req.method() != hyper::Method::GET {
             return Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -4992,8 +5014,7 @@ impl Router {
                 .body(body::buffered(Full::new(Bytes::from_static(b"405 Method Not Allowed"))))
                 .expect("static 405 response");
         }
-        let path = req.uri().path();
-        let client = self.internal_client(req, remote_addr, is_tls, mtls_verified);
+        let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
         if path == self.metrics_path
             && let Some(ref handle) = self.metrics_handle
         {
@@ -5018,7 +5039,7 @@ impl Router {
         error_response(
             StatusCode::NOT_FOUND,
             "404 Not Found: this is the ePHPm metrics listener; it serves only the metrics \
-             path and /_ephpm/requests.",
+             path, /_ephpm/requests and /_ephpm/kv/snapshot[/load].",
         )
     }
 
@@ -5252,16 +5273,31 @@ impl Router {
     ///   the live store now; `200` with the report (whose `outcome` may be
     ///   `cold`).
     ///
-    /// With snapshots off, every method answers `404` naming the knob. Access
-    /// is the `/_ephpm/requests` gate: `[server.diagnostics] allow`/`deny`/
-    /// `token`, and on a multi-site node a credential is mandatory. The gate
-    /// is checked before the method, so an unauthorised caller learns nothing
-    /// from a `405`.
+    /// With snapshots off, every method answers `404` naming the knob. Like
+    /// `/_ephpm/requests`, the endpoints live where the diagnostics live:
+    /// with `[server.metrics] listen` set they are answered only on that
+    /// listener (`via_metrics_listener`), and the main listener answers `404`
+    /// naming the knob — an operator who moved diagnostics onto a private
+    /// (possibly mTLS) port does not keep a public write path.
+    ///
+    /// Access:
+    /// * `GET /_ephpm/kv/snapshot` (status, read-only) — the
+    ///   `/_ephpm/requests` gate: `[server.diagnostics] allow`/`deny`/`token`,
+    ///   a credential mandatory on a multi-site node.
+    /// * every other method, on both paths — the state-changing gate
+    ///   (`kv_snapshot_control_access`): the same ACL and token, but a
+    ///   credential (the token, or a verified mTLS client certificate on the
+    ///   metrics listener) is mandatory on **every** node. Without one
+    ///   configured the call is refused `403` (fail closed).
+    ///
+    /// The gate is checked before the method, so an unauthorised caller
+    /// learns nothing from a `405`.
     async fn handle_kv_snapshot(
         &self,
         uri_path: &str,
         method: &hyper::Method,
         client: &crate::internal_access::Client<'_>,
+        via_metrics_listener: bool,
     ) -> (Response<ServerBody>, &'static str) {
         let Some(svc) = &self.kv_snapshot else {
             return (
@@ -5273,11 +5309,26 @@ impl Router {
                 "diagnostics",
             );
         };
-        match self.diagnostics_access.check(client) {
-            crate::internal_access::Verdict::Allow => {}
-            denied => return (self.diagnostics_access.deny_response(denied), "diagnostics"),
+        if !self.internal_on_main && !via_metrics_listener {
+            return (
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: the KV snapshot controls are served on the separate metrics \
+                     listener ([server.metrics] listen), not on this one.",
+                ),
+                "diagnostics",
+            );
         }
         let is_load = uri_path == KV_SNAPSHOT_LOAD_ROUTE;
+        let access = if !is_load && method == hyper::Method::GET {
+            &self.diagnostics_access
+        } else {
+            &self.kv_snapshot_control_access
+        };
+        match access.check(client) {
+            crate::internal_access::Verdict::Allow => {}
+            denied => return (access.deny_response(denied), "diagnostics"),
+        }
         match (is_load, method) {
             (false, &hyper::Method::GET) => {
                 (json_response_owned(StatusCode::OK, svc.status_json()), "diagnostics")
@@ -9811,13 +9862,14 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
         let get = |path: &str| Request::builder().uri(path).body(Empty::<Bytes>::new()).unwrap();
-        let resp = router.handle_metrics_listener(&get("/metrics"), peer, false, false);
+        let resp = router.handle_metrics_listener(get("/metrics"), peer, false, false).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = router.handle_metrics_listener(&get("/_ephpm/requests"), peer, false, false);
+        let resp =
+            router.handle_metrics_listener(get("/_ephpm/requests"), peer, false, false).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = router.handle_metrics_listener(&get("/_ephpm/health"), peer, false, false);
+        let resp = router.handle_metrics_listener(get("/_ephpm/health"), peer, false, false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "probes are not on the metrics listener");
-        let resp = router.handle_metrics_listener(&get("/index.php"), peer, false, false);
+        let resp = router.handle_metrics_listener(get("/index.php"), peer, false, false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -9832,13 +9884,262 @@ mod tests {
             c.server.metrics.listen = Some("127.0.0.1:9100".to_string());
         });
         let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
-        let req = Request::builder().uri("/metrics").body(Empty::<Bytes>::new()).unwrap();
+        let req = || Request::builder().uri("/metrics").body(Empty::<Bytes>::new()).unwrap();
         assert_eq!(
-            router.handle_metrics_listener(&req, peer, true, false).status(),
+            router.handle_metrics_listener(req(), peer, true, false).await.status(),
             StatusCode::FORBIDDEN,
             "TLS without a verified client certificate is not a credential"
         );
-        assert_eq!(router.handle_metrics_listener(&req, peer, true, true).status(), StatusCode::OK);
+        assert_eq!(
+            router.handle_metrics_listener(req(), peer, true, true).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    // ── KV snapshot controls (`/_ephpm/kv/snapshot[/load]`) ─────────────
+
+    const SNAP_TOKEN: &str = "snap-diag-token";
+    const SNAP_KV_SECRET: &str = "router-snapshot-test-secret";
+
+    /// A router with warm-restart snapshots on (local mode, under a temp
+    /// dir) and one key in the store, plus whatever `tweak` adds.
+    fn snapshot_router(
+        tweak: impl FnOnce(&mut Config),
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Router,
+        Arc<crate::kv_snapshot::KvSnapshotService>,
+        Arc<Store>,
+    ) {
+        let snap_dir = tempfile::tempdir().unwrap();
+        let (dir, router) = access_router(tweak);
+        // The service reads only `[kv] secret` and `[kv.snapshot]`.
+        let snap_config: Config = toml::from_str(&format!(
+            "[kv]\nsecret = \"{SNAP_KV_SECRET}\"\n[kv.snapshot]\nmode = \"local\"\npath = {:?}\n",
+            snap_dir.path().to_string_lossy()
+        ))
+        .unwrap();
+        let store = test_store();
+        store.set("live".into(), b"v1".to_vec(), None);
+        let svc = crate::kv_snapshot::KvSnapshotService::from_config(
+            &snap_config,
+            Arc::clone(&store),
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+        .expect("snapshots on");
+        let router = router.with_kv_snapshot(Some(Arc::clone(&svc)));
+        (dir, snap_dir, router, svc, store)
+    }
+
+    /// `method path` on the main listener from `peer` with extra headers.
+    async fn call_from(
+        router: &Router,
+        method: &str,
+        path: &str,
+        peer: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let addr: SocketAddr = format!("{peer}:4321").parse().unwrap();
+        let mut builder = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let resp = router.handle(builder.body(Empty::<Bytes>::new()).unwrap(), addr, false).await;
+        let resp = resp.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The v0.13.0 audit's S1: on a single-site node with no
+    /// `[server.diagnostics]` config, the read-only status stays open (like
+    /// `/_ephpm/requests`), but the state-changing `POST`s are refused — fail
+    /// closed, naming the token — instead of letting any client roll the
+    /// store back or force full-store writes.
+    #[tokio::test]
+    async fn snapshot_posts_are_refused_without_a_credential_on_a_single_site_node() {
+        let (_d, _s, router, svc, store) = snapshot_router(|_| {});
+        let (status, body) = call_from(&router, "GET", KV_SNAPSHOT_ROUTE, "203.0.113.9", &[]).await;
+        assert_eq!(status, StatusCode::OK, "status stays gated like /_ephpm/requests: {body}");
+
+        for (method, path) in [
+            ("POST", KV_SNAPSHOT_ROUTE),
+            ("POST", KV_SNAPSHOT_LOAD_ROUTE),
+            // Any other method is judged by the write gate too, so an
+            // unauthorised caller learns nothing from a 405.
+            ("PUT", KV_SNAPSHOT_ROUTE),
+            ("GET", KV_SNAPSHOT_LOAD_ROUTE),
+        ] {
+            for peer in ["127.0.0.1", "203.0.113.9"] {
+                let (status, body) = call_from(&router, method, path, peer, &[]).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} from {peer}: {body}");
+                assert!(body.contains("[server.diagnostics] token"), "{body}");
+                assert!(body.contains("on every node"), "{body}");
+            }
+        }
+        assert!(!svc.file().exists(), "a refused save wrote nothing");
+        assert_eq!(store.get("live").as_deref(), Some(&b"v1"[..]));
+    }
+
+    /// Multi-site with no credential: everything on the snapshot paths is
+    /// refused, status included (the existing multi-site rule).
+    #[tokio::test]
+    async fn snapshot_endpoints_are_refused_without_a_credential_on_a_multi_site_node() {
+        let sites = tempfile::tempdir().unwrap();
+        let sites_path = sites.path().to_path_buf();
+        let (_d, _s, router, _svc, _store) =
+            snapshot_router(|c| c.server.sites_dir = Some(sites_path.clone()));
+        for (method, path) in [
+            ("GET", KV_SNAPSHOT_ROUTE),
+            ("POST", KV_SNAPSHOT_ROUTE),
+            ("POST", KV_SNAPSHOT_LOAD_ROUTE),
+        ] {
+            let (status, body) = call_from(&router, method, path, "127.0.0.1", &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        }
+    }
+
+    /// With the token configured the controls work — and only with it, on a
+    /// single-site and a multi-site node alike. A tenant's own derived
+    /// credential (the `DB_PASSWORD` / KV password every site's PHP is
+    /// handed) is not the diagnostics token and is refused.
+    #[tokio::test]
+    async fn snapshot_posts_work_with_the_token_and_refuse_tenant_credentials() {
+        let sites = tempfile::tempdir().unwrap();
+        let sites_path = sites.path().to_path_buf();
+        for multi_site in [false, true] {
+            let (_d, _s, router, svc, store) = snapshot_router(|c| {
+                c.server.diagnostics.token = Some(SNAP_TOKEN.to_string());
+                if multi_site {
+                    c.server.sites_dir = Some(sites_path.clone());
+                }
+            });
+            let auth = format!("Bearer {SNAP_TOKEN}");
+            let tenant = format!(
+                "Bearer {}",
+                ephpm_kv::auth::derive_site_password(SNAP_KV_SECRET, "tenant-a.example")
+            );
+            for headers in [vec![], vec![("authorization", tenant.as_str())]] {
+                for path in [KV_SNAPSHOT_ROUTE, KV_SNAPSHOT_LOAD_ROUTE] {
+                    let (status, body) =
+                        call_from(&router, "POST", path, "127.0.0.1", &headers).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::UNAUTHORIZED,
+                        "multi_site={multi_site} {path} {headers:?}: {body}"
+                    );
+                }
+            }
+            assert!(!svc.file().exists(), "multi_site={multi_site}: nothing saved yet");
+
+            let (status, body) = call_from(
+                &router,
+                "POST",
+                KV_SNAPSHOT_ROUTE,
+                "127.0.0.1",
+                &[("authorization", &auth)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "multi_site={multi_site}: {body}");
+            assert!(svc.file().exists(), "multi_site={multi_site}: the save wrote the file");
+
+            // The load really is a write: it rolls a newer value back.
+            store.set("live".into(), b"v2".to_vec(), None);
+            let (status, body) = call_from(
+                &router,
+                "POST",
+                KV_SNAPSHOT_LOAD_ROUTE,
+                "127.0.0.1",
+                &[("authorization", &auth)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "multi_site={multi_site}: {body}");
+            assert_eq!(store.get("live").as_deref(), Some(&b"v1"[..]));
+
+            let (status, _) = call_from(
+                &router,
+                "GET",
+                KV_SNAPSHOT_ROUTE,
+                "127.0.0.1",
+                &[("authorization", &auth)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    /// The `[server.diagnostics]` IP ACL still applies on top of the token.
+    #[tokio::test]
+    async fn snapshot_posts_honour_the_diagnostics_acl() {
+        let (_d, _s, router, _svc, _store) = snapshot_router(|c| {
+            c.server.diagnostics.token = Some(SNAP_TOKEN.to_string());
+            c.server.diagnostics.allow = vec!["10.0.0.0/8".to_string()];
+        });
+        let auth = format!("Bearer {SNAP_TOKEN}");
+        let (status, body) = call_from(
+            &router,
+            "POST",
+            KV_SNAPSHOT_ROUTE,
+            "203.0.113.9",
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (status, body) =
+            call_from(&router, "POST", KV_SNAPSHOT_ROUTE, "10.1.2.3", &[("authorization", &auth)])
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// `ephpm dev` lifts the multi-site requirement for the read endpoints;
+    /// it must not lift the write gate.
+    #[tokio::test]
+    async fn dev_mode_does_not_lift_the_snapshot_write_gate() {
+        let (_d, _s, router, _svc, _store) = snapshot_router(|_| {});
+        let router = router.with_dev_mode_access(true);
+        let (status, body) = call_from(&router, "POST", KV_SNAPSHOT_ROUTE, "127.0.0.1", &[]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    /// With `[server.metrics] listen` the controls move with the other
+    /// diagnostics: the main listener answers 404 naming the knob for every
+    /// method, the metrics listener serves them — a verified mTLS client
+    /// certificate counts as the credential there.
+    #[tokio::test]
+    async fn snapshot_controls_follow_the_metrics_listener() {
+        let (_d, _s, router, svc, _store) =
+            snapshot_router(|c| c.server.metrics.listen = Some("127.0.0.1:9100".to_string()));
+        for method in ["GET", "POST"] {
+            for path in [KV_SNAPSHOT_ROUTE, KV_SNAPSHOT_LOAD_ROUTE] {
+                let (status, body) = call_from(&router, method, path, "127.0.0.1", &[]).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {body}");
+                assert!(body.contains("[server.metrics] listen"), "{body}");
+            }
+        }
+
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let req = |method: &str, path: &str| {
+            Request::builder().method(method).uri(path).body(Empty::<Bytes>::new()).unwrap()
+        };
+        let resp =
+            router.handle_metrics_listener(req("GET", KV_SNAPSHOT_ROUTE), peer, false, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router
+            .handle_metrics_listener(req("POST", KV_SNAPSHOT_ROUTE), peer, false, false)
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "plain HTTP, no token");
+        let resp =
+            router.handle_metrics_listener(req("POST", KV_SNAPSHOT_ROUTE), peer, true, false).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "TLS without a client cert");
+        assert!(!svc.file().exists());
+        let resp =
+            router.handle_metrics_listener(req("POST", KV_SNAPSHOT_ROUTE), peer, true, true).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a verified client certificate is a credential");
+        assert!(svc.file().exists());
     }
 
     // ── Load shedding (`[php] overload`, issue #301) ────────────────────
