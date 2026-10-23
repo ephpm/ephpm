@@ -66,8 +66,9 @@ profile:
   instead, because the segment is pagefile-backed and commit-charged in full
   at startup — see the [config reference](/reference/config/#resource-aware-autotuning).)
 - **Per-request `memory_limit`** is `(budget − opcache_shm − ~64 MB overhead)
-  / concurrency`, floored at `128 MB`, so N concurrent requests can't
-  collectively exceed the pod's cgroup limit and get OOM-killed.
+  / concurrency`, clamped to `[128, 1024]` MB, so N concurrent requests can't
+  collectively exceed the pod's cgroup limit and get OOM-killed. An explicit
+  `[php] memory_limit` wins over the derived value.
 - **Interned-strings** and **JIT buffers** scale with the SHM / budget
   (clamped). Whether the JIT uses the buffer is shaped by tenancy
   (`[php] opcache_jit`): **`disable` by default in every mode**, including the

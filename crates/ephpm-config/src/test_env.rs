@@ -226,7 +226,7 @@ mod tests {
         // decline to lock because this thread already holds the write side.
         let _env = EnvVars::set("EPHPM_PHP__MEMORY_LIMIT", "321M");
         let config = crate::Config::default_config().unwrap();
-        assert_eq!(config.php.memory_limit, "321M");
+        assert_eq!(config.php.memory_limit.as_deref(), Some("321M"));
     }
 
     #[test]

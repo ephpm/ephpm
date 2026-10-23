@@ -672,7 +672,8 @@ alt_svc_max_age = 86400
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_execution_time` | u32 (sec) | `30` | PHP `max_execution_time` per request (`0` = unlimited). Natively enforced on Linux ZTS builds (per-thread execution timers): exceeding it raises the catchable "Maximum execution time exceeded" fatal (HTTP 500, shutdown functions run, output flushed), is wall-clock (`sleep()` counts), and is overridable at runtime with `set_time_limit()`. `[server.timeouts] request` is the outer hard 504 backstop — keep this below it. Not natively enforced on macOS/Windows (no per-thread timers); there the request timeout is the only ceiling. |
-| `memory_limit` | string | `"128M"` | PHP `memory_limit`. Serves as the dev-mode value and the ultimate fallback; in serve mode it is superseded by the auto-derived per-request limit (see `php_memory_limit` and [Resource-aware autotuning](#resource-aware-autotuning)). |
+| `memory_limit` | string | (unset → derived in serve, `128M` in dev) | Per-request PHP `memory_limit` (PHP quantity syntax: `"256M"`, `"1G"`, `"-1"`). When set it is used as written in **every** mode, including `ephpm serve`, where it wins over the [auto-derived](#resource-aware-autotuning) value. Same setting as `php_memory_limit`, which wins if both are set. Through v0.13.0 an explicit value was silently replaced by the derived one in serve mode on Linux and Windows. Scripts can lower it and raise it again up to `memory_limit_max`. |
+| `memory_limit_max` | string | (unset → the `memory_limit` PHP started with) | Ceiling on a script raising `memory_limit` at runtime. `ini_set('memory_limit', …)` above it — including `-1` — returns `false`, leaves the value unchanged and logs a WARN (`ePHPm refused memory_limit=…`); lowering, and raising back up to the ceiling, work as usual. Also bounds the per-request INI channel ePHPm uses for per-site settings. Startup values (`ini_file`, `ini_overrides`, the generated php.ini) are not bounded, but a startup `memory_limit` above an explicit ceiling — or an explicit `memory_limit` above it — is a startup error; a derived `memory_limit` is lowered to it. Unset, scripts can never raise `memory_limit` above what the operator configured, which keeps [PHP's hard memory limit](#phps-hard-memory-limit) (a percentage of `memory_limit`) meaningful. Set it above `memory_limit` to give apps headroom (WordPress raises admin requests to `256M`; with the ceiling below that, its `ini_set` is refused and the request continues at the lower limit), or `"-1"` for no ceiling (startup then WARNs). Same quantity syntax, parsed strictly (`"512MB"` is rejected). Not applied by `ephpm php`. Independent of PHP 8.5's own `max_memory_limit` directive, which clamps a raise with a warning instead of refusing it. Startup logs the effective limit and ceiling at INFO. Env: `EPHPM_PHP__MEMORY_LIMIT_MAX`. |
 | `opcache_validate_timestamps` | bool | (mode default) | Override `opcache.validate_timestamps`. Unset resolves per mode: **off** (`0`) under `ephpm serve` (trust the cache — refresh code with `ephpm deploy` / `ephpm cache reset`), **on** (`1`) under `ephpm dev` (instant edit-refresh). Set `true`/`false` to force a value in either mode. See the [deploy guide](/guides/opcache-cluster-invalidation/) for the deploys-are-events contract. |
 | `opcache_revalidate_freq` | u32 (sec) | (none → PHP default `2`) | Override `opcache.revalidate_freq`. Only meaningful when timestamp validation is on: how often (at most) the engine re-`stat()`s a cached script. Raising it (e.g. `60`) cuts `stat()` traffic on overlay/network filesystems at the cost of slower edit pickup. Ignored when validation is off. |
 | `opcache_memory_consumption` | u32 (MB) | (auto-derived) | Override `opcache.memory_consumption`. Unset → auto-derived in serve mode (~18% of the detected memory budget, clamped `[64, 512]` MB on Linux/macOS and `[64, 256]` MB on Windows); dev keeps PHP's 128 MB. An explicit value is honoured on every platform. See [Resource-aware autotuning](#resource-aware-autotuning). |
@@ -680,7 +681,7 @@ alt_svc_max_age = 86400
 | `opcache_jit_buffer_size` | u32 (MB) | (auto-derived) | Override `opcache.jit_buffer_size`. Unset → auto-sized (~1/64 of memory, clamped `[32, 64]` MB) in serve mode. Whether the JIT *uses* the buffer is governed by `opcache_jit` (below). When the JIT is on and no size was derived (dev mode), the same derivation is forced so an enabled JIT is never silently bufferless. An explicit `0` is respected — and warned about — because it makes the JIT inert. |
 | `opcache_jit` | string | unset (→ `disable` in every mode — see [OPcache JIT](#opcache-jit)) | `opcache.jit` mode: `"tracing"`, `"function"`, or `"disable"` (anything else is a startup error; raw CRTO digits are deliberately not accepted — use `ini_overrides` if you truly need them). Set explicitly, it wins in **every** mode. **Unset, the JIT is off (`disable`) in every mode**, for a different reason in each: single-site serve (an unfixed upstream tracing-JIT defect crashes the process), multi-tenant serve (`sites_dir` set — per-vhost invalidation never reclaims JIT buffer), worker mode (not positively verified against the persistent-worker lifecycle), and dev (no `opcache.jit` line is emitted). Startup always logs the effective state and why. Env: `EPHPM_PHP__OPCACHE_JIT=disable`. |
 | `opcache_max_accelerated_files` | u32 | `20000` (serve) | Override `opcache.max_accelerated_files`. A generous **fixed** default in serve mode (PHP default in dev). Deliberately *not* derived from memory — the right value is shaped by how many `.php` files the app has, not the machine size. |
-| `php_memory_limit` | string | (auto-derived) | Override the per-request `memory_limit`, taking precedence over `memory_limit` **and** the derivation. Unset → serve mode derives `(memory_budget − opcache_shm − ~64 MB overhead) / concurrency`, floored at `128 MB`; with no detectable memory budget it keeps PHP's `128M`. Dev keeps `memory_limit`. |
+| `php_memory_limit` | string | (auto-derived) | The same setting as `memory_limit` (kept for existing configs); wins if both are set. With neither set, serve mode derives `(memory_budget − opcache_shm − ~64 MB overhead) / concurrency`, clamped to `[128, 1024]` MB and to an explicit `memory_limit_max`; with no detectable memory budget it uses `128M`. Dev uses `128M`. |
 | `realpath_cache_size` | string | `16M` (serve) | Override `realpath_cache_size`. Serve uses `16M` (vs PHP's `256K`) to cut `realpath()`/`stat()` traffic on deep autoload trees; dev keeps the PHP default so new files resolve instantly. |
 | `realpath_cache_ttl` | u32 (sec) | `600` (serve) | Override `realpath_cache_ttl`. Serve uses `600` (vs PHP's `120`); dev keeps the PHP default. |
 | `zend_assertions` | i8 | `-1` (serve) / `1` (dev) | Override `zend.assertions`. Serve uses `-1` (assertions compiled out — zero runtime cost, production-recommended); dev uses `1` (assertions active). Set `-1`/`0`/`1` to pin. |
@@ -765,11 +766,16 @@ Sizing guidance:
   file](#per-site-override-files-site_overrides_dir) accepts only
   `document_root`, `auto_prepend_file` and `[preview_auth]`), so every site on a
   server shares one `memory_hard_limit_percent`. The CLI (`ephpm php`) keeps
-  the upstream behaviour. `memory_limit` stays
-  `PHP_INI_ALL` as upstream ships it, so a script can still raise its own soft
-  limit, and with it the hard limit (which is a percentage of it). A tenant can
-  therefore always reach the hard limit on purpose; on Linux that costs only
-  its own request.
+  the upstream behaviour.
+- `memory_limit` stays `PHP_INI_ALL` as upstream ships it (applications
+  legitimately lower and raise it), but a raise is bounded by
+  [`memory_limit_max`](#php), which defaults to the `memory_limit` PHP started
+  with. So a script cannot lift its soft limit — and with it the hard limit,
+  which is a percentage of it — above what the operator configured;
+  `ini_set('memory_limit', '-1')` returns `false`. Through v0.13.0 there was no
+  ceiling, and a tenant could raise `memory_limit` to `-1` and allocate until
+  the host ran out. A tenant can still reach the hard limit on purpose with one
+  large allocation; on Linux that costs only its own request.
 
 ### Where PHP errors go
 
@@ -865,7 +871,7 @@ The source label in the startup line says which probe won — `cgroup v2`, `cgro
 | `opcache.interned_strings_buffer` | ~1 MB per 16 MB of opcache SHM | `[8, 64]` MB |
 | `opcache.jit_buffer_size` | ~1/64 of memory budget (used when the JIT is on — see [OPcache JIT](#opcache-jit)) | `[32, 64]` MB |
 | `opcache.max_accelerated_files` | fixed `20000` (app-shaped, not memory-shaped) | — |
-| `memory_limit` (per request) | `(budget − opcache_shm − ~64 MB overhead) / concurrency` | floor `128` MB |
+| `memory_limit` (per request) | `(budget − opcache_shm − ~64 MB overhead) / concurrency` | `[128, 1024]` MB, and at most an explicit `memory_limit_max` |
 | `realpath_cache_size` | `16M` | — |
 | `realpath_cache_ttl` | `600` | — |
 | `zend.assertions` | `-1` (compiled out) | — |
@@ -873,6 +879,8 @@ The source label in the startup line says which probe won — `cgroup v2`, `cgro
 Dev mode (`ephpm dev` / bare `ephpm`) derives none of these: it keeps PHP-friendly defaults (timestamp validation on, assertions on, loose realpath) so the edit-refresh loop stays tight.
 
 **Resolution precedence (per directive):** explicit `[php]` value → auto-derived → PHP stock default. Pin any single knob (e.g. `opcache_memory_consumption = 256`) and the rest keep auto-tuning. `ini_overrides` still layers last as the ultimate escape hatch.
+
+The 1024 MB cap on the derived `memory_limit` is new in v0.13.1. Before it, a large host handed every request a share of the whole machine (15.9 GB per request at `concurrency = 4` on a 64 GB host), so neither `memory_limit` nor PHP's hard limit derived from it bounded anything; a 2 MB gzip bomb inflated to 2 GiB and returned `200`. An application that genuinely needs more per request sets `memory_limit` explicitly.
 
 **Windows: OPcache shared memory.** Two things differ on Windows, both because PHP's Windows OPcache backend is a named, pagefile-backed section object rather than an anonymous mapping:
 

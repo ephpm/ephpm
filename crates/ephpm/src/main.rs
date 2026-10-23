@@ -1460,6 +1460,48 @@ fn compose_disable_functions(
     if ordered.is_empty() { None } else { Some(ordered.join(",")) }
 }
 
+/// After PHP module startup: refuse to run when the `memory_limit` PHP started
+/// with is above an explicit `[php] memory_limit_max` (set through
+/// `ini_overrides` or `ini_file`, which `Config::validate` cannot see), and log
+/// the ceiling scripts are held to — or that there is none.
+fn check_memory_limit_ceiling(php: &ephpm_config::PhpConfig) -> anyhow::Result<()> {
+    let fmt = |bytes: u64| {
+        if bytes == u64::MAX {
+            "-1".to_string()
+        } else {
+            ephpm_config::format_php_memory_quantity(bytes)
+        }
+    };
+    match ephpm_php::PhpRuntime::memory_limit_bounds() {
+        Some(bounds) => {
+            if php.memory_limit_max.is_some() && bounds.startup_bytes > bounds.ceiling_bytes {
+                anyhow::bail!(
+                    "PHP started with memory_limit = {} (from [php] ini_overrides or ini_file), \
+                     above [php] memory_limit_max = {}. Lower that memory_limit or raise \
+                     memory_limit_max (\"-1\" = no ceiling)",
+                    fmt(bounds.startup_bytes),
+                    fmt(bounds.ceiling_bytes),
+                );
+            }
+            tracing::info!(
+                memory_limit = %fmt(bounds.startup_bytes),
+                memory_limit_max = %fmt(bounds.ceiling_bytes),
+                "PHP memory_limit ceiling: scripts may lower memory_limit and raise it up to \
+                 memory_limit_max; ini_set() above it (including -1) is refused"
+            );
+        }
+        // Linked engine with no ceiling: either the operator chose `-1`, or
+        // PHP started unlimited and no explicit ceiling was set.
+        None if ephpm_php::PhpRuntime::abi().is_some() => tracing::warn!(
+            "PHP memory_limit has no ceiling: any script can ini_set('memory_limit', '-1') and \
+             allocate without bound, past PHP's hard memory limit. Set [php] memory_limit_max \
+             (and a finite memory_limit) to bound it"
+        ),
+        None => {}
+    }
+    Ok(())
+}
+
 /// Log, at startup, exactly what the multi-tenant hardening preset did — the
 /// denylist it added, the performance it cost, and any residual it could not
 /// close in this configuration. Never silent: an operator who relies on the
@@ -2068,10 +2110,16 @@ fn run_with_config(
         }
     }
 
+    // Ceiling on runtime raises of memory_limit. Handed over before init: the
+    // hook that enforces it is installed during module startup.
+    ephpm_php::PhpRuntime::set_memory_limit_max(config.php.memory_limit_max.as_deref())
+        .context("failed to apply [php] memory_limit_max")?;
+
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
     ephpm_php::PhpRuntime::init_with_ini_file(effective_ini_path.as_deref())
         .context("failed to initialize PHP runtime")?;
+    check_memory_limit_ceiling(&config.php)?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
     // `ephpm dev --xdebug`: prove Xdebug registered as a Zend extension (PHP

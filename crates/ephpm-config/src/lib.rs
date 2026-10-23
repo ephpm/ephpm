@@ -3959,9 +3959,58 @@ pub struct PhpConfig {
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time: u32,
 
-    /// Memory limit for PHP (e.g. "128M").
-    #[serde(default = "default_memory_limit")]
-    pub memory_limit: String,
+    /// Per-request PHP `memory_limit` (e.g. `"256M"`), honoured in every mode.
+    ///
+    /// When set it is the limit each request starts with, in `ephpm serve` as
+    /// well as `ephpm dev`: an explicit value wins over the serve-mode
+    /// derivation (see [`Self::php_memory_limit`], which is the same setting
+    /// under its older name and wins if both are set). Unset: serve mode
+    /// derives a per-request limit from the memory budget (see
+    /// [`derive_tuning`]); dev mode uses `128M`.
+    ///
+    /// Before v0.13.1 an explicit `memory_limit` was silently replaced by the
+    /// derived value in serve mode on any host with a detectable memory
+    /// budget (Linux and Windows), so it only ever took effect in dev mode.
+    ///
+    /// Scripts can still lower it at runtime and raise it back up to
+    /// [`Self::memory_limit_max`]; a raise above that ceiling is refused.
+    ///
+    /// Default: `None` (derived in serve, `128M` in dev).
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+
+    /// Ceiling on a runtime raise of `memory_limit` (e.g. `"512M"`), or `"-1"`
+    /// for no ceiling.
+    ///
+    /// A script (`ini_set('memory_limit', …)`) may lower its own limit and
+    /// raise it again up to this value. A raise above it, including `-1`
+    /// (unlimited), is refused: `ini_set()` returns `false`, the value stays
+    /// as it was, and ePHPm logs the refusal. The ceiling also bounds the
+    /// per-request INI channel ePHPm uses for per-site settings. Values set
+    /// at startup (the generated php.ini, `[php] ini_file`,
+    /// `[php] ini_overrides`) are the operator's and are not bounded, but a
+    /// startup `memory_limit` above an explicit ceiling is a startup error.
+    ///
+    /// This is what keeps PHP's hard memory limit
+    /// (`memory_hard_limit_percent`, derived from `memory_limit`) meaningful in
+    /// a multi-tenant server: without it a tenant script could
+    /// `ini_set('memory_limit', '-1')` and allocate without bound.
+    ///
+    /// Accepts PHP's quantity syntax: an integer with an optional `K`, `M` or
+    /// `G` suffix, or `-1`. Not applied by `ephpm php` (the CLI runs the
+    /// operator's own script, like `php-cli`). PHP 8.5's own
+    /// `max_memory_limit` directive is independent: it clamps a raise (with a
+    /// warning) instead of refusing it, and is unset (`-1`) by default.
+    ///
+    /// Default: `None` — the ceiling is the `memory_limit` PHP started with
+    /// (explicit, derived, or from `ini_overrides`/`ini_file`), so scripts can
+    /// lower it but never raise it above what the operator configured. Set a
+    /// larger value to give applications headroom (WordPress raises admin
+    /// requests to `256M`, for example).
+    ///
+    /// Env override: `EPHPM_PHP__MEMORY_LIMIT_MAX`.
+    #[serde(default)]
+    pub memory_limit_max: Option<String>,
 
     /// Override OPcache timestamp validation (`opcache.validate_timestamps`).
     ///
@@ -4123,14 +4172,15 @@ pub struct PhpConfig {
 
     /// Override the derived per-request `memory_limit` (e.g. `"192M"`).
     ///
-    /// Takes precedence over the legacy [`Self::memory_limit`] field **and**
-    /// over the auto-derived value. When unset, ePHPm derives a per-request
-    /// limit in serve mode from `(memory_budget − opcache_shm − ~64 MB
-    /// overhead) / concurrency`, clamped to a `128 MB` floor; with no
-    /// detectable memory budget it keeps PHP's `128M` default rather than
-    /// inventing a huge number. Dev mode keeps [`Self::memory_limit`].
+    /// The same setting as [`Self::memory_limit`] (kept for existing
+    /// configs); when both are set this one wins. Either one takes precedence
+    /// over the auto-derived value, in every mode. When neither is set, ePHPm
+    /// derives a per-request limit in serve mode from `(memory_budget −
+    /// opcache_shm − ~64 MB overhead) / concurrency`, clamped to `[128 MB,
+    /// 1024 MB]` (and to an explicit [`Self::memory_limit_max`]); with no
+    /// detectable memory budget it uses `128M`. Dev mode uses `128M`.
     ///
-    /// Default: `None` (auto-derived in serve, `memory_limit` in dev).
+    /// Default: `None` (auto-derived in serve, `128M` in dev).
     #[serde(default)]
     pub php_memory_limit: Option<String>,
 
@@ -5022,6 +5072,24 @@ impl Config {
             self.resolve_worker_script()?;
         }
 
+        // [php] memory_limit_max narrows what scripts may do, so a value that
+        // does not parse must fail startup rather than fall back to "no
+        // ceiling"; and an explicit memory_limit above it would start every
+        // request beyond the operator's own ceiling.
+        if let Some(raw) = self.php.memory_limit_max.as_deref() {
+            let ceiling = parse_php_memory_quantity(raw)
+                .map_err(|e| ConfigError::Validation(format!("[php] memory_limit_max: {e}")))?;
+            if let (Some(ceiling), Some(limit_raw)) = (ceiling, self.php.explicit_memory_limit())
+                && let Ok(limit) = parse_php_memory_quantity(limit_raw)
+                && limit.is_none_or(|bytes| bytes > ceiling)
+            {
+                return Err(ConfigError::Validation(format!(
+                    "[php] memory_limit ({limit_raw}) is above [php] memory_limit_max ({raw}). \
+                     Lower memory_limit, or raise memory_limit_max (\"-1\" = no ceiling)"
+                )));
+            }
+        }
+
         // [php] extensions: an empty entry can never load anything, and PHP
         // silently ignores a bare `extension=` line — rejecting it here
         // keeps the knob from being a silent no-op.
@@ -5497,7 +5565,8 @@ impl Default for PhpConfig {
     fn default() -> Self {
         Self {
             max_execution_time: default_max_execution_time(),
-            memory_limit: default_memory_limit(),
+            memory_limit: None,
+            memory_limit_max: None,
             opcache_validate_timestamps: None,
             opcache_revalidate_freq: None,
             opcache_memory_consumption: None,
@@ -5593,15 +5662,33 @@ impl PhpConfig {
 
     /// Resolve the effective per-request PHP `memory_limit` string.
     ///
-    /// Precedence: explicit [`Self::php_memory_limit`] → derived (serve only,
-    /// when a memory budget is detectable) → the legacy [`Self::memory_limit`]
-    /// field (which itself defaults to `128M`). See [`Self::derive_tuning`] for
-    /// the derivation.
+    /// Precedence: explicit [`Self::php_memory_limit`] → explicit
+    /// [`Self::memory_limit`] → derived (serve only, when a memory budget is
+    /// detectable) → `128M`. A derived or default value is clamped to an
+    /// explicit [`Self::memory_limit_max`]. See [`derive_tuning`] for the
+    /// derivation.
     #[must_use]
     pub fn effective_memory_limit(&self, dev_mode: bool) -> String {
         // memory_limit does not depend on the tenancy shape, so the
         // multi-tenant flag is irrelevant here.
         self.autotune(dev_mode, false).memory_limit.value
+    }
+
+    /// The operator's explicit per-request `memory_limit`, if any:
+    /// [`Self::php_memory_limit`] when set, else [`Self::memory_limit`].
+    #[must_use]
+    pub fn explicit_memory_limit(&self) -> Option<&str> {
+        self.php_memory_limit.as_deref().or(self.memory_limit.as_deref())
+    }
+
+    /// The explicit [`Self::memory_limit_max`] in bytes: `None` when the knob
+    /// is unset, set to `-1` (no ceiling), or unparseable (which
+    /// [`Config::validate`] rejects before anything reads this).
+    #[must_use]
+    pub fn memory_limit_ceiling_bytes(&self) -> Option<u64> {
+        self.memory_limit_max
+            .as_deref()
+            .and_then(|raw| parse_php_memory_quantity(raw).ok().flatten())
     }
 
     /// Compute the full resource-aware tuning profile for this run.
@@ -5726,11 +5813,22 @@ impl PhpConfig {
                 derived.opcache_max_accelerated_files,
                 10_000,
             ),
-            memory_limit: resolve(
-                self.php_memory_limit.clone(),
-                derived.memory_limit.clone(),
-                self.memory_limit.clone(),
-            ),
+            memory_limit: {
+                // An explicit limit is the operator's and is used as written
+                // (`Config::validate` rejects one above an explicit ceiling).
+                // A derived or default one never exceeds an explicit
+                // `memory_limit_max`: the narrower operator setting wins.
+                let mut limit = resolve(
+                    self.explicit_memory_limit().map(str::to_string),
+                    derived.memory_limit.clone(),
+                    default_memory_limit(),
+                );
+                if limit.origin != Origin::Explicit {
+                    limit.value =
+                        clamp_memory_limit(limit.value, self.memory_limit_ceiling_bytes());
+                }
+                limit
+            },
             realpath_cache_size: resolve(
                 self.realpath_cache_size.clone(),
                 derived.realpath_cache_size.clone(),
@@ -5909,6 +6007,16 @@ pub struct DerivedTuning {
 /// One mebibyte in bytes.
 const MIB: u64 = 1024 * 1024;
 
+/// Upper bound (MB) on the **derived** per-request `memory_limit`.
+///
+/// The derivation splits the whole memory budget across the execution slots,
+/// which on a large host hands each request several GB — a limit nothing
+/// legitimate needs, and one that turns PHP's hard limit (2 × `memory_limit`,
+/// or `memory_limit` + 1 GB) into no bound at all. 1 GB covers WordPress,
+/// Laravel, Drupal and Magento storefront requests with room to spare. An
+/// explicit `[php] memory_limit` is not capped.
+pub const DERIVED_MEMORY_LIMIT_CAP_MB: u64 = 1024;
+
 /// Ceiling on the **derived** `opcache.memory_consumption` (MB) on Windows.
 ///
 /// Lower than [`UNIX_OPCACHE_SHM_CEILING_MB`] because the two platforms charge
@@ -5973,7 +6081,7 @@ pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
 /// - `opcache.max_accelerated_files` = a generous fixed `20000` (app-file-count
 ///   shaped, not resource-shaped — see the field doc).
 /// - `memory_limit` = `(budget − opcache_shm − 64 MB overhead) / concurrency`,
-///   floored at `128 MB`. With no detectable memory budget it stays `None`
+///   clamped to `[128, DERIVED_MEMORY_LIMIT_CAP_MB]` MB. With no detectable memory budget it stays `None`
 ///   (keep PHP's `128M`) rather than inventing a huge number.
 /// - `realpath_cache_size` = `16M`; `realpath_cache_ttl` = `600`.
 /// - `zend.assertions` = `-1` (compiled out).
@@ -6016,11 +6124,14 @@ pub fn derive_tuning(
 
     // Per-request memory_limit: only derived when we actually know the budget —
     // otherwise keep PHP's 128M (returned as None). Reserve the opcache SHM and
-    // a ~64 MB engine/server overhead, then split across the execution slots.
+    // a ~64 MB engine/server overhead, then split across the execution slots,
+    // capped at DERIVED_MEMORY_LIMIT_CAP_MB: on a large host the split alone
+    // gave every request many GB (15.9 GB at concurrency 4 on 64 GB), which
+    // made memory_limit and the hard limit derived from it bound nothing.
     let memory_limit: Option<String> = mem_bytes.map(|budget| {
         let overhead = 64 * MIB + u64::from(opcache_mb) * MIB;
         let per_request_bytes = budget.saturating_sub(overhead) / (concurrency.max(1) as u64);
-        let per_request_mb = (per_request_bytes / MIB).max(128);
+        let per_request_mb = (per_request_bytes / MIB).clamp(128, DERIVED_MEMORY_LIMIT_CAP_MB);
         // Cap the string at a u32-safe MB count for tidy formatting; budgets
         // this large are unrealistic but keep the cast honest.
         let mb = u32::try_from(per_request_mb).unwrap_or(u32::MAX);
@@ -7463,8 +7574,74 @@ fn default_max_execution_time() -> u32 {
     30
 }
 
+/// The per-request `memory_limit` when neither config nor the serve-mode
+/// derivation supplies one (PHP's own stock default).
 fn default_memory_limit() -> String {
     "128M".to_string()
+}
+
+/// Parse a PHP memory quantity the way `memory_limit` reads one: a
+/// non-negative decimal integer with an optional `K`, `M` or `G` suffix (case
+/// insensitive), or `-1` for unlimited.
+///
+/// Returns `Ok(None)` for `-1`, `Ok(Some(bytes))` otherwise. Deliberately
+/// stricter than PHP (no hex/octal/binary prefixes, no other negatives, no
+/// silently-ignored trailing garbage such as the `B` in `"128MB"`, which PHP
+/// reads as 128 *bytes*), so a mistyped ceiling fails startup instead of
+/// meaning something else.
+///
+/// # Errors
+///
+/// A description of what is wrong with `raw`.
+pub fn parse_php_memory_quantity(raw: &str) -> Result<Option<u64>, String> {
+    let s = raw.trim();
+    if s == "-1" {
+        return Ok(None);
+    }
+    let (digits, multiplier) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], MIB),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024 * MIB),
+        _ => (s, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{raw:?} is not a PHP memory quantity (expected a whole number with an optional \
+             K, M or G suffix, e.g. \"512M\", or -1 for no limit)"
+        ));
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .map(Some)
+        .ok_or_else(|| format!("{raw:?} is too large"))
+}
+
+/// Format a byte count as a PHP memory quantity, in the largest unit that
+/// represents it exactly.
+#[must_use]
+pub fn format_php_memory_quantity(bytes: u64) -> String {
+    for (unit, suffix) in [(1024 * MIB, 'G'), (MIB, 'M'), (1024, 'K')] {
+        if bytes != 0 && bytes.is_multiple_of(unit) {
+            return format!("{}{suffix}", bytes / unit);
+        }
+    }
+    bytes.to_string()
+}
+
+/// Lower a (derived or default) `memory_limit` to `ceiling` bytes when it is
+/// above it or unlimited. A value this parser cannot read is returned as is;
+/// the engine-side check at startup still compares it with the ceiling.
+fn clamp_memory_limit(value: String, ceiling: Option<u64>) -> String {
+    let Some(max) = ceiling else {
+        return value;
+    };
+    match parse_php_memory_quantity(&value) {
+        Ok(Some(bytes)) if bytes <= max => value,
+        Ok(_) => format_php_memory_quantity(max),
+        Err(_) => value,
+    }
 }
 
 fn default_kv_memory_limit() -> String {
@@ -8471,7 +8648,8 @@ idle_timeout_secs = 15
         let config = Config::default_config().expect("default config should load");
         assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.php.max_execution_time, 30);
-        assert_eq!(config.php.memory_limit, "128M");
+        assert_eq!(config.php.memory_limit, None);
+        assert_eq!(config.php.memory_limit_max, None);
         assert_eq!(config.server.index_files, vec!["index.php", "index.html"]);
     }
 
@@ -8812,7 +8990,7 @@ ini_overrides = [["display_errors", "On"]]
         assert_eq!(config.server.document_root, PathBuf::from("/srv/app"));
         assert_eq!(config.server.index_files, vec!["app.php"]);
         assert_eq!(config.php.max_execution_time, 60);
-        assert_eq!(config.php.memory_limit, "256M");
+        assert_eq!(config.php.memory_limit.as_deref(), Some("256M"));
         assert_eq!(config.php.ini_overrides.len(), 1);
         assert_eq!(config.php.ini_overrides[0], ["display_errors", "On"]);
     }
@@ -8835,7 +9013,8 @@ listen = "127.0.0.1:3000"
         // Unspecified fields use defaults
         assert_eq!(config.server.document_root, PathBuf::from("."));
         assert_eq!(config.php.max_execution_time, 30);
-        assert_eq!(config.php.memory_limit, "128M");
+        assert_eq!(config.php.memory_limit, None);
+        assert_eq!(config.php.memory_limit_max, None);
     }
 
     #[test]
@@ -8871,7 +9050,7 @@ listen = "0.0.0.0:8080"
     fn test_env_var_override_without_file() {
         let _env = EnvVars::set("EPHPM_PHP__MEMORY_LIMIT", "256M");
         let config = Config::default_config().unwrap();
-        assert_eq!(config.php.memory_limit, "256M");
+        assert_eq!(config.php.memory_limit.as_deref(), Some("256M"));
     }
 
     // ── [db.sqlite] strict-key parsing ──────────────────────────────────
@@ -9046,6 +9225,8 @@ listen = "0.0.0.0:8080"
             // their default.
             ("[kv.snapshot]", "[kv.snapshot]\non_shutdwon = false\n", "on_shutdwon"),
             ("[php]", "[php]\nmemory_limits = \"256M\"\n", "memory_limits"),
+            // A misspelt ceiling must not silently leave tenants unbounded.
+            ("[php]", "[php]\nmax_memory_limit = \"256M\"\n", "max_memory_limit"),
             // A misspelt `debug_workers` must not silently leave the Xdebug
             // debug lane at its default.
             ("[php.worker]", "[php.worker]\ndebug_worker_cap = 2\n", "debug_worker_cap"),
@@ -11056,7 +11237,7 @@ eviction_policy = "lru"
         // ("stock default") tier of the three-tier resolver, so it used to be
         // filtered out of the generated php.ini as `Origin::Default`. Dev mode
         // derives nothing, so this is where the drop always bit.
-        let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
+        let cfg = PhpConfig { memory_limit: Some("512M".to_string()), ..PhpConfig::default() };
         let lines = cfg.opcache_ini_lines(true, false);
         assert!(
             lines.contains(&("memory_limit".to_string(), "512M".to_string())),
@@ -11080,21 +11261,106 @@ eviction_policy = "lru"
         );
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
     #[test]
-    fn test_memory_limit_emitted_in_serve_mode_without_memory_budget() {
-        // On hosts with no memory probe (macOS) `detect_memory_budget()` yields
-        // `None`, so serve mode derives no memory_limit and the configured
-        // value lands in the bottom tier — the second half of the same
-        // regression. Linux (cgroup/meminfo) and Windows (GlobalMemoryStatusEx)
-        // both detect a budget and therefore derive over it.
-        let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
-        let lines = cfg.opcache_ini_lines(false, false);
+    fn test_explicit_memory_limit_wins_in_serve_mode() {
+        // Regression (v0.13.0 RC stress, W2): an explicit `[php] memory_limit`
+        // used to sit in the bottom tier, under the derived value, so on every
+        // host with a detectable memory budget (Linux, Windows) serve mode
+        // silently replaced it — 15.9 GB per request on a 64 GB host.
+        let cfg = PhpConfig { memory_limit: Some("512M".to_string()), ..PhpConfig::default() };
+        let at = cfg.autotune(false, false);
+        assert_eq!(at.memory_limit.value, "512M");
+        assert_eq!(at.memory_limit.origin, Origin::Explicit);
+        let lines = at.ini_lines();
         assert!(
             lines.contains(&("memory_limit".to_string(), "512M".to_string())),
-            "serve-mode php.ini must carry [php] memory_limit when nothing is \
-             derived, got: {lines:?}"
+            "serve-mode php.ini must carry [php] memory_limit, got: {lines:?}"
         );
+        // php_memory_limit is the same setting and wins when both are set.
+        let both = PhpConfig {
+            memory_limit: Some("512M".to_string()),
+            php_memory_limit: Some("300M".to_string()),
+            ..PhpConfig::default()
+        };
+        assert_eq!(both.autotune(false, false).memory_limit.value, "300M");
+    }
+
+    #[test]
+    fn test_derived_memory_limit_never_exceeds_an_explicit_ceiling() {
+        // Whatever this host derives (>= 128M) or defaults to (128M), an
+        // explicit memory_limit_max below it wins — the narrower setting.
+        for dev in [false, true] {
+            let cfg =
+                PhpConfig { memory_limit_max: Some("64M".to_string()), ..PhpConfig::default() };
+            let at = cfg.autotune(dev, false);
+            assert_eq!(at.memory_limit.value, "64M", "dev={dev}");
+            assert_ne!(at.memory_limit.origin, Origin::Explicit);
+        }
+        // A ceiling above the derived/default value leaves it alone.
+        let cfg = PhpConfig { memory_limit_max: Some("-1".to_string()), ..PhpConfig::default() };
+        assert_eq!(cfg.autotune(true, false).memory_limit.value, "128M");
+    }
+
+    #[test]
+    fn test_parse_php_memory_quantity() {
+        assert_eq!(parse_php_memory_quantity("-1"), Ok(None));
+        assert_eq!(parse_php_memory_quantity(" -1 "), Ok(None));
+        assert_eq!(parse_php_memory_quantity("0"), Ok(Some(0)));
+        assert_eq!(parse_php_memory_quantity("1048576"), Ok(Some(MIB)));
+        assert_eq!(parse_php_memory_quantity("512k"), Ok(Some(512 * 1024)));
+        assert_eq!(parse_php_memory_quantity("256M"), Ok(Some(256 * MIB)));
+        assert_eq!(parse_php_memory_quantity("2g"), Ok(Some(2048 * MIB)));
+        for bad in
+            ["", "M", "-2", "-1M", "128MB", "1.5G", "0x10M", "12 M", "abc", "99999999999999G"]
+        {
+            assert!(parse_php_memory_quantity(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_format_and_clamp_memory_limit() {
+        assert_eq!(format_php_memory_quantity(2048 * MIB), "2G");
+        assert_eq!(format_php_memory_quantity(768 * MIB), "768M");
+        assert_eq!(format_php_memory_quantity(1536), "1536");
+        assert_eq!(format_php_memory_quantity(3 * 1024), "3K");
+        assert_eq!(clamp_memory_limit("1024M".into(), Some(256 * MIB)), "256M");
+        assert_eq!(clamp_memory_limit("-1".into(), Some(256 * MIB)), "256M");
+        assert_eq!(clamp_memory_limit("128M".into(), Some(256 * MIB)), "128M");
+        assert_eq!(clamp_memory_limit("1024M".into(), None), "1024M");
+    }
+
+    #[test]
+    fn test_memory_limit_max_validation() {
+        let validate = |php: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("ephpm.toml");
+            std::fs::write(&file, format!("[php]\n{php}")).unwrap();
+            Config::load(&file).and_then(|c| c.validate().map(|()| c))
+        };
+        let ok = validate("memory_limit_max = \"512M\"\n").expect("valid ceiling");
+        assert_eq!(ok.php.memory_limit_max.as_deref(), Some("512M"));
+        assert_eq!(ok.php.memory_limit_ceiling_bytes(), Some(512 * MIB));
+        validate("memory_limit_max = \"-1\"\nmemory_limit = \"-1\"\n").expect("no ceiling");
+        validate("memory_limit_max = \"256M\"\nmemory_limit = \"256M\"\n").expect("at ceiling");
+        validate("memory_limit_max = \"256M\"\nmemory_limit = \"128M\"\n").expect("below");
+
+        for (body, needle) in [
+            ("memory_limit_max = \"512MB\"\n", "memory_limit_max"),
+            ("memory_limit_max = \"lots\"\n", "memory_limit_max"),
+            ("memory_limit_max = \"256M\"\nmemory_limit = \"512M\"\n", "above"),
+            ("memory_limit_max = \"256M\"\nmemory_limit = \"-1\"\n", "above"),
+            ("memory_limit_max = \"256M\"\nphp_memory_limit = \"1G\"\n", "above"),
+        ] {
+            let err = validate(body).expect_err(body).to_string();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_derive_tuning_memory_limit_is_capped() {
+        // RC stress W2: 64 GB host, concurrency 4 derived 15,921M per request.
+        let d = derive_tuning(Some(32.0), Some(64 * 1024 * MIB), 4, false);
+        assert_eq!(d.memory_limit.as_deref(), Some("1024M"));
     }
 
     // --- Resource-aware autotuning: cgroup memory parsing ---

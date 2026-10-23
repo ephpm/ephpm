@@ -488,7 +488,8 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.tls.cache_dir` | path | `"certs"` | ACME certificate cache directory |
 | `server.tls.staging` | bool | `false` | Use Let's Encrypt staging environment |
 | `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds). Natively enforced (per-thread timer) on Linux ZTS builds — catchable fatal + 500, `set_time_limit()`-able, wall-clock; bounded by `server.timeouts.request`. See [Signal Handling and `max_execution_time`](#signal-handling-and-max_execution_time). |
-| `php.memory_limit` | string | `"128M"` | PHP memory limit |
+| `php.memory_limit` | string | (derived in serve, `"128M"` in dev) | Per-request PHP memory limit; an explicit value wins in every mode |
+| `php.memory_limit_max` | string | (the startup `memory_limit`) | Ceiling on a script raising `memory_limit` at runtime (`ini_set` above it returns `false`) |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
 | `server.metrics.enabled` | bool | `false` | Prometheus metrics endpoint |
 | `server.metrics.path` | string | `"/metrics"` | Metrics endpoint path |

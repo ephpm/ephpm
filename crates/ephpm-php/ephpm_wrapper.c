@@ -3795,6 +3795,135 @@ static void ephpm_lock_hard_limit_ini(void)
     }
 }
 
+/* [php] memory_limit_max: a ceiling on raising `memory_limit` after startup.
+ *
+ * memory_limit is PHP_INI_ALL upstream, and PHP's hard limit
+ * (memory_hard_limit_percent, PHP 8.3.36 / 8.4.27 / 8.5.12) is derived from it,
+ * so a tenant that runs ini_set('memory_limit', '-1') lifts both and can
+ * allocate until the host runs out. Unlike memory_hard_limit_percent the entry
+ * cannot simply be made system-only: applications legitimately lower it and
+ * raise it again (WordPress raises admin requests to 256M). So the entry's
+ * on_modify handler is wrapped instead: a change at RUNTIME (ini_set,
+ * ini_restore), HTACCESS, or ACTIVATE (the per-request channel,
+ * ephpm_request_ini_apply) whose value is above the ceiling is refused —
+ * on_modify returns FAILURE, so ini_set() returns false and the entry keeps its
+ * value. STARTUP (php.ini: the generated one, [php] ini_file, ini_overrides),
+ * SHUTDOWN and DEACTIVATE (zend_ini_deactivate restoring the startup value)
+ * pass through untouched.
+ *
+ * The requested value is parsed with zend_ini_parse_uquantity, the parser
+ * PHP's own OnChangeMemoryLimit uses (its _warn variant), so the number
+ * compared is exactly the number PHP would apply: "-1" parses to
+ * ZEND_ULONG_MAX and is therefore above any finite ceiling; a NULL value means
+ * 1 GiB, as in OnChangeMemoryLimit.
+ *
+ * The ceiling is the raw string handed over by ephpm_set_memory_limit_max()
+ * before module startup, or — when none was — the memory_limit PHP started
+ * with. A ceiling of -1 (or a startup memory_limit of -1 with no explicit
+ * ceiling) disables the check. Not in `ephpm php` (g_cli_mode): the CLI runs
+ * the operator's own script, as php-cli does, and composer needs -1.
+ *
+ * Installed from this module's MINIT, like ephpm_lock_hard_limit_ini, so every
+ * ZTS thread's copy of the entry (zend_copy_ini_directives) carries the
+ * wrapper. The globals below are written once on the single-threaded startup
+ * path, before any request thread exists, and only read afterwards. */
+static char *g_memory_limit_max_raw = NULL;
+static ZEND_INI_MH((*g_memory_limit_orig_on_modify)) = NULL;
+static zend_ulong g_memory_limit_startup = 0;
+static zend_ulong g_memory_limit_ceiling = 0;
+static int g_memory_limit_ceiling_active = 0;
+
+/* Record the operator's [php] memory_limit_max (PHP quantity syntax) for the
+ * MINIT below. Must be called before php_embed_init(); NULL restores the
+ * default (the startup memory_limit). Returns 0 on success, -1 when the copy
+ * could not be allocated. */
+int ephpm_set_memory_limit_max(const char *value)
+{
+    free(g_memory_limit_max_raw);
+    g_memory_limit_max_raw = NULL;
+    if (!value) {
+        return 0;
+    }
+    g_memory_limit_max_raw = ephpm_strdup_malloc(value);
+    return g_memory_limit_max_raw ? 0 : -1;
+}
+
+/* Parse a memory quantity exactly as OnChangeMemoryLimit does, minus the
+ * warning. A NULL value is OnChangeMemoryLimit's "effectively no limit". */
+static zend_ulong ephpm_parse_memory_quantity(zend_string *value)
+{
+    if (!value) {
+        return (zend_ulong)1 << 30;
+    }
+    zend_string *errstr = NULL;
+    zend_ulong bytes = zend_ini_parse_uquantity(value, &errstr);
+    if (errstr) {
+        zend_string_release(errstr);
+    }
+    return bytes;
+}
+
+static ZEND_INI_MH(ephpm_on_modify_memory_limit)
+{
+    if (g_memory_limit_ceiling_active
+        && (stage & (ZEND_INI_STAGE_RUNTIME | ZEND_INI_STAGE_HTACCESS | ZEND_INI_STAGE_ACTIVATE))) {
+        zend_ulong requested = ephpm_parse_memory_quantity(new_value);
+        if (requested > g_memory_limit_ceiling) {
+            if (g_log_sink) {
+                char msg[256];
+                int n = snprintf(msg, sizeof(msg),
+                    "ePHPm refused memory_limit=%.40s: above the server ceiling of "
+                    ZEND_ULONG_FMT " bytes ([php] memory_limit_max); the limit is unchanged",
+                    new_value ? ZSTR_VAL(new_value) : "(default)", g_memory_limit_ceiling);
+                if (n > 0) {
+                    g_log_sink(msg, strlen(msg));
+                }
+            }
+            return FAILURE;
+        }
+    }
+    return g_memory_limit_orig_on_modify(entry, new_value, mh_arg1, mh_arg2, mh_arg3, stage);
+}
+
+static void ephpm_bound_memory_limit_ini(void)
+{
+    if (g_cli_mode) {
+        return;
+    }
+    zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("memory_limit"));
+    if (!entry || !entry->on_modify || entry->on_modify == ephpm_on_modify_memory_limit) {
+        return;
+    }
+    g_memory_limit_startup = ephpm_parse_memory_quantity(entry->value);
+    if (g_memory_limit_max_raw) {
+        zend_string *raw = zend_string_init(g_memory_limit_max_raw, strlen(g_memory_limit_max_raw), 1);
+        g_memory_limit_ceiling = ephpm_parse_memory_quantity(raw);
+        zend_string_release(raw);
+    } else {
+        g_memory_limit_ceiling = g_memory_limit_startup;
+    }
+    g_memory_limit_ceiling_active = g_memory_limit_ceiling != ZEND_ULONG_MAX;
+    g_memory_limit_orig_on_modify = entry->on_modify;
+    entry->on_modify = ephpm_on_modify_memory_limit;
+}
+
+/* Report what ephpm_bound_memory_limit_ini found, for the startup check and
+ * log in Rust. Returns 1 when a ceiling is enforced (both out-params set),
+ * 0 when none is (no ceiling, CLI mode, engine not started). Values are bytes;
+ * a startup memory_limit of -1 reads as ULLONG_MAX. */
+int ephpm_memory_limit_bounds(unsigned long long *startup_bytes,
+                              unsigned long long *ceiling_bytes)
+{
+    if (startup_bytes) {
+        *startup_bytes = g_memory_limit_startup == ZEND_ULONG_MAX
+            ? ULLONG_MAX : (unsigned long long)g_memory_limit_startup;
+    }
+    if (ceiling_bytes) {
+        *ceiling_bytes = (unsigned long long)g_memory_limit_ceiling;
+    }
+    return g_memory_limit_ceiling_active;
+}
+
 static PHP_MINIT_FUNCTION(ephpm_worker)
 {
     (void)type;
@@ -3816,6 +3945,7 @@ static PHP_MINIT_FUNCTION(ephpm_worker)
     }
 
     ephpm_lock_hard_limit_ini();
+    ephpm_bound_memory_limit_ini();
 
     return SUCCESS;
 }
