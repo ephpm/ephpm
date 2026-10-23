@@ -564,8 +564,11 @@ impl Store {
         out
     }
 
-    /// The current replicable state of one field (see [`HashFieldState`]).
-    fn hash_field_state(&self, key: &str, field: &str) -> HashFieldState {
+    /// The current replicable state of one field (see [`HashFieldState`]),
+    /// read from **this node's** map only — what the cluster data plane
+    /// answers a peer that asks for the field.
+    #[must_use]
+    pub fn hash_field_state(&self, key: &str, field: &str) -> HashFieldState {
         let now = Instant::now();
         let remaining = |at: Option<Instant>| at.map(|at| at.saturating_duration_since(now));
         let Some(h) = self.hashes.get(key) else {
@@ -727,6 +730,23 @@ impl Store {
     /// Delete several fields (`HDEL`). Returns how many live fields were
     /// removed; an emptied hash stops existing.
     pub fn hdel_many(&self, key: &str, fields: &[&str]) -> usize {
+        self.hdel_fields(key, fields, false)
+    }
+
+    /// `HDEL` as a client should see it in a cluster: the named fields are
+    /// first made current ([`prepare_hash_fields`](Self::prepare_hash_fields)),
+    /// so the count is right on a node still catching up after a restart.
+    /// When they cannot be, the delete still happens — a delete does not
+    /// depend on the old value — but a tombstone is published for **every**
+    /// named field, including ones this node has not received yet (a plain
+    /// local delete would skip those, and they would survive on the peers).
+    /// The count is then this node's local view.
+    pub fn hdel_through(&self, key: &str, fields: &[&str]) -> usize {
+        let publish_absent = self.prepare_hash_fields(key, fields).is_err();
+        self.hdel_fields(key, fields, publish_absent)
+    }
+
+    fn hdel_fields(&self, key: &str, fields: &[&str], publish_absent: bool) -> usize {
         let mut removed = 0;
         for field in fields {
             let gone = self.replicated_field_op(key, field, || {
@@ -737,7 +757,7 @@ impl Store {
                         super::lazy_drop(old);
                         true
                     });
-                (gone, gone)
+                (gone, gone || publish_absent)
             });
             if gone == Some(true) {
                 removed += 1;

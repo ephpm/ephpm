@@ -12,7 +12,11 @@
 //!
 //! Every field item rides the **gossip** tier, which already reaches every
 //! node and has anti-entropy, so hash reads (`HGET`, `HGETALL`, ...) are
-//! answered locally on every node. A field value too large for a gossip
+//! answered locally on every node once it has caught up with its peers. A
+//! node still catching up after a (re)start resolves the named fields through
+//! its peers first (the data plane's stamped read answers a field's transport
+//! key from the hash), and refuses whole-hash commands until it has caught up
+//! (see `Replicator::resolve_hash_fields` / `resolve_hash_whole`). A field value too large for a gossip
 //! payload is refused at write time (see
 //! [`ephpm_kv::store::HashWriteError::TooLargeForCluster`]) rather than
 //! stored on one node only.

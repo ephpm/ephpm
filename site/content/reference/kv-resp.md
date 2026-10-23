@@ -84,15 +84,15 @@ fields must be valid UTF-8` and changes nothing. That includes a multi-key
 | | `SETEX key seconds value` | `seconds` must be positive and must not overflow, as for `SET EX`. |
 | | `SETNX key value` | `1` inserted, `0` existed, `-OOM` refused. In a cluster it is decided by the key's owner node (see [KV from PHP → Locks in a cluster](/guides/kv-from-php/#locks-in-a-cluster)); an unreachable owner answers `-CLUSTERDOWN …` (nothing written on this node; the owner may still have applied a request that timed out). The same applies to `SET … NX`. |
 | | `GETSET key value` | Clears any TTL, as in Redis. |
-| | `GETDEL key` | Returns the value and deletes the key; `nil` if missing. The read and the delete are one atomic step on this node. In a cluster the delete then replicates; a large value held only by other nodes is fetched and deleted cluster-wide, which is not atomic across nodes. |
+| | `GETDEL key` | Returns the value and deletes the key; `nil` if missing. The read and the delete are one atomic step on this node. In a cluster the delete then replicates (not atomic across nodes); like every read-modify-write it first [makes the key current](#read-modify-writes-in-a-cluster), so a large value held only by other nodes is returned and deleted cluster-wide. |
 | | `GETEX key [EX s \| PX ms \| EXAT unix-s \| PXAT unix-ms \| PERSIST]` | Returns the value and changes its expiry (no option: a plain `GET`). An `EXAT`/`PXAT` in the past deletes the key, as in Redis. Time errors are `ERR invalid expire time in 'getex' command`. |
 | | `MGET key...` / `MSET key value...` | `MSET` is **not atomic** under memory pressure: if a pair is refused with `-OOM`, earlier pairs stay written. |
 | | `INCR` / `DECR` / `INCRBY` / `DECRBY` | 64-bit signed. A result that would overflow is an error and leaves the value unchanged; `DECRBY key -9223372036854775808` is `ERR decrement would overflow`, as in Redis. Atomic on the node that runs them. In a cluster each increment replicates its resulting total, last writer wins, so concurrent increments on different nodes can overwrite rather than add: cluster-wide counts are approximate and can under-count. |
-| | `APPEND key value` | Creates the key if missing. In a cluster, an `APPEND` on a node that has no copy of a large value (one above `small_key_threshold`, held only by its replica set) answers `ERR APPEND to a large value this node does not hold is not supported in a cluster …` and writes nothing: creating the key from the appended bytes would replace the real value on every node. Run it on a node that holds the key, or rewrite the value with `SET`. |
-| | `STRLEN key` | Node-local: in a cluster a large value held only by other nodes reports `0`. |
+| | `APPEND key value` | Creates the key if missing. In a cluster it first [makes the key current](#read-modify-writes-in-a-cluster): on a node that holds no copy of a large value (one above `small_key_threshold`, held only by its replica set) the value is taken from the replicas, appended to, and replicated, as on a holder; when no replica answers it is refused with `-TRYAGAIN …` and nothing is written (creating the key from the appended bytes would replace the real value everywhere). |
+| | `STRLEN key` | On a node still catching up after a restart, answered from its peers' newest copy (like `GET`); otherwise node-local: in a cluster a large value held only by other nodes reports `0`. |
 | Keys | `DEL key...` / `UNLINK key...` | Identical. Removes the string and the hash of that name. Freeing a hash with many fields happens off the calling thread for both (Valkey 8's `lazyfree-lazy-user-del yes` behavior). |
 | | `DELIFEQ key token` | **ePHPm-specific.** Deletes `key` only while its value equals `token`; `1` or `0`. The safe lock-release primitive (pair with `SET key token NX PX ms`; extend with `SET key token IFEQ token PX ms`). Owner-decided in a cluster, like `SETNX`; an unreachable owner answers `-CLUSTERDOWN …`. |
-| | `EXISTS key...` | Counts strings and hashes. |
+| | `EXISTS key...` | Counts strings and hashes. On a node still catching up after a restart, a string key's existence is answered by its peers, like `GET`. |
 | | `EXPIRE key s` / `PEXPIRE key ms` | Positive values only. `EXPIRE key 0` (or negative) is `ERR invalid expire time in 'expire' command`; Redis would delete the key. A value so large the expiry time overflows is the same error, as in Redis. Options (`NX`/`XX`/`GT`/`LT`) are ignored. Works on hashes too (the whole-key expiry). |
 | | `EXPIREAT key unix-s` / `PEXPIREAT key unix-ms` | Absolute expiry. A time at or before now deletes the key and returns `1` (as in Redis). Options are ignored. |
 | | `TTL` / `PTTL` / `PERSIST` | `-2` missing, `-1` no TTL. A hash reports (or removes) its whole-key expiry; field expiries are read with `HTTL`. |
@@ -144,7 +144,8 @@ replicated item on the gossip tier, ordered last-writer-wins by its own stamp.
 Two nodes writing different fields of one hash at the same time both win; two
 nodes writing the same field converge on the later write. Field TTLs and the
 hash key's TTL travel with every field, so a node that joins later converges
-too. Every node holds every field, so hash reads never leave the node.
+too. Every node holds every field, so once a node has caught up with its peers
+hash reads never leave the node (see below for a node that has just started).
 
 Because a field rides a gossip datagram, a clustered hash field value is
 limited to `[cluster.kv] small_key_threshold` minus a 17-byte header (495 bytes
@@ -157,6 +158,59 @@ each field this node knows, so a node that joins later does not resurrect it.
 A field written concurrently on another node that had not reached the deleting
 node yet survives the delete, the same per-write window as everything else in
 this tier.
+
+### Read-modify-writes in a cluster
+
+A command that reads a key to decide what to write — `INCR`/`DECR`/`INCRBY`/`DECRBY`,
+`APPEND`, `GETSET`, `SET … GET|XX|KEEPTTL`, `GETDEL`, `GETEX` with an option,
+`EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, `RENAME`, and every hash
+command that names fields (`HSET`, `HSETNX`, `HINCRBY`, `HINCRBYFLOAT`,
+`HEXPIRE`…, `HPERSIST`) — publishes its result with a fresh stamp, which then
+wins on every node. Computed from a copy that is stale or missing, that result
+overwrites newer data cluster-wide: a counter reset to `1`, a large value
+replaced by an appended tail, a TTL change that drops the value. Two
+situations make a node's copy unfit:
+
+- **The node is catching up after a (re)start** (the [catch-up gate](/architecture/kv-store/#tier-1--gossip-backed-small-values)
+  is cold): its copy may be one a peer has superseded, or not have arrived
+  yet. The command first asks every alive peer for its copy, stamp and TTL
+  and installs the newest locally (or drops a local copy no peer holds) —
+  what gossip would have delivered — then runs. Keys this node wrote since it
+  started are already current. One data-plane round trip per command while
+  cold; nothing once caught up.
+- **The key is a large value held only by its replica set**, and this node
+  holds no copy: a local miss is not proof of absence. The command asks the
+  replicas first (free when this node is one of them, or the only node alive)
+  and runs on their copy, keeping its TTL; the result replicates to the
+  replica set like any large write. This costs a round trip on every such
+  command that **misses** locally — `INCR` creating a counter included — the
+  same as a `GET` miss.
+
+When no peer that could hold the key answers, the command is **refused** with
+`-TRYAGAIN this node cannot establish the key's current value right now …` and
+nothing is written anywhere — a client retry is safe (logged at `WARN` once,
+then `DEBUG`). Plain reads and blind writes are never refused: `GET`/`MGET`,
+`EXISTS`, `STRLEN`, `TTL`/`PTTL`/`EXPIRETIME` answer from the peers while
+cold and as a miss when none answers; `SET` (without `GET`/`XX`/`KEEPTTL`),
+`SETEX`, `MSET`, `DEL` and `HDEL` write without reading. `HDEL` resolves the
+named fields for its count, and when it cannot it still deletes, publishing a
+tombstone for every named field including ones this node has not received.
+`SETNX`, `SET … NX|IFEQ` and `DELIFEQ` are decided by the key's owner node and
+unaffected.
+
+Hash fields are all on every node, so only a node catching up has anything to
+resolve: per-field reads (`HGET`, `HMGET`, `HEXISTS`, `HSTRLEN`, `HTTL`…) ask
+the peers for the named fields and answer a field they cannot establish as a
+miss; per-field writes ask first and are refused when they cannot. Commands
+over the **whole** hash — `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HSCAN`, and
+`EXPIRE`/`PERSIST` of a hash key — are refused with `-TRYAGAIN` until the node
+has caught up: which fields exist cannot be learned without every peer's
+deleted fields, which leave nothing to list, and a union of the peers' fields
+would resurrect deleted ones.
+
+Still served from the local copy while catching up, and possibly lagging:
+`EXISTS`/`TYPE`/`TTL` of a key that is a hash, `DEL` of a hash (it retracts
+only the fields this node has received), and `SCAN`/`KEYS`/`DBSIZE`/`INFO`.
 
 Before v0.13, hash writes were node-local in a cluster. During a rolling
 upgrade, nodes still on an older version store replicated fields as stray

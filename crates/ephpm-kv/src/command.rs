@@ -10,13 +10,20 @@ use tracing::debug;
 
 use crate::resp::Frame;
 use crate::store::{
-    ExpireCondition, GetExpiry, KeyKind, OOM_ERROR, OWNER_UNREACHABLE_ERROR, SetIfEqOutcome,
-    SetNxOutcome, SetTtl, Store,
+    ExpireCondition, GetExpiry, KEY_UNAVAILABLE_ERROR, KeyKind, OOM_ERROR, OWNER_UNREACHABLE_ERROR,
+    SetIfEqOutcome, SetNxOutcome, SetTtl, Store,
 };
 
 /// Error frame for a write refused by the memory budget (Redis `-OOM`).
 fn oom() -> Frame {
     Frame::error(OOM_ERROR)
+}
+
+/// Error frame for an operation refused because this cluster node could not
+/// establish the key's current value (`-TRYAGAIN`, nothing changed). See
+/// [`crate::store::Resolved`].
+fn unavailable() -> Frame {
+    Frame::error(KEY_UNAVAILABLE_ERROR)
 }
 
 /// Early-return an error frame if `argv` has fewer than `n` elements.
@@ -274,14 +281,17 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "STRLEN" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
-            match store.get(&key) {
-                Some(v) => Frame::integer(i64::try_from(v.len()).unwrap_or(i64::MAX)),
-                None => Frame::integer(0),
-            }
+            Frame::integer(i64::try_from(store.strlen_through(&key)).unwrap_or(i64::MAX))
         }
         "GETSET" => {
             check_args!(cmd, argv, 2);
             let key = key!(argv[0]);
+            // The reply is the value replaced: make the local copy current
+            // first (a cluster node catching up, or outside a large value's
+            // replica set, may hold a stale copy or none).
+            if store.prepare_update(&key).is_err() {
+                return unavailable();
+            }
             let old = store.get(&key);
             if !store.set(key, argv[1].to_vec(), None) {
                 return oom();
@@ -295,7 +305,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "GETDEL" => {
             check_args_exact!(cmd, argv, 1);
             let key = key!(argv[0]);
-            store.getdel(&key).map_or(Frame::Null, Frame::bulk)
+            match store.getdel(&key) {
+                Ok(value) => value.map_or(Frame::Null, Frame::bulk),
+                Err(_) => unavailable(),
+            }
         }
         "GETEX" => cmd_getex(store, argv),
 
@@ -340,7 +353,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_keys!(argv.iter());
             let count: i64 = argv
                 .iter()
-                .filter(|k| store.exists(&str_from(k)))
+                .filter(|k| store.exists_through(&str_from(k)))
                 .count()
                 .try_into()
                 .unwrap_or(i64::MAX);
@@ -353,8 +366,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 Ok(ttl) => ttl,
                 Err(f) => return f,
             };
-            let ok = store.expire(&key, ttl);
-            Frame::integer(i64::from(ok))
+            match store.try_expire(&key, ttl) {
+                Ok(ok) => Frame::integer(i64::from(ok)),
+                Err(_) => unavailable(),
+            }
         }
         "PEXPIRE" => {
             check_args!(cmd, argv, 2);
@@ -363,8 +378,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 Ok(ttl) => ttl,
                 Err(f) => return f,
             };
-            let ok = store.expire(&key, ttl);
-            Frame::integer(i64::from(ok))
+            match store.try_expire(&key, ttl) {
+                Ok(ok) => Frame::integer(i64::from(ok)),
+                Err(_) => unavailable(),
+            }
         }
         "EXPIREAT" | "PEXPIREAT" => {
             check_args!(cmd, argv, 2);
@@ -381,19 +398,22 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             match at {
                 // A time already past deletes the key, as Redis does.
                 AbsoluteTtl::Passed => {
-                    let existed = store.exists(&key);
+                    let existed = store.exists_through(&key);
                     if existed {
                         store.remove(&key);
                     }
                     Frame::integer(i64::from(existed))
                 }
-                AbsoluteTtl::After(ttl) => Frame::integer(i64::from(store.expire(&key, ttl))),
+                AbsoluteTtl::After(ttl) => match store.try_expire(&key, ttl) {
+                    Ok(ok) => Frame::integer(i64::from(ok)),
+                    Err(_) => unavailable(),
+                },
             }
         }
         "EXPIRETIME" | "PEXPIRETIME" => {
             check_args_exact!(cmd, argv, 1);
             let key = key!(argv[0]);
-            match store.expire_time_ms(&key) {
+            match store.expire_time_ms_through(&key) {
                 None => Frame::integer(-2),
                 Some(-1) => Frame::integer(-1),
                 Some(ms) if cmd == "PEXPIRETIME" => Frame::integer(ms),
@@ -403,7 +423,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "TTL" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
-            match store.pttl(&key) {
+            match store.pttl_through(&key) {
                 Some(ms) if ms >= 0 => Frame::integer(ms / 1000),
                 Some(ms) => Frame::integer(ms), // -1 or -2
                 None => Frame::integer(-2),
@@ -412,7 +432,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "PTTL" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
-            match store.pttl(&key) {
+            match store.pttl_through(&key) {
                 Some(ms) => Frame::integer(ms),
                 None => Frame::integer(-2),
             }
@@ -420,14 +440,17 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "PERSIST" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
-            Frame::integer(i64::from(store.persist(&key)))
+            match store.try_persist(&key) {
+                Ok(removed) => Frame::integer(i64::from(removed)),
+                Err(_) => unavailable(),
+            }
         }
         "TYPE" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
             if store.is_hash(&key) {
                 Frame::Simple("hash".into())
-            } else if store.exists(&key) {
+            } else if store.exists_through(&key) {
                 Frame::Simple("string".into())
             } else {
                 Frame::Simple("none".into())
@@ -437,6 +460,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args!(cmd, argv, 2);
             let old_key = key!(argv[0]);
             let new_key = key!(argv[1]);
+            // Copies the value: make the local copy of the source current.
+            if store.prepare_update(&old_key).is_err() {
+                return unavailable();
+            }
             match store.get(&old_key) {
                 Some(val) => {
                     // Preserve TTL if present
@@ -485,6 +512,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             let pairs: Vec<(String, &[u8])> =
                 argv[1..].chunks(2).map(|pair| (str_from(pair[0]), pair[1])).collect();
             let pairs: Vec<(&str, &[u8])> = pairs.iter().map(|(f, v)| (f.as_str(), *v)).collect();
+            let names: Vec<&str> = pairs.iter().map(|(f, _)| *f).collect();
+            if store.prepare_hash_fields(&key, &names).is_err() {
+                return unavailable();
+            }
             // Under memory pressure a refused field returns `-OOM` and stops,
             // so earlier fields may already be stored — the same best-effort
             // contract as MSET. A value too large for a clustered hash field
@@ -501,6 +532,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args_exact!(cmd, argv, 3);
             let key = key!(argv[0]);
             let field = key!(argv[1]);
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return unavailable();
+            }
             match store.hsetnx(&key, &field, argv[2]) {
                 Ok(set) => Frame::integer(i64::from(set)),
                 Err(e) => Frame::error(e.to_string()),
@@ -512,6 +546,11 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_keys!(argv[1..].iter());
             let fields: Vec<String> = argv[1..].iter().map(|f| str_from(f)).collect();
             let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            // A read: fields whose current value cannot be established are
+            // answered as misses, as `GET` answers then.
+            if store.prepare_hash_fields(&key, &fields).is_err() {
+                return Frame::Array(vec![Frame::Null; fields.len()]);
+            }
             Frame::Array(
                 store
                     .hmget(&key, &fields)
@@ -528,6 +567,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 Ok(v) => v,
                 Err(f) => return f,
             };
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return unavailable();
+            }
             match store.hincr_by(&key, &field, delta) {
                 Ok(v) => Frame::integer(v),
                 Err(e) => Frame::error(e),
@@ -540,6 +582,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             let Some(delta) = crate::store::parse_float(argv[2]) else {
                 return Frame::error("ERR value is not a valid float");
             };
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return unavailable();
+            }
             match store.hincr_by_float(&key, &field, delta) {
                 Ok(v) => Frame::bulk(v.into_bytes()),
                 Err(e) => Frame::error(e),
@@ -549,6 +594,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args_exact!(cmd, argv, 2);
             let key = key!(argv[0]);
             let field = key!(argv[1]);
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return Frame::integer(0);
+            }
             Frame::integer(i64::try_from(store.hstrlen(&key, &field)).unwrap_or(i64::MAX))
         }
         "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" => cmd_hexpire(store, cmd, argv),
@@ -560,6 +608,15 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 Err(e) => return e,
             };
             let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            if store.prepare_hash_fields(&key, &fields).is_err() {
+                // HPERSIST writes; the others read, and answer "no such
+                // field" (-2) for a field they cannot establish.
+                return if cmd == "HPERSIST" {
+                    unavailable()
+                } else {
+                    Frame::Array(vec![Frame::integer(-2); fields.len()])
+                };
+            }
             let codes = match cmd {
                 "HPERSIST" => store.hpersist(&key, &fields),
                 "HPTTL" => store.hpttl(&key, &fields),
@@ -575,6 +632,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args!(cmd, argv, 2);
             let key = key!(argv[0]);
             let field = key!(argv[1]);
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return Frame::Null;
+            }
             match store.hget(&key, &field) {
                 Some(v) => Frame::bulk(v),
                 None => Frame::Null,
@@ -586,17 +646,18 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             }
             let key = key!(argv[0]);
             check_keys!(argv[1..].iter());
-            let removed: i64 = argv[1..]
-                .iter()
-                .filter(|f| store.hdel(&key, &str_from(f)))
-                .count()
-                .try_into()
-                .unwrap_or(i64::MAX);
-            Frame::integer(removed)
+            let fields: Vec<String> = argv[1..].iter().map(|f| str_from(f)).collect();
+            let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+            // Cluster-aware: never refused (a delete does not depend on the
+            // old value), and never skips a field this node has not received.
+            Frame::integer(i64::try_from(store.hdel_through(&key, &fields)).unwrap_or(i64::MAX))
         }
         "HGETALL" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
+            if store.prepare_hash_whole(&key).is_err() {
+                return unavailable();
+            }
             let pairs = store.hgetall(&key);
             let mut frames = Vec::with_capacity(pairs.len() * 2);
             for (field, value) in pairs {
@@ -608,24 +669,36 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "HKEYS" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
+            if store.prepare_hash_whole(&key).is_err() {
+                return unavailable();
+            }
             let keys = store.hkeys(&key);
             Frame::Array(keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect())
         }
         "HVALS" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
+            if store.prepare_hash_whole(&key).is_err() {
+                return unavailable();
+            }
             let vals = store.hvals(&key);
             Frame::Array(vals.into_iter().map(Frame::bulk).collect())
         }
         "HLEN" => {
             check_args!(cmd, argv, 1);
             let key = key!(argv[0]);
+            if store.prepare_hash_whole(&key).is_err() {
+                return unavailable();
+            }
             Frame::integer(i64::try_from(store.hlen(&key)).unwrap_or(i64::MAX))
         }
         "HEXISTS" => {
             check_args!(cmd, argv, 2);
             let key = key!(argv[0]);
             let field = key!(argv[1]);
+            if store.prepare_hash_fields(&key, &[&field]).is_err() {
+                return Frame::integer(0);
+            }
             Frame::integer(i64::from(store.hexists(&key, &field)))
         }
 
@@ -771,6 +844,13 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         SetCondition::Nx => set_nx(store, key, val, expiry, get),
         SetCondition::IfEq(expected) => set_if_eq(store, key, &expected, val, expiry, get),
         SetCondition::None | SetCondition::Xx => {
+            // GET, XX and KEEPTTL read the key before writing it: make the
+            // local copy current first. A plain SET is a blind write.
+            if (get || cond == SetCondition::Xx || expiry == SetExpiry::Keep)
+                && store.prepare_update(&key).is_err()
+            {
+                return unavailable();
+            }
             let old = store.get(&key);
             // XX: set only if the key exists.
             if cond == SetCondition::Xx && old.is_none() {
@@ -918,10 +998,13 @@ fn cmd_getex(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         _ => return Frame::error("ERR syntax error"),
     };
     let value = match expiry {
-        None => store.get_through(&key),
+        None => Ok(store.get_through(&key)),
         Some(expiry) => store.getex(&key, expiry),
     };
-    value.map_or(Frame::Null, Frame::bulk)
+    match value {
+        Ok(value) => value.map_or(Frame::Null, Frame::bulk),
+        Err(_) => unavailable(),
+    }
 }
 
 /// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`. See
@@ -966,6 +1049,9 @@ fn cmd_hscan(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         Ok(o) => o,
         Err(f) => return f,
     };
+    if store.prepare_hash_whole(&key).is_err() {
+        return unavailable();
+    }
     let mut items = Vec::new();
     if cursor == 0 {
         for (field, value) in store.hscan(&key, pattern.as_deref()) {
@@ -1058,6 +1144,9 @@ fn cmd_hexpire(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         Err(e) => return e,
     };
     let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+    if store.prepare_hash_fields(&key, &fields).is_err() {
+        return unavailable();
+    }
     let codes = store.hexpire(&key, &fields, remaining, cond);
     Frame::Array(codes.into_iter().map(Frame::integer).collect())
 }
@@ -2372,15 +2461,118 @@ mod tests {
         assert_eq!(cmd(&s, &["HSET", "h", "small", "ok"]), Frame::integer(1));
     }
 
-    /// APPEND on a cluster node with no copy of a large key held elsewhere is
-    /// an error reply, not a create that would replace the value everywhere.
+    /// A replicator standing in for a cluster node that cannot establish any
+    /// key's current value: every resolution answers `Unavailable`, and the
+    /// node is warm for plain reads.
+    #[derive(Debug)]
+    struct Unresolvable;
+    impl crate::store::Replicator for Unresolvable {
+        fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
+            panic!("a refused operation must not write");
+        }
+        fn replicate_remove(&self, _: &str) -> bool {
+            true
+        }
+        fn replicate_expire(&self, _: &str, _: Duration) -> bool {
+            panic!("a refused operation must not change an expiry");
+        }
+        fn replicate_published(&self, _: String, _: Vec<u8>, _: Option<Duration>) {
+            panic!("a refused operation must not publish");
+        }
+        fn replicate_remove_published(&self, _: String) {}
+        fn replicate_hash_field(
+            &self,
+            _: &str,
+            _: &str,
+            _: &mut dyn FnMut() -> Option<crate::store::HashFieldState>,
+        ) -> bool {
+            panic!("a refused hash operation must not write a field");
+        }
+        fn resolve_for_update(&self, _: &str, _: bool) -> crate::store::Resolved {
+            crate::store::Resolved::Unavailable
+        }
+        fn resolve_hash_fields(&self, _: &str, _: &[&str]) -> crate::store::Resolved {
+            crate::store::Resolved::Unavailable
+        }
+        fn resolve_hash_whole(&self, _: &str) -> crate::store::Resolved {
+            crate::store::Resolved::Unavailable
+        }
+    }
+
+    /// When a cluster node cannot establish a key's current value, every
+    /// read-modify-write is refused with `TRYAGAIN` and changes nothing —
+    /// computing from its own copy would publish a result that overwrites
+    /// newer data everywhere (a counter reset, a large value replaced by an
+    /// appended tail, a TTL change dropping the value). Blind writes still
+    /// run, and per-field hash reads answer as misses, the way `GET` does.
     #[test]
-    fn append_to_a_key_held_elsewhere_is_an_error() {
+    fn unresolvable_keys_refuse_read_modify_writes_and_miss_on_field_reads() {
+        let s = store();
+        // Seed through the local paths, before the replicator is installed.
+        s.set("n".into(), b"5".to_vec(), None);
+        s.set("s".into(), b"abc".to_vec(), None);
+        s.hset("h", "f", b"v".to_vec()).unwrap();
+        s.set_replicator(Some(Arc::new(Unresolvable)));
+
+        for args in [
+            &["INCR", "n"][..],
+            &["DECRBY", "n", "2"],
+            &["APPEND", "s", "x"],
+            &["GETSET", "s", "y"],
+            &["GETDEL", "s"],
+            &["GETEX", "s", "EX", "10"],
+            &["GETEX", "s", "PERSIST"],
+            &["SET", "s", "z", "GET"],
+            &["SET", "s", "z", "XX"],
+            &["SET", "s", "z", "KEEPTTL"],
+            &["EXPIRE", "s", "10"],
+            &["PEXPIREAT", "s", "99999999999999"],
+            &["PERSIST", "s"],
+            &["RENAME", "s", "t"],
+            &["HSET", "h", "f", "w"],
+            &["HSETNX", "h", "g", "w"],
+            &["HINCRBY", "h", "c", "1"],
+            &["HINCRBYFLOAT", "h", "c", "1.5"],
+            &["HEXPIRE", "h", "10", "FIELDS", "1", "f"],
+            &["HPERSIST", "h", "FIELDS", "1", "f"],
+            &["HGETALL", "h"],
+            &["HKEYS", "h"],
+            &["HVALS", "h"],
+            &["HLEN", "h"],
+            &["HSCAN", "h", "0"],
+        ] {
+            let reply = cmd(&s, args);
+            assert_eq!(err_text(&reply), crate::store::KEY_UNAVAILABLE_ERROR, "{args:?}");
+        }
+        assert_eq!(s.get("n").as_deref(), Some(&b"5"[..]), "nothing changed");
+        assert_eq!(s.get("s").as_deref(), Some(&b"abc"[..]), "nothing changed");
+        assert_eq!(s.pttl("s"), Some(-1), "no expiry was set");
+        assert_eq!(s.hget("h", "f").as_deref(), Some(&b"v"[..]), "nothing changed");
+        assert_eq!(s.get("t"), None, "RENAME wrote nothing");
+
+        // Per-field reads answer as misses rather than serve a field of
+        // unknown freshness.
+        assert_eq!(cmd(&s, &["HGET", "h", "f"]), Frame::Null);
+        assert_eq!(cmd(&s, &["HMGET", "h", "f", "g"]), Frame::Array(vec![Frame::Null; 2]));
+        assert_eq!(cmd(&s, &["HEXISTS", "h", "f"]), Frame::integer(0));
+        assert_eq!(cmd(&s, &["HSTRLEN", "h", "f"]), Frame::integer(0));
+        assert_eq!(
+            cmd(&s, &["HPTTL", "h", "FIELDS", "1", "f"]),
+            Frame::Array(vec![Frame::integer(-2)])
+        );
+        // Blind writes are not read-modify-writes and still run.
+        assert_eq!(cmd(&s, &["DEL", "n"]), Frame::integer(1));
+    }
+
+    /// A resolution that answers `Current` (the default, and a warm cluster
+    /// node holding the key) changes nothing about the commands' results.
+    #[test]
+    fn resolvable_keys_run_as_before() {
         #[derive(Debug)]
-        struct HeldElsewhere;
-        impl crate::store::Replicator for HeldElsewhere {
+        struct Local(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::store::Replicator for Local {
             fn replicate_set(&self, _: String, _: Vec<u8>, _: Option<Duration>) -> bool {
-                panic!("APPEND must not write when the key is held elsewhere");
+                true
             }
             fn replicate_remove(&self, _: &str) -> bool {
                 true
@@ -2399,16 +2591,24 @@ mod tests {
                 let _ = apply();
                 true
             }
-            fn fetch_through(&self, _: &str) -> Option<Vec<u8>> {
-                Some(b"the real large value".to_vec())
+            fn resolve_for_update(&self, _: &str, _: bool) -> crate::store::Resolved {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::store::Resolved::Current
             }
         }
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let s = store();
-        s.set_replicator(Some(Arc::new(HeldElsewhere)));
-        assert_eq!(
-            err_text(&cmd(&s, &["APPEND", "big", "x"])),
-            crate::store::APPEND_HELD_ELSEWHERE_ERROR
-        );
-        assert_eq!(s.get("big"), None, "nothing created locally");
+        s.set_replicator(Some(Arc::new(Local(Arc::clone(&asked)))));
+        assert_eq!(cmd(&s, &["INCR", "n"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["APPEND", "n", "0"]), Frame::integer(2));
+        assert_eq!(bulk_str(&cmd(&s, &["GETSET", "n", "x"])), Some("10"));
+        // (This fake publishes nowhere and materializes nothing, so the GETSET
+        // above left the local copy at "10".)
+        assert_eq!(bulk_str(&cmd(&s, &["SET", "n", "y", "GET"])), Some("10"));
+        // A plain SET is blind: it never asks.
+        let before = asked.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cmd(&s, &["SET", "n", "z"]), Frame::ok());
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), before);
+        assert_eq!(before, 4, "every read-modify-write asked once");
     }
 }

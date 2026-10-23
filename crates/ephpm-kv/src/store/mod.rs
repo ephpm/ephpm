@@ -105,50 +105,27 @@ pub enum SetNxOutcome {
     OwnerUnreachable,
 }
 
-/// Error text for an `APPEND` refused because its key is a large value held
-/// only by other cluster nodes (see [`Store::try_append`]).
-pub const APPEND_HELD_ELSEWHERE_ERROR: &str = "ERR APPEND to a large value this node does not \
-     hold is not supported in a cluster (it would replace the value cluster-wide): run it on a \
-     node that holds the key, or rewrite it with SET";
-
 /// Why [`Store::try_append`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendError {
     /// The memory budget refused the write (Redis `-OOM`).
     OutOfMemory,
-    /// Clustered only: `key` is a large value held by other nodes and not
-    /// this one. See [`Store::try_append`].
-    HeldElsewhere,
+    /// Clustered only: the key's current value could not be established
+    /// ([`KeyUnavailable`]), so appending to this node's copy could replace
+    /// newer data cluster-wide. Nothing was changed.
+    Unavailable,
 }
 
 impl std::fmt::Display for AppendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::OutOfMemory => OOM_ERROR,
-            Self::HeldElsewhere => APPEND_HELD_ELSEWHERE_ERROR,
+            Self::Unavailable => KEY_UNAVAILABLE_ERROR,
         })
     }
 }
 
 impl std::error::Error for AppendError {}
-
-/// Warn once per process that an `APPEND` was refused because its key lives
-/// on other nodes, then log further refusals at DEBUG. The PHP bridge only
-/// sees `false`, so the operator needs one clear line saying why.
-fn log_append_held_elsewhere(key: &str) {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WARNED.swap(true, Ordering::Relaxed) {
-        debug!(key, "APPEND refused: large value held only by other nodes");
-        return;
-    }
-    tracing::warn!(
-        key,
-        "APPEND refused: the key is a large value held only by other cluster nodes, and \
-         creating it from the appended bytes alone would replace that value everywhere. RESP \
-         clients get an error and ephpm_kv_append() returns false. Further refusals are logged \
-         at DEBUG."
-    );
-}
 
 /// Redis Cluster-style error returned when a conditional write (`SETNX`,
 /// `SET … NX`, `DELIFEQ`) cannot reach the cluster node that owns its key.
@@ -189,10 +166,79 @@ pub enum ColdRead {
     /// Not intercepting: serve the local map (then fetch through on a miss).
     Warm,
     /// A peer's current value; serve it instead of anything held locally.
-    Found(Vec<u8>),
+    Found {
+        /// The value.
+        value: Vec<u8>,
+        /// Its remaining lifetime as the peer reported it; `None` = no
+        /// expiry (or a peer too old to report one).
+        ttl: Option<Duration>,
+    },
     /// No peer holds the key (or none could be asked): serve a miss rather
     /// than a local copy of unknown freshness.
     Absent,
+}
+
+/// What a [`Replicator`] answers when asked to make this node's copy of a
+/// key **current** before an operation that reads it to decide what to write
+/// — a read-modify-write such as `INCR`, `APPEND` or `EXPIRE`
+/// ([`Replicator::resolve_for_update`]), or a hash-field read or write
+/// ([`Replicator::resolve_hash_fields`], [`Replicator::resolve_hash_whole`]).
+///
+/// Two situations make a node's local copy unfit to compute from: it is
+/// still catching up with its peers after a (re)start (its copy may be one a
+/// peer has superseded, or missing), or the key is a large value that lives
+/// on its replica set only (a local miss is not proof of absence). A
+/// read-modify-write computed from such a copy publishes its result with a
+/// fresh stamp, which then wins everywhere — a counter reset to `1`, a large
+/// value replaced by an appended tail, a TTL change that drops the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// The local copy — or its absence — is the cluster's current state; it
+    /// may just have been refreshed from a peer. Run the operation locally.
+    Current,
+    /// The current state could not be established (no peer that could hold
+    /// it answered). The operation must not run.
+    Unavailable,
+}
+
+/// Error text for an operation refused because this node could not establish
+/// the key's current value ([`KeyUnavailable`]). `TRYAGAIN` is the Redis
+/// Cluster prefix for "retry later"; nothing was changed.
+pub const KEY_UNAVAILABLE_ERROR: &str = "TRYAGAIN this node cannot establish the key's current \
+     value right now (it is catching up with its peers after a restart, or the value lives on \
+     cluster nodes that did not answer); nothing was changed, retry";
+
+/// An operation was refused because this node could not establish the key's
+/// current value (see [`Resolved::Unavailable`]). Nothing was changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyUnavailable;
+
+impl std::fmt::Display for KeyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(KEY_UNAVAILABLE_ERROR)
+    }
+}
+
+impl std::error::Error for KeyUnavailable {}
+
+/// Warn once per process that an operation was refused with
+/// [`KeyUnavailable`], then log further refusals at DEBUG. The PHP bridge
+/// only sees `false`, so the operator needs one clear line saying why.
+fn log_key_unavailable(op: &str, key: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        debug!(op, key, "KV operation refused: the key's current value is unavailable");
+        return;
+    }
+    tracing::warn!(
+        op,
+        key,
+        "KV operation refused: this node could not establish the key's current value (it is \
+         catching up with its peers after a restart, or the value is a large one held by nodes \
+         that did not answer), and computing from its own copy could overwrite newer data \
+         cluster-wide. Nothing was changed: RESP clients get a TRYAGAIN error, the PHP \
+         functions return false. Further refusals are logged at DEBUG."
+    );
 }
 
 /// Where a [`Replicator`] says a conditional write must be decided.
@@ -644,6 +690,53 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
     fn cold_read(&self, key: &str) -> ColdRead {
         let _ = key;
         ColdRead::Warm
+    }
+
+    /// Make this node's copy of string `key` current before a
+    /// read-modify-write (`INCR`, `APPEND`, `GETDEL`, `GETEX`, `EXPIRE`,
+    /// `PERSIST`, `SET … GET|XX|KEEPTTL`, `GETSET`, `RENAME`) computes from it.
+    /// See [`Resolved`].
+    ///
+    /// `held_locally` says whether this node has a live copy (string or
+    /// hash) of `key`. A clustered implementation:
+    ///
+    /// - while catching up after a (re)start, asks its peers for their copy
+    ///   and stamp and installs the newest locally (or drops a local copy no
+    ///   peer still holds), exactly as gossip would have once caught up;
+    /// - when warm and `held_locally` is `false`, asks the key's replica set
+    ///   whether it holds a large value this node does not, and installs it
+    ///   locally if so;
+    /// - answers [`Resolved::Unavailable`] when no peer that could hold the
+    ///   key answered, so the caller refuses instead of computing from a copy
+    ///   of unknown freshness.
+    ///
+    /// Blocking and bounded like [`fetch_through`](Self::fetch_through). The
+    /// default answers [`Resolved::Current`]: correct with no cluster behind
+    /// the replicator.
+    fn resolve_for_update(&self, key: &str, held_locally: bool) -> Resolved {
+        let _ = (key, held_locally);
+        Resolved::Current
+    }
+
+    /// Make this node's copies of the named fields of hash `key` current
+    /// before a hash command reads or writes them — the per-field analogue of
+    /// [`resolve_for_update`](Self::resolve_for_update). Hash fields are all
+    /// small (gossip tier), so only a node still catching up has anything to
+    /// resolve. Default: [`Resolved::Current`].
+    fn resolve_hash_fields(&self, key: &str, fields: &[&str]) -> Resolved {
+        let _ = (key, fields);
+        Resolved::Current
+    }
+
+    /// Whether a command over the **whole** hash `key` (`HGETALL`, `HKEYS`,
+    /// `HVALS`, `HLEN`, `HSCAN`, `EXPIRE`/`PERSIST` of a hash key) may run on
+    /// this node's copy. A node still catching up cannot know which fields
+    /// exist without asking every peer for every field, so a clustered
+    /// implementation answers [`Resolved::Unavailable`] until it is caught up.
+    /// Default: [`Resolved::Current`].
+    fn resolve_hash_whole(&self, key: &str) -> Resolved {
+        let _ = key;
+        Resolved::Current
     }
 
     /// Decide where a `SETNX` on `key` is arbitrated.
@@ -1359,7 +1452,7 @@ impl Store {
         if let Some(rep) = &replicator {
             match rep.cold_read(key) {
                 ColdRead::Warm => {}
-                ColdRead::Found(value) => return Some(Bytes::from(value)),
+                ColdRead::Found { value, .. } => return Some(Bytes::from(value)),
                 ColdRead::Absent => return None,
             }
         }
@@ -1367,6 +1460,146 @@ impl Store {
             return Some(local);
         }
         replicator?.fetch_through(key).map(Bytes::from)
+    }
+
+    /// The installed replicator's catch-up answer for string `key`, or `None`
+    /// when it is not intercepting (no replicator, or warm).
+    fn cold_answer(&self, key: &str) -> Option<ColdRead> {
+        match self.active_replicator()?.cold_read(key) {
+            ColdRead::Warm => None,
+            answer => Some(answer),
+        }
+    }
+
+    /// [`exists`](Self::exists) as a client should see it: while this node is
+    /// catching up after a (re)start, a string key's existence is answered by
+    /// its peers ([`Replicator::cold_read`]) like `GET` is; otherwise, and for
+    /// hash keys, from the local map. No fetch-through on a warm miss.
+    #[must_use]
+    pub fn exists_through(&self, key: &str) -> bool {
+        match self.cold_answer(key) {
+            None => self.exists(key),
+            Some(ColdRead::Found { .. }) => true,
+            Some(_) => self.is_hash(key),
+        }
+    }
+
+    /// [`pttl`](Self::pttl) as a client should see it (see
+    /// [`exists_through`](Self::exists_through)): a string key's remaining
+    /// lifetime comes from the peer copy while catching up.
+    #[must_use]
+    pub fn pttl_through(&self, key: &str) -> Option<i64> {
+        match self.cold_answer(key) {
+            None => self.pttl(key),
+            Some(ColdRead::Found { ttl, .. }) => {
+                Some(ttl.map_or(-1, |ttl| i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)))
+            }
+            Some(_) if self.is_hash(key) => self.pttl(key),
+            Some(_) => None,
+        }
+    }
+
+    /// [`expire_time_ms`](Self::expire_time_ms) as a client should see it
+    /// (see [`exists_through`](Self::exists_through)).
+    #[must_use]
+    pub fn expire_time_ms_through(&self, key: &str) -> Option<i64> {
+        match self.cold_answer(key) {
+            None => self.expire_time_ms(key),
+            Some(ColdRead::Found { ttl: None, .. }) => Some(-1),
+            Some(ColdRead::Found { ttl: Some(ttl), .. }) => {
+                let at = std::time::SystemTime::now()
+                    .checked_add(ttl)
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(i64::MAX, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                Some(at)
+            }
+            Some(_) if self.is_hash(key) => self.expire_time_ms(key),
+            Some(_) => None,
+        }
+    }
+
+    /// `STRLEN` as a client should see it (see
+    /// [`exists_through`](Self::exists_through)): `0` for a missing key.
+    #[must_use]
+    pub fn strlen_through(&self, key: &str) -> usize {
+        match self.cold_answer(key) {
+            None => self.get(key).map_or(0, |v| v.len()),
+            Some(ColdRead::Found { value, .. }) => value.len(),
+            Some(_) => 0,
+        }
+    }
+
+    /// Make this node's copy of string `key` current before a
+    /// read-modify-write computes from it ([`Replicator::resolve_for_update`]).
+    /// A no-op on a standalone node; in a cluster it may install a peer's
+    /// newer copy, or drop a stale one, before returning.
+    ///
+    /// Every read-modify-write the store implements calls this itself
+    /// (`incr*`, `append`, `getdel`, `getex`, `try_expire`, `try_persist`);
+    /// a caller composing one from `get` + `set` (`SET … GET`, `GETSET`,
+    /// `RENAME`) must call it first.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] when the current value could not be established:
+    /// the caller must not write. Logged (WARN once, then DEBUG).
+    pub fn prepare_update(&self, key: &str) -> Result<(), KeyUnavailable> {
+        self.prepare_update_for("update", key)
+    }
+
+    fn prepare_update_for(&self, op: &str, key: &str) -> Result<(), KeyUnavailable> {
+        let Some(rep) = self.active_replicator() else {
+            return Ok(());
+        };
+        let held = self.data.get(key).is_some_and(|e| !e.is_expired()) || self.is_hash(key);
+        match rep.resolve_for_update(key, held) {
+            Resolved::Current => Ok(()),
+            Resolved::Unavailable => {
+                log_key_unavailable(op, key);
+                Err(KeyUnavailable)
+            }
+        }
+    }
+
+    /// Make this node's copies of `fields` of hash `key` current before a
+    /// hash command reads or writes them ([`Replicator::resolve_hash_fields`]).
+    /// A no-op on a standalone node.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] when they could not be established. A write must
+    /// then be refused; a read answers as a miss (as `GET` does).
+    pub fn prepare_hash_fields(&self, key: &str, fields: &[&str]) -> Result<(), KeyUnavailable> {
+        let Some(rep) = self.active_replicator() else {
+            return Ok(());
+        };
+        match rep.resolve_hash_fields(key, fields) {
+            Resolved::Current => Ok(()),
+            Resolved::Unavailable => {
+                log_key_unavailable("hash field", key);
+                Err(KeyUnavailable)
+            }
+        }
+    }
+
+    /// Whether a command over the whole hash `key` may run on this node's
+    /// copy ([`Replicator::resolve_hash_whole`]). Always `Ok` on a
+    /// standalone node.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] while this node is catching up after a (re)start.
+    pub fn prepare_hash_whole(&self, key: &str) -> Result<(), KeyUnavailable> {
+        let Some(rep) = self.active_replicator() else {
+            return Ok(());
+        };
+        match rep.resolve_hash_whole(key) {
+            Resolved::Current => Ok(()),
+            Resolved::Unavailable => {
+                log_key_unavailable("hash", key);
+                Err(KeyUnavailable)
+            }
+        }
     }
 
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a
@@ -1875,6 +2108,21 @@ impl Store {
         removed
     }
 
+    /// Local-only removal of the **string** `key`, leaving a hash of the same
+    /// name alone — for a replicator dropping a string copy its peers no
+    /// longer hold, where [`remove_local`](Self::remove_local) would also
+    /// discard this node's (replicated, per-field) hash. Returns whether a
+    /// string was removed.
+    pub fn remove_string_local(&self, key: &str) -> bool {
+        let Some((_, old)) = self.data.remove(key) else {
+            return false;
+        };
+        self.mem_sub(old.mem_size);
+        self.ttl_index_drop(key, old.expires_at);
+        self.notify_write(key);
+        true
+    }
+
     /// Compare-and-remove an entry that a read path just observed expired.
     ///
     /// The lazy-expiry reap on `get`/`exists`/`pttl` used to call
@@ -1967,7 +2215,32 @@ impl Store {
     ///
     /// Applies to a hash key too (its whole-key expiry); every field is then
     /// re-published so peers carry the new key expiry.
+    ///
+    /// In a cluster an expiry change re-publishes the value with the new
+    /// lifetime, so it first makes the local copy current
+    /// ([`prepare_update`](Self::prepare_update)); when that is impossible
+    /// nothing changes and this returns `false`. Use
+    /// [`try_expire`](Self::try_expire) to tell that apart from a missing key.
     pub fn expire(&self, key: &str, ttl: Duration) -> bool {
+        self.try_expire(key, ttl).unwrap_or(false)
+    }
+
+    /// [`expire`](Self::expire), reporting a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`] when this node could not establish the key's
+    /// current value (or, for a hash key, is still catching up): nothing was
+    /// changed.
+    pub fn try_expire(&self, key: &str, ttl: Duration) -> Result<bool, KeyUnavailable> {
+        self.prepare_update_for("expire", key)?;
+        if self.is_hash(key) {
+            self.prepare_hash_whole(key)?;
+        }
+        Ok(self.expire_unchecked(key, ttl))
+    }
+
+    fn expire_unchecked(&self, key: &str, ttl: Duration) -> bool {
         let string = if let Some(rep) = self.active_replicator() {
             rep.replicate_expire(key, ttl)
         } else {
@@ -2002,10 +2275,27 @@ impl Store {
     /// Remove the expiry from a key (make it persistent). Returns `true` if
     /// an expiry was removed — `false` if the key does not exist or had none.
     /// Applies to a hash key's whole-key expiry too.
+    ///
+    /// Like [`expire`](Self::expire), changes nothing and returns `false` when
+    /// the key's current value cannot be established in a cluster; see
+    /// [`try_persist`](Self::try_persist).
     pub fn persist(&self, key: &str) -> bool {
+        self.try_persist(key).unwrap_or(false)
+    }
+
+    /// [`persist`](Self::persist), reporting a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyUnavailable`], as for [`try_expire`](Self::try_expire).
+    pub fn try_persist(&self, key: &str) -> Result<bool, KeyUnavailable> {
+        self.prepare_update_for("persist", key)?;
+        if self.is_hash(key) {
+            self.prepare_hash_whole(key)?;
+        }
         let string = self.persist_string(key);
         let hash = self.hash_set_key_expiry(key, None);
-        string || hash
+        Ok(string || hash)
     }
 
     /// [`persist`](Self::persist) for the string keyspace only.
@@ -2081,6 +2371,13 @@ impl Store {
         delta: i64,
         ttl: Option<Duration>,
     ) -> Result<i64, String> {
+        // In a cluster, first make the local copy current: a node catching up
+        // after a restart may hold a superseded counter (or none yet), and a
+        // node outside a large value's replica set holds nothing — either way
+        // an increment computed here would publish a fresh stamp that wins
+        // everywhere, resetting the counter (or replacing the value)
+        // cluster-wide. Refused, not guessed, when that cannot be done.
+        self.prepare_update_for("incr", key).map_err(|e| e.to_string())?;
         // The whole read-modify-write MUST happen under one shard write lock,
         // otherwise two concurrent increments on a missing key both observe it
         // absent and both create it with value `delta`, losing an update (the
@@ -2211,9 +2508,9 @@ impl Store {
     /// instead of falsely answering with a length (#477). A refused append
     /// leaves the existing value untouched.
     ///
-    /// In a cluster, an append that would *create* the key first checks that
-    /// it is not a large value held only by other nodes; such an append is
-    /// refused (`None`) — see [`try_append`](Self::try_append) for the reason.
+    /// In a cluster the local copy is first made current
+    /// ([`prepare_update`](Self::prepare_update)); when that is impossible the
+    /// append is refused (`None`) — see [`try_append`](Self::try_append).
     pub fn append(&self, key: &str, value: &[u8]) -> Option<usize> {
         self.try_append(key, value).ok()
     }
@@ -2223,19 +2520,20 @@ impl Store {
     /// # Errors
     ///
     /// [`AppendError::OutOfMemory`] when the memory budget refuses the write,
-    /// and, in a cluster, [`AppendError::HeldElsewhere`] when this node has no
-    /// copy of `key` but its replica set does (a value above
-    /// `small_key_threshold` lives on `replication_factor` nodes only).
-    /// Creating the key from the appended bytes alone there would replace the
-    /// real value cluster-wide — data loss — and reading it through first
-    /// would drop its TTL (a read-through carries none), so the append is
-    /// refused instead. Run it on a node that holds the key, or rewrite the
-    /// value with `SET`.
+    /// and, in a cluster, [`AppendError::Unavailable`] when the key's current
+    /// value could not be established. A value above `small_key_threshold`
+    /// lives on `replication_factor` nodes only, so on any other node a local
+    /// miss is not proof of absence: the replica set is asked first and its
+    /// copy — value, TTL and stamp — installed here, and the append then runs
+    /// on it and is published to the replica set like any large write. If no
+    /// replica answers, creating the key from the appended bytes alone could
+    /// replace the real value cluster-wide, so the append is refused instead.
     pub fn try_append(&self, key: &str, value: &[u8]) -> Result<usize, AppendError> {
         self.append_inner(key, value)
     }
 
     fn append_inner(&self, key: &str, value: &[u8]) -> Result<usize, AppendError> {
+        self.prepare_update_for("append", key).map_err(|_| AppendError::Unavailable)?;
         // Make room for the growth BEFORE taking the entry guard: reclaiming
         // and evicting lock arbitrary shards, possibly this key's. An append to
         // a live key used to grow it in place with no budget check at all, so
@@ -2299,17 +2597,8 @@ impl Store {
             }
         }
 
-        // No local copy. In a cluster that is not proof of absence: a large
-        // value lives on its replica set only. `fetch_through` costs nothing
-        // when this node is itself a replica (a miss there is authoritative)
-        // and otherwise asks the replicas, bounded.
-        if let Some(rep) = self.active_replicator()
-            && rep.fetch_through(key).is_some()
-        {
-            log_append_held_elsewhere(key);
-            return Err(AppendError::HeldElsewhere);
-        }
-
+        // No local copy, and `prepare_update` above established that none
+        // exists anywhere (in a cluster it would have installed one).
         let len = value.len();
         if self.set(key.to_string(), value.to_vec(), None) {
             Ok(len)
@@ -5503,7 +5792,7 @@ mod tests {
     fn get_through_consults_cold_read_before_the_local_map() {
         let s = test_store();
         s.set_local("k".into(), b"local".to_vec(), None);
-        let rep = ColdReplicator::answering(ColdRead::Found(b"peer".to_vec()));
+        let rep = ColdReplicator::answering(ColdRead::Found { value: b"peer".to_vec(), ttl: None });
         s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
 
         assert_eq!(s.get_through("k").as_deref(), Some(b"peer".as_slice()));

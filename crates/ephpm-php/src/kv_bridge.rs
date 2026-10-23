@@ -748,7 +748,8 @@ unsafe extern "C" fn kv_exists(
         return 0;
     };
 
-    i32::from(store.exists(&key_str))
+    // Cluster-aware: a node catching up after a restart asks its peers.
+    i32::from(store.exists_through(&key_str))
 }
 
 #[cfg(php_linked)]
@@ -798,7 +799,9 @@ unsafe extern "C" fn kv_expire(
     else {
         return 0;
     };
-    i32::from(store.expire(&key_str, ttl))
+    // `false` too when a cluster node cannot establish the key's current
+    // value (nothing changed; logged).
+    i32::from(store.try_expire(&key_str, ttl).unwrap_or(false))
 }
 
 #[cfg(php_linked)]
@@ -815,7 +818,7 @@ unsafe extern "C" fn kv_pttl(
         return -2;
     };
 
-    match store.pttl(&key_str) {
+    match store.pttl_through(&key_str) {
         Some(ms) => ms,
         None => -2, // key does not exist
     }
@@ -1086,6 +1089,10 @@ unsafe extern "C" fn kv_hget(
     let Some(field) = (unsafe { key_arg(field, field_len) }) else {
         return 0;
     };
+    // A field whose current value cannot be established reads as a miss.
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return 0;
+    }
     match store.hget(key, field) {
         Some(v) => i32::from(stage_value(&v)),
         None => 0,
@@ -1112,6 +1119,9 @@ unsafe extern "C" fn kv_hset(
     else {
         return 0;
     };
+    if store.prepare_hash_fields(key, &fields).is_err() {
+        return 0;
+    }
     let pairs: Vec<(&str, &[u8])> = fields.into_iter().zip(vals).collect();
     match store.hset_many(key, &pairs) {
         Ok(count) => {
@@ -1138,6 +1148,9 @@ unsafe extern "C" fn kv_hsetnx(
         return 0;
     };
     let val = unsafe { bytes_arg(val, val_len) };
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return 0;
+    }
     i32::from(store.hsetnx(key, field, val) == Ok(true))
 }
 
@@ -1154,6 +1167,10 @@ unsafe extern "C" fn kv_hmget(
     let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
         return -1;
     };
+    // Fields whose current value cannot be established read as misses.
+    if store.prepare_hash_fields(key, &fields).is_err() {
+        return stage_list(fields.iter().map(|_| None::<&[u8]>));
+    }
     stage_list(store.hmget(key, &fields))
 }
 
@@ -1163,6 +1180,10 @@ unsafe extern "C" fn kv_hgetall(
     key_len: usize,
 ) -> std::os::raw::c_longlong {
     let (store, key) = store_and_key!(key, key_len, -1);
+    // A cluster node catching up cannot know which fields exist: `false`.
+    if store.prepare_hash_whole(key).is_err() {
+        return -1;
+    }
     let pairs = store.hgetall(key);
     stage_list(pairs.iter().flat_map(|(f, v)| [Some(f.as_bytes()), Some(v.as_ref())]))
 }
@@ -1174,6 +1195,9 @@ unsafe extern "C" fn kv_hkeys_vals(
     which: std::os::raw::c_int,
 ) -> std::os::raw::c_longlong {
     let (store, key) = store_and_key!(key, key_len, -1);
+    if store.prepare_hash_whole(key).is_err() {
+        return -1;
+    }
     if which == 0 {
         stage_list(store.hkeys(key).iter().map(|k| Some(k.as_bytes())))
     } else {
@@ -1194,7 +1218,8 @@ unsafe extern "C" fn kv_hdel(
     let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
         return 0;
     };
-    std::os::raw::c_longlong::try_from(store.hdel_many(key, &fields)).unwrap_or(i64::MAX)
+    // Cluster-aware: never skips a field this node has not received yet.
+    std::os::raw::c_longlong::try_from(store.hdel_through(key, &fields)).unwrap_or(i64::MAX)
 }
 
 #[cfg(php_linked)]
@@ -1209,6 +1234,9 @@ unsafe extern "C" fn kv_hexists(
     let Some(field) = (unsafe { key_arg(field, field_len) }) else {
         return 0;
     };
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return 0;
+    }
     i32::from(store.hexists(key, field))
 }
 
@@ -1218,6 +1246,11 @@ unsafe extern "C" fn kv_hlen(
     key_len: usize,
 ) -> std::os::raw::c_longlong {
     let (store, key) = store_and_key!(key, key_len, 0);
+    // The C side returns this as an int with no `false`: a cluster node
+    // catching up answers 0, a miss, rather than a count of unknown freshness.
+    if store.prepare_hash_whole(key).is_err() {
+        return 0;
+    }
     std::os::raw::c_longlong::try_from(store.hlen(key)).unwrap_or(i64::MAX)
 }
 
@@ -1235,6 +1268,9 @@ unsafe extern "C" fn kv_hincr_by(
     let Some(field) = (unsafe { key_arg(field, field_len) }) else {
         return 0;
     };
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return 0;
+    }
     match store.hincr_by(key, field, delta) {
         Ok(v) => {
             // Safety: `result` points to a `long long` local in our C code.
@@ -1265,6 +1301,9 @@ unsafe extern "C" fn kv_hexpire(
     let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
         return -1;
     };
+    if store.prepare_hash_fields(key, &fields).is_err() {
+        return -1;
+    }
     let codes = store.hexpire(key, &fields, ttl, ephpm_kv::store::ExpireCondition::Always);
     let set = codes.iter().filter(|c| **c == ephpm_kv::store::field_code::UPDATED).count();
     std::os::raw::c_longlong::try_from(set).unwrap_or(i64::MAX)
@@ -1282,6 +1321,9 @@ unsafe extern "C" fn kv_hpttl(
     let Some(field) = (unsafe { key_arg(field, field_len) }) else {
         return -2;
     };
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return -2;
+    }
     store.hpttl(key, &[field]).first().copied().unwrap_or(-2)
 }
 
@@ -1297,6 +1339,9 @@ unsafe extern "C" fn kv_hpersist(
     let Some(field) = (unsafe { key_arg(field, field_len) }) else {
         return 0;
     };
+    if store.prepare_hash_fields(key, &[field]).is_err() {
+        return 0;
+    }
     let codes = store.hpersist(key, &[field]);
     i32::from(codes.first() == Some(&ephpm_kv::store::field_code::UPDATED))
 }
@@ -1356,8 +1401,9 @@ unsafe extern "C" fn kv_getdel(
 ) -> std::os::raw::c_int {
     let (store, key) = store_and_key!(key, key_len, 0);
     match store.getdel(key) {
-        Some(v) => i32::from(stage_value(&v)),
-        None => 0,
+        Ok(Some(v)) => i32::from(stage_value(&v)),
+        // Missing, or refused in a cluster (nothing deleted; logged).
+        Ok(None) | Err(_) => 0,
     }
 }
 
@@ -1374,8 +1420,9 @@ unsafe extern "C" fn kv_getex(
         _ => return 0,
     };
     match store.getex(key, expiry) {
-        Some(v) => i32::from(stage_value(&v)),
-        None => 0,
+        Ok(Some(v)) => i32::from(stage_value(&v)),
+        // Missing, or refused in a cluster (nothing changed; logged).
+        Ok(None) | Err(_) => 0,
     }
 }
 
@@ -1385,7 +1432,7 @@ unsafe extern "C" fn kv_persist(
     key_len: usize,
 ) -> std::os::raw::c_int {
     let (store, key) = store_and_key!(key, key_len, 0);
-    i32::from(store.persist(key))
+    i32::from(store.try_persist(key).unwrap_or(false))
 }
 
 #[cfg(php_linked)]
@@ -1443,9 +1490,10 @@ unsafe extern "C" fn kv_strlen(
     key_len: usize,
 ) -> std::os::raw::c_longlong {
     let (store, key) = store_and_key!(key, key_len, 0);
-    // Node-local, like RESP STRLEN (and `type`/`exists`): no read-through to
-    // the replica set for a large value held only by other nodes.
-    store.get(key).map_or(0, |v| std::os::raw::c_longlong::try_from(v.len()).unwrap_or(0))
+    // Like RESP STRLEN (and `type`/`exists`): a cluster node catching up
+    // after a restart asks its peers; no read-through to the replica set for
+    // a large value held only by other nodes once warm.
+    std::os::raw::c_longlong::try_from(store.strlen_through(key)).unwrap_or(0)
 }
 
 #[cfg(php_linked)]
@@ -1454,7 +1502,7 @@ unsafe extern "C" fn kv_key_type(
     key_len: usize,
 ) -> std::os::raw::c_int {
     let (store, key) = store_and_key!(key, key_len, 0);
-    if store.is_hash(key) { 2 } else { i32::from(store.exists(key)) }
+    if store.is_hash(key) { 2 } else { i32::from(store.exists_through(key)) }
 }
 
 #[cfg(php_linked)]
