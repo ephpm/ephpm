@@ -56,7 +56,14 @@ async fn kv(base_url: &str, query: &str) -> String {
 
 async fn snapshot_status(base_url: &str) -> serde_json::Value {
     let url = format!("{base_url}/_ephpm/kv/snapshot");
-    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    // With a diagnostics token configured, the status needs it too (the
+    // `/_ephpm/requests` rule).
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(DIAG_TOKEN)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
     assert_eq!(resp.status().as_u16(), 200, "GET {url}");
     resp.json().await.expect("status JSON")
 }
