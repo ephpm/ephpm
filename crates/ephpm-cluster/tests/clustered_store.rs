@@ -469,3 +469,206 @@ async fn set_returns_true_on_success() {
     drop(cs);
     shutdown(handle).await;
 }
+
+// ---------------------------------------------------------------------------
+// Write stamps order after the version this node already applied
+// ---------------------------------------------------------------------------
+
+/// Every write a replicator originates is stamped above the key's applied
+/// record, even when that record is a peer's stamp a few seconds ahead of this
+/// node's clock (within the drift bound) — so the write applies, here and on
+/// peers, instead of losing to the version it was computed from. Pins each
+/// write site of both replicators: reverting one to a plain clock stamp makes
+/// its write lose to the seed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_replicator_write_is_stamped_above_the_applied_record() {
+    use ephpm_cluster::clustered_store::new_applied_write_map;
+    use ephpm_cluster::gossip_kv::SEQ_BITS;
+    use ephpm_cluster::{KvReplicator, SiteKvReplicator, Stamp, hash_field, site_namespace};
+    use ephpm_kv::store::{HashFieldState, Replicator};
+
+    let port = random_udp_port().await;
+    let handle = Arc::new(start_node(port, vec![], "stamp-after").await);
+    let store = local_store();
+    let site_store = local_store();
+    let config = ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() };
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
+    let applied = new_applied_write_map();
+    let rt = tokio::runtime::Handle::current();
+    let global = KvReplicator::new(Arc::clone(&cs), rt.clone(), Arc::clone(&applied));
+    let site =
+        SiteKvReplicator::new(Arc::clone(&cs), Arc::clone(&site_store), "s", rt, applied.clone());
+
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+    )
+    .unwrap();
+    // A peer's stamp 2 s ahead with the highest tag: a plain local stamp loses.
+    // Each case gets a later one, ahead of where the previous case left this
+    // node's clock, so every case tests its own write site.
+    let seed_for =
+        |i: u64| Stamp { write: (now_ms + 2_000 + 20 * i) << SEQ_BITS, node_tag: u64::MAX };
+    let small = b"v".to_vec();
+    let large = vec![b'L'; 64];
+
+    // (key, its transport key, the write)
+    type Case<'a> = (&'a str, Box<dyn Fn(&str) -> String>, Box<dyn Fn(&str) + 'a>);
+    let cases: Vec<Case> = vec![
+        (
+            "g:set",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_set(k.into(), small.clone(), None);
+            }),
+        ),
+        (
+            "g:set-large",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_set(k.into(), large.clone(), None);
+            }),
+        ),
+        (
+            "g:broadcast",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_broadcast(k.into(), small.clone(), None);
+            }),
+        ),
+        (
+            "g:remove",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_remove(k);
+            }),
+        ),
+        (
+            "g:published",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_published(k.into(), small.clone(), None);
+            }),
+        ),
+        (
+            "g:published-large",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_published(k.into(), large.clone(), None);
+            }),
+        ),
+        (
+            "g:remove-published",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                global.replicate_remove_published(k.into());
+            }),
+        ),
+        (
+            "g:expire",
+            Box::new(str::to_string),
+            Box::new(|k| {
+                store.set_local(k.into(), small.clone(), None);
+                global.replicate_expire(k, Duration::from_secs(60));
+            }),
+        ),
+        (
+            "g:hash",
+            Box::new(|k| hash_field::encode_key(k, "f")),
+            Box::new(|k| {
+                global.replicate_hash_field(k, "f", &mut || {
+                    Some(HashFieldState {
+                        value: Some(b"x".to_vec()),
+                        field_ttl: None,
+                        hash_ttl: None,
+                    })
+                });
+            }),
+        ),
+        (
+            "s:set",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_set(k.into(), small.clone(), None);
+            }),
+        ),
+        (
+            "s:set-large",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_set(k.into(), large.clone(), None);
+            }),
+        ),
+        (
+            "s:remove",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_remove(k);
+            }),
+        ),
+        (
+            "s:published",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_published(k.into(), small.clone(), None);
+            }),
+        ),
+        (
+            "s:published-large",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_published(k.into(), large.clone(), None);
+            }),
+        ),
+        (
+            "s:remove-published",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site.replicate_remove_published(k.into());
+            }),
+        ),
+        (
+            "s:expire",
+            Box::new(|k| site_namespace::encode("s", k)),
+            Box::new(|k| {
+                site_store.set_local(k.into(), small.clone(), None);
+                site.replicate_expire(k, Duration::from_secs(60));
+            }),
+        ),
+        (
+            "s:hash",
+            Box::new(|k| site_namespace::encode("s", &hash_field::encode_key(k, "f"))),
+            Box::new(|k| {
+                site.replicate_hash_field(k, "f", &mut || {
+                    Some(HashFieldState {
+                        value: Some(b"x".to_vec()),
+                        field_ttl: None,
+                        hash_ttl: None,
+                    })
+                });
+            }),
+        ),
+    ];
+    for (i, (key, transport, write)) in (0u64..).zip(&cases) {
+        let seed = seed_for(i);
+        let wire = transport(key);
+        applied.insert(wire.clone(), seed);
+        write(key);
+        let recorded = applied.get(&wire).map(|s| *s);
+        assert!(
+            recorded.is_some_and(|s| s > seed),
+            "{key}: the write must be stamped above the applied {seed:?}, recorded {recorded:?}"
+        );
+    }
+    // The local effects landed (not skipped as stale).
+    assert_eq!(store.get("g:set").as_deref(), Some(small.as_slice()));
+    assert_eq!(store.get("g:set-large").as_deref(), Some(large.as_slice()));
+    assert!(store.pttl("g:expire").is_some_and(|ms| ms > 0));
+    assert_eq!(site_store.get("s:set").as_deref(), Some(small.as_slice()));
+    assert!(site_store.pttl("s:expire").is_some_and(|ms| ms > 0));
+
+    drop(cases);
+    drop((global, site, cs));
+    // The queued large writes' workers hold the store while they run.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown(handle).await;
+}
