@@ -105,13 +105,13 @@ as the record of why the sqld path was retired.
 | **Owned FPM thread-pool is now the default execution engine**; the `spawn_blocking` engine was removed and `[php] workers` renamed to `[php] concurrency` (+ `queue_depth`). tokio's blocking pool no longer runs PHP, so a slow script cannot starve static-file serving by construction | **+8–11% RPS across endpoints** (+10.8% health, +10.9% static, +10.5% cpu, +8.0% db), **P50 −7..−10%, P99 −4..−8%** — measured A/B, Laravel per-request, nginx-fpm control. **The decisive result is overload: the old default spawned 486 threads / ~1.05 GiB RSS under a 200-conn flood; the pool held 65 threads / ~193 MiB while serving more requests at a better P99** | [ephpm#460](https://github.com/ephpm/ephpm/pull/460), [ephpm#462](https://github.com/ephpm/ephpm/pull/462), [ephpm#458](https://github.com/ephpm/ephpm/pull/458) |
 | Worker/fpm dispatch: eliminate the per-request `$_SERVER` rebuild (`&'static CStr` for invariant keys) and the response-header text round-trip (structured `(ptr, len)` across FFI) — the realized part of the worker-dispatch fast-path Phase 1/2 | **~3–4 µs off a trivial request — measured** (honestly ~40× smaller than the #133/#134 estimates; the PR corrects the framing). Also closes two response-header-injection bugs latent in the old text framing | [ephpm#133](https://github.com/ephpm/ephpm/pull/133), [ephpm#134](https://github.com/ephpm/ephpm/pull/134) |
 
-## v0.10.x (current release line)
+## v0.10.x
 
-v0.10.8 is the current release. The v0.10 line shipped no new **runtime**
+The v0.10 line shipped no new **runtime**
 performance lever — its work was the `ephpm analyze` static-analysis
 suite (baselines, diff-aware scans, result cache), security hardening, and
 docs. The perf levers still in flight (TAILCALL-on-Linux, JIT re-enablement,
-the deploy/build lane) are in the backlog below, labeled Planned.
+the deploy/build lane) are in the backlog below, labeled Planned. See the [ePHPm releases](https://github.com/ephpm/ephpm/releases) for the latest version.
 
 ## Backlog — open, by estimated value
 
