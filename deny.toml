@@ -26,6 +26,33 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # zstd 0.13.3 / zstd-safe 7.2.4 / zstd-sys 2.0.16. Fixed only in zstd
+    # 0.14.3 / zstd-safe 8.2.0 / zstd-sys 2.1.2, a breaking bump that chitchat
+    # 0.10 and mysql_common 0.32 (via mysql_async 0.34 and the opensrv-mysql
+    # fork) do not accept yet. mysql_common calls zstd solely to decode binlog
+    # TRANSACTION_PAYLOAD events (src/binlog/events/transaction_payload_event.rs)
+    # -- a replication client path neither the opensrv server nor ePHPm's
+    # mysql_async client ever reaches (mysql_async's own `compression` option is
+    # zlib only), as in litewire's deny.toml. None of the four is reachable; see
+    # https://github.com/ephpm/ephpm/issues/648. Remove these entries when the
+    # graph reaches the fixed versions.
+    # - 0391: context reuse across streams in the `with_context` stream
+    #   constructors. Nothing here uses them: ephpm-kv calls
+    #   `encode_all`/`decode_all`, chitchat calls `bulk::compress_to_buffer` /
+    #   `bulk::decompress_to_buffer` (a fresh context per call), and
+    #   mysql_common's binlog decoder uses `Decoder::with_buffer`/`copy_decode`.
+    "RUSTSEC-2026-0391",
+    # - 0398: `Seekable::decompress`, behind zstd's `seekable` feature, which
+    #   nothing in the graph enables.
+    "RUSTSEC-2026-0398",
+    # - 0403: a corrupt legacy frame through `stream::write::Decoder` /
+    #   `DCtx::decompress_stream` into a `Vec`. The advisory exempts
+    #   `decode_all`, `stream::read::Decoder` and the bulk API, which are the
+    #   only decoders used here (and mysql_common's are binlog-only, above).
+    "RUSTSEC-2026-0403",
+    # - 0410: zstd-sys's allocator shim on wasm32 only; ePHPm does not target
+    #   wasm.
+    "RUSTSEC-2026-0410",
     # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
     # unmaintained) left the graph with mysql-common-derive, once the
     # opensrv-mysql fork stopped enabling mysql_common's default features.
