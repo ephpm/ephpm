@@ -1039,6 +1039,19 @@ impl ClusteredStore {
     /// performed. The replication hooks decide whether a client waits for the
     /// fan-out ([`ReplicationMode`]); this method always awaits it.
     ///
+    /// ## Stamp ordering
+    ///
+    /// This method, [`publish`](Self::publish), [`broadcast`](Self::broadcast),
+    /// [`set_for_site`](Self::set_for_site),
+    /// [`publish_for_site`](Self::publish_for_site) and
+    /// [`remove`](Self::remove) hold no applied-write map, so they stamp from
+    /// this node's clock alone: a write made in the same millisecond as a
+    /// peer's write it has just seen can be stamped below it and lose. The
+    /// replicators ([`KvReplicator`], [`SiteKvReplicator`]) — what the server
+    /// installs — stamp above the key's applied record instead
+    /// ([`stamp_after_applied`](Self::stamp_after_applied)). Use these
+    /// directly only where that ordering does not matter (tests, tooling).
+    ///
     /// ## Membership-change caveat (v1)
     ///
     /// Replication happens only at write time. There is no active
@@ -1455,7 +1468,9 @@ impl ClusteredStore {
         self.large_shed.load(Ordering::Relaxed)
     }
 
-    /// Delete a key from whichever tier owns it, stamping the delete now.
+    /// Delete a key from whichever tier owns it, stamping the delete now
+    /// (from this node's clock alone — see [`set`](Self::set)'s stamp
+    /// ordering note).
     pub fn remove(&self, key: &str) -> bool {
         let stamp = self.cluster.stamp();
         self.remove_at(key, stamp)

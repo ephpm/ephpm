@@ -176,29 +176,73 @@ impl StampClock {
 
     /// Issue the next stamp.
     pub fn next(&self) -> Stamp {
-        let base = now_epoch_ms() << SEQ_BITS;
+        self.next_after(None)
+    }
+
+    /// Issue the next stamp, strictly above `seen` when given (a
+    /// hybrid-logical-clock receive and send in one step): the result beats
+    /// `seen` whatever the two nodes' tags are, and every later stamp from this
+    /// clock does too.
+    ///
+    /// Without it, a node that installs a peer's write and then writes the
+    /// same key **within the same millisecond** can issue a smaller stamp than
+    /// the one it just read (the peer's per-millisecond sequence ran ahead of
+    /// this node's), and last-writer-wins silently discards the newer write.
+    ///
+    /// `seen` only moves the clock up to [`MAX_OBSERVED_DRIFT_MS`] ahead of
+    /// this node's wall time. A stamp further ahead (a peer with a fast clock,
+    /// or a corrupt one) is counted in [`METRIC_STAMP_DRIFT_CLAMPED`] and
+    /// clamped, so one bad peer cannot drag every node's clock into the future
+    /// (where applied-map pruning and tombstone aging, which go by stamp age,
+    /// stop working) or saturate it at `u64::MAX` (where it would repeat
+    /// stamps). The write is then stamped below `seen` and loses to it, as any
+    /// write loses to a newer one.
+    pub fn next_after(&self, seen: Option<Stamp>) -> Stamp {
+        let now = now_epoch_ms();
+        let base = now << SEQ_BITS;
+        let floor = seen.map_or(0, |s| clamp_observed(s.write, now).saturating_add(1));
         let mut prev = self.last.load(Ordering::Relaxed);
         loop {
-            let next = base.max(prev.saturating_add(1));
+            let next = base.max(prev.saturating_add(1)).max(floor);
             match self.last.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => return Stamp { write: next, node_tag: self.node_tag },
                 Err(seen) => prev = seen,
             }
         }
     }
+}
 
-    /// Advance this clock past `seen` (a hybrid-logical-clock receive): every
-    /// stamp issued after this call has a strictly greater
-    /// [`Stamp::write`] than `seen.write`, so it beats `seen` whatever the two
-    /// nodes' tags are.
-    ///
-    /// Without it, a node that installs a peer's write and then writes the
-    /// same key **within the same millisecond** can issue a smaller stamp than
-    /// the one it just read (the peer's per-millisecond sequence ran ahead of
-    /// this node's), and last-writer-wins silently discards the newer write.
-    pub fn observe(&self, seen: Stamp) {
-        self.last.fetch_max(seen.write, Ordering::AcqRel);
+/// How far ahead of this node's wall clock an observed stamp may pull its
+/// [`StampClock`] ([`StampClock::next_after`]). Deliberately not
+/// configurable: the cluster is assumed to run NTP, so honest skew is far
+/// below this.
+pub const MAX_OBSERVED_DRIFT_MS: u64 = 5_000;
+
+/// Counter: observed stamps further than [`MAX_OBSERVED_DRIFT_MS`] ahead of
+/// this node's clock, clamped instead of followed.
+pub const METRIC_STAMP_DRIFT_CLAMPED: &str = "ephpm_cluster_stamp_drift_clamped_total";
+
+/// `write` capped at `now + MAX_OBSERVED_DRIFT_MS` (packed), counting and
+/// (at most once a minute) logging a cap.
+fn clamp_observed(write: u64, now_ms: u64) -> u64 {
+    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
+    let ceiling = now_ms.saturating_add(MAX_OBSERVED_DRIFT_MS) << SEQ_BITS;
+    if write <= ceiling {
+        return write;
     }
+    metrics::counter!(METRIC_STAMP_DRIFT_CLAMPED).increment(1);
+    let last = LAST_WARN_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= 60_000
+        && LAST_WARN_MS.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        tracing::warn!(
+            ahead_ms = (write >> SEQ_BITS).saturating_sub(now_ms),
+            max_drift_ms = MAX_OBSERVED_DRIFT_MS,
+            "a peer's write stamp is too far ahead of this node's clock; not following it \
+             (check NTP on every node)"
+        );
+    }
+    ceiling
 }
 
 /// Encode a binary value with an absolute expiry and its write stamp into
@@ -418,13 +462,10 @@ impl ClusterHandle {
 
     /// Issue the next write stamp, strictly above `seen` when given — the
     /// stamp for a write that must order after a write this node has already
-    /// applied (see [`StampClock::observe`]).
+    /// applied (see [`StampClock::next_after`]).
     #[must_use]
     pub fn stamp_after(&self, seen: Option<Stamp>) -> Stamp {
-        if let Some(seen) = seen {
-            self.clock.observe(seen);
-        }
-        self.clock.next()
+        self.clock.next_after(seen)
     }
 
     /// This node's tie-break tag ([`node_tag`] of its node id).
@@ -871,12 +912,33 @@ mod tests {
         if blind.epoch_ms() == peer.epoch_ms() {
             assert!(blind < peer);
         }
-        clock.observe(peer);
-        let mine = clock.next();
+        let mine = clock.next_after(Some(peer));
         assert!(mine > peer, "{mine:?} must beat the observed {peer:?}");
         // Observing an older stamp never moves the clock backwards.
-        clock.observe(Stamp { write: 1, node_tag: 0 });
-        assert!(clock.next() > mine);
+        assert!(clock.next_after(Some(Stamp { write: 1, node_tag: 0 })) > mine);
+    }
+
+    /// A far-future or near-`u64::MAX` observed stamp moves the clock at most
+    /// `MAX_OBSERVED_DRIFT_MS` ahead, and the clock keeps issuing strictly
+    /// increasing stamps afterwards (no saturation, no repeats).
+    #[test]
+    fn observed_stamps_beyond_the_drift_bound_are_clamped() {
+        let ceiling = |now: u64| (now + MAX_OBSERVED_DRIFT_MS) << SEQ_BITS;
+        for far in [(now_epoch_ms() + 3_600_000) << SEQ_BITS, u64::MAX - 1, u64::MAX] {
+            let clock = StampClock::new("n");
+            let first = clock.next_after(Some(Stamp { write: far, node_tag: 0 }));
+            assert!(first.write <= ceiling(now_epoch_ms()) + 1, "{first:?} followed {far}");
+            let mut prev = first;
+            for _ in 0..1_000 {
+                let next = clock.next();
+                assert!(next > prev && next.write <= ceiling(now_epoch_ms()) + 1_001);
+                prev = next;
+            }
+        }
+        // Within the bound the observed stamp is still followed exactly.
+        let near = (now_epoch_ms() + 2_000) << SEQ_BITS;
+        let clock = StampClock::new("n");
+        assert_eq!(clock.next_after(Some(Stamp { write: near, node_tag: 0 })).write, near + 1);
     }
 
     /// Same `write`, different nodes: the tag breaks the tie, the same way
