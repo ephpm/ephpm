@@ -728,9 +728,11 @@ used_underscore_binding = "allow"
 # whose bundled Z_SOLO zlib shadowed the PHP SDK's libz.a: gzopen(),
 # compress.zlib:// and ZipArchive returned Z_STREAM_ERROR in the v0.11.3
 # Docker image. Do not move this pin back past that change; deny.toml bans
-# libz-sys so it cannot return unnoticed.
+# libz-sys so it cannot return unnoticed. The pin is the fork commit litewire
+# uses (146de689: that change, plus selecting flate2's pure-Rust backend
+# directly), so both repos resolve the same opensrv-mysql.
 [patch.crates-io]
-opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "25b7ac8ac222955336de6fce1e44a00e556920ec" }
+opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "146de689d9febd8dd15eb06eb80bf6f7bdcc1216" }
 # CORRECTNESS: Turso 0.8.3's page-1 allocation race. When several connections
 # make the first write to a fresh database file at once (a new per-site
 # database under concurrent traffic), two pagers could both allocate page 1;

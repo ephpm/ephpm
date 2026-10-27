@@ -3593,7 +3593,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "opensrv-mysql"
 version = "0.7.0"
-source = "git+https://github.com/ephpm/opensrv-mysql.git?rev=25b7ac8ac222955336de6fce1e44a00e556920ec#25b7ac8ac222955336de6fce1e44a00e556920ec"
+source = "git+https://github.com/ephpm/opensrv-mysql.git?rev=146de689d9febd8dd15eb06eb80bf6f7bdcc1216#146de689d9febd8dd15eb06eb80bf6f7bdcc1216"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -7204,9 +7204,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",
