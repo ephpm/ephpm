@@ -70,8 +70,9 @@
 //!    a per-thread [`Session`](litewire::Session) that holds a clone of a site's
 //!    backend `Arc`, as does every `pdo_mysql` connection on the per-site wire
 //!    listener. Eviction is therefore *refcount-aware*: a site is a victim only
-//!    when `Arc::strong_count` of its backend is `1` (only the slot holds it →
-//!    no live session). This makes the fd cap a **soft** bound — a site pinned
+//!    when `Arc::strong_count` of its **served** handle — the site-scoped
+//!    [`UserLockScoped`] wrapper every resolver receives, see "Lock scope"
+//!    below — is `1` (only the slot holds it → no live session). This makes the fd cap a **soft** bound — a site pinned
 //!    by a live session stays open past the cap — but it guarantees eviction
 //!    never yanks a database out from under a running query. The count is read
 //!    while holding the slot's **write** lock, and a resolver can only clone
@@ -89,6 +90,21 @@
 //!    open can never overlap another open or a close of the same file. On the
 //!    close side, invariant 2 means the taken `Arc` is the last reference, so
 //!    dropping it under the guard closes the file before any re-open can begin.
+//!
+//! # Lock scope
+//!
+//! Every backend this registry hands out is wrapped, once, in a
+//! [`UserLockScoped`] whose namespace is the **site key**, over one
+//! [`UserLockRegistry`] per registry (per node). That is what gives MySQL's
+//! named locks (`GET_LOCK()` & co.) their tenant boundary: a tenant's `job`
+//! lock is a different lock from every other tenant's `job`, invisible to
+//! them and unable to block them — and it is one lock table per site across
+//! every route into the database, because the `pdo_mysql` listener, the
+//! `ephpm_db_*` bridge and the owner side of forwarded statements all resolve
+//! through here. The wrapper is created when the site is opened and cached in
+//! the slot (`OpenSite::served`), so the handle a resolver gets is the same
+//! `Arc` every time — which is also what keeps invariant 2's refcount check
+//! meaningful. See `crate::user_locks` for the modes.
 //!
 //! # Cap accounting
 //!
@@ -110,7 +126,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use dashmap::DashMap;
 use ephpm_php::db_bridge::SiteBackendResolver;
-use litewire::backend::SharedBackend;
+use litewire::backend::{SharedBackend, UserLockRegistry, UserLockScoped};
 use tokio::sync::RwLock;
 
 use crate::handoff_gate::{self, HandoffGate, SiteServeState};
@@ -141,17 +157,25 @@ type SiteDb = TrackedBackend<ScreenedBackend<litewire::Turso>>;
 /// evict/re-open, is harmless.
 pub type SiteOpenHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A site's open database: the concrete factory (for the WAL-gate sampler,
+/// which reads its counters by reference) and the handle resolvers get — the
+/// same factory, erased and scoped to the site's lock namespace.
+struct OpenSite {
+    db: Arc<SiteDb>,
+    /// `UserLockScoped` over `db`. Its `Arc::strong_count` is what makes
+    /// eviction refcount-aware: `1` means only this slot holds it (idle),
+    /// `> 1` means at least one thread has a live
+    /// [`Session`](litewire::Session) or wire connection into it.
+    served: SharedBackend,
+}
+
 /// One site's permanent registry slot: its database (when open) plus the lock
 /// that serializes opening and closing *that site* and nothing else.
 struct SiteSlot {
-    /// The site's erased, stats-wrapped Turso backend while it is open.
+    /// The site's database while it is open.
     ///
-    /// Read-locked to resolve (hot path), write-locked to open or evict. The
-    /// `Arc::strong_count` of the value inside is what makes eviction
-    /// refcount-aware: `1` means only this slot holds it (idle), `> 1` means at
-    /// least one thread has a live [`Session`](litewire::Session) or wire
-    /// connection into it.
-    current: RwLock<Option<Arc<SiteDb>>>,
+    /// Read-locked to resolve (hot path), write-locked to open or evict.
+    current: RwLock<Option<OpenSite>>,
     /// Lock-free hint for the eviction scan: roughly "is `current` populated".
     /// Written under the write lock alongside `current`, read with no lock at
     /// all, and only ever used to *skip* slots — the authoritative check
@@ -229,6 +253,10 @@ struct Inner {
     /// clustered replication plane, whose drivers settle each site; unarmed it
     /// lets everything through. See [`crate::handoff_gate`].
     handoff: Arc<HandoffGate>,
+    /// This node's table of held MySQL named locks; every site's served
+    /// handle is scoped to its own namespace in it (module docs, "Lock
+    /// scope").
+    user_locks: Arc<UserLockRegistry>,
 }
 
 impl WalGateStatsSource for Inner {
@@ -242,11 +270,11 @@ impl WalGateStatsSource for Inner {
                 continue;
             }
             let Ok(current) = entry.value().current.try_read() else { continue };
-            let Some(backend) = current.as_ref() else { continue };
+            let Some(open) = current.as_ref() else { continue };
             out.push(WalGateSample {
                 site: entry.key().to_string(),
                 db_path: self.dir.join(format!("{}.db", entry.key())),
-                stats: backend.wal_gate_stats(),
+                stats: open.db.wal_gate_stats(),
             });
         }
     }
@@ -349,8 +377,16 @@ impl SiteBackends {
                 on_open,
                 wal_gate,
                 handoff: Arc::new(HandoffGate::default()),
+                user_locks: UserLockRegistry::new(),
             }),
         })
+    }
+
+    /// This node's named-lock table, which every site's handle is scoped
+    /// into (one namespace per site key). For tests and diagnostics.
+    #[must_use]
+    pub fn user_lock_registry(&self) -> &Arc<UserLockRegistry> {
+        &self.inner.user_locks
     }
 
     /// This registry's ownership-handoff serving gate (see
@@ -420,7 +456,7 @@ impl SiteBackends {
     fn wal_gate_task_finished(&self, site_key: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
         let slot = self.inner.slots.get(site_key)?;
         let current = slot.value().current.try_read().ok()?;
-        current.as_ref()?.inner().inner().wal_gate_task_finished()
+        current.as_ref()?.db.inner().inner().wal_gate_task_finished()
     }
 
     /// Number of databases currently held open (test/observability helper).
@@ -561,9 +597,9 @@ impl SiteBackends {
         // `strong_count == 1` racing it.
         {
             let current = slot.current.read().await;
-            if let Some(backend) = current.as_ref() {
+            if let Some(open) = current.as_ref() {
                 slot.touch(self.now_millis());
-                return Ok(erase(backend));
+                return Ok(Arc::clone(&open.served));
             }
         }
 
@@ -572,15 +608,15 @@ impl SiteBackends {
         // here and take the branch below.
         let path = self.db_path_for(site_key)?;
         let mut current = slot.current.write().await;
-        if let Some(backend) = current.as_ref() {
+        if let Some(open) = current.as_ref() {
             // Someone else opened it while we waited for the lock.
             slot.touch(self.now_millis());
-            return Ok(erase(backend));
+            return Ok(Arc::clone(&open.served));
         }
-        let opened = self.open_backend(site_key, &path).await?;
-        // The slot keeps the concrete type; the handle returned below is an
-        // unsized coercion of the same allocation, so both share one count.
-        let backend = erase(&opened);
+        let opened = self.open_site(site_key, self.open_backend(site_key, &path).await?);
+        // The slot keeps the served handle too, so every resolve returns the
+        // same `Arc` (the eviction refcount counts them all).
+        let backend = Arc::clone(&opened.served);
         *current = Some(opened);
         slot.open.store(true, Ordering::Relaxed);
         slot.touch(self.now_millis());
@@ -681,7 +717,7 @@ impl SiteBackends {
         // lock, so no resolver can be cloning it concurrently (module docs,
         // invariant 2).
         match current.as_ref() {
-            Some(backend) if Arc::strong_count(backend) == 1 => {}
+            Some(open) if Arc::strong_count(&open.served) == 1 => {}
             _ => return false,
         }
         let backend = current.take();
@@ -708,11 +744,16 @@ impl WalGateStatsSource for WeakInner {
     }
 }
 
-/// Erase a concrete per-site backend for the resolvers. An unsized coercion of
-/// the same `Arc` allocation: the strong count the eviction pass reads
-/// includes every erased clone.
-fn erase(backend: &Arc<SiteDb>) -> SharedBackend {
-    Arc::clone(backend) as SharedBackend
+impl SiteBackends {
+    /// Pair a freshly-opened factory with the handle resolvers will get: the
+    /// same factory erased and scoped to `site_key`'s lock namespace (module
+    /// docs, "Lock scope"). Built once per open and cached in the slot.
+    fn open_site(&self, site_key: &str, db: Arc<SiteDb>) -> OpenSite {
+        let erased = Arc::clone(&db) as SharedBackend;
+        let served: SharedBackend =
+            Arc::new(UserLockScoped::new(erased, &self.inner.user_locks, site_key));
+        OpenSite { db, served }
+    }
 }
 
 impl SiteBackendResolver for SiteBackends {

@@ -249,6 +249,19 @@ Use whichever suits the code. `pdo_mysql` is the compatible one (WordPress,
 Laravel, every ORM); the bridge skips the wire round trip and the per-request
 connection setup.
 
+## Named locks are per site
+
+MySQL's `GET_LOCK()` / `RELEASE_LOCK()` / `IS_FREE_LOCK()` / `IS_USED_LOCK()`
+/ `RELEASE_ALL_LOCKS()` and `DO <expr>` work, with MySQL 8 semantics, and
+their namespace is **the site**: a tenant's `GET_LOCK('job', 0)` excludes that
+tenant's other connections (over `pdo_mysql` and the bridge alike) and is
+invisible to — and cannot block — every other tenant's `job`. The namespace
+comes from the connection's authenticated site key, never from a claim. A
+lock is released when the connection holding it ends, however it ends — a
+`SIGKILL`ed worker's lock is free as soon as its socket is. Full semantics,
+including the clustered modes, are on the
+[MySQL compatibility reference](/reference/mysql-compatibility/).
+
 ## Clustered mode
 
 With `[db.sqlite.replication] per_site = true` (**experimental**), each site's
@@ -282,6 +295,15 @@ Two things worth knowing:
   [query stats](/architecture/query-stats/) are recorded there, not on the node
   the request hit. `ATTACH` / `VACUUM` / path-`PRAGMA` rejections are unchanged
   — those are screened locally, at the frontend, before anything is forwarded.
+- **Named locks live on the owner.** A forwarded `GET_LOCK()` is taken by the
+  owner-side session the connection's forwarding stream pins, so two
+  connections for one site exclude each other on any two nodes, and the lock
+  is released when that stream ends — the client disconnected, or its node
+  died. An ownership move does not carry locks; the old owner refuses the
+  pinned stream (re-checking before every lock operation) so the holder fails
+  loudly and must reconnect. See
+  [the reference](/reference/mysql-compatibility/#clustered-mode) for the
+  window that leaves.
 
 Per-site clustered mode is **experimental** (the Turso engine is Beta upstream)
 and its multi-node behaviour is unit-tested rather than validated on a live

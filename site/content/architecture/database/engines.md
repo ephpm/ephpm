@@ -373,6 +373,7 @@ have no embedded engine to choose.
 ## See also
 
 - [Turso engine roadmap](/roadmap/turso-engine/) — the full plan, phase status, gates, and risks
+- [MySQL compatibility: named locks](/reference/mysql-compatibility/) — `GET_LOCK()` & co., per site, in every mode above
 - [Configuration reference → `[db.sqlite]`](/reference/config/#dbsqlite) — every key
 - [Database from PHP](/guides/db-from-php/) — the in-process `ephpm_db_*` bridge
 - [Cluster channel](/roadmap/cluster-channel/) — the transport CDC replication rides on

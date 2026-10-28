@@ -567,6 +567,19 @@ Once it has run, `ephpm_db_in_transaction()` reports `false` — so a wrapper
 that checks before rolling back will not fire a second, pointless `ROLLBACK`
 against a session that has already been cleaned up.
 
+### Named locks end with the request
+
+MySQL's `GET_LOCK()` locks belong to the *connection* that took them. The
+bridge's connection is the thread's session, which outlives the request — so
+at request end ePHPm also releases every named lock the session still holds
+(`RELEASE_ALL_LOCKS()`), on the same seams as the rollback above. A bridge
+lock therefore lives at most for the request that took it; a script that
+wants one to outlive its request must use `pdo_mysql`, whose connection it
+controls. `ephpm_db_query("SELECT GET_LOCK('job', 0) AS got")` returns the
+row, `ephpm_db_execute("DO RELEASE_LOCK('job')")` an OK. Semantics and the
+per-site namespace are on the
+[MySQL compatibility reference](/reference/mysql-compatibility/).
+
 ### Recovery from a dead connection
 
 If the backend connection dies underneath a thread — during a clustered

@@ -44,6 +44,7 @@ pub mod tls;
 pub mod tracked_backend;
 pub mod turso_cdc;
 pub mod turso_cdc_metrics;
+mod user_locks;
 pub mod wal_gate;
 pub mod websocket;
 pub mod worker_pool;
@@ -3214,7 +3215,11 @@ async fn start_single_node_sqlite(
     // erased for litewire and the PHP bridge.
     let tracked = Arc::new(tracked_backend::TrackedBackend::new(backend, query_stats.clone()));
     wal_gate::DatabaseProbe::register(wal_gate::DEFAULT_SITE_LABEL, db_path, &tracked);
-    spawn_single_node_litewire(sqlite_config, share_shared_backend_with_php(tracked), handles);
+    // One database, one node, one lock namespace: MySQL named locks
+    // (`GET_LOCK()` & co.) exclude across every connection to this database —
+    // wire and bridge alike — and die with the connection that holds them.
+    let scoped = user_locks::scope_shared(tracked as litewire::backend::SharedBackend);
+    spawn_single_node_litewire(sqlite_config, share_backend_with_php(scoped), handles);
     Ok(())
 }
 
