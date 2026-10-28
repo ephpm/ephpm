@@ -1755,6 +1755,9 @@ pub async fn serve_snapshot(
     // `serve_snapshot` directly still exercises the instrumentation, and
     // so both outcomes are counted in one place.
     let started = std::time::Instant::now();
+    // A draining node keeps its cluster channel open while snapshots are
+    // being served to new site owners (`crate::drain`).
+    let _serving = crate::drain::snapshot_serve_started();
     match serve_snapshot_inner(&mut stream, mgmt, local_log_id).await {
         Ok((watermark, bytes)) => {
             cdc_metrics::record_snapshot_served("ok", bytes, started.elapsed());
@@ -3791,11 +3794,18 @@ const HANDOFF_BLOCKED_WARN_EVERY: u32 = 10;
 /// with a full-cluster restart) the node the new hash ranks second need not
 /// hold the site at all, while the node the *old* hash made its owner does.
 /// Asking every alive peer in rank order finds that copy wherever it is.
+///
+/// A **draining** peer (one shutting down, [`NodeInfo::draining`]) is ranked by
+/// its real score, not skipped: it no longer owns anything, but it is usually
+/// the node whose departure moved the site here, so it holds the freshest copy,
+/// and it keeps serving `snapshot/<site>` until it closes its cluster channel
+/// (see `crate::drain`).
 fn handoff_candidates(nodes: &[NodeInfo], self_id: &str, site: &str) -> Vec<NodeInfo> {
     let mut remaining: Vec<NodeInfo> = nodes
         .iter()
         .filter(|n| n.id != self_id && n.state == ephpm_cluster::NodeState::Alive)
         .cloned()
+        .map(|n| NodeInfo { draining: false, ..n })
         .collect();
     let mut ranked = Vec::with_capacity(remaining.len());
     // Repeatedly take the HRW winner of what is left: the canonical scoring and
@@ -5258,6 +5268,33 @@ mod tests {
 
         // A sole member has nobody to ask.
         assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
+    }
+
+    /// A node that is leaving owns nothing, but the cold new owner of one of
+    /// its sites must still ask it first: it held the site until a moment ago,
+    /// so it has the freshest copy, and it keeps serving snapshots while it
+    /// drains (`crate::drain`).
+    #[test]
+    fn a_draining_previous_owner_is_still_asked_first() {
+        let all = vec![
+            alive("ephpm-0", "10.0.0.1"),
+            alive("ephpm-1", "10.0.0.2"),
+            alive("ephpm-2", "10.0.0.3"),
+        ];
+        let site = (0..4096)
+            .map(|i| format!("site-{i}"))
+            .find(|s| ephpm_cluster::hrw_owner(&all, s).unwrap().id == "ephpm-0")
+            .expect("ephpm-0 owns some site");
+        let leaving: Vec<NodeInfo> = all
+            .iter()
+            .cloned()
+            .map(|n| if n.id == "ephpm-0" { NodeInfo { draining: true, ..n } } else { n })
+            .collect();
+        let new_owner = ephpm_cluster::hrw_owner(&leaving, &site).unwrap().id.clone();
+        assert_ne!(new_owner, "ephpm-0", "a draining node owns nothing");
+        let ranked = handoff_candidates(&leaving, &new_owner, &site);
+        assert_eq!(ranked.first().map(|n| n.id.as_str()), Some("ephpm-0"));
+        assert_eq!(ranked.len(), 2);
     }
 
     /// **Mixed-scheme cluster fails closed.** A confirmed peer on another

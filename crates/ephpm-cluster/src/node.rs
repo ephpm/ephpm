@@ -34,11 +34,17 @@ pub struct NodeInfo {
     /// advertisement (≤ v0.12.x, which used scheme `1`). See
     /// [`crate::sqlite_election::HRW_SCHEME`].
     pub hrw_scheme: Option<u32>,
+    /// Whether the node has announced that it is shutting down
+    /// ([`DRAINING_KEY`], set by [`ClusterHandle::mark_draining`]). A draining
+    /// node is still alive and still answers on the cluster channel, but it
+    /// is no longer a candidate to own a per-site database
+    /// ([`crate::hrw_owner`]).
+    pub draining: bool,
 }
 
 impl NodeInfo {
-    /// A node known only by id and gossip address — no advertised data port
-    /// and no advertised ownership-hash scheme.
+    /// A node known only by id and gossip address — no advertised data port,
+    /// no advertised ownership-hash scheme, not draining.
     #[must_use]
     pub fn new(id: impl Into<String>, gossip_addr: impl Into<String>, state: NodeState) -> Self {
         Self {
@@ -47,8 +53,23 @@ impl NodeInfo {
             state,
             data_port: None,
             hrw_scheme: None,
+            draining: false,
         }
     }
+}
+
+/// Chitchat key a node sets when it begins a graceful shutdown
+/// ([`ClusterHandle::mark_draining`]). It is the leave message chitchat does
+/// not have: without it peers only notice a stopped node through the failure
+/// detector, 24–40 s after its heartbeat stops, and a node that takes minutes
+/// to stop (its final WAL checkpoint) is counted alive — and kept as the owner
+/// of its per-site databases — the whole time. Outside the `kv:` prefix so the
+/// KV applier never sees it.
+pub const DRAINING_KEY: &str = "ephpm:draining";
+
+/// Read whether a node has announced it is draining.
+fn advertised_draining(state: &chitchat::NodeState) -> bool {
+    state.get(DRAINING_KEY).is_some()
 }
 
 /// Chitchat key under which a node advertises the per-site ownership hash
@@ -290,6 +311,7 @@ pub(crate) fn present_peers_locked(
             state: NodeState::Alive,
             data_port: advertised_data_port(state),
             hrw_scheme: advertised_hrw_scheme(state),
+            draining: advertised_draining(state),
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -327,6 +349,9 @@ pub struct ClusterHandle {
     /// Wall-clock epoch milliseconds at which this node started gossip —
     /// the time a peer's [`KV_MARK_KEY`] must be past to prove catch-up.
     started_ms: u64,
+    /// Set by [`ClusterHandle::mark_draining`]; mirrors [`DRAINING_KEY`] in
+    /// this node's own gossip state.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClusterHandle {
@@ -359,6 +384,7 @@ impl ClusterHandle {
                     state,
                     data_port: node_state.and_then(advertised_data_port),
                     hrw_scheme: node_state.and_then(advertised_hrw_scheme),
+                    draining: node_state.is_some_and(advertised_draining),
                 });
             }
         }
@@ -383,7 +409,33 @@ impl ClusterHandle {
             state: NodeState::Alive,
             data_port: Some(self.data_port),
             hrw_scheme: Some(crate::sqlite_election::HRW_SCHEME),
+            draining: self.is_draining(),
         }
+    }
+
+    /// Announce that this node is shutting down: set [`DRAINING_KEY`] in its
+    /// gossip state, so every node (this one included, immediately; peers on
+    /// their next gossip exchange, about a second) stops counting it as a
+    /// candidate owner of per-site databases ([`crate::hrw_owner`]) and
+    /// re-homes its sites to the next node in each site's HRW order. The node
+    /// stays alive and keeps gossiping, so it is still listed, still asked for
+    /// snapshots of the sites it held, and still reachable by the KV data
+    /// plane. Permanent for this process; idempotent.
+    pub async fn mark_draining(&self) {
+        if self.draining.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let chitchat = self.handle.chitchat();
+        let mut guard = chitchat.lock().await;
+        guard.self_node_state().set(DRAINING_KEY, "1");
+        drop(guard);
+        tracing::info!(node_id = %self.self_id, "announced drain to the cluster");
+    }
+
+    /// Whether [`mark_draining`](Self::mark_draining) has run on this node.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The address this node's KV data plane listens on: the gossip bind IP
@@ -554,6 +606,7 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         writer,
         writer_task,
         started_ms,
+        draining: std::sync::atomic::AtomicBool::new(false),
     })
 }
 

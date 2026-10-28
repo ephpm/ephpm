@@ -346,11 +346,22 @@ where
 /// scores next-highest for it, a node already replicating that site — and
 /// leaves every other site's owner unchanged. That minimal reshuffle is
 /// exactly what mod-N ownership does not give.
+///
+/// # Draining nodes
+///
+/// A node that has announced a graceful shutdown ([`NodeInfo::draining`]) is
+/// skipped while any alive node is not draining, so its sites re-home the
+/// moment the announcement arrives instead of when the failure detector
+/// finally marks it dead. If **every** alive node is draining (the whole
+/// cluster is stopping) the rule falls back to all alive nodes: every node
+/// still agrees on one owner per site, where excluding them all would leave
+/// each node serving its own copy.
 #[must_use]
 pub fn hrw_owner<'a>(alive: &'a [NodeInfo], site: &str) -> Option<&'a NodeInfo> {
-    alive.iter().filter(|n| n.state == NodeState::Alive).max_by(|a, b| {
-        hrw_score(&a.id, site).cmp(&hrw_score(&b.id, site)).then_with(|| a.id.cmp(&b.id))
-    })
+    let any_staying = alive.iter().any(|n| n.state == NodeState::Alive && !n.draining);
+    alive.iter().filter(|n| n.state == NodeState::Alive && (!any_staying || !n.draining)).max_by(
+        |a, b| hrw_score(&a.id, site).cmp(&hrw_score(&b.id, site)).then_with(|| a.id.cmp(&b.id)),
+    )
 }
 
 /// How often the primary refreshes its claim.
@@ -1303,6 +1314,57 @@ mod tests {
         // No alive node → no owner.
         let all_dead = [dead("ephpm-0"), dead("ephpm-1")];
         assert!(hrw_owner(&all_dead, "tenant-x").is_none());
+    }
+
+    fn draining(id: &str) -> NodeInfo {
+        NodeInfo { draining: true, ..alive(id) }
+    }
+
+    /// A draining node gives up exactly the sites it owned, each to the node
+    /// that would own it if the draining node were dead (its warm replica),
+    /// and no other site moves.
+    #[test]
+    fn hrw_owner_skips_a_draining_node_like_a_dead_one() {
+        let all = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        let as_draining: Vec<NodeInfo> = all
+            .iter()
+            .map(|n| if n.id == "ephpm-1" { draining(&n.id) } else { n.clone() })
+            .collect();
+        let as_dead: Vec<NodeInfo> =
+            all.iter().map(|n| if n.id == "ephpm-1" { dead(&n.id) } else { n.clone() }).collect();
+        let mut moved = 0;
+        for i in 0..200 {
+            let site = format!("site-{i}");
+            let before = hrw_owner(&all, &site).unwrap().id.clone();
+            let during = hrw_owner(&as_draining, &site).unwrap().id.clone();
+            assert_ne!(during, "ephpm-1", "a draining node must not own {site}");
+            assert_eq!(during, hrw_owner(&as_dead, &site).unwrap().id, "{site}");
+            if before == "ephpm-1" {
+                moved += 1;
+            } else {
+                assert_eq!(during, before, "{site} was not the draining node's and must stay put");
+            }
+        }
+        assert!(moved > 0, "the draining node owned some of the 200 sites");
+    }
+
+    /// When the whole cluster stops, every node is draining at once. Excluding
+    /// them all would give no owner, and every node would serve its own copy;
+    /// the rule falls back to the alive nodes so they still agree.
+    #[test]
+    fn hrw_owner_with_every_node_draining_keeps_one_owner() {
+        let all = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        let all_draining = [draining("ephpm-0"), draining("ephpm-1"), draining("ephpm-2")];
+        for i in 0..50 {
+            let site = format!("site-{i}");
+            assert_eq!(
+                hrw_owner(&all_draining, &site).unwrap().id,
+                hrw_owner(&all, &site).unwrap().id
+            );
+        }
+        // A dead non-draining node does not count as "staying".
+        let mixed = [draining("ephpm-0"), dead("ephpm-1")];
+        assert_eq!(hrw_owner(&mixed, "s").unwrap().id, "ephpm-0");
     }
 
     #[test]

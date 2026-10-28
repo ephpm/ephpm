@@ -1064,7 +1064,7 @@ async fn serve_forwarded_sql(
     }
 
     tracing::debug!(peer = %peer, site = %site, "forwarded-SQL: serving owner session");
-    serve_owner_statements(&mut stream, registry, site).await
+    serve_owner_statements(&mut stream, registry, site, || cluster.is_draining()).await
 }
 
 /// How long a refused stream waits for the client's first request before
@@ -1116,10 +1116,21 @@ where
 /// [`SqlResponse::Progress`] heartbeat goes out every [`PROGRESS_INTERVAL`],
 /// which is what lets the client bound its wait on a *silent* owner without
 /// bounding how long a statement may legitimately take.
+///
+/// # Draining
+///
+/// `is_draining` is checked before every statement. Once this node has
+/// announced its leave (`crate::drain`) it owns no site, so it must not run a
+/// statement on a stream it accepted while it was the owner: the next owner
+/// may already be accepting writes, and a write here would fork the site. The
+/// request is answered with a connection-shaped refusal flagged `closed`, the
+/// stream ends (dropping the session rolls back any open transaction), and the
+/// client re-resolves the site's current owner.
 async fn serve_owner_statements<S>(
     stream: &mut S,
     registry: &SiteBackends,
     site: &str,
+    is_draining: impl Fn() -> bool,
 ) -> anyhow::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -1146,6 +1157,23 @@ where
                     break;
                 }
             };
+        if is_draining() {
+            tracing::debug!(
+                site = %site,
+                "forwarded-SQL: this node is leaving the cluster; refusing the statement so the \
+                 client re-resolves the site's owner"
+            );
+            let refusal = SqlResponse::Error {
+                sqlite: false,
+                message: format!(
+                    "connection refused: this node is shutting down and no longer owns site \
+                     {site}; reconnect to reach the current owner"
+                ),
+                closed: true,
+            };
+            let _ = write_msg(stream, &refusal).await;
+            break;
+        }
         let progress = req.wants_progress();
         let resp = match open_owner_session(registry, site, &mut backend, &mut conn).await {
             Ok(session) if progress => execute_with_progress(stream, session, req).await?,
@@ -1800,7 +1828,7 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let started = Instant::now();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &registry, "s1").await.unwrap();
+            serve_owner_statements(&mut owner, &registry, "s1", || false).await.unwrap();
             owner
         });
         let owner = served.await.unwrap();
@@ -1825,7 +1853,7 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let owner_registry = registry.clone();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &owner_registry, "s1").await.unwrap();
+            serve_owner_statements(&mut owner, &owner_registry, "s1", || false).await.unwrap();
         });
 
         for sql in ["CREATE TABLE t (x INTEGER)", "BEGIN", "INSERT INTO t VALUES (1)"] {
