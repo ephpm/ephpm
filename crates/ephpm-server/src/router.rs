@@ -2533,6 +2533,7 @@ impl Router {
                     );
                 }
             }
+            write_vhost_marker(&state_root, document_root);
             self.ensured_vhost_dirs.insert(state_root.clone());
         }
 
@@ -7296,6 +7297,69 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// File inside a vhost state root recording the site container it belongs to,
+/// so a later start can tell that the site has been deleted.
+const VHOST_MARKER: &str = ".ephpm-site";
+
+/// Record `container` in `state_root` (best effort; a missing marker only means
+/// the directory is never reaped).
+fn write_vhost_marker(state_root: &Path, container: &Path) {
+    let marker = state_root.join(VHOST_MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&marker, container.to_string_lossy().as_bytes()) {
+        tracing::debug!(path = %marker.display(), error = %e, "could not write vhost marker");
+    }
+}
+
+/// Default grace period before an orphaned vhost state root is reaped.
+pub const VHOST_REAP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Remove per-vhost state roots whose site no longer exists.
+///
+/// The state root (`<tmpdir>/ephpm-vhosts/<label>-<digest>`) is deliberately
+/// stable across restarts so a live site keeps its sessions, so it is NOT
+/// removed on shutdown. What accumulates is the roots of sites that were
+/// deleted (or were one-off, e.g. in a stress run). Each root carries a marker
+/// naming its site container; a root is reaped when that container is gone, the
+/// marker is older than `min_age`, and `sites_dir` itself is present (so an
+/// unmounted sites volume never wipes live sessions). Roots without a marker
+/// are left alone. Returns the number of roots removed.
+#[must_use]
+pub fn reap_orphaned_vhost_state(
+    base: &Path,
+    sites_dir: &Path,
+    min_age: std::time::Duration,
+) -> usize {
+    if !sites_dir.is_dir() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(base) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let root = entry.path();
+        let marker = root.join(VHOST_MARKER);
+        let Ok(container) = std::fs::read_to_string(&marker) else { continue };
+        if Path::new(container.trim()).exists() {
+            continue;
+        }
+        let old_enough = std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough && std::fs::remove_dir_all(&root).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// The three per-vhost private paths injected into a request's PHP sandbox.
 #[derive(Clone, Debug)]
 struct VhostPrivateDirs {
@@ -11776,6 +11840,47 @@ mod tests {
         assert_eq!(sanitize_path_label(""), "site");
         assert_eq!(sanitize_path_label("..").len(), 2); // dots are allowed but the digest suffix keeps it unique+bounded
         assert_eq!(sanitize_path_label(&"x".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn reap_orphaned_vhost_state_removes_only_dead_sites() {
+        let base = tempfile::tempdir().unwrap();
+        let sites = tempfile::tempdir().unwrap();
+        let live = sites.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let gone = sites.path().join("gone");
+
+        let mk = |name: &str, container: Option<&Path>| {
+            let root = base.path().join(name);
+            std::fs::create_dir_all(root.join("tmp")).unwrap();
+            if let Some(c) = container {
+                write_vhost_marker(&root, c);
+            }
+            root
+        };
+        let live_root = mk("live-1", Some(&live));
+        let gone_root = mk("gone-1", Some(&gone));
+        let legacy_root = mk("legacy-1", None);
+
+        // Too young: nothing is removed.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(reap_orphaned_vhost_state(base.path(), sites.path(), hour), 0);
+        assert!(gone_root.exists());
+
+        // Old enough: only the dead site's root goes.
+        assert_eq!(
+            reap_orphaned_vhost_state(base.path(), sites.path(), std::time::Duration::ZERO),
+            1
+        );
+        assert!(!gone_root.exists());
+        assert!(live_root.exists());
+        assert!(legacy_root.exists());
+
+        // Missing sites_dir (unmounted volume): never reaps.
+        let gone2 = mk("gone-2", Some(&gone));
+        let missing = sites.path().join("nope");
+        assert_eq!(reap_orphaned_vhost_state(base.path(), &missing, std::time::Duration::ZERO), 0);
+        assert!(gone2.exists());
     }
 
     #[test]

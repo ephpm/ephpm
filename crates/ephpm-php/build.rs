@@ -535,6 +535,30 @@ fn php_config_has_max_exec_timers(include_dir: &Path) -> bool {
 }
 
 /// Compile the C wrapper that provides `zend_try`/`zend_catch` guards.
+/// Format a Unix timestamp (UTC) the way C's `__DATE__` / `__TIME__` do:
+/// `"Mmm dd yyyy"` (day space-padded to two) and `"hh:mm:ss"`.
+fn c_build_stamp(secs: u64) -> (String, String) {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let month_name = MONTHS[usize::try_from(month - 1).unwrap_or(0)];
+    (
+        format!("{month_name} {day:>2} {year}"),
+        format!("{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60),
+    )
+}
+
 fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool, shared: bool) {
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
@@ -620,6 +644,30 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool, s
         build.define("ZEND_WIN32", None);
         build.define("PHP_WIN32", None);
         build.define("ZEND_DEBUG", Some("0"));
+
+        // `ephpm php -v` printed `(built: 1 1)` on Windows: the wrapper's
+        // `__DATE__`/`__TIME__` did not expand to the usual strings in this
+        // toolchain/PHP-header combination. Hand the wrapper the stamp through
+        // a generated header instead (a header, not `-D`, because the value
+        // contains spaces and `cl` quoting of those is fragile). Honours
+        // SOURCE_DATE_EPOCH for reproducible builds. Unix keeps the compiler
+        // macros.
+        println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+        let secs = env::var("SOURCE_DATE_EPOCH").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let secs = secs.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        });
+        let (date, time) = c_build_stamp(secs);
+        std::fs::write(
+            out_dir.join("ephpm_build_stamp.h"),
+            format!("#define EPHPM_BUILD_DATE \"{date}\"\n#define EPHPM_BUILD_TIME \"{time}\"\n"),
+        )
+        .expect("failed to write ephpm_build_stamp.h");
+        build.include(&out_dir);
+        build.define("EPHPM_HAVE_BUILD_STAMP", None);
     }
 
     // When the SDK has per-thread execution timers, ePHPm lets PHP arm its own
