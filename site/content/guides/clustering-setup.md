@@ -83,7 +83,7 @@ How it differs from whole-database clustering:
 
 > **Upgrading per-site clustered mode to v0.13.0 requires a full-cluster restart.** v0.13.0 replaced the ownership hash (scheme 2). The old one put sites whose keys share a prefix, such as `s001`, `s002` or `pr-12`, on a single node. The new scheme moves most sites to a different owner. A v0.12.x node and a v0.13.0 node disagree on who owns what, so in a mixed cluster the v0.13.0 nodes refuse to act as owner (see above) and only the v0.12.x nodes accept writes. Whole-database clustered mode and single-node mode are unaffected.
 >
-> 1. Stop writes and wait until every site's replicas have caught up: `ephpm_cdc_replication_lag_changes{site=...}` is `0` for every site on the node that serves it.
+> 1. Stop writes and wait until every site's replicas have caught up: for every site, `max by (site) (ephpm_cdc_primary_head_change_id) - min by (site) (ephpm_cdc_applied_change_id)` is `0`. The owner's own `ephpm_cdc_replication_lag_changes` is not enough: it covers only replicas that are attached, so it reads `0` while another replica is still bootstrapping.
 > 2. Stop every node, upgrade, then start them all.
 > 3. Wait until every node has joined (each node sees all the others alive) before you send traffic again.
 >

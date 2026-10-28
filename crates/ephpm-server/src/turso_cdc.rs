@@ -2008,22 +2008,24 @@ async fn table_columns(conn: &turso::Connection, table: &str) -> anyhow::Result<
     Ok(names)
 }
 
-/// Apply a received snapshot dump to the local (cold) DB, then seed the
-/// watermark to `N` so the CDC tail resumes exactly past it, and record
-/// which log `N` belongs to (issue #315) so a later failover to a
-/// different primary is detected as a source switch.
+/// Apply an already-vetted snapshot dump, then seed the watermark to `N` so
+/// the CDC tail resumes exactly past it, and record which log `N` belongs to
+/// (issue #315) so a later failover to a different primary is detected as a
+/// source switch.
 ///
-/// The dump arrives from the network and is only UTF-8 checked before
-/// this point, so it is validated against a statement allowlist first
-/// — see [`validate_snapshot_dump`]. Only then does it reach
-/// `execute_batch`.
+/// Only ever called by [`install_snapshot`], **inside its transaction**: the
+/// dump, the watermark and the source record commit together or not at all.
+/// Run outside one, every `INSERT` of the dump was its own autocommit
+/// transaction (one fsync per row: 177 s to bootstrap one 9,706-change site
+/// on a loaded disk), and an apply cut short — a `database is locked` from
+/// the shutdown checkpoint, a crash — left a partly populated database with
+/// no watermark and no source record, which a restart then mistook for
+/// local-origin data.
 async fn apply_snapshot(
     conn: &turso::Connection,
     header: &SnapshotHeader,
     dump: &str,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(!header.log_id.is_empty(), "snapshot: peer announced an empty log id");
-    validate_snapshot_dump(dump).context("snapshot: dump rejected by the statement allowlist")?;
     // Execute the whole dump as a batch. It is self-consistent DDL+DML
     // captured under one read view on the primary.
     conn.execute_batch(dump).await.context("snapshot: apply dump")?;
@@ -2446,7 +2448,7 @@ async fn fetch_and_apply_snapshot_on(
         fetch_snapshot(primary_addr, channel, max_snapshot_bytes, snapshot_stream).await?;
     {
         let _permit = factory.wal_gate_permit().await;
-        off_runtime(apply_snapshot(conn, &header, &dump)).await?;
+        off_runtime(install_snapshot(conn, &header, &dump, false)).await?;
     }
     // Only counted once the dump is durably applied: bytes received into
     // a buffer that then failed validation are not a bootstrap.
@@ -4302,6 +4304,12 @@ async fn replicate_site_once(
         if let ReplicaAction::Bootstrap { discard_local } =
             plan_replica_attempt(force_reset, lineage.as_deref())
         {
+            // Publish this replica as holding none of the owner's log until
+            // the snapshot installs. The owner cannot see a replica that has
+            // not subscribed yet — its lag gauge covers attached subscribers
+            // only — so without this a replica stuck bootstrapping had no
+            // applied series at all and the cross-node lag query skipped it.
+            cdc_metrics::record_applied_watermark(site, 0);
             let bconn =
                 factory.raw_connection().context("per-site replica: open snapshot connection")?;
             bootstrap_site_from(
@@ -4373,11 +4381,41 @@ async fn bootstrap_site_from(
 /// data already in hand, and so the "an empty snapshot must not clobber live
 /// data" invariant is directly testable against a real database.
 ///
+/// Used by both clustered modes (whole-database bootstrap passes
+/// `discard_local = false`).
+///
+/// # Atomicity
+///
+/// The discard, the dump, the watermark seed and the source-log record run
+/// in **one** `BEGIN IMMEDIATE … COMMIT`. Either the replica ends up with the
+/// whole snapshot and the bookkeeping that names it, or with exactly what it
+/// had before. That is what makes an interrupted install safe to retry:
+///
+/// - an error part-way (a `database is locked` from the shutdown checkpoint,
+///   a constraint failure, a malformed statement) rolls back here;
+/// - a process that dies mid-install never commits, so the uncommitted WAL
+///   frames are discarded when the file is next opened and the next start
+///   sees the pre-install state — cold again, or its own data with its
+///   lineage intact — and bootstraps again.
+///
+/// Before v0.13.1 the steps ran as separate autocommit statements: a failure
+/// after the discard left the replica stripped, and a failure mid-dump left
+/// tables with partial rows and no source record, which the next start read
+/// as local-origin data ([`site_data_lineage`]) — 22 of 40 sites in the
+/// v0.13.0 RC stress run never reconverged. One transaction is also one
+/// commit, so the dump no longer pays an fsync per row.
+///
+/// The caller holds the factory's WAL-gate permit (raw connection, no busy
+/// timeout) and runs this through `off_runtime`; nothing here awaits the
+/// network.
+///
 /// # Errors
 ///
 /// Returns an error, **before touching anything local**, if the dump cannot
-/// replace the local data ([`snapshot_may_replace_local_data`]); or if the
-/// discard or the apply fails.
+/// replace the local data ([`snapshot_may_replace_local_data`]), announces no
+/// log identity, or contains a statement outside the allowlist
+/// ([`validate_snapshot_dump`]); or, after a rollback, if the discard, the
+/// apply or the commit fails.
 async fn install_snapshot(
     conn: &turso::Connection,
     header: &SnapshotHeader,
@@ -4385,12 +4423,52 @@ async fn install_snapshot(
     discard_local: bool,
 ) -> anyhow::Result<()> {
     snapshot_may_replace_local_data(dump, discard_local)?;
-    if discard_local {
-        reset_local_user_tables(conn)
+    anyhow::ensure!(!header.log_id.is_empty(), "snapshot: peer announced an empty log id");
+    // The dump arrives from the network and is only UTF-8 checked before this
+    // point, so it is vetted against the statement allowlist before it can
+    // reach `execute_batch`.
+    validate_snapshot_dump(dump).context("snapshot: dump rejected by the statement allowlist")?;
+
+    // A connection reused across attempts may still be inside the
+    // transaction of an earlier attempt whose rollback failed. `BEGIN` would
+    // then fail on every retry; end that transaction first.
+    if !conn.is_autocommit().context("snapshot: read transaction state")? {
+        conn.execute("ROLLBACK", ())
             .await
-            .context("per-site replica: discard divergent local tables")?;
+            .context("snapshot: roll back a transaction left open by an earlier attempt")?;
     }
-    apply_snapshot(conn, header, dump).await
+    conn.execute("BEGIN IMMEDIATE", ()).await.context("snapshot: begin install transaction")?;
+
+    let staged = async {
+        if discard_local {
+            reset_local_user_tables(conn)
+                .await
+                .context("per-site replica: discard divergent local tables")?;
+        }
+        apply_snapshot(conn, header, dump).await
+    }
+    .await;
+
+    let outcome = match staged {
+        Ok(()) => conn.execute("COMMIT", ()).await.map(drop).context("snapshot: commit install"),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = outcome {
+        // On failure the connection stays inside the transaction. The next
+        // attempt on it rolls back first (above); a dropped connection never
+        // commits it.
+        if !conn.is_autocommit().unwrap_or(false)
+            && let Err(rb) = conn.execute("ROLLBACK", ()).await
+        {
+            tracing::warn!(
+                error = %rb,
+                "snapshot: rollback of a failed install did not complete; the partial install \
+                 is uncommitted and will be discarded"
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// User (non-bookkeeping) table names in a local database — the same predicate
@@ -5168,6 +5246,153 @@ mod tests {
         // on a fresh cluster must still bootstrap.
         reset_local_user_tables(&conn).await.unwrap();
         install_snapshot(&conn, &header, "", false).await.unwrap();
+    }
+
+    /// A replica holding the site's data with a recorded lineage, as a
+    /// re-bootstrap (`discard_local = true`) finds it.
+    async fn populated_replica(conn: &turso::Connection) {
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('kept-1')", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('kept-2')", ()).await.unwrap();
+        seed_watermark(conn, 7).await.unwrap();
+        set_source_log(conn, "old-owner-log").await.unwrap();
+    }
+
+    /// The pre-install state [`populated_replica`] wrote is intact: no table
+    /// dropped, no partial table created, bookkeeping unchanged.
+    async fn assert_pre_install_state(conn: &turso::Connection) {
+        assert_eq!(list_user_tables(conn).await.unwrap(), vec!["posts".to_string()]);
+        assert_eq!(row_count(conn, "posts").await, 2);
+        assert_eq!(read_watermark(conn).await.unwrap(), 7);
+        assert_eq!(
+            read_single_text(conn, SOURCE_LOG_TABLE, "log_id").await.unwrap().as_deref(),
+            Some("old-owner-log")
+        );
+    }
+
+    /// R2 from the v0.13.0 RC stress run: an install that fails part-way must
+    /// leave the replica exactly as it was, not stripped of its tables and not
+    /// holding a partial copy. The dump passes the allowlist but its third
+    /// statement fails at execution, after the discard and after the first
+    /// table and row were written, which is where the shutdown checkpoint's
+    /// `database is locked` used to land. A retry with a good dump then
+    /// installs cleanly on the same connection.
+    #[tokio::test]
+    async fn failed_install_rolls_back_to_the_pre_install_state() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+        populated_replica(&conn).await;
+
+        let header = SnapshotHeader {
+            watermark: 40,
+            total_len: 0,
+            log_id: "new-owner-log".into(),
+            no_copy: false,
+        };
+        let failing = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                       INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n\
+                       INSERT OR REPLACE INTO missing (rowid, a) VALUES (1, 1);\n";
+        let err = install_snapshot(&conn, &header, failing, true).await.unwrap_err();
+        assert!(format!("{err:#}").contains("apply dump"), "unexpected error: {err:#}");
+        assert!(conn.is_autocommit().unwrap(), "the failed install's transaction was ended");
+        assert_pre_install_state(&conn).await;
+
+        install_snapshot(
+            &conn,
+            &header,
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+             INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row_count(&conn, "posts").await, 1);
+        assert_eq!(read_watermark(&conn).await.unwrap(), 40);
+        assert_eq!(
+            read_single_text(&conn, SOURCE_LOG_TABLE, "log_id").await.unwrap().as_deref(),
+            Some("new-owner-log")
+        );
+    }
+
+    /// A process that dies mid-install never commits. Simulated by running the
+    /// install's statements inside an open transaction and dropping the
+    /// connection and the database without a `COMMIT`: another connection can
+    /// still write (the dropped one does not keep the write lock), and after a
+    /// reopen the file holds the pre-install state, so the next start's
+    /// install succeeds.
+    #[tokio::test]
+    async fn install_interrupted_by_exit_leaves_pre_install_state_and_retries_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let header = SnapshotHeader {
+            watermark: 40,
+            total_len: 0,
+            log_id: "new-owner-log".into(),
+            no_copy: false,
+        };
+        let dump = snapshot_dump_with_rows(500);
+        {
+            let t = Turso::open(&path).await.unwrap();
+            let conn = t.raw_connection().unwrap();
+            populated_replica(&conn).await;
+
+            // The install's own steps, cut off before COMMIT.
+            conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+            reset_local_user_tables(&conn).await.unwrap();
+            apply_snapshot(&conn, &header, &dump).await.unwrap();
+            drop(conn);
+
+            let other = t.raw_connection().unwrap();
+            other.execute("CREATE TABLE IF NOT EXISTS probe (a)", ()).await.unwrap();
+            other.execute("DROP TABLE probe", ()).await.unwrap();
+        }
+
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+        assert_pre_install_state(&conn).await;
+
+        install_snapshot(&conn, &header, &dump, true).await.unwrap();
+        assert_eq!(row_count(&conn, "posts").await, 500);
+        assert_eq!(read_watermark(&conn).await.unwrap(), 40);
+    }
+
+    /// A dump of `rows` rows of the `posts` table, shaped like
+    /// `dump_user_tables` output.
+    fn snapshot_dump_with_rows(rows: usize) -> String {
+        use std::fmt::Write as _;
+        let mut dump = String::from("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n");
+        for i in 1..=rows {
+            writeln!(
+                dump,
+                "INSERT OR REPLACE INTO posts (rowid, id, title) VALUES ({i}, {i}, 'row {i} {}');",
+                "x".repeat(200)
+            )
+            .unwrap();
+        }
+        dump
+    }
+
+    /// R3: the dump commits once. A cold install of 20,000 rows (about 4.5 MB)
+    /// completes in one transaction; the old per-row autocommit paid 20,000
+    /// commits for the same dump.
+    #[tokio::test]
+    async fn large_snapshot_installs_in_one_transaction() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+        let header = SnapshotHeader {
+            watermark: 20_000,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+        };
+        install_snapshot(&conn, &header, &snapshot_dump_with_rows(20_000), false).await.unwrap();
+        assert_eq!(row_count(&conn, "posts").await, 20_000);
+        assert_eq!(read_watermark(&conn).await.unwrap(), 20_000);
+        assert!(conn.is_autocommit().unwrap());
     }
 
     #[test]
