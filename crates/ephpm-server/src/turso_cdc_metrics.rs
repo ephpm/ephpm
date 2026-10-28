@@ -106,6 +106,14 @@
 //! dies shows a genuinely growing lag. Before the first subscriber ever
 //! attaches there is no cursor to subtract from, and the lag and shipped
 //! gauges are simply not emitted.
+//!
+//! The lag covers **attached** subscribers only. The owner does not know how
+//! many replicas a site should have, so a replica that is bootstrapping (or
+//! has lost its stream) while another stays caught up is invisible here and
+//! the lag reads `0` (the v0.13.0 RC stress run saw exactly that for 22
+//! sites). The replica side closes the gap: a per-site replica publishes
+//! [`METRIC_APPLIED_CHANGE_ID`] as `0` when it starts a snapshot bootstrap,
+//! so the cross-node query above reports it as behind instead of skipping it.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
