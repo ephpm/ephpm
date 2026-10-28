@@ -583,6 +583,19 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     let snapshot_paths = kv_snapshot.as_ref().map(|svc| svc.runtime_paths()).unwrap_or_default();
     privdrop::drop_privileges(&config, &snapshot_paths).context("failed to drop privileges")?;
 
+    // Reap per-vhost temp/session roots left by sites that no longer exist
+    // (runs as the post-drop uid, which owns the base). Live sites keep theirs.
+    if let Some(sites_dir) = config.server.sites_dir.clone() {
+        std::thread::spawn(move || {
+            let base = std::env::temp_dir().join("ephpm-vhosts");
+            let n =
+                router::reap_orphaned_vhost_state(&base, &sites_dir, router::VHOST_REAP_MIN_AGE);
+            if n > 0 {
+                tracing::info!(removed = n, "reaped temp/session state of deleted vhosts");
+            }
+        });
+    }
+
     // Peer warm-up: pull this node's share of large KV values from its
     // peers — a join wait of up to 10 s for gossip to list a peer (not
     // shortened by `load_timeout`, since `peers == 0` is what lets the

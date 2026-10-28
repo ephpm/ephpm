@@ -353,7 +353,7 @@ In multi-tenant mode each virtual host also gets its own private temp and sessio
 
 ### How It Works
 
-For each vhost, ephpm derives a private state root `<system-temp>/ephpm-vhosts/<label>-<digest>` from the resolved (traversal-safe) **site container** — stable per site across restarts, distinct for every site, and unchanged by a [document-root override](#per-site-document-root-frameworks-with-a-public-directory). Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix), and every request routed to that vhost runs with:
+For each vhost, ephpm derives a private state root `<system-temp>/ephpm-vhosts/<label>-<digest>` from the resolved (traversal-safe) **site container** — stable per site across restarts, distinct for every site, and unchanged by a [document-root override](#per-site-document-root-frameworks-with-a-public-directory). Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix). The root is kept across restarts, so a live site keeps its sessions; when a site's directory is deleted, its state root (identified by a `.ephpm-site` marker ePHPm writes into it) is removed at the next start once it is at least 24 hours old, and only while `sites_dir` itself exists. Every request routed to that vhost runs with:
 
 | PHP directive | Value | Effect |
 |---|---|---|

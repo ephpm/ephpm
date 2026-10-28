@@ -8800,10 +8800,20 @@ int ephpm_cli_main(int argc, char **argv)
              * Formatting ZEND_VERSION by hand here dropped those lines, so
              * `ephpm php -d zend_extension=xdebug.so -v` never said
              * "with Xdebug v3.x" even though Xdebug was loaded. */
+#ifdef EPHPM_HAVE_BUILD_STAMP
+            /* Windows: build.rs generates the stamp (__DATE__/__TIME__ came
+             * out as "1 1" there). */
+#include "ephpm_build_stamp.h"
+#define EPHPM_DATE_ARG EPHPM_BUILD_DATE
+#define EPHPM_TIME_ARG EPHPM_BUILD_TIME
+#else
+#define EPHPM_DATE_ARG __DATE__
+#define EPHPM_TIME_ARG __TIME__
+#endif
             php_printf("PHP %s (%s) (built: %s %s) (%s)\n"
                        "Copyright (c) The PHP Group\n"
                        "%s",
-                       PHP_VERSION, EPHPM_SAPI_NAME, __DATE__, __TIME__,
+                       PHP_VERSION, EPHPM_SAPI_NAME, EPHPM_DATE_ARG, EPHPM_TIME_ARG,
 #ifdef ZTS
                        "ZTS",
 #else
