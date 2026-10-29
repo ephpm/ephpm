@@ -383,7 +383,18 @@ enum Frame {
     /// *for that log* before subscribing, so a cursor accumulated against
     /// a dead primary's log can never be applied to a promoted node's
     /// (differently-numbered) log.
-    Hello { log_id: String },
+    ///
+    /// `epoch` carries the serving owner's **persisted** per-site ownership
+    /// epoch (#654, [`EPOCH_TABLE`]), so a replica adopts it durably
+    /// ([`adopt_site_epoch`]) and, if later promoted, out-ranks a returning
+    /// owner's stale copy by epoch rather than by the per-stint `change_id`
+    /// head. `#[serde(default)]` so a pre-#654 owner (which sends no field)
+    /// decodes as `0` — nothing to adopt, the fail-safe direction.
+    Hello {
+        log_id: String,
+        #[serde(default)]
+        epoch: u64,
+    },
     /// **Replica → primary, sent after [`Frame::Hello`].** The replica's
     /// applied watermark **in the log the Hello named**. The primary
     /// starts this subscriber's tailer at exactly this `change_id`, so
@@ -1095,7 +1106,11 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     local_log_id: &str,
     site: &str,
 ) -> anyhow::Result<()> {
-    write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string() })
+    // Carry this owner's persisted ownership epoch (#654) so the replica can
+    // adopt it durably — the crux that lets a promoted replica out-rank a
+    // returning owner's stale copy without depending on a live gossip advert.
+    let epoch = read_owner_epoch(mgmt).await;
+    write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string(), epoch })
         .await
         .context("send hello frame")?;
     let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
@@ -1308,11 +1323,16 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
              mixed-version clustered nodes are not supported"
         )
     })?;
-    let source_log_id = match hello.context("read hello frame")? {
-        Frame::Hello { log_id } => log_id,
+    let (source_log_id, source_epoch) = match hello.context("read hello frame")? {
+        Frame::Hello { log_id, epoch } => (log_id, epoch),
         other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
     };
     anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
+    // Adopt the owner's ownership epoch durably (#654) before applying its
+    // stint, so if this replica is later promoted its own SiteVersion already
+    // reflects the stint its data descends from — independent of whether the
+    // owner's short-lived gossip advertisement is still live at that time.
+    adopt_site_epoch(factory, source_epoch).await;
 
     let watermark = {
         let _permit = factory.wal_gate_permit().await;
@@ -1443,6 +1463,15 @@ const SOURCE_LOG_TABLE: &str = "__ephpm_cdc_source";
 /// Table holding the per-source-log watermark history.
 const LOG_WATERMARKS_TABLE: &str = "__ephpm_cdc_watermarks";
 
+/// Table holding this site's ownership **epoch** (#654): a per-site counter
+/// bumped each time a node settles as a new owner and begins serving. Combined
+/// with `MAX(turso_cdc.change_id)` it forms the chain-global
+/// [`crate::site_version::SiteVersion`] that lets a returning owner tell a
+/// fresh copy from a stale one. `__`-prefixed and written through the mgmt
+/// connection (capture off), like the other CDC bookkeeping tables, so it is
+/// excluded from snapshot dumps and the cold-start check.
+const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
+
 /// Read this database's persistent CDC log identity, generating and
 /// storing a fresh random one if none exists yet.
 ///
@@ -1540,6 +1569,98 @@ async fn set_source_log(conn: &turso::Connection, log_id: &str) -> anyhow::Resul
     .await
     .context("cdc: write source log")?;
     Ok(())
+}
+
+/// Read this site's persisted ownership epoch (#654). `0` when the table does
+/// not exist yet (a copy that has never settled as an owner — it loses every
+/// [`crate::site_version::SiteVersion`] comparison, which is the fail-safe
+/// direction: it will not out-rank a peer).
+async fn read_site_epoch(conn: &turso::Connection) -> anyhow::Result<u64> {
+    match read_single_text(conn, EPOCH_TABLE, "epoch").await? {
+        Some(s) => Ok(s.parse().unwrap_or(0)),
+        None => Ok(0),
+    }
+}
+
+/// Persist this site's ownership epoch. Stored as text (same row-0 shape as the
+/// other bookkeeping tables) so [`read_single_text`] reads it back.
+async fn write_site_epoch(conn: &turso::Connection, epoch: u64) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {EPOCH_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                epoch TEXT NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create epoch table")?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {EPOCH_TABLE} (id, epoch) VALUES (0, ?)"),
+        (epoch.to_string(),),
+    )
+    .await
+    .context("cdc: write epoch")?;
+    Ok(())
+}
+
+/// This copy's full [`SiteVersion`](crate::site_version::SiteVersion): its
+/// persisted ownership epoch and the head of the current stint's CDC log.
+async fn read_site_version(
+    conn: &turso::Connection,
+) -> anyhow::Result<crate::site_version::SiteVersion> {
+    Ok(crate::site_version::SiteVersion {
+        epoch: read_site_epoch(conn).await?,
+        head: current_max_change_id(conn).await?,
+    })
+}
+
+/// This serving owner's persisted ownership epoch (#654), for the
+/// [`Frame::Hello`]/[`SnapshotHeader`] it sends a replica. `0` on any error or
+/// when the epoch table does not exist (a site this node has never settled as
+/// owner, or whole-database clustered mode, which never writes one). A `0`
+/// never out-ranks a real epoch, so a best-effort read here is fail-safe: the
+/// replica simply has nothing to adopt. Opens its own gated raw connection so
+/// it never races the connection the caller is about to use for the stream.
+async fn read_owner_epoch(mgmt: &Turso) -> u64 {
+    let Ok(conn) = mgmt.raw_connection() else { return 0 };
+    let _permit = mgmt.wal_gate_permit().await;
+    off_runtime(read_site_epoch(&conn)).await.unwrap_or(0)
+}
+
+/// Adopt a peer owner's ownership epoch (#654) into durable local state, so
+/// that if this node is later promoted its own
+/// [`SiteVersion`](crate::site_version::SiteVersion) reflects the stint its
+/// data descends from — the property that lets a promoted node out-rank a
+/// returning owner's stale warm copy by epoch, rather than by the per-stint
+/// `change_id` head (which resets each stint and cannot order across them).
+///
+/// `max(local, received)` — an epoch never moves backwards. A `received == 0`
+/// (a pre-#654 owner, or whole-database mode) is nothing to adopt and writes
+/// nothing, so the `__ephpm_cdc_epoch` table is never created where the feature
+/// is not in play. Best-effort: a failure is logged, not fatal — the owner
+/// re-advertises while it serves and the next settle recomputes, so a missed
+/// adoption only costs a possible catch-up round, never correctness.
+async fn adopt_site_epoch(factory: &Turso, received: u64) {
+    if received == 0 {
+        return;
+    }
+    let Ok(conn) = factory.raw_connection() else {
+        tracing::debug!("per-site: cannot open a connection to adopt the owner's epoch");
+        return;
+    };
+    let _permit = factory.wal_gate_permit().await;
+    let result = off_runtime(async {
+        let local = read_site_epoch(&conn).await?;
+        if received > local {
+            write_site_epoch(&conn, received).await?;
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!("per-site: could not adopt the owner's ownership epoch (#654): {e:#}");
+    }
 }
 
 /// The watermark we had reached in `log_id`, from the per-log history.
@@ -1697,6 +1818,29 @@ struct SnapshotHeader {
     /// handoff classifies the same way ([`snapshot_declares_a_table`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_copy: bool,
+    /// This site's ownership epoch (#654, [`EPOCH_TABLE`]) at the moment the
+    /// snapshot was produced — the serving owner's persisted epoch. A cold new
+    /// owner that installs this dump adopts it ([`apply_snapshot`]), so its
+    /// `SiteVersion` descends from the right stint and a later returning owner
+    /// cannot out-rank it with a stale warm copy.
+    ///
+    /// Backward compatible both ways, like `no_copy`: omitted from the wire
+    /// when `0` (so a normal header stays byte-identical to an older node's),
+    /// and an older node's header parses with it `0` — which adopts nothing,
+    /// the fail-safe direction.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    epoch: u64,
+}
+
+/// `skip_serializing_if` predicate for [`SnapshotHeader::epoch`] (keeps a
+/// zero-epoch header byte-identical to a pre-#654 node's). Takes `&u64` by
+/// reference because serde's `skip_serializing_if` requires `fn(&T) -> bool`.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a &T predicate signature"
+)]
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Spawn the primary-side snapshot server. The handler is registered
@@ -1763,6 +1907,9 @@ pub async fn serve_snapshot(
     // `serve_snapshot` directly still exercises the instrumentation, and
     // so both outcomes are counted in one place.
     let started = std::time::Instant::now();
+    // A draining node keeps its cluster channel open while snapshots are
+    // being served to new site owners (`crate::drain`).
+    let _serving = crate::drain::snapshot_serve_started();
     match serve_snapshot_inner(&mut stream, mgmt, local_log_id).await {
         Ok((watermark, bytes)) => {
             cdc_metrics::record_snapshot_served("ok", bytes, started.elapsed());
@@ -1788,9 +1935,18 @@ async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
     // bootstrap simply times out and retries (the documented long-transaction
     // behaviour) instead of a raw `BEGIN` failing against the exclusive
     // window. Released before the dump is written to the stream.
-    let (watermark, dump) = {
+    let (watermark, dump, epoch) = {
         let _permit = mgmt.wal_gate_permit().await;
-        off_runtime(produce_snapshot(&conn)).await.context("snapshot: produce dump")?
+        off_runtime(async {
+            // The dump and the epoch are read under the one permit and the one
+            // read view, so the snapshot carries the owner's epoch as of the
+            // same instant its bytes were captured (#654).
+            let (watermark, dump) = produce_snapshot(&conn).await?;
+            let epoch = read_site_epoch(&conn).await?;
+            anyhow::Ok((watermark, dump, epoch))
+        })
+        .await
+        .context("snapshot: produce dump")?
     };
 
     let header = SnapshotHeader {
@@ -1798,6 +1954,7 @@ async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
         total_len: dump.len() as u64,
         log_id: local_log_id.to_string(),
         no_copy: false,
+        epoch,
     };
     write_snapshot_header(stream, &header).await?;
 
@@ -1821,8 +1978,13 @@ async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
 /// like a site this node holds (`scan_existing_sites` starts a replication
 /// driver for it at the next boot).
 async fn serve_no_copy<S: AsyncWriteExt + Unpin>(stream: &mut S) -> anyhow::Result<()> {
-    let header =
-        SnapshotHeader { watermark: 0, total_len: 0, log_id: String::new(), no_copy: true };
+    let header = SnapshotHeader {
+        watermark: 0,
+        total_len: 0,
+        log_id: String::new(),
+        no_copy: true,
+        epoch: 0,
+    };
     write_snapshot_header(stream, &header).await?;
     write_snapshot_chunk(stream, &[]).await?;
     stream.flush().await?;
@@ -2042,6 +2204,18 @@ async fn apply_snapshot(
         .await
         .context("snapshot: record per-log watermark")?;
     set_source_log(conn, &header.log_id).await.context("snapshot: record source log")?;
+    // Adopt the source owner's ownership epoch (#654), inside this same install
+    // transaction, so the committed copy's SiteVersion descends from the right
+    // stint. `max(local, received)` — never backwards; a received `0` (a
+    // pre-#654 owner, or whole-database mode) adopts nothing. `discard_local`
+    // leaves `__`-prefixed bookkeeping intact (see `reset_local_user_tables`),
+    // so the local epoch read here is the genuine prior value.
+    if header.epoch > 0 {
+        let local = read_site_epoch(conn).await.context("snapshot: read local epoch")?;
+        if header.epoch > local {
+            write_site_epoch(conn, header.epoch).await.context("snapshot: adopt epoch")?;
+        }
+    }
     Ok(())
 }
 
@@ -3568,7 +3742,7 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                 cdc_metrics::forget_applied(&site);
                 cdc_metrics::track_shipping(&site);
                 let keep_going = tokio::select! {
-                    still = sample_owned_head_until_role_changes(&site, &site_mgmt.factory, &mut role_rx) => still,
+                    still = sample_owned_head_until_role_changes(&site, &site_mgmt.factory, &cluster, &mut role_rx) => still,
                     () = drivers_shutdown().cancelled() => false,
                 };
                 if !keep_going {
@@ -3689,6 +3863,7 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
 async fn sample_owned_head_until_role_changes(
     site: &str,
     factory: &Turso,
+    cluster: &ephpm_cluster::ClusterHandle,
     role_rx: &mut tokio::sync::watch::Receiver<ElectedRole>,
 ) -> bool {
     let mut conn = None;
@@ -3709,13 +3884,26 @@ async fn sample_owned_head_until_role_changes(
                     }
                 }
                 let Some(c) = conn.as_ref() else { continue };
-                let head = {
+                // Read the whole SiteVersion (epoch + head): the head feeds the
+                // lag gauge, and both re-advertise this owner's version in
+                // gossip every tick (#654) as a fast-path hint for a peer that
+                // takes the site while this owner is still alive. The
+                // advertisement is only a hint — it stops the instant this node
+                // loses the role (this loop exits on `role_rx.changed()`) and
+                // then lapses after `SITE_VERSION_TTL`, which is why the durable
+                // epoch carried in `Frame::Hello`/`SnapshotHeader` (adopted via
+                // `adopt_site_epoch`/`apply_snapshot`), not this advert, is the
+                // source of truth that closes the crashed-owner restart case.
+                let version = {
                     let _permit = factory.wal_gate_permit().await;
-                    off_runtime(current_max_change_id(c)).await
+                    off_runtime(read_site_version(c)).await
                 };
-                match head {
-                    Ok(head) => cdc_metrics::observe_head(site, head),
-                    Err(e) => tracing::debug!(site = %site, "per-site CDC head sampler: MAX(change_id) failed: {e:#}"),
+                match version {
+                    Ok(version) => {
+                        cdc_metrics::observe_head(site, version.head);
+                        advertise_site_version(cluster, site, version);
+                    }
+                    Err(e) => tracing::debug!(site = %site, "per-site CDC head sampler: SiteVersion read failed: {e:#}"),
                 }
             }
         }
@@ -3801,11 +3989,18 @@ const HANDOFF_BLOCKED_WARN_EVERY: u32 = 10;
 /// with a full-cluster restart) the node the new hash ranks second need not
 /// hold the site at all, while the node the *old* hash made its owner does.
 /// Asking every alive peer in rank order finds that copy wherever it is.
+///
+/// A **draining** peer (one shutting down, [`NodeInfo::draining`]) is ranked by
+/// its real score, not skipped: it no longer owns anything, but it is usually
+/// the node whose departure moved the site here, so it holds the freshest copy,
+/// and it keeps serving `snapshot/<site>` until it closes its cluster channel
+/// (see `crate::drain`).
 fn handoff_candidates(nodes: &[NodeInfo], self_id: &str, site: &str) -> Vec<NodeInfo> {
     let mut remaining: Vec<NodeInfo> = nodes
         .iter()
         .filter(|n| n.id != self_id && n.state == ephpm_cluster::NodeState::Alive)
         .cloned()
+        .map(|n| NodeInfo { draining: false, ..n })
         .collect();
     let mut ranked = Vec::with_capacity(remaining.len());
     // Repeatedly take the HRW winner of what is left: the canonical scoring and
@@ -3948,6 +4143,49 @@ fn handoff_verdict(unreachable: usize, past_grace: bool) -> HandoffVerdict {
     } else {
         HandoffVerdict::AwaitMembership
     }
+}
+
+/// Gossip KV key under which a site's current owner advertises its
+/// [`SiteVersion`](crate::site_version::SiteVersion) (#654): `sqlite:ver:<site>`
+/// (the KV layer adds its own `kv:` chitchat prefix). A node settling a **warm**
+/// local copy reads this to learn whether a peer holds a strictly fresher copy
+/// — an interim owner that advanced the site while this node was away — and
+/// refuses to serve the stale copy until it has caught up.
+fn site_version_key(site: &str) -> String {
+    format!("sqlite:ver:{site}")
+}
+
+/// TTL on the advertised site version. Longer than [`HEAD_SAMPLE_INTERVAL`]
+/// (the owner refreshes it every tick while it owns the site) so a single
+/// missed refresh does not expire it, but short enough that a dead owner's
+/// advertisement does not linger and wrongly block a new owner. Matches the
+/// per-site primary claim's TTL rationale.
+const SITE_VERSION_TTL: Duration = Duration::from_secs(10);
+
+/// Read the site version a peer (the current owner) advertises in gossip, if
+/// any. `None` when nothing is published or the value is unparseable — which
+/// the settle decision treats as "no peer is known to be ahead" (fail-safe: a
+/// missing peer version only ever permits serving, it never forces it).
+async fn read_advertised_site_version(
+    cluster: &ephpm_cluster::ClusterHandle,
+    site: &str,
+) -> Option<crate::site_version::SiteVersion> {
+    let bytes = cluster.gossip_get(&site_version_key(site)).await?;
+    crate::site_version::decode(&bytes)
+}
+
+/// Publish this node's site version while it owns and serves the site, so a
+/// peer that later becomes the owner can tell whether its own copy is behind.
+fn advertise_site_version(
+    cluster: &ephpm_cluster::ClusterHandle,
+    site: &str,
+    version: crate::site_version::SiteVersion,
+) {
+    cluster.gossip_set(
+        &site_version_key(site),
+        &crate::site_version::encode(version),
+        Some(SITE_VERSION_TTL),
+    );
 }
 
 /// One settle attempt's result.
@@ -4101,18 +4339,57 @@ async fn settle_round(
     past_grace: bool,
 ) -> SettleRound {
     let factory = &*site_mgmt.factory;
-    let cold = {
+    // Read the local coldness AND this copy's SiteVersion (epoch + head) in one
+    // gated, off-runtime scope.
+    let probe = {
         let _permit = factory.wal_gate_permit().await;
-        off_runtime(local_db_is_cold(conn)).await
+        off_runtime(async {
+            let cold = local_db_is_cold(conn).await?;
+            let own = read_site_version(conn).await?;
+            anyhow::Ok((cold, own))
+        })
+        .await
     };
-    match cold {
-        Ok(false) => return SettleRound::Settled,
-        Ok(true) => {}
-        Err(e) => return SettleRound::Blocked(format!("cold-start check failed: {e:#}")),
-    }
+    let (cold, own) = match probe {
+        Ok(v) => v,
+        Err(e) => return SettleRound::Blocked(format!("cold-start/version check failed: {e:#}")),
+    };
 
     let nodes = cluster.nodes().await;
-    if ephpm_cluster::hrw_owner(&nodes, site).is_none_or(|owner| owner.id != self_id) {
+    let owner_is_self =
+        ephpm_cluster::hrw_owner(&nodes, site).is_some_and(|owner| owner.id == self_id);
+    // The freshest version any peer (the current owner) advertises for the site.
+    let best_peer = read_advertised_site_version(cluster, site).await;
+
+    // A WARM local copy (#654): decide whether it is safe to serve now. A stale
+    // copy — one a returning owner holds after an interim owner advanced the
+    // site while it was away — must not be served; it is pulled afresh below
+    // (`discard_local`). A copy on a node whose membership view has not
+    // converged must not be served either (the self-only-membership window of a
+    // restart).
+    let mut discard_local = false;
+    if !cold {
+        match crate::site_version::decide_warm_settle(past_grace, owner_is_self, own, best_peer) {
+            crate::site_version::WarmSettle::Settled => {
+                // The warm copy is authoritative. If we are its owner, bump and
+                // advertise the ownership epoch so a peer that later takes the
+                // site can tell this stint from an earlier one; a replica just
+                // serves (reads only — the write path forwards to the owner).
+                if owner_is_self {
+                    settle_owner_version(conn, factory, cluster, site, own.epoch, best_peer).await;
+                }
+                return SettleRound::Settled;
+            }
+            crate::site_version::WarmSettle::AwaitMembership => {
+                return SettleRound::AwaitMembership(HANDOFF_OWNERSHIP_RECHECK);
+            }
+            // We own the site but a peer holds a strictly fresher copy: pull it
+            // and fast-forward over our stale one (a lossless replace along the
+            // same lineage — the peer's copy descends from ours).
+            crate::site_version::WarmSettle::Blocked => discard_local = true,
+        }
+    } else if !owner_is_self {
+        // Cold and not the owner: nothing to settle until one of those changes.
         return SettleRound::NotOwner;
     }
 
@@ -4134,12 +4411,14 @@ async fn settle_round(
             let _seed = site_mgmt.seed.lock().await;
             let _permit = factory.wal_gate_permit().await;
             off_runtime(async {
-                // Re-checked inside the scope: a replica bootstrap may have
-                // seeded the copy while the snapshot was in flight.
-                if !local_db_is_cold(conn).await? {
+                // When filling a COLD copy, re-check cold inside the scope: a
+                // replica bootstrap may have seeded it while the snapshot was
+                // in flight. A WARM-but-behind owner (`discard_local`) is
+                // deliberately replacing non-cold data, so it skips the check.
+                if !discard_local && !local_db_is_cold(conn).await? {
                     return anyhow::Ok(false);
                 }
-                install_snapshot(conn, &header, &dump, false).await?;
+                install_snapshot(conn, &header, &dump, discard_local).await?;
                 Ok(true)
             })
             .await
@@ -4153,8 +4432,12 @@ async fn settle_round(
                     source = %peer.id,
                     watermark = header.watermark,
                     source_rank = candidates.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
+                    caught_up = discard_local,
                     "ownership handoff complete: pulled the site's data from a peer before serving it"
                 );
+                // We are now this site's serving owner: record a fresh epoch
+                // (strictly above the peer's) and advertise it.
+                settle_owner_version(conn, factory, cluster, site, own.epoch, best_peer).await;
                 SettleRound::Settled
             }
             Ok(false) => SettleRound::Settled,
@@ -4162,6 +4445,28 @@ async fn settle_round(
                 SettleRound::Blocked(format!("installing the copy from {} failed: {e:#}", peer.id))
             }
         };
+    }
+
+    // A warm owner that is behind a peer but could not pull the fresher copy
+    // right now keeps its (untouched) local copy and refuses to serve the stale
+    // one — a loud, retryable refusal, never a silent stale read. The discard
+    // only ever happens inside a successful install above, so nothing was lost.
+    if discard_local {
+        let detail = if search.unreachable.is_empty() {
+            "the current owner did not answer the snapshot request".to_string()
+        } else {
+            search
+                .unreachable
+                .iter()
+                .map(|(id, reason)| format!("peer {id}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return SettleRound::Blocked(format!(
+            "this node owns the site but a peer holds a fresher copy (an interim owner advanced \
+             it while this node was away); refusing to serve the stale copy until it is pulled: \
+             {detail}"
+        ));
     }
 
     match handoff_verdict(search.unreachable.len(), past_grace) {
@@ -4183,6 +4488,55 @@ async fn settle_round(
                 .map(|(id, reason)| format!("peer {id}: {reason}"))
                 .collect::<Vec<_>>()
                 .join("; "),
+        ),
+    }
+}
+
+/// Record and advertise this node's ownership of `site` after it settles as the
+/// serving owner (#654).
+///
+/// Persists an ownership epoch strictly above both this copy's current epoch
+/// (`own_epoch`) and the freshest a peer advertises (`best_peer`), so the
+/// site's [`SiteVersion`](crate::site_version::SiteVersion) is monotonic across
+/// the whole cluster even when ownership ping-pongs between two nodes — the
+/// property that lets a returning owner tell a fresh copy from a stale one. The
+/// new epoch and the current log head are then advertised in gossip so a peer
+/// that later takes the site reads a version it can compare against its own.
+///
+/// Best-effort: a failure to persist or advertise is logged, not fatal — the
+/// per-tick head sampler re-advertises while this node owns the site, and a
+/// missing advertisement only ever *permits* a peer to serve (fail-safe), never
+/// forces it to serve stale.
+async fn settle_owner_version(
+    conn: &turso::Connection,
+    factory: &Turso,
+    cluster: &ephpm_cluster::ClusterHandle,
+    site: &str,
+    own_epoch: u64,
+    best_peer: Option<crate::site_version::SiteVersion>,
+) {
+    let target = crate::site_version::next_owner_epoch(own_epoch, best_peer.map_or(0, |p| p.epoch));
+    let persisted = {
+        let _permit = factory.wal_gate_permit().await;
+        off_runtime(async {
+            write_site_epoch(conn, target).await?;
+            let head = current_max_change_id(conn).await?;
+            anyhow::Ok(head)
+        })
+        .await
+    };
+    match persisted {
+        Ok(head) => {
+            advertise_site_version(
+                cluster,
+                site,
+                crate::site_version::SiteVersion { epoch: target, head },
+            );
+        }
+        Err(e) => tracing::warn!(
+            site = %site,
+            "per-site: could not persist/advertise the ownership epoch (serving continues; the \
+             head sampler re-advertises): {e:#}"
         ),
     }
 }
@@ -4652,7 +5006,7 @@ mod tests {
 
         // The primary speaks first: its Hello names the log it serves.
         match read_frame(&mut client).await.unwrap() {
-            Frame::Hello { log_id } => assert_eq!(log_id, "test-log-id"),
+            Frame::Hello { log_id, .. } => assert_eq!(log_id, "test-log-id"),
             other => panic!("expected Hello as the first frame, got {other:?}"),
         }
         // Subscribe from the very beginning, as a cold replica does.
@@ -4754,6 +5108,7 @@ mod tests {
             total_len: 11,
             log_id: "snap-log-id".to_string(),
             no_copy: false,
+            epoch: 0,
         };
         let chunk_a = b"hello ".to_vec();
         let chunk_b = b"world".to_vec();
@@ -4938,9 +5293,11 @@ mod tests {
     #[tokio::test]
     async fn hello_frame_roundtrips() {
         let (mut client, mut server) = tokio::io::duplex(65536);
-        write_frame(&mut client, &Frame::Hello { log_id: "abc123".into() }).await.unwrap();
+        write_frame(&mut client, &Frame::Hello { log_id: "abc123".into(), epoch: 0 })
+            .await
+            .unwrap();
         match read_frame(&mut server).await.unwrap() {
-            Frame::Hello { log_id } => assert_eq!(log_id, "abc123"),
+            Frame::Hello { log_id, .. } => assert_eq!(log_id, "abc123"),
             other => panic!("expected Hello, got {other:?}"),
         }
     }
@@ -5223,6 +5580,7 @@ mod tests {
             total_len: 0,
             log_id: "peer-log".into(),
             no_copy: false,
+            epoch: 0,
         };
         assert!(
             validate_snapshot_dump("").is_ok(),
@@ -5298,6 +5656,7 @@ mod tests {
             total_len: 0,
             log_id: "new-owner-log".into(),
             no_copy: false,
+            epoch: 0,
         };
         let failing = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
                        INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n\
@@ -5339,6 +5698,7 @@ mod tests {
             total_len: 0,
             log_id: "new-owner-log".into(),
             no_copy: false,
+            epoch: 0,
         };
         let dump = snapshot_dump_with_rows(500);
         {
@@ -5364,6 +5724,52 @@ mod tests {
         install_snapshot(&conn, &header, &dump, true).await.unwrap();
         assert_eq!(row_count(&conn, "posts").await, 500);
         assert_eq!(read_watermark(&conn).await.unwrap(), 40);
+    }
+
+    /// **#654 durable epoch adoption.** A node installing an owner's snapshot
+    /// adopts the owner's ownership epoch into durable local state
+    /// ([`EPOCH_TABLE`]) in the same install transaction, so a later promotion
+    /// gives it a `SiteVersion` descending from the right stint — the crux that
+    /// lets a promoted node out-rank a returning owner's stale copy with no
+    /// live gossip advertisement. Adoption is `max(local, received)`: a snapshot
+    /// carrying a lower epoch never moves it backwards, and a pre-#654 header
+    /// (epoch 0) adopts nothing.
+    #[tokio::test]
+    async fn install_snapshot_adopts_the_owner_epoch_and_never_lowers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        let dump = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n";
+        let header = |epoch| SnapshotHeader {
+            watermark: 40,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+            epoch,
+        };
+
+        // Installing an owner's snapshot carrying epoch 5 adopts it durably.
+        install_snapshot(&conn, &header(5), dump, true).await.unwrap();
+        assert_eq!(read_site_epoch(&conn).await.unwrap(), 5, "epoch adopted from the header");
+
+        // A later snapshot with a LOWER epoch never lowers it (monotonic).
+        install_snapshot(&conn, &header(3), dump, true).await.unwrap();
+        assert_eq!(
+            read_site_epoch(&conn).await.unwrap(),
+            5,
+            "a lower header epoch never lowers it"
+        );
+
+        // A higher epoch is adopted.
+        install_snapshot(&conn, &header(9), dump, true).await.unwrap();
+        assert_eq!(read_site_epoch(&conn).await.unwrap(), 9);
+
+        // A pre-#654 header (epoch 0) adopts nothing and leaves it untouched.
+        install_snapshot(&conn, &header(0), dump, true).await.unwrap();
+        assert_eq!(read_site_epoch(&conn).await.unwrap(), 9, "a zero-epoch header adopts nothing");
     }
 
     /// A dump of `rows` rows of the `posts` table, shaped like
@@ -5396,6 +5802,7 @@ mod tests {
             total_len: 0,
             log_id: "owner-log".into(),
             no_copy: false,
+            epoch: 0,
         };
         install_snapshot(&conn, &header, &snapshot_dump_with_rows(20_000), false).await.unwrap();
         assert_eq!(row_count(&conn, "posts").await, 20_000);
@@ -5493,6 +5900,33 @@ mod tests {
         assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
     }
 
+    /// A node that is leaving owns nothing, but the cold new owner of one of
+    /// its sites must still ask it first: it held the site until a moment ago,
+    /// so it has the freshest copy, and it keeps serving snapshots while it
+    /// drains (`crate::drain`).
+    #[test]
+    fn a_draining_previous_owner_is_still_asked_first() {
+        let all = vec![
+            alive("ephpm-0", "10.0.0.1"),
+            alive("ephpm-1", "10.0.0.2"),
+            alive("ephpm-2", "10.0.0.3"),
+        ];
+        let site = (0..4096)
+            .map(|i| format!("site-{i}"))
+            .find(|s| ephpm_cluster::hrw_owner(&all, s).unwrap().id == "ephpm-0")
+            .expect("ephpm-0 owns some site");
+        let leaving: Vec<NodeInfo> = all
+            .iter()
+            .cloned()
+            .map(|n| if n.id == "ephpm-0" { NodeInfo { draining: true, ..n } } else { n })
+            .collect();
+        let new_owner = ephpm_cluster::hrw_owner(&leaving, &site).unwrap().id.clone();
+        assert_ne!(new_owner, "ephpm-0", "a draining node owns nothing");
+        let ranked = handoff_candidates(&leaving, &new_owner, &site);
+        assert_eq!(ranked.first().map(|n| n.id.as_str()), Some("ephpm-0"));
+        assert_eq!(ranked.len(), 2);
+    }
+
     /// **Mixed-scheme cluster fails closed.** A confirmed peer on another
     /// ownership-hash scheme (a pre-v0.13.0 node advertises none) refuses
     /// owner-serving of every site, settled ones included; once every peer
@@ -5526,6 +5960,7 @@ mod tests {
                 total_len: 0,
                 log_id: log_id.to_string(),
                 no_copy: false,
+                epoch: 0,
             },
             dump: "CREATE TABLE t (a);".to_string(),
             received: 19,
@@ -5594,6 +6029,7 @@ mod tests {
             total_len: 1000,
             log_id: "stalling-log".to_string(),
             no_copy: false,
+            epoch: 0,
         };
         write_snapshot_header(&mut peer, &header).await.unwrap();
         write_snapshot_chunk(&mut peer, b"CREATE TABLE t(x);").await.unwrap();
@@ -5634,8 +6070,13 @@ mod tests {
             total_len: u64,
             log_id: String,
         }
-        let normal =
-            SnapshotHeader { watermark: 3, total_len: 9, log_id: "l".into(), no_copy: false };
+        let normal = SnapshotHeader {
+            watermark: 3,
+            total_len: 9,
+            log_id: "l".into(),
+            no_copy: false,
+            epoch: 0,
+        };
         let json = serde_json::to_string(&normal).unwrap();
         assert!(!json.contains("no_copy"), "{json}");
 
@@ -5648,8 +6089,13 @@ mod tests {
         let parsed: SnapshotHeader = serde_json::from_slice(&old).unwrap();
         assert!(!parsed.no_copy);
 
-        let refusal =
-            SnapshotHeader { watermark: 0, total_len: 0, log_id: String::new(), no_copy: true };
+        let refusal = SnapshotHeader {
+            watermark: 0,
+            total_len: 0,
+            log_id: String::new(),
+            no_copy: true,
+            epoch: 0,
+        };
         let parsed_by_old: OldSnapshotHeader =
             serde_json::from_slice(&serde_json::to_vec(&refusal).unwrap()).unwrap();
         assert_eq!(parsed_by_old.total_len, 0, "an older receiver sees an empty dump");

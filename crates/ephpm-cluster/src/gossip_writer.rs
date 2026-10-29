@@ -339,6 +339,26 @@ impl GossipWriter {
         }
     }
 
+    /// Drain **every** queued op and retirement into `chitchat` now, in one
+    /// call, under the chitchat lock (reacquired per batch so a huge queue does
+    /// not hold the lock in one stretch). Used at graceful drain
+    /// ([`crate::ClusterHandle::mark_draining`]): the drain task is aborted
+    /// moments later by `ClusterHandle::shutdown`, so without this the last up
+    /// to [`DRAIN_IDLE`] of queued small-tier KV writes never reach gossip
+    /// state and are lost on restart (#656). A concurrent `enqueue` after this
+    /// starts is not waited for — the caller has announced the leave, so no new
+    /// local writes are expected; this flushes what is already queued.
+    pub(crate) async fn flush(&self, chitchat: &Arc<tokio::sync::Mutex<Chitchat>>, self_id: &str) {
+        loop {
+            let (ops, retires) = self.take_batch();
+            if ops.is_empty() && retires.is_empty() {
+                break;
+            }
+            let mut guard = chitchat.lock().await;
+            self.apply_batch(&mut guard, self_id, ops, retires);
+        }
+    }
+
     /// Pull up to one batch of ops, and every queued retirement, out of the
     /// maps. A key re-queued after it was listed but before it was removed
     /// simply stays for the next batch.
@@ -524,6 +544,31 @@ mod tests {
         assert!(keys.contains(&"kv:live".to_string()));
         assert!(!keys.contains(&"kv:dead".to_string()), "expired-in-queue never enters state");
         assert!(decode_tombstone(c.self_node_state().get("kv:gone").unwrap()).is_some());
+    }
+
+    /// `flush` empties the whole queue into chitchat state in one call —
+    /// including more than one `DRAIN_BATCH`-worth — so a graceful drain loses
+    /// none of the last queued small-tier writes (#656).
+    #[tokio::test]
+    async fn flush_drains_every_queued_op_at_once() {
+        let w = GossipWriter::new();
+        let clock = StampClock::new("n");
+        // More than one drain batch, so the loop must iterate.
+        let total = DRAIN_BATCH + 10;
+        for i in 0..total {
+            let s = clock.next();
+            w.enqueue_set(format!("kv:{i}"), encode_for_queue(b"v", 0, s), 0, s);
+        }
+        assert_eq!(w.stats().pending, total);
+        let chitchat = Arc::new(tokio::sync::Mutex::new(chitchat("n", Duration::from_secs(60))));
+        w.flush(&chitchat, "n").await;
+        assert_eq!(w.stats().pending, 0, "flush empties the queue");
+        let mut guard = chitchat.lock().await;
+        assert_eq!(live_kv_keys(&mut guard).len(), total, "every queued write reached state");
+        // Flushing an empty queue is a harmless no-op.
+        drop(guard);
+        w.flush(&chitchat, "n").await;
+        assert_eq!(w.stats().pending, 0);
     }
 
     #[test]

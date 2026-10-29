@@ -137,19 +137,23 @@ join = ["ephpm-headless.default.svc.cluster.local:7946"]
 
 Kubernetes sends `SIGKILL` `terminationGracePeriodSeconds` (default **30 s**) after `SIGTERM`. A node with embedded SQLite (`[db.sqlite]`) needs longer than that to stop cleanly:
 
-1. Requests drain, bounded by `[server.timeouts] shutdown` (default 30 s on its own).
-2. Every open database's write-ahead log gets a final `wal_checkpoint(TRUNCATE)`. This runs to completion **outside** that bound, because it is what spares the next start a WAL recovery. Its length depends on how much was written since the last checkpoint and on disk sync latency. In a 3-node per-site cluster (60 sites) stopped while its peers stayed under full write load on one shared disk, it took 45–74 s, and whole-process exit took 50–77 s.
-3. The async runtime gets at most 15 s more.
+1. Requests drain, bounded by `[server.timeouts] shutdown` (default 30 s on its own). The node is still a full member: in per-site clustered mode it keeps serving the sites it owns, including statements its peers forward to it.
+2. **Per-site clustered mode only:** the node announces in gossip that it is leaving. From then on no node counts it as a site owner, so each of its sites moves to the node that would take it over if this one died, within about a second (one gossip round). Statements forwarded to the leaving node in that second are refused with a connection error, and the client reconnects to the new owner. The node keeps its cluster channel open for at least 5 s, and for up to 30 s while a new owner is still pulling a site's data from it. Then it closes the channel. Peers no longer forward to it, so the rest of the shutdown costs no requests.
+3. Every open database's write-ahead log gets a final `wal_checkpoint(TRUNCATE)`. This runs to completion **outside** that bound, because it is what spares the next start a WAL recovery. Its length depends on how much was written since the last checkpoint and on disk sync latency. In a 3-node per-site cluster (60 sites) stopped while its peers stayed under full write load on one shared disk, it took 45–74 s, and whole-process exit took 50–77 s. The v0.13.0 release-candidate stress run measured 128 s on a slower disk.
+4. The async runtime gets at most 15 s more.
 
-A `SIGKILL` during step 2 loses no committed data: the engine recovers the log on the next open, the same as after a crash. But the next start then pays for that recovery on every database whose log was left full. For clustered deployments with an embedded database, set the grace period to cover all three steps with room to spare:
+A `SIGKILL` during step 3 loses no committed data: the engine recovers the log on the next open, the same as after a crash. But the next start then pays for that recovery on every database whose log was left full. For clustered deployments with an embedded database, set the grace period to cover all four steps with room to spare:
 
 ```yaml
 spec:
   template:
     spec:
-      # [server.timeouts] shutdown (30) + final checkpoint + runtime stop (15)
-      terminationGracePeriodSeconds: 120
+      # [server.timeouts] shutdown (30) + per-site handover (up to 30)
+      # + final checkpoint + runtime stop (15)
+      terminationGracePeriodSeconds: 180
 ```
+
+The handover in step 2 moves ownership; it does not wait for replicas to catch up. A replica that takes a site over serves its own copy, so writes the leaving owner had not yet shipped to it are not carried over, as with any other ownership move. For a planned restart, stop writes and wait for zero replication lag first (see the upgrade steps above). Whole-database clustered mode has no step 2: its primary is the lowest node id among the alive nodes, and that does not change until the stopped node is detected as gone.
 
 Watch the `closing embedded databases` lines in the pod's log (INFO once the checkpoint passes 3 s) to see what your workload actually needs.
 

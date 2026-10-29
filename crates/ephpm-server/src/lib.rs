@@ -8,6 +8,7 @@ pub mod dns01_digitalocean;
 pub mod dns01_google;
 pub mod dns01_linode;
 pub mod dns01_route53;
+pub mod drain;
 pub mod file_cache;
 pub mod fpm_pool;
 pub mod framing;
@@ -34,6 +35,7 @@ pub mod screened_backend;
 pub mod sigv4;
 pub mod site_backends;
 mod site_overrides;
+mod site_version;
 pub mod site_wire_auth;
 pub mod sql_forward;
 pub mod static_files;
@@ -640,6 +642,20 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         tracing::info!("shutdown began before the KV warm-up pull finished; pull abandoned");
     }
 
+    // Requests are drained. In per-site clustered mode, announce the leave now,
+    // before anything below closes the cluster channel: peers stop counting
+    // this node as an owner within a gossip round and re-home its sites, so
+    // they stop forwarding to a channel that is about to close. The handover
+    // wait overlaps the KV work below. See `drain` for the whole ordering.
+    let leave = match &cluster_handle {
+        Some(cluster) if is_per_site_clustered(&config, true) => {
+            let leave = drain::announce_leave(cluster).await;
+            turso_cdc::stop_replication_drivers();
+            Some(leave)
+        }
+        _ => None,
+    };
+
     // Requests are drained. Hand this node's large KV values to the peers
     // that take over their replica slots — while gossip still lists this
     // node and the data plane is still up on both ends. Then the snapshot.
@@ -671,6 +687,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     //    handlers.
     // 2. Truncate every open database's write-ahead log (`db_shutdown`),
     //    which runs to completion.
+    //
+    // A node that announced its leave first keeps the channel open until the
+    // sites' new owners have pulled what they need from it (`drain`).
+    if let Some(leave) = leave {
+        leave.await_handover().await;
+    }
     if let Some(channel) = &channel_handle {
         channel.shutdown();
     }
