@@ -1207,7 +1207,8 @@ async fn serve_forwarded_sql(
 
     tracing::debug!(peer = %peer, site = %site, "forwarded-SQL: serving owner session");
     let ownership = OwnershipCheck { cluster, self_id, site };
-    serve_owner_statements(&mut stream, registry, site, Some(&ownership)).await
+    serve_owner_statements(&mut stream, registry, site, Some(&ownership), || cluster.is_draining())
+        .await
 }
 
 /// What [`serve_owner_statements`] needs to re-check, while a stream is open,
@@ -1282,22 +1283,32 @@ where
 /// which is what lets the client bound its wait on a *silent* owner without
 /// bounding how long a statement may legitimately take.
 ///
-/// # Ownership is re-checked while the stream is open
+/// # Draining and ownership are re-checked while the stream is open
 ///
-/// The accept-time HRW gate in [`serve_forwarded_sql`] admits the stream; this
-/// loop re-verifies it (`ownership`, when given) at most every
-/// [`OWNER_RECHECK_INTERVAL`] and before **every** lock operation. A node that
-/// has lost the site refuses the request with a connection-shaped error
-/// flagged `closed`, drops the session — releasing the named locks it held and
-/// any open transaction — and ends the stream, so the client re-resolves the
-/// site's current owner. This is what makes "the pinned old owner refuses"
-/// true at statement granularity, which the named-lock semantics rely on (see
-/// the module docs).
+/// `is_draining` is checked before every statement. Once this node has
+/// announced its leave (`crate::drain`) it owns no site, so it must not run a
+/// statement on a stream it accepted while it was the owner: the next owner
+/// may already be accepting writes, and a write here would fork the site. The
+/// request is answered with a connection-shaped refusal flagged `closed`, the
+/// stream ends (dropping the session rolls back any open transaction), and the
+/// client re-resolves the site's current owner.
+///
+/// Independently of draining, the accept-time HRW gate in
+/// [`serve_forwarded_sql`] admits the stream and this loop re-verifies it
+/// (`ownership`, when given) at most every [`OWNER_RECHECK_INTERVAL`] and
+/// before **every** lock operation. A node that has lost the site (ownership
+/// moved, without this node leaving) refuses the request with a
+/// connection-shaped error flagged `closed`, drops the session — releasing the
+/// named locks it held and any open transaction — and ends the stream, so the
+/// client re-resolves the site's current owner. This is what makes "the pinned
+/// old owner refuses" true at statement granularity, which the named-lock
+/// semantics rely on (see the module docs).
 async fn serve_owner_statements<S>(
     stream: &mut S,
     registry: &SiteBackends,
     site: &str,
     ownership: Option<&OwnershipCheck<'_>>,
+    is_draining: impl Fn() -> bool,
 ) -> anyhow::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -1325,6 +1336,25 @@ where
                     break;
                 }
             };
+        // Drain wins over ownership: once we have announced our leave we own no
+        // site, so refuse before even re-checking HRW ownership.
+        if is_draining() {
+            tracing::debug!(
+                site = %site,
+                "forwarded-SQL: this node is leaving the cluster; refusing the statement so the \
+                 client re-resolves the site's owner"
+            );
+            let refusal = SqlResponse::Error {
+                sqlite: false,
+                message: format!(
+                    "connection refused: this node is shutting down and no longer owns site \
+                     {site}; reconnect to reach the current owner"
+                ),
+                closed: true,
+            };
+            let _ = write_msg(stream, &refusal).await;
+            break;
+        }
         if let Some(check) = ownership
             && ownership_recheck_due(&req, ownership_checked)
         {
@@ -2061,7 +2091,7 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let started = Instant::now();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &registry, "s1", None).await.unwrap();
+            serve_owner_statements(&mut owner, &registry, "s1", None, || false).await.unwrap();
             owner
         });
         let owner = served.await.unwrap();
@@ -2086,7 +2116,9 @@ mod tests {
         let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
         let owner_registry = registry.clone();
         let served = tokio::spawn(async move {
-            serve_owner_statements(&mut owner, &owner_registry, "s1", None).await.unwrap();
+            serve_owner_statements(&mut owner, &owner_registry, "s1", None, || false)
+                .await
+                .unwrap();
         });
 
         for sql in ["CREATE TABLE t (x INTEGER)", "BEGIN", "INSERT INTO t VALUES (1)"] {
