@@ -236,7 +236,20 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 98378dab38a0 — MySQL compatibility for self-migrating PHP apps
+# litewire @ 84e13937b4c6 — MySQL-wire fidelity for the wun rig (v0.13.2).
+# CORRECTNESS / DATA LOSS: do not move this pin backwards past #62. Two fixes:
+# (1) litewire#62 — single-quoted string literals are re-escaped for SQLite
+# before emit: sqlparser's Display left a quote bare when a backslash preceded
+# it (MySQL style), which SQLite/Turso misread, so a mysqldump replay silently
+# dropped rows whose text had `\` just before `'` (45 Sendy campaigns rows).
+# (2) litewire#61 — information_schema.{key_column_usage, referential_constraints,
+# table_constraints, check_constraints} are emulated as derived tables so
+# CakePHP 5's describeForeignKeySql/describeCheckConstraints no longer 1064;
+# FKs come from pragma_foreign_key_list, named `<table>_ibfk_<n>`. No turso
+# move (turso stays =0.8.3); the lockfile changes only the litewire crates'
+# source rev.
+#
+# Previous pin 98378dab38a0 — MySQL compatibility for self-migrating PHP apps
 # (Sendy 7.1.6 replayed against MySQL 8.4; litewire#55–#60), plus named
 # locks (litewire#54, wired by ePHPm #642). CORRECTNESS: do not move this pin
 # backwards past #55 — before it `SHOW INDEX|COLUMNS|TABLES ... WHERE/LIKE`
@@ -588,7 +601,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "98378dab38a0e762c4d3017fd69edd25ef636923", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "84e13937b4c6e498707088b25ea781e0bdf3ff25", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
