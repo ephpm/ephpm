@@ -347,6 +347,7 @@ Slow queries (default: > 1s) are logged at WARN level with the normalized SQL an
 ```toml
 [db.analysis]
 query_stats = true            # on by default
+# log_failed_sql = true       # OFF by default — logs raw failing SQL (may contain tenant data)
 
 [server.metrics]
 enabled = true                # OFF by default — /metrics 404s without this

@@ -3245,6 +3245,24 @@ pub struct DbAnalysisConfig {
     #[serde(default = "default_query_stats_enabled")]
     pub query_stats: bool,
 
+    /// Log the raw SQL of statements that fail at the embedded-SQLite wire
+    /// frontend (litewire), at WARN.
+    ///
+    /// When enabled, a statement that errors while being served by the
+    /// embedded Turso MySQL/PostgreSQL/Hrana/TDS frontends is logged with its
+    /// failing SQL text (truncated by litewire). This covers the single-node,
+    /// per-site, and clustered embedded-SQLite modes; it does not affect the
+    /// `[db.mysql]` / `[db.postgres]` proxies, which forward to a real server.
+    ///
+    /// **Off by default, and a data-exposure risk when on:** the logged SQL is
+    /// the raw statement, so literal values embedded in it — which may be
+    /// tenant data — land in the logs. Enable only for debugging, and only
+    /// where the logs are an acceptable place for that data.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub log_failed_sql: bool,
+
     /// Duration threshold for logging slow queries.
     ///
     /// Queries exceeding this time are logged at WARN and counted in
@@ -3294,6 +3312,7 @@ impl Default for DbAnalysisConfig {
     fn default() -> Self {
         Self {
             query_stats: default_query_stats_enabled(),
+            log_failed_sql: false,
             slow_query_threshold: default_slow_query_threshold(),
             auto_explain: false,
             auto_explain_target: default_auto_explain_target(),
@@ -12572,6 +12591,35 @@ metric_label_series_max = 0
         let _env = EnvVars::set("EPHPM_DB__ANALYSIS__METRIC_LABEL_SERIES_MAX", "5000");
         let config = Config::load(&file).unwrap();
         assert_eq!(config.db.analysis.metric_label_series_max, 5000);
+    }
+
+    #[test]
+    fn test_db_analysis_log_failed_sql_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        // No [db.analysis] block at all — the knob must default to false so a
+        // fresh deployment never logs raw (possibly tenant) SQL by accident.
+        std::fs::write(&file, "").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(!config.db.analysis.log_failed_sql, "log_failed_sql must default to false");
+        // And the struct default agrees with the serde default.
+        assert!(!DbAnalysisConfig::default().log_failed_sql);
+    }
+
+    #[test]
+    fn test_db_analysis_log_failed_sql_override_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[db.analysis]
+log_failed_sql = true
+",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(config.db.analysis.log_failed_sql);
     }
 
     // ── [server.tenant_network] eBPF per-vhost network policy ──────────

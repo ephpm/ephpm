@@ -519,6 +519,9 @@ pub async fn start_clustered_turso_cdc(
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
     channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
+    // From `[db.analysis] log_failed_sql` (off by default), forwarded to the
+    // litewire wire frontend this path spawns.
+    log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
     // Shared "am I the primary?" view exposed at `/_ephpm/primary` for
     // active-passive LB routing. This is the SAME `AtomicBool` the router
@@ -767,7 +770,12 @@ pub async fn start_clustered_turso_cdc(
         Arc::new(tracked) as litewire::backend::SharedBackend,
         Arc::clone(&is_primary),
     );
-    spawn_litewire_serve(sqlite_config, crate::share_backend_with_php(locked), handles);
+    spawn_litewire_serve(
+        sqlite_config,
+        crate::share_backend_with_php(locked),
+        log_failed_sql,
+        handles,
+    );
 
     // Kick off role-appropriate work for the initial role.
     let initial_driver =
@@ -2908,9 +2916,15 @@ async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Frame>
 fn spawn_litewire_serve<B: litewire::backend::Backend>(
     sqlite_config: &SqliteConfig,
     backend: B,
+    // From `[db.analysis] log_failed_sql` (off by default). When set, litewire
+    // logs the raw failing SQL (truncated) at WARN — see the config doc comment.
+    log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let mut builder = litewire::LiteWire::new(backend);
+    if log_failed_sql {
+        builder = builder.log_failed_sql(true);
+    }
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,

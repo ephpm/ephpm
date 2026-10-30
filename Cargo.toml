@@ -236,7 +236,17 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 84e13937b4c6 — MySQL-wire fidelity for the wun rig (v0.13.2).
+# litewire @ aa9f6eef8498 — default-off failed-SQL logging + translation fixes
+# (v0.13.3). Adds `LiteWire::log_failed_sql(bool)` (default false), wired by
+# ePHPm as `[db.analysis] log_failed_sql` (off by default; when on, logs the raw
+# failing SQL truncated at WARN — may contain tenant data). Plus three
+# translation fixes: litewire#65 — `FOR UPDATE` now passes through, `RAND()`
+# translates to `random()`, and `CAST(... AS DATE)` no longer collapses to the
+# literal 2024; litewire#64 adds the MySQL/PG differential wire-compat suite +
+# CI gate (test-only). No turso move (turso stays =0.8.3); the lockfile changes
+# only the litewire crates' source rev.
+#
+# Previous pin 84e13937b4c6 — MySQL-wire fidelity for the wun rig (v0.13.2).
 # CORRECTNESS / DATA LOSS: do not move this pin backwards past #62. Two fixes:
 # (1) litewire#62 — single-quoted string literals are re-escaped for SQLite
 # before emit: sqlparser's Display left a quote bare when a backslash preceded
@@ -601,7 +611,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "84e13937b4c6e498707088b25ea781e0bdf3ff25", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "aa9f6eef849846be730a6a027256fe9ab6b06ed6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
