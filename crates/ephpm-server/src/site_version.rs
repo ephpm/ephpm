@@ -327,7 +327,11 @@ mod tests {
         let advert: Option<SiteVersion> = None; // interim owner stepped down; advert gone
         let durable_from_peers = [v(2, 3)]; // epoch read over the channel, not gossip
         let best = fold_best_version(advert, durable_from_peers);
-        assert_eq!(best, Some(v(2, 3)), "the durable probe supplies the epoch the advert no longer carries");
+        assert_eq!(
+            best,
+            Some(v(2, 3)),
+            "the durable probe supplies the epoch the advert no longer carries"
+        );
         assert_eq!(
             decide_warm_settle(true, true, v(1, 500), best),
             WarmSettle::Blocked,
@@ -349,7 +353,10 @@ mod tests {
         // And the interim owner that adopts the founder's epoch 1 then bumps to
         // 2 — strictly above, so no collision with the returning founder.
         assert_eq!(next_owner_epoch(1, 0), 2);
-        assert!(v(2, 0) > v(1, i64::MAX), "the interim's epoch out-ranks the founder's stale copy at any head");
+        assert!(
+            v(2, 0) > v(1, i64::MAX),
+            "the interim's epoch out-ranks the founder's stale copy at any head"
+        );
     }
 
     #[test]
