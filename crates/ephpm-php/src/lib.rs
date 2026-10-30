@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod capabilities;
 pub mod crash_guard;
 pub mod db_bridge;
 pub mod handoff;
@@ -252,6 +253,28 @@ mod ffi {
         pub fn ephpm_set_memory_limit_max(
             value: *const ::std::os::raw::c_char,
         ) -> ::std::os::raw::c_int;
+
+        /// Record the PHP functions to gate per site (instead of disabling
+        /// process-wide) for the module-startup hook that swaps their internal
+        /// handler for the capability gate. `names` is `count` NUL-terminated
+        /// C strings (canonical, lower-case function names). Must be called
+        /// BEFORE `php_embed_init()`. Each string is copied; the array and the
+        /// strings need not outlive the call. Returns 0 on success, -1 on
+        /// allocation failure or if the list exceeds the fixed capacity.
+        pub fn ephpm_set_capability_gates(
+            names: *const *const ::std::os::raw::c_char,
+            count: usize,
+        ) -> ::std::os::raw::c_int;
+
+        /// Install the per-site capability-check callback the gate consults on
+        /// every call. Function-pointer convention (like `ephpm_set_log_sink`),
+        /// so the C side never links the Rust symbol by name. `None` leaves the
+        /// gate fail-closed (every gated call denied). Call once before serving.
+        pub fn ephpm_set_capability_checker(
+            checker: Option<
+                unsafe extern "C" fn(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int,
+            >,
+        );
 
         /// The startup `memory_limit` and the enforced ceiling, in bytes,
         /// as found by the module-startup hook. Returns 1 when a ceiling is
@@ -1303,6 +1326,67 @@ impl PhpRuntime {
         #[cfg(not(php_linked))]
         {
             let _ = value;
+        }
+        Ok(())
+    }
+
+    /// Register the PHP functions to **gate** per site rather than disable
+    /// process-wide (per-site capabilities, issue: legacy-tenant `mail`/
+    /// `fsockopen`).
+    ///
+    /// Each name is a function the operator removed from the global
+    /// `disable_functions` because at least one virtual host was granted it. The
+    /// C wrapper swaps that function's internal handler for the capability gate
+    /// during module startup; the gate consults
+    /// [`capabilities::is_allowed`] on every call. The companion
+    /// [`capabilities::install`] must be called with the site → capabilities map
+    /// so the gate has something to check.
+    ///
+    /// Must be called **before** [`PhpRuntime::init`] /
+    /// [`PhpRuntime::init_with_ini_file`]: the handler swap runs inside module
+    /// startup. An empty slice installs no gates and leaves the function table
+    /// byte-identical — the no-grant default. A no-op in stub mode.
+    ///
+    /// # Errors
+    ///
+    /// [`PhpError::InvalidSetting`] if any name contains a NUL byte or the list
+    /// could not be stored.
+    pub fn set_capability_gates(names: &[String]) -> Result<(), PhpError> {
+        #[cfg(php_linked)]
+        {
+            use std::ffi::CString;
+
+            let owned: Vec<CString> =
+                names.iter().map(|n| CString::new(n.as_str())).collect::<Result<_, _>>().map_err(
+                    |_| {
+                        PhpError::InvalidSetting(
+                            "a capability function name contains a NUL byte".into(),
+                        )
+                    },
+                )?;
+            let ptrs: Vec<*const std::os::raw::c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+            // SAFETY: `ptrs` points to `owned.len()` valid NUL-terminated strings
+            // that outlive the call; the C side strdups each one and touches no
+            // PHP state (no longjmp possible). Called on the single-threaded
+            // startup path before php_embed_init(), so nothing reads the gate
+            // list concurrently.
+            let rc = unsafe { ffi::ephpm_set_capability_gates(ptrs.as_ptr(), ptrs.len()) };
+            if rc != 0 {
+                return Err(PhpError::InvalidSetting(
+                    "could not store the capability gate list (out of memory or too many)".into(),
+                ));
+            }
+            // Install the request-time check the gate calls through. SAFETY:
+            // stores a function pointer in a C static; the callback never calls
+            // into PHP and never unwinds (it catches panics), so no longjmp can
+            // cross it. Set on the single-threaded startup path before serving.
+            unsafe {
+                ffi::ephpm_set_capability_checker(Some(capabilities::ephpm_capability_allowed));
+            }
+        }
+        #[cfg(not(php_linked))]
+        {
+            let _ = names;
         }
         Ok(())
     }

@@ -4132,6 +4132,16 @@ impl Router {
                 _ => None,
             };
 
+        // The canonical site key for the per-site function-capability gate.
+        // Cloned for the `move` closure and set on the executing thread before
+        // any tenant code runs. This is the one authoritative per-request site
+        // identity — NOT re-derived from `Host`, and distinct from the DB key
+        // (which is `None` outside per-site-database mode): a capability grant
+        // must work in any multi-tenant deployment. `None` (unmatched Host)
+        // clears it so a reused thread carries no previous request's identity
+        // into a gated call.
+        let cap_site_key: Option<String> = site_key.clone();
+
         // In multi-tenant mode, give this vhost its OWN temp + session
         // directories (issue #276). Resolved and created here, in the async
         // context, off the resolved (traversal-safe) document root; the paths
@@ -4275,6 +4285,13 @@ impl Router {
             // backend (single-site) — and clears any stale key so per-site
             // mode never silently reuses a previous request's tenant.
             ephpm_php::db_bridge::set_current_site(db_site_key.as_deref());
+
+            // Scope per-site function capabilities to this vhost: the gate over
+            // a granted builtin (e.g. `mail`) consults this to decide whether
+            // the current request's site may call it. Set from the canonical
+            // site key, independent of the database key above, and cleared
+            // (`None`) for an unmatched Host so the gate fails closed.
+            ephpm_php::capabilities::set_current_site(cap_site_key.as_deref());
 
             // Scope `ephpm_ws_*` to this virtual host. Derived from the SAME
             // canonical site key as the database and KV identities above, so a

@@ -2804,6 +2804,29 @@ pub fn embedded_sqlite_mode(config: &Config) -> EmbeddedSqliteMode {
     }
 }
 
+/// Scan the operator's per-site overrides directory for **function capability**
+/// grants (experimental, opt-in; the migration case of a legacy tenant that
+/// needs `mail()`/`fsockopen()` while a co-tenant stays hardened).
+///
+/// Returns `site key → granted canonical capability names`, the authoritative
+/// startup input for both deciding which functions to leave out of the
+/// process-global `disable_functions` and which site the request-time gate lets
+/// call them. See [`site_overrides::scan_capabilities`] for the fail-closed
+/// rules; the key one is that an **unknown capability name fails startup**.
+///
+/// An empty map (no directory, or no file grants anything) means the mechanism
+/// is inactive and `disable_functions` is unchanged.
+///
+/// # Errors
+///
+/// Returns the human-readable reason when a readable, valid-TOML override file
+/// names a capability outside [`ephpm_config::GRANTABLE_CAPABILITIES`].
+pub fn scan_site_capabilities(
+    overrides_dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
+    site_overrides::scan_capabilities(overrides_dir)
+}
+
 /// Build the per-site database registry and register it with the PHP bridge,
 /// when per-site mode is active. Returns whether it is active (for the router
 /// flag). The registry itself is kept alive by the resolver `Arc` handed to

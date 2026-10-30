@@ -1413,6 +1413,13 @@ fn push_unique(
 ///   when `include_hardening` is `true`.
 /// - `cluster_invalidation` — when `false`, also disable the OPcache
 ///   introspection/invalidation functions that ePHPm otherwise needs.
+/// - `gated` — ePHPm baseline functions that a per-site capability grant moves
+///   from global-disable to per-request gating (canonical lower-case names).
+///   These are **omitted** from ePHPm's baseline here so they stay registered;
+///   the per-site gate decides each call. An **operator**-supplied name is never
+///   omitted — an operator who explicitly disabled a function keeps it disabled,
+///   so a capability grant for it is refused upstream (`resolve_gated`). An empty
+///   set reproduces the previous output byte-for-byte.
 ///
 /// Returns `None` when the union is empty (nothing to emit).
 // Each bool selects an independent, orthogonal baseline group (shell / full
@@ -1425,39 +1432,236 @@ fn compose_disable_functions(
     include_hardening: bool,
     include_reachability_block: bool,
     cluster_invalidation: bool,
+    gated: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let mut ordered: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Operator list first: preserve their explicit intent and ordering.
+    // An ePHPm baseline name that a per-site capability gate owns is left
+    // registered (not disabled). Operator names below never consult this.
+    let push_baseline =
+        |ordered: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, name: &str| {
+            if !gated.contains(name) {
+                push_unique(ordered, seen, name);
+            }
+        };
+
+    // Operator list first: preserve their explicit intent and ordering. Never
+    // skipped for `gated` — an operator's explicit disable always wins.
     for f in operator {
         push_unique(&mut ordered, &mut seen, f);
     }
     if include_shell || include_hardening {
         for f in SHELL_EXEC_FUNCTIONS {
-            push_unique(&mut ordered, &mut seen, f);
+            push_baseline(&mut ordered, &mut seen, f);
         }
     }
     if include_hardening {
         for f in HARDENING_FUNCTIONS {
-            push_unique(&mut ordered, &mut seen, f);
+            push_baseline(&mut ordered, &mut seen, f);
         }
         if include_reachability_block {
             for f in HARDENING_REACHABILITY {
-                push_unique(&mut ordered, &mut seen, f);
+                push_baseline(&mut ordered, &mut seen, f);
             }
         }
         for f in HARDENING_OPCACHE_ALWAYS {
-            push_unique(&mut ordered, &mut seen, f);
+            push_baseline(&mut ordered, &mut seen, f);
         }
         if !cluster_invalidation {
             for f in HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION {
-                push_unique(&mut ordered, &mut seen, f);
+                push_baseline(&mut ordered, &mut seen, f);
             }
         }
     }
 
     if ordered.is_empty() { None } else { Some(ordered.join(",")) }
+}
+
+/// What a set of per-site capability grants resolves to against the effective
+/// hardening baseline.
+///
+/// Given the union of every site's granted capabilities (`granted`, canonical
+/// names) and the baseline flags, partition it into:
+///
+/// * `gated` — names ePHPm's baseline *would* disable and that a grant moves to
+///   per-request gating instead. Exactly the functions to leave out of
+///   `disable_functions` ([`compose_disable_functions`]) and to install a gate
+///   for.
+/// * `redundant` — granted names ePHPm's baseline would not disable anyway
+///   (e.g. `fsockopen` when egress is externally managed, or any name when
+///   hardening is off). Callable by every tenant already, so the grant does
+///   nothing — surfaced so the operator is not misled.
+/// * `operator_blocked` — granted names the operator *explicitly* disabled via
+///   `[php] ini_overrides`. The operator's intent wins; the grant is refused.
+///
+/// The three are disjoint. Only `gated` changes behaviour.
+#[allow(clippy::fn_params_excessive_bools)]
+fn resolve_gated(
+    granted: &std::collections::BTreeSet<String>,
+    operator: &[String],
+    include_shell: bool,
+    include_hardening: bool,
+    include_reachability_block: bool,
+    cluster_invalidation: bool,
+) -> GatedResolution {
+    // The exact set of names ePHPm's baseline would add, given the flags — the
+    // only functions a capability grant can meaningfully un-disable.
+    let mut baseline: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    if include_shell || include_hardening {
+        baseline.extend(SHELL_EXEC_FUNCTIONS.iter().copied());
+    }
+    if include_hardening {
+        baseline.extend(HARDENING_FUNCTIONS.iter().copied());
+        if include_reachability_block {
+            baseline.extend(HARDENING_REACHABILITY.iter().copied());
+        }
+        baseline.extend(HARDENING_OPCACHE_ALWAYS.iter().copied());
+        if !cluster_invalidation {
+            baseline.extend(HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION.iter().copied());
+        }
+    }
+
+    let operator_lower: std::collections::HashSet<String> =
+        operator.iter().map(|f| f.trim().to_ascii_lowercase()).collect();
+
+    let mut resolution = GatedResolution::default();
+    for name in granted {
+        if operator_lower.contains(name) {
+            resolution.operator_blocked.push(name.clone());
+        } else if baseline.contains(name.as_str()) {
+            resolution.gated.insert(name.clone());
+        } else {
+            resolution.redundant.push(name.clone());
+        }
+    }
+    resolution
+}
+
+/// The partition [`resolve_gated`] produces. `gated` drives behaviour; the other
+/// two are for operator-facing diagnostics only.
+#[derive(Default)]
+struct GatedResolution {
+    gated: std::collections::HashSet<String>,
+    redundant: Vec<String>,
+    operator_blocked: Vec<String>,
+}
+
+/// Apply the resolved per-site capability grants: install the request-time gate
+/// (C handler swap list + the site→capabilities map) and log, loudly and
+/// completely, what the feature did.
+///
+/// A no-op beyond logging when nothing is gated — the common case — so a
+/// deployment that uses no capability keeps exactly today's behaviour. Every
+/// grant that does *not* take effect (redundant, or overridden by an operator
+/// `disable_functions`) is warned about, so the feature is never silently inert.
+///
+/// Must be called before PHP initialization (the handler swap runs during module
+/// startup). A no-op in stub mode via the underlying FFI setters.
+fn apply_per_site_capabilities(
+    resolution: &GatedResolution,
+    grants: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    worker_mode: bool,
+) -> anyhow::Result<()> {
+    // Grants that cannot take effect: say so rather than let the operator
+    // believe a function was scoped when it is callable by everyone, or enabled
+    // when the operator's own denylist keeps it off.
+    if !resolution.redundant.is_empty() {
+        let mut names = resolution.redundant.clone();
+        names.sort_unstable();
+        tracing::warn!(
+            capabilities = %names.join(", "),
+            "per-site [security] capabilities grant has no effect: these functions are not \
+             disabled by this configuration (multi-tenant hardening off, or egress externally \
+             managed for fsockopen), so every tenant can already call them. The grant is ignored."
+        );
+    }
+    if !resolution.operator_blocked.is_empty() {
+        let mut names = resolution.operator_blocked.clone();
+        names.sort_unstable();
+        tracing::warn!(
+            capabilities = %names.join(", "),
+            "per-site [security] capabilities grant is overridden by an explicit [php] \
+             ini_overrides disable_functions entry: the operator disabled these process-wide, \
+             which wins. The grant is ignored; remove the disable_functions entry to gate them \
+             per site instead."
+        );
+    }
+
+    if resolution.gated.is_empty() {
+        // Nothing moved from global-disable to gating: do not install any gate
+        // or map. `disable_functions` and the function table are unchanged.
+        return Ok(());
+    }
+
+    // Worker mode has no per-request site context for the gate (the router's
+    // per-request `set_current_site` runs on the per_request dispatch path
+    // only), so every gated call fails closed — the grant would silently never
+    // work. Say so rather than let an operator believe it took effect. The
+    // functions still move out of the global denylist; they are simply
+    // uncallable everywhere in worker mode.
+    if worker_mode {
+        let mut names: Vec<String> = resolution.gated.iter().cloned().collect();
+        names.sort_unstable();
+        tracing::warn!(
+            capabilities = %names.join(", "),
+            "per-site [security] capabilities are set but `[php] mode = \"worker\"` cannot honour \
+             them: the gate has no per-request site in worker mode, so every gated call is denied \
+             (fail-closed). Use per-request mode to grant capabilities, or remove the grants."
+        );
+    }
+
+    let mut gated_names: Vec<String> = resolution.gated.iter().cloned().collect();
+    gated_names.sort_unstable();
+
+    // The map the request-time gate consults: each site's granted capabilities
+    // restricted to the ones actually gated. A site whose grants were all
+    // redundant/operator-blocked contributes nothing.
+    let mut map: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (site, caps) in grants {
+        let effective: std::collections::HashSet<String> =
+            caps.iter().filter(|c| resolution.gated.contains(*c)).cloned().collect();
+        if !effective.is_empty() {
+            map.insert(site.clone(), effective);
+        }
+    }
+
+    // Hand the gate list to the C wrapper (handler swap at module startup) and
+    // the map to the Rust gate, before init.
+    ephpm_php::PhpRuntime::set_capability_gates(&gated_names)
+        .context("failed to register per-site capability gates")?;
+    ephpm_php::capabilities::install(map.clone());
+
+    tracing::info!(
+        functions = %gated_names.join(", "),
+        "per-site function capabilities ENABLED (experimental): these functions were moved from \
+         the process-global disable_functions denylist to PER-REQUEST, PER-SITE gating. Only a \
+         virtual host explicitly granted a function may call it; every other tenant gets the same \
+         'disabled for security reasons' error as before. This is cooperative-tenant isolation at \
+         the ePHPm layer, NOT a kernel boundary."
+    );
+    let mut sites: Vec<&String> = map.keys().collect();
+    sites.sort();
+    for site in sites {
+        let mut caps: Vec<&String> = map[site].iter().collect();
+        caps.sort();
+        tracing::info!(
+            site = %site,
+            capabilities = %caps.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
+            "per-site capability grant"
+        );
+    }
+    if map.values().filter(|caps| caps.contains("pfsockopen")).count() > 1 {
+        tracing::warn!(
+            "more than one site was granted `pfsockopen`: a persistent socket lives in the \
+             shared per-thread EG(persistent_list) keyed host:port, so two granted sites can \
+             inherit each other's live sockets on a reused worker thread. Grant pfsockopen to at \
+             most one site, or use fsockopen (non-persistent) instead."
+        );
+    }
+
+    Ok(())
 }
 
 /// After PHP module startup: refuse to run when the `memory_limit` PHP started
@@ -1829,6 +2033,42 @@ fn run_with_config(
     // builder and the startup log agree.
     let cluster_invalidation =
         config.opcache.effective_cluster_invalidation(config.cluster.enabled);
+    // Per-site function capabilities (experimental, opt-in). Scan the operator's
+    // per-site overrides directory ONCE, here, before PHP init: the set of
+    // functions a grant moves from global-disable to per-request gating is fixed
+    // at MINIT, so the grants that decide it are read now and frozen. Only active
+    // in multi-tenant mode with an overrides directory configured; otherwise the
+    // scan is skipped and everything below is a no-op (empty grants), keeping
+    // `disable_functions` byte-identical to a build without this feature.
+    let operator_df_for_caps = collect_operator_disable_functions(&config.php.ini_overrides);
+    let capability_grants = if let Some(overrides_dir) =
+        config.server.effective_site_overrides_dir().filter(|_| config.server.sites_dir.is_some())
+    {
+        ephpm_server::scan_site_capabilities(overrides_dir).map_err(|reason| {
+            anyhow::anyhow!(
+                "a per-site [security] capabilities grant names an unknown capability: {reason}. \
+                 Accepted capabilities: {}",
+                ephpm_config::GRANTABLE_CAPABILITIES.join(", ")
+            )
+        })?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    // Union of every site's grants, then partitioned against the effective
+    // hardening baseline: `gated` is what actually changes (left registered,
+    // gated per request); `redundant`/`operator_blocked` are logged so a grant
+    // that does nothing is never silent.
+    let granted_union: std::collections::BTreeSet<String> =
+        capability_grants.values().flatten().cloned().collect();
+    let gated_resolution = resolve_gated(
+        &granted_union,
+        &operator_df_for_caps,
+        vhost_disable_shell,
+        vhost_hardening,
+        include_reachability_block,
+        cluster_invalidation,
+    );
+    let gated_capabilities = gated_resolution.gated.clone();
     // Worker mode needs the generated ini for log_errors=On (seeded for every
     // mode now, see `error_display_ini_defaults`): a worker script that dies
     // during boot leaves no diagnostic otherwise — display_errors output is
@@ -1983,6 +2223,10 @@ fn run_with_config(
                 vhost_hardening,
                 include_reachability_block,
                 cluster_invalidation,
+                // Functions a per-site capability grant moves to per-request
+                // gating are omitted from the baseline here so they stay
+                // registered (empty set when no site granted anything).
+                &gated_capabilities,
             ) {
                 let _ = writeln!(content, "disable_functions={df}");
             }
@@ -2114,6 +2358,15 @@ fn run_with_config(
     // hook that enforces it is installed during module startup.
     ephpm_php::PhpRuntime::set_memory_limit_max(config.php.memory_limit_max.as_deref())
         .context("failed to apply [php] memory_limit_max")?;
+
+    // Per-site function capabilities. Hand the gate list to the C wrapper and
+    // the site→capabilities map to the request-time gate, BEFORE init: the
+    // handler swap runs during module startup. Both are no-ops when no site
+    // granted anything (empty list, empty map). Logged either way so the move
+    // from global-disable to per-site gating, and who holds what, is never
+    // silent — this widens the shared-process surface, so an operator must see
+    // exactly what it bought.
+    apply_per_site_capabilities(&gated_resolution, &capability_grants, worker_mode)?;
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
@@ -3064,14 +3317,20 @@ mod disable_functions_tests {
         pairs.iter().map(|(k, v)| [(*k).to_string(), (*v).to_string()]).collect()
     }
 
+    /// The common case for these legacy tests: no per-site capability gating, so
+    /// `compose_disable_functions` must reproduce exactly the pre-feature output.
+    fn no_gates() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn nothing_to_emit_without_operator_or_baseline() {
-        assert_eq!(compose_disable_functions(&[], false, false, true, false), None);
+        assert_eq!(compose_disable_functions(&[], false, false, true, false, &no_gates()), None);
     }
 
     #[test]
     fn shell_only_matches_legacy_line() {
-        let df = compose_disable_functions(&[], true, false, true, false).unwrap();
+        let df = compose_disable_functions(&[], true, false, true, false, &no_gates()).unwrap();
         assert_eq!(df, "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec");
     }
 
@@ -3084,7 +3343,8 @@ mod disable_functions_tests {
             "disable_functions",
             "pcntl_fork,mkdir_helper",
         )]));
-        let df = compose_disable_functions(&operator, true, false, true, false).unwrap();
+        let df =
+            compose_disable_functions(&operator, true, false, true, false, &no_gates()).unwrap();
         // Operator entries come first and survive.
         assert!(df.starts_with("pcntl_fork,mkdir_helper,"));
         // Shell baseline is still present.
@@ -3094,7 +3354,7 @@ mod disable_functions_tests {
 
     #[test]
     fn hardening_adds_the_proven_channels() {
-        let df = compose_disable_functions(&[], true, true, true, false).unwrap();
+        let df = compose_disable_functions(&[], true, true, true, false, &no_gates()).unwrap();
         for expected in [
             "system",        // shell family
             "pcntl_fork",    // pcntl
@@ -3117,7 +3377,7 @@ mod disable_functions_tests {
         // reachability block OFF (network_egress_externally_managed = true):
         // fsockopen is lifted, but pfsockopen and every non-reachability block
         // stay in place — this is the whole point of the knob.
-        let df = compose_disable_functions(&[], true, true, false, false).unwrap();
+        let df = compose_disable_functions(&[], true, true, false, false, &no_gates()).unwrap();
         assert!(
             !df.split(',').any(|f| f == "fsockopen"),
             "fsockopen must be lifted when egress is externally managed: {df}"
@@ -3133,7 +3393,8 @@ mod disable_functions_tests {
         // the knob only drops ePHPm's own baseline entry, never the operator's.
         let operator =
             collect_operator_disable_functions(&ov(&[("disable_functions", "fsockopen")]));
-        let with_operator = compose_disable_functions(&operator, true, true, false, false).unwrap();
+        let with_operator =
+            compose_disable_functions(&operator, true, true, false, false, &no_gates()).unwrap();
         assert!(with_operator.split(',').any(|f| f == "fsockopen"));
     }
 
@@ -3141,13 +3402,13 @@ mod disable_functions_tests {
     fn cluster_invalidation_keeps_opcache_introspection_callable() {
         // With cluster invalidation ON, ePHPm needs opcache_invalidate/status,
         // so they must NOT be in the denylist — but opcache_reset always is.
-        let on = compose_disable_functions(&[], true, true, true, true).unwrap();
+        let on = compose_disable_functions(&[], true, true, true, true, &no_gates()).unwrap();
         assert!(on.split(',').any(|f| f == "opcache_reset"));
         assert!(!on.split(',').any(|f| f == "opcache_invalidate"));
         assert!(!on.split(',').any(|f| f == "opcache_get_status"));
 
         // With it OFF, they are disabled too.
-        let off = compose_disable_functions(&[], true, true, true, false).unwrap();
+        let off = compose_disable_functions(&[], true, true, true, false, &no_gates()).unwrap();
         assert!(off.split(',').any(|f| f == "opcache_invalidate"));
         assert!(off.split(',').any(|f| f == "opcache_get_status"));
     }
@@ -3156,7 +3417,8 @@ mod disable_functions_tests {
     fn duplicate_names_are_deduplicated_case_insensitively() {
         let operator =
             collect_operator_disable_functions(&ov(&[("disable_functions", "System, PCNTL_FORK")]));
-        let df = compose_disable_functions(&operator, true, true, true, false).unwrap();
+        let df =
+            compose_disable_functions(&operator, true, true, true, false, &no_gates()).unwrap();
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("system")).count(), 1);
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("pcntl_fork")).count(), 1);
     }
@@ -3169,6 +3431,101 @@ mod disable_functions_tests {
             ("disable_functions", "c"),
         ]));
         assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    // ── Per-site function capabilities ──────────────────────────────────
+
+    fn gates(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    fn granted(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// The hard requirement: with nothing granted, the composed denylist is
+    /// byte-identical to the pre-feature output. `no_gates()` is what every
+    /// legacy test above already passes, so this pins the equality directly.
+    #[test]
+    fn no_grant_leaves_disable_functions_byte_identical() {
+        for (shell, harden, reach, cluster) in [
+            (false, false, true, false),
+            (true, false, true, false),
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+        ] {
+            let baseline =
+                compose_disable_functions(&[], shell, harden, reach, cluster, &no_gates());
+            let with_empty_gated =
+                compose_disable_functions(&[], shell, harden, reach, cluster, &gates(&[]));
+            assert_eq!(baseline, with_empty_gated, "an empty gate set must not change the output");
+        }
+    }
+
+    /// A gated function is removed from ePHPm's baseline (left registered for the
+    /// per-site gate) while the rest of the hardening set is untouched.
+    #[test]
+    fn a_gated_function_is_removed_from_the_denylist() {
+        let full = compose_disable_functions(&[], true, true, true, false, &no_gates()).unwrap();
+        assert!(full.split(',').any(|f| f == "mail"));
+        assert!(full.split(',').any(|f| f == "fsockopen"));
+
+        let gated =
+            compose_disable_functions(&[], true, true, true, false, &gates(&["mail", "fsockopen"]))
+                .unwrap();
+        assert!(!gated.split(',').any(|f| f == "mail"), "a gated function must not be disabled");
+        assert!(!gated.split(',').any(|f| f == "fsockopen"));
+        // Everything else the preset disables is still there.
+        assert!(gated.split(',').any(|f| f == "pcntl_fork"));
+        assert!(gated.split(',').any(|f| f == "shm_attach"));
+        assert!(gated.split(',').any(|f| f == "opcache_reset"));
+    }
+
+    /// An operator's explicit `disable_functions` entry always wins: compose
+    /// never skips an operator name even if it appears in the gated set.
+    #[test]
+    fn gating_never_overrides_an_operator_explicit_disable() {
+        let operator = collect_operator_disable_functions(&ov(&[("disable_functions", "mail")]));
+        let df = compose_disable_functions(&operator, true, true, true, false, &gates(&["mail"]))
+            .unwrap();
+        assert!(df.split(',').any(|f| f == "mail"), "operator-disabled mail must stay disabled");
+    }
+
+    /// `resolve_gated` partitions a grant union into gated / redundant /
+    /// operator-blocked against the effective baseline.
+    #[test]
+    fn resolve_gated_partitions_against_the_baseline() {
+        // Hardening on, egress NOT externally managed (fsockopen is in the
+        // reachability block), operator explicitly disabled pfsockopen.
+        let operator = vec!["pfsockopen".to_string()];
+        let res = resolve_gated(
+            &granted(&["mail", "fsockopen", "pfsockopen"]),
+            &operator,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(res.gated, gates(&["mail", "fsockopen"]));
+        assert_eq!(res.operator_blocked, vec!["pfsockopen".to_string()]);
+        assert_eq!(res.redundant, [] as [String; 0]);
+    }
+
+    /// With egress externally managed, `fsockopen` is not in the baseline at
+    /// all, so granting it is redundant — not gated.
+    #[test]
+    fn resolve_gated_marks_already_callable_grants_redundant() {
+        // include_reachability_block = false => fsockopen is not disabled.
+        let res = resolve_gated(&granted(&["mail", "fsockopen"]), &[], true, true, false, false);
+        assert_eq!(res.gated, gates(&["mail"]));
+        assert_eq!(res.redundant, vec!["fsockopen".to_string()]);
+        assert_eq!(res.operator_blocked, [] as [String; 0]);
+
+        // Hardening entirely off => every grant is redundant (nothing disabled).
+        let off = resolve_gated(&granted(&["mail"]), &[], false, false, true, false);
+        assert!(off.gated.is_empty(), "nothing disabled means nothing to gate");
+        assert_eq!(off.redundant, vec!["mail".to_string()]);
     }
 
     fn ini_value(defaults: &[(&str, &str)], key: &str) -> Option<String> {

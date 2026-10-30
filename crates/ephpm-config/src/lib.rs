@@ -5475,6 +5475,40 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
+/// PHP functions the multi-tenant hardening preset disables that an operator
+/// may grant back to a **single** virtual host through a per-site
+/// `[security] capabilities` override (see `ephpm-server`'s `site_overrides`).
+///
+/// Experimental, opt-in, and deliberately narrow. The list is the subset of the
+/// hardening denylist a legacy app realistically needs and that can be gated
+/// per request without handing one tenant a channel into another's data:
+///
+/// * `mail` — `mail()` relay from the shared identity.
+/// * `fsockopen` — a *non-persistent* raw socket (dies at request end), so it
+///   carries only a reachability concern, which a grant scopes to one site.
+/// * `pfsockopen` — a *persistent* raw socket. Grantable because a legacy SMTP
+///   client wants one, but with a documented residual: the persistent handle
+///   lives in the shared per-thread `EG(persistent_list)` keyed `host:port`, so
+///   granting it to **two** sites lets them inherit each other's live sockets on
+///   a reused ZTS worker thread. Safe only while at most one site holds it.
+///
+/// The shell-execution family (`exec`, `system`, `proc_open`, `popen`,
+/// `shell_exec`, `passthru`, `pcntl_exec`) is **never** grantable — it stays
+/// hard-off in every mode. Anything not in this list cannot be granted.
+pub const GRANTABLE_CAPABILITIES: &[&str] = &["mail", "fsockopen", "pfsockopen"];
+
+/// Canonicalize a requested capability name against [`GRANTABLE_CAPABILITIES`].
+///
+/// Returns the canonical (lower-case, `'static`) spelling when `name`
+/// (case-insensitively, trimmed) is a grantable capability, or `None` when it is
+/// not — the single source of truth every caller uses to reject an unknown
+/// capability name fail-closed.
+#[must_use]
+pub fn normalize_capability(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    GRANTABLE_CAPABILITIES.iter().copied().find(|c| *c == lower)
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
