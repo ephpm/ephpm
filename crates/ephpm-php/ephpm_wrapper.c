@@ -7752,7 +7752,13 @@ int ephpm_set_capability_gates(const char *const *names, size_t count)
  * through (site is granted) or raises the standard disabled-function warning.
  * Identical denied-call behaviour to zend_disable_functions' display_disabled_function.
  */
-static void ephpm_capability_gate(INTERNAL_FUNCTION_PARAMETERS)
+/* `zif_handler` is `void (ZEND_FASTCALL *)(INTERNAL_FUNCTION_PARAMETERS)`, so
+ * the gate must carry ZEND_FASTCALL too — it is empty on LP64 (Linux/macOS) but
+ * a real calling convention on MSVC/LLP64, where omitting it makes the
+ * `.handler` assignment a type mismatch (C2440). Declared via the same
+ * ZEND_NAMED_FUNCTION macro the engine uses for every internal handler so the
+ * signature matches `zif_handler` exactly on every target. */
+static ZEND_NAMED_FUNCTION(ephpm_capability_gate)
 {
     const char *fname = get_active_function_name();
     zif_handler orig = NULL;
