@@ -1356,15 +1356,15 @@ impl PhpRuntime {
         {
             use std::ffi::CString;
 
-            let owned: Vec<CString> = names
-                .iter()
-                .map(|n| CString::new(n.as_str()))
-                .collect::<Result<_, _>>()
-                .map_err(|_| {
-                    PhpError::InvalidSetting("a capability function name contains a NUL byte".into())
-                })?;
-            let ptrs: Vec<*const std::os::raw::c_char> =
-                owned.iter().map(|s| s.as_ptr()).collect();
+            let owned: Vec<CString> =
+                names.iter().map(|n| CString::new(n.as_str())).collect::<Result<_, _>>().map_err(
+                    |_| {
+                        PhpError::InvalidSetting(
+                            "a capability function name contains a NUL byte".into(),
+                        )
+                    },
+                )?;
+            let ptrs: Vec<*const std::os::raw::c_char> = owned.iter().map(|s| s.as_ptr()).collect();
             // SAFETY: `ptrs` points to `owned.len()` valid NUL-terminated strings
             // that outlive the call; the C side strdups each one and touches no
             // PHP state (no longjmp possible). Called on the single-threaded

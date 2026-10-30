@@ -729,10 +729,7 @@ pub(crate) fn scan_capabilities(
         };
 
         let granted = parse_capabilities(sec).map_err(|detail| {
-            format!(
-                "per-site override {} ([security] capabilities): {detail}",
-                path.display()
-            )
+            format!("per-site override {} ([security] capabilities): {detail}", path.display())
         })?;
         if !granted.is_empty() {
             map.insert(site_key.to_string(), granted);
@@ -1963,8 +1960,11 @@ mod tests {
         // Invalid TOML: skipped, not a scan error.
         std::fs::write(f.overrides.join("broken.test.toml"), "this is = = not toml").unwrap();
         // Not a valid site key: never read.
-        std::fs::write(f.overrides.join("has a space.toml"), "[security]\ncapabilities=[\"mail\"]\n")
-            .unwrap();
+        std::fs::write(
+            f.overrides.join("has a space.toml"),
+            "[security]\ncapabilities=[\"mail\"]\n",
+        )
+        .unwrap();
         assert!(scan_capabilities(&f.overrides).unwrap().is_empty());
     }
 

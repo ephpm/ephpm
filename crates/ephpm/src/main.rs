@@ -3343,7 +3343,8 @@ mod disable_functions_tests {
             "disable_functions",
             "pcntl_fork,mkdir_helper",
         )]));
-        let df = compose_disable_functions(&operator, true, false, true, false, &no_gates()).unwrap();
+        let df =
+            compose_disable_functions(&operator, true, false, true, false, &no_gates()).unwrap();
         // Operator entries come first and survive.
         assert!(df.starts_with("pcntl_fork,mkdir_helper,"));
         // Shell baseline is still present.
@@ -3392,7 +3393,8 @@ mod disable_functions_tests {
         // the knob only drops ePHPm's own baseline entry, never the operator's.
         let operator =
             collect_operator_disable_functions(&ov(&[("disable_functions", "fsockopen")]));
-        let with_operator = compose_disable_functions(&operator, true, true, false, false, &no_gates()).unwrap();
+        let with_operator =
+            compose_disable_functions(&operator, true, true, false, false, &no_gates()).unwrap();
         assert!(with_operator.split(',').any(|f| f == "fsockopen"));
     }
 
@@ -3415,7 +3417,8 @@ mod disable_functions_tests {
     fn duplicate_names_are_deduplicated_case_insensitively() {
         let operator =
             collect_operator_disable_functions(&ov(&[("disable_functions", "System, PCNTL_FORK")]));
-        let df = compose_disable_functions(&operator, true, true, true, false, &no_gates()).unwrap();
+        let df =
+            compose_disable_functions(&operator, true, true, true, false, &no_gates()).unwrap();
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("system")).count(), 1);
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("pcntl_fork")).count(), 1);
     }
@@ -3452,7 +3455,8 @@ mod disable_functions_tests {
             (true, true, false, false),
             (true, true, true, true),
         ] {
-            let baseline = compose_disable_functions(&[], shell, harden, reach, cluster, &no_gates());
+            let baseline =
+                compose_disable_functions(&[], shell, harden, reach, cluster, &no_gates());
             let with_empty_gated =
                 compose_disable_functions(&[], shell, harden, reach, cluster, &gates(&[]));
             assert_eq!(baseline, with_empty_gated, "an empty gate set must not change the output");
@@ -3467,15 +3471,9 @@ mod disable_functions_tests {
         assert!(full.split(',').any(|f| f == "mail"));
         assert!(full.split(',').any(|f| f == "fsockopen"));
 
-        let gated = compose_disable_functions(
-            &[],
-            true,
-            true,
-            true,
-            false,
-            &gates(&["mail", "fsockopen"]),
-        )
-        .unwrap();
+        let gated =
+            compose_disable_functions(&[], true, true, true, false, &gates(&["mail", "fsockopen"]))
+                .unwrap();
         assert!(!gated.split(',').any(|f| f == "mail"), "a gated function must not be disabled");
         assert!(!gated.split(',').any(|f| f == "fsockopen"));
         // Everything else the preset disables is still there.
@@ -3488,11 +3486,9 @@ mod disable_functions_tests {
     /// never skips an operator name even if it appears in the gated set.
     #[test]
     fn gating_never_overrides_an_operator_explicit_disable() {
-        let operator =
-            collect_operator_disable_functions(&ov(&[("disable_functions", "mail")]));
-        let df =
-            compose_disable_functions(&operator, true, true, true, false, &gates(&["mail"]))
-                .unwrap();
+        let operator = collect_operator_disable_functions(&ov(&[("disable_functions", "mail")]));
+        let df = compose_disable_functions(&operator, true, true, true, false, &gates(&["mail"]))
+            .unwrap();
         assert!(df.split(',').any(|f| f == "mail"), "operator-disabled mail must stay disabled");
     }
 
