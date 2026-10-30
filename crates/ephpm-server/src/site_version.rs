@@ -88,6 +88,28 @@ pub(crate) fn next_owner_epoch(own: u64, best_peer: u64) -> u64 {
     own.max(best_peer).saturating_add(1)
 }
 
+/// Fold the gossip-advertised site version together with every version a peer
+/// reports over the **durable channel probe**, taking the max.
+///
+/// The gossip advert (`sqlite:ver:<site>`) alone is not enough to decide
+/// whether a warm owner's copy is stale: it is published only by the *current*
+/// owner and lapses after `SITE_VERSION_TTL` (10 s). After an interim owner
+/// advances a site and then releases ownership, its advert is gone within
+/// seconds — so a returning owner that settles a little later would read no
+/// advert, conclude no peer is ahead, and serve its stale copy, dropping the
+/// interim owner's acknowledged writes (#654 crash-restart hole). Probing peers'
+/// *persisted* epoch directly over the cluster channel closes that hole; this
+/// folds those probe results with the advert so the freshest known version
+/// wins regardless of advert timing. `None` only when neither the advert nor
+/// any peer reported a version (the fail-safe direction — nothing out-ranks a
+/// local copy, so it may serve).
+pub(crate) fn fold_best_version(
+    advert: Option<SiteVersion>,
+    peers: impl IntoIterator<Item = SiteVersion>,
+) -> Option<SiteVersion> {
+    peers.into_iter().fold(advert, |acc, v| Some(acc.map_or(v, |a| a.max(v))))
+}
+
 /// What [`decide_warm_settle`] concludes for a node whose local copy of a site
 /// is **warm** (holds data). The cold path is unchanged and handled elsewhere
 /// (`settle_round`'s ownership-handoff probe).
@@ -271,6 +293,63 @@ mod tests {
             WarmSettle::Settled,
             "pre-fix: a colliding epoch lets head decide, and A wrongly wins"
         );
+    }
+
+    #[test]
+    fn fold_best_version_takes_the_max_over_advert_and_peers() {
+        // Nothing known anywhere → None (fail-safe: local copy may serve).
+        assert_eq!(fold_best_version(None, std::iter::empty()), None);
+        // Only the advert.
+        assert_eq!(fold_best_version(Some(v(1, 5)), std::iter::empty()), Some(v(1, 5)));
+        // Only a peer probe (the advert has lapsed).
+        assert_eq!(fold_best_version(None, [v(2, 0)]), Some(v(2, 0)));
+        // A peer's higher epoch beats a stale advert.
+        assert_eq!(fold_best_version(Some(v(1, 999)), [v(2, 0)]), Some(v(2, 0)));
+        // An advert ahead of every peer is kept.
+        assert_eq!(fold_best_version(Some(v(3, 0)), [v(2, 500)]), Some(v(3, 0)));
+        // Within one epoch the higher head wins.
+        assert_eq!(fold_best_version(Some(v(2, 10)), [v(2, 50)]), Some(v(2, 50)));
+        // The max across several peers.
+        assert_eq!(fold_best_version(None, [v(1, 9), v(2, 1), v(2, 0)]), Some(v(2, 1)));
+    }
+
+    /// **#654 crash-restart hole, closed by the durable peer probe.** The
+    /// interim owner persisted epoch 2 and then released ownership, so its
+    /// `sqlite:ver` gossip advert has already lapsed (`advert = None`) by the
+    /// time the original owner returns warm at epoch 1. Before this fix the
+    /// returning owner saw `best_peer = None`, concluded no peer was ahead, and
+    /// SERVED ITS STALE COPY — dropping the 40 interim writes. Reading the
+    /// interim owner's *persisted* epoch directly over the channel folds
+    /// `best_peer` to `v(2, _)`, so the returning owner now BLOCKS and catches
+    /// up instead.
+    #[test]
+    fn durable_peer_probe_blocks_a_returning_owner_when_the_advert_has_lapsed() {
+        let advert: Option<SiteVersion> = None; // interim owner stepped down; advert gone
+        let durable_from_peers = [v(2, 3)]; // epoch read over the channel, not gossip
+        let best = fold_best_version(advert, durable_from_peers);
+        assert_eq!(best, Some(v(2, 3)), "the durable probe supplies the epoch the advert no longer carries");
+        assert_eq!(
+            decide_warm_settle(true, true, v(1, 500), best),
+            WarmSettle::Blocked,
+            "the returning owner refuses its stale copy once it learns the interim epoch durably"
+        );
+    }
+
+    /// **#654 founding-owner hole (gap 1).** A brand-new site served empty must
+    /// still record `epoch >= 1` (via `settle_owner_version` on the `NewSite`
+    /// path), so that if the founder later dies and an interim owner takes over,
+    /// the interim bumps to 2 and out-ranks the founder's returning stale copy.
+    /// Pre-fix the founding stint ran at epoch 0, and a returning founder then
+    /// collided with the interim owner at epoch 1 (head, which resets per stint,
+    /// wrongly decided). `settle_round` is not pure, so this pins the arithmetic
+    /// it must apply: own epoch 0, no peer → epoch 1.
+    #[test]
+    fn a_founding_owner_establishes_epoch_one() {
+        assert_eq!(next_owner_epoch(0, 0), 1);
+        // And the interim owner that adopts the founder's epoch 1 then bumps to
+        // 2 — strictly above, so no collision with the returning founder.
+        assert_eq!(next_owner_epoch(1, 0), 2);
+        assert!(v(2, 0) > v(1, i64::MAX), "the interim's epoch out-ranks the founder's stale copy at any head");
     }
 
     #[test]

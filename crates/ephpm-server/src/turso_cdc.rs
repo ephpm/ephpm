@@ -4113,6 +4113,70 @@ where
     PeerSearch { found: None, unreachable }
 }
 
+/// Probe one peer for just its persisted [`SiteVersion`] (epoch + head),
+/// reading the snapshot **header only** and abandoning the dump body.
+///
+/// Unlike [`read_advertised_site_version`] — the `sqlite:ver:<site>` gossip
+/// advert, which only the *current* owner publishes and which lapses after
+/// [`SITE_VERSION_TTL`] (10 s) — this reads the peer's **durable** epoch over
+/// the reliable cluster channel. It is what lets a returning owner learn an
+/// interim owner's higher epoch *after* that owner has released ownership and
+/// its advert has lapsed (the #654 crash-restart hole). The header carries both
+/// the persisted `epoch` and the stint `watermark` (head), so the full
+/// [`SiteVersion`] is available without transferring the dump.
+///
+/// `None` when the peer holds no copy (`no_copy`), is unreachable, or does not
+/// answer within [`HANDOFF_PROBE_TIMEOUT`] — every one of which only ever
+/// *permits* serving (fail-safe), never forces a stale read. The dump body is
+/// deliberately never read: dropping the stream after the header abandons it,
+/// which the serving owner handles as an ordinary client disconnect.
+async fn probe_peer_version(
+    addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    site: &str,
+) -> Option<crate::site_version::SiteVersion> {
+    let stream_type = snapshot_stream_type(site);
+    let opened =
+        tokio::time::timeout(HANDOFF_PROBE_TIMEOUT, open_snapshot(addr, channel, &stream_type))
+            .await;
+    // `_stream` is dropped here, abandoning the (unread) dump body on purpose.
+    let (_stream, header) = match opened {
+        Ok(Ok(opened)) => opened,
+        _ => return None,
+    };
+    if header.no_copy {
+        return None;
+    }
+    Some(crate::site_version::SiteVersion { epoch: header.epoch, head: header.watermark })
+}
+
+/// The freshest site version known from a **durable** source: the gossip advert
+/// folded with every alive candidate peer's persisted epoch (probed header-only
+/// over the channel). Closes the #654 crash-restart hole where a returning
+/// owner could not learn the interim owner's higher epoch once the interim
+/// owner released ownership and its 10 s advert lapsed.
+///
+/// Only called for a **warm owner** — the one case that can serve a stale copy
+/// and so needs the robust answer. Settle rounds happen only on an ownership
+/// change, so probing the candidates here is infrequent; each probe is bounded
+/// by [`HANDOFF_PROBE_TIMEOUT`], as the existing handoff probe already is.
+async fn best_peer_version_durable(
+    channel: &ephpm_cluster::ChannelHandle,
+    site: &str,
+    advert: Option<crate::site_version::SiteVersion>,
+    candidates: &[NodeInfo],
+) -> Option<crate::site_version::SiteVersion> {
+    let mut peer_versions = Vec::new();
+    for peer in candidates {
+        if let Some(addr) = crate::sql_forward::member_channel_addr(peer)
+            && let Some(v) = probe_peer_version(addr, channel, site).await
+        {
+            peer_versions.push(v);
+        }
+    }
+    crate::site_version::fold_best_version(advert, peer_versions)
+}
+
 /// What a cold owner does when no peer answered with data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandoffVerdict {
@@ -4358,8 +4422,25 @@ async fn settle_round(
     let nodes = cluster.nodes().await;
     let owner_is_self =
         ephpm_cluster::hrw_owner(&nodes, site).is_some_and(|owner| owner.id == self_id);
-    // The freshest version any peer (the current owner) advertises for the site.
-    let best_peer = read_advertised_site_version(cluster, site).await;
+    let candidates = handoff_candidates(&nodes, self_id, site);
+
+    // The freshest version a peer holds for this site. The gossip advert alone
+    // is insufficient for a WARM OWNER — the case that can serve a stale copy
+    // and drop an interim owner's acknowledged writes (#654): the interim owner
+    // stops advertising the instant it releases ownership, and the advert
+    // lapses after SITE_VERSION_TTL (10 s), so a returning owner that settles a
+    // little later would see no fresher peer and serve stale. For that case,
+    // fold the advert with peers' DURABLE persisted epoch (probed header-only
+    // over the channel) so the block decision never depends on advert timing.
+    // Every other case either ignores best_peer (a warm replica) or pulls and
+    // adopts the epoch anyway (a cold owner's handoff), so the plain advert is
+    // enough and the extra probe is skipped.
+    let advert = read_advertised_site_version(cluster, site).await;
+    let best_peer = if !cold && owner_is_self {
+        best_peer_version_durable(channel, site, advert, &candidates).await
+    } else {
+        advert
+    };
 
     // A WARM local copy (#654): decide whether it is safe to serve now. A stale
     // copy — one a returning owner holds after an interim owner advanced the
@@ -4393,7 +4474,6 @@ async fn settle_round(
         return SettleRound::NotOwner;
     }
 
-    let candidates = handoff_candidates(&nodes, self_id, site);
     let search = search_peers_for_copy(&candidates, |peer| {
         let addr = crate::sql_forward::member_channel_addr(peer);
         async move {
@@ -4478,6 +4558,16 @@ async fn settle_round(
                 "ownership handoff: no alive peer holds a copy of this site; it is new and starts \
                  from an empty database"
             );
+            // Establish this FOUNDING owner's ownership epoch (#654, gap 1).
+            // A brand-new site served empty must still record epoch >= 1 — the
+            // warm-Settled and handoff-install branches both do this, but the
+            // founding path did not, so the first stint ran at epoch 0. If this
+            // founder later dies and returns stale, the interim owner must be
+            // able to out-rank it by epoch; without a founding epoch both bump
+            // 0 -> 1 and collide, and the per-stint head (which resets each
+            // stint) wrongly decides. best_peer is None here (no peer has a
+            // copy), so next_owner_epoch(0, 0) = 1.
+            settle_owner_version(conn, factory, cluster, site, own.epoch, best_peer).await;
             SettleRound::Settled
         }
         HandoffVerdict::AwaitMembership => SettleRound::AwaitMembership(HANDOFF_OWNERSHIP_RECHECK),
@@ -4507,6 +4597,13 @@ async fn settle_round(
 /// per-tick head sampler re-advertises while this node owns the site, and a
 /// missing advertisement only ever *permits* a peer to serve (fail-safe), never
 /// forces it to serve stale.
+///
+/// The target epoch floors on the **currently persisted** epoch, not just the
+/// `own_epoch` the caller captured earlier in the settle round: a handoff
+/// install may have adopted a *higher* peer epoch since then
+/// ([`install_snapshot`] → [`apply_snapshot`]), and the new owner epoch must be
+/// strictly above that adopted value — writing a lower one would clobber it and
+/// re-open the #654 ordering hole.
 async fn settle_owner_version(
     conn: &turso::Connection,
     factory: &Turso,
@@ -4515,18 +4612,21 @@ async fn settle_owner_version(
     own_epoch: u64,
     best_peer: Option<crate::site_version::SiteVersion>,
 ) {
-    let target = crate::site_version::next_owner_epoch(own_epoch, best_peer.map_or(0, |p| p.epoch));
+    let best_peer_epoch = best_peer.map_or(0, |p| p.epoch);
     let persisted = {
         let _permit = factory.wal_gate_permit().await;
         off_runtime(async {
+            let current = read_site_epoch(conn).await?;
+            let target =
+                crate::site_version::next_owner_epoch(current.max(own_epoch), best_peer_epoch);
             write_site_epoch(conn, target).await?;
             let head = current_max_change_id(conn).await?;
-            anyhow::Ok(head)
+            anyhow::Ok((target, head))
         })
         .await
     };
     match persisted {
-        Ok(head) => {
+        Ok((target, head)) => {
             advertise_site_version(
                 cluster,
                 site,
