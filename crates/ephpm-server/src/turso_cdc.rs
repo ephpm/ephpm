@@ -3688,12 +3688,20 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
     // it either — a restarted driver starts its own. Aborting it is safe: its
     // engine work runs in offloaded scopes, which an abort on the server's
     // multi-thread runtime cannot cut short (it lands at the next await).
-    let _settle = AbortOnDrop(tokio::spawn(settle_site_serving(
+    //
+    // It is **re-spawned on every later promotion** (see the `Primary` arm
+    // below): this one-shot task settles the site's *initial* ownership and
+    // then exits, so without the re-spawn a node promoted to owner mid-life —
+    // an interim takeover after the previous owner died — would never re-run
+    // `settle_round`, and so would never mark a new ownership epoch for its
+    // stint (#654, crash-restart failure mode 1). `gate` is cloned so the
+    // re-spawn can hand it the same gate.
+    let mut settle = AbortOnDrop(tokio::spawn(settle_site_serving(
         site.clone(),
         Arc::clone(&cluster),
         channel.clone(),
         Arc::clone(&site_mgmt),
-        gate,
+        Arc::clone(&gate),
         max_snapshot_bytes,
         plane_started,
     )));
@@ -3720,6 +3728,12 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
     let mut force_reset = false;
     // Reconnect pacing for this site's replica stream; see the failure arm.
     let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
+    // Whether this node already held the site as owner on the role it last
+    // observed. A transition **into** ownership is a promotion that must
+    // re-settle the site (and so mark a new ownership epoch) — see
+    // [`promotion_restarts_settle`]. The initial role (never a transition) is
+    // settled by the one-shot task spawned above, so it is not a promotion.
+    let mut was_owner = matches!(*role_rx.borrow(), ElectedRole::Primary);
 
     loop {
         // Process shutdown: leave at this safe point (see
@@ -3730,6 +3744,40 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
         let role = role_rx.borrow().clone();
         match role {
             ElectedRole::Primary => {
+                // A promotion — this node has just (re)acquired ownership of a
+                // site it was not the owner of a moment ago (an interim
+                // takeover after the previous owner died, or any HRW re-home
+                // onto this node). The one-shot settle task spawned at driver
+                // start has already exited (the site became `Ready`), so
+                // nothing would otherwise re-run `settle_round` for the new
+                // stint. Re-spawn it: `settle_round` re-decides serving
+                // (blocking and pulling if a peer holds a strictly fresher
+                // copy) and, when it settles as owner, bumps and advertises a
+                // new ownership epoch strictly above the stint this copy
+                // descends from. Marking the epoch **inside** `settle_round`,
+                // downstream of its stale-copy block, is what prevents a
+                // returning owner from stamping a fresh epoch onto a stale copy
+                // (#654, crash-restart failure mode 1).
+                if promotion_restarts_settle(was_owner, true) {
+                    tracing::info!(
+                        site = %site,
+                        "per-site: promoted to this site's owner; re-settling serving and the \
+                         ownership epoch for the new stint (#654)"
+                    );
+                    drop(std::mem::replace(
+                        &mut settle,
+                        AbortOnDrop(tokio::spawn(settle_site_serving(
+                            site.clone(),
+                            Arc::clone(&cluster),
+                            channel.clone(),
+                            Arc::clone(&site_mgmt),
+                            Arc::clone(&gate),
+                            max_snapshot_bytes,
+                            plane_started,
+                        ))),
+                    ));
+                }
+                was_owner = true;
                 // We own this site; owner-side handlers serve replicas.
                 // Nothing to drive until the role changes. (Becoming the owner
                 // of a site whose data lives on another node is handled by
@@ -3750,6 +3798,9 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                 }
             }
             ElectedRole::Replica { primary_grpc_url } if !primary_grpc_url.is_empty() => {
+                // Not the owner: the next transition into ownership is a
+                // promotion that must re-settle (see the `Primary` arm).
+                was_owner = false;
                 // Another node ships this site now; drop our owner-side
                 // series so a stale lag/head cannot outlive the ownership.
                 cdc_metrics::forget_shipping(&site);
@@ -3830,6 +3881,9 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                 }
             }
             ElectedRole::Replica { .. } => {
+                // Not the owner: the next transition into ownership is a
+                // promotion that must re-settle (see the `Primary` arm).
+                was_owner = false;
                 // Owner not resolved yet — wait for the election to name one.
                 // Either way this node no longer ships the site.
                 cdc_metrics::forget_shipping(&site);
@@ -3915,6 +3969,29 @@ async fn sample_owned_head_until_role_changes(
 /// `None` once all agree.
 fn scheme_block_reason(confirmed: &[(String, Option<u32>)]) -> Option<String> {
     (!confirmed.is_empty()).then(|| ephpm_cluster::describe_hrw_scheme_mismatches(confirmed))
+}
+
+/// Whether observing the owner role should (re)start the per-site serving/epoch
+/// settle for a new ownership stint.
+///
+/// `true` only on a **transition** into ownership (`now_owner && !was_owner`) —
+/// a promotion — never for the role already held. This is the rule the
+/// `run_site_replication` loop applies (#654, crash-restart failure mode 1):
+///
+/// - The site's *initial* ownership (founding, cold handoff, or a warm fast
+///   restart) is settled once by the task spawned at driver start, so the
+///   initial `Primary` role is **not** a promotion and must not re-settle.
+/// - Every *later* promotion (an interim takeover after the previous owner
+///   died, or an HRW re-home onto this node) is where the one-shot task has
+///   already exited; re-settling is what re-runs `settle_round` — which blocks
+///   and pulls a strictly fresher peer copy, then marks a new epoch strictly
+///   above the stint the served copy descends from. An interim owner that never
+///   re-settled would keep the dead owner's epoch, and a returning owner could
+///   then no longer tell the two stints apart by epoch and might serve stale.
+///
+/// Pure so the transition rule is unit-tested without a live election.
+fn promotion_restarts_settle(was_owner: bool, now_owner: bool) -> bool {
+    now_owner && !was_owner
 }
 
 /// Aborts the task it holds when dropped.
@@ -5998,6 +6075,79 @@ mod tests {
 
         // A sole member has nobody to ask.
         assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
+    }
+
+    /// **#654 crash-restart, the hole 47ff6093 did not close.** A promotion must
+    /// re-settle the site; the role already held must not.
+    ///
+    /// The one-shot `settle_site_serving` bumps the ownership epoch only for a
+    /// site's *initial* ownership and then exits. When a warm replica is later
+    /// promoted to owner (an interim takeover after the previous owner was
+    /// SIGKILLed), nothing re-ran `settle_round`, so the interim owner kept the
+    /// dead owner's epoch. A returning owner's durable probe then read that
+    /// unchanged epoch, `decide_warm_settle` fell through to the per-stint
+    /// `change_id` head tie-break (not comparable across physically distinct
+    /// logs), and the returning owner served its stale copy — dropping the
+    /// interim owner's acknowledged writes. The fix re-settles on every
+    /// promotion; this pins exactly when that fires.
+    #[test]
+    fn a_promotion_re_settles_but_the_held_role_does_not() {
+        // Replica -> owner: a promotion, re-settle (and so re-bump the epoch).
+        assert!(promotion_restarts_settle(false, true));
+        // Already owner (the initial Primary role, or re-entering the owner arm
+        // without a role change): the one-shot settle already covered it.
+        assert!(!promotion_restarts_settle(true, true));
+        // Losing / not holding ownership never re-settles.
+        assert!(!promotion_restarts_settle(true, false));
+        assert!(!promotion_restarts_settle(false, false));
+    }
+
+    /// **#654 end to end, as the failing lab run on the 47ff6093 image showed.**
+    /// Composes the epoch arithmetic the re-settle now applies with the serving
+    /// decision, proving the returning owner blocks once — and only once — the
+    /// interim owner's promotion marked a new epoch. This is the invariant that
+    /// must hold even when the gossip advert has lapsed (the epoch is read from
+    /// the interim owner's *persisted* state over the durable probe) and when
+    /// the election and HRW subsystems transiently disagree (the block is driven
+    /// by the epoch the interim owner durably recorded, not by which subsystem
+    /// calls whom primary).
+    #[test]
+    fn a_returning_owner_blocks_once_the_interim_promotion_marks_a_new_epoch() {
+        use crate::site_version::{SiteVersion, decide_warm_settle, next_owner_epoch};
+
+        // Founder A settles its stint at epoch 1; its stale copy has an inflated
+        // local `change_id` head (a founder accumulates bookkeeping change_ids a
+        // replica's rebuilt log does not), deliberately ABOVE the interim
+        // owner's watermark to prove the head tie-break is what used to go wrong.
+        let a_stale = SiteVersion { epoch: 1, head: 120 };
+
+        // A is SIGKILLed. B (a warm replica that adopted A's epoch 1) is
+        // promoted. The re-settle this fix adds runs `settle_round`'s owner
+        // branch, which marks a new epoch strictly above the adopted one:
+        // next_owner_epoch(own=1, best_peer=1) = 2. B then takes the interim
+        // writes; its stint head is small (a rebuilt log), below A's stale head.
+        let b_epoch = next_owner_epoch(1, 1);
+        assert_eq!(b_epoch, 2);
+        let b_interim = SiteVersion { epoch: b_epoch, head: 40 };
+
+        // A returns warm (epoch 1) and HRW re-homes the site to it. Its durable
+        // probe reads B's persisted epoch 2 regardless of advert timing, so the
+        // serving decision blocks the stale copy — and pulls B's fresher one.
+        assert_eq!(
+            decide_warm_settle(true, true, a_stale, Some(b_interim)),
+            crate::site_version::WarmSettle::Blocked,
+            "returning owner must refuse its stale copy once the interim stint has a higher epoch"
+        );
+
+        // Regression guard for the exact bug: WITHOUT the promotion re-settle,
+        // B keeps the dead owner's epoch 1, the epochs tie, and the head
+        // tie-break (A's 120 > B's 40) lets the returning owner serve stale.
+        let b_never_bumped = SiteVersion { epoch: 1, head: 40 };
+        assert_eq!(
+            decide_warm_settle(true, true, a_stale, Some(b_never_bumped)),
+            crate::site_version::WarmSettle::Settled,
+            "pre-fix: a tied epoch lets the head decide, and the stale founder wrongly wins"
+        );
     }
 
     /// A node that is leaving owns nothing, but the cold new owner of one of
