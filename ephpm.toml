@@ -179,6 +179,7 @@ ini_overrides = [
 # --- Query Analysis ---
 #
 # [db.analysis]
+# log_failed_sql = true                # OFF by default; logs raw failing SQL (may contain tenant data)
 # slow_query_threshold = "100ms"       # queries slower than this are captured
 # auto_explain = true                  # run EXPLAIN on slow queries
 # auto_explain_target = "replica"      # don't hit primary with EXPLAINs

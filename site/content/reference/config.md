@@ -1078,6 +1078,7 @@ Clustered SQLite is **experimental** in v0.7.0: it uses the in-process Turso CDC
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `query_stats` | bool | `true` | Track per-digest timing/throughput metrics. Applies to the embedded SQLite paths **and** the MySQL/PostgreSQL proxies — see the coverage table below. |
+| `log_failed_sql` | bool | `false` | Log the raw SQL of statements that fail at the embedded-SQLite wire frontend (litewire), at WARN, with the failing SQL text truncated. Covers the single-node, per-site, and clustered embedded-Turso modes; it does **not** affect the `[db.mysql]` / `[db.postgres]` proxies. **Off by default and a data-exposure risk when on:** the logged statement includes its literal values, which may be tenant data. Enable only for debugging, where the logs are an acceptable place for that data. |
 | `slow_query_threshold` | duration string | `"1s"` | Queries exceeding this are logged at WARN. |
 | `auto_explain` | bool | `false` | **Not yet implemented** — parsed but unused. |
 | `auto_explain_target` | string | `"stderr"` | **Not yet implemented**. |

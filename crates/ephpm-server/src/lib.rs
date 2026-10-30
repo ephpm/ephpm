@@ -515,7 +515,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             None
         }
         (Some(auth), Some(sqlite)) => {
-            let listen = start_per_site_wire(sqlite, &auth, &mut per_site_wire_handles).await?;
+            let listen = start_per_site_wire(
+                sqlite,
+                &auth,
+                config.db.analysis.log_failed_sql,
+                &mut per_site_wire_handles,
+            )
+            .await?;
             Some((auth, listen))
         }
         _ => None,
@@ -2611,6 +2617,7 @@ async fn start_db_proxies(
                 cluster,
                 channel_handle,
                 query_stats,
+                config.db.analysis.log_failed_sql,
                 &mut handles,
                 primary_view,
             )
@@ -2621,7 +2628,13 @@ async fn start_db_proxies(
             // router, so credentials are never injected for an unbound
             // endpoint) via `start_per_site_wire`.
         } else {
-            start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
+            start_single_node_sqlite(
+                sqlite_config,
+                query_stats,
+                config.db.analysis.log_failed_sql,
+                &mut handles,
+            )
+            .await?;
         }
 
         // One sampler for every embedded-database mode: publishes each open
@@ -3113,6 +3126,11 @@ fn per_site_wire_enabled(sqlite: &ephpm_config::SqliteConfig) -> bool {
 async fn start_per_site_wire(
     sqlite_config: &ephpm_config::SqliteConfig,
     auth: &site_wire_auth::SiteWireAuth,
+    // From `[db.analysis] log_failed_sql` (off by default). Covers both per-site
+    // single-node and per-site clustered mode (both reach the wire through this
+    // one listener). When set, litewire logs the raw failing SQL (truncated) at
+    // WARN — see the config doc comment.
+    log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<String> {
     let proxy = &sqlite_config.proxy;
@@ -3135,8 +3153,11 @@ async fn start_per_site_wire(
         );
     }
 
-    let mut builder =
-        litewire::LiteWire::with_authenticator(auth.as_authenticator()).mysql(&proxy.mysql_listen);
+    let mut builder = litewire::LiteWire::with_authenticator(auth.as_authenticator());
+    if log_failed_sql {
+        builder = builder.log_failed_sql(true);
+    }
+    builder = builder.mysql(&proxy.mysql_listen);
 
     if proxy.max_connections > 0 {
         builder = builder.max_connections(proxy.max_connections);
@@ -3239,6 +3260,9 @@ pub(crate) async fn probe_sqlite_listeners(frontends: &[(&str, &str)]) -> anyhow
 async fn start_single_node_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     query_stats: &ephpm_query_stats::QueryStats,
+    // From `[db.analysis] log_failed_sql` (off by default), forwarded to the
+    // litewire wire frontend.
+    log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     probe_sqlite_listeners(&sqlite_frontend_addrs(&sqlite_config.proxy))
@@ -3264,7 +3288,12 @@ async fn start_single_node_sqlite(
     // (`GET_LOCK()` & co.) exclude across every connection to this database —
     // wire and bridge alike — and die with the connection that holds them.
     let scoped = user_locks::scope_shared(tracked as litewire::backend::SharedBackend);
-    spawn_single_node_litewire(sqlite_config, share_backend_with_php(scoped), handles);
+    spawn_single_node_litewire(
+        sqlite_config,
+        share_backend_with_php(scoped),
+        log_failed_sql,
+        handles,
+    );
     Ok(())
 }
 
@@ -3319,9 +3348,15 @@ impl litewire::backend::Backend for PhpSharedBackend {
 fn spawn_single_node_litewire(
     sqlite_config: &ephpm_config::SqliteConfig,
     backend: impl litewire::backend::Backend,
+    // From `[db.analysis] log_failed_sql` (off by default). When set, litewire
+    // logs the raw failing SQL (truncated) at WARN — see the config doc comment.
+    log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let mut builder = litewire::LiteWire::new(backend);
+    if log_failed_sql {
+        builder = builder.log_failed_sql(true);
+    }
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,
@@ -4331,7 +4366,7 @@ mod lib_tests {
         let stats = ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default());
         let mut handles = Vec::new();
 
-        let err = start_single_node_sqlite(&cfg, &stats, &mut handles)
+        let err = start_single_node_sqlite(&cfg, &stats, false, &mut handles)
             .await
             .expect_err("an occupied mysql_listen must fail startup");
         assert!(format!("{err:#}").contains(&addr), "got: {err:#}");
