@@ -102,7 +102,7 @@ use std::path::{Component, Path, PathBuf};
 /// Drives the "did you mean" hint on an unrecognized key, so it must stay in
 /// step with [`RawOverride`]'s fields — pinned by
 /// [`tests::known_keys_matches_the_parsed_schema`].
-const KNOWN_KEYS: &[&str] = &["document_root", "auto_prepend_file", "preview_auth"];
+const KNOWN_KEYS: &[&str] = &["document_root", "auto_prepend_file", "preview_auth", "security"];
 
 /// Shortest accepted preview-gate `session_secret`, in bytes.
 ///
@@ -226,6 +226,35 @@ struct RawOverride {
     auto_prepend_file: Option<String>,
     #[serde(default)]
     preview_auth: Option<RawPreviewAuth>,
+    #[serde(default)]
+    security: Option<RawSecurity>,
+    #[serde(flatten)]
+    unknown: toml::Table,
+}
+
+/// The `[security]` section: per-site **function capabilities** (experimental,
+/// opt-in). It lets the operator grant **this one** virtual host a function the
+/// multi-tenant hardening preset otherwise disables process-wide — the migration
+/// case of a legacy tenant that needs `mail()`/`fsockopen()` in a deployment
+/// where another tenant stays fully hardened.
+///
+/// Written by the operator/switchboard, never by the tenant: it lives in the
+/// operator-owned overrides directory (outside `sites_dir`), and a grant widens
+/// the shared-process attack surface, so it is trusted exactly as
+/// `[preview_auth]` is.
+///
+/// Only names in [`ephpm_config::GRANTABLE_CAPABILITIES`] are accepted. An
+/// unknown capability name is **rejected** — fail-closed — rather than tolerated
+/// the way an unknown top-level *key* is: see [`parse_capabilities`] for why this
+/// one value is strict while the surrounding file stays lenient.
+#[derive(serde::Deserialize)]
+struct RawSecurity {
+    /// Function names to grant this site, e.g. `["mail", "fsockopen"]`. Absent or
+    /// empty grants nothing — the documented default, identical to no section.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    /// Unknown keys inside the section — tolerated and surfaced with a
+    /// `security.` prefix, exactly as unknown `[preview_auth]` keys are.
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -435,7 +464,23 @@ pub(crate) fn load(
     if let Some(pa) = &raw.preview_auth {
         unknown_keys.extend(pa.unknown.keys().map(|k| format!("preview_auth.{k}")));
     }
+    if let Some(sec) = &raw.security {
+        unknown_keys.extend(sec.unknown.keys().map(|k| format!("security.{k}")));
+    }
     unknown_keys.sort_unstable();
+
+    // Validate `[security] capabilities` defensively. The authoritative grant is
+    // the startup scan ([`scan_capabilities`]), which hard-fails the whole server
+    // on an unknown capability name, so a server that started will never reach
+    // this with a bad name. But an override file can be rewritten at runtime (the
+    // router re-reads it every SITE_CONFIG_TTL), and a capability is a *widening*
+    // instruction, so an unknown name here fails the one site CLOSED (503) rather
+    // than serving it as if nothing was asked for.
+    if let Some(sec) = &raw.security
+        && let Err(detail) = parse_capabilities(sec)
+    {
+        return unusable("[security] capabilities names an unknown capability", &detail);
+    }
 
     let document_root = match raw.document_root.as_deref() {
         Some(declared) => match validate_declared_root(container, declared, site_key) {
@@ -572,6 +617,129 @@ fn resolve_preview_auth(
         config.insert("exempt_paths".into(), serde_json::Value::from(paths.clone()));
     }
     Ok((serde_json::Value::Object(config), repo))
+}
+
+/// Validate and canonicalize a `[security] capabilities` list.
+///
+/// Returns the granted set as canonical (lower-case) names drawn from
+/// [`ephpm_config::GRANTABLE_CAPABILITIES`], de-duplicated. An absent or empty
+/// list grants nothing (`Ok(empty)`). An **unknown capability name** is an
+/// `Err` carrying a detailed, operator-facing message naming the bad value and
+/// the accepted set.
+///
+/// # Why this value is strict while the file stays lenient
+///
+/// The override file tolerates unknown *keys* (a leading provisioning daemon
+/// must not take a fleet off its web roots with one deploy — see [`load`]). A
+/// capability *name* is the opposite case and is rejected:
+///
+/// * It is a security **widening**, not a forward-compat key, so a typo must
+///   never silently grant nothing (confusing) or — worse under a future rename —
+///   something unintended.
+/// * The feature is brand-new and opt-in, so there is no deployed writer whose
+///   newer vocabulary we must tolerate: there is no skew to absorb.
+/// * The accepted set is a short, curated allowlist the operator can see in the
+///   error, so "did you mean" is unnecessary and a wrong guess would be worse
+///   than the exact list.
+fn parse_capabilities(sec: &RawSecurity) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut granted = std::collections::BTreeSet::new();
+    let Some(list) = &sec.capabilities else {
+        return Ok(granted);
+    };
+    for raw_name in list {
+        match ephpm_config::normalize_capability(raw_name) {
+            Some(canonical) => {
+                granted.insert(canonical.to_string());
+            }
+            None => {
+                return Err(format!(
+                    "`{}` is not a grantable capability — accepted: {}",
+                    raw_name.trim(),
+                    ephpm_config::GRANTABLE_CAPABILITIES.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(granted)
+}
+
+/// Scan every `<site-key>.toml` in `overrides_dir` at startup and collect the
+/// per-site **function capability** grants, as `site key → canonical capability
+/// names`.
+///
+/// This is the **authoritative** source for the two startup decisions the
+/// per-request [`load`] path cannot make: which functions to leave out of the
+/// process-global `disable_functions` (because some site was granted them) and
+/// which site holds which capability (the frozen map the request-time gate
+/// consults). It runs once, before PHP initialization; the set it produces is
+/// immutable for the process lifetime, exactly like `disable_functions` itself.
+///
+/// Fail-closed and bounded:
+///
+/// * An **unknown capability name** in any readable, valid-TOML file is a hard
+///   `Err` — the caller fails startup, naming the file and the bad value. This
+///   is the one place the override mechanism is strict rather than lenient; see
+///   [`parse_capabilities`] for the justification.
+/// * A file that is unreadable, not valid TOML, or declares no `[security]`
+///   section contributes nothing and is **skipped** (not an error): a broken
+///   file already takes its own site out of service at request time via
+///   [`load`]'s `unusable`, and failing startup on it would let one bad tenant
+///   file stop every tenant — the outage the file-leniency rule exists to
+///   prevent.
+/// * A file whose stem is not a valid site key is skipped, matching [`load`]'s
+///   contract that such a file is never read.
+///
+/// Returns an empty map when `overrides_dir` does not exist or holds no grants —
+/// the no-op default that keeps `disable_functions` byte-identical to today.
+pub(crate) fn scan_capabilities(
+    overrides_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
+    let mut map = std::collections::BTreeMap::new();
+
+    let entries = match std::fs::read_dir(overrides_dir) {
+        Ok(entries) => entries,
+        // No directory (or unreadable) means no grants: the mechanism is simply
+        // inactive, exactly as if no file declared a capability.
+        Err(_) => return Ok(map),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(site_key) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // A file not named for a valid site key is never consulted (same rule as
+        // `load`), so its grants must not reach `disable_functions` either.
+        if !crate::router::is_valid_site_key(site_key) {
+            continue;
+        }
+
+        // A broken file is skipped here and 503s its own site at request time.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(raw) = toml::from_str::<RawOverride>(&text) else {
+            continue;
+        };
+        let Some(sec) = &raw.security else {
+            continue;
+        };
+
+        let granted = parse_capabilities(sec).map_err(|detail| {
+            format!(
+                "per-site override {} ([security] capabilities): {detail}",
+                path.display()
+            )
+        })?;
+        if !granted.is_empty() {
+            map.insert(site_key.to_string(), granted);
+        }
+    }
+
+    Ok(map)
 }
 
 /// Validate a `[preview_auth] repo` value as `owner/name`.
@@ -1491,10 +1659,12 @@ mod tests {
         // (a TOML table), so it takes table syntax; the scalar keys take a
         // string. Either way, nothing must fall into `unknown`.
         for key in KNOWN_KEYS {
-            let toml = if *key == "preview_auth" {
-                format!("[{key}]\nsession_secret = \"x\"\n")
-            } else {
-                format!("{key} = \"x\"\n")
+            let toml = match *key {
+                "preview_auth" => format!("[{key}]\nsession_secret = \"x\"\n"),
+                // A TOML table section with one recognized sub-key, so nothing
+                // lands in either the top-level or the section's `unknown` table.
+                "security" => format!("[{key}]\ncapabilities = []\n"),
+                _ => format!("{key} = \"x\"\n"),
             };
             let raw: RawOverride = toml::from_str(&toml).unwrap();
             assert!(
@@ -1727,5 +1897,96 @@ mod tests {
         assert_eq!(edit_distance("abc", ""), 3);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("sitting", "kitten"), 3);
+    }
+
+    // ── [security] capabilities ─────────────────────────────────────────
+
+    /// A valid grant is collected, canonicalized, and de-duplicated by the
+    /// startup scan, keyed on the site (file stem).
+    #[test]
+    fn scan_collects_valid_capability_grants() {
+        let f = fixture();
+        f.write("[security]\ncapabilities = [\"mail\", \"FSockOpen\", \"mail\"]\n");
+        let map = scan_capabilities(&f.overrides).unwrap();
+        let caps = map.get("app.test").expect("site has grants");
+        assert_eq!(
+            caps,
+            &["fsockopen".to_string(), "mail".to_string()].into_iter().collect(),
+            "names are canonicalized to lower-case and de-duplicated"
+        );
+    }
+
+    /// The strict rule: an unknown capability name hard-fails the scan (and so
+    /// the whole server start), naming the file.
+    #[test]
+    fn scan_rejects_an_unknown_capability_name() {
+        let f = fixture();
+        f.write("[security]\ncapabilities = [\"mail\", \"exec\"]\n");
+        let err = scan_capabilities(&f.overrides).expect_err("unknown name must fail the scan");
+        assert!(err.contains("exec"), "the error names the bad value: {err}");
+        assert!(err.contains("app.test.toml"), "the error names the file: {err}");
+    }
+
+    /// The shell-exec family is never grantable — it is not in the allowlist.
+    #[test]
+    fn shell_exec_is_never_grantable() {
+        for bad in ["system", "shell_exec", "proc_open", "passthru", "popen", "pcntl_exec"] {
+            assert!(
+                ephpm_config::normalize_capability(bad).is_none(),
+                "{bad} must never be grantable"
+            );
+        }
+    }
+
+    /// No `[security]` section, an empty list, and a missing directory all mean
+    /// "no grants" — the no-op default.
+    #[test]
+    fn scan_without_grants_is_empty() {
+        let f = fixture();
+        assert!(scan_capabilities(&f.overrides).unwrap().is_empty(), "no files");
+
+        f.write("document_root = \"web\"\n");
+        assert!(scan_capabilities(&f.overrides).unwrap().is_empty(), "no [security] section");
+
+        f.write("[security]\ncapabilities = []\n");
+        assert!(scan_capabilities(&f.overrides).unwrap().is_empty(), "empty list grants nothing");
+
+        let missing = f.overrides.join("does-not-exist");
+        assert!(scan_capabilities(&missing).unwrap().is_empty(), "missing dir is inactive");
+    }
+
+    /// A broken file is skipped by the scan (its own site 503s at request time),
+    /// and a file not named for a valid site key is never consulted.
+    #[test]
+    fn scan_skips_broken_and_misnamed_files() {
+        let f = fixture();
+        // Invalid TOML: skipped, not a scan error.
+        std::fs::write(f.overrides.join("broken.test.toml"), "this is = = not toml").unwrap();
+        // Not a valid site key: never read.
+        std::fs::write(f.overrides.join("has a space.toml"), "[security]\ncapabilities=[\"mail\"]\n")
+            .unwrap();
+        assert!(scan_capabilities(&f.overrides).unwrap().is_empty());
+    }
+
+    /// An unknown capability name fails the one site closed on the per-request
+    /// path too (defensive — the file can change after startup).
+    #[test]
+    fn load_fails_closed_on_an_unknown_capability_name() {
+        let f = fixture();
+        f.write("document_root = \"web\"\n[security]\ncapabilities = [\"evil\"]\n");
+        let over = f.load();
+        assert!(over.unusable.is_some(), "an unknown capability name must fail the site closed");
+        assert_eq!(over.document_root, None, "a failed-closed site serves nothing");
+    }
+
+    /// A valid grant does not make the file unusable, and an unknown *sub-key*
+    /// under `[security]` is tolerated like any other unknown key.
+    #[test]
+    fn valid_capabilities_load_and_unknown_subkey_is_tolerated() {
+        let f = fixture();
+        f.write("[security]\ncapabilities = [\"mail\"]\nfuture_knob = true\n");
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(over.unknown_keys, vec!["security.future_knob".to_string()]);
     }
 }

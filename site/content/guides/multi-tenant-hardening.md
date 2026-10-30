@@ -78,6 +78,84 @@ and `disable_functions` are the reason a tenant cannot simply shell out or
 > The full per-function rationale (with the pen-test that justified each) lives
 > in [Virtual Hosts → the hardening preset](/guides/virtual-hosts/#multi-tenant-hardening-preset).
 
+#### Per-site capabilities — grant one tenant a hardened function (experimental)
+
+`disable_functions` is process-global and only acts at MINIT: `zend_disable_functions`
+**removes** each function from the internal function table, once, and under ZTS
+that table is shared across every worker thread. So the same preset applies to
+every tenant, and the only way to relax it used to be
+`multi_tenant_hardening = false` — which turns it off for *all* tenants at once.
+
+Per-site capabilities let the operator grant **one** virtual host a function the
+preset otherwise disables, without weakening any other tenant. The migration
+case it exists for: a legacy app (e.g. a mailing-list tool) that needs `mail()`
+and `fsockopen()` for SMTP, co-located with a fully-hardened tenant.
+
+Because the function cannot be both removed-at-MINIT and callable, a granted
+function is instead **left registered and gated per request**. ePHPm takes it
+out of the process-global `disable_functions`, swaps its internal handler for a
+gate, and on every call checks whether *this request's site* was granted it —
+calling the real builtin if so, or raising the identical "has been disabled for
+security reasons" warning if not.
+
+Grant it in the site's [operator override file](/reference/config/#site_overrides_dir)
+(`<site_overrides_dir>/<site-key>.toml`, the same operator-owned file that sets
+`document_root`):
+
+```toml
+# /var/lib/ephpm/site-overrides/sendy.example.toml
+document_root = "."
+[security]
+capabilities = ["mail", "fsockopen"]
+```
+
+Rules, all fail-closed:
+
+* **Curated allowlist only.** The grantable set is `mail`, `fsockopen`,
+  `pfsockopen` — nothing else. The shell-execution family and every
+  process/IPC/`dl`/OPcache function stays hard-off and can never be granted. An
+  **unknown capability name fails startup**, naming the file and value.
+* **A site with no grant is exactly as restricted as today.** The default is no
+  capabilities; an unmatched host (no site) gets none; the gate denies unless
+  the current request's site explicitly holds the capability.
+* **Zero change when unused.** If no site grants anything, the generated php.ini
+  and the function table are byte-identical to a build without the feature — no
+  function is un-disabled, no gate is installed.
+* **Grants are startup-fixed.** The set of gated functions is decided before PHP
+  starts (same as `disable_functions`), so changing a grant needs a restart.
+* **`pfsockopen` caveat.** A persistent socket lives in the shared per-thread
+  `EG(persistent_list)` keyed `host:port` (see §3). Granting `pfsockopen` to a
+  single site is safe because no other tenant can call it; granting it to **two**
+  sites lets them inherit each other's live sockets on a reused worker thread.
+  ePHPm warns at startup if more than one site holds it. Prefer `fsockopen`
+  (non-persistent) unless a persistent socket is genuinely required.
+
+Startup logs, at INFO, exactly which functions moved from global-disable to
+per-site gating and which site holds which capability; a grant that cannot take
+effect (a function this configuration does not disable anyway, or one the
+operator explicitly disabled in `[php] ini_overrides`) is logged at WARN rather
+than silently ignored.
+
+**Observable residual.** Because a gated function stays *registered* (only its
+handler is swapped), `function_exists('mail')` returns `true` for **every**
+tenant, not just the granted one — unlike a hard-disabled function, which is
+removed from the table and reports `false`. A non-granted tenant that calls it
+still gets the identical "disabled for security reasons" warning and a `null`
+return, so nothing becomes *callable*; only the existence probe differs. Code
+that branches on `function_exists()` to pick a transport should not rely on that
+difference.
+
+> **This is cooperative-tenant isolation at the ePHPm layer, not a kernel
+> boundary.** The gate is a handler check inside one shared process; a
+> memory-safety break in PHP or an extension, or any way to reach the original
+> handler directly, bypasses it. It does not add a sandbox. What it guarantees is
+> that granting one tenant a function never makes that function callable from
+> another tenant's request. As with every per-site override, the grant is only as
+> trustworthy as the operator-owned overrides directory: whoever can write that
+> directory chooses the grants. Capabilities are honoured in per-request mode
+> (the default); in worker mode the gate has no per-request site and fails
+> closed.
+
 ### 3. Persistent connections — off
 
 The preset sets `mysqli.allow_persistent = 0` (and `pgsql.allow_persistent = 0`,

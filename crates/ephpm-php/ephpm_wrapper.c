@@ -7657,6 +7657,155 @@ int ephpm_sqlite_memstatus_result(void)
     return g_sqlite_memstatus_rc;
 }
 
+/* ===== Per-site function capabilities — gate instead of global-disable =====
+ *
+ * `disable_functions` is process-global and only acts at MINIT:
+ * zend_disable_functions() REMOVES each named function from the internal
+ * function table, once, and under ZTS that table is shared across every worker
+ * thread (new threads copy GLOBAL_FUNCTION_TABLE's internal-function structs by
+ * pointer in compiler_globals_ctor). So a function cannot be disabled for one
+ * tenant and enabled for another via any per-thread mechanism.
+ *
+ * The workaround: for a function at least one virtual host was granted, the
+ * host leaves it OUT of `disable_functions` (so it stays registered) and hands
+ * its name to ephpm_set_capability_gates() before php_embed_init(). During
+ * module startup, ephpm_install_capability_gates() SWAPS that function's
+ * internal handler for ephpm_capability_gate below — once, on the struct that is
+ * now GLOBAL_FUNCTION_TABLE's (shared with every future thread). On each call
+ * the gate asks Rust whether THIS request's site holds the capability, then
+ * either calls the real builtin through the saved original handler or raises the
+ * exact warning a disabled function raises.
+ *
+ * This is cooperative-tenant isolation at the ePHPm layer, not a kernel
+ * boundary: it gates a shared-process handler. A function no site granted stays
+ * in `disable_functions` and is removed as before — untouched by any of this.
+ */
+#ifndef EPHPM_MAX_CAP_GATES
+#define EPHPM_MAX_CAP_GATES 16
+#endif
+
+/*
+ * Callback: does the current request's site hold capability `name`? Set by Rust
+ * before init via ephpm_set_capability_checker() (the same function-pointer
+ * convention as ephpm_set_log_sink), rather than linked by name, which matches
+ * every other C↔Rust seam here. Fail-closed: NULL (never set) denies, and the
+ * Rust side returns 0 on every uncertainty. Must never call into PHP or unwind,
+ * so no longjmp can cross it.
+ */
+static int (*g_cap_checker)(const char *name) = NULL;
+
+void ephpm_set_capability_checker(int (*checker)(const char *name))
+{
+    g_cap_checker = checker;
+}
+
+/* Gated function names, strdup'd by ephpm_set_capability_gates() before init. */
+static char *g_cap_gate_names[EPHPM_MAX_CAP_GATES];
+/* The real builtin handler for each gated name, saved at install time. NULL
+ * until installed, or if the function was not present to gate. */
+static zif_handler g_cap_gate_orig[EPHPM_MAX_CAP_GATES];
+static size_t g_cap_gate_count = 0;
+
+/*
+ * Record the functions to gate per site. Must be called BEFORE php_embed_init()
+ * (the handler swap runs inside module startup). Each name is copied. Returns 0
+ * on success, -1 if more than EPHPM_MAX_CAP_GATES names were supplied or a copy
+ * failed — fail-closed: a name that cannot be recorded is simply never gated, so
+ * it stays whatever the generated php.ini made it (the host only un-disables a
+ * function it also gates, so a dropped gate means the function stays callable
+ * ungated only if the host already removed it from disable_functions; the host
+ * logs the gate set it asked for, so a capacity overflow is visible there too).
+ */
+int ephpm_set_capability_gates(const char *const *names, size_t count)
+{
+    for (size_t i = 0; i < g_cap_gate_count; i++) {
+        free(g_cap_gate_names[i]);
+        g_cap_gate_names[i] = NULL;
+        g_cap_gate_orig[i] = NULL;
+    }
+    g_cap_gate_count = 0;
+
+    if (!names) {
+        return 0;
+    }
+    if (count > EPHPM_MAX_CAP_GATES) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!names[i]) {
+            continue;
+        }
+        char *dup = strdup(names[i]);
+        if (!dup) {
+            return -1;
+        }
+        g_cap_gate_names[g_cap_gate_count] = dup;
+        g_cap_gate_orig[g_cap_gate_count] = NULL;
+        g_cap_gate_count++;
+    }
+    return 0;
+}
+
+/*
+ * The shared gate handler installed over every granted builtin. Reads the
+ * called function's name, finds its saved original handler, and either calls
+ * through (site is granted) or raises the standard disabled-function warning.
+ * Identical denied-call behaviour to zend_disable_functions' display_disabled_function.
+ */
+static void ephpm_capability_gate(INTERNAL_FUNCTION_PARAMETERS)
+{
+    const char *fname = get_active_function_name();
+    zif_handler orig = NULL;
+
+    if (fname) {
+        for (size_t i = 0; i < g_cap_gate_count; i++) {
+            if (g_cap_gate_orig[i] && strcmp(g_cap_gate_names[i], fname) == 0) {
+                orig = g_cap_gate_orig[i];
+                break;
+            }
+        }
+    }
+
+    if (orig && fname && g_cap_checker && g_cap_checker(fname)) {
+        orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+        return;
+    }
+
+    /* Denied — or, defensively, a swap we cannot resolve: behave exactly like a
+     * function removed by disable_functions. */
+    zend_error(E_WARNING, "%s() has been disabled for security reasons",
+               fname ? fname : "?");
+}
+
+/*
+ * Swap the internal handler of each gated function for ephpm_capability_gate.
+ * Called from ephpm_module_startup AFTER php_module_startup() returns SUCCESS —
+ * the standard extension has registered mail/fsockopen/pfsockopen,
+ * zend_disable_functions has already removed the ungranted ones, and
+ * CG(function_table) is now GLOBAL_FUNCTION_TABLE, whose internal-function
+ * structs every future ZTS thread shares by pointer. So one swap here reaches
+ * every thread. A name that is absent (extension not built, or still in
+ * disable_functions) leaves g_cap_gate_orig[i] NULL and is simply not gated —
+ * calling a missing function is already a fatal.
+ */
+static void ephpm_install_capability_gates(void)
+{
+    for (size_t i = 0; i < g_cap_gate_count; i++) {
+        const char *name = g_cap_gate_names[i];
+        if (!name) {
+            continue;
+        }
+        zend_function *fn =
+            zend_hash_str_find_ptr(CG(function_table), name, strlen(name));
+        if (!fn || fn->type != ZEND_INTERNAL_FUNCTION) {
+            g_cap_gate_orig[i] = NULL;
+            continue;
+        }
+        g_cap_gate_orig[i] = fn->internal_function.handler;
+        fn->internal_function.handler = ephpm_capability_gate;
+    }
+}
+
 static int ephpm_module_startup(sapi_module_struct *sm)
 {
     /* Before php_module_startup(): no extension has touched SQLite yet. */
@@ -7724,6 +7873,14 @@ static int ephpm_module_startup(sapi_module_struct *sm)
      * pay nothing for the absence. */
     if (ret == SUCCESS) {
         (void)php_session_register_module(&ps_mod_ephpm);
+
+        /* Per-site capability gates. Here, not earlier or later: the standard
+         * extension has registered mail/fsockopen/pfsockopen and
+         * zend_disable_functions has removed the ungranted functions, while
+         * CG(function_table) is already GLOBAL_FUNCTION_TABLE (shared, by
+         * pointer, with every future ZTS thread). No-op when no site granted a
+         * capability — g_cap_gate_count is 0. */
+        ephpm_install_capability_gates();
     }
     return ret;
 }
