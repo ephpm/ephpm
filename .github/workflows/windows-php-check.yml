@@ -88,9 +88,10 @@ jobs:
       # ---- Toolchain provisioning ----------------------------------------
       # The three steps below are copied from release.yml's build-windows job
       # — keep them in sync with it. They stay separate, named steps on
-      # purpose: a red "Install ..." / "Enter ..." step is a runner or infra
-      # problem; only a red "cargo check" step is a real compile error in the
-      # change under test.
+      # purpose: a red "Install ...", "Enter ...", or "Verify ..." step is a
+      # runner or infra problem; only a red "cargo check" step is a real
+      # compile error in the change under test. (The "Verify ..." guard below
+      # is this gate job's own, not copied from release.yml — see its note.)
 
       - name: Install Rust toolchain
         shell: powershell
@@ -139,8 +140,46 @@ jobs:
           if (Test-Path "$libclangDir\libclang.dll") {
             "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
           } else {
-            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+            Write-Warning "libclang.dll not found at $libclangDir -- the Verify step below will fail the job"
           }
+
+      # ---- Fail fast if the toolchain is only half-present (#377) ----------
+      # The steps above can "succeed" on a runner that has MSBuild.exe (so the
+      # install script fast-paths) and vcvars64.bat (so the env step runs) yet
+      # is missing the VC compiler toolset or libclang -- a partially
+      # provisioned or drifted runner image. Without this guard that gap
+      # surfaces only deep inside `cargo check`, as a confusing cc/bindgen
+      # error that reads as a compile failure in the change under test rather
+      # than what it is: a runner that could not be provisioned (#377,
+      # suggested fix 3 -- "distinguish 'could not provision' from 'does not
+      # compile'"). This gate job's whole value is a trustworthy red/green
+      # signal, so it asserts the exact two tools the gate needs -- cl.exe
+      # (compiles ephpm_wrapper.c) and libclang (bindgen parses the SDK
+      # headers) -- and fails LOUD and fast as a provisioning error, naming
+      # what is missing, before the SDK download and the compile. The env the
+      # previous step wrote to $GITHUB_ENV (PATH, LIBCLANG_PATH) is in effect
+      # here because GITHUB_ENV applies to subsequent steps.
+      - name: Verify MSVC toolchain is usable
+        shell: powershell
+        run: |
+          $missing = @()
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          if ($cl) {
+            Write-Host "cl.exe: $($cl.Source)"
+          } else {
+            $missing += 'cl.exe (the MSVC C/C++ compiler; Microsoft.VisualStudio.Workload.VCTools is absent or not on PATH)'
+          }
+          if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            Write-Host "libclang.dll: $(Join-Path $env:LIBCLANG_PATH 'libclang.dll')"
+          } else {
+            $missing += "libclang.dll (needed by bindgen; LIBCLANG_PATH='$env:LIBCLANG_PATH'; Microsoft.VisualStudio.Component.VC.Llvm.Clang is absent)"
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error title=VS Build Tools provisioning failed::MSVC toolchain is only half-present on this runner; the PHP-linked check cannot compile. Missing: $($missing -join '; ')."
+            Write-Host 'This is a RUNNER PROVISIONING failure, not a compile error in the change under test (#377).'
+            exit 1
+          }
+          Write-Host 'MSVC toolchain verified: cl.exe and libclang.dll are both present.'
 
       # ---- PHP SDK ---------------------------------------------------------
       # Separate step for the same reason as the toolchain ones: a download
