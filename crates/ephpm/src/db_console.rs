@@ -18,7 +18,8 @@
 //!   (offline-only) drops the screen so engine operations like
 //!   `PRAGMA integrity_check` can run.
 //! * **Read-only** — `--read-only` refuses any statement whose leading keyword
-//!   is not a pure read.
+//!   is not a pure read, including a data-modifying CTE hidden behind a `WITH`
+//!   (`WITH … DELETE …`, or a Postgres `WITH t AS (DELETE … RETURNING …)`).
 //! * **Formatting** — result sets render as an aligned table, TSV, CSV, or a
 //!   JSON array of objects.
 //! * **KV** — the REPL's `/kv` and `/kv-put` reach the live KV over the same
@@ -569,9 +570,70 @@ fn routes_to_query(sql: &str) -> bool {
 fn write_keyword(sql: &str) -> Option<String> {
     let kw = leading_keyword(sql);
     match kw.as_str() {
-        "" | "SELECT" | "WITH" | "VALUES" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "DESC" => None,
+        "" | "SELECT" | "VALUES" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "DESC" => None,
+        // A CTE can wrap a data-modifying statement — `WITH x AS (...) DELETE ...`
+        // (SQLite) or a data-modifying CTE body `WITH t AS (DELETE ... RETURNING ...)`
+        // (Postgres). Classifying `WITH` as a pure read by its leading keyword alone
+        // would let those slip past `--read-only`, so `WITH` is read-only only when it
+        // carries no DML token.
+        "WITH" => dml_token(sql),
         _ => Some(kw),
     }
+}
+
+/// The first data-modifying keyword (`INSERT` / `UPDATE` / `DELETE`) appearing
+/// as a bare word token in `sql`, skipping the contents of string and
+/// backtick-quoted literals and `--` / `/* */` comments. Used to stop a
+/// data-modifying CTE from slipping past `--read-only` behind a `WITH`.
+/// `REPLACE` / `MERGE` are deliberately excluded: `replace()` is a common
+/// read-only scalar function, so matching the bare word would false-positive;
+/// `INSERT`/`UPDATE`/`DELETE` are not standard function names.
+fn dml_token(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == q {
+                        // A doubled quote is an escaped quote, not a close.
+                        if bytes.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = sql[start..i].to_ascii_uppercase();
+                if matches!(word.as_str(), "INSERT" | "UPDATE" | "DELETE") {
+                    return Some(word);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Whether `s` is a safe bare SQL identifier (`[A-Za-z0-9_]+`, non-empty) — the
@@ -1004,6 +1066,28 @@ mod tests {
         assert_eq!(write_keyword("drop table t").as_deref(), Some("DROP"));
         // PRAGMA is conservatively a write under --read-only.
         assert_eq!(write_keyword("PRAGMA integrity_check").as_deref(), Some("PRAGMA"));
+    }
+
+    #[test]
+    fn read_only_blocks_data_modifying_cte() {
+        // A plain read-only CTE is allowed.
+        assert_eq!(write_keyword("WITH x AS (SELECT 1) SELECT * FROM x"), None);
+        // SQLite-style: a DML after the CTE must be refused.
+        assert_eq!(write_keyword("WITH x AS (SELECT 1) DELETE FROM t").as_deref(), Some("DELETE"));
+        // Postgres-style data-modifying CTE body must be refused.
+        assert_eq!(
+            write_keyword("WITH t AS (DELETE FROM x RETURNING *) SELECT * FROM t").as_deref(),
+            Some("DELETE")
+        );
+        // replace() as a scalar function is NOT a DML false-positive.
+        assert_eq!(
+            write_keyword("WITH x AS (SELECT replace(a,'d','e') FROM t) SELECT * FROM x"),
+            None
+        );
+        // An identifier containing a DML word is not a false positive.
+        assert_eq!(write_keyword("WITH x AS (SELECT deleted_at FROM t) SELECT * FROM x"), None);
+        // A DML word hidden in a string literal is not flagged.
+        assert_eq!(write_keyword("WITH x AS (SELECT 'DELETE me' AS s) SELECT * FROM x"), None);
     }
 
     #[test]

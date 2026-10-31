@@ -329,7 +329,9 @@ fails loudly rather than writing a literal `${col}`.
 ### `--read-only` and `--maintenance`
 
 - **`--read-only`** refuses any statement whose leading keyword is not a pure
-  read (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`, `SHOW`, `DESCRIBE`). A write is
+  read (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`, `SHOW`, `DESCRIBE`). A `WITH` is
+  additionally inspected so a data-modifying CTE (`WITH … DELETE …`, or a
+  Postgres `WITH t AS (DELETE … RETURNING …)`) is still refused. A write is
   rejected before it reaches the engine:
 
   ```
