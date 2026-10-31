@@ -26,52 +26,15 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
-    # zstd 0.13.3 / zstd-safe 7.2.4. Fixed only in zstd 0.14.3 / zstd-safe
-    # 8.2.0, a breaking bump that no consumer in the graph accepts. Re-verified
-    # 2026-10-30 for the v0.13.4 patch: EVERY published chitchat (through the
-    # latest 0.13.0) requires `zstd ^0.13`, and so does every published
-    # mysql_common (through the latest 0.38.2, where it is optional but still
-    # ^0.13; reached here via mysql_async 0.34 and the opensrv-mysql fork). So
-    # no lockfile or semver bump can pull zstd 0.14 into this graph: it needs a
-    # chitchat release on zstd 0.14 (none exists; no ephpm/chitchat fork either)
-    # plus the mysql_common -> mysql_async -> opensrv-mysql-fork chain moved to
-    # one. Both are out-of-tree forks, not a clean dependency bump, so the
-    # ignores stay for v0.13.4. mysql_common calls zstd solely to decode binlog
-    # TRANSACTION_PAYLOAD events (src/binlog/events/transaction_payload_event.rs)
-    # -- a replication client path neither the opensrv server nor ePHPm's
-    # mysql_async client ever reaches (mysql_async's own `compression` option is
-    # zlib only), as in litewire's deny.toml. None of the three is reachable; see
-    # https://github.com/ephpm/ephpm/issues/648. Remove these entries when the
-    # graph reaches the fixed versions.
-    # - 0391: context reuse across streams in the `with_context` stream
-    #   constructors. Nothing here uses them: ephpm-kv calls
-    #   `encode_all`/`decode_all`, chitchat calls `bulk::compress_to_buffer` /
-    #   `bulk::decompress_to_buffer` (a fresh context per call), and
-    #   mysql_common's binlog decoder uses `Decoder::with_buffer`/`copy_decode`.
-    "RUSTSEC-2026-0391",
-    # - 0398: `Seekable::decompress`, behind zstd's `seekable` feature, which
-    #   nothing in the graph enables.
-    "RUSTSEC-2026-0398",
-    # - 0403: a corrupt legacy frame through `stream::write::Decoder` /
-    #   `DCtx::decompress_stream` into a `Vec`. The advisory exempts
-    #   `decode_all`, `stream::read::Decoder` and the bulk API, which are the
-    #   only decoders used here (and mysql_common's are binlog-only, above).
-    "RUSTSEC-2026-0403",
-    # tokio 1.53.1: `AsyncFd`'s safe constructors (`new`, `with_interest`,
-    # `try_new`, `try_with_interest`) accept any `AsRawFd`, including a raw fd
-    # the caller does not own. Fixed in 1.53.3, but vivacity pins
-    # `tokio = "=1.53.1"` (an exact `=` pin, in both `vivacity` and
-    # `vivacity-core`), so the resolver rejects `cargo update -p tokio
-    # --precise 1.53.3`. Re-verified 2026-10-30 for the v0.13.4 patch: every
-    # published vivacity still carries that pin -- 0.23.0, 0.24.0 and the latest
-    # 0.25.0 (2026-10-28). Clearing it needs a vivacity release that relaxes the
-    # pin (none exists), or an out-of-tree fork of the vivacity crates -- not a
-    # clean dependency bump -- so the ignore stays for v0.13.4. Nothing in the
-    # graph calls those constructors anyway: no ePHPm crate uses `AsyncFd`,
-    # tokio itself does not, and the only dependency that does (aya's
-    # `AsyncPerfEventArray`) sits behind aya's `async_tokio` feature, which is
-    # off. #648; remove when vivacity relaxes its =1.53.1 tokio pin.
-    "RUSTSEC-2026-0386",
+    # RESOLVED (do not re-add): RUSTSEC-2026-0391 (zstd), RUSTSEC-2026-0398 and
+    # RUSTSEC-2026-0403 (zstd-safe) are fixed by zstd 0.14.3 / zstd-safe 8.2.0,
+    # now in the graph: the workspace `zstd = "0.14"` bump plus org forks of
+    # chitchat and rust_mysql_common that move their `zstd` dependency to 0.14
+    # (see [patch.crates-io] and allow-git below). #648.
+    # RESOLVED (do not re-add): RUSTSEC-2026-0386 (tokio AsyncFd unsound safe
+    # constructors) is fixed at tokio 1.53.3, now resolvable because the ephpm
+    # fork of vivacity relaxes its exact `tokio = "=1.53.1"` pin (see
+    # [patch.crates-io] below). #648.
     # RESOLVED (do not re-add): RUSTSEC-2026-0410 (zstd-sys wasm32 allocator
     # shim) is fixed by zstd-sys 2.1.2, which zstd-safe 7 accepts.
     # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
@@ -141,6 +104,17 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/ephpm/litewire.git",
+    # ePHPm fork of vivacity (the `ephpm composer` installer) with the exact
+    # `tokio = "=1.53.1"` workspace pin relaxed to ">=1.53.3, <1.54" so the
+    # RUSTSEC-2026-0386 fix can enter the graph; see [patch.crates-io] in
+    # Cargo.toml. Remove when upstream relaxes the pin.
+    "https://github.com/ephpm/vivacity.git",
+    # ePHPm forks of chitchat and rust_mysql_common with only their `zstd`
+    # dependency bumped 0.13 -> 0.14 so the whole graph can reach the
+    # RUSTSEC-2026-0391/0398/0403 fix (zstd 0.14.3 / zstd-safe 8.2.0); see
+    # [patch.crates-io] in Cargo.toml. Remove when both release on zstd 0.14.
+    "https://github.com/ephpm/chitchat.git",
+    "https://github.com/ephpm/rust_mysql_common.git",
     # ePHPm fork of opensrv-mysql 0.7.0 (RUSTSEC-2026-0285 fix; see
     # [patch.crates-io] in Cargo.toml). Remove when it returns to a crates.io source.
     "https://github.com/ephpm/opensrv-mysql.git",
