@@ -341,13 +341,17 @@ impl GossipWriter {
 
     /// Drain **every** queued op and retirement into `chitchat` now, in one
     /// call, under the chitchat lock (reacquired per batch so a huge queue does
-    /// not hold the lock in one stretch). Used at graceful drain
-    /// ([`crate::ClusterHandle::mark_draining`]): the drain task is aborted
-    /// moments later by `ClusterHandle::shutdown`, so without this the last up
-    /// to [`DRAIN_IDLE`] of queued small-tier KV writes never reach gossip
-    /// state and are lost on restart (#656). A concurrent `enqueue` after this
-    /// starts is not waited for — the caller has announced the leave, so no new
-    /// local writes are expected; this flushes what is already queued.
+    /// not hold the lock in one stretch). Used at graceful drain — in **all**
+    /// clustered modes — via [`crate::ClusterHandle::flush_gossip_writer`]
+    /// (called by [`crate::ClusterHandle::mark_draining`] on the per-site
+    /// clustered leave, directly by the server on a whole-database or KV-only
+    /// clustered drain, and by [`crate::ClusterHandle::shutdown`] before the
+    /// drain task is aborted): without it the last up to [`DRAIN_IDLE`] of
+    /// queued small-tier KV writes never reach gossip state and are lost on
+    /// restart (#656). A concurrent `enqueue` after this starts is not waited
+    /// for — the caller is shutting down, so no new local writes are expected;
+    /// this flushes what is already queued, which is why calling it more than
+    /// once over one shutdown is a harmless no-op the second time.
     pub(crate) async fn flush(&self, chitchat: &Arc<tokio::sync::Mutex<Chitchat>>, self_id: &str) {
         loop {
             let (ops, retires) = self.take_batch();
