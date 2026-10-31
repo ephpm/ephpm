@@ -718,7 +718,7 @@ turso = { version = "=0.8.3", default-features = false }
 # (unchanged by this bump, and not compiled for the host target). vivacity-core
 # 0.25.0 still pins `zip =2.4.2` (identical features, pure-Rust backends) and
 # `tokio =1.53.1`; see the RUSTSEC ignores in deny.toml.
-vivacity = { version = "=0.25.0", default-features = false, features = ["rustls-tls-no-provider"] }
+vivacity = { version = "=0.26.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
