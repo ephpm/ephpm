@@ -46,6 +46,10 @@ clap.workspace = true
 ephpm-analyze = { workspace = true, features = ["php"] }
 ephpm-config.workspace = true
 ephpm-db.workspace = true
+# Dump-file sanitizer + compatibility reporter backing `ephpm db import`
+# (src/db_import.rs). Pure Rust, no PHP, no network — the binary builds a
+# `StatementSink` over the bound litewire backend and drives it.
+ephpm-dbimport.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
 ephpm-server.workspace = true

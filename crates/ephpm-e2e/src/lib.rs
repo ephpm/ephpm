@@ -199,6 +199,165 @@ impl Drop for SingleNodeFixture {
     }
 }
 
+/// A self-managed, multi-tenant **per-site** node for exercising
+/// `ephpm db import` end to end.
+///
+/// `ephpm db import --site` requires per-site mode (`[server] sites_dir` +
+/// `[db.sqlite] dir`), which [`SingleNodeFixture`]'s single-database template
+/// does not provide — hence a dedicated fixture rather than an `extra_toml`
+/// tweak. It is built in two phases so the import can run **offline**
+/// (direct-open, the preferred transport) before any server exists:
+///
+/// 1. [`prepare`](Self::prepare) lays down an isolated scratch tree — one
+///    vhost directory holding the supplied `index.php`, a per-site database
+///    directory, and a config — and reserves the HTTP/MySQL ports, but starts
+///    nothing.
+/// 2. [`import`](Self::import) runs `ephpm db import` as a subprocess against
+///    that config while no server holds the file open.
+/// 3. [`serve`](Self::serve) starts the node so the imported rows can be read
+///    back over HTTP.
+///
+/// Everything lives under a per-fixture [`TempDir`] and dies with it: no shared
+/// node, no interaction with sibling suites (#288/#295).
+pub struct DbImportFixture {
+    child: Option<Child>,
+    base_url: String,
+    http_port: u16,
+    binary: PathBuf,
+    config_path: PathBuf,
+    site: String,
+    lease: Option<PortLease>,
+    _tempdir: TempDir,
+}
+
+impl DbImportFixture {
+    /// Lay down the scratch tree and config for site `site`, writing
+    /// `vhost_index_php` as that vhost's `index.php`. Reserves ports but does
+    /// not start the server (the import runs offline first).
+    ///
+    /// # Errors
+    ///
+    /// Fails if ports cannot be reserved or the scratch files cannot be
+    /// written.
+    pub fn prepare(ephpm_binary: &Path, site: &str, vhost_index_php: &str) -> Result<Self> {
+        let mut reserver = PortReserver::new();
+        let lease = reserver.lease(&[PortKind::Tcp, PortKind::Tcp])?;
+        let (http_port, mysql_port) = (lease.port(0), lease.port(1));
+
+        let tmp = tempfile::Builder::new()
+            .prefix("ephpm-e2e-dbimport-")
+            .tempdir()
+            .context("create tempdir")?;
+        let sites_dir = tmp.path().join("sites");
+        let vhost = sites_dir.join(site);
+        fs::create_dir_all(&vhost).context("create vhost dir")?;
+        fs::write(vhost.join("index.php"), vhost_index_php).context("write vhost index.php")?;
+        let db_dir = tmp.path().join("db");
+        fs::create_dir_all(&db_dir).context("create db dir")?;
+
+        let config = DB_IMPORT_TEMPLATE
+            .replace("{HTTP_PORT}", &http_port.to_string())
+            .replace("{MYSQL_PORT}", &mysql_port.to_string())
+            .replace("{SITES_DIR}", &escape_toml(&sites_dir))
+            .replace("{DB_DIR}", &escape_toml(&db_dir))
+            .replace("{SITE}", site)
+            .replace("{METRICS_TOKEN}", E2E_METRICS_TOKEN);
+        let config_path = tmp.path().join("ephpm.toml");
+        fs::write(&config_path, config).context("write config")?;
+
+        Ok(Self {
+            child: None,
+            base_url: String::new(),
+            http_port,
+            binary: ephpm_binary.to_path_buf(),
+            config_path,
+            site: site.to_string(),
+            lease: Some(lease),
+            _tempdir: tmp,
+        })
+    }
+
+    /// The generated config file path.
+    #[must_use]
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// The site key this fixture serves.
+    #[must_use]
+    pub fn site(&self) -> &str {
+        &self.site
+    }
+
+    /// The fixture's scratch directory.
+    #[must_use]
+    pub fn scratch_dir(&self) -> &Path {
+        self._tempdir.path()
+    }
+
+    /// Run `ephpm db import <dump> --site <site> --config <cfg> <extra_args>`
+    /// as a subprocess and return its captured output. The server must not be
+    /// running (offline direct-open) — the state right after
+    /// [`prepare`](Self::prepare).
+    ///
+    /// Releasing the port reservation first is load-bearing: `db import`
+    /// decides between the offline direct-open and the live-server wire path by
+    /// TCP-probing the configured `mysql_listen` port, and the reservation holds
+    /// a *listener* on it that accepts the probe. Left held, the import would
+    /// pick the wire path and block forever on a MySQL handshake the reservation
+    /// socket never answers. The import binds nothing itself, so dropping the
+    /// reservation here (rather than in [`serve`](Self::serve)) costs nothing and
+    /// makes "the server is down" actually true for the probe.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the subprocess cannot be spawned.
+    pub fn import(&mut self, dump: &Path, extra_args: &[&str]) -> Result<std::process::Output> {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        Command::new(&self.binary)
+            .args(["db", "import"])
+            .arg(dump)
+            .args(["--site", &self.site, "--config"])
+            .arg(&self.config_path)
+            .args(extra_args)
+            .output()
+            .with_context(|| format!("running `ephpm db import` ({})", self.binary.display()))
+    }
+
+    /// Start the node serving the imported site and wait for health.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the child cannot be spawned or never reports healthy.
+    pub async fn serve(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        let child =
+            spawn_serve(&self.binary, &self.config_path, self._tempdir.path(), self.http_port)
+                .await?;
+        self.child = Some(child);
+        self.base_url = format!("http://127.0.0.1:{}", self.http_port);
+        Ok(())
+    }
+
+    /// Base URL (`http://127.0.0.1:<port>`); empty until [`serve`](Self::serve).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for DbImportFixture {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            terminate(child);
+        }
+    }
+}
+
 /// A single ephpm process whose database is a **`[db.mysql]` proxy** pointed at
 /// a real MySQL/MariaDB backend.
 ///
@@ -875,6 +1034,43 @@ memory_limit = "128M"
 [db.mysql]
 url = "{BACKEND_URL}"
 listen = "127.0.0.1:{PROXY_PORT}"
+"#;
+
+/// Config for [`DbImportFixture`] — a per-site (`sites_dir` + `[db.sqlite]
+/// dir`) node, the mode `ephpm db import --site` requires. Placeholders:
+/// `{HTTP_PORT}`, `{MYSQL_PORT}`, `{SITES_DIR}`, `{DB_DIR}`, `{SITE}` (the one
+/// vhost key), `{METRICS_TOKEN}`. `[kv] secret` is fixed so the per-site MySQL
+/// password is stable (unused by the offline import, which direct-opens, but
+/// required for a valid per-site config).
+const DB_IMPORT_TEMPLATE: &str = r#"# Auto-generated by ephpm-e2e DbImportFixture — do not edit.
+[server]
+listen = "127.0.0.1:{HTTP_PORT}"
+document_root = "{SITES_DIR}"
+sites_dir = "{SITES_DIR}"
+index_files = ["index.php", "index.html"]
+
+[server.request]
+trusted_hosts = ["localhost", "127.0.0.1", "127.0.0.1:{HTTP_PORT}", "{SITE}"]
+
+[server.metrics]
+enabled = true
+token = "{METRICS_TOKEN}"
+
+[server.diagnostics]
+token = "{METRICS_TOKEN}"
+
+[php]
+max_execution_time = 30
+memory_limit = "128M"
+
+[kv]
+secret = "e2e-db-import-secret-not-for-prod"
+
+[db.sqlite]
+dir = "{DB_DIR}"
+
+[db.sqlite.proxy]
+mysql_listen = "127.0.0.1:{MYSQL_PORT}"
 "#;
 
 const CLUSTER_NODE_TEMPLATE: &str = r#"# Auto-generated by ephpm-e2e ClusterFixture — do not edit.

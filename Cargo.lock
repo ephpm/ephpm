@@ -1479,6 +1479,7 @@ dependencies = [
  "ephpm-analyze",
  "ephpm-config",
  "ephpm-db",
+ "ephpm-dbimport",
  "ephpm-kv",
  "ephpm-php",
  "ephpm-server",
@@ -1586,6 +1587,15 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+]
+
+[[package]]
+name = "ephpm-dbimport"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
