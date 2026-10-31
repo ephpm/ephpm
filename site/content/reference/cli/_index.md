@@ -299,6 +299,36 @@ The command goes after `--`. `ephpm exec --help` does not print help, because th
 
 ---
 
+## `ephpm db import`
+
+Import a `mysqldump` / `pg_dump` SQL file into a virtual host's embedded (Turso) database. Opens the dump (a path, `-` for stdin, or a `.gz`), resolves the target the same way [`ephpm php --site`](php/#binding-a-virtual-hosts-database-site) does (offline direct-open preferred; forwarded over a running server's MySQL listener when one answers; per-site clustered with no server refused), sanitizes each statement for SQLite/Turso, and prints a **compatibility report** of everything that was downgraded, dropped, or is unsupported. See the [full `db import` reference](db/) and the [import guide](/guides/importing-a-sql-dump/).
+
+```bash
+# Offline (no server) — loads blog.db directly, then reports
+ephpm db import blog.sql --site blog --config /etc/ephpm/ephpm.toml
+
+# Preview only — parse, sanitize, report; execute nothing
+ephpm db import blog.sql --site blog --config ephpm.toml --dry-run
+
+# A gzipped pg_dump from stdin, skipping unsupported constructs
+gunzip -c dump.sql.gz | ephpm db import - --site shop --config ephpm.toml --dialect pg --on-error skip
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
+| `-c`, `--config <FILE>` | (required) | Config with `[server] sites_dir`, `[db.sqlite]`, `[kv] secret` |
+| `--dialect <auto\|mysql\|pg>` | `auto` | Dump dialect; `auto` sniffs the header |
+| `--gzip` | off | Force gzip decompression regardless of extension |
+| `--on-error <stop\|skip>` | `stop` | Stop at (or skip past) an unsupported construct / SQL error |
+| `--dry-run` | off | Parse + sanitize + report only; no execution, no backend |
+| `--batch-size <N>` | `1000` | Statements per transaction |
+| `--report <FILE>` | — | Also write the compatibility report as JSON |
+| `--defer-indexes` | off | Hold `CREATE INDEX` statements and replay them after the data |
+| `--verbose` | off | Also list dropped safe-no-op findings |
+
+---
+
 ## Service Lifecycle
 
 Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows. Every lifecycle command except `status` and `logs` needs root (`sudo`) or an Administrator shell. Without it, it exits `1` with `requires root privileges`.

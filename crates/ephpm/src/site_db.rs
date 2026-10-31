@@ -83,7 +83,7 @@ pub enum Strategy {
 /// Fails closed when the site key is invalid, the config is not multi-tenant
 /// per-site, the wire path is needed but `[kv] secret` is unset, per-site
 /// clustered mode is offline, or `[db.sqlite] dir` is missing for a direct-open.
-fn choose_strategy(
+pub(crate) fn choose_strategy(
     config: &Config,
     site_key: &str,
     reachable: Option<SocketAddr>,
@@ -281,7 +281,7 @@ fn open_direct(
 
 /// Probe the server's MySQL listener. Returns the resolved address when a TCP
 /// connection is accepted within [`REACHABILITY_TIMEOUT`], else `None`.
-fn server_reachable(listen: &str) -> Option<SocketAddr> {
+pub(crate) fn server_reachable(listen: &str) -> Option<SocketAddr> {
     let addr = listen.to_socket_addrs().ok()?.next()?;
     match TcpStream::connect_timeout(&addr, REACHABILITY_TIMEOUT) {
         Ok(stream) => {

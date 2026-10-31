@@ -317,12 +317,19 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// no shared node could survive. Its `[kv.snapshot]` config lives in the
 /// suite's own template (`SingleNodeFixture::start_with`), per #288/#295.
 ///
+/// `db_import` is here because it is a two-phase process-lifecycle test: it
+/// runs `ephpm db import` offline (direct-open, server down) into a per-site
+/// `[db.sqlite]` database, then starts a node serving that site to read the
+/// imported rows back over HTTP. The import must own the database file while
+/// no server holds it, so it cannot share any node; its per-site config lives
+/// in the suite's own template (`DbImportFixture`), per #288/#295.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
 /// fixtures, and a suite that gets it starts spawning real processes.
 const SELF_MANAGED_SUITES: &[&str] =
-    &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy", "kv_snapshot_restart"];
+    &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy", "kv_snapshot_restart", "db_import"];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///

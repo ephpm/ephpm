@@ -1,0 +1,22 @@
+[package]
+name = "ephpm-dbimport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dump-file sanitizer and compatibility reporter for `ephpm db import`"
+
+[dependencies]
+# Domain errors for the sanitizer/sink boundary. `anyhow` is deliberately NOT a
+# dependency: this crate is a pure library with a single outbound edge
+# (`StatementSink`), so every error it produces is a typed domain error the
+# caller adds context to.
+thiserror.workspace = true
+# The compatibility report serializes to JSON (`CompatReport::to_json`, the
+# `--report <path>` output). serde_json is already resolved workspace-wide.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

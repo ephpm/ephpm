@@ -38,6 +38,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod db_import;
 mod dev_xdebug;
 mod exec_sandbox;
 mod ext_ini;
@@ -268,6 +269,12 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Database tooling (currently: import a SQL dump into a site)
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
+
     /// Inspect or manipulate the KV store on a running server
     Kv {
         /// KV server host
@@ -412,6 +419,87 @@ enum Commands {
     },
 }
 
+/// Dialect selector for `ephpm db import`.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum DialectOpt {
+    /// Detect from the dump header (fail if ambiguous).
+    Auto,
+    /// Force MySQL (`mysqldump`).
+    Mysql,
+    /// Force PostgreSQL (`pg_dump`).
+    Pg,
+}
+
+/// Error policy for `ephpm db import`.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum OnErrorOpt {
+    /// Stop at the first unsupported construct or execution error.
+    Stop,
+    /// Record the failure and keep going.
+    Skip,
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    /// Import a `mysqldump` / `pg_dump` SQL file into a virtual host's
+    /// embedded (Turso) database.
+    ///
+    /// Opens the dump (path, `-` for stdin, or a `.gz`), resolves the target
+    /// the same way `ephpm php --site` does (offline direct-open preferred;
+    /// forwarded over a running server's MySQL listener when one answers;
+    /// per-site clustered with no server refused), sanitizes each statement
+    /// for SQLite/Turso, and prints a compatibility report of everything that
+    /// was downgraded, dropped, or is unsupported.
+    Import {
+        /// The dump file, or `-` to read from stdin.
+        dump: String,
+
+        /// The virtual host key (vhost directory name under `[server]
+        /// sites_dir`) whose database to load. Validated fail-closed.
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file (supplies `[server] sites_dir`,
+        /// `[db.sqlite]`, and `[kv] secret`).
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// Dump dialect (default: auto-detect from the header).
+        #[arg(long, value_enum, default_value = "auto")]
+        dialect: DialectOpt,
+
+        /// Force gzip decompression regardless of the file extension.
+        #[arg(long)]
+        gzip: bool,
+
+        /// What to do on an unsupported construct or execution error.
+        #[arg(long, value_enum, default_value = "stop")]
+        on_error: OnErrorOpt,
+
+        /// Parse, sanitize, and report only — execute nothing and bind no
+        /// backend.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Statements per transaction.
+        #[arg(long, default_value_t = 1000usize)]
+        batch_size: usize,
+
+        /// Write the compatibility report as JSON to this path.
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Hold `CREATE INDEX` statements and replay them after the data has
+        /// loaded (often faster for large tables).
+        #[arg(long)]
+        defer_indexes: bool,
+
+        /// Also list dropped safe-no-op findings (otherwise only counted).
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum CacheSubcommand {
     /// Invalidate the OPcache for one vhost, or every vhost via `--all`.
@@ -546,6 +634,45 @@ fn run() -> anyhow::Result<ExitCode> {
         Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
             ensure_cli_tracing();
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
+        }
+        Some(Commands::Db {
+            command:
+                DbCommand::Import {
+                    dump,
+                    site,
+                    config,
+                    dialect,
+                    gzip,
+                    on_error,
+                    dry_run,
+                    batch_size,
+                    report,
+                    defer_indexes,
+                    verbose,
+                },
+        }) => {
+            ensure_cli_tracing();
+            let req = db_import::ImportRequest {
+                dump,
+                site,
+                config,
+                dialect: match dialect {
+                    DialectOpt::Auto => db_import::DialectArg::Auto,
+                    DialectOpt::Mysql => db_import::DialectArg::MySql,
+                    DialectOpt::Pg => db_import::DialectArg::Pg,
+                },
+                gzip,
+                on_error: match on_error {
+                    OnErrorOpt::Stop => db_import::OnErrorArg::Stop,
+                    OnErrorOpt::Skip => db_import::OnErrorArg::Skip,
+                },
+                dry_run,
+                batch_size,
+                report,
+                defer_indexes,
+                verbose,
+            };
+            db_import::run(&req)
         }
         // Snapshot operations are blocking (file I/O, a blocking HTTP
         // client) and must run outside the tokio runtime the RESP commands

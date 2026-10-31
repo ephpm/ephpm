@@ -149,6 +149,7 @@ COPY crates/ephpm-analyze/Cargo.toml      crates/ephpm-analyze/Cargo.toml
 COPY crates/ephpm-cluster/Cargo.toml      crates/ephpm-cluster/Cargo.toml
 COPY crates/ephpm-config/Cargo.toml       crates/ephpm-config/Cargo.toml
 COPY crates/ephpm-db/Cargo.toml           crates/ephpm-db/Cargo.toml
+COPY crates/ephpm-dbimport/Cargo.toml     crates/ephpm-dbimport/Cargo.toml
 COPY crates/ephpm-kv/Cargo.toml           crates/ephpm-kv/Cargo.toml
 COPY crates/ephpm-middleware/Cargo.toml   crates/ephpm-middleware/Cargo.toml
 COPY crates/ephpm-middleware-builtins/Cargo.toml crates/ephpm-middleware-builtins/Cargo.toml
@@ -175,6 +176,7 @@ RUN mkdir -p \
         crates/ephpm-cluster/src \
         crates/ephpm-config/src \
         crates/ephpm-db/src \
+        crates/ephpm-dbimport/src \
         crates/ephpm-kv/src \
         crates/ephpm-middleware/src \
         crates/ephpm-middleware-builtins/src \
@@ -190,7 +192,7 @@ RUN mkdir -p \
         examples/rust-middleware/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-analyze ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-middleware-session-cookie ephpm-php ephpm-query-stats ephpm-server ephpm-ws; do \
+    for d in ephpm-analyze ephpm-cluster ephpm-config ephpm-db ephpm-dbimport ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-middleware-session-cookie ephpm-php ephpm-query-stats ephpm-server ephpm-ws; do \
         touch crates/$d/src/lib.rs; \
     done && \
     # examples/rust-middleware declares an explicit [lib] (name = "api_gate");
