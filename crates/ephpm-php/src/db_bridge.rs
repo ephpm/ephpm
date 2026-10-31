@@ -3647,25 +3647,27 @@ mod per_site_tests {
         reset_staged();
     }
 
-    /// The boundary of the has-rowset signal (#263), pinned against the
+    /// CTEs and `INSERT ... RETURNING` are rowset-producing statements, and
+    /// the has-rowset signal (#263) reports them as such — pinned against the
     /// **production** (file-backed Turso) backend.
     ///
     /// `had_rowset` is authoritative for every statement litewire *runs*,
-    /// because it reads the executed `SessionResult`. It cannot rescue a
-    /// statement litewire never runs correctly: `Session::query` picks
-    /// `BackendConn::query` vs `BackendConn::execute` from
-    /// `litewire_translate::classify()`, which is itself a first-keyword
-    /// match (`litewire-translate/src/lib.rs`). `WITH` falls through to
-    /// `StatementKind::Other` and `INSERT ... RETURNING` matches `INSERT`, so
-    /// both are sent to `execute()` and the engine rejects them.
+    /// because it reads the executed `SessionResult`. That depends on
+    /// `Session::query` picking `BackendConn::query` (not `execute()`) for
+    /// these shapes, via `litewire_translate::classify()`. This used to be a
+    /// first-keyword match that sent `WITH ...` (classified `Other`) and
+    /// `INSERT ... RETURNING` (matched as a plain `INSERT`) to `execute()`,
+    /// where the engine rejected them — and an `INSERT ... RETURNING` still
+    /// *wrote its row* before tripping over the returned row `execute()` had
+    /// nowhere to put, so a caller that retried on the error double-inserted.
     ///
-    /// They **error** rather than silently returning nothing, which is the
-    /// tolerable failure mode — and they fail identically on the wire path,
-    /// so this is not a bridge regression. Fixing it means teaching
-    /// litewire's `classify()` about CTEs and `RETURNING`; this test will
-    /// start failing the moment that lands, which is the intent.
+    /// litewire #38/#67 fixed both: `WITH ... SELECT` and `INSERT ...
+    /// RETURNING` route to the query path, so they return their rows and the
+    /// `RETURNING` insert runs exactly once. This test is the ePHPm-level
+    /// regression guard for that contract — that these shapes classify as
+    /// rowsets through the bridge, and that `RETURNING` does not double-apply.
     #[test]
-    fn litewire_classification_bounds_the_has_rowset_signal() {
+    fn litewire_classifies_cte_and_returning_as_rowsets() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge = single_turso_bridge(&dir.path().join("classify.db"));
 
@@ -3676,34 +3678,35 @@ mod per_site_tests {
         assert_eq!(run(&bridge, "INSERT INTO cls (n) VALUES ('a')"), RunStatus::Ok);
         assert!(!had_rowset());
 
-        for sql in [
-            "WITH r AS (SELECT id FROM cls) SELECT id FROM r",
-            "INSERT INTO cls (n) VALUES ('b') RETURNING id",
-        ] {
-            assert_eq!(
-                run(&bridge, sql),
-                RunStatus::Err,
-                "{sql} is expected to fail until litewire's classify() handles it"
-            );
-            // A SQL-range code, not a reserved one: from the adapter's point
-            // of view this is "the statement failed", not "the bridge is
-            // broken" — which is the correct classification (#259).
-            let code = error_code();
-            assert!(!(2000..3000).contains(&code), "{sql} reported reserved code {code}");
-        }
+        // A read-only CTE is a query: it returns rows, and the has-rowset
+        // signal reflects the executed result, not the SQL's first keyword.
+        assert_eq!(
+            run(&bridge, "WITH r AS (SELECT id FROM cls) SELECT id FROM r"),
+            RunStatus::Rows,
+            "a read-only CTE must classify as a query"
+        );
+        assert!(had_rowset());
+        assert_eq!(row_count(), 1, "the CTE sees the one existing row");
 
-        // A plain SELECT over the same table still works, so the failure is
-        // the classifier, not the data.
+        // `INSERT ... RETURNING` returns the inserted row (its `id`), so it is
+        // a rowset too — not an OK with no result set.
+        assert_eq!(
+            run(&bridge, "INSERT INTO cls (n) VALUES ('b') RETURNING id"),
+            RunStatus::Rows,
+            "INSERT ... RETURNING must return its row"
+        );
+        assert!(had_rowset());
+        assert_eq!(row_count(), 1, "RETURNING yields exactly the one inserted row");
+
+        // A plain SELECT over the same table still works.
         assert_eq!(run(&bridge, "SELECT id FROM cls"), RunStatus::Rows);
         assert!(had_rowset());
-        // BOTH rows are present: the `INSERT ... RETURNING` above reported an
-        // error to the caller and *still wrote its row*. The engine performs
-        // the insert and only then trips over the returned row that
-        // `execute()` has nowhere to put. Pinned deliberately — a caller that
-        // retries on that error double-inserts, which is the sharpest edge of
-        // this limitation and the reason it is documented rather than merely
-        // known.
-        assert_eq!(row_count(), 2, "INSERT ... RETURNING errors but is NOT rolled back");
+        // Exactly two rows total — 'a' plus the single 'b'. The old bug left
+        // the engine having written 'b' while the statement errored; the fix
+        // runs the insert once, on the query path, with no double-apply.
+        assert_eq!(row_count(), 2, "'a' plus exactly one 'b'");
+        assert_eq!(run(&bridge, "SELECT n FROM cls WHERE n = 'b'"), RunStatus::Rows);
+        assert_eq!(row_count(), 1, "INSERT ... RETURNING inserted 'b' exactly once");
         reset_staged();
     }
 

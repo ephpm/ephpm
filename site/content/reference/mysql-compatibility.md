@@ -30,7 +30,8 @@ relies on the lock disappearing if the worker dies mid-send.
 | `RELEASE_LOCK(name)` | `1` released one acquisition, `0` held by another session (nothing released), `NULL` nobody holds it | yes |
 | `RELEASE_ALL_LOCKS()` | the number of acquisitions released (a name held three times counts three) | yes |
 | `IS_FREE_LOCK(name)` | `1` / `0` | yes |
-| `IS_USED_LOCK(name)` | the holder's session id, or `NULL` | yes, but the id is litewire's own per-connection counter, not `CONNECTION_ID()` (which reports `0`) |
+| `IS_USED_LOCK(name)` | the holder's session id, or `NULL` | yes — the id is litewire's own per-connection counter, and a bare `SELECT CONNECTION_ID()` reports that same id, so the two agree as MySQL guarantees |
+| `CONNECTION_ID()` | the connection's own session id (non-zero) | yes for a bare `SELECT CONNECTION_ID()`; a connection with no lock scope reports `0`, and the call embedded in a larger expression still rewrites to `0` |
 | Lock names | case-insensitive (lowercased), at most 64 characters | yes |
 | Empty / `NULL` name | error — `ER_USER_LOCK_WRONG_NAME` (3057) in the bridge, `ER_WRONG_ARGUMENTS` (1210) over the wire (the wire library's error table predates 3057) | code differs on the wire |
 | Name over 64 characters | error — 3938 in the bridge, 1210 over the wire | code differs on the wire |

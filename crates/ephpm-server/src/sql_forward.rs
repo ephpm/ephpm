@@ -360,11 +360,24 @@ impl From<WireColumn> for Column {
 /// is self-describing and version-stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireLockOp {
-    Get { name: String, timeout: i64 },
-    Release { name: String },
+    Get {
+        name: String,
+        timeout: i64,
+    },
+    Release {
+        name: String,
+    },
     ReleaseAll,
-    IsFree { name: String },
-    IsUsed { name: String },
+    IsFree {
+        name: String,
+    },
+    IsUsed {
+        name: String,
+    },
+    /// `CONNECTION_ID()`: no lock name — it reports the owner-side session's
+    /// own id, so a forwarded `CONNECTION_ID()` agrees with a forwarded
+    /// `IS_USED_LOCK()` (both resolve on the owner, where the locks live).
+    ConnectionId,
 }
 
 impl From<&UserLockOp> for WireLockOp {
@@ -382,6 +395,7 @@ impl From<&UserLockOp> for WireLockOp {
             UserLockOp::ReleaseAll => Self::ReleaseAll,
             UserLockOp::IsFree { name } => Self::IsFree { name: name.clone() },
             UserLockOp::IsUsed { name } => Self::IsUsed { name: name.clone() },
+            UserLockOp::ConnectionId => Self::ConnectionId,
         }
     }
 }
@@ -396,6 +410,7 @@ impl From<WireLockOp> for UserLockOp {
             WireLockOp::ReleaseAll => Self::ReleaseAll,
             WireLockOp::IsFree { name } => Self::IsFree { name },
             WireLockOp::IsUsed { name } => Self::IsUsed { name },
+            WireLockOp::ConnectionId => Self::ConnectionId,
         }
     }
 }
@@ -1846,6 +1861,28 @@ mod tests {
             write_msg(&mut a, &SqlResponse::Lock { value }).await.unwrap();
             let got: SqlResponse = read_msg(&mut b).await.unwrap();
             assert!(matches!(got, SqlResponse::Lock { value: v } if v == value));
+        }
+    }
+
+    /// The non-`Get` lock ops — including `CONNECTION_ID()` (#657), which
+    /// carries no name — survive the `UserLockOp` ⇄ `WireLockOp` conversion
+    /// and the wire round-trip, so a forwarded `CONNECTION_ID()` reaches the
+    /// owner and resolves to the owner-side session id.
+    #[tokio::test]
+    async fn nameless_and_named_lock_ops_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        for op in [
+            UserLockOp::Release { name: "job".into() },
+            UserLockOp::ReleaseAll,
+            UserLockOp::IsFree { name: "job".into() },
+            UserLockOp::IsUsed { name: "job".into() },
+            UserLockOp::ConnectionId,
+        ] {
+            let req = SqlRequest::Lock { op: WireLockOp::from(&op), progress: true };
+            write_msg(&mut a, &req).await.unwrap();
+            let got: SqlRequest = read_msg(&mut b).await.unwrap();
+            let SqlRequest::Lock { op: wire, .. } = got else { panic!("expected Lock") };
+            assert_eq!(UserLockOp::from(wire), op);
         }
     }
 

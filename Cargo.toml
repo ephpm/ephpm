@@ -236,7 +236,22 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ aa9f6eef8498 — default-off failed-SQL logging + translation fixes
+# litewire @ 664d4aef8900 — MySQL-compat correctness: CONNECTION_ID() + classify.
+# CORRECTNESS: do not move this pin backwards past #66/#67. (1) litewire#66 —
+# a bare `SELECT CONNECTION_ID()` now reports the connection's real
+# per-connection id (its `LockSession` id) instead of the constant 0, so it
+# agrees with `IS_USED_LOCK()` as MySQL guarantees and apps compare on (ePHPm
+# #657). It travels the `UserLockOp` / `BackendConn::user_lock` path, so a
+# forwarding backend reports the owner-side session id — this bump adds the
+# matching `WireLockOp::ConnectionId` to ePHPm's per-site-clustered
+# write-forwarding (sql_forward.rs) so CONNECTION_ID() forwards to the site
+# owner. A connection with no lock scope still reports 0 and never errors.
+# (2) litewire#67 (litewire#38) — `WITH … SELECT` CTEs and `INSERT … RETURNING`
+# are classified onto the query path so their rows are returned instead of
+# being run as a no-result statement. No turso move (turso stays =0.8.3); the
+# lockfile changes only the litewire crates' source rev.
+#
+# Previous pin aa9f6eef8498 — default-off failed-SQL logging + translation fixes
 # (v0.13.3). Adds `LiteWire::log_failed_sql(bool)` (default false), wired by
 # ePHPm as `[db.analysis] log_failed_sql` (off by default; when on, logs the raw
 # failing SQL truncated at WARN — may contain tenant data). Plus three
@@ -611,7 +626,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "aa9f6eef849846be730a6a027256fe9ab6b06ed6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "664d4aef89009469f824369407612f18fb4a9045", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
