@@ -151,18 +151,25 @@ listener (`[db.sqlite.proxy] mysql_listen`):
 | Per-site **clustered**, no server | — | **Refused** — a standalone CLI cannot reach the site's owner or safely write a replica (same message `ephpm php --site` gives). | — |
 
 **The single-writer rule, fail-closed.** Two processes must never hold the same
-Turso file open at once, and `sqlite`-native access means opening the file
-directly. So **a `sqlite` (or `pg`) request while a server is up is a hard
-error, never a silent fallback**:
+Turso file open at once, and `sqlite`-native / `pg` access means opening the
+file directly, so neither can run through the live server. How that resolves
+depends on whether you *chose* the dialect:
 
-```
-a server is serving this site on 127.0.0.1:3306; sqlite needs offline access
-(direct file open) — use --dialect mysql for the live DB, or stop the server
-and re-run for sqlite access.
-```
+- **No `--dialect` (the default).** Live mode auto-selects `mysql` so `db
+  query` / `db shell` just work against a running server; stop the server and
+  the same command opens the file offline as `sqlite`. You never have to think
+  about it.
+- **An explicit `--dialect sqlite` (or `pg`) while a server is up** is a hard
+  error, never a silent override of your choice:
 
-Use `--dialect mysql` to work against the live database through the running
-server, or stop the server for `sqlite`-native / `pg` offline access.
+  ```
+  a server is serving this site on 127.0.0.1:3306; sqlite needs offline access
+  (direct file open) — use --dialect mysql for the live DB, or stop the server
+  and re-run for sqlite access.
+  ```
+
+  Pass `--dialect mysql` to work against the live database, or stop the server
+  for `sqlite`-native / `pg` offline access.
 
 ### Dialects
 
@@ -207,7 +214,7 @@ to stdout. A statement error stops the batch and exits non-zero.
 |------|---------|---------|
 | `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
 | `-c`, `--config <FILE>` | (required) | Config with `[server] sites_dir`, `[db.sqlite]`, and (for live mode / `/kv`) `[kv] secret` |
-| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | SQL dialect (see [Dialects](#dialects)). Live mode is MySQL-only |
+| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | SQL dialect (see [Dialects](#dialects)). Omitted, the default auto-promotes to `mysql` in live mode; an explicit `sqlite`/`pg` is refused there |
 | `--format <table\|tsv\|csv\|json>` | `table` | Output format (see below) |
 | `--read-only` | off | Refuse any statement that is not a pure read (`SELECT` / `WITH` / `VALUES` / `EXPLAIN` / `SHOW` / `DESCRIBE`) |
 | `--maintenance` | off | **Offline-only, unscreened.** Drop statement screening so engine operations (`PRAGMA integrity_check`, `PRAGMA wal_checkpoint`, path-PRAGMAs) can run. Refused while a server is up or in per-site clustered mode (see below) |
@@ -295,7 +302,7 @@ session's stdout stays clean.
 |------|---------|---------|
 | `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
 | `-c`, `--config <FILE>` | (required) | Config (as for `db query`) |
-| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | Initial dialect; switch at runtime with `/dialect`. Live mode is MySQL-only |
+| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | Initial dialect; switch at runtime with `/dialect`. Omitted, the default auto-promotes to `mysql` in live mode; an explicit `sqlite`/`pg` is refused there |
 | `--read-only` | off | Refuse any statement that is not a pure read |
 | `--maintenance` | off | Offline-only, unscreened (as for `db query`) |
 

@@ -46,7 +46,7 @@ UNLOCK TABLES;
 /// serve. Panics on any import failure (the point under test is the console,
 /// not the importer).
 fn seed(binary: &std::path::Path) -> DbImportFixture {
-    let fixture = DbImportFixture::prepare(binary, "shop", VHOST_INDEX_PHP).expect("prepare");
+    let mut fixture = DbImportFixture::prepare(binary, "shop", VHOST_INDEX_PHP).expect("prepare");
     let dump = fixture.scratch_dir().join("customers.sql");
     std::fs::write(&dump, fake_mysqldump()).expect("write dump");
     let out = fixture

@@ -570,10 +570,12 @@ enum DbCommand {
         #[arg(long, short = 'c')]
         config: PathBuf,
 
-        /// SQL dialect. `sqlite` runs native against the engine; `mysql`/`pg`
-        /// translate via litewire. Live mode is MySQL-only.
-        #[arg(long, value_enum, default_value = "sqlite")]
-        dialect: QueryDialectOpt,
+        /// SQL dialect. `sqlite` (the default) runs native against the engine;
+        /// `mysql`/`pg` translate via litewire. Live mode (server up) speaks
+        /// only MySQL: the default is auto-promoted to `mysql` there, while an
+        /// explicit `--dialect sqlite`/`pg` is refused (stop the server first).
+        #[arg(long, value_enum)]
+        dialect: Option<QueryDialectOpt>,
 
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
@@ -615,10 +617,12 @@ enum DbCommand {
         #[arg(long, short = 'c')]
         config: PathBuf,
 
-        /// Initial SQL dialect (`sqlite` native by default; live mode forces
-        /// `mysql`). Switch at runtime with `/dialect`.
-        #[arg(long, value_enum, default_value = "sqlite")]
-        dialect: QueryDialectOpt,
+        /// Initial SQL dialect. `sqlite` (the default) runs native; live mode
+        /// (server up) speaks only MySQL, so the default is auto-promoted to
+        /// `mysql` there while an explicit `--dialect sqlite`/`pg` is refused.
+        /// Switch at runtime with `/dialect`.
+        #[arg(long, value_enum)]
+        dialect: Option<QueryDialectOpt>,
 
         /// Refuse any statement that is not a pure read.
         #[arg(long)]
@@ -874,7 +878,10 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
         } => db_query::run(db_query::QueryRequest {
             site,
             config,
-            dialect: dialect.to_dialect(),
+            // Absent `--dialect` is the non-explicit `sqlite` default, which
+            // live mode auto-promotes to MySQL; a given one is explicit.
+            dialect: dialect.map_or(ephpm_dbimport::Dialect::Sqlite, QueryDialectOpt::to_dialect),
+            dialect_explicit: dialect.is_some(),
             format: format.to_format(),
             read_only,
             maintenance,
@@ -885,7 +892,9 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
             db_shell::run(db_shell::ShellRequest {
                 site,
                 config,
-                dialect: dialect.to_dialect(),
+                dialect: dialect
+                    .map_or(ephpm_dbimport::Dialect::Sqlite, QueryDialectOpt::to_dialect),
+                dialect_explicit: dialect.is_some(),
                 read_only,
                 maintenance,
             })

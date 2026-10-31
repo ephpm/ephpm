@@ -116,6 +116,12 @@ pub(crate) struct ConsoleConfig {
     pub config_path: PathBuf,
     /// The initial dialect (`sqlite` by default).
     pub dialect: Dialect,
+    /// Whether [`dialect`](Self::dialect) was given explicitly on the command
+    /// line (vs left at the `sqlite` default). Live mode is MySQL-only: a
+    /// *default* sqlite is auto-promoted to MySQL when the server is up, but an
+    /// *explicit* `--dialect sqlite`/`pg` there is refused rather than silently
+    /// overridden.
+    pub dialect_explicit: bool,
     /// Reject any statement that is not a pure read.
     pub read_only: bool,
     /// Offline-only: drop statement screening so engine operations
@@ -195,9 +201,13 @@ impl Console {
         let (mode, dialect, screen, sink, offline) = match strategy {
             Strategy::Wire { addr, user, password } => {
                 // Live mode is MySQL-only: only the server's MySQL listener is
-                // bound. A sqlite-native or pg request here must not silently
-                // fall back — the single-writer rule is the whole point.
-                if cfg.dialect != Dialect::MySql {
+                // bound, and the single-writer rule means we must forward to it
+                // rather than open the file. A *default* sqlite dialect is
+                // auto-promoted to MySQL here so `db shell`/`db query` just work
+                // against a running server; only an *explicit* sqlite/pg request
+                // is refused — silently overriding a deliberate choice would be
+                // worse than a clear error telling you to stop the server.
+                if cfg.dialect != Dialect::MySql && cfg.dialect_explicit {
                     bail!(server_up_dialect_error(cfg.dialect, &listen));
                 }
                 if cfg.maintenance {

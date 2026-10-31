@@ -134,12 +134,16 @@ The prompt is `  <site> ‹<mode> · <dialect>› > `, and both middle words mat
   `sqlite`-native.
 - **`live`** — a server *is* running, so the shell forwards every statement to
   it over the MySQL listener and the server does the work (translation,
-  screening, clustered owner-forwarding). Live mode is **MySQL-only**.
+  screening, clustered owner-forwarding). Live mode is **MySQL-only**, so a
+  shell started without `--dialect` auto-selects `mysql` here — you don't have
+  to ask.
 
 Why the distinction is load-bearing: the embedded engine is single-writer — two
 processes must never hold the same file open at once. So the shell picks the
-transport automatically, and if you ask for `sqlite`-native access while a
-server is up it refuses rather than corrupt the file:
+transport automatically. Leaving `--dialect` off, it just works in both modes
+(`sqlite` offline, `mysql` live). Only an *explicit* `sqlite`-native (or `pg`)
+request while a server is up refuses, rather than silently override your choice
+or corrupt the file:
 
 ```
   blog ‹live · mysql› > /dialect sqlite
@@ -147,8 +151,8 @@ error: live mode talks to the server's MySQL listener, so it is MySQL-only;
 'sqlite' is not available. Stop the server for offline access to sqlite/pg.
 ```
 
-To work against the live database, use `mysql`. To use `sqlite`-native, stop
-the server first.
+To work against the live database, use `mysql` (the live default). To use
+`sqlite`-native, stop the server first.
 
 ### Switching dialects
 

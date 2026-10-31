@@ -24,6 +24,10 @@ pub struct QueryRequest {
     pub config: PathBuf,
     /// The dialect to speak (`sqlite` by default).
     pub dialect: Dialect,
+    /// Whether `--dialect` was passed explicitly (vs the `sqlite` default). A
+    /// default sqlite is auto-promoted to MySQL in live mode; an explicit one
+    /// is refused there (see [`Console::connect`]).
+    pub dialect_explicit: bool,
     /// Output format.
     pub format: Format,
     /// Reject any statement that is not a pure read.
@@ -55,6 +59,7 @@ pub fn run(req: QueryRequest) -> anyhow::Result<ExitCode> {
         site: req.site,
         config_path: req.config,
         dialect: req.dialect,
+        dialect_explicit: req.dialect_explicit,
         read_only: req.read_only,
         maintenance: req.maintenance,
     })?;
