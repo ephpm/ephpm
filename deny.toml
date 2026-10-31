@@ -27,9 +27,16 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     # zstd 0.13.3 / zstd-safe 7.2.4. Fixed only in zstd 0.14.3 / zstd-safe
-    # 8.2.0, a breaking bump that chitchat
-    # 0.10 and mysql_common 0.32 (via mysql_async 0.34 and the opensrv-mysql
-    # fork) do not accept yet. mysql_common calls zstd solely to decode binlog
+    # 8.2.0, a breaking bump that no consumer in the graph accepts. Re-verified
+    # 2026-10-30 for the v0.13.4 patch: EVERY published chitchat (through the
+    # latest 0.13.0) requires `zstd ^0.13`, and so does every published
+    # mysql_common (through the latest 0.38.2, where it is optional but still
+    # ^0.13; reached here via mysql_async 0.34 and the opensrv-mysql fork). So
+    # no lockfile or semver bump can pull zstd 0.14 into this graph: it needs a
+    # chitchat release on zstd 0.14 (none exists; no ephpm/chitchat fork either)
+    # plus the mysql_common -> mysql_async -> opensrv-mysql-fork chain moved to
+    # one. Both are out-of-tree forks, not a clean dependency bump, so the
+    # ignores stay for v0.13.4. mysql_common calls zstd solely to decode binlog
     # TRANSACTION_PAYLOAD events (src/binlog/events/transaction_payload_event.rs)
     # -- a replication client path neither the opensrv server nor ePHPm's
     # mysql_async client ever reaches (mysql_async's own `compression` option is
@@ -52,12 +59,18 @@ ignore = [
     "RUSTSEC-2026-0403",
     # tokio 1.53.1: `AsyncFd`'s safe constructors (`new`, `with_interest`,
     # `try_new`, `try_with_interest`) accept any `AsRawFd`, including a raw fd
-    # the caller does not own. Fixed in 1.53.3, but vivacity (0.23.0, and
-    # 0.24.0 too) pins `tokio = "=1.53.1"`. Nothing in the graph calls those
-    # constructors: no ePHPm crate uses `AsyncFd`, tokio itself does not, and
-    # the only dependency that does (aya's `AsyncPerfEventArray`) sits behind
-    # aya's `async_tokio` feature, which is off. #648; remove when vivacity
-    # relaxes its =1.53.1 tokio pin.
+    # the caller does not own. Fixed in 1.53.3, but vivacity pins
+    # `tokio = "=1.53.1"` (an exact `=` pin, in both `vivacity` and
+    # `vivacity-core`), so the resolver rejects `cargo update -p tokio
+    # --precise 1.53.3`. Re-verified 2026-10-30 for the v0.13.4 patch: every
+    # published vivacity still carries that pin -- 0.23.0, 0.24.0 and the latest
+    # 0.25.0 (2026-10-28). Clearing it needs a vivacity release that relaxes the
+    # pin (none exists), or an out-of-tree fork of the vivacity crates -- not a
+    # clean dependency bump -- so the ignore stays for v0.13.4. Nothing in the
+    # graph calls those constructors anyway: no ePHPm crate uses `AsyncFd`,
+    # tokio itself does not, and the only dependency that does (aya's
+    # `AsyncPerfEventArray`) sits behind aya's `async_tokio` feature, which is
+    # off. #648; remove when vivacity relaxes its =1.53.1 tokio pin.
     "RUSTSEC-2026-0386",
     # RESOLVED (do not re-add): RUSTSEC-2026-0410 (zstd-sys wasm32 allocator
     # shim) is fixed by zstd-sys 2.1.2, which zstd-safe 7 accepts.
