@@ -663,12 +663,26 @@ turso = { version = "=0.8.3", default-features = false }
 # 0.23 prints the phpstan/rector/phpcs/package-versions installer lines on
 # stdout, runs emulated plugin listeners in Composer's activation order, and
 # ties those emulations to the plugin versions whose source was read (others
-# hand over). `vivacity::run` is unchanged (0.22 only adds a per-run git
-# answer cache that the call scopes). Linking: 0.21→0.23 changes only
-# vivacity's own six crates — no new transitive crate, no new C dep, still one
-# rustls provider. vivacity-core 0.23.0 still pins `zip =2.4.2`; see the
-# RUSTSEC ignores in deny.toml.
-vivacity = { version = "=0.23.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# hand over). `vivacity::run` is unchanged through 0.23 (0.22 only adds a
+# per-run git answer cache that the call scopes).
+# 0.24–0.25 are Composer-fidelity fixes: `require` exits 100 on an
+# unreachable repository (Composer's transport policy), `dump-autoload`
+# purges packages that have left the vendor dir, zip entry directory modes are
+# carried into `vendor/`, `allow-plugins` is judged at plugin-load time, and
+# php-http/discovery, custom installers, git-only package installs and `-v`
+# verbosity fidelity all match Composer. The `vivacity::run` embed entry point
+# was re-vetted at 0.25.0 and is byte-identical — `run<I, T>(args: I) -> i32`
+# (argv[0] = program name; returns the process exit code as `i32`), the same
+# contract crates/ephpm/src/main.rs forwards argv to.
+# Linking: 0.21→0.25 changes only vivacity's own six crates — no new
+# transitive crate, no new C dep, and no second rustls crypto provider:
+# vivacity-core → reqwest still resolves the single rustls (0.23.x) with no
+# baked provider (`rustls-tls-no-provider`), so it uses ePHPm's aws-lc-rs
+# process provider; the only `ring` in the graph is still quinn's HTTP/3 path
+# (unchanged by this bump, and not compiled for the host target). vivacity-core
+# 0.25.0 still pins `zip =2.4.2` (identical features, pure-Rust backends) and
+# `tokio =1.53.1`; see the RUSTSEC ignores in deny.toml.
+vivacity = { version = "=0.25.0", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
