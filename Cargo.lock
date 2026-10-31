@@ -943,8 +943,7 @@ dependencies = [
 [[package]]
 name = "chitchat"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "735f8a51f68b353b17e351b38317433d6afcaa9cc04f4d0f6c9e9125c49c1efe"
+source = "git+https://github.com/ephpm/chitchat.git?rev=52188450c14cc899846bc66baccc39c56297cc9d#52188450c14cc899846bc66baccc39c56297cc9d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3423,8 +3422,7 @@ dependencies = [
 [[package]]
 name = "mysql_common"
 version = "0.32.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "478b0ff3f7d67b79da2b96f56f334431aef65e15ba4b29dd74a4236e29582bdc"
+source = "git+https://github.com/ephpm/rust_mysql_common.git?rev=44aee03c86b7c939ea484edb98f71dfc4b921fc3#44aee03c86b7c939ea484edb98f71dfc4b921fc3"
 dependencies = [
  "base64 0.21.7",
  "bindgen 0.72.1",
@@ -5443,9 +5441,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc 0.2.189",
@@ -6196,8 +6194,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vivacity"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f55d9f70d8d756390f88e6eb26f9c8926b3701a8501fd690bcf81f425e0e7c04"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6213,8 +6210,7 @@ dependencies = [
 [[package]]
 name = "vivacity-autoload"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0927d663fa7a9cb80cdd38c1dd3310f8a563a40e5839c6cb1fb5f7780e2ec524"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "md-5 0.10.6",
  "memchr",
@@ -6230,8 +6226,7 @@ dependencies = [
 [[package]]
 name = "vivacity-core"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9faae25fd267cc42e7b4cd2fc8eeff982ef8469a5dd63d9b12c41e68e05dad10"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6256,8 +6251,7 @@ dependencies = [
 [[package]]
 name = "vivacity-pcre2"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c1fe8e5995e8e327a0553895c0d06e20ccccbab6efcfc8ed715ad3e24ea01aa"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6267,8 +6261,7 @@ dependencies = [
 [[package]]
 name = "vivacity-pcre2-sys"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5f5345ac872e61fe0770e308ed4e1d3dbd7ff1b2f8b2c0364916f6c0b09bc67"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6277,8 +6270,7 @@ dependencies = [
 [[package]]
 name = "vivacity-resolver"
 version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb7f70ee002b086d47f50994c0be7ae93e9c6b7d2956926aea57eb4615bb898c"
+source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
 dependencies = [
  "serde",
  "serde_json",
@@ -7187,18 +7179,18 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.2.4"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]

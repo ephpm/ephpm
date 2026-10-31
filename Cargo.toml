@@ -92,7 +92,12 @@ clap = { version = "4", features = ["derive"] }
 mime_guess = "2"
 flate2 = "1"
 brotli = "7"
-zstd = "0.13"
+# 0.14 (RUSTSEC-2026-0391/0398/0403). ephpm-kv uses only the high-level
+# zstd::encode_all / zstd::decode_all, unchanged across 0.13 -> 0.14. The
+# other two graph consumers of zstd (chitchat and mysql_common) are moved to
+# 0.14 by the org forks patched in at the end of this file, so the whole tree
+# resolves to zstd 0.14 / zstd-safe 8 and the advisories clear. See #648.
+zstd = "0.14"
 ipnet = "2"
 # CIDR membership for the `ip-allowlist` builtin middleware (IPv4 + IPv6).
 # Default features only (`serde` is opt-in and not enabled), so no extra
@@ -804,6 +809,33 @@ used_underscore_binding = "allow"
 # directly), so both repos resolve the same opensrv-mysql.
 [patch.crates-io]
 opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "146de689d9febd8dd15eb06eb80bf6f7bdcc1216" }
+# SECURITY (RUSTSEC-2026-0386): vivacity (the `ephpm composer` installer)
+# pins `tokio = "=1.53.1"` exactly in its workspace manifest — for Cargo.lock
+# byte-parity with PHP Composer, a property ePHPm does not need. That exact pin
+# blocked the tokio 1.53.3 fix (unsound `AsyncFd` safe constructors) for the
+# whole graph. The ePHPm fork (github.com/ephpm/vivacity, branch
+# ephpm-relax-tokio) relaxes only that one workspace line to ">=1.53.3, <1.54"
+# — no code change, no other dependency moves. Patching `vivacity` pulls its
+# sibling crates (vivacity-core/-resolver/-autoload/-pcre2[-sys]) from the fork
+# too, via the workspace's path deps, so their `tokio.workspace = true` picks
+# up the relaxed pin as well. Remove when upstream vivacity relaxes the pin or
+# a release admits 1.53.3. See ephpm/ephpm#648.
+vivacity = { git = "https://github.com/ephpm/vivacity.git", rev = "ad6ea26b397f0f9007817e8ee9d41a9752d608b7" }
+# SECURITY (RUSTSEC-2026-0391/0398/0403): zstd/zstd-safe are fixed only in
+# zstd 0.14.3 / zstd-safe 8.2.0 (a breaking bump of the zstd-safe low-level
+# API). The whole graph must move together, and two crates.io consumers still
+# require `zstd ^0.13`: chitchat (gossip payload compression, used by
+# ephpm-cluster) and mysql_common (binlog TRANSACTION_PAYLOAD decoder, reached
+# via mysql_async and the opensrv-mysql fork). Each ePHPm fork bumps ONLY its
+# `zstd` dependency 0.13 -> 0.14 with no code change — both crates call only
+# high-level zstd APIs (chitchat: bulk::{compress,decompress}_to_buffer;
+# mysql_common: Decoder::with_buffer + stream::copy_decode) whose signatures
+# are unchanged in 0.14. With these plus the workspace `zstd = "0.14"` bump
+# (ephpm-kv), the tree resolves to zstd 0.14.3 / zstd-safe 8.2.0 (zstd-sys
+# stays 2.1.2). Remove both when upstream chitchat and mysql_common release on
+# zstd 0.14. See ephpm/ephpm#648.
+chitchat = { git = "https://github.com/ephpm/chitchat.git", rev = "52188450c14cc899846bc66baccc39c56297cc9d" }
+mysql_common = { git = "https://github.com/ephpm/rust_mysql_common.git", rev = "44aee03c86b7c939ea484edb98f71dfc4b921fc3" }
 # CORRECTNESS: Turso 0.8.3's page-1 allocation race. When several connections
 # make the first write to a fresh database file at once (a new per-site
 # database under concurrent traffic), two pagers could both allocate page 1;
