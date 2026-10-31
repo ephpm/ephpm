@@ -26,11 +26,11 @@ use std::time::Duration;
 use anyhow::Context;
 use ephpm_config::Config;
 use ephpm_dbimport::{
-    CompatReport, Dialect, DumpReader, FindingKind, ImportOptions, ImportOutcome, OnError,
-    SinkError, StatementSink, run_import, sniff,
+    Cell, CompatReport, Dialect, DumpReader, FindingKind, ImportOptions, ImportOutcome, OnError,
+    RowSet, SinkError, StatementSink, run_import, sniff,
 };
 use ephpm_php::db_bridge::{RemoteBackend, screen_sql};
-use litewire::backend::{SharedBackend, Value};
+use litewire::backend::{BackendConn, BackendError, ResultSet, SharedBackend, Value};
 use litewire::translate::Dialect as LwDialect;
 use litewire::{Session, SessionError, SessionResult};
 
@@ -241,16 +241,19 @@ fn build_sink(
                         "connecting to the running server's MySQL listener at {addr} as {user:?}"
                     )
                 })?;
-            Ok(Box::new(WireSink { backend, handle: handle.clone() }))
+            Ok(Box::new(WireSink { backend, handle: handle.clone(), screen: true }))
         }
     }
 }
 
-/// Map this crate's [`Dialect`] onto litewire's translation dialect.
-fn lw_dialect(dialect: Dialect) -> LwDialect {
+/// Map this crate's [`Dialect`] onto litewire's translation dialect, or `None`
+/// for [`Dialect::Sqlite`] — which runs straight against the engine with no
+/// translation (the raw-connection path), so it needs no translator.
+fn lw_dialect(dialect: Dialect) -> Option<LwDialect> {
     match dialect {
-        Dialect::MySql => LwDialect::MySQL,
-        Dialect::Pg => LwDialect::PostgreSQL,
+        Dialect::MySql => Some(LwDialect::MySQL),
+        Dialect::Pg => Some(LwDialect::PostgreSQL),
+        Dialect::Sqlite => None,
     }
 }
 
@@ -260,69 +263,222 @@ fn session_err(e: &SessionError) -> SinkError {
     SinkError::coded(e.code(), e.to_string())
 }
 
-/// A sink that executes statements against a directly-opened Turso file
-/// through a translating litewire [`Session`].
-struct DirectSink {
-    session: Session,
+/// Turn a litewire [`BackendError`] (raw, sqlite-native path) into a sink
+/// error. The backend carries no MySQL errno, so the code is left unset.
+fn backend_err(e: &BackendError) -> SinkError {
+    SinkError::message(e.to_string())
+}
+
+/// Screen one statement with [`screen_sql`] when `enabled`, mapping a rejection
+/// to a [`SinkError`]. `enabled` is `false` only on the console's offline
+/// `--maintenance` path; every other caller screens.
+fn screen_statement(enabled: bool, sql: &str) -> Result<(), SinkError> {
+    if enabled {
+        screen_sql(sql).map_err(|offending| {
+            SinkError::message(format!("statement rejected on the tenant path: {offending}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// Map a litewire [`Value`] onto a dump-crate [`Cell`] for a [`RowSet`].
+fn value_to_cell(v: Value) -> Cell {
+    match v {
+        Value::Null => Cell::Null,
+        Value::Integer(i) => Cell::Integer(i),
+        Value::Float(f) => Cell::Float(f),
+        Value::Text(s) => Cell::Text(s),
+        Value::Blob(b) => Cell::Blob(b),
+    }
+}
+
+/// Convert a litewire [`ResultSet`] into a dump-crate [`RowSet`].
+fn result_set_to_rowset(rs: ResultSet) -> RowSet {
+    RowSet {
+        columns: rs.columns.into_iter().map(|c| c.name).collect(),
+        rows: rs.rows.into_iter().map(|row| row.into_iter().map(value_to_cell).collect()).collect(),
+    }
+}
+
+/// How a [`DirectSink`] reaches a directly-opened Turso file.
+enum DirectInner {
+    /// `mysql` / `pg`: a translating litewire [`Session`] over the connection.
+    Translating(Session),
+    /// `sqlite`: the raw [`BackendConn`], run with no translation.
+    Native(Box<dyn BackendConn>),
+}
+
+/// A sink that executes statements against a directly-opened Turso file,
+/// offline (no server holds it). It speaks either the translating litewire
+/// [`Session`] (`mysql` / `pg`) or the raw engine connection (`sqlite`-native),
+/// chosen at construction from the dialect.
+///
+/// `db import` always builds it screening (the tenant path) and in a MySQL or
+/// PostgreSQL dialect, so its execute path is unchanged. The `db query` /
+/// `db shell` consoles reuse it, add the [`query_rows`](StatementSink::query_rows)
+/// read path, pick `sqlite` by default, and drop screening only in the offline
+/// `--maintenance` mode.
+pub(crate) struct DirectSink {
+    inner: DirectInner,
     handle: tokio::runtime::Handle,
-    // Keep the backend alive for the session's connection lifetime.
+    /// Screen each statement with [`screen_sql`] before running it.
+    screen: bool,
+    // Keep the backend alive for the connection's lifetime.
     _backend: SharedBackend,
 }
 
 impl DirectSink {
-    fn open(path: &str, dialect: Dialect, handle: tokio::runtime::Handle) -> anyhow::Result<Self> {
-        let turso =
-            handle.block_on(litewire::Turso::open(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let backend: SharedBackend = Arc::new(turso);
+    /// Open the Turso file at `path` and bind a screening sink speaking
+    /// `dialect` (the `db import` / tenant path).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or a connection made.
+    pub(crate) fn open(
+        path: &str,
+        dialect: Dialect,
+        handle: tokio::runtime::Handle,
+    ) -> anyhow::Result<Self> {
+        let backend = open_offline_backend(path, &handle)?;
+        Self::from_backend(backend, dialect, handle, true)
+    }
+
+    /// Bind a sink over an already-open `backend`. The console opens the file
+    /// once and rebinds across `/dialect` switches (and the `--maintenance`
+    /// `screen = false` toggle) without reopening it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a connection to the backend cannot be opened.
+    pub(crate) fn from_backend(
+        backend: SharedBackend,
+        dialect: Dialect,
+        handle: tokio::runtime::Handle,
+        screen: bool,
+    ) -> anyhow::Result<Self> {
         let conn = handle
             .block_on(backend.connect())
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("opening a connection to the site database")?;
-        let session = Session::new(conn, lw_dialect(dialect));
-        Ok(Self { session, handle, _backend: backend })
+        let inner = match lw_dialect(dialect) {
+            Some(lw) => DirectInner::Translating(Session::new(conn, lw)),
+            None => DirectInner::Native(conn),
+        };
+        Ok(Self { inner, handle, screen, _backend: backend })
     }
 
-    fn query(&mut self, sql: &str) -> Result<(), SinkError> {
-        screen_sql(sql).map_err(|offending| {
-            SinkError::message(format!("statement rejected on the tenant path: {offending}"))
-        })?;
-        match self.handle.block_on(self.session.query(sql, &[] as &[Value])) {
-            Ok(SessionResult::Ok(_) | SessionResult::Rows(_)) => Ok(()),
-            Err(e) => Err(session_err(&e)),
+    /// Execute `sql`, discarding any result set (the import / transaction-control
+    /// path).
+    fn exec_inner(&mut self, sql: &str) -> Result<(), SinkError> {
+        screen_statement(self.screen, sql)?;
+        match &mut self.inner {
+            DirectInner::Translating(session) => {
+                match self.handle.block_on(session.query(sql, &[] as &[Value])) {
+                    Ok(SessionResult::Ok(_) | SessionResult::Rows(_)) => Ok(()),
+                    Err(e) => Err(session_err(&e)),
+                }
+            }
+            DirectInner::Native(conn) => {
+                match self.handle.block_on(conn.execute(sql, &[] as &[Value])) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(backend_err(&e)),
+                }
+            }
+        }
+    }
+
+    /// Execute `sql` and return its result set (empty for a write / DDL).
+    fn query_inner(&mut self, sql: &str) -> Result<RowSet, SinkError> {
+        screen_statement(self.screen, sql)?;
+        match &mut self.inner {
+            DirectInner::Translating(session) => {
+                match self.handle.block_on(session.query(sql, &[] as &[Value])) {
+                    Ok(SessionResult::Rows(rs)) => Ok(result_set_to_rowset(rs)),
+                    Ok(SessionResult::Ok(_)) => Ok(RowSet::empty()),
+                    Err(e) => Err(session_err(&e)),
+                }
+            }
+            DirectInner::Native(conn) => {
+                match self.handle.block_on(conn.query(sql, &[] as &[Value])) {
+                    Ok(rs) => Ok(result_set_to_rowset(rs)),
+                    Err(e) => Err(backend_err(&e)),
+                }
+            }
         }
     }
 }
 
 impl StatementSink for DirectSink {
     fn exec(&mut self, sql: &str) -> Result<(), SinkError> {
-        self.query(sql)
+        self.exec_inner(sql)
     }
     fn begin(&mut self) -> Result<(), SinkError> {
-        self.query("BEGIN")
+        self.exec_inner("BEGIN")
     }
     fn commit(&mut self) -> Result<(), SinkError> {
-        self.query("COMMIT")
+        self.exec_inner("COMMIT")
     }
     fn rollback(&mut self) -> Result<(), SinkError> {
-        self.query("ROLLBACK")
+        self.exec_inner("ROLLBACK")
     }
+    fn query_rows(&mut self, sql: &str) -> Result<RowSet, SinkError> {
+        self.query_inner(sql)
+    }
+}
+
+/// Open a Turso database file directly and return it as a shared backend.
+///
+/// Deliberately opened **without** the server's WAL checkpoint gate — this is a
+/// short-lived CLI process with no concurrent readers (the same reasoning as
+/// [`crate::site_db`]'s offline direct-open). The caller truncates the log at
+/// exit.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened.
+pub(crate) fn open_offline_backend(
+    path: &str,
+    handle: &tokio::runtime::Handle,
+) -> anyhow::Result<SharedBackend> {
+    let turso = handle.block_on(litewire::Turso::open(path)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Arc::new(turso))
 }
 
 /// A sink that forwards raw SQL to a running server's MySQL wire listener,
 /// where the server does the translation/screening (the same path
 /// `ephpm php --site` uses against a live server).
-struct WireSink {
+pub(crate) struct WireSink {
     backend: RemoteMysqlBackend,
     handle: tokio::runtime::Handle,
+    /// Screen each statement CLI-side with [`screen_sql`] before forwarding it.
+    /// The server screens again; this is defence in depth and keeps the error
+    /// local and fast.
+    screen: bool,
 }
 
 impl WireSink {
-    fn run(&self, sql: &str) -> Result<(), SinkError> {
-        screen_sql(sql).map_err(|offending| {
-            SinkError::message(format!("statement rejected on the tenant path: {offending}"))
-        })?;
+    /// Build a wire sink over an already-connected [`RemoteMysqlBackend`].
+    pub(crate) fn new(
+        backend: RemoteMysqlBackend,
+        handle: tokio::runtime::Handle,
+        screen: bool,
+    ) -> Self {
+        Self { backend, handle, screen }
+    }
+
+    fn exec_inner(&self, sql: &str) -> Result<(), SinkError> {
+        screen_statement(self.screen, sql)?;
         match self.handle.block_on(self.backend.run(sql, &[] as &[Value])) {
             Ok(SessionResult::Ok(_) | SessionResult::Rows(_)) => Ok(()),
+            Err(e) => Err(session_err(&e)),
+        }
+    }
+
+    fn query_inner(&self, sql: &str) -> Result<RowSet, SinkError> {
+        screen_statement(self.screen, sql)?;
+        match self.handle.block_on(self.backend.run(sql, &[] as &[Value])) {
+            Ok(SessionResult::Rows(rs)) => Ok(result_set_to_rowset(rs)),
+            Ok(SessionResult::Ok(_)) => Ok(RowSet::empty()),
             Err(e) => Err(session_err(&e)),
         }
     }
@@ -330,16 +486,19 @@ impl WireSink {
 
 impl StatementSink for WireSink {
     fn exec(&mut self, sql: &str) -> Result<(), SinkError> {
-        self.run(sql)
+        self.exec_inner(sql)
     }
     fn begin(&mut self) -> Result<(), SinkError> {
-        self.run("BEGIN")
+        self.exec_inner("BEGIN")
     }
     fn commit(&mut self) -> Result<(), SinkError> {
-        self.run("COMMIT")
+        self.exec_inner("COMMIT")
     }
     fn rollback(&mut self) -> Result<(), SinkError> {
-        self.run("ROLLBACK")
+        self.exec_inner("ROLLBACK")
+    }
+    fn query_rows(&mut self, sql: &str) -> Result<RowSet, SinkError> {
+        self.query_inner(sql)
     }
 }
 

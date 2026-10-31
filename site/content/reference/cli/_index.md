@@ -329,6 +329,55 @@ gunzip -c dump.sql.gz | ephpm db import - --site shop --config ephpm.toml --dial
 
 ---
 
+## `ephpm db query`
+
+Run one SQL statement (or a `;`-separated batch) against a virtual host's embedded database and print the result set. Same transport as [`ephpm php --site`](php/#binding-a-virtual-hosts-database-site): with a server up the SQL is forwarded over its MySQL listener (MySQL dialect only), with no server the site's file is opened directly (any dialect, `sqlite`-native by default). A `sqlite`/`pg` request while a server is up is a clear error, never a silent fallback. The SQL comes from the positional argument, `-e`, or stdin. See the [full `db` reference](db/#ephpm-db-query).
+
+```bash
+# Default sqlite-native, aligned table output (server stopped)
+ephpm db query --site blog --config ephpm.toml "SELECT ID, post_title FROM wp_posts LIMIT 5"
+
+# Against the live database (server running) as CSV
+ephpm db query --site shop --config ephpm.toml --dialect mysql --format csv \
+  "SELECT id, total FROM orders" > orders.csv
+
+# From stdin, JSON, read-only
+echo "SELECT 1 AS ok" | ephpm db query --site blog --config ephpm.toml --read-only --format json
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
+| `-c`, `--config <FILE>` | (required) | Config with `[server] sites_dir`, `[db.sqlite]`, `[kv] secret` |
+| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | SQL dialect; live mode is MySQL-only |
+| `--format <table\|tsv\|csv\|json>` | `table` | Output format |
+| `--read-only` | off | Refuse any statement that is not a pure read |
+| `--maintenance` | off | Offline-only, unscreened engine access (`PRAGMA integrity_check`, …) |
+| `-e`, `--execute <SQL>` | — | The SQL to run (wins over the positional argument) |
+| `[SQL]` | — | The SQL to run (positional); omit to use `-e` or stdin |
+
+---
+
+## `ephpm db shell`
+
+An interactive SQL REPL over a virtual host's embedded database. The prompt shows the mode and dialect (`blog ‹offline · sqlite›` / `blog ‹live · mysql›`). SQL ends at a `;`; slash meta-commands cover dialect/format switching, introspection, and the live KV. See the [full `db` reference](db/#ephpm-db-shell) and the [REPL guide](/guides/using-the-db-repl/).
+
+```bash
+ephpm db shell --site blog --config ephpm.toml
+```
+
+Meta-commands: `/dialect [D]`, `/format [F]`, `/tables`, `/schema <table>`, `/kv <ARGS...>`, `/kv-put '<key-tmpl>' [col]`, `/help`, `/quit` (`/exit`, Ctrl-D). `/kv` and `/kv-put` need live mode (a running server) and reach the per-site KV over RESP. `/kv-put` is the **client-side** loop over the last result set — the in-SQL `kv_set()` is a separate, coming feature.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
+| `-c`, `--config <FILE>` | (required) | Config (as for `db query`) |
+| `--dialect <sqlite\|mysql\|pg>` | `sqlite` | Initial dialect; switch with `/dialect`. Live mode is MySQL-only |
+| `--read-only` | off | Refuse any statement that is not a pure read |
+| `--maintenance` | off | Offline-only, unscreened engine access |
+
+---
+
 ## Service Lifecycle
 
 Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows. Every lifecycle command except `status` and `logs` needs root (`sudo`) or an Administrator shell. Without it, it exits `1` with `requires root privileges`.
@@ -446,6 +495,7 @@ The log file is at the path in [Where things live](#where-things-live). On macOS
 | `composer` | The exit code of the embedded installer. See [`composer`](composer/). |
 | `analyze` | `0` pass, `2` quarantine, `3` deny, `1` internal error. See [`analyze`](analyze/). |
 | `exec` | The command's own exit status once it has started, `1` if setup fails. See [`exec`](exec/#exit-status). |
+| `db query`, `db shell` | `0` on success (`db shell` always exits `0` once running — per-statement errors are printed and the session continues). `1` when the transport cannot be established (single-writer violation, bad `--site`, server auth failure) or, for `db query`, when a statement is rejected or errors. |
 | `kv` | `0` on success. Server replies such as `(nil)`, `(empty)` or `key does not exist` count as success. `1` if the server answers with an error (`-ERR`, `-NOAUTH`, …), which is printed as `error: ...` on stderr. |
 | `deploy`, `cache reset` | `0` on success, `1` if the RESP listener is unreachable or returns an error |
 | `install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs` | `0` on success, `1` on any failure (`error: service command failed: ...` on stderr) |
@@ -473,6 +523,11 @@ ephpm deploy         Cluster-wide OPcache invalidation (--site/--all/--rev)
 ephpm cache reset    OPcache reset for one vhost or all (--site/--all)
 ephpm exec           Run a command in a vhost's tenant sandbox (Linux only;
                      --site/--config/--timeout/--no-sandbox)
+ephpm db import      Load a mysqldump/pg_dump into a site (--site/--config/--dialect/...)
+ephpm db query       Run one SQL statement and print the result (--site/--config/
+                     --dialect/--format/--read-only/--maintenance/-e)
+ephpm db shell       Interactive SQL REPL (--site/--config/--dialect/--read-only/
+                     --maintenance; /dialect /format /tables /schema /kv /kv-put /help /quit)
 
 ephpm install        Install + start the system service (--user/--group)
 ephpm uninstall      Remove the service AND delete config/data/logs (--keep-data keeps them)

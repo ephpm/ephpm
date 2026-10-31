@@ -324,12 +324,24 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// no server holds it, so it cannot share any node; its per-site config lives
 /// in the suite's own template (`DbImportFixture`), per #288/#295.
 ///
+/// `db_shell` is here for the same reason: it exercises `ephpm db query` /
+/// `ephpm db shell` both offline (direct-open the per-site file, server down)
+/// and live (server up, forwarding over the MySQL listener + a per-site RESP
+/// `/kv-put` round-trip). It reuses `DbImportFixture`, so it owns the database
+/// file offline exactly as `db_import` does.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
 /// fixtures, and a suite that gets it starts spawning real processes.
-const SELF_MANAGED_SUITES: &[&str] =
-    &["turso_cdc", "bare_process_smoke", "pdo_mysql_proxy", "kv_snapshot_restart", "db_import"];
+const SELF_MANAGED_SUITES: &[&str] = &[
+    "turso_cdc",
+    "bare_process_smoke",
+    "pdo_mysql_proxy",
+    "kv_snapshot_restart",
+    "db_import",
+    "db_shell",
+];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///

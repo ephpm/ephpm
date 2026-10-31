@@ -44,4 +44,4 @@ pub use driver::{ImportOptions, ImportOutcome, ImportStats, OnError, run_import}
 pub use reader::{DumpReader, RawStatement, ReadError};
 pub use report::{CompatReport, Finding, FindingKind, Summary};
 pub use sanitizer::{SanitizeOutcome, Sanitizer};
-pub use sink::{SinkError, StatementSink};
+pub use sink::{Cell, RowSet, SinkError, StatementSink};
