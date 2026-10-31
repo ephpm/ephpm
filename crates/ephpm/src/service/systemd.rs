@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn unit_body_without_owner_omits_user_and_hardening() {
         // Backward compatibility: no `--user` must produce exactly what
-        // pre-#XXX callers got — root, no `User=`/`Group=`, no sandboxing.
+        // pre-#406 callers got — root, no `User=`/`Group=`, no sandboxing.
         let paths = test_paths();
         let body = unit_body(&paths, None);
         assert!(!body.contains("User="));

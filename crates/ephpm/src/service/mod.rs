@@ -677,7 +677,7 @@ pub fn logs(follow: bool) -> Result<()> {
 /// Non-root identity the installed service should run as.
 ///
 /// When `install()` is called with `None`, the generated unit is byte-for-byte
-/// identical to the pre-#XXX output: no `User=`/`Group=`, no sandboxing
+/// identical to the pre-#406 output: no `User=`/`Group=`, no sandboxing
 /// directives, service runs as whatever account performed the (elevated)
 /// install — historically root. Passing `Some` opts into running the service
 /// as `user`/`group` plus a conservative systemd hardening profile (see
