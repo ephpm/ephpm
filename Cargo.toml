@@ -189,6 +189,12 @@ base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 chitchat = "0.10"
 serde_json = "1"
+# Per-site rewrite rules (`[[rewrite]]`): the regex engine for matching request
+# paths. Chosen deliberately for its linear-time guarantee — the engine has no
+# backtracking, so an operator-authored pattern cannot be a ReDoS vector on the
+# per-request hot path. Already resolved in the lock as a transitive dependency,
+# so this is a new direct edge, not a new crate.
+regex = "1"
 async-trait = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"

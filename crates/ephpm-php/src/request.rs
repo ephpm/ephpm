@@ -777,6 +777,42 @@ mod tests {
         assert_eq!(find_var(&vars, "REDIRECT_STATUS"), Some("200"));
     }
 
+    /// A request produced by a `[[rewrite]]` rule (`/l/AAA/BBB/CCC` →
+    /// `l.php?i=AAA/BBB/CCC`): PHP must see the rewritten script and query. The
+    /// router builds exactly these fields from the matched rule — `uri`/`path`/
+    /// `query_string` are the rewrite's, `script_filename` is re-resolved from
+    /// the new path.
+    ///
+    /// `QUERY_STRING` is what PHP's SAPI parses into `$_GET` during request
+    /// startup (via `SG(request_info).query_string`), so asserting it carries
+    /// the captured slashes unencoded is the pure-Rust half of the `$_GET`
+    /// guarantee; the linked-PHP half lives in `ephpm-server`'s
+    /// `rewrite_populates_get_with_slashes_preserved`.
+    #[test]
+    fn rewritten_request_exposes_target_script_and_sliced_query() {
+        let mut req = make_request();
+        req.uri = "/l.php?i=AAA/BBB/CCC".into();
+        req.path = "/l.php".into();
+        req.query_string = "i=AAA/BBB/CCC".into();
+        req.script_filename = PathBuf::from("/var/www/html/l.php");
+
+        let vars = req.server_variables();
+        assert_eq!(find_var(&vars, "REQUEST_URI"), Some("/l.php?i=AAA/BBB/CCC"));
+        assert_eq!(
+            find_var(&vars, "QUERY_STRING"),
+            Some("i=AAA/BBB/CCC"),
+            "slashes in the captured value must survive into QUERY_STRING unencoded"
+        );
+        // Script re-resolution: SCRIPT_NAME/PHP_SELF/SCRIPT_FILENAME are the
+        // rewritten script, not the original request path.
+        assert_eq!(find_var(&vars, "SCRIPT_NAME"), Some("/l.php"));
+        assert_eq!(find_var(&vars, "PHP_SELF"), Some("/l.php"));
+        assert_eq!(
+            PathBuf::from(find_var(&vars, "SCRIPT_FILENAME").unwrap()),
+            PathBuf::from("/var/www/html/l.php")
+        );
+    }
+
     #[test]
     fn test_server_variables_script_paths() {
         let req = make_request();

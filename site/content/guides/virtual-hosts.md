@@ -446,6 +446,70 @@ multi_tenant_hardening = false
 
 > This is **not** a denylist against bugs real apps depend on: `unserialize`, `preg_*`, etc. are *not* disabled. The one structural residual the denylist cannot close is a whole-process crash (e.g. a deep recursive object-graph free overflowing the C stack) — that is a shared-fate availability problem, not a confidentiality one, and needs per-tenant process isolation, which the single-process model does not provide.
 
+## Hosting a legacy `.htaccess` app (Sendy)
+
+ePHPm's default `fallback` is perfect for a single-front-controller framework (Laravel, WordPress, CakePHP). A **pre-front-controller** app — many top-level scripts plus pretty URLs cleaned onto them by Apache `RewriteRule`s — needs two things working together: a `fallback` entry for the generic `/word → word.php` case, and [`[[rewrite]]` rules](/reference/config/#rewrite-rules-rewrite) for the capture-and-query cases. [Sendy](https://sendy.co/) 7.1.6 is the worked example.
+
+Sendy's `.htaccess`:
+
+```apache
+RewriteRule ^([a-zA-Z0-9-]+)$ $1.php [L]              # /subscribe -> subscribe.php
+RewriteRule ^l/([a-zA-Z0-9/]+)$ l.php?i=$1 [L]        # click tracking
+RewriteRule ^t/([a-zA-Z0-9/]+)$ t.php?i=$1 [L]        # open tracking
+RewriteRule ^w/([a-zA-Z0-9/]+)$ w.php?i=$1 [L]        # web version
+RewriteRule ^unsubscribe/(.*)$ unsubscribe.php?i=$1 [L]
+RewriteRule ^subscribe/(.*)$ subscribe.php?i=$1 [L]
+```
+
+Its click/open/unsubscribe links are **multi-segment** — a click URL is `/l/<subscriberID>/<linkID>/<campaignID>` — and the receiving script reads `$_GET['i']` and splits on `/`. So the captured value legitimately contains slashes and must land in `QUERY_STRING` intact.
+
+### Rule 1 is a `fallback` entry, not a rewrite
+
+The generic `^([a-zA-Z0-9-]+)$ → $1.php` rule is just "if `/name` has no file but `/name.php` does, run it". Add `"$uri.php"` to the `fallback` chain and you get it for free — including the `!-f` "only if the file exists" behaviour, which fallback resolution already has:
+
+```toml
+[server]
+fallback = ["$uri", "$uri/", "$uri.php", "/index.php?$query_string"]
+```
+
+Now `GET /subscribe` reaches `subscribe.php`, `GET /login` reaches `login.php`, and `GET /` still serves `index.php`. Do **not** fold this into `[[rewrite]]`.
+
+### Rules 2–6 are `[[rewrite]]` rules
+
+These strip a path prefix and move the remainder into `$_GET['i']` — the capture-and-query case `fallback` cannot express. In **single-site** mode they go under `[server]`:
+
+```toml
+[server]
+document_root = "/var/www/sendy"
+fallback = ["$uri", "$uri/", "$uri.php", "/index.php?$query_string"]
+
+[[server.rewrite]]
+regex = "^/l/([a-zA-Z0-9/]+)$"
+to    = "/l.php?i=${1}"
+
+[[server.rewrite]]
+regex = "^/t/([a-zA-Z0-9/]+)$"
+to    = "/t.php?i=${1}"
+
+[[server.rewrite]]
+regex = "^/w/([a-zA-Z0-9/]+)$"
+to    = "/w.php?i=${1}"
+
+[[server.rewrite]]
+regex = "^/unsubscribe/(.*)$"
+to    = "/unsubscribe.php?i=${1}"
+
+[[server.rewrite]]
+regex = "^/subscribe/(.*)$"
+to    = "/subscribe.php?i=${1}"
+```
+
+`GET /l/AAA/BBB/CCC` now runs `l.php` with `$_GET['i'] === "AAA/BBB/CCC"` and `$_SERVER['QUERY_STRING'] === "i=AAA/BBB/CCC"` — slashes preserved, no redirect. A rewritten `POST /subscribe/x` still delivers its body to `subscribe.php`.
+
+**Multi-tenant:** if Sendy is one vhost among many under `sites_dir`, put the five `[[rewrite]]` rules (spelled `[[rewrite]]`, not `[[server.rewrite]]`) in that vhost's [override file](/reference/config/#per-site-override-files-site_overrides_dir), `<site_overrides_dir>/sendy.toml`. They then apply to the `sendy` vhost only; other tenants are untouched. The `$uri.php` fallback stays in `[server]` and is shared.
+
+See the [`[[rewrite]]` reference](/reference/config/#rewrite-rules-rewrite) for the full semantics (capture syntax, containment, the ReDoS bound, and why a path-regex reverse proxy can't produce the query).
+
 ## Dropping root (`run_as_user`)
 
 Every tenant's PHP runs in one process. By default that process keeps whatever uid it was started with — and if you start it as root (to bind :80/:443), **all tenants run as root**, so `open_basedir` is the only confidentiality wall with no kernel behind it. `run_as_user` removes the root-escalation blast radius: ePHPm binds privileged ports, starts the DB proxies, opens the generated `php.ini`, and creates its runtime directories **as root**, then permanently drops the whole process to an unprivileged uid/gid before it serves a single request.
@@ -693,7 +757,8 @@ When `sites_dir` is not configured, the router behaves identically to today (sin
 
 | Feature | Status |
 |---------|--------|
-| Operator-owned `<site-key>.toml` in `[server] site_overrides_dir` | **Implemented** — carries `document_root` and `auto_prepend_file`. See [Per-site document root](#per-site-document-root-frameworks-with-a-public-directory) and [Per-site `auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) |
+| Operator-owned `<site-key>.toml` in `[server] site_overrides_dir` | **Implemented** — carries `document_root`, `auto_prepend_file`, a `[preview_auth]` gate, `[security] capabilities`, and `[[rewrite]]` rules. See [Per-site document root](#per-site-document-root-frameworks-with-a-public-directory), [Per-site `auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) and [Hosting a legacy `.htaccess` app](#hosting-a-legacy-htaccess-app-sendy) |
+| Per-site `[[rewrite]]` rules | **Implemented** — regex rewrite with capture + query output, for legacy `.htaccess` apps. Also accepted under `[server]` for single-site mode. See [Rewrite rules](/reference/config/#rewrite-rules-rewrite) |
 | Per-site `index_files` / `fallback` | Not implemented. No consumer has asked for it; the global values apply to every site |
 | Per-site PHP resource limits (`memory_limit`, `max_execution_time`) | Not implemented. If it lands it will be named, typed, individually-clamped fields — **not** a free-form `ini` table, for the reason given in [Other per-site configuration](#other-per-site-configuration) |
 | Per-site metrics | Not implemented — a `host` label on Prometheus metrics for per-site traffic visibility |

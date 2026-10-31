@@ -102,7 +102,8 @@ use std::path::{Component, Path, PathBuf};
 /// Drives the "did you mean" hint on an unrecognized key, so it must stay in
 /// step with [`RawOverride`]'s fields — pinned by
 /// [`tests::known_keys_matches_the_parsed_schema`].
-const KNOWN_KEYS: &[&str] = &["document_root", "auto_prepend_file", "preview_auth", "security"];
+const KNOWN_KEYS: &[&str] =
+    &["document_root", "auto_prepend_file", "preview_auth", "security", "rewrite"];
 
 /// Shortest accepted preview-gate `session_secret`, in bytes.
 ///
@@ -211,6 +212,17 @@ pub(crate) struct SiteOverride {
     /// caller ([`crate::router::Router::site_roots`]) owns the previous value
     /// and reports a *transition*, exactly as it does for `document_root`.
     pub(crate) unknown_keys: Vec<String>,
+    /// This site's `[[rewrite]]` rules, as raw (regex, to) strings, in file
+    /// order. Empty when none are declared.
+    ///
+    /// Kept **raw** here — not compiled — for the same reason `preview_gate`
+    /// holds JSON rather than a built module: a compiled
+    /// [`regex::Regex`](ephpm_config::CompiledRewrite) is neither `PartialEq`
+    /// nor cheap to diff, and this struct is `PartialEq` so the router can
+    /// detect an unchanged file across a `SITE_CONFIG_TTL` re-read.
+    /// [`crate::router::resolve_site_roots`] compiles them, failing the one
+    /// site closed (503) on a bad regex or an escaping `to`.
+    pub(crate) rewrites: Vec<ephpm_config::RewriteRule>,
 }
 
 /// The override file's schema.
@@ -228,6 +240,11 @@ struct RawOverride {
     preview_auth: Option<RawPreviewAuth>,
     #[serde(default)]
     security: Option<RawSecurity>,
+    /// Ordered `[[rewrite]]` rules. Each is strict (`deny_unknown_fields` on
+    /// [`ephpm_config::RewriteRule`]), so a typo'd key inside a rule is a TOML
+    /// parse error that fails the file closed, like every other understood key.
+    #[serde(default)]
+    rewrite: Vec<ephpm_config::RewriteRule>,
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -542,6 +559,10 @@ pub(crate) fn load(
         preview_gate_repo,
         unknown_keys,
         unusable: None,
+        // Carried raw; compiled (and failed-closed on error) in
+        // `resolve_site_roots`. A typo'd key inside a `[[rewrite]]` was already
+        // a TOML parse error above (the rule struct is strict).
+        rewrites: raw.rewrite,
     }
 }
 
@@ -1661,6 +1682,8 @@ mod tests {
                 // A TOML table section with one recognized sub-key, so nothing
                 // lands in either the top-level or the section's `unknown` table.
                 "security" => format!("[{key}]\ncapabilities = []\n"),
+                // An array-of-tables, with both of the rule's required keys.
+                "rewrite" => format!("[[{key}]]\nregex = \"^/x$\"\nto = \"/x.php\"\n"),
                 _ => format!("{key} = \"x\"\n"),
             };
             let raw: RawOverride = toml::from_str(&toml).unwrap();
@@ -1672,6 +1695,53 @@ mod tests {
         // And nothing outside the list parses as typed.
         let raw: RawOverride = toml::from_str("some_future_key = \"x\"\n").unwrap();
         assert_eq!(raw.unknown.len(), 1);
+    }
+
+    // ── [[rewrite]] — per-site rewrite rules (v0.13.4) ────────────────────
+
+    /// The rules are carried raw, in file order, and `rewrite` is not reported
+    /// as an unknown key.
+    #[test]
+    fn rewrite_rules_are_parsed_in_order() {
+        let f = fixture();
+        f.write(
+            "[[rewrite]]\nregex = \"^/l/([a-zA-Z0-9/]+)$\"\nto = \"/l.php?i=${1}\"\n\
+             \n[[rewrite]]\nregex = \"^/t/([a-zA-Z0-9/]+)$\"\nto = \"/t.php?i=${1}\"\n",
+        );
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert!(over.unknown_keys.is_empty(), "`rewrite` is a known key");
+        assert_eq!(over.rewrites.len(), 2);
+        assert_eq!(over.rewrites[0].regex, "^/l/([a-zA-Z0-9/]+)$");
+        assert_eq!(over.rewrites[0].to, "/l.php?i=${1}");
+        assert_eq!(over.rewrites[1].to, "/t.php?i=${1}");
+    }
+
+    /// A rule is strict (`deny_unknown_fields`), so a typo'd key inside a
+    /// `[[rewrite]]` is a TOML parse error that fails the file closed — it never
+    /// lands in `unknown_keys`.
+    #[test]
+    fn unknown_key_inside_a_rewrite_rule_fails_the_file() {
+        let f = fixture();
+        f.write("[[rewrite]]\nregex = \"^/x$\"\nto = \"/x.php\"\ntoo = \"oops\"\n");
+        let over = f.load();
+        assert_eq!(
+            over.unusable,
+            Some("override file is not valid TOML"),
+            "a strict rule rejects an unknown sub-key at parse time"
+        );
+    }
+
+    /// A file that declares only `[[rewrite]]` is otherwise a normal, serving
+    /// site (no document-root narrowing, so not unusable).
+    #[test]
+    fn rewrite_only_file_still_serves() {
+        let f = fixture();
+        f.write("[[rewrite]]\nregex = \"^/l/(.*)$\"\nto = \"/l.php?i=${1}\"\n");
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(over.document_root, None, "no narrowing was declared");
+        assert_eq!(over.rewrites.len(), 1);
     }
 
     // ── [preview_auth] — the access gate (issue #487) ─────────────────────

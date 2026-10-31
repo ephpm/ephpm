@@ -13,6 +13,9 @@ serde_json.workspace = true
 figment.workspace = true
 ipnet.workspace = true
 thiserror.workspace = true
+# Per-site `[[rewrite]]` rules compile to linear-time (non-backtracking)
+# regexes — see the workspace manifest for why that matters on the hot path.
+regex.workspace = true
 
 # Serve-mode autotuning probes physical RAM (`GlobalMemoryStatusEx`) and the
 # job-object memory limit (`QueryInformationJobObject`) on Windows, the way it

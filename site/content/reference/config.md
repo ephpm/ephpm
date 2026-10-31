@@ -41,6 +41,7 @@ Mode-selecting string *values* are checked too: an unrecognised `[db.sqlite.repl
 | `run_as_group` | string | (none) | **Unix only.** Numeric gid or group name to drop to alongside `run_as_user`. Defaults to the user's primary group (named user) or the same numeric id as the uid. Only consulted when `run_as_user` is set. |
 | `index_files` | array of strings | `["index.php", "index.html"]` | Index file names to try when a directory is requested. |
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
+| `[[rewrite]]` | array of tables | `[]` | Ordered **regex rewrite rules** evaluated *before* `fallback`, for hosting legacy `.htaccess` apps with multiple top-level scripts. Each rule is `{ regex, to }`; a capture (`${1}`..`${9}`) substitutes into `to`, and a `?` in `to` sets the new `QUERY_STRING` (reaching PHP as `$_GET`, slashes preserved). First-match-wins, internal (never a 3xx), script re-resolved from the new path. Under `[server]` the rules apply in single-site mode; multi-tenant vhosts put them in their [override file](#per-site-override-files-site_overrides_dir). In `ephpm.toml` the TOML spelling is `[[server.rewrite]]`. See [Rewrite rules](#rewrite-rules-rewrite) below. Env: not settable (array of tables). |
 | `preview` | bool | `false` | Preview-host preset for **not-production** PR-preview instances. Adds `X-Ephpm-Preview: 1` to every response, and every `[server.limits]` knob you did not set explicitly resolves to a preview default instead of "off": `max_connections = 256`, `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`, `per_site_burst = 20`. The preset also supplies one `[php]` knob: [`overload = "shed"`](#php), so a saturated preview instance answers `503` + `Retry-After` instead of absorbing requests until the client times out. Explicit values always win — including explicit `0`, which disables that limit even under preview, and an explicit `overload = "wait"`. Startup logs exactly which values the preset supplied. **Behind a load balancer** the preset's `per_ip_max_connections = 32` counts the balancer, not each client, and so caps the whole node — see [Behind a load balancer](#behind-a-load-balancer-or-reverse-proxy). Env override: `EPHPM_SERVER__PREVIEW=true`. |
 | `io_threads` | usize | `0` (tokio default) | Number of async I/O threads (tokio worker threads: accept, HTTP parsing, middleware, static files). Does **not** size PHP execution — that is [`[php] concurrency`](#php) on its own dedicated pool — and leaves tokio's blocking pool alone. `0` keeps tokio's choice: `TOKIO_WORKER_THREADS` when set, else the host's available parallelism (logical CPUs). A non-zero value wins over `TOKIO_WORKER_THREADS`. Startup logs the effective value and its source at INFO (`tokio async I/O threads`). Env override: `EPHPM_SERVER__IO_THREADS=8`. |
 
@@ -54,6 +55,7 @@ Not part of `ephpm.toml`: one `<site_overrides_dir>/<site-key>.toml` per virtual
 | `auto_prepend_file` | path | (none) | A PHP file run before every request to this site, relative to the container. Must resolve to a regular file inside it. Per-request mode only; worker mode warns that it is inert. |
 | `[preview_auth]` | section | (absent = no gate) | Turns the [preview access gate](/guides/virtual-hosts/#preview_auth-the-access-gate) on for this vhost. ePHPm builds a per-site [`preview-gate`](/guides/native-middleware/#preview-gate) instance from it and runs it on the static, PHP and WebSocket paths, fail-closed. Keys below. |
 | `[security] capabilities` | array of strings | `[]` | **Experimental.** Grant this one vhost PHP functions the [multi-tenant hardening preset](/guides/multi-tenant-hardening/#per-site-capabilities-grant-one-tenant-a-hardened-function-experimental) otherwise disables process-wide, gated per request so no other tenant is weakened. Allowlist: `mail`, `fsockopen`, `pfsockopen` (shell-exec and all other hardened functions are never grantable). An **unknown name fails startup**. No grant anywhere = byte-identical `disable_functions`. Grants are read at startup (restart to change). |
+| `[[rewrite]]` | array of tables | `[]` | This vhost's [rewrite rules](#rewrite-rules-rewrite) — the per-site equivalent of `[server] rewrite`, spelled `[[rewrite]]` at the top of the override file. A site that declares any uses its own set in place of the server-level one. A bad regex or an escaping `to` takes **this one site** out of service (503), like any other understood-but-unhonourable key. |
 
 **`[security]` keys.** `capabilities` is the only key. A granted function is moved from the process-global `disable_functions` and gated: only a request to this site may call it; every other tenant gets the same "disabled for security reasons" error as before. This is cooperative-tenant isolation at the ePHPm layer, **not** a kernel boundary. Granting `pfsockopen` to more than one site reintroduces a cross-tenant persistent-socket leak (ePHPm warns). See the [capabilities section of the hardening guide](/guides/multi-tenant-hardening/#per-site-capabilities-grant-one-tenant-a-hardened-function-experimental).
 
@@ -77,6 +79,36 @@ Not part of `ephpm.toml`: one `<site_overrides_dir>/<site-key>.toml` per virtual
 | `exempt_paths` | array of strings | `[]` | Absolute request paths that bypass the gate. Not needed for the default `/_ephpm/auth/…` endpoints, which the gate never sees. |
 
 The OAuth *issuer* that mints the session (`github-auth`, which holds the GitHub OAuth App's client secret) is **not** configured here. It is an out-of-tree module mounted globally under `[[middleware]]` — see the [GitHub auth middleware guide](/guides/github-auth-middleware/).
+
+### Rewrite rules (`[[rewrite]]`)
+
+An ordered list of **regex rewrite rules**, evaluated at routing time **before** the `fallback` chain. This is how you host a legacy `.htaccess` PHP app — one with many top-level scripts and "pretty" URLs — rather than only a single-front-controller framework. Each rule has two keys, both required:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `regex` | string | A regular expression matched against the request's percent-decoded path. Not implicitly anchored — write `^…$` as in `.htaccess`. |
+| `to` | string | The rewrite target: a root-relative path, optionally followed by `?` and a query template. Capture groups from `regex` substitute in as `${1}`..`${9}`. |
+
+**Where they live.** Under `[server]` (spelled `[[server.rewrite]]` in `ephpm.toml`) for single-site mode; in a vhost's [override file](#per-site-override-files-site_overrides_dir) (spelled `[[rewrite]]` there) for multi-tenant mode. A vhost that declares its own rules uses them in place of the server-level set.
+
+**Semantics:**
+
+- **Order, first-match-wins** (Apache `[L]`). Evaluated once, before `fallback`. No match → routing is byte-identical to a build without the feature.
+- **Internal rewrite, never a 3xx.** The client-visible URL does not change.
+- **Capture substitution.** `${1}`..`${9}` in `to` are replaced by the regex's capture groups (the unbraced `$1` and named `$name` forms also work; prefer the **braced** `${N}` so a literal digit immediately after a group is unambiguous — `${1}0` is group 1 then `0`, whereas `$10` is group 10). At least nine groups are supported.
+- **Query output.** If `to` contains `?`, everything after the first `?` becomes the new `QUERY_STRING`, **replacing** the original (Apache's default; not `[QSA]`). It reaches PHP as `$_SERVER['QUERY_STRING']` and is parsed into `$_GET` by PHP's own request startup — **with slashes preserved, not re-encoded**. So `GET /l/AAA/BBB/CCC` with `to = "/l.php?i=${1}"` gives `l.php` both `QUERY_STRING == "i=AAA/BBB/CCC"` and `$_GET['i'] == "AAA/BBB/CCC"`.
+- **The script is re-resolved from the new path**, so `SCRIPT_NAME`, `SCRIPT_FILENAME` and `PATH_INFO` reflect the rewritten target. This is deliberately **different from the native-middleware `rewrite` verdict**, where a `REQUEST_URI` change does *not* re-resolve the script in per-request mode (see the `[[middleware]]` verdict table below). A `[[rewrite]]` runs at routing time, before script resolution; a middleware `rewrite` runs after.
+- **Method and body are preserved** — a rewritten `POST /subscribe/x` still delivers its body to `subscribe.php`.
+
+> **This is why `[[rewrite]]` exists and a path-regex proxy middleware does not suffice.** Traefik's `ReplacePathRegex` (and ePHPm's own native-middleware rewrite) operate on the path only; they percent-encode a `?` in the replacement, producing `REQUEST_URI=/l.php%3Fi=…` with an *empty* `QUERY_STRING`. The query has to be produced by whatever does the rewrite — which is what this feature does.
+
+**Containment and limits (fail-closed):**
+
+- The literal path of `to` (before `?`) must be root-relative and must not escape the document root. A `to` whose static path contains `..`, a backslash or a NUL is a **hard startup error** (`[server] rewrite`) or takes the one site out of service (override file). A bad `regex` is rejected the same way, **naming the offending rule**.
+- Captures are normally substituted into the **query**. If a capture lands in the **path** and the expanded path would escape the document root (a `..` segment), the request is refused `403` — the matched rule still wins (`[L]`), so no later rule is tried.
+- At most **64 rules** per list. The regex engine is linear-time with no backtracking, so a pattern cannot be a ReDoS vector; the rule cap and a per-pattern compiled-size limit bound the remaining cost.
+
+Keep the generic `/word → word.php` rule out of `[[rewrite]]`: add `"$uri.php"` to the `fallback` chain instead, which inherits fallback's "only if the file exists, else fall through" behaviour (exactly Apache's `!-f` condition). See the [Sendy worked example](/guides/virtual-hosts/#hosting-a-legacy-htaccess-app-sendy) for the full rule set.
 
 ### `[server]` — WebSocket entrypoint
 
@@ -1284,7 +1316,7 @@ resolved two-phase plan.
 |---|---|
 | Verdict: continue | Fall off the end of the script, or `return;` |
 | Verdict: respond | `http_response_code(403); echo '...'; exit;` — remaining mounts and the application script are skipped |
-| Verdict: rewrite | Assign to `$_SERVER` (e.g. `$_SERVER['HTTP_X_USER']`). As in the native lane, a `REQUEST_URI` change does not re-resolve the script in per-request mode. |
+| Verdict: rewrite | Assign to `$_SERVER` (e.g. `$_SERVER['HTTP_X_USER']`). As in the native lane, a `REQUEST_URI` change does not re-resolve the script in per-request mode. To change *which script runs* from a path, use a [`[[rewrite]]` rule](#rewrite-rules-rewrite) instead — it runs at routing time, before resolution. |
 | Response headers | `header()`, as in any PHP script |
 | Mount config | `json_decode(ephpm_middleware_config() ?? '{}', true)` — returns `null` outside a middleware file |
 | Path resolution | Relative to the **request's** document root. Absolute paths, `..`, `\`, and drive prefixes are rejected at startup. |

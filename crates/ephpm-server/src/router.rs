@@ -48,6 +48,24 @@ enum Resolved {
     Status(u16),
 }
 
+/// A matched `[[rewrite]]` rule's result, threaded into [`Router::handle_php`]
+/// so the PHP request's `REQUEST_URI` / `QUERY_STRING` / `SCRIPT_NAME` reflect
+/// the rewritten target instead of the original client URI.
+///
+/// Built in [`Router::handle_inner`] before script resolution — which is why a
+/// rewrite re-resolves the script (unlike the native-middleware `REWRITE`
+/// verdict, which rewrites `REQUEST_URI` *after* resolution). `None` at the
+/// call sites means no rule matched, the overwhelmingly common case, and PHP's
+/// `$_SERVER` is derived from the request exactly as before.
+#[derive(Clone)]
+struct AppliedRewrite {
+    /// Rewritten path, e.g. `/l.php`. Already containment-checked.
+    path: String,
+    /// Rewritten query string, e.g. `i=AAA/BBB/CCC`. May be empty (a `to` with
+    /// no `?` clears the query). Delivered to PHP verbatim — slashes preserved.
+    query: String,
+}
+
 /// Compression settings extracted from config.
 #[derive(Clone, Copy)]
 pub struct CompressionSettings {
@@ -273,6 +291,17 @@ pub(crate) struct SiteRoots {
     /// for the overwhelming majority of sites, so the per-request clone of this
     /// struct allocates nothing new.
     pub(crate) unknown_keys: Vec<String>,
+    /// This vhost's compiled [`[[rewrite]]`](ephpm_config::RewriteRule) rules,
+    /// from its override file. Evaluated at routing time before the fallback
+    /// chain (see [`Router::handle`]). Empty for a site that declares none, in
+    /// which case the server-level `[server] rewrite` set applies instead.
+    ///
+    /// Compiled once per [`SITE_CONFIG_TTL`] in [`resolve_site_roots`]; a
+    /// compile failure (bad regex, escaping `to`) sets
+    /// [`unusable`](Self::unusable) so the one site fails closed. Cheap to clone
+    /// per request — the compiled regexes sit behind the `RewriteSet`'s `Vec`,
+    /// and an empty set clones nothing.
+    pub(crate) rewrites: ephpm_config::RewriteSet,
 }
 
 impl SiteRoots {
@@ -288,6 +317,7 @@ impl SiteRoots {
             preview_gate: None,
             preview_gate_repo: None,
             unknown_keys: Vec::new(),
+            rewrites: ephpm_config::RewriteSet::default(),
         }
     }
 
@@ -568,6 +598,14 @@ pub struct Router {
     /// [`Router::handle_websocket_upgrade`].
     self_weak: std::sync::Weak<Router>,
     fallback: Vec<String>,
+    /// Compiled `[server] rewrite` rules — the **single-site** rewrite set,
+    /// applied to every request whose resolved site declares no per-site
+    /// `[[rewrite]]` of its own. Compiled once here from config already
+    /// validated by [`ephpm_config::Config::validate`], so an error at this
+    /// point is unreachable in a normally-started server; it is logged and
+    /// treated as "no rules" (a passthrough, never a routing hole). Empty for
+    /// the overwhelming majority of deployments.
+    server_rewrites: ephpm_config::RewriteSet,
     server_port: u16,
     max_body_size: u64,
     /// `[server.request] middleware_body_limit` — max body bytes buffered and
@@ -1056,14 +1094,36 @@ fn resolve_site_roots(
         },
         None => (None, None),
     };
+    // Compile this site's `[[rewrite]]` rules. Like `document_root`, a rule the
+    // operator wrote and we cannot honour (bad regex, escaping `to`) fails this
+    // ONE site closed (503) rather than silently routing without it — the same
+    // fail-closed-per-site contract the rest of the override file follows. The
+    // error names the offending rule in the WARN.
+    let (rewrites, rewrite_unusable) = if over.rewrites.is_empty() {
+        (ephpm_config::RewriteSet::default(), None)
+    } else {
+        match ephpm_config::rewrite::compile_rules(&over.rewrites) {
+            Ok(set) => (set, None),
+            Err(err) => {
+                tracing::warn!(
+                    site = site_key,
+                    error = %err,
+                    "per-site override has an invalid [[rewrite]] rule — this site will REFUSE \
+                     TO SERVE (503) rather than route without a rewrite the operator declared"
+                );
+                (ephpm_config::RewriteSet::default(), Some("invalid [[rewrite]] rule"))
+            }
+        }
+    };
     SiteRoots {
         document_root: over.document_root.unwrap_or_else(|| container.clone()),
         container,
         auto_prepend_file: over.auto_prepend_file,
-        unusable: over.unusable.or(gate_unusable),
+        unusable: over.unusable.or(gate_unusable).or(rewrite_unusable),
         preview_gate,
         preview_gate_repo: over.preview_gate_repo,
         unknown_keys: over.unknown_keys,
+        rewrites,
     }
 }
 
@@ -1277,6 +1337,17 @@ impl Router {
                 .map(|s| s.to_ascii_lowercase()),
             index_files: config.server.index_files.clone(),
             fallback: config.server.fallback.clone(),
+            // `Config::validate` already compiled these and refused startup on a
+            // bad rule, so this re-compile cannot fail in a real server. If it
+            // somehow does (a Router built in a test without validate()), log
+            // and fall back to no rules rather than route — an empty set is a
+            // safe passthrough.
+            server_rewrites: ephpm_config::rewrite::compile_rules(&config.server.rewrite)
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "[server] rewrite rules failed to compile after \
+                         validate() passed — routing without them (this is a bug)");
+                    ephpm_config::RewriteSet::default()
+                }),
             server_port: port,
             max_body_size: config.server.request.max_body_size,
             middleware_body_limit: config.server.request.middleware_body_limit,
@@ -3202,6 +3273,57 @@ impl Router {
             && site_roots.preview_gate.is_none()
             && self.middleware_chain.is_none();
 
+        // Per-site rewrite rules (`[[rewrite]]`), evaluated HERE — before
+        // static-file / index / fallback resolution — so a matched rule's
+        // target path drives script resolution (`SCRIPT_NAME` /
+        // `SCRIPT_FILENAME`), not just `REQUEST_URI`. This is the deliberate
+        // difference from the native-middleware `REWRITE` verdict, which runs
+        // after resolution and so cannot change which script executes in
+        // per-request mode.
+        //
+        // First-match-wins (Apache `[L]`); the rewrite is internal (never a
+        // 3xx). A site's own rules win; otherwise the server-level `[server]
+        // rewrite` set applies (single-site mode). When nothing matches, the
+        // original path/query flow on unchanged — byte-identical to a build
+        // without the feature.
+        let effective_rewrites = if site_roots.rewrites.is_empty() {
+            &self.server_rewrites
+        } else {
+            &site_roots.rewrites
+        };
+        let rewrite: Option<AppliedRewrite> = if effective_rewrites.is_empty() {
+            None
+        } else {
+            match effective_rewrites.apply(&uri_path) {
+                ephpm_config::RewriteOutcome::NoMatch => None,
+                ephpm_config::RewriteOutcome::Rewrite { path, query } => {
+                    counter!("ephpm_rewrite_applied_total").increment(1);
+                    Some(AppliedRewrite { path, query })
+                }
+                // A rule matched but its substituted path escaped the document
+                // root (a capture produced a `..` segment / NUL / backslash).
+                // `[L]` means no later rule is tried: refuse, fail-closed.
+                ephpm_config::RewriteOutcome::Unsafe => {
+                    counter!("ephpm_rewrite_rejected_total").increment(1);
+                    tracing::warn!(
+                        site = site_key.as_deref().unwrap_or("-"),
+                        path = %uri_path,
+                        "a [[rewrite]] rule matched but its target path escaped the document \
+                         root — refusing the request (403) rather than routing it"
+                    );
+                    let mut resp = error_response(StatusCode::FORBIDDEN, "403 Forbidden");
+                    self.apply_response_headers(&mut resp);
+                    return Ok((resp, "error"));
+                }
+            }
+        };
+        // From here down, routing and the PHP request env see the rewritten
+        // target. When `rewrite` is `None` the originals move through unchanged.
+        let (uri_path, query_string) = match &rewrite {
+            Some(rw) => (rw.path.clone(), rw.query.clone()),
+            None => (uri_path, query_string),
+        };
+
         let (mut response, handler) = match self.resolve_fallback(
             &uri_path,
             &query_string,
@@ -3239,6 +3361,7 @@ impl Router {
                                 site_roots.clone(),
                                 site_key.clone(),
                                 None,
+                                rewrite.clone(),
                             )
                             .await;
 
@@ -3335,6 +3458,7 @@ impl Router {
                             site_roots.clone(),
                             site_key.clone(),
                             None,
+                            rewrite.clone(),
                         )
                         .await;
                     if php_etag_cacheable {
@@ -3645,6 +3769,9 @@ impl Router {
                     connection_id: registered.id.clone(),
                     opcode: None,
                 }),
+                // WebSocket upgrades are resolved before the rewrite stage, so
+                // no `[[rewrite]]` rule applies to them.
+                None,
             )
             .await;
         counter!("ephpm_ws_events_total", "event" => "connect").increment(1);
@@ -3702,6 +3829,9 @@ impl Router {
             roots,
             site_key,
             Some(event),
+            // A WebSocket event's script is already resolved; rewrites do not
+            // apply on this lane.
+            None,
         )
         .await
     }
@@ -3727,6 +3857,7 @@ impl Router {
         roots: SiteRoots,
         site_key: Option<String>,
         ws_event: Option<crate::websocket::WsEvent>,
+        rewrite: Option<AppliedRewrite>,
     ) -> Response<ServerBody>
     where
         B: RequestBody,
@@ -3747,6 +3878,10 @@ impl Router {
             // override that was fully honoured.
             unusable: _,
             unknown_keys: _,
+            // Rewrites are evaluated in `handle_inner` before script
+            // resolution, not here — by the time a request reaches `handle_php`
+            // the path/query already reflect any match (see the `rewrite` arg).
+            rewrites: _,
         } = roots;
         // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
         // default under `[server] preview`). Enforced HERE — the single point
@@ -3779,9 +3914,28 @@ impl Router {
         // `"OTHER"`, so random verbs can't explode the series count or cost
         // a `String` allocation per request on the hot path.
         let method_label: &'static str = method_metric_label(req.method());
-        let mut uri = request_uri_origin_form(&req);
-        let mut path = req.uri().path().to_string();
-        let query_string = req.uri().query().unwrap_or("").to_string();
+        // REQUEST_URI / path / QUERY_STRING come from a matched `[[rewrite]]`
+        // rule when one applies, so the executing script sees the rewritten
+        // target (`/l.php`, `i=AAA/BBB/CCC`) rather than the original client
+        // URI — the query reaches PHP as `$_SERVER['QUERY_STRING']` and `$_GET`
+        // with slashes preserved. With no rewrite (the common case) they are
+        // derived from the request exactly as before. The method and body are
+        // always taken from `req`, so a rewritten POST still delivers its body.
+        let (mut uri, mut path, query_string) = match &rewrite {
+            Some(rw) => {
+                let uri = if rw.query.is_empty() {
+                    rw.path.clone()
+                } else {
+                    format!("{}?{}", rw.path, rw.query)
+                };
+                (uri, rw.path.clone(), rw.query.clone())
+            }
+            None => (
+                request_uri_origin_form(&req),
+                req.uri().path().to_string(),
+                req.uri().query().unwrap_or("").to_string(),
+            ),
+        };
         let protocol = format!("{:?}", req.version());
         let mut headers = extract_headers(req.headers(), &self.ingest_strip_headers);
         let content_type =
@@ -11953,6 +12107,318 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("ephpm-evd-{}", std::process::id())),
+        );
+    }
+
+    // ── per-site rewrite rules (`[[rewrite]]`, v0.13.4) ─────────────────
+
+    /// The Sendy rule set — the acceptance fixture (spec EPHPM-0134).
+    fn sendy_rules() -> Vec<ephpm_config::RewriteRule> {
+        [
+            ("^/l/([a-zA-Z0-9/]+)$", "/l.php?i=${1}"),
+            ("^/t/([a-zA-Z0-9/]+)$", "/t.php?i=${1}"),
+            ("^/w/([a-zA-Z0-9/]+)$", "/w.php?i=${1}"),
+            ("^/unsubscribe/(.*)$", "/unsubscribe.php?i=${1}"),
+            ("^/subscribe/(.*)$", "/subscribe.php?i=${1}"),
+        ]
+        .into_iter()
+        .map(|(regex, to)| ephpm_config::RewriteRule { regex: regex.into(), to: to.into() })
+        .collect()
+    }
+
+    /// Populate a directory with the Sendy docroot: the top-level scripts, a
+    /// front controller, a login script (reached via `$uri.php` fallback) and a
+    /// static asset.
+    fn write_sendy_docroot(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for script in [
+            "l.php",
+            "t.php",
+            "w.php",
+            "subscribe.php",
+            "unsubscribe.php",
+            "index.php",
+            "login.php",
+        ] {
+            std::fs::write(dir.join(script), b"<?php /* sendy */").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("css")).unwrap();
+        std::fs::write(dir.join("css").join("app.css"), b"body{color:red}").unwrap();
+    }
+
+    /// A single-site router whose `[server] rewrite` carries the Sendy rules and
+    /// whose fallback includes `$uri.php` (the clean solution for `word →
+    /// word.php`, deliberately NOT a `[[rewrite]]` rule).
+    fn sendy_single_site_router(dir: &Path) -> Router {
+        write_sendy_docroot(dir);
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec![
+                    "$uri".to_string(),
+                    "$uri/".to_string(),
+                    "$uri.php".to_string(),
+                    "/index.php?$query_string".to_string(),
+                ],
+                rewrite: sendy_rules(),
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.validate().expect("the Sendy single-site config must validate");
+        Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    /// Body of a response as a lossy string — the stub PHP SAPI echoes the
+    /// resolved `script_filename` into it, which is what lets these tests prove
+    /// script re-resolution end-to-end without a linked PHP.
+    async fn body_text(resp: Response<ServerBody>) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn get(uri: &str) -> Request<Empty<Bytes>> {
+        Request::builder().method("GET").uri(uri).body(Empty::<Bytes>::new()).unwrap()
+    }
+
+    /// The core new behaviour: a multi-segment capture lands the remainder in
+    /// the query, and the rewritten path resolves to `l.php` — what Traefik's
+    /// `ReplacePathRegex` cannot do (it would percent-encode the `?`).
+    #[tokio::test]
+    async fn rewrite_multi_segment_runs_target_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = sendy_single_site_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let resp = router.handle(get("/l/AAA/BBB/CCC"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "no redirect — an internal rewrite");
+        assert!(
+            resp.headers().get(hyper::header::LOCATION).is_none(),
+            "must not be a 3xx redirect"
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("l.php"), "the rewritten path must resolve to l.php, got: {body}");
+        assert!(!body.contains("index.php"), "must not fall through to the front controller");
+    }
+
+    /// Each Sendy prefix rewrites to its own script.
+    #[tokio::test]
+    async fn rewrite_each_sendy_prefix_resolves_its_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = sendy_single_site_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        for (uri, script) in [
+            ("/t/AA/BB", "t.php"),
+            ("/w/AA/BB/CC", "w.php"),
+            ("/unsubscribe/AA/BB/CC", "unsubscribe.php"),
+        ] {
+            let resp = router.handle(get(uri), addr, false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = body_text(resp).await;
+            assert!(body.contains(script), "{uri} must resolve to {script}, got: {body}");
+        }
+    }
+
+    /// A rewritten POST still reaches its target script — method and body are
+    /// taken from the request, never from the rewrite.
+    #[tokio::test]
+    async fn rewrite_post_reaches_target_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = sendy_single_site_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/subscribe/x")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Full::new(Bytes::from_static(b"email=a@b.c")))
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("subscribe.php"), "POST must reach subscribe.php, got: {body}");
+        assert!(!body.contains("unsubscribe.php"), "must not land on the unsubscribe script");
+    }
+
+    /// No rule matches: `/` → index.php, a static asset is served verbatim, and
+    /// `/login` resolves via the `$uri.php` fallback — all unchanged by the
+    /// feature.
+    #[tokio::test]
+    async fn rewrite_no_match_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = sendy_single_site_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let resp = router.handle(get("/"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_text(resp).await.contains("index.php"), "/ must serve the front controller");
+
+        let resp = router.handle(get("/css/app.css"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_text(resp).await, "body{color:red}", "static asset served verbatim");
+
+        let resp = router.handle(get("/login"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            body_text(resp).await.contains("login.php"),
+            "/login resolves via the $uri.php fallback, not a rewrite rule"
+        );
+    }
+
+    /// With no rules configured, routing is byte-identical to a build without
+    /// the feature — the empty-set fast path is a true no-op.
+    #[tokio::test]
+    async fn rewrite_empty_set_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sendy_docroot(dir.path());
+        // `test_router` has no `[server] rewrite` and the default fallback.
+        let router = test_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // `/l/AAA/BBB/CCC` has no matching file and no rule — the default
+        // fallback sends it to the front controller.
+        let resp = router.handle(get("/l/AAA/BBB/CCC"), addr, false).await.unwrap();
+        let body = body_text(resp).await;
+        assert!(body.contains("index.php"), "without rules it falls through, got: {body}");
+    }
+
+    /// A per-site override file's `[[rewrite]]` rules apply to that vhost only,
+    /// on the lazy unknown-host discovery path — the same model as per-site
+    /// capabilities.
+    #[tokio::test]
+    async fn per_site_rewrite_is_isolated_to_its_vhost() {
+        let base = tempfile::tempdir().unwrap();
+        let sites = base.path().join("sites");
+        let overrides = base.path().join("overrides");
+        std::fs::create_dir_all(&overrides).unwrap();
+        write_sendy_docroot(&sites.join("sendy"));
+        write_sendy_docroot(&sites.join("other"));
+        std::fs::write(
+            overrides.join("sendy.toml"),
+            "[[rewrite]]\nregex = \"^/l/([a-zA-Z0-9/]+)$\"\nto = \"/l.php?i=${1}\"\n",
+        )
+        .unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: sites.clone(),
+                sites_dir: Some(sites.clone()),
+                site_overrides_dir: Some(overrides),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "/index.php?$query_string".to_string()],
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // `sendy` has the rule → `/l/A/B/C` runs l.php.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/l/A/B/C")
+            .header("host", "sendy")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_text(resp).await.contains("l.php"), "sendy's rule must apply");
+
+        // `other` has no override → no rule → falls through to index.php.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/l/A/B/C")
+            .header("host", "other")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        let body = body_text(resp).await;
+        assert!(body.contains("index.php"), "the other vhost must be unaffected, got: {body}");
+    }
+
+    /// A per-site override with an invalid `[[rewrite]]` rule fails that **one**
+    /// site closed (503) rather than routing it without the rule — the same
+    /// fail-closed-per-site contract `document_root` follows.
+    #[tokio::test]
+    async fn per_site_bad_rewrite_makes_the_site_unusable() {
+        let base = tempfile::tempdir().unwrap();
+        let sites = base.path().join("sites");
+        let overrides = base.path().join("overrides");
+        std::fs::create_dir_all(&overrides).unwrap();
+        write_sendy_docroot(&sites.join("sendy"));
+        std::fs::write(
+            overrides.join("sendy.toml"),
+            "[[rewrite]]\nregex = \"^/l/([a-z\"\nto = \"/l.php?i=${1}\"\n",
+        )
+        .unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: sites.clone(),
+                sites_dir: Some(sites.clone()),
+                site_overrides_dir: Some(overrides),
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "sendy")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a bad [[rewrite]] rule must take the one site out of service"
+        );
+    }
+
+    /// A linked-PHP end-to-end check that the rewritten query reaches `$_GET`
+    /// with its slashes intact. Runs only in the PHP-linked (nightly) build;
+    /// the stub SAPI cannot execute `l.php`.
+    #[cfg(php_linked)]
+    #[tokio::test]
+    async fn rewrite_populates_get_with_slashes_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build the router first (the helper lays down the stub docroot), then
+        // replace l.php with a script that echoes what we assert on.
+        let router = sendy_single_site_router(dir.path());
+        std::fs::write(
+            dir.path().join("l.php"),
+            b"<?php echo $_GET['i'], '|', $_SERVER['QUERY_STRING'];",
+        )
+        .unwrap();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let resp = router.handle(get("/l/AAA/BBB/CCC"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_text(resp).await,
+            "AAA/BBB/CCC|i=AAA/BBB/CCC",
+            "$_GET['i'] and QUERY_STRING must carry the captured slashes unencoded"
         );
     }
 
