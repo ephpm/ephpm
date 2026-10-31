@@ -229,6 +229,7 @@ ephpm-analyze = { path = "crates/ephpm-analyze" }
 ephpm-cluster = { path = "crates/ephpm-cluster" }
 ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }
+ephpm-dbimport = { path = "crates/ephpm-dbimport" }
 ephpm-kv = { path = "crates/ephpm-kv" }
 ephpm-middleware = { path = "crates/ephpm-middleware" }
 ephpm-middleware-builtins = { path = "crates/ephpm-middleware-builtins" }

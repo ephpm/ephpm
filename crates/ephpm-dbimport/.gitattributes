@@ -1,0 +1,4 @@
+# Dump fixtures are parsed byte-for-byte (tab-delimited COPY data, LF line
+# comments). Pin them to LF so a Windows checkout with autocrlf=true cannot
+# rewrite the line endings out from under the splitter tests.
+tests/fixtures/** text eol=lf
