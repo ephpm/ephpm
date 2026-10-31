@@ -8,6 +8,10 @@ use serde::Deserialize;
 #[cfg(test)]
 mod test_env;
 
+pub mod rewrite;
+
+pub use rewrite::{CompiledRewrite, RewriteOutcome, RewriteRule, RewriteSet};
+
 /// Top-level config sections — the only first segments an `EPHPM_*`
 /// environment variable can map to. Keep in sync with the fields of
 /// [`Config`] (pinned by `config_top_level_sections_match_struct`).
@@ -621,6 +625,35 @@ pub struct ServerConfig {
     /// Default: `["$uri", "$uri/", "/index.php?$query_string"]`
     #[serde(default = "default_fallback")]
     pub fallback: Vec<String>,
+
+    /// Ordered **rewrite rules** evaluated at routing time, *before* the
+    /// [`fallback`](Self::fallback) chain. Each rule is a `regex` matched
+    /// against the request's (percent-decoded) path and a `to` target with
+    /// capture substitution (`${1}`..`${9}`) and optional query output:
+    ///
+    /// ```toml
+    /// [[rewrite]]
+    /// regex = "^/l/([a-zA-Z0-9/]+)$"
+    /// to    = "/l.php?i=${1}"
+    /// ```
+    ///
+    /// First-match-wins (Apache `[L]`); the rewrite is internal (never a `3xx`)
+    /// and the script is re-resolved from the new path. If `to` contains `?`,
+    /// everything after it *replaces* the query string and reaches PHP as
+    /// `QUERY_STRING` / `$_GET` with slashes preserved. This is the mechanism
+    /// for hosting a legacy `.htaccess` app (e.g. Sendy) with multiple
+    /// top-level scripts; see [`crate::rewrite`] and the reference docs.
+    ///
+    /// Here under `[server]` the rules apply in **single-site** mode. In
+    /// multi-tenant mode (`sites_dir`) a vhost's rules live in its operator-
+    /// owned override file (`<site_overrides_dir>/<site-key>.toml`) instead, and
+    /// a site that declares any uses those in place of this list.
+    ///
+    /// A malformed `regex`, or a `to` whose static path escapes the document
+    /// root, is a hard startup error naming the rule. Empty (the default) =
+    /// routing is byte-identical to a build without the feature.
+    #[serde(default)]
+    pub rewrite: Vec<RewriteRule>,
 
     /// Preview-host preset (`[server] preview = true`).
     ///
@@ -4789,6 +4822,15 @@ impl Config {
         )?;
         validate_metrics_listener(&self.server.metrics)?;
 
+        // [server] rewrite: compile every rule now so a bad regex or a `to`
+        // target that escapes the document root is a hard startup error naming
+        // the rule, never a silent skip on the request path. (Per-site override
+        // files carry their own `[[rewrite]]` rules and fail that one site
+        // closed instead — see `ephpm-server`'s `site_overrides`.)
+        rewrite::compile_rules(&self.server.rewrite).map_err(|e| {
+            ConfigError::Validation(format!("[server] rewrite rule is invalid: {e}"))
+        })?;
+
         // [server.tenant_network] ebpf_policy: fail closed, never a silent
         // no-op. The runtime-capability gate (kernel too old / no BTF / missing
         // CAP_BPF) can't be decided from config alone — that is a hard startup
@@ -5541,6 +5583,7 @@ impl Default for ServerConfig {
             index_files: default_index_files(),
             websocket_files: default_websocket_files(),
             fallback: default_fallback(),
+            rewrite: Vec::new(),
             preview: false,
             io_threads: 0,
             request: RequestConfig::default(),
@@ -9292,6 +9335,11 @@ listen = "0.0.0.0:8080"
                 "[[middleware]]\nlibrary = \"jwt\"\norder = 10\nbogus_key = 1\n",
                 "bogus_key",
             ),
+            (
+                "[[server.rewrite]]",
+                "[[server.rewrite]]\nregex = \"^/l/(.*)$\"\nto = \"/l.php?i=${1}\"\nbogus_key = 1\n",
+                "bogus_key",
+            ),
         ];
 
         for (section, toml, key) in cases {
@@ -9302,6 +9350,55 @@ listen = "0.0.0.0:8080"
                  find the typo, got: {err}"
             );
         }
+    }
+
+    /// A malformed `[[rewrite]]` regex must be a hard startup error from
+    /// `validate()` naming the rule — never a silent skip on the request path.
+    #[test]
+    fn server_rewrite_bad_regex_fails_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[server.rewrite]]\nregex = \"^/l/([a-z\"\nto = \"/l.php?i=${1}\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap().validate().expect_err("bad regex must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("rewrite"), "error must mention rewrite: {msg}");
+        assert!(msg.contains("regex does not compile"), "error must say why: {msg}");
+    }
+
+    /// A `to` target whose static path escapes the document root must be a hard
+    /// startup error, not a traversal primitive discovered at request time.
+    #[test]
+    fn server_rewrite_escaping_target_fails_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[server.rewrite]]\nregex = \"^/x/(.*)$\"\nto = \"/../etc/p.php?i=${1}\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap().validate().expect_err("escaping `to` must fail");
+        assert!(err.to_string().contains("rewrite"), "error must mention rewrite: {err}");
+    }
+
+    /// The five Sendy rules under `[server]` must load and validate cleanly.
+    #[test]
+    fn server_rewrite_sendy_rules_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[server.rewrite]]\nregex = \"^/l/([a-zA-Z0-9/]+)$\"\nto = \"/l.php?i=${1}\"\n\
+             \n[[server.rewrite]]\nregex = \"^/unsubscribe/(.*)$\"\n\
+             to = \"/unsubscribe.php?i=${1}\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.rewrite.len(), 2);
+        config.validate().expect("the Sendy rules must validate");
     }
 
     /// Strictness must not cost the `EPHPM_` env-var override lane. Figment's
