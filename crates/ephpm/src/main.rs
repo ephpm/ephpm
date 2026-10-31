@@ -38,7 +38,10 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod db_console;
 mod db_import;
+mod db_query;
+mod db_shell;
 mod dev_xdebug;
 mod exec_sandbox;
 mod ext_ini;
@@ -269,7 +272,8 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// Database tooling (currently: import a SQL dump into a site)
+    /// Database tooling: import a SQL dump, run a one-shot query, or open an
+    /// interactive SQL shell against a virtual host's embedded database.
     Db {
         #[command(subcommand)]
         command: DbCommand,
@@ -439,6 +443,55 @@ enum OnErrorOpt {
     Skip,
 }
 
+/// Dialect selector for `ephpm db query` / `ephpm db shell`. Defaults to
+/// `sqlite` (the engine's native tongue) — distinct from `db import`, which
+/// sniffs the dump header.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum QueryDialectOpt {
+    /// Run straight against the Turso engine, no litewire translation.
+    Sqlite,
+    /// Translate MySQL SQL through litewire.
+    Mysql,
+    /// Translate PostgreSQL SQL through litewire.
+    Pg,
+}
+
+impl QueryDialectOpt {
+    /// Map onto the shared [`ephpm_dbimport::Dialect`].
+    fn to_dialect(self) -> ephpm_dbimport::Dialect {
+        match self {
+            Self::Sqlite => ephpm_dbimport::Dialect::Sqlite,
+            Self::Mysql => ephpm_dbimport::Dialect::MySql,
+            Self::Pg => ephpm_dbimport::Dialect::Pg,
+        }
+    }
+}
+
+/// Output format for `ephpm db query`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum FormatOpt {
+    /// Aligned, human-readable columns (the default).
+    Table,
+    /// Tab-separated values with a header row.
+    Tsv,
+    /// RFC 4180 comma-separated values.
+    Csv,
+    /// A JSON array of row objects.
+    Json,
+}
+
+impl FormatOpt {
+    /// Map onto the console's [`db_console::Format`].
+    fn to_format(self) -> db_console::Format {
+        match self {
+            Self::Table => db_console::Format::Table,
+            Self::Tsv => db_console::Format::Tsv,
+            Self::Csv => db_console::Format::Csv,
+            Self::Json => db_console::Format::Json,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum DbCommand {
     /// Import a `mysqldump` / `pg_dump` SQL file into a virtual host's
@@ -497,6 +550,83 @@ enum DbCommand {
         /// Also list dropped safe-no-op findings (otherwise only counted).
         #[arg(long)]
         verbose: bool,
+    },
+
+    /// Run one SQL statement (or a `;`-separated batch) against a virtual
+    /// host's embedded database and print the result set.
+    ///
+    /// The transport mirrors `ephpm php --site`: with a server running, the SQL
+    /// is forwarded over its MySQL listener (MySQL dialect only); with no
+    /// server, the site's database file is opened directly (any dialect,
+    /// including `sqlite`-native). A `sqlite`/`pg` request while a server is up
+    /// is a clear error, never a silent fallback (single-writer rule). Pass the
+    /// SQL positionally, with `-e`, or on stdin.
+    Query {
+        /// The vhost key (directory name under `[server] sites_dir`).
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file.
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// SQL dialect. `sqlite` runs native against the engine; `mysql`/`pg`
+        /// translate via litewire. Live mode is MySQL-only.
+        #[arg(long, value_enum, default_value = "sqlite")]
+        dialect: QueryDialectOpt,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: FormatOpt,
+
+        /// Refuse any statement that is not a pure read (SELECT / WITH / VALUES
+        /// / EXPLAIN / SHOW / DESCRIBE).
+        #[arg(long)]
+        read_only: bool,
+
+        /// Offline-only: drop statement screening so engine-maintenance SQL
+        /// (`PRAGMA integrity_check`, `wal_checkpoint`, path-PRAGMAs) can run.
+        /// Refused while a server is up or in per-site clustered mode.
+        #[arg(long)]
+        maintenance: bool,
+
+        /// The SQL to run. Alternatively pass it positionally or on stdin.
+        #[arg(long, short = 'e', value_name = "SQL")]
+        execute: Option<String>,
+
+        /// The SQL to run (positional). Omit to read it from `-e` or stdin.
+        #[arg(value_name = "SQL")]
+        sql: Option<String>,
+    },
+
+    /// Open an interactive SQL shell (REPL) against a virtual host's embedded
+    /// database.
+    ///
+    /// Same transport and single-writer rules as `db query`. The prompt shows
+    /// the mode and dialect (`blog ‹offline · sqlite›`). Slash meta-commands:
+    /// `/dialect`, `/format`, `/tables`, `/schema`, `/kv`, `/kv-put`, `/help`,
+    /// `/quit`. See `ephpm help db` and the REPL guide.
+    Shell {
+        /// The vhost key (directory name under `[server] sites_dir`).
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file.
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// Initial SQL dialect (`sqlite` native by default; live mode forces
+        /// `mysql`). Switch at runtime with `/dialect`.
+        #[arg(long, value_enum, default_value = "sqlite")]
+        dialect: QueryDialectOpt,
+
+        /// Refuse any statement that is not a pure read.
+        #[arg(long)]
+        read_only: bool,
+
+        /// Offline-only: drop statement screening (see `db query --maintenance`).
+        #[arg(long)]
+        maintenance: bool,
     },
 }
 
@@ -635,45 +765,7 @@ fn run() -> anyhow::Result<ExitCode> {
             ensure_cli_tracing();
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
         }
-        Some(Commands::Db {
-            command:
-                DbCommand::Import {
-                    dump,
-                    site,
-                    config,
-                    dialect,
-                    gzip,
-                    on_error,
-                    dry_run,
-                    batch_size,
-                    report,
-                    defer_indexes,
-                    verbose,
-                },
-        }) => {
-            ensure_cli_tracing();
-            let req = db_import::ImportRequest {
-                dump,
-                site,
-                config,
-                dialect: match dialect {
-                    DialectOpt::Auto => db_import::DialectArg::Auto,
-                    DialectOpt::Mysql => db_import::DialectArg::MySql,
-                    DialectOpt::Pg => db_import::DialectArg::Pg,
-                },
-                gzip,
-                on_error: match on_error {
-                    OnErrorOpt::Stop => db_import::OnErrorArg::Stop,
-                    OnErrorOpt::Skip => db_import::OnErrorArg::Skip,
-                },
-                dry_run,
-                batch_size,
-                report,
-                defer_indexes,
-                verbose,
-            };
-            db_import::run(&req)
-        }
+        Some(Commands::Db { command }) => run_db(command),
         // Snapshot operations are blocking (file I/O, a blocking HTTP
         // client) and must run outside the tokio runtime the RESP commands
         // use.
@@ -728,6 +820,76 @@ fn run() -> anyhow::Result<ExitCode> {
         // arguments, so this default never executes under SCM/systemd/launchd.
         None => run_dev(None, None, 8080, None, 0, &dev_xdebug::XdebugArgs::default()),
         other @ Some(Commands::Serve { .. }) => run_serve_sync(other),
+    }
+}
+
+/// Dispatch an `ephpm db` subcommand (`import` / `query` / `shell`).
+fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
+    ensure_cli_tracing();
+    match command {
+        DbCommand::Import {
+            dump,
+            site,
+            config,
+            dialect,
+            gzip,
+            on_error,
+            dry_run,
+            batch_size,
+            report,
+            defer_indexes,
+            verbose,
+        } => {
+            let req = db_import::ImportRequest {
+                dump,
+                site,
+                config,
+                dialect: match dialect {
+                    DialectOpt::Auto => db_import::DialectArg::Auto,
+                    DialectOpt::Mysql => db_import::DialectArg::MySql,
+                    DialectOpt::Pg => db_import::DialectArg::Pg,
+                },
+                gzip,
+                on_error: match on_error {
+                    OnErrorOpt::Stop => db_import::OnErrorArg::Stop,
+                    OnErrorOpt::Skip => db_import::OnErrorArg::Skip,
+                },
+                dry_run,
+                batch_size,
+                report,
+                defer_indexes,
+                verbose,
+            };
+            db_import::run(&req)
+        }
+        DbCommand::Query {
+            site,
+            config,
+            dialect,
+            format,
+            read_only,
+            maintenance,
+            execute,
+            sql,
+        } => db_query::run(db_query::QueryRequest {
+            site,
+            config,
+            dialect: dialect.to_dialect(),
+            format: format.to_format(),
+            read_only,
+            maintenance,
+            // An explicit `-e` wins over a positional argument.
+            sql: execute.or(sql),
+        }),
+        DbCommand::Shell { site, config, dialect, read_only, maintenance } => {
+            db_shell::run(db_shell::ShellRequest {
+                site,
+                config,
+                dialect: dialect.to_dialect(),
+                read_only,
+                maintenance,
+            })
+        }
     }
 }
 

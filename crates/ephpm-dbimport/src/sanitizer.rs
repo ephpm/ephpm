@@ -87,6 +87,13 @@ impl Sanitizer {
         match self.dialect {
             Dialect::MySql => self.sanitize_mysql(flat, line),
             Dialect::Pg => self.sanitize_pg(flat, line),
+            // `db import` never constructs a `Sqlite` sanitizer (only `sniff`
+            // or an explicit `--dialect mysql|pg` feeds this crate); `Sqlite`
+            // exists purely for the `db query`/`db shell` consoles, which run
+            // SQL raw and never touch the sanitizer. If one ever reaches here,
+            // the statement is already the engine's own dialect — emit it as-is
+            // rather than misapplying MySQL/PG rewrites.
+            Dialect::Sqlite => SanitizeOutcome::Emit(vec![flat.to_string()]),
         }
     }
 

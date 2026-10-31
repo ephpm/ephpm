@@ -17,6 +17,16 @@ pub enum Dialect {
     MySql,
     /// A `pg_dump` file (PostgreSQL).
     Pg,
+    /// SQLite / Turso — the embedded engine's own dialect.
+    ///
+    /// Never produced by [`sniff`] (no dump tool emits a SQLite banner here)
+    /// and never used by `db import` (which only loads MySQL/PostgreSQL dumps).
+    /// It exists for the interactive `ephpm db query` / `ephpm db shell`
+    /// consoles, whose default dialect is the engine's native tongue: a
+    /// `sqlite` statement is run straight against the Turso engine with **no**
+    /// litewire translation, whereas `mysql`/`pg` go through the translating
+    /// [`Session`](https://docs.rs/litewire).
+    Sqlite,
 }
 
 impl Dialect {
@@ -26,6 +36,7 @@ impl Dialect {
         match self {
             Self::MySql => "mysql",
             Self::Pg => "pg",
+            Self::Sqlite => "sqlite",
         }
     }
 }
@@ -102,6 +113,24 @@ mod tests {
 
     #[test]
     fn returns_none_for_an_ambiguous_header() {
+        assert_eq!(sniff(b"INSERT INTO t VALUES (1);\n"), None);
+    }
+
+    #[test]
+    fn dialect_names_are_stable() {
+        assert_eq!(Dialect::MySql.as_str(), "mysql");
+        assert_eq!(Dialect::Pg.as_str(), "pg");
+        assert_eq!(Dialect::Sqlite.as_str(), "sqlite");
+    }
+
+    #[test]
+    fn sniff_never_returns_sqlite() {
+        // No dump tool emits a SQLite banner, so `sniff` must never produce the
+        // console-only `Sqlite` variant — `db import`'s auto path would then
+        // feed it to a MySQL/PG translator. Exercise both real banners plus the
+        // ambiguous fallback.
+        assert_ne!(sniff(b"-- MySQL dump 10.13\n"), Some(Dialect::Sqlite));
+        assert_ne!(sniff(b"-- PostgreSQL database dump\n"), Some(Dialect::Sqlite));
         assert_eq!(sniff(b"INSERT INTO t VALUES (1);\n"), None);
     }
 }
