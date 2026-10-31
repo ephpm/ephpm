@@ -159,9 +159,14 @@ async fn mysqldump_imports_and_rows_round_trip() {
     assert!(report.summary.unsupported >= 1, "trigger should be Unsupported: {report:?}");
     assert!(report.summary.downgraded >= 1, "ENUM column should be Downgraded: {report:?}");
 
-    // Now serve the site and read the imported rows back over HTTP.
+    // Now serve the site and read the imported rows back over HTTP. The client
+    // carries an explicit timeout so a serving-side hang fails this test in
+    // seconds rather than wedging until the CI job's hour-long kill.
     fixture.serve().await.expect("serve");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build http client")
         .get(format!("{}/index.php", fixture.base_url()))
         .header("Host", fixture.site())
         .send()
@@ -193,7 +198,7 @@ async fn pgdump_dry_run_reports_compatibility() {
         return;
     };
 
-    let fixture =
+    let mut fixture =
         DbImportFixture::prepare(&binary, "pgshop", VHOST_INDEX_PHP).expect("prepare fixture");
     let dump = fixture.scratch_dir().join("pg.sql");
     std::fs::write(&dump, fake_pgdump()).expect("write dump");

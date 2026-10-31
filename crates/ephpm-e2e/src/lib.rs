@@ -300,10 +300,22 @@ impl DbImportFixture {
     /// running (offline direct-open) — the state right after
     /// [`prepare`](Self::prepare).
     ///
+    /// Releasing the port reservation first is load-bearing: `db import`
+    /// decides between the offline direct-open and the live-server wire path by
+    /// TCP-probing the configured `mysql_listen` port, and the reservation holds
+    /// a *listener* on it that accepts the probe. Left held, the import would
+    /// pick the wire path and block forever on a MySQL handshake the reservation
+    /// socket never answers. The import binds nothing itself, so dropping the
+    /// reservation here (rather than in [`serve`](Self::serve)) costs nothing and
+    /// makes "the server is down" actually true for the probe.
+    ///
     /// # Errors
     ///
     /// Fails if the subprocess cannot be spawned.
-    pub fn import(&self, dump: &Path, extra_args: &[&str]) -> Result<std::process::Output> {
+    pub fn import(&mut self, dump: &Path, extra_args: &[&str]) -> Result<std::process::Output> {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
         Command::new(&self.binary)
             .args(["db", "import"])
             .arg(dump)

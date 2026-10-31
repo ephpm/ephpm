@@ -51,6 +51,16 @@ use mysql_async::prelude::Queryable;
 /// wedged listener).
 const REACHABILITY_TIMEOUT: Duration = Duration::from_millis(400);
 
+/// How long to wait for the MySQL connect **and handshake** to complete before
+/// giving up. [`server_reachable`] only proves the port accepts a TCP
+/// connection, not that an ePHPm MySQL listener is behind it: anything that
+/// accepts but never sends a greeting (a mis-probed port, a wedged or wrong
+/// service) would otherwise block the handshake read forever — `mysql_async`
+/// has no default handshake timeout. A co-located loopback listener greets in
+/// well under this, so the ceiling only fires on a dead or impostor port, where
+/// failing loudly beats hanging.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// SQLSTATE reported for a client-side (connection/driver) failure, matching
 /// what a MySQL client library reports for its own errors.
 const CLIENT_SQLSTATE: [u8; 5] = *b"HY000";
@@ -317,7 +327,20 @@ impl RemoteMysqlBackend {
             .tcp_port(addr.port())
             .user(Some(user.to_string()))
             .pass(Some(password.to_string()));
-        let conn = mysql_async::Conn::new(opts).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Bound the whole connect+handshake: `server_reachable` only proved the
+        // port accepts TCP, so a port that accepts but never greets (a wedged or
+        // non-ePHPm service) must fail here rather than hang the handshake read
+        // forever (`mysql_async` applies no handshake timeout of its own).
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(opts))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out after {CONNECT_TIMEOUT:?} connecting to the server's MySQL listener \
+                     at {addr}: the port accepts connections but did not complete a MySQL \
+                     handshake — is an ePHPm server actually listening there?"
+                )
+            })?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self { conn: tokio::sync::Mutex::new(conn) })
     }
 }
