@@ -433,8 +433,30 @@ impl ClusterHandle {
         // flush the coalescing write queue here — while it and chitchat are
         // still live — or the last up-to-`DRAIN_IDLE` of queued small-tier KV
         // writes never reach gossip state and are lost on restart.
-        self.writer.flush(&chitchat, &self.self_id).await;
+        self.flush_gossip_writer().await;
         tracing::info!(node_id = %self.self_id, "announced drain to the cluster");
+    }
+
+    /// Drain this node's coalescing gossip-write queue into chitchat state now,
+    /// without announcing a leave.
+    ///
+    /// The gossip writer batches a node's small-tier KV writes and applies them
+    /// to chitchat state on a timer (every [`DRAIN_IDLE`](crate::gossip_writer)
+    /// at the latest). On a graceful shutdown the writer task is stopped moments
+    /// later, so without an explicit flush the last up-to-`DRAIN_IDLE` of queued
+    /// writes never reach gossip state and are lost to peers on restart (#656).
+    ///
+    /// [`mark_draining`](Self::mark_draining) already calls this as part of the
+    /// per-site clustered leave; clustered modes that announce no leave
+    /// (whole-database clustered, KV-only clustered) must call it directly on
+    /// drain. It is **idempotent and bounded** — it drains a finite queue and is
+    /// a no-op when the queue is empty, so calling it twice (announce then
+    /// shutdown) cannot double-apply or hang. A concurrent `enqueue` after it
+    /// starts is not waited for; the caller is shutting down, so no new local
+    /// writes are expected.
+    pub async fn flush_gossip_writer(&self) {
+        let chitchat = self.handle.chitchat();
+        self.writer.flush(&chitchat, &self.self_id).await;
     }
 
     /// Whether [`mark_draining`](Self::mark_draining) has run on this node.
@@ -498,6 +520,12 @@ impl ClusterHandle {
 
     /// Gracefully shut down the gossip protocol.
     pub async fn shutdown(self) {
+        // #656: flush the coalescing write queue into chitchat state *before*
+        // the writer task is aborted, or the last up-to-`DRAIN_IDLE` of queued
+        // small-tier KV writes are dropped. Idempotent with any earlier flush
+        // (`mark_draining`, or the server's per-mode drain flush): an empty
+        // queue drains to a no-op.
+        self.flush_gossip_writer().await;
         self.writer_task.abort();
         let _ = self.handle.shutdown().await;
     }
@@ -693,5 +721,71 @@ mod tests {
         let status = CatchUpStatus { peers: vec![peer("a", true), peer("b", true)] };
         assert!(status.complete());
         assert_eq!(status.pending(), Vec::<&str>::new());
+    }
+
+    /// #656: a graceful `shutdown` must flush the gossip writer's coalescing
+    /// queue into chitchat state before aborting the drain task, in a
+    /// non-per-site clustered configuration (whole-database / KV-only
+    /// clustered, which announce no leave). Without the flush, a small-tier KV
+    /// write queued just before shutdown is dropped and never reaches peers.
+    #[tokio::test]
+    async fn shutdown_flushes_queued_gossip_writes() {
+        use crate::gossip_kv::{KV_PREFIX, encode_value};
+
+        // An ephemeral loopback port for this single-node cluster.
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("bind ephemeral udp port")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let config = ClusterConfig {
+            enabled: true,
+            bind: format!("127.0.0.1:{port}"),
+            join: vec![],
+            secret: String::new(),
+            allow_insecure_no_auth: false,
+            node_id: "flush-656".to_string(),
+            cluster_id: "flush-656-cluster".to_string(),
+            ..ClusterConfig::default()
+        };
+        let handle = start_gossip(&config).await.expect("gossip start");
+
+        // Stop the background drain/sweep task so that the *only* thing that can
+        // move the queued write into chitchat state is the flush on `shutdown`.
+        // Without this the 50 ms drain tick (or the write's own `notify`) could
+        // drain it and mask a missing flush.
+        handle.writer_task.abort();
+        tokio::task::yield_now().await;
+
+        // Queue a small-tier KV write the way a local `SET` does, and do not
+        // wait for any drain.
+        let key = format!("{KV_PREFIX}regression-656");
+        let stamp = handle.clock.next();
+        assert!(
+            handle.writer.enqueue_set(key.clone(), encode_value(b"v656", 0, stamp.write), 0, stamp),
+            "write should queue, not shed"
+        );
+        // It is only queued, not yet in chitchat state.
+        {
+            let chitchat = handle.handle.chitchat();
+            let mut guard = chitchat.lock().await;
+            assert!(
+                guard.self_node_state().get(&key).is_none(),
+                "write must still be queued (not yet drained) before shutdown"
+            );
+        }
+
+        // Retain the chitchat state Arc so it outlives the handle: `shutdown`
+        // consumes the handle and stops the gossip task, but the shared state
+        // survives in this Arc for the assertion.
+        let chitchat = handle.handle.chitchat();
+        handle.shutdown().await;
+
+        let mut guard = chitchat.lock().await;
+        assert!(
+            guard.self_node_state().get(&key).is_some(),
+            "#656: the queued small-tier write was lost on shutdown — the gossip writer queue \
+             was not flushed before the drain task was aborted"
+        );
     }
 }

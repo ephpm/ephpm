@@ -647,13 +647,26 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // this node as an owner within a gossip round and re-home its sites, so
     // they stop forwarding to a channel that is about to close. The handover
     // wait overlaps the KV work below. See `drain` for the whole ordering.
+    //
+    // #656: in *every* clustered mode, flush the gossip writer's coalescing
+    // queue before the process winds down (the writer task is detached and the
+    // runtime stops moments later), or the last up-to-`DRAIN_IDLE` of queued
+    // small-tier KV writes never reach gossip state and are lost to peers on
+    // restart. The per-site leave flushes as part of `mark_draining`; the other
+    // clustered modes (whole-database, KV-only) announce no leave, so they must
+    // flush here. The flush is idempotent and bounded, and runs before the
+    // channel is closed below.
     let leave = match &cluster_handle {
         Some(cluster) if is_per_site_clustered(&config, true) => {
             let leave = drain::announce_leave(cluster).await;
             turso_cdc::stop_replication_drivers();
             Some(leave)
         }
-        _ => None,
+        Some(cluster) => {
+            cluster.flush_gossip_writer().await;
+            None
+        }
+        None => None,
     };
 
     // Requests are drained. Hand this node's large KV values to the peers
