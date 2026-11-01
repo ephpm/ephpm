@@ -12129,6 +12129,12 @@ mod tests {
     /// Populate a directory with the Sendy docroot: the top-level scripts, a
     /// front controller, a login script (reached via `$uri.php` fallback) and a
     /// static asset.
+    ///
+    /// Each script echoes its own basename (`l.php` echoes `l.php`, …) so the
+    /// rewrite tests assert on real output under a **linked** PHP build, not
+    /// only under the stub SAPI. The stub echoes the resolved `script_filename`
+    /// regardless of the file's contents, so these bodies are a no-op there and
+    /// the same assertions hold in both builds — see [`body_text`].
     fn write_sendy_docroot(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         for script in [
@@ -12140,7 +12146,7 @@ mod tests {
             "index.php",
             "login.php",
         ] {
-            std::fs::write(dir.join(script), b"<?php /* sendy */").unwrap();
+            std::fs::write(dir.join(script), b"<?php echo basename(__FILE__);").unwrap();
         }
         std::fs::create_dir_all(dir.join("css")).unwrap();
         std::fs::write(dir.join("css").join("app.css"), b"body{color:red}").unwrap();
@@ -12176,9 +12182,11 @@ mod tests {
         Router::new(&config, test_store(), None, None, None, None, None)
     }
 
-    /// Body of a response as a lossy string — the stub PHP SAPI echoes the
-    /// resolved `script_filename` into it, which is what lets these tests prove
-    /// script re-resolution end-to-end without a linked PHP.
+    /// Body of a response as a lossy string. The stub PHP SAPI echoes the
+    /// resolved `script_filename` into it, and `write_sendy_docroot`'s scripts
+    /// echo their own basename, so a body that contains `l.php` proves `l.php`
+    /// was the re-resolved script under **both** the stub and a linked PHP
+    /// build — the rewrite tests run green in stub CI and in the linked nightly.
     async fn body_text(resp: Response<ServerBody>) -> String {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
