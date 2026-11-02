@@ -136,7 +136,7 @@ define( 'WP_CACHE', true );
 # 'Failed to open stream' on subdirectory requests.
 ephpm dev --port 8088 --document-root "$(pwd)/wordpress"
 
-#   ePHPm 0.13.0 — dev server
+#   ePHPm 0.14.0 — dev server
 #     serving:  /path/to/wordpress
 #     url:      http://127.0.0.1:8088
 #     php:      8.5.12

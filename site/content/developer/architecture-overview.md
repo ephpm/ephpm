@@ -48,6 +48,7 @@ ephpm/
 │   │       └── lib.rs          # Config structs + figment loading
 │   ├── ephpm-kv/               # Embedded KV store — DashMap, RESP2, TTL/expiry, compression
 │   ├── ephpm-db/               # DB proxy — MySQL/PostgreSQL wire, pooling, R/W splitting
+│   ├── ephpm-dbimport/         # SQL-dump import (mysqldump/pg_dump → site .db) with compatibility report
 │   ├── ephpm-cluster/          # Gossip clustering (chitchat), KV replication, primary election
 │   ├── ephpm-query-stats/      # SQL normalization, digest tracking, slow query log
 │   └── ephpm-e2e/              # E2E test crate — EXCLUDED from the workspace
@@ -72,6 +73,7 @@ ephpm/
 | `ephpm-config` | Library | Configuration structs, TOML loading via figment, env var overrides |
 | `ephpm-kv` | Library | Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, eviction, compression |
 | `ephpm-db` | Library | DB proxy — MySQL/PostgreSQL wire protocols, connection pooling, R/W splitting |
+| `ephpm-dbimport` | Library | SQL-dump import — mysqldump/pg_dump dialect detection, sanitizer for the Turso engine, compatibility report, batched driver. Backs `ephpm db import` |
 | `ephpm-cluster` | Library | SWIM gossip via chitchat, KV replication, SQLite primary election |
 | `ephpm-query-stats` | Library | SQL normalization, digest tracking, slow query logging, Prometheus metrics |
 | `ephpm-e2e` | Tests | E2E test crate — excluded from the workspace, runs in Docker via `cargo xtask e2e` |

@@ -117,7 +117,14 @@ Unsupported, and an error rather than silently wrong:
 
 ## Restoring a mysqldump
 
-A MySQL 8.4 `mysqldump` restores statement by statement through the `mysql`
+The first-class path is **[`ephpm db import`](../importing-a-sql-dump/)**: it
+streams a mysqldump (or pg_dump) into a site's embedded database and prints a
+compatibility report of exactly the constructs this page covers — including the
+views, triggers and routines the Turso engine can't take. Reach for the raw
+`mysql`-client path below only when you want a MySQL driver in the loop; the
+import guide is the recommended route.
+
+A MySQL 8.4 `mysqldump` also restores statement by statement through the `mysql`
 client or any MySQL driver connected to ePHPm:
 
 ```sh

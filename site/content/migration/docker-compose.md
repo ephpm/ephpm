@@ -80,6 +80,14 @@ memory_limit = "128MB"
 docker compose exec mysql mysqldump -u root -psecret app > backup.sql
 ```
 
+Once ePHPm is configured (steps 3–4 below), load that dump into the embedded
+database with **[`ephpm db import`](/guides/importing-a-sql-dump/)**, which
+translates the MySQL dialect and prints a compatibility report:
+
+```bash
+ephpm db import backup.sql --site app --config ephpm.toml
+```
+
 ### 2. Copy Your Source Code
 
 Your source is probably mounted from `./src`. Just keep it where it is — ePHPm serves it directly from disk.

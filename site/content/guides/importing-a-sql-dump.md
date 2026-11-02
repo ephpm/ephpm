@@ -105,9 +105,15 @@ unfamiliar dump.
 
 ### 5. Choose an error policy
 
-- `--on-error stop` (default) — halt at the first unsupported construct or SQL
-  error and exit non-zero *before touching data past it*. Use this for a clean,
-  all-or-nothing migration you will inspect.
+- `--on-error stop` (default) — halt at the first blocking finding (an
+  `unsupported` construct or a SQL error) and exit non-zero *before touching
+  data past it*. This is **not** an all-or-nothing transaction: `db import`
+  commits every `--batch-size` statements (default `1000`), so `stop` rolls back
+  only the open batch — every batch already committed **persists**. A stopped
+  import can therefore leave a **partial** database. Scout the dump with
+  `--dry-run` first (next step), and on a retry treat the target as dirty:
+  delete the site's `.db` and re-import from a clean file rather than importing
+  again on top of a half-loaded one.
 - `--on-error skip` — record each problem as a finding and keep going, exiting
   zero-with-warnings. Use this to get everything importable in, then review the
   findings.

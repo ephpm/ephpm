@@ -6,7 +6,7 @@ weight = 5
 
 Exhaustive reference for every CLI command, configuration key, and metric.
 
-- **[CLI](cli/)** — `ephpm serve`, `dev`, `php`, `kv`, `deploy`, `cache`, and the service commands (`install`, `start`, `stop`, `restart`, `status`, `logs`, `uninstall`).
+- **[CLI](cli/)** — `ephpm serve`, `dev`, `php`, `db`, `kv`, `deploy`, `cache`, `exec`, `analyze`, `composer`, and the service commands (`install`, `start`, `stop`, `restart`, `status`, `logs`, `uninstall`).
 - **[Configuration](config/)** — every key in `ephpm.toml`, with type, default, and example.
 - **[Environment Variables](environment-variables/)** — `EPHPM_*` overrides.
 - **[Metrics](metrics/)** — every Prometheus metric exposed at `/metrics`.

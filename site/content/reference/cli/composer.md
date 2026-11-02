@@ -16,12 +16,16 @@ it hands the work to a real `composer` on `PATH` or stops with an error. The
 differences are listed [below](#differences-from-composer), and you need to
 read them before you put it in CI.
 
-> **Pinned to vivacity 0.23.0.** ePHPm pins vivacity to an exact version
-> (`=0.23.0` in the workspace `Cargo.toml`, from crates.io). Flags and behavior
-> can change when that pin moves, so this page describes 0.23.0 only. Released
-> binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1 embeds 0.15.0,
-> and v0.11.2 through v0.12.0 embed 0.17.0; 0.23.0 ships in v0.13.0.
-> `ephpm composer --version` prints the version your binary embeds.
+> **Pinned to vivacity 0.25.0.** ePHPm pins vivacity to an exact version
+> (`=0.25.0` in the workspace `Cargo.toml`), patched via `[patch.crates-io]` to
+> the ePHPm org fork (`github.com/ephpm/vivacity`) rather than plain crates.io —
+> the fork relaxes one transitive `tokio` pin to clear a security advisory
+> (RUSTSEC-2026-0386) and changes nothing in vivacity's own behavior. Flags and
+> behavior can change when the pin moves, so this page describes 0.25.0 only.
+> Released binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1 embeds
+> 0.15.0, v0.11.2 through v0.12.0 embed 0.17.0, and v0.13.x embeds 0.23.0; 0.25.0
+> ships in v0.14.0. `ephpm composer --version` prints the version your binary
+> embeds.
 
 ## What needs PHP or Composer
 
