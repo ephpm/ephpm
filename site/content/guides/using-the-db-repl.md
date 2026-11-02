@@ -27,6 +27,9 @@ For the exhaustive flag-by-flag reference see [`ephpm db`](/reference/cli/db/).
 - `--read-only` and an offline-only `--maintenance` mode.
 - `/kv` and `/kv-put` reach the **live** KV store over RESP, scoped to the site
   — a **client-side** loop.
+- An output-formatting **pipe** on `/kv` (`/kv … | <format> <path>`): normalize
+  the reply to JSON, select part of it with a jq-lite path, and render it as
+  `raw`/`json`/`yaml`/`table`.
 
 **Coming later (not in this REPL):**
 
@@ -271,6 +274,123 @@ hello world
   blog ‹live · mysql› > /kv TTL greeting
 -1
 ```
+
+### Formatting `/kv` output: the pipe {#kv-pipe}
+
+Values in the KV are often JSON (a cached object, a row dump, a session blob).
+`/kv` can **pipe** its reply through an output formatter so you can read it,
+pull one field out, or hand it to another tool — without leaving the shell.
+
+The grammar adds an optional pipe after the RESP command:
+
+```
+/kv <resp-command…> [ | <format> <path> ]
+```
+
+Everything after a top-level `|` is the pipe. It takes an optional **format**
+keyword and an optional **path** (a field selector); **at least one** must be
+present. (A `|` *inside* a quoted RESP argument — `/kv SET k "a|b"` — is part of
+the value, not a pipe.)
+
+The model is always the same three steps: **normalize the reply to a JSON value,
+apply the path, then render with the format.** Normalization makes the pipe work
+on any command, not just `GET`: an integer reply becomes a JSON number, a nil
+becomes `null`, a bulk value is parsed as JSON when it is valid JSON (otherwise
+kept as a string), and an array reply (`LRANGE`, `HGETALL`) becomes a JSON array.
+
+Take a product cached as JSON:
+
+```
+  blog ‹live · mysql› > /kv GET widget:42
+{"id":42,"slug":"blue-hat","price":1900,"updated_at":"2026-10-30 11:02:04"}
+```
+
+**Formats** (`| <format>`):
+
+- **`raw`** — the classic reply rendering (what you get with no pipe at all).
+  With a path, a selected scalar prints bare and a selected object/array prints
+  as compact JSON.
+- **`json`** — pretty-printed, 2-space indent:
+
+  ```
+    blog ‹live · mysql› > /kv GET widget:42 | json
+  {
+    "id": 42,
+    "slug": "blue-hat",
+    "price": 1900,
+    "updated_at": "2026-10-30 11:02:04"
+  }
+  ```
+
+- **`yaml`** — a YAML block:
+
+  ```
+    blog ‹live · mysql› > /kv GET widget:42 | yaml
+  id: 42
+  slug: blue-hat
+  price: 1900
+  updated_at: 2026-10-30 11:02:04
+  ```
+
+- **`table`** — an object becomes a two-column `key | value` table; an array of
+  objects becomes a multi-column table (columns are the union of keys):
+
+  ```
+    blog ‹live · mysql› > /kv GET widget:42 | table
+  key        | value
+  -----------+--------------------
+  id         | 42
+  slug       | blue-hat
+  price      | 1900
+  updated_at | 2026-10-30 11:02:04
+  (4 rows)
+  ```
+
+**Paths** (`| <path>`, a jq-lite selector) operate on the normalized value:
+
+| Path | Selects |
+|------|---------|
+| `.` | the whole value (identity) |
+| `.slug` | an object field (nestable: `.meta.author.name`) |
+| `.items[2]` | an array element (negative counts from the end: `.items[-1]`) |
+| `.items[]` | **fan out** — each element on its own line |
+| `.slug,.price` | multiple paths → one reduced object keyed by each path's final segment |
+
+```
+  blog ‹live · mysql› > /kv GET widget:42 | .price
+1900
+  blog ‹live · mysql› > /kv GET widget:42 | .slug,.price
+{
+  "slug": "blue-hat",
+  "price": 1900
+}
+  blog ‹live · mysql› > /kv LRANGE recent 0 2 | json
+[
+  "post:9",
+  "post:8",
+  "post:7"
+]
+```
+
+When you give a path but no format, the output is **auto**: a scalar prints raw
+(bare, as `.price` shows above), and an object or array prints as pretty JSON (as
+`.slug,.price` shows). A path that doesn't resolve — a missing field or an
+out-of-range index — is a clear error naming the path, not a crash.
+
+**Fail-soft on non-JSON.** If the value is not JSON and you ask for `json`,
+`yaml`, `table`, or a path, the shell prints the value **raw** and adds a one-line
+note on stderr (`value is not JSON; printed raw`) rather than quoting a bare
+string or erroring. The value is never swallowed.
+
+```
+  blog ‹live · mysql› > /kv GET greeting | json
+value is not JSON; printed raw
+hello world
+```
+
+The pipe is a read-side convenience for `/kv` only. It does not touch
+`/kv-put` (which writes and returns no value) or the `--format` / `/format` used
+for SQL result sets.
 
 ### Worked example: pre-warm the cache from a query {#pre-warm}
 
