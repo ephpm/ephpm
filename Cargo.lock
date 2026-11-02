@@ -6203,8 +6203,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vivacity"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6219,14 +6219,15 @@ dependencies = [
 
 [[package]]
 name = "vivacity-autoload"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "md-5 0.10.6",
  "memchr",
  "rayon",
  "serde_json",
  "sha1",
+ "tempfile",
  "thiserror 2.0.20",
  "vivacity-core",
  "vivacity-pcre2",
@@ -6235,8 +6236,8 @@ dependencies = [
 
 [[package]]
 name = "vivacity-core"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6255,13 +6256,14 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "vivacity-pcre2",
+ "winapi-util",
  "zip",
 ]
 
 [[package]]
 name = "vivacity-pcre2"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "libc 0.2.189",
  "log",
@@ -6270,8 +6272,8 @@ dependencies = [
 
 [[package]]
 name = "vivacity-pcre2-sys"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "cc",
  "libc 0.2.189",
@@ -6279,8 +6281,8 @@ dependencies = [
 
 [[package]]
 name = "vivacity-resolver"
-version = "0.25.0"
-source = "git+https://github.com/ephpm/vivacity.git?rev=ad6ea26b397f0f9007817e8ee9d41a9752d608b7#ad6ea26b397f0f9007817e8ee9d41a9752d608b7"
+version = "0.26.1"
+source = "git+https://github.com/ephpm/vivacity.git?rev=9e606108329325717cc9d178456ff5fdbeb30a70#9e606108329325717cc9d178456ff5fdbeb30a70"
 dependencies = [
  "serde",
  "serde_json",
