@@ -23,8 +23,8 @@ read them before you put it in CI.
 > retired.) Flags and behavior can change when the pin moves, so this page
 > describes 0.26.2 only.
 > Released binaries differ: ePHPm v0.11.0 embeds vivacity 0.11.1, v0.11.1 embeds
-> 0.15.0, v0.11.2 through v0.12.0 embed 0.17.0, v0.13.x embeds 0.23.0, and v0.14.0
-> embeds 0.25.0; 0.26.2 is the current pin, shipping in the next release.
+> 0.15.0, v0.11.2 through v0.12.0 embed 0.17.0, v0.13.x embeds 0.23.0, v0.14.0
+> embeds 0.25.0, and v0.14.1 embeds 0.26.2.
 > `ephpm composer --version` prints the version your binary embeds.
 
 ## What needs PHP or Composer
