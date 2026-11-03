@@ -243,7 +243,40 @@ With `[cluster]` enabled, per-site databases are off by default: the database is
 | `unknown.com` | `/var/www/sites/unknown.com/` | Not found → fallback to `document_root` |
 | No Host header | — | Fallback to `document_root` |
 
-Port numbers and trailing dots are stripped before matching, and the host is lowercased. The match is exact — no wildcard or regex patterns. For `www.` handling, either create a symlink or handle the redirect in your fallback site.
+Port numbers and trailing dots are stripped before matching, and the host is lowercased. The match is exact — no wildcard or regex patterns. To make one site answer to more than one hostname (`www.`, an `api.` subdomain, a vanity or legacy domain), map the extra names onto it with [`[server.host_map]`](#host-aliases-serverhost_map) below; a symlinked directory also works but creates a *second* tenant with its own database and keyspace.
+
+### Host aliases (`[server.host_map]`)
+
+One site directory, several hostnames. `[server.host_map]` is an exact-host → site-key table consulted **before** everything above:
+
+```toml
+[server]
+sites_dir            = "/var/www/sites"
+sites_domain_suffix  = ".whatsupnails.com"     # optional; the two coexist
+
+[server.host_map]
+"api.whatsupnails.com" = "admin"               # /var/www/sites/admin/ also answers api.
+"www.whatsupnails.com" = "whatsupnails.com"    # apex + www are one tenant
+"legacy-shop.example"  = "shop"                # keep an old domain alive during a migration
+```
+
+Resolution order for a request `Host`, after port/trailing-dot stripping and lowercasing:
+
+1. **`host_map` exact hit** — the mapped site key is the *only* candidate. `api.whatsupnails.com` resolves `admin/` even if an `api/` directory (via the suffix) or an `api.whatsupnails.com/` directory exists; the map is authoritative for that host.
+2. Otherwise the existing path: `sites_domain_suffix` stripped, then the literal host, as directory names under `sites_dir`.
+3. Otherwise `document_root`, with no tenant identity.
+
+What an alias does **not** change:
+
+- **The site key stays canonical.** `api.whatsupnails.com` resolves to the key `admin`, and every per-tenant identity in the [Site Identity](#site-identity-the-canonical-site-key) table — `admin.db`, the `admin` KV keyspace, `DB_USER = admin`, the `admin` temp/session root, the `admin` OPcache vhost — follows that key. Nothing is ever named after the alias host, so `Host: api.whatsupnails.com` and `Host: admin.whatsupnails.com` are one tenant with one database (the same invariant issue #290 established for the suffix).
+- **PHP still sees the real host.** `$_SERVER['HTTP_HOST']` (and `SERVER_NAME`) carry the request's own `Host`, not the site key — an app can branch on `api.` versus the main host, generate absolute URLs for the domain the visitor used, and serve a different route tree per hostname, all from one checkout.
+- **Gates still apply.** An alias is validated like any other host: it must be a well-formed DNS name (the [Host Sanitization](#host-sanitization) rule), and `[server.request] trusted_hosts`, when set, must list it or the request is answered `421` before resolution runs. Mapping a host does not trust it.
+
+Fail-closed at startup (`ephpm serve` refuses to start, naming the entry): `host_map` without `sites_dir`; an alias that is not a bare, port-free DNS name of `[a-z0-9._-]` labels; two aliases that normalize to one host (`API.example.com` and `api.example.com.`); a target that is not a canonical site key (uppercase, `..`, a path). Aliases are matched case-insensitively.
+
+Whether the target **directory exists** is checked when the server starts (`WARN` per alias whose site has no directory under `sites_dir`) rather than refused, because sites are discovered lazily and a provisioning daemon may create the directory after startup. Until it exists the alias resolves like an unknown host — `document_root`, no per-site database, credentials or KV keyspace — and the router logs a `WARN` naming the alias and the missing site about once a minute while requests keep arriving. It never falls back to a directory named after the alias.
+
+Not in this release: a *list* of `sites_domain_suffix` values, and a per-site `hosts = [...]` key in the [override file](#per-site-document-root-frameworks-with-a-public-directory). `host_map` covers both cases with one more line per hostname.
 
 ### Site Identity (the canonical site key)
 
@@ -261,7 +294,7 @@ The key that matched above is the tenant's **whole** identity, not just its docu
 
 Two consequences worth stating explicitly:
 
-- **Every name that reaches a site is the same tenant.** With `[server] sites_domain_suffix = ".localhost"`, `Host: blog.localhost`, `Host: blog` and `Host: BLOG.LOCALHOST:8080` all resolve to `blog` — one document root, one `blog.db`, one session directory, one set of credentials. (Until issue #290 the database key was derived separately and kept the suffix, so a tenant addressed both ways silently used two database files.)
+- **Every name that reaches a site is the same tenant.** With `[server] sites_domain_suffix = ".localhost"`, `Host: blog.localhost`, `Host: blog` and `Host: BLOG.LOCALHOST:8080` all resolve to `blog` — one document root, one `blog.db`, one session directory, one set of credentials. (Until issue #290 the database key was derived separately and kept the suffix, so a tenant addressed both ways silently used two database files.) A [`[server.host_map]`](#host-aliases-serverhost_map) alias is one more name for the same key: `api.whatsupnails.com → admin` derives the `admin` identity, never an `api.whatsupnails.com` one.
 - **An unmatched host is not a tenant.** It serves `document_root`, but it has no site key, so it gets no per-site database and no `DB_*` credentials — a client cannot create `<anything>.db` by inventing a `Host` header (issue #291). `ephpm_db_*` on the fallback docroot reports `no per-site database context for this request`. The same applies to the KV store: an unmatched host gets no KV store and no `EPHPM_REDIS_*` credentials. Its `ephpm_kv_*` calls return their failure value with a `no per-site KV context for this request` warning, once per request. Previously each distinct `Host` header created its own KV store, which was never freed. If you want the fallback site to have a database or a KV keyspace, give it a real vhost directory.
 
 ### Host Sanitization
