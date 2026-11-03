@@ -208,11 +208,15 @@ On a 512 MB VM, the traditional stack barely fits. ePHPm leaves room to breathe.
 
 ## Backup Strategy for SQLite
 
-Since there's no MySQL server, backups are simpler:
+Since there's no MySQL server, backups are simpler — but the embedded engine is
+Turso, not stock SQLite, so the tool choice matters. **Litestream, LiteFS, and
+any other stock-SQLite replication/tailing tool are unsupported and will lock
+ePHPm out of the file** (Turso has its own WAL format and file locking); see
+[Backups, and why external SQLite tools lock the file](/architecture/database/engines/#backups-and-why-external-sqlite-tools-lock-the-file).
+Use:
 
-- **Cloud volume snapshots** — AWS EBS snapshots, Hetzner snapshots, DigitalOcean backups. Cheapest, simplest. Most providers offer automated daily snapshots.
-- **File copy with WAL checkpoint** — `PRAGMA wal_checkpoint(TRUNCATE)` then copy `app.db`. Safe for consistent backups while the server is running.
-- **Litestream** — continuous SQLite replication to S3/GCS/Azure Blob. Sub-second RPO. Free, open-source.
-- **Disk-level backups** — rsync, restic, borgbackup on the data directory.
+- **Cloud volume snapshots** — AWS EBS, Hetzner, DigitalOcean, and most providers' automated daily snapshots. Safe when the snapshot is crash-consistent (atomic across the `.db`, `-wal` and `-shm` on one volume); the restore recovers like a crash image.
+- **Stop-and-copy** — a graceful `ephpm` shutdown checkpoints and truncates the WAL, leaving a single clean `.db`; copy it. This is the guaranteed-consistent path. A plain `cp`/`rsync` of a live `.db` is **not** consistent — it misses the `-wal` or catches a write mid-flight.
+- **Disk-level backups** — rsync, restic, borgbackup, but only over a stopped node or a crash-consistent snapshot, never a live open file.
 
-For clustered mode (experimental Turso CDC replication), each replica holds a full local copy of the database, so the loss of any single node does not lose committed data already shipped downstream.
+There is no continuous / point-in-time backup of the database today — nothing ships `.db` changes to object storage. For clustered mode (experimental Turso CDC replication), each replica holds a full local copy of the database, so the loss of any single node does not lose committed data already shipped downstream — that is high availability, not a backup.
