@@ -638,7 +638,16 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "664d4aef89009469f824369407612f18fb4a9045", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+# Current pin 1b2312f3 adds two catalog-emulation correctness fixes over the
+# previous 664d4aef (SECURITY note above still applies — do not move backwards):
+# litewire#68 reports a `DEFAULT NULL` column's COLUMN_DEFAULT / SHOW COLUMNS
+# Default as SQL NULL instead of the literal string "NULL" (hit every nullable
+# column after a mysqldump import; ORMs like CakePHP pre-filled forms with
+# "NULL"), and litewire#69 keeps MySQL's boolean idiom — `BOOL` / `BOOLEAN` /
+# `tinyint(1)` are rewritten to `TINYINT(1)` at CREATE time and reported as
+# `tinyint(1)` so ORM bool detection works (new tables only; existing INTEGER
+# columns keep reporting `bigint`).
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "1b2312f3c2be5511f5f14152a82961b8bbfee415", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)

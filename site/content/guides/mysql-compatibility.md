@@ -100,7 +100,7 @@ against MySQL 8.4.11.
 | `TRUNCATE` affected rows | 0 | rows deleted |
 | Date/time functions | session `time_zone` | UTC |
 | `ON UPDATE CURRENT_TIMESTAMP` | column refreshed on every update | not emulated |
-| `SHOW COLUMNS` `Type` | declared type (`varchar(100)`, `int`) | affinity (`longtext`, `bigint`, `double`, `longblob`) |
+| `SHOW COLUMNS` `Type` | declared type (`varchar(100)`, `int`) | affinity (`longtext`, `bigint`, `double`, `longblob`); the one exception is MySQL's boolean idiom — `BOOL` / `BOOLEAN` / `tinyint(1)` are reported as `tinyint(1)` so ORM bool detection works |
 | `SHOW` / `information_schema` on a missing table | error 1146 | empty result |
 | `SHOW DATABASES LIKE` / `WHERE` | supported | error (one database per connection) |
 | Column order after a column add with no position | appended | appended (same). With `FIRST` / `AFTER`, the table is rebuilt to match |
