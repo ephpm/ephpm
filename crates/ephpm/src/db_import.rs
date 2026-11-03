@@ -26,10 +26,11 @@ use std::time::Duration;
 use anyhow::Context;
 use ephpm_config::Config;
 use ephpm_dbimport::{
-    Cell, CompatReport, Dialect, DumpReader, FindingKind, ImportOptions, ImportOutcome, OnError,
-    RowSet, SinkError, StatementSink, run_import, sniff,
+    Cell, CompatReport, Dialect, DumpReader, FindingKind, ImportOptions, ImportOutcome,
+    ImportStats, OnError, RowSet, SinkError, SourceCharset, StatementSink, Utf8Policy, run_import,
+    sniff,
 };
-use ephpm_php::db_bridge::{RemoteBackend, screen_sql};
+use ephpm_php::db_bridge::{RemoteBackend, screen_sql, screen_sql_mysql};
 use litewire::backend::{BackendConn, BackendError, ResultSet, SharedBackend, Value};
 use litewire::translate::Dialect as LwDialect;
 use litewire::{Session, SessionError, SessionResult};
@@ -56,6 +57,20 @@ pub enum OnErrorArg {
     Skip,
 }
 
+/// How the operator named the invalid-UTF-8 policy on the CLI
+/// (`--on-invalid-utf8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnInvalidUtf8Arg {
+    /// Refuse the import (the default).
+    Reject,
+    /// Drop the invalid bytes.
+    Strip,
+    /// Replace each invalid sequence with U+FFFD.
+    Replace,
+    /// Transcode each invalid sequence from `--source-charset`.
+    Transcode,
+}
+
 /// One `ephpm db import` invocation, assembled from the CLI flags.
 pub struct ImportRequest {
     /// The dump path, or `-` for stdin.
@@ -80,12 +95,82 @@ pub struct ImportRequest {
     pub defer_indexes: bool,
     /// List dropped safe-no-op findings too.
     pub verbose: bool,
+    /// `--on-invalid-utf8`, when given explicitly.
+    pub on_invalid_utf8: Option<OnInvalidUtf8Arg>,
+    /// `--source-charset`, when given. Implies `--on-invalid-utf8 transcode`.
+    pub source_charset: Option<String>,
 }
 
 /// WAL-checkpoint give-up budget for the direct-open path at exit (nothing
 /// else holds the file, so only a dump that left a transaction open could keep
 /// it busy).
 const CHECKPOINT_GIVE_UP: Duration = Duration::from_secs(30);
+
+/// Resolve `--source-charset`, `--on-invalid-utf8` and `--on-error` into one
+/// [`Utf8Policy`].
+///
+/// `--source-charset` (default `utf8mb4`) says what the dump's bytes are.
+/// `utf8mb4` means the stream is UTF-8: valid text passes through untouched
+/// and an invalid run is handled by the policy without any transcoding. A
+/// legacy single-byte charset means invalid runs are *transcoded* from it.
+///
+/// Without an explicit `--on-invalid-utf8`, the policy follows the flags the
+/// operator already set:
+///
+/// * a legacy `--source-charset` → `transcode` (naming the charset is the
+///   instruction);
+/// * otherwise `--on-error stop` (the default) → `reject`: nothing is written;
+/// * otherwise `--on-error skip` → `strip`: keep going, report per column.
+///
+/// An explicit `--on-invalid-utf8` wins, but must agree with the charset:
+/// `transcode` needs a legacy charset, and `reject`/`strip`/`replace` cannot
+/// be combined with one (that would silently ignore the charset).
+///
+/// # Errors
+///
+/// A contradiction, a missing charset for `transcode`, or an unknown /
+/// multi-byte charset label.
+pub fn resolve_utf8_policy(
+    on_error: OnErrorArg,
+    on_invalid: Option<OnInvalidUtf8Arg>,
+    source_charset: Option<&str>,
+) -> anyhow::Result<Utf8Policy> {
+    let charset = source_charset
+        .map(|label| {
+            SourceCharset::parse(label).with_context(|| format!("--source-charset {label:?}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let legacy = charset.legacy();
+    let name = |o: OnInvalidUtf8Arg| match o {
+        OnInvalidUtf8Arg::Reject => "reject",
+        OnInvalidUtf8Arg::Strip => "strip",
+        OnInvalidUtf8Arg::Replace => "replace",
+        OnInvalidUtf8Arg::Transcode => "transcode",
+    };
+    match (on_invalid, legacy) {
+        (None | Some(OnInvalidUtf8Arg::Transcode), Some(cs)) => Ok(Utf8Policy::Transcode(cs)),
+        (None, None) => Ok(match on_error {
+            OnErrorArg::Stop => Utf8Policy::Reject,
+            OnErrorArg::Skip => Utf8Policy::Strip,
+        }),
+        (Some(OnInvalidUtf8Arg::Transcode), None) => anyhow::bail!(
+            "--on-invalid-utf8 transcode needs a legacy --source-charset (e.g. windows-1252 \
+             for a latin1/cp1252 dump) to say what the invalid bytes are encoded in; \
+             --source-charset utf8mb4 (the default) has nothing to transcode from"
+        ),
+        (Some(OnInvalidUtf8Arg::Reject), None) => Ok(Utf8Policy::Reject),
+        (Some(OnInvalidUtf8Arg::Strip), None) => Ok(Utf8Policy::Strip),
+        (Some(OnInvalidUtf8Arg::Replace), None) => Ok(Utf8Policy::Replace),
+        (Some(other), Some(cs)) => anyhow::bail!(
+            "--on-invalid-utf8 {} would ignore --source-charset {cs}: a legacy charset means \
+             invalid sequences are transcoded from it (--on-invalid-utf8 transcode, or just \
+             omit --on-invalid-utf8); drop --source-charset to {} them instead",
+            name(other),
+            name(other)
+        ),
+    }
+}
 
 /// Run `ephpm db import`.
 ///
@@ -99,9 +184,17 @@ pub fn run(req: &ImportRequest) -> anyhow::Result<ExitCode> {
     let config = Config::load(&req.config)
         .with_context(|| format!("loading configuration from {}", req.config.display()))?;
 
+    let utf8 =
+        resolve_utf8_policy(req.on_error, req.on_invalid_utf8, req.source_charset.as_deref())?;
+
     // Open the dump and settle the dialect before deciding anything else.
     let (mut source, dialect) = open_dump(req)?;
-    tracing::info!(dialect = dialect.as_str(), dump = %req.dump, "db import: starting");
+    tracing::info!(
+        dialect = dialect.as_str(),
+        dump = %req.dump,
+        on_invalid_utf8 = %utf8,
+        "db import: starting"
+    );
 
     let opts = ImportOptions {
         batch_size: req.batch_size,
@@ -111,12 +204,52 @@ pub fn run(req: &ImportRequest) -> anyhow::Result<ExitCode> {
         },
         defer_indexes: req.defer_indexes,
         verbose: req.verbose,
+        utf8,
     };
     let sanitizer = ephpm_dbimport::Sanitizer::new(dialect);
     let mut report = CompatReport::new();
 
+    // `reject` is a promise that nothing is written if the dump holds a value
+    // the engine would refuse to read back — so the dump is validated whole
+    // *before* the database is even opened. That needs a second pass over the
+    // source, which stdin cannot give (and spooling a multi-GiB stream to disk
+    // behind the operator's back is worse than asking).
+    if utf8.is_reject() && !req.dry_run {
+        if req.dump == "-" {
+            anyhow::bail!(
+                "--on-invalid-utf8 reject (the default under --on-error stop) validates the \
+                 whole dump before writing anything, which needs a re-readable source and stdin \
+                 is not one. Either save the dump to a file first, or choose a streaming policy: \
+                 --on-error skip (which strips invalid bytes and reports them), \
+                 --on-invalid-utf8 strip|replace, or --source-charset <legacy charset> to \
+                 transcode them"
+            );
+        }
+        tracing::info!("db import: validating the dump's UTF-8 before opening the database");
+        let (mut prescan, _) = open_dump(req)?;
+        let reader = DumpReader::new(&mut prescan, dialect).with_utf8_policy(utf8);
+        let mut prescan_report = CompatReport::new();
+        let scan_opts = ImportOptions { on_error: OnError::Skip, ..opts.clone() };
+        let (scan_stats, _) = run_import(reader, &sanitizer, None, &scan_opts, &mut prescan_report)
+            .context("validating the dump's UTF-8")?;
+        if scan_stats.invalid_utf8_values > 0 {
+            print_utf8_rejection(&prescan_report, scan_stats);
+            if let Some(path) = &req.report {
+                std::fs::write(path, prescan_report.to_json()).with_context(|| {
+                    format!("writing the compatibility report to {}", path.display())
+                })?;
+            }
+            anyhow::bail!(
+                "refusing to import: {} TEXT value(s) across {} row(s) are not valid UTF-8 and \
+                 nothing was written (see the report above)",
+                scan_stats.invalid_utf8_values,
+                scan_stats.invalid_utf8_rows
+            );
+        }
+    }
+
     let (stats, outcome) = if req.dry_run {
-        let reader = DumpReader::new(&mut source, dialect);
+        let reader = DumpReader::new(&mut source, dialect).with_utf8_policy(utf8);
         run_import(reader, &sanitizer, None, &opts, &mut report)
             .context("parsing the dump for the dry run")?
     } else {
@@ -132,7 +265,7 @@ pub fn run(req: &ImportRequest) -> anyhow::Result<ExitCode> {
 
         let strategy = resolve_strategy(&config, &req.site)?;
         let mut sink = build_sink(&strategy, dialect, runtime.handle())?;
-        let reader = DumpReader::new(&mut source, dialect);
+        let reader = DumpReader::new(&mut source, dialect).with_utf8_policy(utf8);
         let result = run_import(reader, &sanitizer, Some(sink.as_mut()), &opts, &mut report)
             .context("importing the dump");
 
@@ -157,6 +290,7 @@ pub fn run(req: &ImportRequest) -> anyhow::Result<ExitCode> {
     };
 
     print_report(&report, stats, req.verbose);
+    print_utf8_summary(stats, utf8);
 
     if let Some(path) = &req.report {
         std::fs::write(path, report.to_json())
@@ -269,12 +403,26 @@ fn backend_err(e: &BackendError) -> SinkError {
     SinkError::message(e.to_string())
 }
 
-/// Screen one statement with [`screen_sql`] when `enabled`, mapping a rejection
-/// to a [`SinkError`]. `enabled` is `false` only on the console's offline
+/// Screen one statement when `enabled`, mapping a rejection to a
+/// [`SinkError`]. `enabled` is `false` only on the console's offline
 /// `--maintenance` path; every other caller screens.
-fn screen_statement(enabled: bool, sql: &str) -> Result<(), SinkError> {
+///
+/// The lexing rule follows the text's dialect: MySQL text (a `mysqldump`, the
+/// `--dialect mysql` console, and everything forwarded over the wire, which is
+/// MySQL by construction) is screened by [`screen_sql_mysql`], because MySQL
+/// escapes an embedded quote as `\'` and litewire's translator reads it that
+/// way; the standard-rule [`screen_sql`] would take the escaped quote for the
+/// closing one and refuse a statement with an odd number of them as "malformed
+/// SQL" — which is how v0.14.0 dropped every extended `INSERT` holding an
+/// apostrophe (~257k of 530k rows on a real dump). PostgreSQL and
+/// `sqlite`-native text keep the standard rule.
+fn screen_statement(enabled: bool, dialect: Dialect, sql: &str) -> Result<(), SinkError> {
     if enabled {
-        screen_sql(sql).map_err(|offending| {
+        let screen = match dialect {
+            Dialect::MySql => screen_sql_mysql,
+            Dialect::Pg | Dialect::Sqlite => screen_sql,
+        };
+        screen(sql).map_err(|offending| {
             SinkError::message(format!("statement rejected on the tenant path: {offending}"))
         })?;
     }
@@ -321,8 +469,11 @@ enum DirectInner {
 pub(crate) struct DirectSink {
     inner: DirectInner,
     handle: tokio::runtime::Handle,
-    /// Screen each statement with [`screen_sql`] before running it.
+    /// Screen each statement (by `dialect`'s lexing rule) before running it.
     screen: bool,
+    /// The dialect the statements are in — selects the translator and the
+    /// screen's string-escaping rule.
+    dialect: Dialect,
     // Keep the backend alive for the connection's lifetime.
     _backend: SharedBackend,
 }
@@ -364,13 +515,13 @@ impl DirectSink {
             Some(lw) => DirectInner::Translating(Session::new(conn, lw)),
             None => DirectInner::Native(conn),
         };
-        Ok(Self { inner, handle, screen, _backend: backend })
+        Ok(Self { inner, handle, screen, dialect, _backend: backend })
     }
 
     /// Execute `sql`, discarding any result set (the import / transaction-control
     /// path).
     fn exec_inner(&mut self, sql: &str) -> Result<(), SinkError> {
-        screen_statement(self.screen, sql)?;
+        screen_statement(self.screen, self.dialect, sql)?;
         match &mut self.inner {
             DirectInner::Translating(session) => {
                 match self.handle.block_on(session.query(sql, &[] as &[Value])) {
@@ -389,7 +540,7 @@ impl DirectSink {
 
     /// Execute `sql` and return its result set (empty for a write / DDL).
     fn query_inner(&mut self, sql: &str) -> Result<RowSet, SinkError> {
-        screen_statement(self.screen, sql)?;
+        screen_statement(self.screen, self.dialect, sql)?;
         match &mut self.inner {
             DirectInner::Translating(session) => {
                 match self.handle.block_on(session.query(sql, &[] as &[Value])) {
@@ -467,7 +618,9 @@ impl WireSink {
     }
 
     fn exec_inner(&self, sql: &str) -> Result<(), SinkError> {
-        screen_statement(self.screen, sql)?;
+        // The wire is MySQL by construction (the server's listener speaks
+        // MySQL and translates), so the text is MySQL-dialect.
+        screen_statement(self.screen, Dialect::MySql, sql)?;
         match self.handle.block_on(self.backend.run(sql, &[] as &[Value])) {
             Ok(SessionResult::Ok(_) | SessionResult::Rows(_)) => Ok(()),
             Err(e) => Err(session_err(&e)),
@@ -475,7 +628,7 @@ impl WireSink {
     }
 
     fn query_inner(&self, sql: &str) -> Result<RowSet, SinkError> {
-        screen_statement(self.screen, sql)?;
+        screen_statement(self.screen, Dialect::MySql, sql)?;
         match self.handle.block_on(self.backend.run(sql, &[] as &[Value])) {
             Ok(SessionResult::Rows(rs)) => Ok(result_set_to_rowset(rs)),
             Ok(SessionResult::Ok(_)) => Ok(RowSet::empty()),
@@ -536,5 +689,133 @@ fn print_report(report: &CompatReport, stats: ephpm_dbimport::ImportStats, verbo
     }
     if shown == 0 && (s.unsupported + s.downgraded + s.error) == 0 {
         println!("  (no compatibility concerns)");
+    }
+}
+
+/// One headline line for the invalid-UTF-8 tally, when there was one.
+fn print_utf8_summary(stats: ImportStats, policy: Utf8Policy) {
+    if stats.invalid_utf8_values > 0 {
+        println!(
+            "invalid UTF-8: {} TEXT value(s) across {} row(s) — {}",
+            stats.invalid_utf8_values,
+            stats.invalid_utf8_rows,
+            policy.applied()
+        );
+    }
+}
+
+/// The pre-validation refusal under `--on-invalid-utf8 reject`: the per
+/// `table.column` findings, then how to proceed. Nothing has been opened or
+/// written when this prints.
+fn print_utf8_rejection(report: &CompatReport, stats: ImportStats) {
+    println!(
+        "\ndb import: the dump holds {} TEXT value(s) across {} row(s) that are not valid UTF-8. \
+         The embedded engine validates TEXT when it is read, so importing them would produce a \
+         database whose SELECTs fail with `TEXT value contains invalid UTF-8`. Nothing was written.",
+        stats.invalid_utf8_values, stats.invalid_utf8_rows
+    );
+    for f in report.findings().iter().filter(|f| f.kind == FindingKind::Error) {
+        println!("  [error] line {} {}: {}", f.line, f.object, f.detail);
+    }
+    println!(
+        "Re-run with --source-charset <charset> (windows-1252 for a latin1/cp1252 dump) to \
+         transcode those bytes losslessly, or --on-invalid-utf8 strip|replace to drop or \
+         replace them. --dry-run previews the same report."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The v0.14.1 row-loss regression at the sink boundary: every `db import`
+    /// sink screens each statement before executing it, and the screen used
+    /// to apply the SQLite lexing rule to MySQL text. An extended `INSERT`
+    /// whose rows carry `\'` (an odd number of them), `''`, `);`, `,`, a `\\`
+    /// before a closing quote and HTML was refused as "malformed SQL" — the
+    /// dry run (which never screens) was clean — and under `--on-error skip`
+    /// the whole statement's rows were silently lost.
+    #[test]
+    fn mysql_sink_screen_accepts_escaped_quotes_in_an_extended_insert() {
+        let rows: Vec<String> = (1..=50)
+            .map(|i| match i % 5 {
+                0 => format!(r"({i},'O\'Brien & co; it\'s fine')"),
+                1 => format!(r"({i},'it''s doubled); not a boundary')"),
+                2 => format!(r#"({i},'<a href="x">O\'Brien & co</a>, <b>bold</b>')"#),
+                3 => format!(r"({i},'trailing backslash \\')"),
+                _ => format!(r"({i},'plain, with comma)')"),
+            })
+            .collect();
+        let insert = format!("INSERT INTO `t` VALUES {}", rows.join(","));
+        screen_statement(true, Dialect::MySql, &insert)
+            .expect("a MySQL-dialect extended INSERT with escaped quotes must pass the screen");
+        // The one-row shape from the report: a single `\'` in the only row.
+        screen_statement(true, Dialect::MySql, r"INSERT INTO t VALUES (1,'it\'s')").unwrap();
+        // The screen still refuses what it must, under both rules.
+        assert!(screen_statement(true, Dialect::MySql, "ATTACH DATABASE 'x' AS y").is_err());
+        assert!(screen_statement(true, Dialect::Sqlite, "ATTACH DATABASE 'x' AS y").is_err());
+        assert!(screen_statement(true, Dialect::Pg, "VACUUM").is_err());
+        // `sqlite`-native text keeps the standard rule: litewire's own
+        // emitted form of the same value (quote doubled, backslash literal).
+        screen_statement(true, Dialect::Sqlite, r"INSERT INTO t VALUES (1,'O\''Brien')").unwrap();
+        // Disabled screening (the console's --maintenance) passes anything.
+        screen_statement(false, Dialect::Sqlite, "PRAGMA writable_schema = 1").unwrap();
+    }
+
+    #[test]
+    fn utf8_policy_follows_on_error_unless_overridden() {
+        use OnErrorArg::{Skip, Stop};
+        let cp1252 = ephpm_dbimport::Charset::parse("windows-1252").unwrap();
+        // The defaults: `--on-error stop` rejects, `--on-error skip` strips.
+        assert_eq!(resolve_utf8_policy(Stop, None, None).unwrap(), Utf8Policy::Reject);
+        assert_eq!(resolve_utf8_policy(Skip, None, None).unwrap(), Utf8Policy::Strip);
+        // `utf8mb4` is the native passthrough — the same defaults.
+        assert_eq!(resolve_utf8_policy(Stop, None, Some("utf8mb4")).unwrap(), Utf8Policy::Reject);
+        assert_eq!(resolve_utf8_policy(Skip, None, Some("UTF-8")).unwrap(), Utf8Policy::Strip);
+        // A legacy charset means transcode, whatever --on-error says, and
+        // MySQL's latin1 is windows-1252.
+        for on_error in [Stop, Skip] {
+            assert_eq!(
+                resolve_utf8_policy(on_error, None, Some("latin1")).unwrap(),
+                Utf8Policy::Transcode(cp1252)
+            );
+        }
+        // Explicit --on-invalid-utf8 overrides the --on-error default.
+        assert_eq!(
+            resolve_utf8_policy(Stop, Some(OnInvalidUtf8Arg::Strip), None).unwrap(),
+            Utf8Policy::Strip
+        );
+        assert_eq!(
+            resolve_utf8_policy(Skip, Some(OnInvalidUtf8Arg::Reject), None).unwrap(),
+            Utf8Policy::Reject
+        );
+        assert_eq!(
+            resolve_utf8_policy(Skip, Some(OnInvalidUtf8Arg::Replace), Some("utf8mb4")).unwrap(),
+            Utf8Policy::Replace
+        );
+        assert_eq!(
+            resolve_utf8_policy(Stop, Some(OnInvalidUtf8Arg::Transcode), Some("windows-1252"))
+                .unwrap(),
+            Utf8Policy::Transcode(cp1252)
+        );
+    }
+
+    #[test]
+    fn utf8_policy_contradictions_are_refused() {
+        use OnErrorArg::Stop;
+        // transcode without a legacy charset has nothing to transcode from.
+        let err = resolve_utf8_policy(Stop, Some(OnInvalidUtf8Arg::Transcode), None).unwrap_err();
+        assert!(err.to_string().contains("legacy --source-charset"), "{err}");
+        let err = resolve_utf8_policy(Stop, Some(OnInvalidUtf8Arg::Transcode), Some("utf8mb4"))
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing to transcode from"), "{err}");
+        // A legacy charset with a policy that would ignore it is a no-op flag.
+        let err =
+            resolve_utf8_policy(Stop, Some(OnInvalidUtf8Arg::Strip), Some("latin1")).unwrap_err();
+        assert!(err.to_string().contains("would ignore --source-charset windows-1252"), "{err}");
+        let err = resolve_utf8_policy(Stop, None, Some("gbk")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a single-byte charset"), "{err:#}");
+        let err = resolve_utf8_policy(Stop, None, Some("klingon")).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown charset"), "{err:#}");
     }
 }

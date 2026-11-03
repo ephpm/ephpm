@@ -23,6 +23,12 @@
 //!   / full-text indexes as unsupported or downgraded.
 //! * [`CompatReport`] — the ordered list of [`Finding`]s, with a [`summary`]
 //!   and a JSON serialization.
+//! * [`Utf8Policy`] — the invalid-UTF-8 ingestion contract: the reader works
+//!   on bytes, and a byte run that is not valid UTF-8 is refused (the
+//!   default), stripped, replaced with U+FFFD, or transcoded per sequence from
+//!   a legacy single-byte [`Charset`]; every run is attributed to its
+//!   table/column/row in the report. Turso validates `TEXT` at read time, so
+//!   an import must never write a value a `SELECT` will then refuse.
 //!
 //! The actual MySQL/PostgreSQL → SQLite **type and dialect translation** is
 //! *not* this crate's job — the sanitized statements are fed to litewire's
@@ -32,12 +38,14 @@
 //!
 //! [`summary`]: CompatReport::summary
 
+mod attribute;
 mod dialect;
 mod driver;
 mod reader;
 mod report;
 mod sanitizer;
 mod sink;
+mod utf8;
 
 pub use dialect::{Dialect, sniff};
 pub use driver::{ImportOptions, ImportOutcome, ImportStats, OnError, run_import};
@@ -45,3 +53,4 @@ pub use reader::{DumpReader, RawStatement, ReadError};
 pub use report::{CompatReport, Finding, FindingKind, Summary};
 pub use sanitizer::{SanitizeOutcome, Sanitizer};
 pub use sink::{Cell, RowSet, SinkError, StatementSink};
+pub use utf8::{Charset, CharsetError, InvalidRun, SourceCharset, Utf8Policy};

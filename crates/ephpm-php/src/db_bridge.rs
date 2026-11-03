@@ -1040,8 +1040,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     };
 
     // Defense-in-depth: reject cross-database / path primitives on the tenant
-    // query path regardless of what the backend would do on its own.
-    if let Err(offending) = screen_sql(sql) {
+    // query path regardless of what the backend would do on its own. The
+    // bridge's input is MySQL-dialect text (translated by litewire below), so
+    // it is screened by the MySQL lexing rule — see `screen_sql`'s docs.
+    if let Err(offending) = screen_sql_mysql(sql) {
         return stage_error(BridgeError {
             code: ER_UNKNOWN_ERROR,
             sqlstate: *b"HY000",
@@ -1352,7 +1354,45 @@ const ASSIGN_ONLY_FORBIDDEN_PRAGMAS: [&str; 1] = ["journal_mode"];
 /// (`ScreenedBackend`), so both routes to a tenant database refuse the same
 /// statements for ePHPm's own reasons rather than the engine's defaults. Pure
 /// and stub-safe — a string scan with no PHP or backend involvement.
+///
+/// # Which rule to call
+///
+/// This function lexes string literals by the **SQLite / standard** rule: a
+/// quote is escaped only by doubling it, and a backslash is an ordinary byte.
+/// That is right for text the engine itself will parse — the wire listener's
+/// `ScreenedBackend` sees SQL litewire has *already translated*, in which
+/// every `\'` has become `''` and the backslash is literal — and for the
+/// `sqlite`-native console. Text that is still in the **MySQL** dialect (the
+/// `ephpm_db_*` bridge's input, `ephpm php --site`'s forwarded SQL, and every
+/// statement `db import` / `db query --dialect mysql` hands to a translating
+/// session) must be screened with [`screen_sql_mysql`] instead, which lexes
+/// `\'` the way MySQL and litewire's translator do. Applying this rule to
+/// MySQL text misreads an escaped quote as the closing one, and a statement
+/// with an odd number of them is refused as malformed — which is how `db
+/// import` silently dropped every extended `INSERT` whose rows contained an
+/// apostrophe (v0.14.1 row-loss fix).
 pub fn screen_sql(sql: &str) -> Result<(), String> {
+    scan_statements(sql, false)
+}
+
+/// [`screen_sql`] for text still in the **MySQL** dialect: inside `'…'` and
+/// `"…"` a backslash escapes the next byte (`\'`, `\"`, `\\`, `\n`, …), exactly
+/// as MySQL's lexer and litewire's MySQL translator (sqlparser's `MySqlDialect`,
+/// and its own quote-aware pre-passes) read it. Backtick identifiers have no
+/// backslash escape in MySQL and keep only the doubled-backtick form. Same
+/// denylist, same conservative "unterminated means refused" rule.
+///
+/// # Errors
+///
+/// As [`screen_sql`].
+pub fn screen_sql_mysql(sql: &str) -> Result<(), String> {
+    scan_statements(sql, true)
+}
+
+/// The shared scanner behind [`screen_sql`] (`backslash_escapes = false`) and
+/// [`screen_sql_mysql`] (`true`). Splits `sql` into statements on unquoted,
+/// uncommented `;` and runs [`check_statement`] on each.
+fn scan_statements(sql: &str, backslash_escapes: bool) -> Result<(), String> {
     let bytes = sql.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -1361,10 +1401,20 @@ pub fn screen_sql(sql: &str) -> Result<(), String> {
         match bytes[i] {
             b'\'' | b'"' | b'`' => {
                 let quote = bytes[i];
+                // MySQL: `\` escapes the next byte in string literals only —
+                // never inside a backtick-quoted identifier.
+                let escapes = backslash_escapes && quote != b'`';
                 i += 1;
                 loop {
                     if i >= bytes.len() {
                         return Err("malformed SQL".to_string());
+                    }
+                    if escapes && bytes[i] == b'\\' {
+                        // Skip the backslash and whatever it escapes; a
+                        // trailing lone backslash leaves the literal open and
+                        // is refused by the bounds check above.
+                        i += 2;
+                        continue;
                     }
                     if bytes[i] == quote {
                         // A doubled quote is an escaped quote, not a close.
@@ -3358,6 +3408,65 @@ mod screen_tests {
     fn truncated_quote_or_comment_is_rejected_conservatively() {
         rejected("SELECT 'unterminated");
         rejected("SELECT 1 /* unterminated");
+    }
+
+    /// The mysqldump row-loss bug (v0.14.1): a MySQL-dialect string literal
+    /// escapes an embedded quote as `\'`, which the SQLite-rule scan read as
+    /// the *closing* quote. With an odd number of them the statement ended
+    /// inside a string and was refused as "malformed SQL" — so `db import`
+    /// (which screens every statement, unlike `--dry-run`) dropped whole
+    /// extended `INSERT`s: ~257k of 530k rows on a real Sendy dump. The
+    /// MySQL-rule screen must lex exactly as litewire's MySQL translator does:
+    /// `\` escapes the next byte inside `'…'` and `"…"`, never in backticks.
+    #[test]
+    fn mysql_rule_honours_backslash_escapes_in_string_literals() {
+        let allowed_mysql = |sql: &str| {
+            assert!(screen_sql_mysql(sql).is_ok(), "expected MySQL-rule screen to allow `{sql}`");
+        };
+        allowed_mysql(r"INSERT INTO t VALUES (1,'O\'Brien')");
+        allowed_mysql(r"INSERT INTO t VALUES (1,'O\'Brien'),(2,'it''s'),(3,'a);b'),(4,'x,y')");
+        allowed_mysql(r#"INSERT INTO t VALUES (1,'<a href="x">O\'Brien & co</a>')"#);
+        allowed_mysql(r#"INSERT INTO t VALUES (1,"she said \"hi\"")"#);
+        // A backslash-escaped backslash is not an escaped quote: `'a\\'` is the
+        // two-byte string `a\` and the quote after it closes.
+        allowed_mysql(r"INSERT INTO t VALUES (1,'a\\'),(2,'b')");
+        // Escaped newline / NUL / tab spellings mysqldump emits.
+        allowed_mysql(r"INSERT INTO t VALUES (1,'line1\nline2\0\t\Z')");
+        // The exact shape the bug reported: an odd number of `\'` in one row.
+        allowed_mysql(r"INSERT INTO t VALUES (1,'it\'s'),(2,'plain')");
+        // Backticks have no backslash escape in MySQL — a backslash before the
+        // closing backtick is literal and the identifier still closes.
+        allowed_mysql(r"SELECT * FROM `odd\`");
+        // The SQLite-rule scan is unchanged: that is what the wire listener's
+        // ScreenedBackend runs on *post-translation* text, where litewire has
+        // already turned `\'` into `''` and left the backslash literal.
+        allowed(r"INSERT INTO t VALUES (1,'O\''Brien')");
+        // …and it is exactly the scan that mis-read MySQL text before the fix:
+        // pinned so the two rules are never "unified" back into one.
+        rejected(r"INSERT INTO t VALUES (1,'it\'s')");
+    }
+
+    #[test]
+    fn mysql_rule_still_refuses_what_the_sqlite_rule_refuses() {
+        let rejected_mysql = |sql: &str| {
+            assert!(screen_sql_mysql(sql).is_err(), "expected MySQL-rule screen to refuse `{sql}`");
+        };
+        rejected_mysql("ATTACH DATABASE '/etc/passwd' AS steal");
+        rejected_mysql("SELECT 1; ATTACH DATABASE 'x' AS y");
+        // The string closes at the second quote (the `\\` is a literal
+        // backslash), so the ATTACH that follows is a real second statement.
+        rejected_mysql(r"SELECT '\\'; ATTACH DATABASE 'x' AS y");
+        rejected_mysql(r"SELECT 'a\'b'; VACUUM");
+        rejected_mysql("SELECT 'unterminated");
+        rejected_mysql(r"SELECT 'escaped close\'");
+        rejected_mysql("SELECT 1 /* unterminated");
+        rejected_mysql("EXPLAIN ATTACH DATABASE 'x.db' AS y");
+        rejected_mysql("PRAGMA journal_mode = mvcc");
+        // A forbidden verb that only *looks* like a statement start to a scan
+        // that does not know `\'`, but is string data to MySQL (and therefore
+        // to litewire's parser), is correctly allowed — the parser never sees
+        // an ATTACH statement here.
+        assert!(screen_sql_mysql(r"SELECT 'a\'; ATTACH DATABASE ''x'' AS y; SELECT '").is_ok());
     }
 
     #[test]

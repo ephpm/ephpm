@@ -17,6 +17,10 @@ thiserror.workspace = true
 # `--report <path>` output). serde_json is already resolved workspace-wide.
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# WHATWG single-byte charset tables for the `--source-charset` transcoding
+# policy (src/utf8.rs). Only the stateless single-byte encodings are accepted,
+# because the policy decodes *invalid byte runs* in an otherwise-UTF-8 stream.
+encoding_rs.workspace = true
 
 [lints]
 workspace = true

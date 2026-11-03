@@ -443,6 +443,20 @@ enum OnErrorOpt {
     Skip,
 }
 
+/// Invalid-UTF-8 policy for `ephpm db import` (`--on-invalid-utf8`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum OnInvalidUtf8Opt {
+    /// Refuse the import, naming the affected tables/columns; nothing is
+    /// written (the default).
+    Reject,
+    /// Drop the invalid bytes.
+    Strip,
+    /// Replace each invalid sequence with U+FFFD.
+    Replace,
+    /// Transcode each invalid sequence from `--source-charset`.
+    Transcode,
+}
+
 /// Dialect selector for `ephpm db query` / `ephpm db shell`. Defaults to
 /// `sqlite` (the engine's native tongue) — distinct from `db import`, which
 /// sniffs the dump header.
@@ -550,6 +564,27 @@ enum DbCommand {
         /// Also list dropped safe-no-op findings (otherwise only counted).
         #[arg(long)]
         verbose: bool,
+
+        /// What to do with TEXT bytes that are not valid UTF-8 (a latin1 /
+        /// binary column's cp1252 smart quotes, a lone high byte). The
+        /// embedded engine validates TEXT when it is *read*, so such a value
+        /// would import and then break every SELECT. Default: follows
+        /// --on-error — `stop` rejects (the whole dump is validated first and
+        /// nothing is written if any is found), `skip` strips — and a legacy
+        /// --source-charset means `transcode`. `replace` substitutes U+FFFD.
+        /// Valid UTF-8 is never touched by any policy.
+        #[arg(long, value_enum)]
+        on_invalid_utf8: Option<OnInvalidUtf8Opt>,
+
+        /// What the dump's bytes are encoded in. `utf8mb4` (the default; also
+        /// `utf8`): the stream is UTF-8 and passes through byte-identically,
+        /// 4-byte emoji included. A legacy single-byte charset (windows-1252,
+        /// latin1, iso-8859-15, windows-1251, koi8-r, …) transcodes only the
+        /// byte runs that are NOT valid UTF-8 from it; text that is already
+        /// UTF-8 is never re-decoded. MySQL's `latin1` is cp1252, so
+        /// windows-1252 is the right choice for a latin1 dump.
+        #[arg(long, value_name = "CHARSET", default_value = "utf8mb4")]
+        source_charset: String,
     },
 
     /// Run one SQL statement (or a `;`-separated batch) against a virtual
@@ -843,6 +878,8 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
             report,
             defer_indexes,
             verbose,
+            on_invalid_utf8,
+            source_charset,
         } => {
             let req = db_import::ImportRequest {
                 dump,
@@ -863,6 +900,13 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
                 report,
                 defer_indexes,
                 verbose,
+                on_invalid_utf8: on_invalid_utf8.map(|o| match o {
+                    OnInvalidUtf8Opt::Reject => db_import::OnInvalidUtf8Arg::Reject,
+                    OnInvalidUtf8Opt::Strip => db_import::OnInvalidUtf8Arg::Strip,
+                    OnInvalidUtf8Opt::Replace => db_import::OnInvalidUtf8Arg::Replace,
+                    OnInvalidUtf8Opt::Transcode => db_import::OnInvalidUtf8Arg::Transcode,
+                }),
+                source_charset: Some(source_charset),
             };
             db_import::run(&req)
         }
