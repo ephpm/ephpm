@@ -33,7 +33,8 @@ header('Content-Type: application/json');
 $keys = ['DB_CONNECTION','DB_HOST','DB_PORT','DB_DATABASE','DB_NAME','DB_USER','DB_USERNAME','DB_PASSWORD','DATABASE_URL'];
 $present = [];
 foreach ($keys as $k) { if (isset($_SERVER[$k])) { $present[$k] = $_SERVER[$k]; } }
-$out = ['sapi' => PHP_SAPI, 'present' => array_keys($present), 'vars' => $present];
+// `(object)` so an empty map encodes as `{}`, not `[]`.
+$out = ['sapi' => PHP_SAPI, 'present' => array_keys($present), 'vars' => (object)$present];
 
 // The bridge path works in both modes (offline direct-open, or the wire).
 try {

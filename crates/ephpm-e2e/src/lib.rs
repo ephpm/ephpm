@@ -358,8 +358,26 @@ impl DbImportFixture {
     ///
     /// Fails if the subprocess cannot be spawned.
     pub fn php(&self, php_args: &[&str]) -> Result<std::process::Output> {
-        Command::new(&self.binary)
-            .args(["php", "--site", &self.site, "--config"])
+        let mut cmd = Command::new(&self.binary);
+        // php-cli's `$_SERVER` is the process environment, so anything the
+        // *test runner's* environment carries under these names (a developer
+        // box with a `DATABASE_URL` for some other project) would show up in
+        // the script as if the CLI had exported it. Scrub them, so what the
+        // script sees is exactly what `ephpm php --site` added.
+        for key in [
+            "DB_CONNECTION",
+            "DB_HOST",
+            "DB_PORT",
+            "DB_DATABASE",
+            "DB_NAME",
+            "DB_USER",
+            "DB_USERNAME",
+            "DB_PASSWORD",
+            "DATABASE_URL",
+        ] {
+            cmd.env_remove(key);
+        }
+        cmd.args(["php", "--site", &self.site, "--config"])
             .arg(&self.config_path)
             .args(php_args)
             .output()
