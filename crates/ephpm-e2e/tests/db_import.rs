@@ -422,7 +422,7 @@ async fn valid_multibyte_utf8_round_trips_byte_identical() {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0]["h"], "E28FB02078", "⏰ must not become 3F ('?'): {rows:?}");
     assert_eq!(rows[0]["v"], "\u{23F0} x");
-    assert_eq!(rows[1]["h"], "F09F988020436166C3A920E4B8AD", "{rows:?}");
+    assert_eq!(rows[1]["h"], "F09F988020636166C3A920E4B8AD", "{rows:?}");
     assert_eq!(rows[1]["v"], "\u{1F600} caf\u{E9} \u{4E2D}");
 }
 
