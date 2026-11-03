@@ -31,7 +31,7 @@ ignore = [
     # family as 0367/0368/0369 above and waived for the same reason — vivacity's
     # `extract::extract_zip` never calls `ZipArchive::extract`; it walks entries
     # with `by_index` and rejects escaping/symlink targets itself. Pre-existing
-    # on main (zip =2.4.2 is unchanged by the 0.25→0.26.1 vivacity bump); fixed
+    # on main (zip =2.4.2 is unchanged by the 0.25→0.26.2 vivacity bump); fixed
     # by zip >= 9.0.0, remove with the three above when vivacity moves to it.
     "RUSTSEC-2026-0429",
     # RESOLVED (do not re-add): RUSTSEC-2026-0391 (zstd), RUSTSEC-2026-0398 and
@@ -40,9 +40,10 @@ ignore = [
     # chitchat and rust_mysql_common that move their `zstd` dependency to 0.14
     # (see [patch.crates-io] and allow-git below). #648.
     # RESOLVED (do not re-add): RUSTSEC-2026-0386 (tokio AsyncFd unsound safe
-    # constructors) is fixed at tokio 1.53.3, now resolvable because the ephpm
-    # fork of vivacity relaxes its exact `tokio = "=1.53.1"` pin (see
-    # [patch.crates-io] below). #648.
+    # constructors) is fixed at tokio 1.53.3. vivacity 0.26.2 pins `tokio =
+    # "=1.53.3"` upstream, so the fix is in the graph with no patch — the ephpm
+    # vivacity fork that used to relax the old `=1.53.1` pin has been retired
+    # (its allow-git line and [patch.crates-io] entry are both removed). #648.
     # RESOLVED (do not re-add): RUSTSEC-2026-0410 (zstd-sys wasm32 allocator
     # shim) is fixed by zstd-sys 2.1.2, which zstd-safe 7 accepts.
     # RESOLVED (do not re-add): RUSTSEC-2026-0173 (proc-macro-error2
@@ -112,11 +113,6 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/ephpm/litewire.git",
-    # ePHPm fork of vivacity (the `ephpm composer` installer) with the exact
-    # `tokio = "=1.53.1"` workspace pin relaxed to ">=1.53.3, <1.54" so the
-    # RUSTSEC-2026-0386 fix can enter the graph; see [patch.crates-io] in
-    # Cargo.toml. Remove when upstream relaxes the pin.
-    "https://github.com/ephpm/vivacity.git",
     # ePHPm forks of chitchat and rust_mysql_common with only their `zstd`
     # dependency bumped 0.13 -> 0.14 so the whole graph can reach the
     # RUSTSEC-2026-0391/0398/0403 fix (zstd 0.14.3 / zstd-safe 8.2.0); see

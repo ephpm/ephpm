@@ -75,8 +75,12 @@ Because the engine is Beta upstream, take its limits literally:
   as a production SQLite replacement.
 - **`VACUUM` is unsupported.**
 - **Multi-process access is unsupported.** One process opens the database
-  file. Do not point a second ePHPm instance, a `sqlite3` shell, or a backup
-  tool at the same file while the server is running.
+  file. Do not point a second ePHPm instance, a `sqlite3` shell, or a
+  file-tailing backup/replication tool (**Litestream, LiteFS**, or anything
+  built for stock SQLite) at the same file while the server is running — see
+  [Backups, and why external SQLite tools lock the file](#backups-and-why-external-sqlite-tools-lock-the-file)
+  below. It is not a reader/writer coexistence story; the second opener and
+  ePHPm fight over the file and one of them loses it.
 
 ## Opening existing SQLite / rusqlite `.db` files
 
@@ -358,6 +362,61 @@ gauge measured in **change-log rows, not seconds** — are in the
 full design, its verified findings, and everything still deferred (including
 read-only enforcement on replica wire frontends and `turso_cdc` retention
 pruning) are on the [Turso engine roadmap](/roadmap/turso-engine/).
+
+## Backups, and why external SQLite tools lock the file
+
+**Litestream, LiteFS, and every other tool built for stock SQLite are
+unsupported on a Turso-backed database file, and will take the site down.**
+This is not a tuning caveat; it is a hard incompatibility.
+
+Turso is not a drop-in `sqlite3` library that happens to share a file format.
+It has its **own write-ahead-log format and its own file locking**, and ePHPm's
+always-on [WAL checkpoint gate](#wal-growth-under-load-and-the-checkpoint-gate)
+assumes it is the only thing touching the `-wal`. A stock-SQLite tool does the
+opposite of a passive reader: it opens the file as a SQLite database, forces its
+own WAL mode, and holds read/write descriptors to tail the `-wal`. Pointed at a
+Turso file it
+
+1. cannot parse Turso's WAL (Litestream logs `primary wal header: EOF` and
+   "clears the generation"),
+2. imposes its own WAL/lock state on the file, and
+3. locks ePHPm out — the next Turso open fails with
+   `Locking error: Failed locking file '…'. File is locked by another process`.
+
+On the per-site wire path that surfaces as a connection that **authenticates but
+cannot be served**: ePHPm verifies the site credential, then refuses with
+`could not open the database for site <key>: … File is locked by another
+process` (a verified credential is never downgraded to an auth failure — see
+[the clustered busy-database note](#clustered-mode-experimental)). Whichever
+process opens the file first wins, so the symptom is timing-dependent: a site
+whose file ePHPm opens before the sidecar may survive until the next restart,
+while a larger file the sidecar snapshots first is dead from the start. Deleting
+the `-wal`/`-shm` while ePHPm is stopped does not help — the sidecar re-grabs the
+file on restart. There is no locking contract for an external opener; the only
+supported state is *ePHPm is the sole process on the file*.
+
+### Supported backups
+
+There is no continuous / point-in-time backup of the embedded database today —
+nothing ships `.db` changes to object storage. (`[kv.snapshot]`'s S3 mode backs
+up the **KV store**, not the database, and is a cache warm-up rather than
+durability. `[db.sqlite.replication]` is experimental cross-node **cluster
+replication** for high availability, not a backup to external storage — a node
+loss keeps committed data that was already shipped to a replica, but it gives no
+archive and no restore-to-a-point.) Use one of:
+
+- **Stop-and-copy (the clean path).** A graceful `ephpm` shutdown runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` on every open database, so a cleanly stopped
+  node leaves a single consolidated `.db` with an empty `-wal`. Copy that file.
+- **Crash-consistent volume snapshots** — AWS EBS, Hetzner, DigitalOcean, LVM,
+  ZFS. These are safe only when the snapshot is **atomic across the `.db`, `-wal`
+  and `-shm` together** (a single-volume block snapshot is). The restored image
+  is equivalent to a crash image, which Turso recovers on next open — the same
+  recovery path verified for the [0.7.2 → 0.8.2 upgrade](#turso-072--082-v0120).
+  A plain `cp`/`rsync` of a live `.db` alone is **not** consistent: it misses the
+  `-wal` or captures a write in progress.
+- **High availability** (not a backup): experimental clustered mode keeps a full
+  local copy on every node — see [Clustered mode](#clustered-mode-experimental).
 
 ## How the modes line up
 
