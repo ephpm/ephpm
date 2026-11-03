@@ -1028,10 +1028,7 @@ fn render_kv_piped(frame: &Frame, pipe: &KvPipe) -> anyhow::Result<KvReply> {
     // structurally reformatted. Print it raw with a one-line note rather than a
     // quoted scalar, a path error, or a panic.
     if let Some(raw) = non_json_bulk_raw(frame) {
-        return Ok(KvReply {
-            text: raw,
-            note: Some("value is not JSON; printed raw".to_string()),
-        });
+        return Ok(KvReply { text: raw, note: Some("value is not JSON; printed raw".to_string()) });
     }
 
     let value = frame_to_json(frame);
@@ -1281,7 +1278,10 @@ mod kv_path {
                 match step {
                     Step::Field(name) => {
                         let obj = v.as_object().ok_or_else(|| {
-                            anyhow!("path {path}: field {name:?} needs an object, found {}", kind(v))
+                            anyhow!(
+                                "path {path}: field {name:?} needs an object, found {}",
+                                kind(v)
+                            )
                         })?;
                         let field = obj
                             .get(name)
@@ -1453,12 +1453,8 @@ fn render_table_grid(columns: &[String], rows: &[Vec<String>]) -> String {
     }
 
     let mut out = String::new();
-    let header = columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| pad(c, widths[i]))
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let header =
+        columns.iter().enumerate().map(|(i, c)| pad(c, widths[i])).collect::<Vec<_>>().join(" | ");
     out.push_str(&header);
     out.push('\n');
     out.push_str(&widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("-+-"));
@@ -1825,7 +1821,10 @@ mod tests {
         // A JSON bulk parses to its structured value.
         assert_eq!(frame_to_json(&widget_frame())["price"], serde_json::json!(1900));
         // A non-JSON bulk becomes a JSON string of its UTF-8 text.
-        assert_eq!(frame_to_json(&Frame::bulk(b"blue-hat".to_vec())), serde_json::json!("blue-hat"));
+        assert_eq!(
+            frame_to_json(&Frame::bulk(b"blue-hat".to_vec())),
+            serde_json::json!("blue-hat")
+        );
         // A nested array converts recursively (non-JSON items → strings).
         let arr = Frame::Array(vec![Frame::Integer(1), Frame::bulk(b"two".to_vec()), Frame::Null]);
         assert_eq!(frame_to_json(&arr), serde_json::json!([1, "two", null]));
@@ -1838,7 +1837,10 @@ mod tests {
 
     #[test]
     fn pipe_parsing_grammar() {
-        assert_eq!(parse_kv_pipe("json").unwrap(), KvPipe { format: Some(KvFormat::Json), path: None });
+        assert_eq!(
+            parse_kv_pipe("json").unwrap(),
+            KvPipe { format: Some(KvFormat::Json), path: None }
+        );
         assert_eq!(parse_kv_pipe("yaml").unwrap().format, Some(KvFormat::Yaml));
         assert_eq!(parse_kv_pipe("yml").unwrap().format, Some(KvFormat::Yaml));
         assert_eq!(
@@ -1862,7 +1864,10 @@ mod tests {
             parse_kv_pipe("").unwrap_err().to_string(),
             "pipe needs a format or a path, e.g. | json .price"
         );
-        assert_eq!(parse_kv_pipe("   ").unwrap_err().to_string(), "pipe needs a format or a path, e.g. | json .price");
+        assert_eq!(
+            parse_kv_pipe("   ").unwrap_err().to_string(),
+            "pipe needs a format or a path, e.g. | json .price"
+        );
         // Unknown leading bareword format.
         assert!(parse_kv_pipe("xml").unwrap_err().to_string().contains("unknown pipe format"));
         // Extra tokens.
@@ -1887,13 +1892,15 @@ mod tests {
     fn piped_scalar_path_is_raw_bare() {
         let reply = render_kv_piped(&widget_frame(), &parse_kv_pipe(".price").unwrap()).unwrap();
         assert_eq!(reply.text, "1900");
-        let reply = render_kv_piped(&widget_frame(), &parse_kv_pipe("json .price").unwrap()).unwrap();
+        let reply =
+            render_kv_piped(&widget_frame(), &parse_kv_pipe("json .price").unwrap()).unwrap();
         assert_eq!(reply.text, "1900");
     }
 
     #[test]
     fn piped_comma_select_auto_is_pretty_object() {
-        let reply = render_kv_piped(&widget_frame(), &parse_kv_pipe(".slug,.price").unwrap()).unwrap();
+        let reply =
+            render_kv_piped(&widget_frame(), &parse_kv_pipe(".slug,.price").unwrap()).unwrap();
         let v: Value = serde_json::from_str(&reply.text).unwrap();
         assert_eq!(v, serde_json::json!({ "slug": "blue-hat", "price": 1900 }));
     }
@@ -1931,7 +1938,11 @@ mod tests {
         for pipe in ["json", "yaml", "table", ".price"] {
             let reply = render_kv_piped(&frame, &parse_kv_pipe(pipe).unwrap()).unwrap();
             assert_eq!(reply.text, "blue-hat", "pipe {pipe}");
-            assert_eq!(reply.note.as_deref(), Some("value is not JSON; printed raw"), "pipe {pipe}");
+            assert_eq!(
+                reply.note.as_deref(),
+                Some("value is not JSON; printed raw"),
+                "pipe {pipe}"
+            );
         }
     }
 

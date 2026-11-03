@@ -480,7 +480,10 @@ mod tests {
     fn parses_kv_with_pipe() {
         assert_eq!(
             parse_meta("/kv GET widget:42 | json .price"),
-            Meta::Kv { args: vec!["GET".into(), "widget:42".into()], pipe: Some(" json .price".into()) }
+            Meta::Kv {
+                args: vec!["GET".into(), "widget:42".into()],
+                pipe: Some(" json .price".into())
+            }
         );
         // A path-only pipe.
         assert_eq!(
