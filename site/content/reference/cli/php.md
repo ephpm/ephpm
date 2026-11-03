@@ -100,6 +100,27 @@ At startup a strategy is chosen automatically:
 `--site` requires multi-tenant per-site mode (`[server] sites_dir` + `[db.sqlite]`);
 a single-shared-database config is rejected rather than bound.
 
+### DB variables for stock mysqli and pdo_mysql
+
+On the **server-running** path, `--site` also exports the per-site database
+credentials the HTTP router injects into that site's requests — `DB_HOST`,
+`DB_PORT`, `DB_USER`/`DB_USERNAME`, `DB_PASSWORD`, `DB_NAME`/`DB_DATABASE`,
+`DB_CONNECTION` and `DATABASE_URL` — into the CLI's process environment before
+PHP starts, so they appear in `$_SERVER` (and `$_ENV`/`getenv()`) exactly as a
+request sees them. The map is built by the same function the router uses, so
+the two cannot drift. A script that opens its own `mysqli`/`pdo_mysql`
+connection from `$_SERVER['DB_*']` (Sendy's `includes/config.php`, for one)
+therefore reaches the running server's listener and its own database
+unchanged — the supported shape for cron jobs; see
+[Cron and Scheduled Scripts](/guides/cron-and-scheduled-scripts/). Added in
+[#689](https://github.com/ephpm/ephpm/issues/689).
+
+On the **offline** path nothing is exported: there is no listener for a raw
+socket to reach, and an unset `DB_HOST` is a clearer failure than a
+connection refused. The bridge still works offline. The CLI logs which path it
+took on stderr. Any `DB_*` already present in the invoking environment is
+overwritten on the server-running path and left alone on the offline path.
+
 Wrapping this in [`ephpm exec --site …`](../exec/) to run it inside the tenant's
 Linux filesystem/uid sandbox **does not currently work** when the config lives
 in `/etc/ephpm`. The sandbox denies that directory on purpose, so the inner
@@ -160,7 +181,11 @@ bare with a program on stdin) runs PHP — see [Re-invoking
 
 This applies to `ephpm php` only. In the server the process environment is
 deliberately **not** merged into a request's `$_SERVER`: `ephpm serve` is
-multi-tenant, and the process environment holds cross-tenant material.
+multi-tenant, and the process environment holds cross-tenant material. The
+converse holds for the per-site `DB_*` credentials: the server injects them
+per request without touching the environment, while `ephpm php --site`
+(a single-tenant process) exports them into its real environment — see
+[DB variables for stock mysqli and pdo_mysql](#db-variables-for-stock-mysqli-and-pdo_mysql) above.
 
 > **Fixed in v0.7.4.** Up to and including v0.7.3, CLI `$_SERVER` carried
 > neither the environment nor `DOCUMENT_ROOT`

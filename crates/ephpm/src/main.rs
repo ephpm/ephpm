@@ -177,7 +177,10 @@ enum Commands {
     /// bound to a virtual host's database, so `wp`, `artisan`, migrations, and
     /// seeders built on the `db-*` Composer packages reach that tenant's Turso
     /// database — over the running server's wire listener when one is up, or by
-    /// opening the site's file directly for offline work (issue #471).
+    /// opening the site's file directly for offline work (issue #471). When a
+    /// server is up, the script's `$_SERVER['DB_*']` also carries the same
+    /// per-site `pdo_mysql`/`mysqli` credentials a request gets, so cron-style
+    /// scripts that open their own connection work too (issue #689).
     #[command(disable_help_flag = true)]
     Php {
         /// Path to the ephpm configuration file. Only read together with
@@ -189,9 +192,11 @@ enum Commands {
         config: Option<PathBuf>,
 
         /// Bind `ephpm_db_*` to virtual host `<key>`'s database (requires
-        /// multi-tenant `[server] sites_dir` + `[db.sqlite]` and `--config`).
-        /// Without it, `ephpm php` runs with no embedded database bound, exactly
-        /// as before.
+        /// multi-tenant `[server] sites_dir` + `[db.sqlite]` and `--config`),
+        /// and — when the server's MySQL listener answers — export that site's
+        /// `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` (the request-path map)
+        /// into `$_SERVER` for stock `mysqli`/`pdo_mysql`. Without it,
+        /// `ephpm php` runs with no embedded database bound, exactly as before.
         #[arg(long)]
         site: Option<String>,
 
@@ -1357,6 +1362,14 @@ fn run_php(
             }
             let cfg = ephpm_config::Config::load(&config_path)
                 .with_context(|| format!("loading configuration from {}", config_path.display()))?;
+            // Plan first (a thread-free TCP probe), then export the per-site
+            // `DB_*` credentials into the environment — php-cli's `$_SERVER`
+            // is the environment, so this is how a raw-mysqli cron script
+            // gets what a request gets (issue #689). Both happen while the
+            // process is still single-threaded: the runtime below is the
+            // first thread this subcommand spawns.
+            let strategy = site_db::plan_site_db(&cfg, &site_key)?;
+            site_db::export_db_env(&strategy);
             // A dedicated multi-thread runtime, NOT entered on this thread —
             // PHP runs here, the runtime's own worker threads drive the backend.
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1365,7 +1378,7 @@ fn run_php(
                 .thread_name("ephpm-php-db")
                 .build()
                 .context("failed to build the database runtime for `ephpm php --site`")?;
-            let offline = site_db::bind_site_db(&cfg, &site_key, runtime.handle())?;
+            let offline = site_db::bind_site_db(&site_key, strategy, runtime.handle())?;
             Some((runtime, offline))
         }
         None => {

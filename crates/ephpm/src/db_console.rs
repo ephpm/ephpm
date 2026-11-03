@@ -190,11 +190,7 @@ impl Console {
             .build()
             .context("building the database runtime for the db console")?;
 
-        let listen =
-            config.db.sqlite.as_ref().map(|s| s.proxy.mysql_listen.clone()).unwrap_or_default();
-        let reachable = if listen.is_empty() { None } else { site_db::server_reachable(&listen) };
-
-        let strategy = site_db::choose_strategy(&config, &cfg.site, reachable)
+        let strategy = site_db::plan_site_db(&config, &cfg.site)
             .context("resolving --site against the configuration")?;
 
         let kv = KvAccess {
@@ -204,7 +200,7 @@ impl Console {
         };
 
         let (mode, dialect, screen, sink, offline) = match strategy {
-            Strategy::Wire { addr, user, password } => {
+            Strategy::Wire { addr, listen, user, password } => {
                 // Live mode is MySQL-only: only the server's MySQL listener is
                 // bound, and the single-writer rule means we must forward to it
                 // rather than open the file. A *default* sqlite dialect is

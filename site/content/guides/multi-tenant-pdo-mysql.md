@@ -348,6 +348,12 @@ ephpm php --site shop --config /etc/ephpm/ephpm.toml -- wp --path=/srv/sites/sho
 ephpm php --site shop --config /etc/ephpm/ephpm.toml -- vendor/bin/wp option get siteurl
 ```
 
+With a server running, `--site` also exports this page's `DB_*` credentials
+into the CLI's `$_SERVER` (the same map the router injects, built by the same
+function), so a script that opens its own `pdo_mysql`/`mysqli` connection from
+them — a cron job — works too; offline, nothing is exported. See
+[Cron and Scheduled Scripts](/guides/cron-and-scheduled-scripts/).
+
 `--config` and `--site` are ePHPm's own options and must come **before** the
 PHP program/args; everything after (including a `--` separator) is passed to PHP
 untouched. Without `--site`, `ephpm php` behaves exactly as before (no database
