@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 
@@ -585,6 +586,42 @@ pub struct ServerConfig {
     /// addressed.)
     #[serde(default)]
     pub sites_domain_suffix: Option<String>,
+
+    /// Exact-host **aliases**: extra hostnames a virtual host answers to, as a
+    /// map from hostname to the canonical site key (the directory name under
+    /// [`sites_dir`](Self::sites_dir)).
+    ///
+    /// ```toml
+    /// [server.host_map]
+    /// "api.whatsupnails.com" = "admin"
+    /// "www.whatsupnails.com" = "whatsupnails.com"
+    /// ```
+    ///
+    /// Consulted **first** by the router, on the normalized `Host` (port and
+    /// trailing dot stripped, lowercased) and *before*
+    /// [`sites_domain_suffix`](Self::sites_domain_suffix) is stripped: an exact
+    /// hit is authoritative for that host, every other host takes the existing
+    /// suffix-strip → directory-name path, so the two coexist. The resolved
+    /// **site key stays canonical** — the per-site database, `pdo_mysql`
+    /// credential, KV keyspace and temp/session root all derive from the mapped
+    /// key, never from the alias — while PHP still sees the real request host
+    /// in `$_SERVER['HTTP_HOST']`. Alias hosts remain subject to
+    /// `[server.request] trusted_hosts`.
+    ///
+    /// Fail closed at startup (`Config::validate`): requires `sites_dir`; each
+    /// alias must be a port-free DNS name that is itself a valid vhost key
+    /// (it is lowercased and a trailing dot removed, and two aliases that
+    /// normalize to the same host are refused); each target must be a valid
+    /// canonical site key. Whether the target directory *exists* can only be
+    /// known once `sites_dir` is read (sites are discovered lazily), so a target
+    /// with no directory is a startup `WARN` naming the alias, and that alias
+    /// then resolves like an unknown host — the default document root with
+    /// **no** tenant identity — never a `sites_dir` join on the alias.
+    ///
+    /// Default: empty (byte-identical routing to a build without the knob).
+    /// Env: not settable (a table).
+    #[serde(default)]
+    pub host_map: BTreeMap<String, String>,
 
     /// Index file names to try when a directory is requested.
     #[serde(default = "default_index_files")]
@@ -5090,6 +5127,16 @@ impl Config {
             )));
         }
 
+        // Fail closed: `[server.host_map]` is a routing instruction, so a
+        // malformed entry must stop startup rather than quietly route nowhere.
+        // The alias is matched against the normalized `Host` and must be a
+        // valid vhost key in its own right (the router's `is_valid_site_key`
+        // gate rejects malformed hosts before resolution, so an alias that
+        // fails it could never match); the target is joined onto `sites_dir`
+        // and must be a canonical site key. Existence of the target directory
+        // is a router-startup WARN — sites are discovered lazily.
+        validate_host_map(&self.server.host_map, self.server.sites_dir.is_some())?;
+
         // Fail closed: per-site overrides are trusted because they live where no
         // tenant can write. A `site_overrides_dir` inside `sites_dir` is inside
         // some tenant's container, hence inside that tenant's `open_basedir`,
@@ -5580,6 +5627,7 @@ impl Default for ServerConfig {
             run_as_user: None,
             run_as_group: None,
             sites_domain_suffix: None,
+            host_map: BTreeMap::new(),
             index_files: default_index_files(),
             websocket_files: default_websocket_files(),
             fallback: default_fallback(),
@@ -7505,6 +7553,94 @@ fn default_index_files() -> Vec<String> {
 /// mistake (`sites_dir = "/var/www/sites"`, `site_overrides_dir =
 /// "/var/www/sites/_overrides"`), not a determined operator using symlinks to
 /// defeat their own guard rail.
+/// Whether a **normalized** host key (port and trailing dot stripped,
+/// lowercased) is safe to join onto `[server] sites_dir` as a virtual-host
+/// directory name — the one allowlist every site-key consumer shares.
+///
+/// A key is valid only if it is a non-empty sequence of DNS-style labels drawn
+/// from `[a-z0-9._-]` with no empty label (which rejects `.`, `..`, `a..b` and
+/// leading/trailing dots in one test); `/`, `\`, NUL, `:` and every other
+/// separator or control byte are simply outside the charset. Length is capped
+/// at 255 (DNS names max 253, with slack). This closes the `Host`-header path
+/// traversal of issue #275 lexically: no `..` segment and no separator can
+/// survive, so `sites_dir.join(key)` only ever names a direct child.
+///
+/// The router (`ephpm-server`) applies this to every request's `Host`; config
+/// validation applies it to `[server.host_map]` aliases and targets so a
+/// malformed entry is a startup error rather than one that can never match.
+#[must_use]
+pub fn is_valid_site_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > 255 {
+        return false;
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    !key.split('.').any(str::is_empty)
+}
+
+/// Normalize a `[server.host_map]` alias the way the router normalizes a
+/// request `Host` *minus* port stripping: lowercased, trailing dot removed. A
+/// port is deliberately not stripped here — an alias with a port is refused by
+/// [`is_valid_site_key`] (`:` is outside the charset), because the router
+/// matches on the port-free host and the entry would otherwise never fire.
+#[must_use]
+pub fn normalize_host_alias(alias: &str) -> String {
+    alias.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Validate `[server.host_map]`: every alias must normalize to a valid vhost
+/// key, two aliases must not collapse onto one host, every target must be a
+/// canonical site key, and the map is meaningless without `sites_dir`.
+fn validate_host_map(
+    host_map: &BTreeMap<String, String>,
+    has_sites_dir: bool,
+) -> Result<(), ConfigError> {
+    if host_map.is_empty() {
+        return Ok(());
+    }
+    if !has_sites_dir {
+        return Err(ConfigError::Validation(
+            "[server.host_map] is set but [server] sites_dir is not. Host aliases map a \
+             hostname onto a virtual-host directory under sites_dir, so without it every \
+             entry would be a silent no-op. Set [server] sites_dir, or remove the map."
+                .to_string(),
+        ));
+    }
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for (alias, target) in host_map {
+        let normalized = normalize_host_alias(alias);
+        if !is_valid_site_key(&normalized) {
+            return Err(ConfigError::Validation(format!(
+                "[server.host_map] alias {alias:?} is not a valid hostname for virtual-host \
+                 routing. An alias is matched against the request Host with the port and any \
+                 trailing dot removed, so write it as a bare DNS name of labels drawn from \
+                 [a-z0-9._-] with no empty label and no port (e.g. \"api.example.com\"). \
+                 Malformed hosts are rejected before routing, so this entry could never match."
+            )));
+        }
+        if let Some(first) = seen.insert(normalized.clone(), alias.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "[server.host_map] aliases {first:?} and {alias:?} both normalize to \
+                 {normalized:?} (hosts are matched case-insensitively, without a trailing \
+                 dot). Keep one of them."
+            )));
+        }
+        if !is_valid_site_key(target) {
+            return Err(ConfigError::Validation(format!(
+                "[server.host_map] alias {alias:?} maps to {target:?}, which is not a valid \
+                 site key. The target is the canonical site key — the directory name under \
+                 [server] sites_dir, exactly as spelled on disk: lowercase labels drawn from \
+                 [a-z0-9._-] with no empty label (e.g. \"admin\" or \"shop.example.com\")."
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn overrides_dir_is_inside_sites_dir(overrides: &Path, sites: &Path) -> bool {
     let normalize = |p: &Path| -> PathBuf {
         // Drop `.` segments so `./sites` and `sites` compare equal; keep
@@ -9276,6 +9412,14 @@ listen = "0.0.0.0:8080"
         // (description, toml, the key the error must name)
         let cases: &[(&str, &str, &str)] = &[
             ("[server]", "[server]\nlistens = \"0.0.0.0:8080\"\n", "listens"),
+            // `[server.host_map]` is a free-form alias → site-key table, so
+            // its *entries* are never unknown keys; the strict surface is the
+            // table's own name under `[server]`.
+            (
+                "[server.host_maps]",
+                "[server]\n[server.host_maps]\n\"api.example.com\" = \"admin\"\n",
+                "host_maps",
+            ),
             ("[server.request]", "[server.request]\nmax_body_sizes = 1024\n", "max_body_sizes"),
             ("[server.timeouts]", "[server.timeouts]\nrequests = 30\n", "requests"),
             ("[server.response]", "[server.response]\nbogus_key = 1\n", "bogus_key"),
@@ -10381,6 +10525,88 @@ path = "test.db"
             cfg.validate()
                 .unwrap_or_else(|e| panic!("dotted/unset suffix {suffix:?} must validate: {e}"));
         }
+    }
+
+    /// `[server.host_map]` defaults to empty — routing is byte-identical to a
+    /// build without the knob — and a well-formed map loads and validates.
+    #[test]
+    fn host_map_default_is_empty_and_valid_map_loads() {
+        assert!(Config::default_config().unwrap().server.host_map.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\
+             [server.host_map]\n\
+             \"api.whatsupnails.com\" = \"admin\"\n\
+             \"www.whatsupnails.com\" = \"whatsupnails.com\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&file).unwrap();
+        cfg.validate().expect("a well-formed host_map must validate");
+        assert_eq!(
+            cfg.server.host_map.get("api.whatsupnails.com").map(String::as_str),
+            Some("admin")
+        );
+        assert_eq!(cfg.server.host_map.len(), 2);
+    }
+
+    /// Issue #688: a `host_map` that cannot route is a startup error naming
+    /// the offending entry — never a silent no-op discovered as a 404.
+    #[test]
+    fn host_map_rejects_entries_that_could_never_route() {
+        let with_map = |entries: &[(&str, &str)], sites_dir: bool| {
+            let mut cfg = Config::default_config().unwrap();
+            cfg.server.sites_dir = sites_dir.then(|| PathBuf::from("/var/www/sites"));
+            cfg.server.host_map =
+                entries.iter().map(|(a, t)| ((*a).to_string(), (*t).to_string())).collect();
+            cfg
+        };
+
+        // Without sites_dir the whole map is a no-op: refuse.
+        let err = with_map(&[("api.example.com", "admin")], false)
+            .validate()
+            .expect_err("host_map without sites_dir must be rejected");
+        assert!(err.to_string().contains("sites_dir"), "must name sites_dir: {err}");
+
+        // A target that is not a canonical site key can never be joined onto
+        // sites_dir — traversal, uppercase, empty label, empty string.
+        for target in ["../etc", "Admin", "a..b", "", "admin/", "shop:8080"] {
+            let err = with_map(&[("api.example.com", target)], true)
+                .validate()
+                .expect_err("invalid host_map target must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("host_map") && msg.contains(target),
+                "error should name the knob and the target {target:?}: {msg}"
+            );
+        }
+
+        // An alias the router's malformed-host gate would 404 could never
+        // match — a port, a scheme, a path, an empty label.
+        for alias in ["api.example.com:8080", "http://api.example.com", "api/x", "a..b", ""] {
+            let err = with_map(&[(alias, "admin")], true)
+                .validate()
+                .expect_err("malformed host_map alias must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("host_map") && msg.contains(alias),
+                "error should name the knob and the alias {alias:?}: {msg}"
+            );
+        }
+
+        // Two spellings of one host (case, trailing dot) would silently shadow
+        // each other after normalization.
+        let err = with_map(&[("API.example.com", "admin"), ("api.example.com.", "shop")], true)
+            .validate()
+            .expect_err("aliases that normalize to one host must be rejected");
+        assert!(err.to_string().contains("normalize"), "must explain the collision: {err}");
+
+        // Case-insensitive aliases are accepted (normalized at the router).
+        with_map(&[("API.Example.COM.", "admin")], true)
+            .validate()
+            .expect("a mixed-case alias normalizes to a valid host");
     }
 
     /// A sibling directory whose path merely *starts with the same characters*
