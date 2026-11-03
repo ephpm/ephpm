@@ -22,6 +22,7 @@ use ephpm_dbimport::Dialect;
 
 use crate::db_console::{
     Console, ConsoleConfig, Format, format_rows, parse_dialect, parse_kv_pipe, split_statements,
+    top_level_semicolons,
 };
 
 /// One `ephpm db shell` invocation, assembled from the CLI flags.
@@ -120,7 +121,7 @@ pub fn run(req: ShellRequest) -> anyhow::Result<ExitCode> {
         pending.push('\n');
 
         // Execute once the pending buffer carries a terminating ';'.
-        if ends_statement(&pending) {
+        if ends_statement(&pending, console.dialect() == Dialect::MySql) {
             run_buffer(&mut console, &pending, format, &mut last_rows);
             pending.clear();
             prompt(&console, false);
@@ -176,51 +177,14 @@ fn prompt(console: &Console, continuation: bool) {
 /// only whitespace. Blank input counts as complete (nothing to run).
 ///
 /// Quote-/comment-aware so a `;` inside a string (`SELECT ';'`) does not look
-/// like a terminator.
-fn ends_statement(buf: &str) -> bool {
+/// like a terminator; `mysql_escapes` applies the MySQL `\'` rule (see
+/// [`top_level_semicolons`]).
+fn ends_statement(buf: &str, mysql_escapes: bool) -> bool {
     if buf.trim().is_empty() {
         return true;
     }
-    let bytes = buf.as_bytes();
-    let mut i = 0usize;
-    let mut tail_start = None;
-    while i < bytes.len() {
-        match bytes[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == q {
-                        if bytes.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            b';' => {
-                tail_start = Some(i + 1);
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    match tail_start {
-        Some(start) => buf[start..].trim().is_empty(),
+    match top_level_semicolons(buf, mysql_escapes).last() {
+        Some(&semi) => buf[semi + 1..].trim().is_empty(),
         None => false,
     }
 }
@@ -233,7 +197,7 @@ fn run_buffer(
     format: Format,
     last_rows: &mut ephpm_dbimport::RowSet,
 ) {
-    for stmt in split_statements(buf) {
+    for stmt in split_statements(buf, console.dialect() == Dialect::MySql) {
         match console.run_sql(&stmt) {
             Ok(rows) => {
                 if rows.is_empty() {
@@ -532,13 +496,20 @@ mod tests {
 
     #[test]
     fn statement_termination_detection() {
-        assert!(ends_statement("SELECT 1;"));
-        assert!(ends_statement("SELECT 1;\n"));
-        assert!(!ends_statement("SELECT 1"));
-        assert!(!ends_statement("SELECT ';'"));
-        assert!(ends_statement("SELECT ';';"));
+        assert!(ends_statement("SELECT 1;", false));
+        assert!(ends_statement("SELECT 1;\n", false));
+        assert!(!ends_statement("SELECT 1", false));
+        assert!(!ends_statement("SELECT ';'", false));
+        assert!(ends_statement("SELECT ';';", false));
         // A bare terminator / only comments is "complete" (nothing to run).
-        assert!(ends_statement("   "));
+        assert!(ends_statement("   ", false));
+        // MySQL mode: `\'` does not close the literal, so the `;` that follows
+        // is still inside it and the statement is not complete yet …
+        assert!(!ends_statement(r"INSERT INTO t VALUES ('it\'s; ", true));
+        // … and under the SQLite rule the same text reads as complete-ish only
+        // after a real terminator.
+        assert!(ends_statement(r"INSERT INTO t VALUES ('it\'s');", true));
+        assert!(ends_statement("INSERT INTO t VALUES ('it''s');", false));
     }
 
     #[test]

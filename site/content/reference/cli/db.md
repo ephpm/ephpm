@@ -114,6 +114,53 @@ always printed. `--report <FILE>` additionally writes the full report as JSON:
 | `--report <FILE>` | — | Write the compatibility report as JSON to `FILE` |
 | `--defer-indexes` | off | Hold `CREATE INDEX` statements and replay them after the data has loaded (often faster for large tables) |
 | `--verbose` | off | Also list `dropped` safe-no-op findings |
+| `--source-charset <CHARSET>` | `utf8mb4` | What the dump's bytes are encoded in (see [Character encoding](#character-encoding)). `utf8mb4` (also `utf8`): the stream is UTF-8 and passes through byte-identically. A legacy single-byte charset (`windows-1252`, `latin1`, `iso-8859-15`, `windows-1251`, `koi8-r`, …) transcodes only the byte runs that are **not** valid UTF-8 from it |
+| `--on-invalid-utf8 <reject\|strip\|replace\|transcode>` | follows `--on-error` | What to do with `TEXT` bytes that are not valid UTF-8. Default: `--on-error stop` ⇒ `reject` (the whole dump is validated first; **nothing** is written if any is found), `--on-error skip` ⇒ `strip`, and a legacy `--source-charset` ⇒ `transcode`. An explicit value overrides, but must agree with the charset (`transcode` needs a legacy charset; the others cannot be combined with one) |
+
+### Character encoding
+
+`db import` parses the dump file itself — it never shells out to a `mysql`
+client — and reads it as **bytes**, so there is no charset-negotiating hop
+between the file and the engine. With the default `--source-charset utf8mb4`
+every valid UTF-8 sequence, 4-byte emoji included, lands byte-identical; nothing
+on the path can narrow `⏰` to `?`.
+
+What MySQL *does* leave in a dump is **invalid** UTF-8: it never validates the
+bytes in a `TEXT` column, so a `latin1` or `binary` column holds whatever was
+written (cp1252 smart quotes `0x92`/`0x93`/`0x94`, an em-dash `0x97`, lone high
+bytes), and `mysqldump` writes those bytes out verbatim. The embedded engine
+validates `TEXT` when it is **read**, so such a value would import and then make
+every `SELECT` touching it fail with `TEXT value contains invalid UTF-8`. `db
+import` therefore never writes one; what it does instead is the
+`--on-invalid-utf8` policy, whose default follows the flags you already set:
+
+- **`reject`** — the default under `--on-error stop` (itself the default). The
+  whole dump is scanned before the database is opened; if any invalid sequence
+  is found, one `error` finding per `table.column` (with how many values are
+  affected) is printed, nothing is written, and the exit is non-zero with the
+  way forward. Because this needs a second pass over the source, `reject`
+  refuses a dump on **stdin** (`-`); save it to a file first or pick a streaming
+  policy.
+- **`transcode`** — the default when `--source-charset` names a legacy charset.
+  Decodes *only the invalid byte runs* from that charset: bytes that already
+  form valid UTF-8 are never re-decoded, so a `café` written as UTF-8 stays
+  `café` while a raw `0x92` becomes `’` (U+2019). Lossless when the non-UTF-8
+  columns really are in that charset. MySQL's `latin1` is cp1252, so
+  `windows-1252` is the right choice for a `latin1` dump (the `latin1` label
+  maps to it too). Only single-byte charsets are accepted.
+- **`strip`** — the default under `--on-error skip`: the invalid bytes are
+  dropped and the import continues. **`replace`** substitutes U+FFFD per
+  invalid sequence. Both are lossy and both report what they changed.
+
+Under every policy the run reports what happened, per column:
+
+```text
+  [downgraded] line 142 wp_posts.post_content: 318 TEXT value(s) not valid UTF-8; transcoded from windows-1252
+invalid UTF-8: 331 TEXT value(s) across 320 row(s) — transcoded from windows-1252
+```
+
+`--dry-run` produces the same findings (as `error`s under `reject`), so it is
+the way to find out whether a dump needs a policy before touching anything.
 
 ### Exit codes
 
@@ -121,6 +168,8 @@ always printed. `--report <FILE>` additionally writes the full report as JSON:
   report has warnings (count them in the summary).
 - non-zero — under `--on-error stop`, any `unsupported` or `error` finding, or a
   statement that aborted the run.
+- non-zero — the dump holds invalid UTF-8 under `--on-invalid-utf8 reject` (the
+  default under `--on-error stop`); nothing is written.
 - non-zero — the config or dump could not be read, the `--site` key was invalid,
   or the transport could not be established.
 
@@ -134,8 +183,15 @@ ephpm php --site blog --config /etc/ephpm/ephpm.toml -- wp db query 'SELECT COUN
 # Preview what a dump would do without changing anything
 ephpm db import blog.sql --site blog --config ephpm.toml --dry-run
 
-# A gzipped pg_dump from stdin, keeping everything it can
+# A gzipped pg_dump from stdin, keeping everything it can. --on-error skip
+# also selects the streaming `strip` UTF-8 policy stdin needs.
 gunzip -c shop.sql.gz | ephpm db import - --site shop --config ephpm.toml --dialect pg --on-error skip --report import.json
+
+# A utf8mb4 dump, byte-faithful (this is the default; spelled out for clarity)
+ephpm db import blog.sql --site blog --config ephpm.toml --source-charset utf8mb4
+
+# A latin1 (cp1252) mysqldump: transcode the non-UTF-8 bytes losslessly
+ephpm db import legacy.sql --site shop --config ephpm.toml --source-charset windows-1252
 ```
 
 ## Transport & mode (shared) {#transport--mode-shared}

@@ -92,6 +92,11 @@ clap = { version = "4", features = ["derive"] }
 mime_guess = "2"
 flate2 = "1"
 brotli = "7"
+# Legacy single-byte charset tables for `ephpm db import --source-charset`
+# (crates/ephpm-dbimport/src/utf8.rs): a dump's invalid-UTF-8 byte runs are
+# transcoded from windows-1252 / latin1 / … per sequence. Pure Rust, already in
+# the graph through reqwest, and its 0.8.41 `rust-version` is exactly our MSRV.
+encoding_rs = "0.8"
 # 0.14 (RUSTSEC-2026-0391/0398/0403). ephpm-kv uses only the high-level
 # zstd::encode_all / zstd::decode_all, unchanged across 0.13 -> 0.14. The
 # other two graph consumers of zstd (chitchat and mysql_common) are moved to

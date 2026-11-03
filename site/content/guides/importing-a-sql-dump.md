@@ -60,8 +60,13 @@ live traffic. The dump can be a path, `-` for stdin, or a `.sql.gz` (decompresse
 transparently):
 
 ```bash
-gunzip -c blog.sql.gz | ephpm db import - --site blog --config ephpm.toml
+gunzip -c blog.sql.gz | ephpm db import - --site blog --config ephpm.toml --on-error skip
 ```
+
+(A dump on stdin needs a streaming UTF-8 policy — `--on-error skip`, an explicit
+`--on-invalid-utf8`, or a legacy `--source-charset` — because the default
+`reject` validates the whole file before writing anything — see
+[step 7](#7-character-encoding-a-dump-that-is-not-all-utf-8).)
 
 > **Import before enabling clustering.** Do the import against a single-node
 > (non-clustered) configuration. In **per-site clustered** mode a standalone
@@ -126,6 +131,47 @@ file size is not a limit. Two knobs help a big import:
 - `--batch-size <N>` (default `1000`) — statements per transaction.
 - `--defer-indexes` — hold `CREATE INDEX` statements and replay them after the
   data has loaded, which is often faster for large tables.
+
+### 7. Character encoding: a dump that is not all UTF-8
+
+If the import stops with
+
+```text
+db import: the dump holds 331 TEXT value(s) across 320 row(s) that are not valid UTF-8. …
+  [error] line 142 wp_posts.post_content: 318 TEXT value(s) not valid UTF-8; rejected (…)
+  [error] line 9120 wp_comments.comment_content: 13 TEXT value(s) not valid UTF-8; rejected (…)
+Re-run with --source-charset <charset> (windows-1252 for a latin1/cp1252 dump) to transcode …
+```
+
+the old database had `latin1`/`binary` columns holding cp1252 bytes (smart
+quotes, em-dashes) that MySQL never checked. The embedded engine *does* check
+`TEXT` — when it is read — so importing those bytes as-is would give you a
+database whose `SELECT`s fail later with `TEXT value contains invalid UTF-8`.
+That is why, under the default `--on-error stop`, the import **refuses and
+writes nothing**. Pick one:
+
+```bash
+# Lossless: the columns are really cp1252 (MySQL's `latin1` *is* cp1252).
+# Only the invalid byte runs are transcoded; text that is already UTF-8 stays as it is.
+ephpm db import blog.sql --site blog --config ephpm.toml --source-charset windows-1252
+
+# Lossy alternatives
+ephpm db import blog.sql --site blog --config ephpm.toml --on-error skip             # strip the bytes, keep going
+ephpm db import blog.sql --site blog --config ephpm.toml --on-invalid-utf8 replace   # U+FFFD per sequence
+```
+
+The report then lists what was done per column. `--dry-run` shows the same
+findings up front. Note that `reject` needs to read the dump twice (validate,
+then import), so it refuses a dump on stdin — write it to a file, or use a
+streaming policy (`--on-error skip`, `--on-invalid-utf8 strip|replace`, or a
+legacy `--source-charset`).
+
+A dump that *is* UTF-8 needs none of this: `--source-charset utf8mb4` is the
+default and passes every valid sequence through byte-identically — the importer
+reads the file as bytes and never routes them through a narrower charset, so a
+`⏰` or an emoji can never come out as `?`. See the
+[`db import` reference](/reference/cli/db/#character-encoding) for the full
+contract.
 
 ## Compatibility matrix
 

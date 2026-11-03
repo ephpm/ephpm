@@ -50,8 +50,7 @@ pub fn run(req: QueryRequest) -> anyhow::Result<ExitCode> {
         Some(s) => s,
         None => read_stdin()?,
     };
-    let statements = split_statements(&sql);
-    if statements.is_empty() {
+    if sql.trim().is_empty() {
         bail!("no SQL to run — pass it as an argument, with -e <SQL>, or on stdin");
     }
 
@@ -63,6 +62,15 @@ pub fn run(req: QueryRequest) -> anyhow::Result<ExitCode> {
         read_only: req.read_only,
         maintenance: req.maintenance,
     })?;
+
+    // Split with the rule of the dialect the console settled on (live mode
+    // may have promoted the default to MySQL, whose `\'` the SQLite rule
+    // misreads).
+    let statements = split_statements(&sql, console.dialect() == ephpm_dbimport::Dialect::MySql);
+    if statements.is_empty() {
+        console.finish();
+        bail!("no SQL to run — pass it as an argument, with -e <SQL>, or on stdin");
+    }
 
     let result = run_statements(&mut console, &statements, req.format);
     // Always truncate the offline WAL before returning, success or not —

@@ -726,20 +726,30 @@ fn utf8_len(lead: u8) -> usize {
     }
 }
 
-/// Split `sql` into individual statements on top-level `;`, skipping separators
-/// hidden inside string literals (`'`, `"`, `` ` ``), `--` line comments and
-/// `/* */` block comments. Blank statements are dropped; each result is
-/// trimmed. A trailing statement with no `;` is returned too.
-pub(crate) fn split_statements(sql: &str) -> Vec<String> {
+/// Byte offsets of every top-level `;` in `sql` — one not inside a string
+/// literal (`'`, `"`, `` ` ``), a `--` line comment or a `/* */` block comment.
+///
+/// `mysql_escapes` selects the string-literal rule: in the MySQL dialect a
+/// backslash escapes the next byte inside `'…'` and `"…"` (so `'it\'s'` is one
+/// literal), never inside backticks; SQLite/PostgreSQL text knows only the
+/// doubled-quote escape. The console must scan with the rule of the dialect
+/// it is speaking, or a MySQL statement with an odd number of `\'` is cut at
+/// the next `;` inside a later literal (the same bug class `db import`'s screen
+/// had, v0.14.1).
+pub(crate) fn top_level_semicolons(sql: &str, mysql_escapes: bool) -> Vec<usize> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
-    let mut start = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
             q @ (b'\'' | b'"' | b'`') => {
+                let escapes = mysql_escapes && q != b'`';
                 i += 1;
                 while i < bytes.len() {
+                    if escapes && bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
                     if bytes[i] == q {
                         // A doubled quote is an escaped quote, not a close.
                         if bytes.get(i + 1) == Some(&q) {
@@ -765,12 +775,25 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
                 i = (i + 2).min(bytes.len());
             }
             b';' => {
-                push_statement(&mut out, &sql[start..i]);
+                out.push(i);
                 i += 1;
-                start = i;
             }
             _ => i += 1,
         }
+    }
+    out
+}
+
+/// Split `sql` into individual statements on top-level `;` (see
+/// [`top_level_semicolons`] for what counts as top-level and for
+/// `mysql_escapes`). Blank statements are dropped; each result is trimmed. A
+/// trailing statement with no `;` is returned too.
+pub(crate) fn split_statements(sql: &str, mysql_escapes: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for semi in top_level_semicolons(sql, mysql_escapes) {
+        push_statement(&mut out, &sql[start..semi]);
+        start = semi + 1;
     }
     push_statement(&mut out, &sql[start..]);
     out
@@ -1781,19 +1804,42 @@ mod tests {
 
     #[test]
     fn splitter_respects_quotes_and_comments() {
-        assert_eq!(split_statements("SELECT 1; SELECT 2"), vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(split_statements("SELECT 1; SELECT 2", false), vec!["SELECT 1", "SELECT 2"]);
         // A ';' inside a string literal is not a separator.
         assert_eq!(
-            split_statements("SELECT ';' AS a; SELECT 2"),
+            split_statements("SELECT ';' AS a; SELECT 2", false),
             vec!["SELECT ';' AS a", "SELECT 2"]
         );
         // A ';' inside a block comment is not a separator.
         assert_eq!(
-            split_statements("SELECT 1 /* ; */ ; SELECT 2"),
+            split_statements("SELECT 1 /* ; */ ; SELECT 2", false),
             vec!["SELECT 1 /* ; */", "SELECT 2"]
         );
-        assert_eq!(split_statements("  ;  ;SELECT 1;"), vec!["SELECT 1"]);
-        assert_eq!(split_statements(""), Vec::<String>::new());
+        assert_eq!(split_statements("  ;  ;SELECT 1;", false), vec!["SELECT 1"]);
+        assert_eq!(split_statements("", false), Vec::<String>::new());
+    }
+
+    /// The MySQL rule: `\'` is an escaped quote, so a `;` inside a later
+    /// literal is not a separator. Under the SQLite rule the same text is a
+    /// different (and, for SQLite, correct) tokenisation.
+    #[test]
+    fn splitter_honours_mysql_backslash_escapes_only_in_mysql_mode() {
+        let sql = r"INSERT INTO t VALUES (1,'it\'s'),(2,'a; b'); SELECT 1";
+        assert_eq!(
+            split_statements(sql, true),
+            vec![r"INSERT INTO t VALUES (1,'it\'s'),(2,'a; b')", "SELECT 1"]
+        );
+        // SQLite text: litewire's emitted form of the same value.
+        let sqlite = "INSERT INTO t VALUES (1,'it''s'),(2,'a; b'); SELECT 1";
+        assert_eq!(
+            split_statements(sqlite, false),
+            vec!["INSERT INTO t VALUES (1,'it''s'),(2,'a; b')", "SELECT 1"]
+        );
+        // Backticks never take a backslash escape, in either mode.
+        assert_eq!(
+            split_statements(r"SELECT `a\`; SELECT 2", true),
+            vec![r"SELECT `a\`", "SELECT 2"]
+        );
     }
 
     #[test]

@@ -60,6 +60,12 @@ impl Sanitizer {
         Self { dialect }
     }
 
+    /// The dialect this sanitizer was built for.
+    #[must_use]
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
     /// Classify and rewrite one statement.
     #[must_use]
     pub fn sanitize(&self, stmt: &RawStatement) -> SanitizeOutcome {
@@ -252,7 +258,7 @@ fn unsupported_object(flat: &str) -> Option<&'static str> {
 /// Best-effort name of the object a `CREATE …`/`ALTER …` statement acts on —
 /// the first identifier-looking token after the object keyword. Used only to
 /// label findings, so an imperfect answer is harmless.
-fn object_name(flat: &str) -> Option<String> {
+pub(crate) fn object_name(flat: &str) -> Option<String> {
     let mut it = flat.split_whitespace();
     // Walk to the keyword that introduces a name, then take the next token.
     let mut prev_was_kw = false;
@@ -370,6 +376,70 @@ fn rewrite_create_table(flat: &str, line: u64) -> SanitizeOutcome {
     }
 }
 
+/// Column-definition prefixes that are table constraints, not columns, inside
+/// a `CREATE TABLE` body.
+const CONSTRAINT_PREFIXES: [&str; 11] = [
+    "PRIMARY",
+    "KEY",
+    "INDEX",
+    "UNIQUE",
+    "CONSTRAINT",
+    "FULLTEXT",
+    "SPATIAL",
+    "FOREIGN",
+    "CHECK",
+    "EXCLUDE",
+    "LIKE",
+];
+
+/// Strip identifier quoting (`` ` ``, `"`) from one name.
+pub(crate) fn unquote_ident(tok: &str) -> String {
+    tok.trim().trim_matches(|c| c == '`' || c == '"').to_string()
+}
+
+/// Lowercased, unquoted form of a (possibly schema-qualified) table name,
+/// used as the key of the driver's schema memory so `` `posts` `` in a
+/// `CREATE TABLE` and `posts` in an `INSERT` meet.
+pub(crate) fn table_key(name: &str) -> String {
+    name.split('.')
+        .map(|part| unquote_ident(part).to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// If `raw` is a `CREATE TABLE`, return the table's key ([`table_key`]) and
+/// its column names in declaration order (constraints skipped). The driver
+/// remembers these so an invalid-UTF-8 run in a column-list-less
+/// `mysqldump` `INSERT` can be named by column rather than by position.
+pub(crate) fn create_table_columns(raw: &str, dialect: Dialect) -> Option<(String, Vec<String>)> {
+    let flat = flatten(raw.trim(), dialect);
+    let flat = flat.trim();
+    if !head_upper(flat, 2).starts_with("CREATE TABLE") {
+        return None;
+    }
+    let open = flat.find('(')?;
+    let close = matching_paren(flat, open)?;
+    // The name is the last token before the `(` (after `IF NOT EXISTS`).
+    let table = flat[..open].split_whitespace().last()?;
+    let body = &flat[open + 1..close];
+    let cols = split_top_level_commas(body)
+        .into_iter()
+        .filter_map(|def| {
+            let def = def.trim();
+            let first = def.split_whitespace().next()?;
+            let up = unquote_ident(first).to_ascii_uppercase();
+            // A quoted first token is always a column name; a bare one that
+            // is a constraint keyword is a constraint.
+            let quoted = first.starts_with('`') || first.starts_with('"');
+            if !quoted && CONSTRAINT_PREFIXES.contains(&up.as_str()) {
+                return None;
+            }
+            Some(unquote_ident(first))
+        })
+        .collect();
+    Some((table_key(table), cols))
+}
+
 /// If a column definition's type is `ENUM(…)` or `SET(…)`, rewrite it to
 /// `TEXT` (keeping the column name and the trailing attributes), returning
 /// `(rewritten_def, column_name)`. Otherwise `None`.
@@ -402,7 +472,7 @@ fn rewrite_enum_set_column(def: &str) -> Option<(String, String)> {
 // ── COPY FROM stdin → INSERT ─────────────────────────────────────────────────
 
 /// Whether `raw` is a bundled `COPY … FROM stdin` block (header + data rows).
-fn is_copy_block(raw: &str) -> bool {
+pub(crate) fn is_copy_block(raw: &str) -> bool {
     let first = raw.lines().next().unwrap_or("");
     let up = first.to_ascii_uppercase();
     up.trim_start().starts_with("COPY ") && up.contains("FROM STDIN")
@@ -447,7 +517,7 @@ fn convert_copy_block(raw: &str, line: u64) -> SanitizeOutcome {
 
 /// Parse the table name and optional column list out of a `COPY … FROM stdin`
 /// header. Returns `(table, Some(cols))` or `(table, None)`.
-fn parse_copy_header(header: &str) -> (String, Option<String>) {
+pub(crate) fn parse_copy_header(header: &str) -> (String, Option<String>) {
     // Drop the leading `COPY `.
     let rest = header.trim_start();
     let rest = rest[rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len())..].trim_start();
@@ -499,7 +569,7 @@ fn copy_field_to_sql(field: &str) -> String {
 
 /// Index of the `)` matching the `(` at `open`, quote/backtick aware. `None`
 /// if unbalanced.
-fn matching_paren(s: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching_paren(s: &str, open: usize) -> Option<usize> {
     let b = s.as_bytes();
     let mut depth = 0i32;
     let mut i = open;
@@ -538,7 +608,7 @@ fn matching_paren(s: &str, open: usize) -> Option<usize> {
 }
 
 /// Split `s` on top-level commas (not inside parens, quotes, or backticks).
-fn split_top_level_commas(s: &str) -> Vec<String> {
+pub(crate) fn split_top_level_commas(s: &str) -> Vec<String> {
     let b = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -582,7 +652,7 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 /// `/*M! … */` executable comments to their inner SQL (dropping the gate
 /// markers and the version number). String/identifier literals are preserved
 /// byte-for-byte.
-fn flatten(s: &str, dialect: Dialect) -> String {
+pub(crate) fn flatten(s: &str, dialect: Dialect) -> String {
     let ms = matches!(dialect, Dialect::MySql);
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(bytes.len());
@@ -635,8 +705,13 @@ fn flatten(s: &str, dialect: Dialect) -> String {
                 }
             }
             _ => {
-                out.push(byte as char);
-                i += 1;
+                // Copy the whole character: `byte as char` on a lead byte of
+                // a multi-byte sequence would re-encode it (`café` → `cafÃ©`)
+                // anywhere outside a quoted literal, e.g. in a comment or a
+                // DDL default.
+                let ch = s[i..].chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -694,7 +769,7 @@ mod tests {
     use super::*;
 
     fn stmt(sql: &str) -> RawStatement {
-        RawStatement { sql: sql.to_string(), line: 1 }
+        RawStatement::new(sql, 1)
     }
 
     fn emit(outcome: SanitizeOutcome) -> Vec<String> {
@@ -843,6 +918,29 @@ mod tests {
         let s = Sanitizer::new(Dialect::Pg);
         let sql = "INSERT INTO public.t (id, v) VALUES (1, 'x')";
         assert_eq!(emit(s.sanitize(&stmt(sql))), vec![sql.to_string()]);
+    }
+
+    #[test]
+    fn flatten_keeps_multibyte_text_outside_quotes_intact() {
+        // A non-ASCII character outside any literal (a column COMMENT is
+        // quoted, but an identifier or a stray comment line need not be).
+        let s = Sanitizer::new(Dialect::MySql);
+        let out = emit(s.sanitize(&stmt("INSERT INTO café VALUES (1,'naïve') -- déjà\n")));
+        assert_eq!(out, vec!["INSERT INTO café VALUES (1,'naïve')".to_string()]);
+    }
+
+    #[test]
+    fn create_table_columns_are_remembered_in_order() {
+        let raw = "CREATE TABLE `posts` (\n  `id` int NOT NULL,\n  `body` text,\n  `status` enum('a','b'),\n  PRIMARY KEY (`id`),\n  KEY `k` (`status`),\n  CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `x` (`id`)\n) ENGINE=InnoDB";
+        let (table, cols) = create_table_columns(raw, Dialect::MySql).expect("a CREATE TABLE");
+        assert_eq!(table, "posts");
+        assert_eq!(cols, vec!["id", "body", "status"]);
+        // Schema-qualified, double-quoted (PostgreSQL).
+        let raw = "CREATE TABLE public.\"Users\" (id integer NOT NULL, \"Name\" text)";
+        let (table, cols) = create_table_columns(raw, Dialect::Pg).expect("a CREATE TABLE");
+        assert_eq!(table, "public.users");
+        assert_eq!(cols, vec!["id", "Name"]);
+        assert!(create_table_columns("INSERT INTO t VALUES (1)", Dialect::MySql).is_none());
     }
 
     #[test]
