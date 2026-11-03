@@ -651,5 +651,6 @@ taken (UTC)                     bytes key
 
 - [Using the db REPL](/guides/using-the-db-repl/) — a from-zero walkthrough of `db query` and `db shell`
 - [Importing a SQL dump](/guides/importing-a-sql-dump/) — a worked WordPress migration and the full compatibility matrix
+- [Database backups to object storage](/guides/database-backups/) — enabling `[db.sqlite.backup]`, credentials for S3/MinIO/R2, and a worked `db restore --at`
 - [`ephpm php`](../php/) — run `wp` / `artisan` against a site's database
 - [Database architecture](/architecture/database/) — how the embedded engine and litewire fit together

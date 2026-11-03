@@ -11283,7 +11283,7 @@ multi_tenant_hardening = false
         assert_eq!(cfg.kv.snapshot.max_size_bytes().unwrap(), 512 << 20);
 
         for (field, bad) in
-            [("interval", "15"), ("interval", "1d"), ("load_timeout", "soon"), ("max_size", "1TB")]
+            [("interval", "15"), ("interval", "1w"), ("load_timeout", "soon"), ("max_size", "1TB")]
         {
             let mut cfg = Config::default_config().unwrap();
             match field {

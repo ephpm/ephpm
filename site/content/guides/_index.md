@@ -17,6 +17,7 @@ Task-oriented walkthroughs for common deployments.
 - **[Database from PHP](db-from-php/)** — the in-process `ephpm_db_*` bridge, and how it relates to the `pdo_mysql` wire path.
 - **[Importing a SQL dump](importing-a-sql-dump/)** — load a mysqldump/pg_dump into a site database with a compatibility report.
 - **[Using the db REPL](using-the-db-repl/)** — an interactive SQL console against a running server, with a live KV bridge.
+- **[Database backups to object storage](database-backups/)** — scheduled `VACUUM INTO` snapshots of every site's database to S3/MinIO/R2, retention, and a worked `ephpm db restore --at`.
 - **[KV from PHP](kv-from-php/)** — the `ephpm_kv_*` SAPI functions.
 - **[Sessions](sessions/)** — the native `ephpm` session save handler: `$_SESSION` in the KV store, opt-in.
 - **[WebSockets](websockets/)** — *experimental*: Rust owns the sockets, PHP runs per event via `websocket.php`, and any HTTP request can push a frame.

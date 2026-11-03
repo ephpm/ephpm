@@ -428,7 +428,10 @@ What it is and is not:
   artifact would carry CDC bookkeeping a restore must reconcile. Clustered
   backup is a follow-up.
 
-Configuration and the per-tick mechanics are in the
+The from-zero walkthrough — enabling it, credentials for S3/MinIO/R2, reading
+the listing and the status endpoint, retention, and a worked restore — is the
+[Database backups guide](/guides/database-backups/). Configuration and the
+per-tick mechanics are in the
 [config reference](/reference/config/#dbsqlitebackup); the metrics in
 [Metrics → Database backups](/reference/metrics/#database-backups).
 

@@ -116,7 +116,7 @@ impl SingleNodeFixture {
 
         // Hand the ports off: release the probes and spawn in the same breath.
         lease.release();
-        let child = spawn_serve(ephpm_binary, &config_path, tmp.path(), http_port).await?;
+        let child = spawn_serve(ephpm_binary, &config_path, tmp.path(), http_port, &[]).await?;
 
         Ok(Self {
             child: Some(child),
@@ -148,7 +148,7 @@ impl SingleNodeFixture {
                 .map_err(|e| anyhow!("join error: {e}"))?;
         }
         let tmp = self._tempdir.path().to_path_buf();
-        let child = spawn_serve(&self.binary, &self.config_path, &tmp, self.http_port).await?;
+        let child = spawn_serve(&self.binary, &self.config_path, &tmp, self.http_port, &[]).await?;
         self.child = Some(child);
         Ok(())
     }
@@ -162,8 +162,15 @@ impl SingleNodeFixture {
 
 /// Spawn `ephpm serve --config <config>` with its logs in `dir`, and wait for
 /// its health endpoint on `http_port`. Logs are opened in append mode so a
-/// restarted node's output follows the previous run's.
-async fn spawn_serve(binary: &Path, config_path: &Path, dir: &Path, http_port: u16) -> Result<Child> {
+/// restarted node's output follows the previous run's. `env` is added to the
+/// child's environment (on top of the inherited one).
+async fn spawn_serve(
+    binary: &Path,
+    config_path: &Path,
+    dir: &Path,
+    http_port: u16,
+    env: &[(String, String)],
+) -> Result<Child> {
     let stdout = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -177,6 +184,7 @@ async fn spawn_serve(binary: &Path, config_path: &Path, dir: &Path, http_port: u
     let mut child = Command::new(binary)
         .args(["serve", "--config"])
         .arg(config_path)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -228,6 +236,10 @@ pub struct DbImportFixture {
     config_path: PathBuf,
     site: String,
     lease: Option<PortLease>,
+    /// Added to the environment of every subprocess this fixture spawns (the
+    /// server and each CLI invocation) — e.g. `AWS_*` credentials for
+    /// `[db.sqlite.backup]`, which are read from the environment only.
+    env: Vec<(String, String)>,
     _tempdir: TempDir,
 }
 
@@ -241,6 +253,25 @@ impl DbImportFixture {
     /// Fails if ports cannot be reserved or the scratch files cannot be
     /// written.
     pub fn prepare(ephpm_binary: &Path, site: &str, vhost_index_php: &str) -> Result<Self> {
+        Self::prepare_with(ephpm_binary, site, vhost_index_php, "", &[])
+    }
+
+    /// [`prepare`](Self::prepare) with `extra_toml` appended to the generated
+    /// config (a whole section such as `[db.sqlite.backup]`, scoped to this
+    /// fixture and nothing else — #288/#295) and `env` added to every
+    /// subprocess the fixture spawns. `extra_toml` may use the `{SCRATCH_DIR}`
+    /// placeholder (the fixture's scratch directory, already TOML-escaped).
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare`](Self::prepare).
+    pub fn prepare_with(
+        ephpm_binary: &Path,
+        site: &str,
+        vhost_index_php: &str,
+        extra_toml: &str,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
         let mut reserver = PortReserver::new();
         // Three ports: HTTP, the MySQL listener, and the RESP (KV) listener —
         // the last so the `db shell` live `/kv` round-trip has a per-fixture,
@@ -260,12 +291,13 @@ impl DbImportFixture {
         let db_dir = tmp.path().join("db");
         fs::create_dir_all(&db_dir).context("create db dir")?;
 
-        let config = DB_IMPORT_TEMPLATE
+        let config = format!("{DB_IMPORT_TEMPLATE}\n{extra_toml}\n")
             .replace("{HTTP_PORT}", &http_port.to_string())
             .replace("{MYSQL_PORT}", &mysql_port.to_string())
             .replace("{KV_PORT}", &kv_port.to_string())
             .replace("{SITES_DIR}", &escape_toml(&sites_dir))
             .replace("{DB_DIR}", &escape_toml(&db_dir))
+            .replace("{SCRATCH_DIR}", &escape_toml(tmp.path()))
             .replace("{SITE}", site)
             .replace("{METRICS_TOKEN}", E2E_METRICS_TOKEN);
         let config_path = tmp.path().join("ephpm.toml");
@@ -280,8 +312,61 @@ impl DbImportFixture {
             config_path,
             site: site.to_string(),
             lease: Some(lease),
+            env: env.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
             _tempdir: tmp,
         })
+    }
+
+    /// The site's database file: `<scratch>/db/<site>.db`. Exists only once
+    /// something has written to the site (an import, a served request).
+    #[must_use]
+    pub fn db_path(&self) -> PathBuf {
+        self._tempdir.path().join("db").join(format!("{}.db", self.site))
+    }
+
+    /// A `Command` for the fixture's binary carrying the fixture's extra
+    /// environment — the one place every subprocess is built.
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.binary);
+        cmd.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd
+    }
+
+    /// Run `ephpm db <leading…> --site <site> --config <cfg> <trailing…>` as a
+    /// subprocess and return its captured output — for the `db` subcommands
+    /// that have no dedicated helper (`db backup list --json`,
+    /// `db restore --from … --yes`). Whether the server must be up or down is
+    /// the subcommand's business, not this method's.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the subprocess cannot be spawned.
+    pub fn db(&self, leading: &[&str], trailing: &[&str]) -> Result<std::process::Output> {
+        self.command()
+            .arg("db")
+            .args(leading)
+            .args(["--site", &self.site, "--config"])
+            .arg(&self.config_path)
+            .args(trailing)
+            .output()
+            .with_context(|| {
+                format!("running `ephpm db {}` ({})", leading.join(" "), self.binary.display())
+            })
+    }
+
+    /// Stop the served node (SIGTERM, then SIGKILL) so an offline-only command
+    /// (`db restore`, `db import`) sees "the server is down"; also drops any
+    /// port reservation still held, for the same reason as
+    /// [`import`](Self::import). [`serve`](Self::serve) starts it again on
+    /// the same ports and data.
+    pub fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate(&mut child);
+        }
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        self.base_url = String::new();
     }
 
     /// The generated config file path.
@@ -308,7 +393,7 @@ impl DbImportFixture {
     ///
     /// Fails if the subprocess cannot be spawned.
     pub fn query(&self, extra_args: &[&str]) -> Result<std::process::Output> {
-        Command::new(&self.binary)
+        self.command()
             .args(["db", "query", "--site", &self.site, "--config"])
             .arg(&self.config_path)
             .args(extra_args)
@@ -323,7 +408,8 @@ impl DbImportFixture {
     ///
     /// Fails if the subprocess cannot be spawned or stdin cannot be written.
     pub fn shell(&self, extra_args: &[&str], stdin_script: &str) -> Result<std::process::Output> {
-        let mut child = Command::new(&self.binary)
+        let mut child = self
+            .command()
             .args(["db", "shell", "--site", &self.site, "--config"])
             .arg(&self.config_path)
             .args(extra_args)
@@ -368,7 +454,7 @@ impl DbImportFixture {
         if let Some(lease) = self.lease.take() {
             lease.release();
         }
-        Command::new(&self.binary)
+        self.command()
             .args(["db", "import"])
             .arg(dump)
             .args(["--site", &self.site, "--config"])
@@ -387,9 +473,14 @@ impl DbImportFixture {
         if let Some(lease) = self.lease.take() {
             lease.release();
         }
-        let child =
-            spawn_serve(&self.binary, &self.config_path, self._tempdir.path(), self.http_port)
-                .await?;
+        let child = spawn_serve(
+            &self.binary,
+            &self.config_path,
+            self._tempdir.path(),
+            self.http_port,
+            &self.env,
+        )
+        .await?;
         self.child = Some(child);
         self.base_url = format!("http://127.0.0.1:{}", self.http_port);
         Ok(())
@@ -1091,7 +1182,8 @@ listen = "127.0.0.1:{PROXY_PORT}"
 /// Config for [`DbImportFixture`] — a per-site (`sites_dir` + `[db.sqlite]
 /// dir`) node, the mode `ephpm db import --site` requires. Placeholders:
 /// `{HTTP_PORT}`, `{MYSQL_PORT}`, `{KV_PORT}`, `{SITES_DIR}`, `{DB_DIR}`,
-/// `{SITE}` (the one vhost key), `{METRICS_TOKEN}`. `[kv] secret` is fixed so
+/// `{SITE}` (the one vhost key), `{METRICS_TOKEN}`, and `{SCRATCH_DIR}` for a
+/// caller's `extra_toml` ([`DbImportFixture::prepare_with`]). `[kv] secret` is fixed so
 /// the per-site MySQL and RESP passwords are stable (unused by the offline
 /// import, which direct-opens, but required for a valid per-site config). The
 /// RESP listener is enabled on `{KV_PORT}` for the `db shell` live `/kv`

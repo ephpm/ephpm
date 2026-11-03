@@ -330,6 +330,17 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// `/kv-put` round-trip). It reuses `DbImportFixture`, so it owns the database
 /// file offline exactly as `db_import` does.
 ///
+/// `db_backup` is here for the same reason again, plus one of its own: it
+/// boots an S3-compatible server in a container (named container + named
+/// volume, removed on every exit path), serves a per-site node with
+/// `[db.sqlite.backup]` pointed at it, then stops that node, deletes the
+/// site's `.db` and runs `ephpm db restore` offline. Its backup config lives
+/// in the suite's own `DbImportFixture::prepare_with` TOML, per #288/#295.
+/// It self-skips (loudly, exit 0) where no `podman`/`docker` answers — the
+/// ordinary E2E legs run inside a container with neither — so a missing
+/// runtime never reds a leg; `EPHPM_REQUIRE_CONTAINER_TESTS=1` makes that a
+/// failure instead.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
@@ -341,6 +352,7 @@ const SELF_MANAGED_SUITES: &[&str] = &[
     "kv_snapshot_restart",
     "db_import",
     "db_shell",
+    "db_backup",
 ];
 
 /// Test suites that must be excluded from bare-process runs entirely.
