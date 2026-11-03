@@ -711,15 +711,27 @@ turso = { version = "=0.8.3", default-features = false }
 # was re-vetted at 0.25.0 and is byte-identical — `run<I, T>(args: I) -> i32`
 # (argv[0] = program name; returns the process exit code as `i32`), the same
 # contract crates/ephpm/src/main.rs forwards argv to.
-# Linking: 0.21→0.25 changes only vivacity's own six crates — no new
-# transitive crate, no new C dep, and no second rustls crypto provider:
-# vivacity-core → reqwest still resolves the single rustls (0.23.x) with no
-# baked provider (`rustls-tls-no-provider`), so it uses ePHPm's aws-lc-rs
-# process provider; the only `ring` in the graph is still quinn's HTTP/3 path
-# (unchanged by this bump, and not compiled for the host target). vivacity-core
-# 0.25.0 still pins `zip =2.4.2` (identical features, pure-Rust backends) and
-# `tokio =1.53.1`; see the RUSTSEC ignores in deny.toml.
-vivacity = { version = "=0.25.0", default-features = false, features = ["rustls-tls-no-provider"] }
+# 0.26.0 → 0.26.1: this is a MINOR version bump (0.25.0 → 0.26.1). 0.26.0 was
+# skipped deliberately — it shipped a vendor/ ↔ shared-store package-cache
+# isolation bug on Linux/Docker (vendor/ hard-linked to the package store, so
+# an edit in one project's vendor/ reached through to the shared store, exactly
+# `ephpm composer`'s surface). 0.26.1 is the fix release: it never hard-links
+# vendor/ to the store, unlinks projects already laid out that way, pins the
+# repository cache directory name to Composer's, and masks credentials in its
+# diagnostics. Confirmed against the upstream v0.26.0..v0.26.1 log (fix commit
+# "Never hard-link vendor/ to the store…", plus the vendor-isolation harness
+# and docs/plans/vendor-isolation.md).
+# COMPATIBILITY CAVEAT: the "no new transitive crate / no new C dep / single
+# rustls provider / byte-identical `vivacity::run`" analysis above was only
+# vetted across the 0.21→0.25 PATCH/MINOR range. 0.26 is a MINOR jump that
+# touched vivacity-core/-resolver/-autoload substantially (fetch, store, clone,
+# classmap), so that reasoning is NOT yet re-confirmed for 0.26 — treat
+# `cargo deny check` + `cargo check` as the real gate for this bump. What is
+# re-checked: vivacity 0.26.1's workspace manifest still pins `zip =2.4.2`
+# (identical features, pure-Rust backends) and `tokio =1.53.1` — so the fork's
+# one-line tokio relaxation is STILL required, and the zip RUSTSEC ignores in
+# deny.toml still apply unchanged.
+vivacity = { version = "=0.26.1", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
@@ -815,13 +827,14 @@ opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "146
 # byte-parity with PHP Composer, a property ePHPm does not need. That exact pin
 # blocked the tokio 1.53.3 fix (unsound `AsyncFd` safe constructors) for the
 # whole graph. The ePHPm fork (github.com/ephpm/vivacity, branch
-# ephpm-relax-tokio) relaxes only that one workspace line to ">=1.53.3, <1.54"
+# ephpm-relax-tokio-0.26.1, off upstream tag v0.26.1) relaxes only that one
+# workspace line to ">=1.53.3, <1.54"
 # — no code change, no other dependency moves. Patching `vivacity` pulls its
 # sibling crates (vivacity-core/-resolver/-autoload/-pcre2[-sys]) from the fork
 # too, via the workspace's path deps, so their `tokio.workspace = true` picks
 # up the relaxed pin as well. Remove when upstream vivacity relaxes the pin or
 # a release admits 1.53.3. See ephpm/ephpm#648.
-vivacity = { git = "https://github.com/ephpm/vivacity.git", rev = "ad6ea26b397f0f9007817e8ee9d41a9752d608b7" }
+vivacity = { git = "https://github.com/ephpm/vivacity.git", rev = "9e606108329325717cc9d178456ff5fdbeb30a70" }
 # SECURITY (RUSTSEC-2026-0391/0398/0403): zstd/zstd-safe are fixed only in
 # zstd 0.14.3 / zstd-safe 8.2.0 (a breaking bump of the zstd-safe low-level
 # API). The whole graph must move together, and two crates.io consumers still
