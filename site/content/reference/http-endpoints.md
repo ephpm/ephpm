@@ -141,7 +141,7 @@ Each request is checked in this order. The first step that answers ends it.
 
 | Header | Used for |
 |---|---|
-| `Host` (or HTTP/2 and HTTP/3 `:authority` when `Host` is absent) | `trusted_hosts`, vhost resolution (port and trailing dot stripped, lowercased, `sites_domain_suffix` removed), `$_SERVER['SERVER_NAME']`, the `redirect_http` `Location`. |
+| `Host` (or HTTP/2 and HTTP/3 `:authority` when `Host` is absent) | `trusted_hosts`, vhost resolution (port and trailing dot stripped, lowercased, then an exact `[server.host_map]` alias hit, else `sites_domain_suffix` removed), `$_SERVER['SERVER_NAME']`, the `redirect_http` `Location`. |
 | `X-Forwarded-For` | Client IP (`REMOTE_ADDR`, per-IP rate limit, access log), **only** when the TCP peer is inside `[server.security] trusted_proxies`. Every `X-Forwarded-For` line is read, in order, as one list, walked right to left; the first address that is not a trusted proxy wins. If every address is trusted, the leftmost is used. An entry that is not a bare IP address (for example `ip:port`) stops the walk, and the TCP peer is used instead. IPv4-mapped peers match IPv4 `trusted_proxies` entries. |
 | `X-Forwarded-Proto` | `$_SERVER['HTTPS']`, only from a trusted proxy. When present, it **replaces** the connection's own TLS status: any value other than `https` turns `HTTPS` off, even on a native TLS connection. When absent, the connection's TLS status stands. |
 | `Accept-Encoding` | Brotli is chosen when the client accepts `br`, else gzip, else identity. |

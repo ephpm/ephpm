@@ -574,6 +574,12 @@ pub struct Router {
     /// `Host` headers before vhost resolution. Lets dev-mode users keep
     /// short directory names while their browser uses `*.localhost`.
     sites_domain_suffix: Option<String>,
+    /// `[server.host_map]` (issue #688): normalized alias host → canonical
+    /// site key. Consulted first in [`Router::resolve_site`], before the suffix
+    /// strip; a hit is authoritative for that host. Aliases are lowercased and
+    /// trailing-dot-stripped at construction so the lookup is one `HashMap`
+    /// probe on the already-normalized request host. Empty unless configured.
+    host_map: HashMap<String, String>,
     index_files: Vec<String>,
     /// Default WebSocket entrypoint names (`[server] websocket_files`), used
     /// for the default document root and for lazily-discovered vhosts.
@@ -1305,6 +1311,54 @@ impl Router {
             &config.server.fallback,
         );
 
+        // `[server.host_map]` (issue #688). `Config::validate` already refused
+        // a malformed alias or target and a map without `sites_dir`; what it
+        // could not know is whether each target *directory* exists, because
+        // sites are discovered lazily. Say so now, per alias, so an operator
+        // sees "alias → missing site" at startup instead of a 404 later. Not a
+        // hard error: a provisioning daemon may create the directory after the
+        // server starts, and until then the alias resolves like any unknown
+        // host — the default document root with no tenant identity.
+        let host_map: HashMap<String, String> = config
+            .server
+            .host_map
+            .iter()
+            .map(|(alias, target)| (ephpm_config::normalize_host_alias(alias), target.clone()))
+            // Load-bearing backstop, same shape as the #397 suffix rule: the
+            // target is joined onto `sites_dir`, so it must pass the allowlist
+            // here too, not only in `validate()` (a Router can be built
+            // without it). Cannot fire in a real server; if it does, log and
+            // drop the entry rather than route a traversal.
+            .filter(|(alias, target)| {
+                let ok = is_valid_site_key(target) && is_valid_site_key(alias);
+                if !ok {
+                    tracing::error!(
+                        alias,
+                        site = %target,
+                        "[server.host_map] entry is not a valid alias/site-key pair after \
+                         validate() passed — dropping it (this is a bug)"
+                    );
+                }
+                ok
+            })
+            .collect();
+        for (alias, target) in &host_map {
+            let known = sites.contains_key(target)
+                || config.server.sites_dir.as_deref().is_some_and(|d| d.join(target).is_dir());
+            if known {
+                tracing::info!(alias, site = %target, "[server.host_map] host alias active");
+            } else {
+                tracing::warn!(
+                    alias,
+                    site = %target,
+                    sites_dir = ?config.server.sites_dir,
+                    "[server.host_map] alias maps to a site with no directory under sites_dir \
+                     — until that directory exists the alias serves the default document root \
+                     with no tenant identity (no per-site database, credentials or KV keyspace)"
+                );
+            }
+        }
+
         // The dedicated per-request PHP thread pool (`mode = "per_request"`).
         // The pool size IS the concurrency cap — capping PHP execution here
         // never caps tokio's blocking pool, so static-file serving and other
@@ -1346,6 +1400,7 @@ impl Router {
                 .sites_domain_suffix
                 .as_ref()
                 .map(|s| s.to_ascii_lowercase()),
+            host_map,
             index_files: config.server.index_files.clone(),
             fallback: config.server.fallback.clone(),
             // `Config::validate` already compiled these and refused startup on a
@@ -2294,6 +2349,15 @@ impl Router {
     /// `sapi_module.getenv`, deliberately: a process-global environment is
     /// shared by every worker thread and would be exactly the cross-tenant leak
     /// this design avoids. Tenants must read `$_SERVER['DB_PASSWORD']`.
+    ///
+    /// # One map, two deliveries
+    ///
+    /// The variable set comes from
+    /// [`per_site_db_env_vars`](crate::site_wire_auth::per_site_db_env_vars),
+    /// which `ephpm php --site` also exports into its process environment
+    /// (issue #689). This method only adds the per-request pieces: the
+    /// fail-closed key check and the cached password. Pinned by
+    /// `site_key_agreement::request_injection_is_the_shared_db_env_map`.
     fn build_per_site_db_env_vars(&self, site_key: &str) -> Vec<(String, String)> {
         let Some(wire) = &self.per_site_db_wire else {
             return Vec::new();
@@ -2314,25 +2378,9 @@ impl Router {
             derived
         };
 
-        let (host, port) = wire.listen.rsplit_once(':').unwrap_or(("127.0.0.1", "3306"));
-        // The database name is cosmetic here — the connection's database is
-        // fixed by the credential, and litewire answers `USE <db>` without
-        // switching anything. Set it to the site key so framework config and
-        // logs read sensibly.
-        vec![
-            ("DB_CONNECTION".into(), "mysql".into()),
-            ("DB_HOST".into(), host.into()),
-            ("DB_PORT".into(), port.into()),
-            ("DB_DATABASE".into(), site_key.into()),
-            ("DB_NAME".into(), site_key.into()),
-            ("DB_USER".into(), site_key.into()),
-            ("DB_USERNAME".into(), site_key.into()),
-            ("DB_PASSWORD".into(), password.clone()),
-            (
-                "DATABASE_URL".into(),
-                format!("mysql://{site_key}:{password}@{host}:{port}/{site_key}"),
-            ),
-        ]
+        // The map itself is shared with `ephpm php --site` (issue #689): one
+        // definition, so a cron script sees exactly what a request sees.
+        crate::site_wire_auth::per_site_db_env_vars(&wire.listen, site_key, &password)
     }
 
     /// Build `EPHPM_REDIS_*` environment variables for PHP injection.
@@ -2428,8 +2476,20 @@ impl Router {
             self.unknown_site_cache.remove(&clean);
         }
 
-        // If a domain suffix is configured (e.g. `.localhost`), peel it off
-        // first so `blog.localhost` looks up the `blog/` directory. Falls
+        // `[server.host_map]` first (issue #688): an exact hit on the normalized
+        // host is authoritative — the mapped canonical key is the ONLY lookup
+        // candidate, so `api.example.com → admin` can never fall through to a
+        // literal `api.example.com/` directory or a suffix-stripped `api/`.
+        // Everything per-tenant downstream derives from the key returned here,
+        // so the alias host names the `admin` database, credential and
+        // keyspace — exactly as `Host: admin` would (the #290 invariant, which
+        // `site_key_agreement::alias_host_derives_the_canonical_tenant` pins).
+        // `validate()` guaranteed the target is a valid site key, so the join
+        // below is as safe as for a request host that passed the gate above.
+        let mapped = self.host_map.get(&clean);
+
+        // Otherwise, if a domain suffix is configured (e.g. `.localhost`), peel
+        // it off so `blog.localhost` looks up the `blog/` directory. Falls
         // back to the literal name if the host doesn't end with the suffix.
         //
         // Security (issue #397): the stripped result is a fresh candidate vhost
@@ -2445,15 +2505,19 @@ impl Router {
         // `sites_dir`-rooted document root. `sites_domain_suffix` is additionally
         // rejected at config load when it lacks a leading dot, but this is the
         // load-bearing backstop and holds for any suffix shape.
-        let stripped = self
-            .sites_domain_suffix
-            .as_deref()
-            .and_then(|suffix| clean.strip_suffix(suffix))
-            .filter(|s| is_valid_site_key(s))
-            .map(str::to_owned);
-        let lookup_keys: &[&str] = match stripped.as_deref() {
-            Some(s) => &[s, clean.as_str()][..],
-            None => &[clean.as_str()][..],
+        let stripped = if mapped.is_some() {
+            None
+        } else {
+            self.sites_domain_suffix
+                .as_deref()
+                .and_then(|suffix| clean.strip_suffix(suffix))
+                .filter(|s| is_valid_site_key(s))
+                .map(str::to_owned)
+        };
+        let lookup_keys: &[&str] = match (mapped, stripped.as_deref()) {
+            (Some(target), _) => &[target.as_str()][..],
+            (None, Some(s)) => &[s, clean.as_str()][..],
+            (None, None) => &[clean.as_str()][..],
         };
 
         // Check the startup-scanned registry first for each candidate key.
@@ -2507,7 +2571,21 @@ impl Router {
             }
         }
 
-        // Nothing matched. Remember this host so we don't re-syscall
+        // Nothing matched. An operator-configured alias whose site has no
+        // directory is worth a WARN (once per `UNKNOWN_SITE_TTL`, since the
+        // negative cache short-circuits this path in between) — it is a
+        // configuration gap, not a bot probe, and the alias is now serving the
+        // default document root with no tenant identity.
+        if let Some(target) = mapped {
+            tracing::warn!(
+                host = %clean,
+                site = %target,
+                "[server.host_map] alias maps to a site with no directory under sites_dir — \
+                 serving the default document root with no tenant identity"
+            );
+        }
+
+        // Remember this host so we don't re-syscall
         // for the next probe from the same bot. Cap at a
         // configuration-agnostic ceiling to avoid unbounded growth
         // under a very determined attacker; 10_000 covers realistic
@@ -6699,27 +6777,13 @@ fn opcache_vhost_key(site_key: Option<&str>) -> String {
 /// canonical-containment gate would break that supported pattern. Confining
 /// the join to a direct child is enough, since the label can no longer contain
 /// traversal primitives.
+///
+/// The rule itself lives in [`ephpm_config::is_valid_site_key`] so that
+/// `Config::validate` applies the *same* allowlist to `[server.host_map]`
+/// aliases and targets (issue #688) — one function, no drift between what the
+/// config accepts and what the router will join.
 pub(crate) fn is_valid_site_key(key: &str) -> bool {
-    // Cap length defensively (DNS names max 253; allow a little slack). An
-    // empty key would `join("")` back to `sites_dir` itself — reject it.
-    if key.is_empty() || key.len() > 255 {
-        return false;
-    }
-    // Allowlist charset. `/`, `\`, NUL, `:`, `%`, whitespace, and every other
-    // separator/control byte fall outside it and are rejected here.
-    if !key
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return false;
-    }
-    // With `.` allowed for subdomains, an empty label is the one traversal the
-    // charset check can't see: it means a leading dot, a trailing dot, or a
-    // `..` segment. Any of those would traverse when joined.
-    if key.split('.').any(str::is_empty) {
-        return false;
-    }
-    true
+    ephpm_config::is_valid_site_key(key)
 }
 
 /// Build a JSON response with the given status and body.
@@ -15167,6 +15231,267 @@ echo "post response";
         assert_eq!(resolved.roots.document_root, sites.join("blog"));
     }
 
+    // ── `[server.host_map]`: exact-host aliases (issue #688) ─────────
+    mod host_map {
+        use http_body_util::Empty;
+
+        use super::*;
+
+        /// A multi-tenant router with `sites_dir`, an optional suffix, an
+        /// optional `trusted_hosts` list and the given `host_map`.
+        fn router_with_map(
+            docroot: &Path,
+            sites: &Path,
+            suffix: Option<&str>,
+            trusted_hosts: &[&str],
+            host_map: &[(&str, &str)],
+        ) -> Router {
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: docroot.to_path_buf(),
+                    sites_dir: Some(sites.to_path_buf()),
+                    sites_domain_suffix: suffix.map(str::to_owned),
+                    host_map: host_map
+                        .iter()
+                        .map(|(a, t)| ((*a).to_string(), (*t).to_string()))
+                        .collect(),
+                    request: ephpm_config::RequestConfig {
+                        trusted_hosts: trusted_hosts.iter().map(|h| (*h).to_string()).collect(),
+                        ..ephpm_config::RequestConfig::default()
+                    },
+                    ..ServerConfig::default()
+                },
+                php: test_php_config(),
+                db: DbConfig::default(),
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            // The real server runs `validate()` first; mirror it so a test
+            // fixture can never rely on a map `serve` would have refused.
+            config.validate().expect("fixture config must validate");
+            Router::new(&config, test_store(), None, None, None, None, None)
+        }
+
+        /// The MVP case from the issue: `api.whatsupnails.com → admin`. Every
+        /// request-side spelling of the alias (case, port, trailing dot) lands
+        /// on the mapped site's container and key.
+        #[test]
+        fn alias_resolves_to_the_mapped_site() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                None,
+                &[],
+                &[("api.whatsupnails.com", "admin")],
+            );
+
+            for host in [
+                "api.whatsupnails.com",
+                "API.WHATSUPNAILS.COM",
+                "api.whatsupnails.com:8080",
+                "api.whatsupnails.com.",
+            ] {
+                let resolved = router.resolve_site(host);
+                assert_eq!(resolved.key.as_deref(), Some("admin"), "Host: {host}");
+                assert_eq!(resolved.roots.document_root, sites.join("admin"), "Host: {host}");
+            }
+            // The site's own name still works — an alias adds a name, it does
+            // not replace the directory-name route.
+            assert_eq!(router.resolve_site("admin").key.as_deref(), Some("admin"));
+        }
+
+        /// An exact `host_map` hit wins over a competing suffix-strip, and the
+        /// two routes coexist: hosts the map does not name still strip.
+        #[test]
+        fn exact_alias_wins_over_suffix_strip_and_both_coexist() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            // `api/` exists, so suffix-strip alone would pick it.
+            for name in ["api", "admin", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                Some(".example.com"),
+                &[],
+                &[("api.example.com", "admin")],
+            );
+
+            let aliased = router.resolve_site("api.example.com");
+            assert_eq!(aliased.key.as_deref(), Some("admin"), "the map must beat suffix-strip");
+            assert_eq!(aliased.roots.document_root, sites.join("admin"));
+
+            let stripped = router.resolve_site("blog.example.com");
+            assert_eq!(stripped.key.as_deref(), Some("blog"), "unmapped hosts still strip");
+            assert_eq!(stripped.roots.document_root, sites.join("blog"));
+
+            // The `api/` directory is reachable by its own bare name only.
+            assert_eq!(router.resolve_site("api").key.as_deref(), Some("api"));
+        }
+
+        /// A host that is neither an alias nor a directory (with or without
+        /// the suffix) is still no tenant: default document root, no key.
+        #[test]
+        fn host_with_neither_alias_nor_directory_is_unmatched() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                Some(".example.com"),
+                &[],
+                &[("api.example.com", "admin")],
+            );
+
+            for host in ["other.example.com", "api.example.org", "random.test"] {
+                let resolved = router.resolve_site(host);
+                assert_eq!(resolved.key, None, "Host: {host} must name no tenant");
+                assert_eq!(resolved.roots.document_root, dir.path(), "Host: {host}");
+            }
+        }
+
+        /// An alias whose target has no directory (validate() cannot know
+        /// that — sites are discovered lazily) fails closed at the router:
+        /// the alias resolves like an unknown host, never to a `sites_dir`
+        /// join on the alias itself and never to a minted tenant identity.
+        #[test]
+        fn alias_to_a_missing_site_names_no_tenant() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+            // A directory literally named after the alias must NOT be picked
+            // up either: the map is authoritative for that host.
+            fs::create_dir_all(sites.join("api.example.com")).unwrap();
+
+            let router =
+                router_with_map(dir.path(), &sites, None, &[], &[("api.example.com", "ghost")]);
+
+            let resolved = router.resolve_site("api.example.com");
+            assert_eq!(resolved.key, None);
+            assert_eq!(resolved.roots.document_root, dir.path());
+            let ids = router.site_identities(resolved.key.as_deref());
+            assert_eq!(ids.db, None);
+            assert_eq!(ids.kv, None);
+        }
+
+        /// An alias is still a request `Host`: `[server.request] trusted_hosts`
+        /// gates it exactly as any other host. Mapping a host does not trust it.
+        #[test]
+        fn alias_host_is_still_subject_to_trusted_hosts() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                None,
+                &["admin.example.com"],
+                &[("api.example.com", "admin")],
+            );
+
+            let req = |host: &str| {
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header("host", host)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap()
+            };
+
+            // The alias resolves...
+            assert_eq!(router.resolve_site("api.example.com").key.as_deref(), Some("admin"));
+            // ...but the trusted-host gate, which runs before resolution,
+            // still answers 421 for a host that is not on the list.
+            let rejected = router
+                .check_trusted_host(&req("api.example.com"))
+                .expect("an unlisted alias must be rejected");
+            assert_eq!(rejected.status(), StatusCode::MISDIRECTED_REQUEST);
+            assert!(router.check_trusted_host(&req("admin.example.com")).is_none());
+
+            // And the malformed-host gate is unaffected: a traversal host
+            // cannot be smuggled past it by also appearing in the map, since
+            // validate() refuses such an alias — here, a plain malformed host.
+            assert!(router.reject_malformed_host(&req("../etc")).is_some());
+        }
+
+        /// The router's own backstop (the #397 pattern): a Router built
+        /// WITHOUT `validate()` and handed a traversal target must drop the
+        /// entry, never join it onto `sites_dir`. The alias then resolves like
+        /// an unknown host.
+        #[test]
+        fn invalid_target_is_dropped_even_without_validate() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+            let secret = dir.path().join("secret");
+            fs::create_dir_all(&secret).unwrap();
+
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: dir.path().to_path_buf(),
+                    sites_dir: Some(sites.clone()),
+                    host_map: [("api.example.com".to_string(), "../secret".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..ServerConfig::default()
+                },
+                php: test_php_config(),
+                db: DbConfig::default(),
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            assert!(config.validate().is_err(), "validate() must refuse the traversal target");
+            // Bypass it deliberately.
+            let router = Router::new(&config, test_store(), None, None, None, None, None);
+
+            let resolved = router.resolve_site("api.example.com");
+            assert_eq!(resolved.key, None);
+            assert_eq!(resolved.roots.document_root, dir.path());
+            assert_ne!(resolved.roots.document_root, secret);
+        }
+
+        /// The *target* is the only lookup candidate on a hit: a map entry
+        /// cannot be used to reach a directory by any other spelling, and the
+        /// target must be joined as-is (validate() already pinned its shape).
+        #[test]
+        fn alias_target_is_the_only_lookup_candidate() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            // With the suffix configured, `shop.example.com` would strip to
+            // `shop/`; the map points it at `admin/` instead and the stripped
+            // candidate must not be consulted.
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                Some(".example.com"),
+                &[],
+                &[("shop.example.com", "admin")],
+            );
+
+            let resolved = router.resolve_site("shop.example.com");
+            assert_eq!(resolved.key.as_deref(), Some("admin"));
+            assert_eq!(resolved.roots.document_root, sites.join("admin"));
+        }
+    }
+
     // ── one canonical site key: the four derivations must agree ──────
     //
     // Issue #290. With `sites_domain_suffix` set, `Host: shop.local` and
@@ -15218,12 +15543,28 @@ echo "post response";
             suffix: Option<&str>,
             auth: &SiteWireAuth,
         ) -> Router {
+            router_with_map(docroot, sites, dbdir, suffix, &[], auth)
+        }
+
+        /// [`router_with`] plus a `[server.host_map]` (issue #688).
+        fn router_with_map(
+            docroot: &Path,
+            sites: &Path,
+            dbdir: &Path,
+            suffix: Option<&str>,
+            host_map: &[(&str, &str)],
+            auth: &SiteWireAuth,
+        ) -> Router {
             let config = Config {
                 server: ServerConfig {
                     listen: "0.0.0.0:8080".to_string(),
                     document_root: docroot.to_path_buf(),
                     sites_dir: Some(sites.to_path_buf()),
                     sites_domain_suffix: suffix.map(str::to_owned),
+                    host_map: host_map
+                        .iter()
+                        .map(|(a, t)| ((*a).to_string(), (*t).to_string()))
+                        .collect(),
                     ..ServerConfig::default()
                 },
                 php: test_php_config(),
@@ -15410,6 +15751,89 @@ echo "post response";
             assert!(
                 !dbdir.join("shop.local.db").exists(),
                 "the suffixed spelling must not mint a second database — issue #290"
+            );
+        }
+
+        /// Issue #689: what a request's PHP sees in `$_SERVER['DB_*']` is
+        /// exactly the shared map `ephpm php --site` exports — same keys, same
+        /// order, same values — with the password the listener verifies. The
+        /// CLI side pins the other half (`site_db::tests`), so the two
+        /// deliveries cannot drift without one of these failing.
+        #[tokio::test]
+        async fn request_injection_is_the_shared_db_env_map() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let injected = router.build_per_site_db_env_vars("shop");
+            let shared = crate::site_wire_auth::per_site_db_env_vars(
+                "127.0.0.1:3306",
+                "shop",
+                &auth.password_for("shop"),
+            );
+            assert_eq!(injected, shared, "the router must inject the shared DB_* map verbatim");
+            // And a second request gets the same (cached) credential.
+            assert_eq!(router.build_per_site_db_env_vars("shop"), shared);
+            // Fail closed: no key, no credential (never a default account).
+            assert_eq!(router.build_per_site_db_env_vars(""), Vec::new());
+        }
+
+        /// Issue #688: a `[server.host_map]` alias is just another spelling of
+        /// the tenant's `Host`. `api.whatsupnails.com → admin` must derive the
+        /// SAME identity as `Host: admin.local` / `Host: admin` — the `admin`
+        /// container, `admin.db`, `DB_USER = admin`, the `admin` keyspace and
+        /// ETag cache key — and must never mint anything named after the
+        /// alias. A disagreement here would be #290 again, through a new door.
+        #[tokio::test]
+        async fn alias_host_derives_the_canonical_tenant() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("admin")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with_map(
+                dir.path(),
+                &sites,
+                &dbdir,
+                Some(".local"),
+                &[("api.whatsupnails.com", "admin")],
+                &auth,
+            );
+
+            let canonical = derive(&router, &backends, "admin.local");
+            assert_eq!(canonical.key.as_deref(), Some("admin"));
+            assert_eq!(canonical.db_path, Some(dbdir.join("admin.db")));
+            assert_eq!(canonical.wire_user.as_deref(), Some("admin"));
+            assert_eq!(canonical.kv.as_deref(), Some("admin"));
+            assert_eq!(canonical.etag_cache_key, "etag:admin:GET:/index.php");
+
+            for host in [
+                "api.whatsupnails.com",
+                "API.WHATSUPNAILS.COM:443",
+                "api.whatsupnails.com.",
+                "admin",
+            ] {
+                assert_eq!(
+                    derive(&router, &backends, host),
+                    canonical,
+                    "Host: {host} must derive exactly the admin tenant's identity — \
+                     an alias is a name for the tenant, not a tenant"
+                );
+            }
+            assert!(
+                !dbdir.join("api.whatsupnails.com.db").exists(),
+                "nothing may be named after the alias host"
             );
         }
 
