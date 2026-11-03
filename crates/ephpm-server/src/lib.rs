@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod body;
+pub mod db_backup;
 pub mod db_health;
 pub mod db_shutdown;
 pub mod debug_lane;
@@ -555,6 +556,14 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     let kv_snapshot_periodic =
         kv_snapshot.as_ref().and_then(kv_snapshot::KvSnapshotService::spawn_periodic);
 
+    // Scheduled embedded-database backups (`[db.sqlite.backup]`): the task
+    // opens its own gated engine handle per database per tick, so it needs
+    // nothing from the serving factories and can start now. Clustered modes
+    // were refused by `Config::validate`.
+    let db_backup = db_backup::DbBackupService::from_config(&config)
+        .context("failed to set up embedded database backups")?;
+    let db_backup_periodic = db_backup.as_ref().map(db_backup::DbBackupService::spawn_periodic);
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -567,6 +576,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         per_site_db_wire,
         Arc::clone(&primary_view),
         kv_snapshot.clone(),
+        db_backup.clone(),
         dev_mode,
     )
     .await?;
@@ -588,8 +598,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // single request. No PHP has run yet, so no request-carrying thread can
     // race the process-wide credential change.
     // The KV snapshot directory (and the staging dir in object mode) is
-    // written by the periodic and shutdown saves, i.e. after the drop.
-    let snapshot_paths = kv_snapshot.as_ref().map(|svc| svc.runtime_paths()).unwrap_or_default();
+    // written by the periodic and shutdown saves, i.e. after the drop; so is
+    // the database backup's staging directory.
+    let mut snapshot_paths =
+        kv_snapshot.as_ref().map(|svc| svc.runtime_paths()).unwrap_or_default();
+    if let Some(svc) = &db_backup {
+        snapshot_paths.extend(svc.runtime_paths());
+    }
     privdrop::drop_privileges(&config, &snapshot_paths).context("failed to drop privileges")?;
 
     // Reap per-vhost temp/session roots left by sites that no longer exist
@@ -694,6 +709,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     }
     if let Some(svc) = &kv_snapshot {
         svc.save_at_shutdown().await;
+    }
+    // Stop the backup scheduler before the databases are closed below. A
+    // tick mid-flight is abandoned at its next await (its staging files go
+    // with the staging directory when the service drops); the object it was
+    // writing, if any, is simply not there — the previous one is.
+    if let Some(task) = db_backup_periodic {
+        task.abort();
     }
 
     // Requests are drained (bounded by `[server.timeouts] shutdown`). Now close
@@ -839,6 +861,9 @@ async fn bind_listeners(
     // Warm-restart KV snapshots, for the `/_ephpm/kv/snapshot` control
     // endpoint. `None` when `[kv.snapshot] mode = "off"`.
     kv_snapshot: Option<Arc<kv_snapshot::KvSnapshotService>>,
+    // Scheduled database backups, for the `GET /_ephpm/db/backup` status
+    // endpoint. `None` when `[db.sqlite.backup] enabled = false`.
+    db_backup: Option<Arc<db_backup::DbBackupService>>,
     // `ephpm dev`: lifts the multi-site credential requirement on the
     // internal endpoints (see `Router::with_dev_mode_access`).
     dev_mode: bool,
@@ -1131,6 +1156,7 @@ async fn bind_listeners(
         .with_db_health(db_health)
         .with_primary_view(primary_view)
         .with_kv_snapshot(kv_snapshot)
+        .with_db_backup(db_backup)
         .with_websocket(websocket)
         .with_request_log(request_log)
         .with_dev_mode_access(dev_mode)
@@ -3775,6 +3801,7 @@ mod lib_tests {
                 primary_grpc_url: String::new(),
                 ..ephpm_config::ReplicationConfig::default()
             },
+            backup: ephpm_config::DbBackupConfig::default(),
         }
     }
 

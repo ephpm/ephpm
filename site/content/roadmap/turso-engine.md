@@ -356,6 +356,42 @@ path is a **single ordered stream** with no schema-sync side channel.
   true`, so a node promoted mid-life still captures), but a session
   that uses `raw_connection()` bypasses it — a documented gotcha.
 
+### Backups — Tier 0 shipped, Tier 1 planned
+
+**Tier 0 (shipped): scheduled `.db` snapshots to object storage.**
+[`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup) snapshots every
+embedded database with the engine's `VACUUM INTO` (supported by the pinned
+0.8.3 — the "vacuum missing" note in the verified facts above dates from
+0.7.0 and no longer holds for `VACUUM INTO`; in-place `VACUUM` is still
+screened off the tenant path) through a short-lived in-process gated
+handle, gzips it and uploads it as
+`<s3_path>/<site>/<YYYYMMDDTHHMMSSZ>.db.gz`, with a retention sweep that
+always keeps the newest object; `ephpm db restore` installs one offline
+after a `PRAGMA integrity_check`. RPO = `interval`. Single-node and per-site
+modes only; the object is plaintext (bucket-side encryption). The replica
+bootstrap deliberately keeps its logical dump: a physical image carries
+triggers, which a replica must not hold.
+
+#### Tier 1: point-in-time restore (planned)
+
+**Planned — not yet implemented.** Transaction-granularity PITR on top of
+the Tier 0 bases: continuous CDC batch archival via
+`CdcTailer::poll_batch`/`read_watermark` into
+`<s3_path>/<site>/cdc/<watermark>.bin` generations; restore = newest base
+at or before the target time, then replay generations up to it through
+`apply_batch`. Requires enabling CDC capture in the non-clustered modes
+(today only the clustered registries open with `enable_cdc_on_connect`),
+`turso_cdc` retention pruning (still deferred above), and generation
+compaction. Also deferred from Tier 0: **clustered-mode backup**
+(owner/primary-only scheduling so a site is shipped once, and an artifact
+that carries `turso_cdc` + `__ephpm_cdc_source` + `__litewire_cdc_watermark`
+bookkeeping a restore must reconcile with the lineage rules — today
+`enabled = true` with clustering is a startup refusal), a **live restore**
+(quiesce the site's serving handle, swap, reopen — today the restore is
+offline only), **boot-time auto-hydrate** (pull the newest object when a
+site's `.db` is absent at first open), and an opt-in `encrypt = true`
+reusing the KV snapshot primitives (same AEAD, HKDF from `[kv] secret`).
+
 ### Phase 3 — default engine (a major-version decision)
 
 > **Status: SHIPPED in v0.7.0.** Turso is now the default and only

@@ -137,14 +137,20 @@
 //!
 //! Why a logical dump and not a physical file copy:
 //!
-//! - turso 0.7.0 (still true of 0.8.2) exposes no online-backup, `serialize`, or local
-//!   `checkpoint` API (verified against `turso = 0.7.0` and re-checked on 0.8.2
-//!   crate: `Database`/`Connection` have `execute`/`query`/`prepare`/
-//!   `pragma_*` but nothing that yields a consistent byte image, and
-//!   the `checkpoint()` method exists only on the remote sync database,
-//!   not the local one). `VACUUM INTO` is likewise out: litewire's
-//!   Turso backend rejects `VACUUM` outright and turso 0.7.0's VACUUM
-//!   is incomplete upstream.
+//! - turso exposes no online-backup, `serialize`, or local `checkpoint`
+//!   API (`Database`/`Connection` have `execute`/`query`/`prepare`/
+//!   `pragma_*` but nothing that yields a consistent byte image; the
+//!   `checkpoint()` method exists only on the remote sync database, not
+//!   the local one). `VACUUM INTO` was out on turso 0.7.0 (incomplete
+//!   upstream); the pinned 0.8.3 **does** support it, and the scheduled
+//!   backup path (`crate::db_backup`) uses it for exactly the physical
+//!   page image this list wants. The replica bootstrap deliberately keeps
+//!   the logical dump anyway: a physical image carries **triggers**, which
+//!   a replica must not hold (CDC already ships the rows a trigger
+//!   produced on the primary, so a replica firing it again would diverge),
+//!   and the dump's `CREATE`/`INSERT` allowlist is what lets the receiver
+//!   validate the payload before applying it. litewire's tenant-session
+//!   screen still rejects `VACUUM` on the tenant path.
 //! - A raw file-byte copy would have to reason about turso's on-disk
 //!   shape (main file plus any `-wal`/`-shm` sidecars, whose
 //!   memory-mapped index state is not portable across a copy) and hold

@@ -2832,6 +2832,163 @@ pub struct SqliteConfig {
     /// Replication settings (clustered mode only).
     #[serde(default)]
     pub replication: ReplicationConfig,
+
+    /// Scheduled backups of every embedded database to S3-compatible object
+    /// storage (`[db.sqlite.backup]`). Off by default.
+    #[serde(default)]
+    pub backup: DbBackupConfig,
+}
+
+/// Scheduled embedded-database backups to object storage
+/// (`[db.sqlite.backup]`).
+///
+/// Every `interval`, each embedded database (the one `[db.sqlite] path` in
+/// single-node mode; every `<dir>/<site-key>.db` in per-site mode, open or
+/// not) is snapshotted with `VACUUM INTO` through an in-process engine handle
+/// — never a second process on the file — gzipped and uploaded as
+/// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. **RPO = `interval`.**
+/// Objects older than `retention` are deleted after each successful upload
+/// for that site, always keeping the newest. Restore with `ephpm db restore`.
+///
+/// The object is a plain gzip of a standard SQLite file, **not** encrypted
+/// by ePHPm (unlike `[kv.snapshot]`, so that anything can open it when ePHPm
+/// is gone and no `[kv] secret` is needed): the bucket must carry server-side
+/// encryption and a tight policy.
+///
+/// Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+
+/// optional `AWS_SESSION_TOKEN`) in the environment only — never from this
+/// file, never logged; startup fails with `enabled = true` and none set.
+///
+/// Single-node and per-site modes only: with clustering enabled startup
+/// refuses (`Config::validate`) rather than ship every site once per node.
+///
+/// Unknown keys are a startup error, as in every section.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DbBackupConfig {
+    /// Turn scheduled backups on. Default: `false`. With `true`,
+    /// [`s3_bucket`](Self::s3_bucket) is required.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Destination bucket (a lowercase S3 bucket name). **Required** when
+    /// `enabled = true`. Default: `None`.
+    #[serde(default)]
+    pub s3_bucket: Option<String>,
+
+    /// Key prefix inside the bucket; objects land at
+    /// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. Leading and trailing
+    /// slashes are ignored; empty puts the site directories at the bucket
+    /// root. Default: `"ephpm/db"`.
+    #[serde(default = "default_db_backup_s3_path")]
+    pub s3_path: String,
+
+    /// Snapshot cadence — the recovery point objective. Integer with `ms`,
+    /// `s`, `m`, `h` or `d`. `"0"` is an error here (`enabled` is the
+    /// switch). The first backup runs one interval after startup; a tick
+    /// that overruns the interval is logged and the next starts when it
+    /// finishes (ticks never overlap). Default: `"15m"`.
+    #[serde(default = "default_db_backup_interval")]
+    pub interval: String,
+
+    /// Objects older than this are deleted after each successful upload for
+    /// the site, **always keeping the newest object** regardless of age (a
+    /// site that stopped changing keeps a restorable backup). Same format as
+    /// `interval`; `"0"` is an error. Default: `"14d"`.
+    #[serde(default = "default_db_backup_retention")]
+    pub retention: String,
+
+    /// S3-compatible endpoint origin (`http://minio:9000`,
+    /// `https://<account>.r2.cloudflarestorage.com`). Default: AWS S3 for
+    /// `region` (`https://s3.<region>.amazonaws.com`). Must carry a scheme.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// SigV4 signing region (`auto` for Cloudflare R2). Default: `"us-east-1"`.
+    #[serde(default = "default_kv_snapshot_region")]
+    pub region: String,
+
+    /// Path-style addressing (`endpoint/bucket/key`) rather than
+    /// virtual-hosted (`bucket.endpoint/key`). Default: `true` when
+    /// `endpoint` is set, `false` for AWS S3.
+    #[serde(default)]
+    pub path_style: Option<bool>,
+}
+
+impl Default for DbBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            s3_bucket: None,
+            s3_path: default_db_backup_s3_path(),
+            interval: default_db_backup_interval(),
+            retention: default_db_backup_retention(),
+            endpoint: None,
+            region: default_kv_snapshot_region(),
+            path_style: None,
+        }
+    }
+}
+
+impl DbBackupConfig {
+    /// The key prefix with surrounding slashes removed (`""` or `"a/b"`).
+    #[must_use]
+    pub fn prefix(&self) -> String {
+        self.s3_path.trim().trim_matches('/').to_string()
+    }
+
+    /// Path-style addressing as configured, or the default for the
+    /// endpoint (`true` with a custom endpoint, `false` for AWS S3).
+    #[must_use]
+    pub fn effective_path_style(&self) -> bool {
+        self.path_style.unwrap_or(self.endpoint.is_some())
+    }
+
+    /// The snapshot cadence.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable or zero `interval`.
+    pub fn interval(&self) -> Result<std::time::Duration, ConfigError> {
+        let d = parse_duration_knob("[db.sqlite.backup] interval", &self.interval)?;
+        if d.is_zero() {
+            return Err(ConfigError::Validation(
+                "[db.sqlite.backup] interval must be greater than zero (set enabled = false to \
+                 turn backups off)"
+                    .to_string(),
+            ));
+        }
+        Ok(d)
+    }
+
+    /// How long objects are kept.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable or zero `retention`.
+    pub fn retention(&self) -> Result<std::time::Duration, ConfigError> {
+        let d = parse_duration_knob("[db.sqlite.backup] retention", &self.retention)?;
+        if d.is_zero() {
+            return Err(ConfigError::Validation(
+                "[db.sqlite.backup] retention must be greater than zero (the newest object is \
+                 always kept; retention bounds how long older ones live)"
+                    .to_string(),
+            ));
+        }
+        Ok(d)
+    }
+}
+
+fn default_db_backup_s3_path() -> String {
+    "ephpm/db".to_string()
+}
+
+fn default_db_backup_interval() -> String {
+    "15m".to_string()
+}
+
+fn default_db_backup_retention() -> String {
+    "14d".to_string()
 }
 
 /// Wire protocol frontend addresses for the `SQLite` proxy (`[db.sqlite.proxy]`).
@@ -3525,7 +3682,7 @@ pub struct KvSnapshotConfig {
     /// Also write a snapshot periodically while running, e.g. `"15m"`. `"0"`
     /// (default) disables periodic snapshots. A periodic snapshot is what
     /// survives a crash or `SIGKILL`, at the cost of a CPU and disk burst
-    /// each time. Format: an integer with `ms`, `s`, `m` or `h`.
+    /// each time. Format: an integer with `ms`, `s`, `m`, `h` or `d`.
     #[serde(default = "default_kv_snapshot_interval")]
     pub interval: String,
 
@@ -3657,13 +3814,13 @@ impl KvSnapshotConfig {
     }
 }
 
-/// Parse a duration knob: an integer followed by `ms`, `s`, `m` or `h`; a
-/// bare `0` means zero.
+/// Parse a duration knob: an integer followed by `ms`, `s`, `m`, `h` or
+/// `d`; a bare `0` means zero.
 fn parse_duration_knob(knob: &str, value: &str) -> Result<std::time::Duration, ConfigError> {
     let s = value.trim();
     let bad = || {
         ConfigError::Validation(format!(
-            "{knob} must be an integer with a unit (ms, s, m, h) such as \"30s\", or \"0\", got {value:?}"
+            "{knob} must be an integer with a unit (ms, s, m, h, d) such as \"30s\", or \"0\", got {value:?}"
         ))
     };
     if s == "0" {
@@ -3677,6 +3834,7 @@ fn parse_duration_knob(knob: &str, value: &str) -> Result<std::time::Duration, C
         "s" => 1_000,
         "m" => 60_000,
         "h" => 3_600_000,
+        "d" => 86_400_000,
         _ => return Err(bad()),
     };
     n.checked_mul(mult_ms).map(std::time::Duration::from_millis).ok_or_else(bad)
@@ -5422,6 +5580,61 @@ impl Config {
                 SQLITE_REPLICATION_ROLES.join(", "),
                 sqlite.replication.role,
             )));
+        }
+
+        // [db.sqlite.backup]: `enabled` is the switch, so everything it needs
+        // is checked up front — a bucket, parsable non-zero cadence and
+        // retention, a well-formed endpoint — rather than at the first tick,
+        // fifteen minutes after a start that logged "backup enabled".
+        // Clustered modes are refused outright: nothing schedules per
+        // owner/primary yet, so every node would ship every site once per
+        // interval, and the artifact would carry CDC bookkeeping a restore
+        // cannot reconcile. See the roadmap for the clustered follow-up.
+        if let Some(sqlite) = self.db.sqlite.as_ref()
+            && sqlite.backup.enabled
+        {
+            let backup = &sqlite.backup;
+            let bucket = backup.s3_bucket.as_deref().map(str::trim).unwrap_or_default();
+            let bucket_ok = !bucket.is_empty()
+                && bucket
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+            if !bucket_ok {
+                return Err(ConfigError::Validation(format!(
+                    "[db.sqlite.backup] enabled = true requires s3_bucket (a lowercase S3 bucket \
+                     name), got {bucket:?}"
+                )));
+            }
+            if let Some(endpoint) = backup.endpoint.as_deref()
+                && !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+            {
+                return Err(ConfigError::Validation(format!(
+                    "[db.sqlite.backup] endpoint must be an origin such as \
+                     \"https://minio.internal:9000\", got {endpoint:?}"
+                )));
+            }
+            if backup.region.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "[db.sqlite.backup] region must not be empty".to_string(),
+                ));
+            }
+            backup.interval()?;
+            backup.retention()?;
+            let role = sqlite.replication.role.as_str();
+            let clustered =
+                role == "primary" || role == "replica" || (role == "auto" && self.cluster.enabled);
+            if clustered {
+                return Err(ConfigError::Validation(
+                    "[db.sqlite.backup] enabled = true is not supported in clustered mode \
+                     ([cluster] enabled = true with [db.sqlite.replication] role = \"auto\", or \
+                     role = \"primary\" / \"replica\"): backups are not yet scheduled per \
+                     owner/primary, so every node would upload every database once per interval, \
+                     and the snapshot would carry replication bookkeeping a restore cannot \
+                     reconcile. Set [db.sqlite.backup] enabled = false on cluster nodes, or set \
+                     [db.sqlite.replication] role = \"single\" to run this node unclustered."
+                        .to_string(),
+                ));
+            }
         }
 
         // [[server.proxy]]: validate every rule at startup so a bad upstream,
@@ -9313,6 +9526,13 @@ listen = "0.0.0.0:8080"
                  \n[db.mysql.replicas]\nurls = []\nbogus_key = 1\n",
                 "bogus_key",
             ),
+            // A misspelt `retention` must not silently keep every backup
+            // forever (or a misspelt `enabled` leave backups off).
+            (
+                "[db.sqlite.backup]",
+                "[db.sqlite]\n[db.sqlite.backup]\nretention_days = 14\n",
+                "retention_days",
+            ),
             ("[db.read_write_split]", "[db.read_write_split]\nbogus_key = 1\n", "bogus_key"),
             ("[db.analysis]", "[db.analysis]\nbogus_key = 1\n", "bogus_key"),
             ("[kv]", "[kv]\nbogus_key = 1\n", "bogus_key"),
@@ -9350,6 +9570,93 @@ listen = "0.0.0.0:8080"
                  find the typo, got: {err}"
             );
         }
+    }
+
+    /// `[db.sqlite.backup]` absent (and present but off) is a usable default:
+    /// off, 15 m cadence, 14 d retention, AWS addressing.
+    #[test]
+    fn db_backup_defaults_are_off_with_documented_cadence() {
+        let cfg = load_toml("[db.sqlite]\n");
+        let backup = &cfg.db.sqlite.as_ref().unwrap().backup;
+        assert!(!backup.enabled);
+        assert_eq!(backup.s3_bucket, None);
+        assert_eq!(backup.s3_path, "ephpm/db");
+        assert_eq!(backup.prefix(), "ephpm/db");
+        assert_eq!(backup.interval().unwrap(), std::time::Duration::from_secs(15 * 60));
+        assert_eq!(backup.retention().unwrap(), std::time::Duration::from_secs(14 * 86_400));
+        assert_eq!(backup.region, "us-east-1");
+        assert!(!backup.effective_path_style());
+        cfg.validate().expect("the default is valid");
+
+        let cfg = load_toml(
+            "[db.sqlite]\n[db.sqlite.backup]\nendpoint = \"http://minio:9000\"\ns3_path = \
+             \"/a/b/\"\n",
+        );
+        let backup = &cfg.db.sqlite.as_ref().unwrap().backup;
+        assert!(backup.effective_path_style(), "a custom endpoint defaults to path style");
+        assert_eq!(backup.prefix(), "a/b");
+        // Disabled: nothing else is checked, so a half-written section is
+        // not a startup error until it is switched on.
+        cfg.validate().expect("disabled backups validate");
+    }
+
+    /// `enabled = true` needs a bucket, non-zero cadence and retention, a
+    /// scheme on `endpoint`, and single-node or per-site mode.
+    #[test]
+    fn db_backup_enabled_is_validated_up_front() {
+        let validate = |body: &str| -> Result<(), String> {
+            let cfg = load_toml(&format!("[db.sqlite]\n[db.sqlite.backup]\n{body}"));
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        let err = validate("enabled = true\n").unwrap_err();
+        assert!(err.contains("s3_bucket"), "{err}");
+        let err = validate("enabled = true\ns3_bucket = \"Bad_Bucket\"\n").unwrap_err();
+        assert!(err.contains("s3_bucket"), "{err}");
+        let err = validate("enabled = true\ns3_bucket = \"b\"\ninterval = \"0\"\n").unwrap_err();
+        assert!(err.contains("interval"), "{err}");
+        let err = validate("enabled = true\ns3_bucket = \"b\"\ninterval = \"15\"\n").unwrap_err();
+        assert!(err.contains("interval"), "{err}");
+        let err = validate("enabled = true\ns3_bucket = \"b\"\nretention = \"0\"\n").unwrap_err();
+        assert!(err.contains("retention"), "{err}");
+        let err =
+            validate("enabled = true\ns3_bucket = \"b\"\nendpoint = \"minio:9000\"\n").unwrap_err();
+        assert!(err.contains("endpoint"), "{err}");
+        let err = validate("enabled = true\ns3_bucket = \"b\"\nregion = \" \"\n").unwrap_err();
+        assert!(err.contains("region"), "{err}");
+        validate("enabled = true\ns3_bucket = \"ephpm-backups\"\nretention = \"30d\"\n")
+            .expect("a complete single-node section validates");
+
+        // Clustered: refused, every way clustering can be selected.
+        let clustered = |extra: &str| -> String {
+            let cfg = load_toml(&format!(
+                "[db.sqlite]\n[db.sqlite.backup]\nenabled = true\ns3_bucket = \"b\"\n{extra}"
+            ));
+            cfg.validate().expect_err("clustered + backup must refuse").to_string()
+        };
+        let err = clustered("[cluster]\nenabled = true\nsecret = \"s\"\n");
+        assert!(err.contains("clustered"), "{err}");
+        let err = clustered("[db.sqlite.replication]\nrole = \"primary\"\n");
+        assert!(err.contains("clustered"), "{err}");
+        let err = clustered("[db.sqlite.replication]\nrole = \"replica\"\n");
+        assert!(err.contains("clustered"), "{err}");
+        // `role = "single"` forces single-node even with clustering on, so
+        // backups are allowed there.
+        let cfg = load_toml(
+            "[db.sqlite]\n[db.sqlite.backup]\nenabled = true\ns3_bucket = \"b\"\n[cluster]\n\
+             enabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"single\"\n",
+        );
+        cfg.validate().expect("role = single is unclustered");
+    }
+
+    /// `d` is a duration unit (`retention = "14d"`), alongside the others.
+    #[test]
+    fn duration_knob_accepts_days() {
+        assert_eq!(
+            parse_duration_knob("k", "2d").unwrap(),
+            std::time::Duration::from_secs(2 * 86_400)
+        );
+        assert_eq!(parse_duration_knob("k", "90m").unwrap(), std::time::Duration::from_secs(5400));
+        assert!(parse_duration_knob("k", "2w").is_err());
     }
 
     /// A malformed `[[rewrite]]` regex must be a hard startup error from

@@ -3,7 +3,7 @@ title = "ephpm db"
 weight = 8
 +++
 
-Database tooling for a virtual host's embedded (Turso) database. Three
+Database tooling for a virtual host's embedded (Turso) database. Five
 subcommands:
 
 - [`db import`](#ephpm-db-import) — load a `mysqldump` / `pg_dump` SQL file,
@@ -12,10 +12,13 @@ subcommands:
   batch) and print the result set.
 - [`db shell`](#ephpm-db-shell) — an interactive SQL REPL with introspection and
   cache meta-commands.
+- [`db restore`](#ephpm-db-restore) — install a scheduled backup
+  (`[db.sqlite.backup]`) or a local `.db`/`.db.gz` over a site's database.
+- [`db backup list`](#ephpm-db-backup-list) — list a site's backup objects.
 
-All three resolve the target the same way [`ephpm php --site`](../php/#binding-a-virtual-hosts-database-site)
-does and obey the same single-writer rule (see [Transport & mode](#transport--mode-shared)).
-`db export` is **planned — not yet implemented**.
+`import`, `query` and `shell` resolve the target the same way [`ephpm php --site`](../php/#binding-a-virtual-hosts-database-site)
+does and obey the same single-writer rule (see [Transport & mode](#transport--mode-shared));
+`restore` is offline-only. `db export` is **planned — not yet implemented**.
 
 ## `ephpm db import`
 
@@ -538,6 +541,111 @@ ID | post_title
 
 See the [REPL guide](/guides/using-the-db-repl/) for a from-zero walkthrough,
 including a worked `/kv-put` cache pre-warm.
+
+## `ephpm db restore`
+
+```bash
+ephpm db restore --site <KEY> --config <FILE> --from s3://bucket[/prefix] [--at <TIME>] [--yes]
+ephpm db restore --site <KEY> --config <FILE> --from <local .db or .db.gz> [--yes]
+```
+
+Installs a backup written by [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)
+— a gzip of a standard SQLite main file taken with `VACUUM INTO` — over a site's
+live database. It is a **file install**, not an SQL replay, and it is
+**offline only**: the command refuses while a server is running.
+
+### What it does, in order
+
+1. **Resolves the target** fail-closed, as `db import` does: `--site` must name
+   a vhost directory under `[server] sites_dir` (the file is
+   `[db.sqlite] dir/<key>.db`); in a single-node config the one database is
+   addressed as `--site default` (its backups are stored under that key). A
+   clustered config is refused — a file installed on one node would be
+   discarded or diverged from by the replica set.
+2. **Picks the object.** With `--from s3://bucket[/prefix]` the objects under
+   `<prefix>/<site>/` are listed and the newest with a timestamp **at or
+   before `--at`** is chosen (default: the newest of all). `--at` takes the
+   compact form the objects are named with (`20260301T120000Z`),
+   `YYYY-MM-DDTHH:MM:SSZ`, or a date (`2026-03-01` = midnight UTC). The
+   endpoint, region and addressing style come from `[db.sqlite.backup]` in
+   `--config` (the bucket may differ from the configured one); the credentials
+   from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. A local `--from` path is
+   used as is (`.gz` is gunzipped).
+3. **Prints the plan** — site, source (object, time taken, size), target and
+   whether it exists — and asks for a typed `yes` on a terminal. Without a
+   terminal it refuses unless `--yes` is given. Nothing has been touched yet.
+4. **Checks the server is stopped**: both `[server] listen` and (when the wire
+   listener is on) `[db.sqlite.proxy] mysql_listen` are probed; if either
+   answers, the command stops with "stop the server first". A database file
+   cannot be replaced under an open engine handle (the rename would be ignored
+   on Linux and fail on Windows), so there is no live path with a physical
+   artifact. A live restore is **planned — not yet implemented**.
+5. **Downloads and verifies.** The object is downloaded to
+   `<target>.restore-tmp.gz` next to the target (so the final rename stays on
+   one filesystem), gunzipped to `<target>.restore-tmp`, opened with the engine
+   and checked with `PRAGMA integrity_check`. Anything but `ok` deletes the
+   temporary file and exits `2` — **the live database is never touched by a
+   file that does not verify**.
+6. **Installs.** The verified file is renamed over `<key>.db` (atomic replace),
+   and a stale `<key>.db-wal` / `-shm` from the stopped server is deleted so it
+   can never be replayed onto the new file. Start the server; the site serves
+   the restored data.
+
+### Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir`, or `default` for a single-node config |
+| `-c`, `--config <FILE>` | (required) | Config with `[server] sites_dir`, `[db.sqlite]` and the `[db.sqlite.backup]` endpoint/region |
+| `--from <SOURCE>` | (required) | `s3://bucket[/prefix]` (the prefix is the configured `s3_path`), or a local `.db` / `.db.gz` |
+| `--at <TIME>` | newest | Restore the newest object taken at or before this UTC time; `s3://` sources only |
+| `-y`, `--yes` | off | Skip the confirmation (required when stdin is not a terminal) |
+
+### Exit codes
+
+- `0` — restored.
+- `2` — the backup failed `PRAGMA integrity_check`; nothing was changed.
+- `1` — anything else: a server is running, no object at or before `--at`, an
+  invalid `--site`, a clustered config, a download or install error, or the
+  confirmation was declined.
+
+### Examples
+
+```bash
+# Roll a site back to the newest backup
+ephpm db restore --site blog --config /etc/ephpm/ephpm.toml --from s3://ephpm-backups/ephpm/db
+
+# The newest backup taken before a bad deploy at 09:30 UTC
+ephpm db restore --site blog --config ephpm.toml --from s3://ephpm-backups/ephpm/db --at 2026-03-01T09:30:00Z --yes
+
+# A single-node config's one database, from a file copied off another host
+ephpm db restore --site default --config ephpm.toml --from /backups/20260301T090000Z.db.gz
+```
+
+## `ephpm db backup list`
+
+```bash
+ephpm db backup list --site <KEY> --config <FILE> [--from s3://bucket[/prefix]] [--json]
+```
+
+Lists a site's backup objects — time taken (UTC), compressed size and key —
+oldest first, from the configured `[db.sqlite.backup]` bucket and `s3_path`
+(or `--from`). The site key resolves as for `db restore`. `--json` prints a
+document with `site`, `location` and a `backups` array (`key`, `taken_at`,
+`taken_at_unix`, `bytes`). Credentials come from the environment, as for the
+server. Nothing else is implemented under `db backup`: there is no `now`
+(the server has no "run now" endpoint in this release) and no `rm` — delete
+objects with your bucket tooling; the retention sweep keeps the newest one
+regardless.
+
+```text
+$ ephpm db backup list --site blog --config ephpm.toml
+site:     blog
+location: s3://ephpm-backups/ephpm/db/blog/
+taken (UTC)                     bytes key
+2026-03-01T08:45:00Z          1048231 ephpm/db/blog/20260301T084500Z.db.gz
+2026-03-01T09:00:00Z          1049920 ephpm/db/blog/20260301T090000Z.db.gz
+```
 
 ## See also
 

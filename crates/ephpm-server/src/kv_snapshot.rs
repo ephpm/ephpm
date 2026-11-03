@@ -47,8 +47,7 @@ use ephpm_kv::snapshot::{
 use ephpm_kv::store::Store;
 use metrics::{counter, gauge, histogram};
 
-use crate::s3::{S3Client, S3Location};
-use crate::sigv4::Credentials;
+use crate::s3::{ObjectSettings, S3Client, S3Location};
 
 /// File extension of a snapshot.
 pub const SNAPSHOT_EXTENSION: &str = "kvsnap";
@@ -231,28 +230,20 @@ pub fn object_client_from_config(config: &Config) -> anyhow::Result<(S3Client, S
 
 /// An object client for `bucket` using `[kv.snapshot]`'s endpoint, region
 /// and addressing style — for the CLI's `inspect`/`verify` of an arbitrary
-/// `s3://` URL.
+/// `s3://` URL. (`[db.sqlite.backup]` has its own settings; see
+/// [`crate::db_backup::object_client_for_bucket`].)
 ///
 /// # Errors
 ///
 /// Missing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 pub fn object_client_for_bucket(config: &Config, bucket: String) -> anyhow::Result<S3Client> {
     let snap = &config.kv.snapshot;
-    let creds = Credentials::from_env().context(
-        "[kv.snapshot] mode = \"object\" needs credentials in the environment: set \
-         AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN for temporary \
-         credentials). They are read from the environment only — never from ephpm.toml.",
-    )?;
-    let location = S3Location {
-        bucket,
-        endpoint: snap
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| S3Location::aws_endpoint(snap.region.trim())),
-        region: snap.region.trim().to_string(),
+    let settings = ObjectSettings {
+        endpoint: snap.endpoint.clone(),
+        region: snap.region.clone(),
         path_style: snap.effective_path_style(),
     };
-    S3Client::new(location, creds)
+    S3Client::for_bucket(&settings, bucket, "[kv.snapshot] mode = \"object\"")
 }
 
 /// The object key of `identity`'s snapshot under `prefix`.
@@ -323,7 +314,7 @@ impl KvSnapshotService {
                 // before this process — still root, ahead of the privilege
                 // drop — downloaded into it.
                 None => {
-                    let staging = PrivateStagingDir::create(&std::env::temp_dir())
+                    let staging = PrivateStagingDir::create(&std::env::temp_dir(), "kv-snapshot")
                         .context("creating the [kv.snapshot] staging directory")?;
                     (staging.path().to_path_buf(), target, Some(staging))
                 }
@@ -829,8 +820,6 @@ impl KvSnapshotService {
     }
 }
 
-/// Remove `.<identity>.kvsnap.tmp-*` files a crashed or timed-out writer left
-/// in `dir`. They are never loadable (no trailer), only wasted space.
 /// A staging directory this process created for itself: a fresh,
 /// unpredictable name under the system temp directory, made with `mkdir`
 /// (which fails rather than following anything already at that path) and
@@ -840,22 +829,23 @@ impl KvSnapshotService {
 /// and the object is authoritative, so nothing is lost by not reusing a
 /// previous process's directory. A process killed without dropping the
 /// service leaves its directory behind (ciphertext only); set
-/// `[kv.snapshot] path` for a stable location instead.
+/// `[kv.snapshot] path` for a stable location instead. The database backup
+/// (`crate::db_backup`) stages its snapshots the same way.
 #[derive(Debug)]
-struct PrivateStagingDir {
+pub(crate) struct PrivateStagingDir {
     path: PathBuf,
 }
 
 impl PrivateStagingDir {
-    /// Create `<base>/ephpm-kv-snapshot-<pid>-<random>`.
-    fn create(base: &Path) -> std::io::Result<Self> {
+    /// Create `<base>/ephpm-<kind>-<pid>-<random>`.
+    pub(crate) fn create(base: &Path, kind: &str) -> std::io::Result<Self> {
         let pid = std::process::id();
         let mut last_err = None;
         for _ in 0..16 {
             let mut raw = [0u8; 8];
             getrandom::fill(&mut raw).map_err(|e| std::io::Error::other(e.to_string()))?;
             let nonce = u64::from_le_bytes(raw);
-            let path = base.join(format!("ephpm-kv-snapshot-{pid}-{nonce:016x}"));
+            let path = base.join(format!("ephpm-{kind}-{pid}-{nonce:016x}"));
             #[cfg(unix)]
             let builder = {
                 use std::os::unix::fs::DirBuilderExt as _;
@@ -875,7 +865,7 @@ impl PrivateStagingDir {
         Err(last_err.unwrap_or_else(|| std::io::Error::other("no staging directory name free")))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -885,11 +875,13 @@ impl Drop for PrivateStagingDir {
         if let Err(e) = std::fs::remove_dir_all(&self.path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::debug!(dir = %self.path.display(), "could not remove KV snapshot staging dir: {e}");
+            tracing::debug!(dir = %self.path.display(), "could not remove staging dir: {e}");
         }
     }
 }
 
+/// Remove `.<identity>.kvsnap.tmp-*` files a crashed or timed-out writer left
+/// in `dir`. They are never loadable (no trailer), only wasted space.
 fn remove_stale_temp_files(dir: &Path, identity: &str) {
     let prefix = format!(".{identity}.{SNAPSHOT_EXTENSION}.tmp-");
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -1009,8 +1001,8 @@ mod tests {
     #[test]
     fn private_staging_dir_is_fresh_private_and_removed_on_drop() {
         let base = tempfile::tempdir().unwrap();
-        let a = PrivateStagingDir::create(base.path()).unwrap();
-        let b = PrivateStagingDir::create(base.path()).unwrap();
+        let a = PrivateStagingDir::create(base.path(), "kv-snapshot").unwrap();
+        let b = PrivateStagingDir::create(base.path(), "kv-snapshot").unwrap();
         assert_ne!(a.path(), b.path(), "unpredictable, per-call names");
         let meta = std::fs::symlink_metadata(a.path()).unwrap();
         assert!(meta.is_dir() && !meta.file_type().is_symlink());
