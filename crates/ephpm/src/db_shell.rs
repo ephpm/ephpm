@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use ephpm_dbimport::Dialect;
 
 use crate::db_console::{
-    Console, ConsoleConfig, Format, format_rows, parse_dialect, split_statements,
+    Console, ConsoleConfig, Format, format_rows, parse_dialect, parse_kv_pipe, split_statements,
 };
 
 /// One `ephpm db shell` invocation, assembled from the CLI flags.
@@ -53,8 +53,11 @@ pub enum Meta {
     Tables,
     /// `/schema <table>` — describe one table.
     Schema(String),
-    /// `/kv <ARGS...>` — a RESP command passthrough to the live KV store.
-    Kv(Vec<String>),
+    /// `/kv <ARGS...> [| <format> <path>]` — a RESP command passthrough to the
+    /// live KV store, with an optional output-formatting pipe. `pipe` holds the
+    /// raw text after the first top-level `|` (parsed by [`parse_kv_pipe`] when
+    /// the command runs, so a pipe syntax error is reported then).
+    Kv { args: Vec<String>, pipe: Option<String> },
     /// `/kv-put '<key-template>' [value-col]` — pipe the last result set into KV.
     KvPut { template: String, value_col: Option<String> },
     /// `/help` — command help.
@@ -279,10 +282,27 @@ fn handle_meta(
             Ok(rows) => println!("{}", format_rows(&rows, *format)),
             Err(e) => eprintln!("error: {e:#}"),
         },
-        Meta::Kv(args) => match console.kv_command(&args) {
-            Ok(line) => println!("{line}"),
-            Err(e) => eprintln!("error: {e:#}"),
-        },
+        Meta::Kv { args, pipe } => {
+            let parsed = match pipe.as_deref() {
+                Some(text) => match parse_kv_pipe(text) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        return MetaResult::Continue;
+                    }
+                },
+                None => None,
+            };
+            match console.kv_command(&args, parsed.as_ref()) {
+                Ok(reply) => {
+                    if let Some(note) = reply.note {
+                        eprintln!("{note}");
+                    }
+                    println!("{}", reply.text);
+                }
+                Err(e) => eprintln!("error: {e:#}"),
+            }
+        }
         Meta::KvPut { template, value_col } => {
             match console.kv_put(last_rows, &template, value_col.as_deref()) {
                 Ok(n) => eprintln!("/kv-put: wrote {n} key(s)"),
@@ -304,7 +324,8 @@ fn print_help() {
          \u{20}  /format  [table|tsv|csv|json] show or set the output format\n\
          \u{20}  /tables                      list the user tables\n\
          \u{20}  /schema <table>              describe one table\n\
-         \u{20}  /kv <ARGS...>                run a RESP command against the live KV store\n\
+         \u{20}  /kv <ARGS...> [| fmt path]   run a RESP command against the live KV store;\n\
+         \u{20}                               optional pipe: fmt = raw|json|yaml|table, path = .a.b / .arr[] / .a,.b\n\
          \u{20}  /kv-put '<key-tmpl>' [col]   write the last result set into the live KV\n\
          \u{20}  /help                        this help\n\
          \u{20}  /quit, /exit                 leave (Ctrl-D also works)\n\
@@ -330,7 +351,10 @@ pub fn parse_meta(line: &str) -> Meta {
         "format" | "f" => Meta::Format(opt(rest)),
         "tables" | "t" => Meta::Tables,
         "schema" | "s" => Meta::Schema(rest.to_string()),
-        "kv" => Meta::Kv(tokenize(rest)),
+        "kv" => {
+            let (cmd_part, pipe) = split_kv_line(rest);
+            Meta::Kv { args: tokenize(cmd_part), pipe: pipe.map(str::to_string) }
+        }
         "kv-put" | "kvput" => {
             let tokens = tokenize(rest);
             let mut it = tokens.into_iter();
@@ -355,6 +379,31 @@ fn split_first_word(s: &str) -> (&str, &str) {
         Some(i) => (&s[..i], &s[i..]),
         None => (s, ""),
     }
+}
+
+/// Split a `/kv` argument line into the RESP command part and an optional pipe
+/// part at the first **top-level** `|` — one that is not inside a single- or
+/// double-quoted span. A `|` inside a quoted RESP argument (`/kv SET k "a|b"`)
+/// is therefore part of the value, not a pipe separator. The returned pipe text
+/// (everything after the `|`) is `None` when there is no top-level `|`.
+fn split_kv_line(rest: &str) -> (&str, Option<&str>) {
+    let bytes = rest.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'|' => return (&rest[..i], Some(&rest[i + 1..])),
+                _ => {}
+            },
+        }
+    }
+    (rest, None)
 }
 
 /// Split `s` into tokens, honoring single- and double-quoted spans (so a quoted
@@ -416,12 +465,51 @@ mod tests {
     fn parses_kv_passthrough() {
         assert_eq!(
             parse_meta("/kv GET session:42"),
-            Meta::Kv(vec!["GET".into(), "session:42".into()])
+            Meta::Kv { args: vec!["GET".into(), "session:42".into()], pipe: None }
         );
         assert_eq!(
             parse_meta("/kv SET greeting \"hello world\""),
-            Meta::Kv(vec!["SET".into(), "greeting".into(), "hello world".into()])
+            Meta::Kv {
+                args: vec!["SET".into(), "greeting".into(), "hello world".into()],
+                pipe: None,
+            }
         );
+    }
+
+    #[test]
+    fn parses_kv_with_pipe() {
+        assert_eq!(
+            parse_meta("/kv GET widget:42 | json .price"),
+            Meta::Kv {
+                args: vec!["GET".into(), "widget:42".into()],
+                pipe: Some(" json .price".into())
+            }
+        );
+        // A path-only pipe.
+        assert_eq!(
+            parse_meta("/kv GET widget:42 | .slug,.price"),
+            Meta::Kv {
+                args: vec!["GET".into(), "widget:42".into()],
+                pipe: Some(" .slug,.price".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn kv_pipe_bar_inside_a_quoted_arg_is_not_a_separator() {
+        // The `|` is inside the quoted value, so there is no pipe and the value
+        // keeps its bar.
+        assert_eq!(
+            parse_meta("/kv SET k \"a|b\""),
+            Meta::Kv { args: vec!["SET".into(), "k".into(), "a|b".into()], pipe: None }
+        );
+    }
+
+    #[test]
+    fn split_kv_line_splits_on_top_level_bar_only() {
+        assert_eq!(split_kv_line("GET k | json"), ("GET k ", Some(" json")));
+        assert_eq!(split_kv_line("GET k"), ("GET k", None));
+        assert_eq!(split_kv_line("SET k \"a|b\""), ("SET k \"a|b\"", None));
     }
 
     #[test]

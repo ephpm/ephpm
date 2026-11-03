@@ -317,7 +317,7 @@ it at runtime.
 | `/format [F]` | `/format json` | Show the current format (no arg), or set it to `table`/`tsv`/`csv`/`json` |
 | `/tables` | `/tables` | List the user tables (`sqlite_master` in `sqlite`, `SHOW TABLES` in `mysql`/`pg`) |
 | `/schema <table>` | `/schema wp_posts` | Describe one table (its stored `CREATE` statements in `sqlite`, `DESCRIBE` in `mysql`/`pg`). The table name must be `[A-Za-z0-9_]+` |
-| `/kv <ARGS...>` | `/kv GET session:42` | Run a RESP command against the **live** KV store (per-site authenticated). **Live mode only** |
+| `/kv <ARGS...> [\| <fmt> <path>]` | `/kv GET widget:42 \| json .price` | Run a RESP command against the **live** KV store (per-site authenticated), optionally piping the reply through a formatter (see [The `/kv` output pipe](#kv-output-pipe)). **Live mode only** |
 | `/kv-put '<tmpl>' [col]` | `/kv-put 'cust:${id}' name` | Pipe the **last** result set into the live KV: for each row `SET` the interpolated key to `col` (or the whole row as JSON when no column is given). **Live mode only.** This is the **client-side** loop — see the note below |
 | `/help` | `/help` | Command help |
 | `/quit`, `/exit` | `/quit` | Leave (Ctrl-D also works) |
@@ -332,6 +332,98 @@ fails loudly rather than writing a literal `${col}`.
 > — writing the KV from **inside** a `SELECT` executed by the engine — is a
 > **separate, coming feature** and is documented elsewhere when it ships. They
 > are not the same mechanism; do not conflate them.
+
+### The `/kv` output pipe {#kv-output-pipe}
+
+`/kv` accepts an optional output-formatting **pipe** after the RESP command:
+
+```
+/kv <resp-command…> [ | <format> <path> ]
+```
+
+Everything after the first **top-level** `|` is the pipe (a `|` inside a quoted
+RESP argument, `/kv SET k "a|b"`, is part of the value, not a separator). The
+pipe carries an optional **format** keyword and an optional **path**; **at least
+one must be present**, otherwise it is an error:
+
+```
+pipe needs a format or a path, e.g. | json .price
+```
+
+The pipe applies to `/kv` only — never to `/kv-put` (which writes and returns no
+value) or to the SQL-result-set `--format` / `/format`.
+
+#### Model: normalize → path → format
+
+The reply is first **normalized to a JSON value**, then the path selects part of
+it, then the format renders it:
+
+| RESP reply | JSON value |
+|------------|-----------|
+| `Simple` / `Error` string | a JSON string |
+| integer | a JSON number |
+| nil | `null` |
+| bulk | the parsed JSON if the bytes are valid JSON; else the UTF-8 text as a string; else a lowercase-hex string (non-UTF-8) |
+| array (`LRANGE`, `HGETALL`, …) | a JSON array of recursively-normalized items |
+
+#### Formats
+
+| Format | Renders |
+|--------|---------|
+| `raw` | The classic reply rendering (the default when there is **no** pipe). With a path, a selected scalar prints bare and a selected object/array prints as compact JSON. |
+| `json` | Pretty-printed JSON, 2-space indent. |
+| `yaml` | A YAML block (via `serde_yaml_ng`). |
+| `table` | An object → a two-column `key \| value` table; an array of objects → a multi-column table (columns are the union of keys, first-seen order; a missing key is empty). A nested object/array in a cell renders as compact JSON. A scalar prints as itself. |
+
+With a path but **no** format keyword, the output is **auto**: a scalar prints
+raw (bare), an object or array prints as pretty JSON.
+
+#### Path (jq-lite field selector)
+
+The path operates on the normalized JSON value:
+
+| Path | Meaning |
+|------|---------|
+| `.` | identity — the whole value |
+| `.field` | an object field; nestable (`.a.b.c`) |
+| `.arr[2]` | an array element by index |
+| `.arr[-1]` | a negative index counts from the end |
+| `.arr[]` | **fan out** — each element is formatted and printed on its own line |
+| `.a,.b` | a comma list — build one **reduced object** keyed by each path's final field segment (a deliberate simplification of jq's comma stream) |
+
+Field names in a path are `[A-Za-z0-9_-]`. A path that does not resolve (a
+missing field or an out-of-range index) is a clear error naming the path, not a
+crash.
+
+#### Fail-soft on non-JSON
+
+When the reply is a **top-level bulk value that is not JSON** and the pipe asks
+for `json` / `yaml` / `table` or a path, the value is printed **raw** with a
+one-line note on stderr — never quoted, never a path error, never a panic:
+
+```
+value is not JSON; printed raw
+```
+
+(A non-JSON bulk *inside* an array still normalizes to a JSON string, so an
+array reply formats cleanly.)
+
+#### Examples
+
+For `widget:42` holding `{"id":42,"slug":"blue-hat","price":1900}`:
+
+```
+/kv GET widget:42                      → {"id":42,"slug":"blue-hat","price":1900}   (raw)
+/kv GET widget:42 | json               → pretty JSON of all fields
+/kv GET widget:42 | yaml               → a YAML block
+/kv GET widget:42 | table              → a key | value table
+/kv GET widget:42 | .price             → 1900          (scalar, bare)
+/kv GET widget:42 | json .price        → 1900
+/kv GET widget:42 | .slug,.price       → pretty JSON of {"slug":"blue-hat","price":1900}
+/kv GET widget:42 | table .slug,.price → a key | value table of those two
+/kv LRANGE recent 0 4 | json           → pretty JSON array
+/kv GET missing | json                 → null
+```
 
 ### `--read-only` and `--maintenance`
 

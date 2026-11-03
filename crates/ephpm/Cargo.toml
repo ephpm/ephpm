@@ -79,6 +79,12 @@ tar = { version = "0.4", default-features = false }
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# YAML rendering for the `db shell` / `db query` `/kv` output pipe
+# (`/kv … | yaml …`, src/db_console.rs). serde_yaml_ng is the maintained
+# serde_yaml continuation already in the workspace (ephpm-analyze uses it) and
+# is pure Rust (unsafe-libyaml, not a C libyaml), so adding this direct dep
+# pulls nothing new into the graph and `cargo deny check` stays clean.
+serde_yaml_ng.workspace = true
 # Read-only symbol inspection of shared objects (src/ext_ini.rs): a library
 # exporting `zend_extension_entry` must be loaded with `zend_extension=`, not
 # `extension=`. ELF (Linux), Mach-O (macOS) and PE (Windows DLL exports); no
