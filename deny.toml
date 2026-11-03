@@ -26,6 +26,14 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # RUSTSEC-2026-0429 (same zip 2.4.2, same code path): a crafted symlink
+    # entry makes `ZipArchive::extract` abort the process (DoS). Same function
+    # family as 0367/0368/0369 above and waived for the same reason — vivacity's
+    # `extract::extract_zip` never calls `ZipArchive::extract`; it walks entries
+    # with `by_index` and rejects escaping/symlink targets itself. Pre-existing
+    # on main (zip =2.4.2 is unchanged by the 0.25→0.26.1 vivacity bump); fixed
+    # by zip >= 9.0.0, remove with the three above when vivacity moves to it.
+    "RUSTSEC-2026-0429",
     # RESOLVED (do not re-add): RUSTSEC-2026-0391 (zstd), RUSTSEC-2026-0398 and
     # RUSTSEC-2026-0403 (zstd-safe) are fixed by zstd 0.14.3 / zstd-safe 8.2.0,
     # now in the graph: the workspace `zstd = "0.14"` bump plus org forks of
