@@ -441,6 +441,19 @@ async fn backup_round_trips_through_object_storage() {
     eprintln!("==> container runtime: {runtime}");
     let store = match ObjectStore::start(&runtime) {
         Ok(s) => s,
+        // A runtime that answers `info` but cannot actually provision is the
+        // ephemerd CI runner: its docker shim advertises itself, yet `volume
+        // create`/`run` are unimplemented. That must skip the leg, not red it —
+        // same contract as "no runtime answered". `EPHPM_REQUIRE_CONTAINER_TESTS=1`
+        // (the local proof the test ran) still turns it into a failure.
+        Err(e) if !require => {
+            eprintln!(
+                "!!! SKIPPING db_backup round-trip: container runtime {runtime:?} answered \
+                 `info` but could not start the S3-compatible server ({e}). Set \
+                 EPHPM_REQUIRE_CONTAINER_TESTS=1 to make this a failure."
+            );
+            return;
+        }
         Err(e) => panic!("could not start the S3-compatible server: {e}"),
     };
 
