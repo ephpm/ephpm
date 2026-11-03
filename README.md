@@ -205,7 +205,7 @@ secret = "YOUR_HIGH_ENTROPY_BASE64_SECRET_HERE"  # Required: Enforces encrypted 
 join = ["ephpm.default.svc.cluster.local"]
 ```
 
-Already have a SQL dump? Load it straight into a site's embedded database with `ephpm db import dump.sql --site <key>`, which translates a mysqldump or pg_dump and prints a compatibility report of anything the Turso engine can't take. `ephpm db query` and `ephpm db shell` give you a SQL console over that database — offline, or against a live server.
+Already have a SQL dump? Load it straight into a site's embedded database with `ephpm db import dump.sql --site <key>`, which translates a mysqldump or pg_dump and prints a compatibility report of anything the Turso engine can't take. `ephpm db query` and `ephpm db shell` give you a SQL console over that database — offline, or against a live server. `[db.sqlite.backup]` snapshots every site's database to S3-compatible storage on a schedule (from inside the process — no sidecar on the file), and `ephpm db restore --site <key> --from s3://… --at <time>` brings one back.
 
 ### How the in-process database works under the hood
 Single node is very simple and accessed via SAPI functions added to the runtime by ePHPm.

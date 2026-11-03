@@ -1,0 +1,1224 @@
+//! Scheduled backups of the embedded databases to object storage
+//! (`[db.sqlite.backup]`, Tier 0 of #686).
+//!
+//! Every `interval`, each embedded database is snapshotted, gzipped and
+//! uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects older
+//! than `retention` are then deleted for that site, always keeping the
+//! newest. **RPO = `interval`.** Point-in-time restore at transaction
+//! granularity (continuous CDC archival on top of these bases) is the Tier 1
+//! follow-up on the Turso engine roadmap, not this module.
+//!
+//! # Capture: `VACUUM INTO` on a gated raw connection
+//!
+//! The artifact is a **physical page image** produced by the engine's own
+//! `VACUUM INTO` (supported by the pinned Turso: autocommit only, one active
+//! statement on the connection, a destination that must not exist, and the
+//! output finalised with a `TRUNCATE` checkpoint under full sync, so it is one
+//! self-contained `.db` with no `-wal` sidecar). Chosen over the clustered
+//! path's logical dump because it is *faithful* (the dump deliberately skips
+//! triggers, which a replica must not re-fire — a backup must carry them),
+//! *vanilla-SQLite-readable* (an operator can open it with `sqlite3` with no
+//! ePHPm at all), *online* (the source is read under a `BEGIN` read view, no
+//! write pause), and restorable as a file install rather than an SQL replay.
+//!
+//! The serving factories hold no handle a backup task can reach (single-node
+//! keeps its `Turso` behind the tracked backend; per-site keeps an LRU of
+//! serving factories, and a site that is not open has none), so each tick
+//! opens **its own short-lived gated factory** per database —
+//! [`wal_gate::builder_with_gate`], exactly as `db_shutdown` and the per-site
+//! clustered mgmt registry open second in-process handles on a serving file.
+//! The engine coordinates every in-process handle on one file through a
+//! shared WAL index; the gate is keyed by canonical path, so the backup's
+//! permit and the serving factory's truncate window coordinate; and the
+//! backup never touches the serving LRU (no eviction churn, no slot burnt).
+//! Databases are enumerated from config, open or not: `[db.sqlite] path` in
+//! single-node mode (site `default`, the label `ephpm_sqlite_wal_bytes`
+//! uses), `<dir>/*.db` in per-site mode.
+//!
+//! # Rules this module lives by
+//!
+//! * [`Turso::wal_gate_permit`] is held for the whole `VACUUM INTO` and
+//!   released **before** the gzip and the upload — never across a network
+//!   wait. A long snapshot holds the shared permit for its duration and
+//!   delays the gate's truncate window by that much (the same cost a
+//!   clustered snapshot dump has).
+//! * Every engine call runs under `litewire::litewire_turso::offload::engine`
+//!   (permit first, then offload: a wait inside the scope parks a blocking
+//!   thread for nothing); the gzip runs under `spawn_blocking`. Nothing
+//!   holds a tokio worker. An enclosing timeout would not cancel an
+//!   offloaded scope, so none is attempted.
+//! * Credentials come from `AWS_*` in the environment only — never from
+//!   config, never logged, never in the status JSON.
+//! * The object is a plain gzip of a standard SQLite file, **not** wrapped
+//!   in `[kv.snapshot]`'s AEAD: the value of a physical image is that
+//!   anything can open it when ePHPm is gone, and the KV envelope keys off
+//!   `[kv] secret`, which most single-node deployments do not set. The
+//!   bucket must carry server-side encryption and a tight policy.
+//!
+//! # Modes
+//!
+//! Single-node and per-site (single) only. Clustered modes are refused at
+//! startup by `Config::validate` (and again here): nothing schedules per
+//! owner/primary yet, so every node would ship every site once per
+//! interval, and the artifact would carry CDC bookkeeping
+//! (`turso_cdc`, `__ephpm_cdc_source`, `__litewire_cdc_watermark`) a restore
+//! must reconcile with the lineage rules.
+//!
+//! # Restore
+//!
+//! `ephpm db restore` (offline only in Tier 0; the CLI in
+//! `crates/ephpm/src/db_restore.rs`) picks the newest object at or before
+//! `--at`, downloads, gunzips, verifies with `PRAGMA integrity_check`, and
+//! renames over the site's `.db` — only when no server holds the file.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::Context as _;
+use ephpm_config::Config;
+use litewire::Turso;
+use litewire::litewire_turso::offload;
+use metrics::{counter, gauge, histogram};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+use crate::kv_snapshot::PrivateStagingDir;
+use crate::s3::{ObjectMeta, ObjectSettings, S3Client};
+use crate::{EmbeddedSqliteMode, wal_gate};
+
+/// Object name suffix: a gzipped SQLite main file.
+pub const OBJECT_SUFFIX: &str = ".db.gz";
+
+/// Metric: backups attempted, by site and outcome (`ok`, `snapshot_failed`,
+/// `upload_failed`).
+pub const METRIC_BACKUP_TOTAL: &str = "ephpm_db_backup_total";
+/// Metric: wall time of one database's backup (snapshot + gzip + upload).
+pub const METRIC_BACKUP_DURATION: &str = "ephpm_db_backup_duration_seconds";
+/// Metric: compressed size of the last successfully uploaded object.
+pub const METRIC_LAST_BYTES: &str = "ephpm_db_backup_last_bytes";
+/// Metric: Unix time of the last successful upload (`time() - this` is the
+/// backup lag an alert watches).
+pub const METRIC_LAST_SUCCESS_TIMESTAMP: &str = "ephpm_db_backup_last_success_timestamp_seconds";
+/// Metric: objects deleted by the retention sweep.
+pub const METRIC_RETENTION_DELETED: &str = "ephpm_db_backup_retention_deleted_total";
+/// Metric: retention sweeps that failed (listing or a delete). Never fatal
+/// to the backup itself.
+pub const METRIC_RETENTION_ERRORS: &str = "ephpm_db_backup_retention_errors_total";
+
+/// How many databases are backed up at once within a tick. Each holds a
+/// WAL-gate permit on its own file and runs its `VACUUM INTO` on an
+/// offloaded thread, then gzips on a blocking thread; a few overlap the
+/// disk and network waits, more would only contend for the same disk.
+const BACKUP_CONCURRENCY: usize = 4;
+
+/// One database to back up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Database {
+    /// The `site` label: the vhost's site key, or `default` in single-node
+    /// mode.
+    pub site: String,
+    /// The database file.
+    pub path: PathBuf,
+}
+
+/// Where the databases come from, per mode.
+#[derive(Debug, Clone)]
+enum DatabaseSource {
+    /// Single-node: the one file at `[db.sqlite] path`.
+    Single { path: PathBuf },
+    /// Per-site: every `<dir>/<site-key>.db`, open or not.
+    PerSite { dir: PathBuf },
+}
+
+impl DatabaseSource {
+    /// The databases that exist right now. A single-node file that has not
+    /// been created yet (no query has run) is simply not listed.
+    fn enumerate(&self) -> Vec<Database> {
+        match self {
+            Self::Single { path } => {
+                if path.is_file() {
+                    vec![Database {
+                        site: wal_gate::DEFAULT_SITE_LABEL.to_string(),
+                        path: path.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            Self::PerSite { dir } => enumerate_site_databases(dir),
+        }
+    }
+}
+
+/// Every `<dir>/<site>.db` regular file, sorted by site key. Hidden files
+/// and the `-wal`/`-shm` sidecars (whose names do not end in `.db`) are
+/// skipped.
+fn enumerate_site_databases(dir: &Path) -> Vec<Database> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Database> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let site = name.strip_suffix(".db")?;
+            if site.is_empty() || site.starts_with('.') || !path.is_file() {
+                return None;
+            }
+            Some(Database { site: site.to_string(), path })
+        })
+        .collect();
+    out.sort_by(|a, b| a.site.cmp(&b.site));
+    out
+}
+
+/// A backup object as listed from the bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupObject {
+    /// Full object key.
+    pub key: String,
+    /// The snapshot time encoded in the key, Unix seconds.
+    pub timestamp: u64,
+    /// Object size in bytes (compressed).
+    pub size: u64,
+}
+
+/// The last successful upload of one site, for the status endpoint.
+#[derive(Debug, Clone)]
+pub struct LastUpload {
+    /// Unix seconds when it finished.
+    pub at: u64,
+    /// The object key.
+    pub key: String,
+    /// Compressed bytes.
+    pub bytes: u64,
+    /// Snapshot + gzip + upload.
+    pub elapsed: Duration,
+}
+
+/// The last failure of one site, for the status endpoint.
+#[derive(Debug, Clone)]
+pub struct LastError {
+    /// Unix seconds when it happened.
+    pub at: u64,
+    /// `snapshot_failed`, `upload_failed` or `retention_failed`.
+    pub stage: &'static str,
+    /// The error, rendered.
+    pub message: String,
+}
+
+/// One site's status.
+#[derive(Debug, Clone, Default)]
+pub struct SiteStatus {
+    /// Last successful upload.
+    pub last_ok: Option<LastUpload>,
+    /// Last failure, kept even after a later success so an operator sees
+    /// it; the timestamps tell which came last.
+    pub last_error: Option<LastError>,
+}
+
+/// What one tick did.
+#[derive(Debug, Clone, Default)]
+pub struct TickReport {
+    /// Databases found.
+    pub databases: usize,
+    /// Backed up and uploaded.
+    pub ok: usize,
+    /// Failed at the snapshot or the upload.
+    pub failed: usize,
+    /// Wall time of the whole tick.
+    pub elapsed: Duration,
+    /// Unix seconds when it finished.
+    pub finished_at: u64,
+}
+
+/// The running server's backup lifecycle. One per process, built by
+/// [`DbBackupService::from_config`] when `[db.sqlite.backup] enabled`.
+pub struct DbBackupService {
+    client: Arc<S3Client>,
+    prefix: String,
+    interval: Duration,
+    retention: Duration,
+    source: DatabaseSource,
+    staging: PrivateStagingDir,
+    /// Serialises ticks: one in flight at a time, never overlapping.
+    running: tokio::sync::Mutex<()>,
+    sites: Mutex<BTreeMap<String, SiteStatus>>,
+    last_tick: Mutex<Option<TickReport>>,
+}
+
+impl std::fmt::Debug for DbBackupService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbBackupService")
+            .field("bucket", &self.client.location().bucket)
+            .field("prefix", &self.prefix)
+            .field("interval", &self.interval)
+            .field("retention", &self.retention)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The addressing `[db.sqlite.backup]` declares (defaults when there is no
+/// `[db.sqlite]` section at all), for building a client to any bucket.
+#[must_use]
+pub fn object_settings(config: &Config) -> ObjectSettings {
+    let backup = config.db.sqlite.as_ref().map(|s| s.backup.clone()).unwrap_or_default();
+    ObjectSettings {
+        endpoint: backup.endpoint.clone(),
+        region: backup.region.clone(),
+        path_style: backup.effective_path_style(),
+    }
+}
+
+/// An object client for `bucket` using `[db.sqlite.backup]`'s endpoint,
+/// region and addressing style — for `ephpm db restore --from s3://…` and
+/// `ephpm db backup list`, which may name a bucket other than the configured
+/// one.
+///
+/// # Errors
+///
+/// Missing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+pub fn object_client_for_bucket(config: &Config, bucket: String) -> anyhow::Result<S3Client> {
+    S3Client::for_bucket(&object_settings(config), bucket, "[db.sqlite.backup]")
+}
+
+/// The client and key prefix `[db.sqlite.backup]` describes.
+///
+/// # Errors
+///
+/// Backups not enabled, no bucket, or missing credentials.
+pub fn object_client_from_config(config: &Config) -> anyhow::Result<(S3Client, String)> {
+    let backup = &config
+        .db
+        .sqlite
+        .as_ref()
+        .context("[db.sqlite] is not configured, so there is no embedded database to back up")?
+        .backup;
+    anyhow::ensure!(backup.enabled, "[db.sqlite.backup] enabled is false");
+    let bucket = backup
+        .s3_bucket
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .context("[db.sqlite.backup] s3_bucket is not set")?
+        .to_string();
+    Ok((object_client_for_bucket(config, bucket)?, backup.prefix()))
+}
+
+/// `<prefix>/<site>` (or `<site>` with an empty prefix): the directory of
+/// one site's objects, without a trailing slash.
+#[must_use]
+pub fn site_prefix(prefix: &str, site: &str) -> String {
+    if prefix.is_empty() { site.to_string() } else { format!("{prefix}/{site}") }
+}
+
+/// The key of a snapshot of `site` taken at `unix_secs`.
+#[must_use]
+pub fn object_key(prefix: &str, site: &str, unix_secs: u64) -> String {
+    format!("{}/{}{OBJECT_SUFFIX}", site_prefix(prefix, site), format_timestamp(unix_secs))
+}
+
+/// The snapshot time encoded in a key (`…/<YYYYMMDDTHHMMSSZ>.db.gz`), or
+/// `None` for any other object.
+#[must_use]
+pub fn parse_key_timestamp(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let stamp = name.strip_suffix(OBJECT_SUFFIX)?;
+    parse_compact_timestamp(stamp)
+}
+
+/// `YYYYMMDDTHHMMSSZ` for a Unix-seconds timestamp — lexicographic order is
+/// chronological order, so a listing sorted by key is sorted by time.
+#[must_use]
+pub fn format_timestamp(unix_secs: u64) -> String {
+    let (y, m, d, hh, mm, ss) = civil_from_unix(unix_secs);
+    format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z")
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix-seconds timestamp (for humans).
+#[must_use]
+pub fn format_rfc3339(unix_secs: u64) -> String {
+    let (y, m, d, hh, mm, ss) = civil_from_unix(unix_secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Parse a point in time as the CLI accepts it: the compact key form
+/// `YYYYMMDDTHHMMSSZ`, RFC 3339 UTC `YYYY-MM-DDTHH:MM:SSZ` (a fractional
+/// second is accepted and ignored), or a date `YYYY-MM-DD` (midnight UTC).
+#[must_use]
+pub fn parse_timestamp(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(v) = parse_compact_timestamp(s) {
+        return Some(v);
+    }
+    let (date, time) = match s.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (s, None),
+    };
+    let [year, month, day] = fixed_fields(date, '-', [4, 2, 2])?;
+    let [hour, minute, second] = match time {
+        None => [0, 0, 0],
+        Some(time) => {
+            let time = time.strip_suffix('Z')?;
+            let time = time.split_once('.').map_or(time, |(whole, _frac)| whole);
+            fixed_fields(time, ':', [2, 2, 2])?
+        }
+    };
+    unix_from_civil(year, month, day, hour, minute, second)
+}
+
+/// Split `s` on `sep` into exactly three all-digit fields of the given
+/// widths, parsed.
+fn fixed_fields(s: &str, sep: char, widths: [usize; 3]) -> Option<[u64; 3]> {
+    let mut parts = s.split(sep);
+    let mut out = [0u64; 3];
+    for (slot, width) in out.iter_mut().zip(widths) {
+        let field = parts.next()?;
+        if field.len() != width || !field.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = field.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// `YYYYMMDDTHHMMSSZ` → Unix seconds.
+fn parse_compact_timestamp(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    if !b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| s[range].parse::<u64>().ok();
+    unix_from_civil(num(0..4)?, num(4..6)?, num(6..8)?, num(9..11)?, num(11..13)?, num(13..15)?)
+}
+
+/// Civil UTC date-time from Unix seconds (Howard Hinnant's `civil_from_days`).
+fn civil_from_unix(unix_secs: u64) -> (i64, i64, i64, u64, u64, u64) {
+    let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400).unsigned_abs();
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+/// Unix seconds from a civil UTC date-time (`days_from_civil`), `None` for
+/// an out-of-range field.
+fn unix_from_civil(y: u64, m: u64, d: u64, hh: u64, mm: u64, ss: u64) -> Option<u64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return None;
+    }
+    let (y, m, d) = (i64::try_from(y).ok()?, i64::try_from(m).ok()?, i64::try_from(d).ok()?);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400).ok()?.checked_add(hh * 3600 + mm * 60 + ss)
+}
+
+/// Unix seconds now.
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The newest object whose timestamp is at or before `at` (`None` = the
+/// newest of all). Ties on timestamp resolve to the greater key.
+#[must_use]
+pub fn select_at_or_before(objects: &[BackupObject], at: Option<u64>) -> Option<&BackupObject> {
+    objects
+        .iter()
+        .filter(|o| at.is_none_or(|at| o.timestamp <= at))
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.key.cmp(&b.key)))
+}
+
+/// The objects the retention sweep deletes: every one older than
+/// `retention` as of `now`, **except the newest object**, which is always
+/// kept regardless of age — a site that stopped changing must still have a
+/// restorable backup.
+#[must_use]
+pub fn retention_victims(
+    objects: &[BackupObject],
+    now: u64,
+    retention: Duration,
+) -> Vec<&BackupObject> {
+    let Some(newest) = select_at_or_before(objects, None) else {
+        return Vec::new();
+    };
+    let cutoff = now.saturating_sub(retention.as_secs());
+    objects.iter().filter(|o| o.key != newest.key && o.timestamp < cutoff).collect()
+}
+
+/// The backup objects of `site` under `prefix`, oldest first. Objects whose
+/// name is not a timestamped `.db.gz` are ignored.
+///
+/// # Errors
+///
+/// The listing failed.
+pub async fn list_site_backups(
+    client: &S3Client,
+    prefix: &str,
+    site: &str,
+) -> anyhow::Result<Vec<BackupObject>> {
+    let dir = format!("{}/", site_prefix(prefix, site));
+    let listed = client.list(&dir).await?;
+    Ok(to_backup_objects(&dir, listed))
+}
+
+/// Keep the listed objects directly under `dir` whose names carry a
+/// timestamp, sorted oldest first.
+fn to_backup_objects(dir: &str, listed: Vec<ObjectMeta>) -> Vec<BackupObject> {
+    let mut out: Vec<BackupObject> = listed
+        .into_iter()
+        .filter_map(|o| {
+            let name = o.key.strip_prefix(dir)?;
+            if name.contains('/') {
+                return None;
+            }
+            let timestamp = parse_key_timestamp(name)?;
+            Some(BackupObject { key: o.key, timestamp, size: o.size })
+        })
+        .collect();
+    out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.key.cmp(&b.key)));
+    out
+}
+
+impl DbBackupService {
+    /// Build the service from `[db.sqlite.backup]`, or `None` when backups
+    /// are off. Checks the mode, creates the private staging directory and
+    /// the object client (credentials from the environment).
+    ///
+    /// # Errors
+    ///
+    /// A clustered mode, a missing `[db.sqlite] dir` in per-site mode, a
+    /// staging directory that cannot be created, missing credentials, or an
+    /// unparsable knob (which `Config::validate` normally catches first).
+    pub fn from_config(config: &Config) -> anyhow::Result<Option<Arc<Self>>> {
+        let Some(sqlite) = config.db.sqlite.as_ref() else {
+            return Ok(None);
+        };
+        let backup = &sqlite.backup;
+        if !backup.enabled {
+            return Ok(None);
+        }
+        let source = match crate::embedded_sqlite_mode(config) {
+            EmbeddedSqliteMode::SingleNode => {
+                DatabaseSource::Single { path: PathBuf::from(&sqlite.path) }
+            }
+            EmbeddedSqliteMode::PerSite => DatabaseSource::PerSite {
+                dir: PathBuf::from(
+                    sqlite
+                        .dir
+                        .as_deref()
+                        .context("[db.sqlite.backup] per-site mode requires [db.sqlite] dir")?,
+                ),
+            },
+            EmbeddedSqliteMode::Clustered | EmbeddedSqliteMode::PerSiteClustered => {
+                anyhow::bail!(
+                    "[db.sqlite.backup] enabled = true is not supported in clustered mode \
+                     (backups are not scheduled per owner/primary yet); set enabled = false on \
+                     cluster nodes"
+                )
+            }
+            EmbeddedSqliteMode::None => return Ok(None),
+        };
+        let (client, prefix) = object_client_from_config(config)?;
+        let interval = backup.interval()?;
+        let retention = backup.retention()?;
+        // Never a predictable shared path: see `PrivateStagingDir`.
+        let staging = PrivateStagingDir::create(&std::env::temp_dir(), "db-backup")
+            .context("creating the [db.sqlite.backup] staging directory")?;
+        let svc = Arc::new(Self {
+            client: Arc::new(client),
+            prefix,
+            interval,
+            retention,
+            source,
+            staging,
+            running: tokio::sync::Mutex::new(()),
+            sites: Mutex::new(BTreeMap::new()),
+            last_tick: Mutex::new(None),
+        });
+        tracing::info!(
+            bucket = %svc.client.location().bucket,
+            endpoint = %svc.client.location().endpoint,
+            prefix = %svc.prefix,
+            interval_secs = interval.as_secs(),
+            retention_secs = retention.as_secs(),
+            databases = svc.source.enumerate().len(),
+            staging = %svc.staging.path().display(),
+            "embedded database backup enabled (VACUUM INTO snapshot → gzip → object storage; \
+             the object is not encrypted by ePHPm — use bucket-side encryption)"
+        );
+        Ok(Some(svc))
+    }
+
+    /// The directory this service writes staging files to after startup,
+    /// for the privilege drop to hand to the serving user.
+    #[must_use]
+    pub fn runtime_paths(&self) -> Vec<PathBuf> {
+        vec![self.staging.path().to_path_buf()]
+    }
+
+    /// The snapshot cadence.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Start the periodic task. The first tick fires one interval after
+    /// start (not immediately); a tick that overruns the interval is
+    /// logged, and the next starts when it finishes — ticks never overlap.
+    /// The returned handle is aborted at shutdown.
+    pub fn spawn_periodic(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(svc.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                let report = svc.run_now().await;
+                if report.elapsed > svc.interval {
+                    tracing::warn!(
+                        elapsed_secs = report.elapsed.as_secs(),
+                        interval_secs = svc.interval.as_secs(),
+                        databases = report.databases,
+                        "database backup tick overran its interval; the next tick starts now \
+                         (the effective RPO is the tick duration, not the interval)"
+                    );
+                }
+            }
+        })
+    }
+
+    /// Back up every database now. Waits for a tick already in flight.
+    pub async fn run_now(&self) -> TickReport {
+        let _guard = self.running.lock().await;
+        let started = Instant::now();
+        let databases = self.source.enumerate();
+        let mut report = TickReport { databases: databases.len(), ..TickReport::default() };
+        tracing::debug!(databases = databases.len(), "database backup tick");
+
+        let permits = Arc::new(Semaphore::new(BACKUP_CONCURRENCY));
+        let mut tasks: JoinSet<(String, Outcome)> = JoinSet::new();
+        for db in databases {
+            let permits = Arc::clone(&permits);
+            let client = Arc::clone(&self.client);
+            let prefix = self.prefix.clone();
+            let retention = self.retention;
+            let staging = self.staging.path().to_path_buf();
+            // Each database is its own task: its engine work runs under
+            // `offload::engine`, whose nested `block_on` holds the polling
+            // task, so attempts polled together on one task would serialise.
+            tasks.spawn(async move {
+                // The semaphore is never closed, so `acquire_owned` cannot fail.
+                let _permit = permits.acquire_owned().await;
+                let outcome = backup_one(&client, &prefix, retention, &staging, &db).await;
+                (db.site, outcome)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((site, outcome)) => {
+                    if self.record(&site, outcome) {
+                        report.ok += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    tracing::warn!("database backup task failed: {e}");
+                }
+            }
+        }
+        report.elapsed = started.elapsed();
+        report.finished_at = now_unix();
+        if report.databases > 0 {
+            tracing::info!(
+                databases = report.databases,
+                ok = report.ok,
+                failed = report.failed,
+                elapsed_ms = u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+                "database backup tick finished"
+            );
+        }
+        if let Ok(mut slot) = self.last_tick.lock() {
+            *slot = Some(report.clone());
+        }
+        report
+    }
+
+    /// The status document served at `GET /_ephpm/db/backup`. Never carries
+    /// credentials; the endpoint and bucket are not secrets.
+    #[must_use]
+    pub fn status_json(&self) -> String {
+        let sites = self.sites.lock().map(|s| s.clone()).unwrap_or_default();
+        let last_tick = self.last_tick.lock().ok().and_then(|t| t.clone());
+        let sites_json: serde_json::Map<String, serde_json::Value> = sites
+            .iter()
+            .map(|(site, status)| {
+                let last_ok = status.last_ok.as_ref().map(|u| {
+                    serde_json::json!({
+                        "at_unix": u.at,
+                        "at": format_rfc3339(u.at),
+                        "object": format!("s3://{}/{}", self.client.location().bucket, u.key),
+                        "bytes": u.bytes,
+                        "elapsed_ms": u64::try_from(u.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    })
+                });
+                let last_error = status.last_error.as_ref().map(|e| {
+                    serde_json::json!({
+                        "at_unix": e.at,
+                        "at": format_rfc3339(e.at),
+                        "stage": e.stage,
+                        "error": e.message,
+                    })
+                });
+                (site.clone(), serde_json::json!({ "last_ok": last_ok, "last_error": last_error }))
+            })
+            .collect();
+        serde_json::json!({
+            "bucket": self.client.location().bucket,
+            "endpoint": self.client.location().endpoint,
+            "prefix": self.prefix,
+            "interval_secs": self.interval.as_secs(),
+            "retention_secs": self.retention.as_secs(),
+            "databases": self.source.enumerate().len(),
+            "running": self.running.try_lock().is_err(),
+            "last_tick": last_tick.map(|t| serde_json::json!({
+                "finished_at_unix": t.finished_at,
+                "finished_at": format_rfc3339(t.finished_at),
+                "databases": t.databases,
+                "ok": t.ok,
+                "failed": t.failed,
+                "elapsed_ms": u64::try_from(t.elapsed.as_millis()).unwrap_or(u64::MAX),
+            })),
+            "sites": sites_json,
+        })
+        .to_string()
+    }
+}
+
+impl DbBackupService {
+    /// Record `outcome` for `site`, returning whether the backup succeeded.
+    fn record(&self, site: &str, outcome: Outcome) -> bool {
+        let ok = outcome.upload.is_some();
+        let Ok(mut map) = self.sites.lock() else { return ok };
+        let entry = map.entry(site.to_string()).or_default();
+        if let Some(upload) = outcome.upload {
+            entry.last_ok = Some(upload);
+        }
+        if let Some(error) = outcome.error {
+            entry.last_error = Some(error);
+        }
+        ok
+    }
+}
+
+/// What one database's backup produced: an upload (success), an error
+/// (snapshot or upload failure), or both (upload succeeded, retention
+/// sweep failed).
+#[derive(Debug, Default)]
+struct Outcome {
+    upload: Option<LastUpload>,
+    error: Option<LastError>,
+}
+
+/// Snapshot, gzip, upload and sweep one database. Records the metrics and
+/// the log lines; the staging files are removed on every path.
+async fn backup_one(
+    client: &S3Client,
+    prefix: &str,
+    retention: Duration,
+    staging: &Path,
+    db: &Database,
+) -> Outcome {
+    let started = Instant::now();
+    let site = db.site.clone();
+    let mut outcome = Outcome::default();
+
+    let mut nonce = [0u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let stem = format!("{}-{:016x}", sanitize_file_stem(&site), u64::from_le_bytes(nonce));
+    let staging_db = staging.join(format!("{stem}.db"));
+    let staging_gz = staging.join(format!("{stem}{OBJECT_SUFFIX}"));
+
+    // 1. Snapshot (engine, under the WAL-gate permit) then 2. gzip
+    //    (blocking thread). The permit is released inside `snapshot_into`,
+    //    before any of this.
+    let compressed = match snapshot_into(&db.path, &staging_db).await {
+        Ok(()) => {
+            let (src, dst) = (staging_db.clone(), staging_gz.clone());
+            tokio::task::spawn_blocking(move || gzip_file(&src, &dst))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("gzip task failed: {e}")))
+        }
+        Err(e) => Err(e),
+    };
+    remove_quietly(&staging_db);
+    let compressed = match compressed {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            remove_quietly(&staging_gz);
+            counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "snapshot_failed")
+                .increment(1);
+            tracing::warn!(site = %site, path = %db.path.display(), "database backup snapshot FAILED: {e:#}");
+            outcome.error = Some(LastError {
+                at: now_unix(),
+                stage: "snapshot_failed",
+                message: format!("{e:#}"),
+            });
+            return outcome;
+        }
+    };
+
+    // 3. Upload.
+    let taken_at = now_unix();
+    let key = object_key(prefix, &site, taken_at);
+    let uploaded = client.put_file(&key, &staging_gz).await;
+    remove_quietly(&staging_gz);
+    if let Err(e) = uploaded {
+        counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "upload_failed")
+            .increment(1);
+        tracing::warn!(site = %site, key = %key, "database backup upload FAILED: {e:#}");
+        outcome.error =
+            Some(LastError { at: now_unix(), stage: "upload_failed", message: format!("{e:#}") });
+        return outcome;
+    }
+    let elapsed = started.elapsed();
+    counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "ok").increment(1);
+    histogram!(METRIC_BACKUP_DURATION, "site" => site.clone()).record(elapsed.as_secs_f64());
+    #[allow(clippy::cast_precision_loss)] // byte counts and Unix seconds fit f64 exactly
+    {
+        gauge!(METRIC_LAST_BYTES, "site" => site.clone()).set(compressed as f64);
+        gauge!(METRIC_LAST_SUCCESS_TIMESTAMP, "site" => site.clone()).set(taken_at as f64);
+    }
+    tracing::info!(
+        site = %site,
+        key = %key,
+        bytes = compressed,
+        elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "database backup uploaded"
+    );
+    outcome.upload =
+        Some(LastUpload { at: taken_at, key: key.clone(), bytes: compressed, elapsed });
+
+    // 4. Retention, only after a successful upload (so the newest object
+    //    is the one just written). Never fatal.
+    match sweep_retention(client, prefix, &site, retention).await {
+        Ok(deleted) => {
+            if deleted > 0 {
+                counter!(METRIC_RETENTION_DELETED, "site" => site.clone()).increment(deleted);
+                tracing::info!(site = %site, deleted, "database backup retention sweep");
+            }
+        }
+        Err(e) => {
+            counter!(METRIC_RETENTION_ERRORS, "site" => site.clone()).increment(1);
+            tracing::warn!(site = %site, "database backup retention sweep FAILED: {e:#}");
+            outcome.error = Some(LastError {
+                at: now_unix(),
+                stage: "retention_failed",
+                message: format!("{e:#}"),
+            });
+        }
+    }
+    outcome
+}
+
+/// Delete every object of `site` the retention policy says to; returns how
+/// many. Stops at the first failed delete (the rest are retried next tick).
+async fn sweep_retention(
+    client: &S3Client,
+    prefix: &str,
+    site: &str,
+    retention: Duration,
+) -> anyhow::Result<u64> {
+    let objects = list_site_backups(client, prefix, site).await.context("listing the backups")?;
+    let mut deleted = 0u64;
+    for victim in retention_victims(&objects, now_unix(), retention) {
+        client.delete(&victim.key).await.with_context(|| format!("deleting {}", victim.key))?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// `VACUUM INTO dest` from `source`, through a short-lived gated factory
+/// on the source file. The WAL-gate permit (shared with the serving
+/// factory's gate, which is keyed by canonical path) is held for the whole
+/// statement and released before this returns. `dest` must not exist.
+///
+/// # Errors
+///
+/// The source cannot be opened, or the engine refused the statement (a
+/// transaction in progress, an existing destination, `auto_vacuum =
+/// INCREMENTAL` on the source — surfaced, never worked around).
+pub async fn snapshot_into(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    let source_s = source.to_str().context("database path is not UTF-8")?;
+    let dest_s = dest.to_str().context("staging path is not UTF-8")?;
+    // `build()` reads the header and recovers any WAL; litewire offloads it.
+    let turso = wal_gate::builder_with_gate(Turso::builder(source_s))
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("open {} for backup: {e}", source.display()))?;
+    let permit = turso.wal_gate_permit().await;
+    let sql = format!("VACUUM INTO '{}'", dest_s.replace('\'', "''"));
+    let result = offload::engine(async {
+        let conn = turso.raw_connection().map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        conn.execute(&sql, ()).await.context("VACUUM INTO")?;
+        anyhow::Ok(())
+    })
+    .await;
+    drop(permit);
+    drop(turso);
+    // The output is finalised with a TRUNCATE checkpoint; an empty sidecar
+    // may still be left beside it.
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = dest.as_os_str().to_owned();
+        sidecar.push(suffix);
+        remove_quietly(Path::new(&sidecar));
+    }
+    result
+}
+
+/// Open `path` with the engine and run `PRAGMA integrity_check`; `Ok` only
+/// when the answer is the single row `ok`. For `ephpm db restore`, before a
+/// downloaded file replaces the live one. Opens a plain (ungated,
+/// short-lived) handle and removes the empty `-wal`/`-shm` the open leaves
+/// beside the file. Engine work runs under `offload::engine`.
+///
+/// # Errors
+///
+/// The file cannot be opened as a database, or the check reported
+/// anything but `ok` (the first problem is in the message).
+pub async fn verify_integrity(path: &Path) -> anyhow::Result<()> {
+    let path_s = path.to_str().context("path is not UTF-8")?;
+    let result = offload::engine(async {
+        let db = turso::Builder::new_local(path_s)
+            .build()
+            .await
+            .with_context(|| format!("open {} as a database", path.display()))?;
+        let conn = db.connect().context("connect")?;
+        let mut rows = conn.query("PRAGMA integrity_check", ()).await.context("integrity_check")?;
+        let first = rows.next().await.context("read the integrity_check result")?;
+        match first {
+            Some(row) => match row.get_value(0)? {
+                turso::Value::Text(s) if s == "ok" => anyhow::Ok(()),
+                turso::Value::Text(s) => anyhow::bail!("integrity_check reported: {s}"),
+                other => anyhow::bail!("integrity_check returned {other:?}"),
+            },
+            None => anyhow::bail!("integrity_check returned no rows"),
+        }
+    })
+    .await;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        remove_quietly(Path::new(&sidecar));
+    }
+    result
+}
+
+/// Gzip `src` into `dst` (created or truncated), fsynced. Returns the
+/// compressed size. Blocking: call from `spawn_blocking`.
+///
+/// # Errors
+///
+/// Any I/O failure.
+pub fn gzip_file(src: &Path, dst: &Path) -> anyhow::Result<u64> {
+    use std::io::Write as _;
+    let mut input = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let out = std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    let mut encoder =
+        flate2::write::GzEncoder::new(std::io::BufWriter::new(out), flate2::Compression::default());
+    std::io::copy(&mut input, &mut encoder).context("compressing")?;
+    let mut writer = encoder.finish().context("finishing the gzip stream")?;
+    writer.flush()?;
+    let file = writer.into_inner().map_err(|e| anyhow::anyhow!("flushing: {e}"))?;
+    file.sync_all()?;
+    Ok(file.metadata()?.len())
+}
+
+/// Gunzip `src` into `dst` (created or truncated), fsynced. Returns the
+/// decompressed size. Blocking.
+///
+/// # Errors
+///
+/// Any I/O failure, including a stream that is not gzip.
+pub fn gunzip_file(src: &Path, dst: &Path) -> anyhow::Result<u64> {
+    let input = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let mut decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(input));
+    let mut out =
+        std::fs::File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    let bytes = std::io::copy(&mut decoder, &mut out).context("decompressing")?;
+    out.sync_all()?;
+    Ok(bytes)
+}
+
+/// A site key as a file-name stem (site keys are `[a-z0-9._-]` already; this
+/// only guards against a stray file name in `[db.sqlite] dir`).
+fn sanitize_file_stem(site: &str) -> String {
+    site.chars()
+        .map(
+            |c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' },
+        )
+        .collect()
+}
+
+fn remove_quietly(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(file = %path.display(), "could not remove a backup staging file: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(key: &str, size: u64) -> BackupObject {
+        BackupObject { key: key.to_string(), timestamp: parse_key_timestamp(key).unwrap(), size }
+    }
+
+    #[test]
+    fn timestamps_round_trip_and_sort_lexicographically() {
+        assert_eq!(format_timestamp(0), "19700101T000000Z");
+        assert_eq!(format_timestamp(1_700_000_000), "20231114T221320Z");
+        assert_eq!(parse_timestamp("20231114T221320Z"), Some(1_700_000_000));
+        assert_eq!(parse_timestamp("2023-11-14T22:13:20Z"), Some(1_700_000_000));
+        assert_eq!(parse_timestamp("2023-11-14T22:13:20.5Z"), Some(1_700_000_000));
+        assert_eq!(parse_timestamp("2023-11-14"), Some(1_699_920_000));
+        assert_eq!(format_rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        for bad in ["", "2023-13-01", "20231114T221320", "2023-11-14T22:13Z", "yesterday"] {
+            assert_eq!(parse_timestamp(bad), None, "{bad:?}");
+        }
+        // A later time is a greater key: a sorted listing is chronological.
+        let a = object_key("ephpm/db", "blog", 1_700_000_000);
+        let b = object_key("ephpm/db", "blog", 1_700_000_001);
+        assert_eq!(a, "ephpm/db/blog/20231114T221320Z.db.gz");
+        assert!(a < b);
+        assert_eq!(object_key("", "default", 0), "default/19700101T000000Z.db.gz");
+        assert_eq!(parse_key_timestamp(&a), Some(1_700_000_000));
+        assert_eq!(parse_key_timestamp("ephpm/db/blog/notes.txt"), None);
+        assert_eq!(parse_key_timestamp("ephpm/db/blog/latest.db.gz"), None);
+    }
+
+    #[test]
+    fn newest_at_or_before_selection() {
+        let objects = vec![
+            obj("p/s/20260101T000000Z.db.gz", 1),
+            obj("p/s/20260102T000000Z.db.gz", 2),
+            obj("p/s/20260103T000000Z.db.gz", 3),
+        ];
+        let newest = select_at_or_before(&objects, None).unwrap();
+        assert_eq!(newest.size, 3);
+        let at = parse_timestamp("2026-01-02T12:00:00Z");
+        assert_eq!(select_at_or_before(&objects, at).unwrap().size, 2);
+        // Exactly at a snapshot's time selects it.
+        let at = parse_timestamp("2026-01-02T00:00:00Z");
+        assert_eq!(select_at_or_before(&objects, at).unwrap().size, 2);
+        // Before the oldest: nothing.
+        let at = parse_timestamp("2025-12-31T00:00:00Z");
+        assert!(select_at_or_before(&objects, at).is_none());
+        assert!(select_at_or_before(&[], None).is_none());
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_regardless_of_age() {
+        let objects = vec![
+            obj("p/s/20260101T000000Z.db.gz", 1),
+            obj("p/s/20260102T000000Z.db.gz", 2),
+            obj("p/s/20260103T000000Z.db.gz", 3),
+        ];
+        let now = parse_timestamp("2026-03-01T00:00:00Z").unwrap();
+        let victims = retention_victims(&objects, now, Duration::from_secs(14 * 86_400));
+        let keys: Vec<&str> = victims.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["p/s/20260101T000000Z.db.gz", "p/s/20260102T000000Z.db.gz"],
+            "everything old but the newest"
+        );
+        // A single, ancient object is never deleted.
+        let victims = retention_victims(&objects[..1], now, Duration::from_secs(1));
+        assert_eq!(victims.len(), 0, "{victims:?}");
+        // Nothing old enough: nothing.
+        let now = parse_timestamp("2026-01-04T00:00:00Z").unwrap();
+        let victims = retention_victims(&objects, now, Duration::from_secs(14 * 86_400));
+        assert_eq!(victims.len(), 0, "{victims:?}");
+    }
+
+    #[test]
+    fn listing_keeps_only_timestamped_objects_directly_under_the_site() {
+        let listed = vec![
+            ObjectMeta {
+                key: "p/s/20260102T000000Z.db.gz".into(),
+                size: 2,
+                last_modified: String::new(),
+            },
+            ObjectMeta {
+                key: "p/s/20260101T000000Z.db.gz".into(),
+                size: 1,
+                last_modified: String::new(),
+            },
+            ObjectMeta { key: "p/s/cdc/0001.bin".into(), size: 9, last_modified: String::new() },
+            ObjectMeta { key: "p/s/README".into(), size: 9, last_modified: String::new() },
+        ];
+        let objects = to_backup_objects("p/s/", listed);
+        let sizes: Vec<u64> = objects.iter().map(|o| o.size).collect();
+        assert_eq!(sizes, [1, 2], "oldest first, foreign objects ignored");
+        assert_eq!(site_prefix("", "s"), "s");
+        assert_eq!(site_prefix("p/q", "s"), "p/q/s");
+    }
+
+    #[test]
+    fn per_site_enumeration_lists_db_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["blog.db", "shop.db", "shop.db-wal", "shop.db-shm", ".hidden.db", "notes.txt"]
+        {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("folder.db")).unwrap();
+        let found = enumerate_site_databases(dir.path());
+        let sites: Vec<&str> = found.iter().map(|d| d.site.as_str()).collect();
+        assert_eq!(sites, ["blog", "shop"]);
+        assert_eq!(found[0].path, dir.path().join("blog.db"));
+
+        let single = DatabaseSource::Single { path: dir.path().join("missing.db") };
+        assert!(single.enumerate().is_empty(), "an uncreated single-node file is skipped");
+        let single = DatabaseSource::Single { path: dir.path().join("blog.db") };
+        assert_eq!(single.enumerate()[0].site, "default");
+    }
+
+    #[test]
+    fn gzip_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.bin");
+        let gz = dir.path().join("a.bin.gz");
+        let back = dir.path().join("b.bin");
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let compressed = gzip_file(&src, &gz).unwrap();
+        assert!(compressed > 0 && compressed < payload.len() as u64);
+        assert_eq!(gunzip_file(&gz, &back).unwrap(), payload.len() as u64);
+        assert_eq!(std::fs::read(&back).unwrap(), payload);
+        assert!(gunzip_file(&src, &back).is_err(), "not a gzip stream");
+    }
+
+    async fn exec(conn: &turso::Connection, sql: &str) {
+        conn.execute(sql, ()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    async fn count(conn: &turso::Connection, sql: &str) -> i64 {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        match row.get_value(0).unwrap() {
+            turso::Value::Integer(n) => n,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    /// The property the backup relies on: `VACUUM INTO` of a live database
+    /// — serving factory open, a writer committing concurrently, a trigger
+    /// in the schema — yields a self-contained file that passes
+    /// `integrity_check` and still carries the trigger and the rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacuum_into_of_a_live_database_is_consistent_and_carries_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let serving = wal_gate::builder_with_gate(Turso::builder(path.to_str().unwrap()))
+            .build()
+            .await
+            .unwrap();
+        let conn = serving.raw_connection().unwrap();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        exec(&conn, "CREATE TABLE log (id INTEGER)").await;
+        exec(
+            &conn,
+            "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); END",
+        )
+        .await;
+        for i in 0..200 {
+            exec(&conn, &format!("INSERT INTO t (v) VALUES ('row {i}')")).await;
+        }
+        let before = count(&conn, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(before, 200);
+
+        // A writer that keeps committing while the snapshot runs.
+        let writer_conn = serving.raw_connection().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    exec(&writer_conn, &format!("INSERT INTO t (v) VALUES ('late {n}')")).await;
+                    n += 1;
+                    tokio::task::yield_now().await;
+                }
+                n
+            })
+        };
+
+        let dest = dir.path().join("snap.db");
+        snapshot_into(&path, &dest).await.expect("VACUUM INTO on a live database");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let written = writer.await.unwrap();
+        assert!(written > 0, "the concurrent writer must have run");
+        // A second snapshot into an existing path is refused by the engine,
+        // surfaced rather than worked around.
+        assert!(snapshot_into(&path, &dest).await.is_err());
+
+        // The source is unharmed: every row ever written is there.
+        let total = count(&conn, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(total, 200 + i64::from(written));
+        drop(conn);
+        drop(serving);
+
+        // The artifact: self-contained, intact, trigger included, rows
+        // from a consistent read view (at least the 200 committed before).
+        assert!(!dest.with_extension("db-wal").exists(), "no -wal sidecar left");
+        let snap = turso::Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();
+        let sconn = snap.connect().unwrap();
+        let mut rows = sconn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get_value(0).unwrap(), turso::Value::Text("ok".into()));
+        drop(rows);
+        assert_eq!(
+            count(&sconn, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'").await,
+            1,
+            "the trigger ships with the backup"
+        );
+        let in_snapshot = count(&sconn, "SELECT COUNT(*) FROM t").await;
+        assert!(in_snapshot >= 200 && in_snapshot <= total, "{in_snapshot}");
+        assert_eq!(
+            count(&sconn, "SELECT COUNT(*) FROM log").await,
+            in_snapshot,
+            "the trigger's rows are consistent with the table's"
+        );
+        // And the trigger still fires in the restored copy.
+        exec(&sconn, "INSERT INTO t (v) VALUES ('restored')").await;
+        assert_eq!(count(&sconn, "SELECT COUNT(*) FROM log").await, in_snapshot + 1);
+    }
+}

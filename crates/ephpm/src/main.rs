@@ -41,6 +41,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod db_console;
 mod db_import;
 mod db_query;
+mod db_restore;
 mod db_shell;
 mod dev_xdebug;
 mod exec_sandbox;
@@ -277,8 +278,9 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// Database tooling: import a SQL dump, run a one-shot query, or open an
-    /// interactive SQL shell against a virtual host's embedded database.
+    /// Database tooling: import a SQL dump, run a one-shot query, open an
+    /// interactive SQL shell, or restore a scheduled backup
+    /// (`[db.sqlite.backup]`) over a virtual host's embedded database.
     Db {
         #[command(subcommand)]
         command: DbCommand,
@@ -672,6 +674,72 @@ enum DbCommand {
         #[arg(long)]
         maintenance: bool,
     },
+
+    /// Restore a virtual host's embedded database from a scheduled backup
+    /// (`[db.sqlite.backup]`) or a local `.db` / `.db.gz` file.
+    ///
+    /// Picks the newest object under `<prefix>/<site>/` at or before `--at`
+    /// (default: the newest), downloads and gunzips it next to the target,
+    /// verifies it with `PRAGMA integrity_check`, and only then renames it
+    /// over the site's `.db` (stale `-wal`/`-shm` removed). Offline only:
+    /// refused while a server is running. Prints the plan and asks for
+    /// confirmation unless `--yes`.
+    Restore {
+        /// The vhost key (directory name under `[server] sites_dir`), or
+        /// `default` for a single-node config's one database.
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file (supplies `[server] sites_dir`,
+        /// `[db.sqlite]` and the `[db.sqlite.backup]` endpoint/region).
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// `s3://bucket[/prefix]` (credentials from AWS_ACCESS_KEY_ID /
+        /// AWS_SECRET_ACCESS_KEY), or a local `.db` / `.db.gz` file.
+        #[arg(long)]
+        from: String,
+
+        /// Restore the newest backup taken at or before this time:
+        /// `YYYYMMDDTHHMMSSZ` (as the objects are named),
+        /// `YYYY-MM-DDTHH:MM:SSZ`, or `YYYY-MM-DD`. s3:// sources only.
+        #[arg(long)]
+        at: Option<String>,
+
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Scheduled backup objects (`[db.sqlite.backup]`).
+    Backup {
+        #[command(subcommand)]
+        command: DbBackupCommand,
+    },
+}
+
+/// `ephpm db backup <COMMAND>`.
+#[derive(Subcommand, Debug)]
+enum DbBackupCommand {
+    /// List a site's backup objects (time taken, size, key), oldest first.
+    List {
+        /// The vhost key, or `default` for a single-node config.
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file.
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// `s3://bucket[/prefix]` to list instead of the configured
+        /// `[db.sqlite.backup]` bucket and `s3_path`.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -867,7 +935,8 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Dispatch an `ephpm db` subcommand (`import` / `query` / `shell`).
+/// Dispatch an `ephpm db` subcommand (`import` / `query` / `shell` /
+/// `restore` / `backup list`).
 fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
     ensure_cli_tracing();
     match command {
@@ -947,6 +1016,12 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
                 read_only,
                 maintenance,
             })
+        }
+        DbCommand::Restore { site, config, from, at, yes } => {
+            db_restore::run_restore(&db_restore::RestoreRequest { site, config, from, at, yes })
+        }
+        DbCommand::Backup { command: DbBackupCommand::List { site, config, from, json } } => {
+            db_restore::run_list(&db_restore::ListRequest { site, config, from, json })
         }
     }
 }

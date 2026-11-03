@@ -374,7 +374,7 @@ Virtual hosts work with clustered SQLite (experimental Turso CDC replication). B
 
 The tradeoff is granularity: the whole shared database replicates as a unit. You can't cluster one site and leave the rest single-node.
 
-**Recommendation:** Use single-node SQLite for multi-tenant hosting. Back up with crash-consistent volume snapshots or a stop-and-copy of the database file — **not** Litestream/LiteFS, which are built for stock SQLite and lock ePHPm out of a Turso file ([why](/architecture/database/engines/#backups-and-why-external-sqlite-tools-lock-the-file)). If you need more, consider:
+**Recommendation:** Use single-node SQLite for multi-tenant hosting. Back up with the built-in [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup) (per-site snapshots to object storage every `interval`, restored with `ephpm db restore`), crash-consistent volume snapshots, or a stop-and-copy of the database file — **not** Litestream/LiteFS, which are built for stock SQLite and lock ePHPm out of a Turso file ([why](/architecture/database/engines/#backups-and-why-external-sqlite-tools-lock-the-file)). If you need more, consider:
 
 - Enable clustering — the shared database replicates across nodes as one unit
 - Move high-traffic sites to an external MySQL via the DB proxy

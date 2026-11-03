@@ -373,6 +373,18 @@ Meta-commands: `/dialect [D]`, `/format [F]`, `/tables`, `/schema <table>`, `/kv
 | `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir` |
 | `-c`, `--config <FILE>` | (required) | Config (as for `db query`) |
 | `--dialect <sqlite\|mysql\|pg>` | `sqlite` | Initial dialect; switch with `/dialect`. Live mode is MySQL-only |
+
+---
+
+## `ephpm db restore`
+
+Installs a scheduled backup ([`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)) — or a local `.db` / `.db.gz` — over a site's embedded database. Picks the newest object at or before `--at`, downloads and gunzips it next to the target, verifies it with `PRAGMA integrity_check`, and only then renames it over `<key>.db`. **Offline only**: refused while a server is running. Prints the plan and asks for a typed `yes` unless `--yes`. Clustered configs are refused. See the [full `db` reference](db/#ephpm-db-restore).
+
+```bash
+ephpm db restore --site blog --config ephpm.toml --from s3://ephpm-backups/ephpm/db --at 2026-03-01T09:30:00Z
+```
+
+`ephpm db backup list --site <KEY> --config <FILE> [--from s3://…] [--json]` lists a site's backup objects.
 | `--read-only` | off | Refuse any statement that is not a pure read |
 | `--maintenance` | off | Offline-only, unscreened engine access |
 
@@ -496,6 +508,7 @@ The log file is at the path in [Where things live](#where-things-live). On macOS
 | `analyze` | `0` pass, `2` quarantine, `3` deny, `1` internal error. See [`analyze`](analyze/). |
 | `exec` | The command's own exit status once it has started, `1` if setup fails. See [`exec`](exec/#exit-status). |
 | `db query`, `db shell` | `0` on success (`db shell` always exits `0` once running — per-statement errors are printed and the session continues). `1` when the transport cannot be established (single-writer violation, bad `--site`, server auth failure) or, for `db query`, when a statement is rejected or errors. |
+| `db restore` | `0` restored; `2` the backup failed `PRAGMA integrity_check` (nothing changed); `1` a server is running, no object at or before `--at`, a bad `--site`, a clustered config, or a download/install error. See [`db restore`](db/#ephpm-db-restore). |
 | `kv` | `0` on success. Server replies such as `(nil)`, `(empty)` or `key does not exist` count as success. `1` if the server answers with an error (`-ERR`, `-NOAUTH`, …), which is printed as `error: ...` on stderr. |
 | `deploy`, `cache reset` | `0` on success, `1` if the RESP listener is unreachable or returns an error |
 | `install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs` | `0` on success, `1` on any failure (`error: service command failed: ...` on stderr) |
@@ -528,6 +541,9 @@ ephpm db query       Run one SQL statement and print the result (--site/--config
                      --dialect/--format/--read-only/--maintenance/-e)
 ephpm db shell       Interactive SQL REPL (--site/--config/--dialect/--read-only/
                      --maintenance; /dialect /format /tables /schema /kv /kv-put /help /quit)
+ephpm db restore     Install a [db.sqlite.backup] object (or a local .db/.db.gz) over a
+                     site's database, offline (--site/--config/--from/--at/--yes)
+ephpm db backup list List a site's backup objects (--site/--config/--from/--json)
 
 ephpm install        Install + start the system service (--user/--group)
 ephpm uninstall      Remove the service AND delete config/data/logs (--keep-data keeps them)

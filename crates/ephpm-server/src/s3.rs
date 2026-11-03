@@ -86,6 +86,21 @@ impl S3Location {
     }
 }
 
+/// The addressing half of an object-storage config section — what
+/// `[kv.snapshot]` and `[db.sqlite.backup]` both declare — resolved to one
+/// client by [`S3Client::for_bucket`]. One constructor for every section, so
+/// credentials are read the same way (environment only) and the error names
+/// the section that needs them.
+#[derive(Debug, Clone)]
+pub struct ObjectSettings {
+    /// Endpoint origin, or `None` for AWS S3 in `region`.
+    pub endpoint: Option<String>,
+    /// SigV4 signing region.
+    pub region: String,
+    /// Path-style addressing.
+    pub path_style: bool,
+}
+
 /// Metadata of one object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -132,6 +147,39 @@ impl S3Client {
             .build()
             .context("failed to build the S3 HTTP client")?;
         Ok(Self { http, location, creds })
+    }
+
+    /// A client for `bucket` addressed as `settings` says, with credentials
+    /// from the environment. `section` names the config section in the
+    /// error (`"[kv.snapshot] mode = \"object\""`).
+    ///
+    /// # Errors
+    ///
+    /// Missing `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or an HTTP
+    /// client that cannot be built.
+    pub fn for_bucket(
+        settings: &ObjectSettings,
+        bucket: String,
+        section: &str,
+    ) -> anyhow::Result<Self> {
+        let creds = Credentials::from_env().with_context(|| {
+            format!(
+                "{section} needs credentials in the environment: set AWS_ACCESS_KEY_ID and \
+                 AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN for temporary credentials). They \
+                 are read from the environment only — never from ephpm.toml."
+            )
+        })?;
+        let region = settings.region.trim().to_string();
+        let location = S3Location {
+            bucket,
+            endpoint: settings
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| S3Location::aws_endpoint(&region)),
+            region,
+            path_style: settings.path_style,
+        };
+        Self::new(location, creds)
     }
 
     /// Where this client points.

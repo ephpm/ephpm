@@ -161,7 +161,15 @@ pub(crate) const INTERNAL_ROUTES: &[&str] = &[
     "/_ephpm/requests",
     KV_SNAPSHOT_ROUTE,
     KV_SNAPSHOT_LOAD_ROUTE,
+    DB_BACKUP_ROUTE,
 ];
+
+/// Scheduled embedded-database backup status (`[db.sqlite.backup]`): `GET`
+/// = status JSON (last object and last error per site, last tick), gated
+/// like `/_ephpm/requests`. Read-only — there is no "run now" `POST` in
+/// Tier 0. `404` naming the knob when backups are off. Moves to the metrics
+/// listener with `[server.metrics] listen`.
+pub(crate) const DB_BACKUP_ROUTE: &str = "/_ephpm/db/backup";
 
 /// Warm-restart KV snapshot control: `GET` = status (gated like
 /// `/_ephpm/requests`), `POST` = write a snapshot now (a credential —
@@ -901,6 +909,9 @@ pub struct Router {
     /// Warm-restart KV snapshots (`[kv.snapshot]`), for the
     /// `/_ephpm/kv/snapshot` control endpoint. `None` = snapshots are off.
     kv_snapshot: Option<Arc<crate::kv_snapshot::KvSnapshotService>>,
+    /// Scheduled database backups (`[db.sqlite.backup]`), for the
+    /// `/_ephpm/db/backup` status endpoint. `None` = backups are off.
+    db_backup: Option<Arc<crate::db_backup::DbBackupService>>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -1587,6 +1598,7 @@ impl Router {
             // election's shared view via `with_primary_view`.
             primary_view: Arc::new(AtomicBool::new(true)),
             kv_snapshot: None,
+            db_backup: None,
         };
 
         // Read every known site's override once, now: it seeds the cache (so the
@@ -2244,6 +2256,39 @@ impl Router {
     ) -> Self {
         self.kv_snapshot = service;
         self
+    }
+
+    /// Attach the scheduled database backup service, for the
+    /// `GET /_ephpm/db/backup` status endpoint.
+    #[must_use]
+    pub fn with_db_backup(
+        mut self,
+        service: Option<Arc<crate::db_backup::DbBackupService>>,
+    ) -> Self {
+        self.db_backup = service;
+        self
+    }
+
+    /// `GET /_ephpm/db/backup` (see [`DB_BACKUP_ROUTE`]): the backup status
+    /// JSON, gated like `/_ephpm/requests`; `404` naming the knob when
+    /// backups are off.
+    fn handle_db_backup_status(
+        &self,
+        client: &crate::internal_access::Client<'_>,
+    ) -> Response<ServerBody> {
+        let Some(svc) = &self.db_backup else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "404 Not Found: scheduled database backups are off. Enable them with \
+                 [db.sqlite.backup] enabled = true (and an s3_bucket).",
+            );
+        };
+        match self.diagnostics_access.check(client) {
+            crate::internal_access::Verdict::Allow => {
+                json_response_owned(StatusCode::OK, svc.status_json())
+            }
+            denied => self.diagnostics_access.deny_response(denied),
+        }
     }
 
     /// Inject per-site `pdo_mysql` credentials for the multi-tenant wire
@@ -5352,10 +5397,13 @@ impl Router {
                 ),
             };
         }
+        if path == DB_BACKUP_ROUTE {
+            return self.handle_db_backup_status(&client);
+        }
         error_response(
             StatusCode::NOT_FOUND,
             "404 Not Found: this is the ePHPm metrics listener; it serves only the metrics \
-             path, /_ephpm/requests and /_ephpm/kv/snapshot[/load].",
+             path, /_ephpm/requests, /_ephpm/db/backup and /_ephpm/kv/snapshot[/load].",
         )
     }
 
@@ -5542,6 +5590,18 @@ impl Router {
                 ),
                 "diagnostics",
             ),
+            // Scheduled database backup status: lives with the diagnostics,
+            // so it follows `[server.metrics] listen` the same way.
+            DB_BACKUP_ROUTE if !self.internal_on_main => (
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: the database backup status is served on the separate \
+                     metrics listener ([server.metrics] listen), not on this one.",
+                ),
+                "diagnostics",
+            ),
+            DB_BACKUP_ROUTE => (self.handle_db_backup_status(client), "diagnostics"),
+
             "/_ephpm/requests" => match self.request_log {
                 Some(ref log) => match self.diagnostics_access.check(client) {
                     crate::internal_access::Verdict::Allow => {
@@ -9735,6 +9795,14 @@ mod tests {
                     let (status, body) = probe(router, "POST", path).await;
                     assert_eq!(status, StatusCode::NOT_FOUND, "POST {path}: {body}");
                     assert!(body.contains("[kv.snapshot]"), "POST {path}: {body}");
+                }
+                // Backups are off on these routers: the server's own 404
+                // naming the knob; a POST is a plain 405 (read-only endpoint).
+                DB_BACKUP_ROUTE => {
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+                    assert!(body.contains("[db.sqlite.backup]"), "{path}: {body}");
+                    let (status, _) = probe(router, "POST", path).await;
+                    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "POST {path}");
                 }
                 other => panic!(
                     "INTERNAL_ROUTES gained {other} with no assertion here — pin what it must \
@@ -15509,6 +15577,7 @@ echo "post response";
                         proxy: ephpm_config::SqliteProxyConfig::default(),
                         sqld: None,
                         replication: ephpm_config::ReplicationConfig::default(),
+                        backup: ephpm_config::DbBackupConfig::default(),
                     }),
                     ..DbConfig::default()
                 },

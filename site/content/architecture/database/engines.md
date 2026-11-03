@@ -397,13 +397,52 @@ supported state is *ePHPm is the sole process on the file*.
 
 ### Supported backups
 
-There is no continuous / point-in-time backup of the embedded database today —
-nothing ships `.db` changes to object storage. (`[kv.snapshot]`'s S3 mode backs
-up the **KV store**, not the database, and is a cache warm-up rather than
-durability. `[db.sqlite.replication]` is experimental cross-node **cluster
-replication** for high availability, not a backup to external storage — a node
-loss keeps committed data that was already shipped to a replica, but it gives no
-archive and no restore-to-a-point.) Use one of:
+**Built in: scheduled snapshots to object storage (`[db.sqlite.backup]`).**
+Every `interval`, each embedded database — the one `[db.sqlite] path` in
+single-node mode, every `<dir>/<site-key>.db` in per-site mode, open or not —
+is snapshotted *inside the ePHPm process* with the engine's own `VACUUM INTO`,
+gzipped and uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects
+older than `retention` are deleted after each successful upload, always keeping
+the newest. The snapshot is read through an in-process engine handle,
+coordinated with the serving handle by the WAL checkpoint gate — which is the
+whole point versus the external tools above: nothing else opens the file. The
+artifact is a self-contained SQLite main file (no `-wal` sidecar; triggers
+included) that `sqlite3` can open with no ePHPm at all.
+
+What it is and is not:
+
+- **RPO = `interval`.** A restore loses whatever was written after the chosen
+  snapshot. There is no transaction-granularity point-in-time restore yet —
+  continuous CDC archival on top of these snapshots is
+  [planned — not yet implemented](/roadmap/turso-engine/#tier-1-point-in-time-restore-planned).
+- **Restore is offline** (`ephpm db restore --site <key> --from s3://… [--at <ts>]`):
+  the newest object at or before `--at` is downloaded, verified with
+  `PRAGMA integrity_check`, and renamed over the site's `.db` — only when no
+  server holds the file. A corrupt object never replaces the live file. See
+  [`ephpm db restore`](/reference/cli/db/#ephpm-db-restore).
+- **The object is plaintext** (a gzip of a standard SQLite file, not the
+  `[kv.snapshot]` AEAD envelope — so it needs no `[kv] secret` and opens
+  anywhere). The bucket must carry server-side encryption and a tight policy.
+- **Single-node and per-site modes only.** With clustering enabled, startup
+  refuses `enabled = true`: nothing schedules per owner/primary yet, and the
+  artifact would carry CDC bookkeeping a restore must reconcile. Clustered
+  backup is a follow-up.
+
+The from-zero walkthrough — enabling it, credentials for S3/MinIO/R2, reading
+the listing and the status endpoint, retention, and a worked restore — is the
+[Database backups guide](/guides/database-backups/). Configuration and the
+per-tick mechanics are in the
+[config reference](/reference/config/#dbsqlitebackup); the metrics in
+[Metrics → Database backups](/reference/metrics/#database-backups).
+
+(`[kv.snapshot]`'s S3 mode backs up the **KV store**, not the database, and is a
+cache warm-up rather than durability. `[db.sqlite.replication]` is experimental
+cross-node **cluster replication** for high availability, not a backup to
+external storage — a node loss keeps committed data that was already shipped to
+a replica, but it gives no archive and no restore-to-a-point.)
+
+The alternatives below still apply — on a clustered node, or where object
+storage is not an option:
 
 - **Stop-and-copy (the clean path).** A graceful `ephpm` shutdown runs
   `PRAGMA wal_checkpoint(TRUNCATE)` on every open database, so a cleanly stopped

@@ -215,8 +215,9 @@ ePHPm out of the file** (Turso has its own WAL format and file locking); see
 [Backups, and why external SQLite tools lock the file](/architecture/database/engines/#backups-and-why-external-sqlite-tools-lock-the-file).
 Use:
 
+- **Built-in scheduled backups** — [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup) snapshots every embedded database to S3-compatible object storage every `interval` (the RPO) from inside the ePHPm process, with retention and [`ephpm db restore`](/reference/cli/db/#ephpm-db-restore). Single-node and per-site modes; the object is plaintext, so use bucket-side encryption.
 - **Cloud volume snapshots** — AWS EBS, Hetzner, DigitalOcean, and most providers' automated daily snapshots. Safe when the snapshot is crash-consistent (atomic across the `.db`, `-wal` and `-shm` on one volume); the restore recovers like a crash image.
 - **Stop-and-copy** — a graceful `ephpm` shutdown checkpoints and truncates the WAL, leaving a single clean `.db`; copy it. This is the guaranteed-consistent path. A plain `cp`/`rsync` of a live `.db` is **not** consistent — it misses the `-wal` or catches a write mid-flight.
 - **Disk-level backups** — rsync, restic, borgbackup, but only over a stopped node or a crash-consistent snapshot, never a live open file.
 
-There is no continuous / point-in-time backup of the database today — nothing ships `.db` changes to object storage. For clustered mode (experimental Turso CDC replication), each replica holds a full local copy of the database, so the loss of any single node does not lose committed data already shipped downstream — that is high availability, not a backup.
+There is no transaction-granularity point-in-time restore yet — the built-in backup's RPO is its `interval`; continuous CDC archival on top of it is [planned](/roadmap/turso-engine/#tier-1-point-in-time-restore-planned). For clustered mode (experimental Turso CDC replication), each replica holds a full local copy of the database, so the loss of any single node does not lose committed data already shipped downstream — that is high availability, not a backup, and the scheduled backup does not run on cluster nodes yet.

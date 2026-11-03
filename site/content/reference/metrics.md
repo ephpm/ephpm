@@ -551,6 +551,27 @@ Recorded only when `[kv.snapshot] mode != "off"` ([config](/reference/config/#kv
 increase(ephpm_kv_snapshot_load_total{outcome="cold",reason!="missing"}[1h]) > 0
 ```
 
+## Database backups
+
+Recorded only when `[db.sqlite.backup] enabled = true` ([config](/reference/config/#dbsqlitebackup)). Nothing is pre-seeded: a site's series appear on its first backup attempt. The `site` label is the vhost's site key, or `default` in single-node mode — the same value `ephpm_sqlite_wal_bytes{site}` carries, bounded by the number of `.db` files in `[db.sqlite] dir`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_db_backup_total` | counter | `site`, `outcome` (`ok`, `snapshot_failed`, `upload_failed`) | Backups attempted, one per database per tick. `snapshot_failed` covers the `VACUUM INTO` and the gzip; `upload_failed` the `PutObject`. Each failure is also a `WARN` naming the site. |
+| `ephpm_db_backup_duration_seconds` | histogram | `site` | Wall time of one successful backup: snapshot + gzip + upload (the retention sweep is not included). |
+| `ephpm_db_backup_last_bytes` | gauge | `site` | Compressed size of the last successfully uploaded object. |
+| `ephpm_db_backup_last_success_timestamp_seconds` | gauge | `site` | Unix time of the last successful upload; `time() - this` is the backup lag. |
+| `ephpm_db_backup_retention_deleted_total` | counter | `site` | Objects deleted by the retention sweep (the newest is never one of them). |
+| `ephpm_db_backup_retention_errors_total` | counter | `site` | Retention sweeps that failed (a listing or a delete). The backup itself succeeded; the sweep is retried on the next tick. |
+
+```promql
+# A site whose last good backup is older than two intervals (here: 15m).
+(time() - ephpm_db_backup_last_success_timestamp_seconds) > 2 * 900
+
+# Any failed backup in the last hour, by site and stage.
+increase(ephpm_db_backup_total{outcome!="ok"}[1h]) > 0
+```
+
 ## KV catch-up gate
 
 Clustered KV only. A node that starts into a running cluster serves reads

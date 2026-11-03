@@ -132,6 +132,7 @@ fn sqlite_config(dir: &Path) -> SqliteConfig {
             per_site: true,
             ..ephpm_config::ReplicationConfig::default()
         },
+        backup: ephpm_config::DbBackupConfig::default(),
     }
 }
 
