@@ -344,6 +344,45 @@ impl SiteWireAuth {
     }
 }
 
+/// The `DB_*` variables a tenant's PHP receives so that stock `pdo_mysql` /
+/// `mysqli` can reach the tenant's **own** database over the per-site wire
+/// listener — the one definition both delivery paths use.
+///
+/// * The HTTP router injects them into every request's `$_SERVER` (per request,
+///   thread-local — see `Router::build_per_site_db_env_vars`).
+/// * `ephpm php --site` exports them into its own process environment before
+///   PHP starts, so a cron/CLI script reading `$_SERVER['DB_*']` connects to the
+///   running server exactly like a web request would (issue #689).
+///
+/// Keeping one function is what stops the two from drifting: a key added here
+/// reaches both, and a test on each side pins that it calls this and nothing
+/// else. The map is deliberately redundant — Laravel-style (`DB_CONNECTION`,
+/// `DB_DATABASE`, `DB_USERNAME`), generic (`DB_NAME`, `DB_USER`) and a composed
+/// `DATABASE_URL` — so framework auto-discovery works without an app-side
+/// mapping layer.
+///
+/// `listen` is the configured `[db.sqlite.proxy] mysql_listen` string
+/// (`host:port`); the host part is passed through verbatim, never resolved, so
+/// a DNS name stays a DNS name for the client. The database name is cosmetic:
+/// the connection's database is fixed by the credential it authenticates with,
+/// and litewire answers `USE <db>` without switching anything — it is set to
+/// the site key so framework config and logs read sensibly.
+#[must_use]
+pub fn per_site_db_env_vars(listen: &str, site_key: &str, password: &str) -> Vec<(String, String)> {
+    let (host, port) = listen.rsplit_once(':').unwrap_or(("127.0.0.1", "3306"));
+    vec![
+        ("DB_CONNECTION".into(), "mysql".into()),
+        ("DB_HOST".into(), host.into()),
+        ("DB_PORT".into(), port.into()),
+        ("DB_DATABASE".into(), site_key.into()),
+        ("DB_NAME".into(), site_key.into()),
+        ("DB_USER".into(), site_key.into()),
+        ("DB_USERNAME".into(), site_key.into()),
+        ("DB_PASSWORD".into(), password.into()),
+        ("DATABASE_URL".into(), format!("mysql://{site_key}:{password}@{host}:{port}/{site_key}")),
+    ]
+}
+
 #[litewire::async_trait]
 impl ConnectionAuthenticator for SiteWireAuth {
     async fn authenticate(&self, req: &AuthRequest<'_>) -> AuthOutcome {
@@ -464,6 +503,47 @@ mod tests {
     }
 
     const SALT: &[u8] = b"abcdefghijklmnopqrst";
+
+    /// The shared `DB_*` map (issue #689): every spelling a framework probes,
+    /// the listen host passed through verbatim (a DNS name stays one), and a
+    /// `DATABASE_URL` composed from the same parts.
+    #[test]
+    fn per_site_db_env_map_shape() {
+        let vars = per_site_db_env_vars("db.ephpm.svc:3307", "shop", "pw-hex");
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "DB_CONNECTION",
+                "DB_HOST",
+                "DB_PORT",
+                "DB_DATABASE",
+                "DB_NAME",
+                "DB_USER",
+                "DB_USERNAME",
+                "DB_PASSWORD",
+                "DATABASE_URL",
+            ]
+        );
+        let get = |k: &str| get_var(&vars, k);
+        assert_eq!(get("DB_CONNECTION"), Some("mysql"));
+        assert_eq!(get("DB_HOST"), Some("db.ephpm.svc"));
+        assert_eq!(get("DB_PORT"), Some("3307"));
+        for k in ["DB_DATABASE", "DB_NAME", "DB_USER", "DB_USERNAME"] {
+            assert_eq!(get(k), Some("shop"), "{k} is the site key");
+        }
+        assert_eq!(get("DB_PASSWORD"), Some("pw-hex"));
+        assert_eq!(get("DATABASE_URL"), Some("mysql://shop:pw-hex@db.ephpm.svc:3307/shop"));
+
+        // A listen string with no port falls back to the documented default.
+        let vars = per_site_db_env_vars("nonsense", "shop", "pw");
+        assert_eq!(get_var(&vars, "DB_HOST"), Some("127.0.0.1"));
+        assert_eq!(get_var(&vars, "DB_PORT"), Some("3306"));
+    }
+
+    fn get_var<'a>(vars: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        vars.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str())
+    }
 
     fn request<'a>(user: &'a str, response: &'a [u8]) -> AuthRequest<'a> {
         AuthRequest {

@@ -32,6 +32,26 @@
 //! [`ephpm_php::db_bridge::screen_sql`] before it reaches a backend (the bridge
 //! does this for the direct-open path; the remote path forwards to a server
 //! that screens again).
+//!
+//! # `$_SERVER['DB_*']` for stock `mysqli` / `pdo_mysql` (issue #689)
+//!
+//! The bridge covers apps built on the `db-*` packages. An app that opens its
+//! own connection from `$_SERVER['DB_HOST']` & co. — Sendy's `includes/config.php`,
+//! a Laravel `.env`-less deployment, anything the HTTP router already serves
+//! this way — needs those variables too, and it needs them to name the **same**
+//! listener and credential the router injects. So on the wire path the CLI
+//! exports the router's exact map ([`ephpm_server::site_wire_auth::per_site_db_env_vars`],
+//! one definition for both) into its own process environment before PHP
+//! starts; php-cli's `$_SERVER` is the process environment, so the script
+//! reads them exactly as a request would. This is what makes a cron job —
+//! `ephpm php --site sendy /srv/sites/sendy/scheduled.php` next to a running
+//! server — work for a raw-`mysqli` app.
+//!
+//! On the **offline direct-open path nothing is exported**: there is no
+//! listener for a raw socket to reach, so injecting `DB_HOST=127.0.0.1` would
+//! turn a clear "not configured" into a connection-refused after a timeout.
+//! The bridge still works offline; raw `mysqli`/`pdo_mysql` needs a reachable
+//! server, and the startup log line says which path was taken.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -76,10 +96,28 @@ const CR_SERVER_LOST: u16 = 2013;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
     /// A server is running: connect to its MySQL listener at `addr` as `user`
-    /// (the site key) with `password`, and forward raw SQL.
-    Wire { addr: SocketAddr, user: String, password: String },
+    /// (the site key) with `password`, and forward raw SQL. `listen` is the
+    /// configured `[db.sqlite.proxy] mysql_listen` string the address was
+    /// resolved from — kept verbatim because it is what the router hands
+    /// tenants as `DB_HOST`/`DB_PORT`, and the CLI must hand out the same.
+    Wire { addr: SocketAddr, listen: String, user: String, password: String },
     /// No server: open the site's own database file at `path` directly.
     DirectOpen { path: String },
+}
+
+impl Strategy {
+    /// The `$_SERVER['DB_*']` variables this strategy entitles the script to —
+    /// the router's exact per-request map on the wire path, nothing on the
+    /// offline path (see the module docs on why offline injects nothing).
+    #[must_use]
+    pub fn db_env_vars(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Wire { listen, user, password, .. } => {
+                ephpm_server::site_wire_auth::per_site_db_env_vars(listen, user, password)
+            }
+            Self::DirectOpen { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Decide how to bind `site_key`'s database under `config`, given the result of
@@ -139,7 +177,7 @@ pub(crate) fn choose_strategy(
             )
         })?;
         let password = ephpm_kv::auth::derive_site_password(secret, &key);
-        return Ok(Strategy::Wire { addr, user: key, password });
+        return Ok(Strategy::Wire { addr, listen: listen.clone(), user: key, password });
     }
 
     // Server is not running. Direct-open is only safe when there is a single
@@ -174,13 +212,66 @@ pub(crate) fn choose_strategy(
     Ok(Strategy::DirectOpen { path })
 }
 
-/// Bind the `ephpm_db_*` bridge to the right backend for `site_key` under
-/// `config`, registering it with the PHP runtime on `handle`.
+/// Decide how `site_key`'s database is reached under `config`: probe the
+/// server's MySQL listener, then let the pure [`choose_strategy`] pick.
 ///
-/// Probes the server's MySQL listener, then acts on the [`Strategy`] the pure
-/// [`choose_strategy`] returns: connect a [`RemoteMysqlBackend`] (server up) or
-/// direct-open the site's Turso file (server down, single-node/per-site-single).
-/// Per-site-clustered-offline is refused inside [`choose_strategy`].
+/// Sync and thread-free on purpose (a plain `std` TCP probe), so a caller can
+/// plan — and [export the resulting environment](export_db_env) — before it
+/// spawns a runtime or any other thread.
+///
+/// # Errors
+///
+/// Fails closed exactly as [`choose_strategy`] does.
+pub(crate) fn plan_site_db(config: &Config, site_key: &str) -> anyhow::Result<Strategy> {
+    let listen =
+        config.db.sqlite.as_ref().map(|s| s.proxy.mysql_listen.clone()).unwrap_or_default();
+    let reachable = if listen.is_empty() { None } else { server_reachable(&listen) };
+    choose_strategy(config, site_key, reachable)
+}
+
+/// Export the strategy's [`$_SERVER['DB_*']` map](Strategy::db_env_vars) into
+/// this process's environment, so the PHP CLI's `$_SERVER` (which php-cli
+/// builds from the environment) carries the same per-site credential a request
+/// gets. A no-op on the offline path.
+///
+/// Unlike the server, where `$_SERVER` is per request and `getenv()` sees
+/// nothing, here the variables are genuinely in the environment: `getenv()`
+/// and `$_ENV` see them, and any process the script spawns inherits them. That
+/// is the right shape for a CLI process that serves exactly one tenant.
+///
+/// Must be called while the process is still single-threaded — before the
+/// `--site` database runtime, before PHP starts.
+pub(crate) fn export_db_env(strategy: &Strategy) {
+    let vars = strategy.db_env_vars();
+    if vars.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+    #[allow(unsafe_code)]
+    // SAFETY: `set_var` is unsound only when another thread reads or writes
+    // the environment concurrently. The one caller (`run_php`) invokes this on
+    // the main thread after loading the config and planning the strategy —
+    // both thread-free — and before it builds the tokio runtime or starts
+    // PHP, so no other thread exists yet (the fatal-signal handler installed
+    // earlier never touches the environment). Same contract as
+    // `php_personality::export_for_children`.
+    unsafe {
+        for (k, v) in &vars {
+            std::env::set_var(k, v);
+        }
+    }
+    tracing::info!(
+        vars = %names.join(","),
+        "ephpm php --site: exported the per-site database credentials into $_SERVER (as a \
+         request would get them)"
+    );
+}
+
+/// Bind the `ephpm_db_*` bridge to the backend `strategy` names, registering
+/// it with the PHP runtime on `handle`: connect a [`RemoteMysqlBackend`]
+/// (server up) or direct-open the site's Turso file (server down,
+/// single-node/per-site-single). Per-site-clustered-offline was refused by
+/// [`choose_strategy`] already.
 ///
 /// Returns the opened database on the direct-open path, which the caller must
 /// [checkpoint](OfflineDatabase::checkpoint_before_exit) once PHP is done;
@@ -188,19 +279,15 @@ pub(crate) fn choose_strategy(
 ///
 /// # Errors
 ///
-/// Returns an error — and registers nothing — when [`choose_strategy`] fails
-/// closed, the server refuses authentication, or the database cannot be opened.
+/// Returns an error — and registers nothing — when the server refuses
+/// authentication or the database cannot be opened.
 pub fn bind_site_db(
-    config: &Config,
     site_key: &str,
+    strategy: Strategy,
     handle: &tokio::runtime::Handle,
 ) -> anyhow::Result<Option<OfflineDatabase>> {
-    let listen =
-        config.db.sqlite.as_ref().map(|s| s.proxy.mysql_listen.clone()).unwrap_or_default();
-    let reachable = if listen.is_empty() { None } else { server_reachable(&listen) };
-
-    match choose_strategy(config, site_key, reachable)? {
-        Strategy::Wire { addr, user, password } => {
+    match strategy {
+        Strategy::Wire { addr, user, password, .. } => {
             let backend = handle
                 .block_on(RemoteMysqlBackend::connect(addr, &user, &password))
                 .with_context(|| {
@@ -218,7 +305,12 @@ pub fn bind_site_db(
             let backend = open_direct(handle, &path)
                 .with_context(|| format!("opening site database at {path}"))?;
             ephpm_php::PhpRuntime::set_db_backend(backend, handle.clone());
-            tracing::info!(path = %path, "ephpm php --site: opened local database (offline)");
+            tracing::info!(
+                path = %path,
+                "ephpm php --site: opened local database (offline) — no server answered on \
+                 [db.sqlite.proxy] mysql_listen, so $_SERVER['DB_*'] is NOT set: ephpm_db_* works, \
+                 but a stock mysqli/pdo_mysql connection needs a running server"
+            );
             Ok(Some(OfflineDatabase { site: site_key.to_string(), path: path.into() }))
         }
     }
@@ -531,11 +623,83 @@ mod tests {
             strategy,
             Strategy::Wire {
                 addr,
+                listen: "127.0.0.1:3306".to_string(),
                 user: "shop".to_string(),
                 // Exactly what the server derives (same secret, same key).
                 password: ephpm_kv::auth::derive_site_password("s3cr3t", "shop"),
             }
         );
+    }
+
+    // ── $_SERVER['DB_*'] export (issue #689) ────────────────────────────────
+
+    /// The wire strategy's `DB_*` map is the shared router map, built with the
+    /// password the server's own authenticator derives from the same
+    /// `[kv] secret` — the CLI half of the no-drift invariant (the router half
+    /// is `router::tests::site_key_agreement::request_injection_is_the_shared_db_env_map`).
+    #[test]
+    fn wire_strategy_db_env_is_the_routers_map_with_the_servers_password() {
+        /// The authenticator only needs *a* route to exist; the test never
+        /// resolves a backend, it only asks the server side for its password.
+        struct NoRoute;
+        #[litewire::async_trait]
+        impl ephpm_server::site_wire_auth::SiteWireRoute for NoRoute {
+            async fn backend_for(
+                &self,
+                _site_key: &str,
+            ) -> anyhow::Result<litewire::backend::SharedBackend> {
+                bail!("not resolved in this test")
+            }
+        }
+
+        let (config, _g) = cfg("[kv]\nsecret = \"s3cr3t\"\n");
+        let strategy = choose_strategy(&config, "shop", Some(a_reachable_addr())).expect("wire");
+
+        // What the server would mint for a request to `shop` under this config.
+        let server_auth = ephpm_server::site_wire_auth::SiteWireAuth::with_route_and_secret(
+            Arc::new(NoRoute),
+            config.kv.secret.clone(),
+        )
+        .expect("auth");
+        let expected = ephpm_server::site_wire_auth::per_site_db_env_vars(
+            "127.0.0.1:3306",
+            "shop",
+            &server_auth.password_for("shop"),
+        );
+
+        assert_eq!(strategy.db_env_vars(), expected);
+        // The pieces a raw-mysqli script actually reads.
+        let get =
+            |k: &str| strategy.db_env_vars().into_iter().find(|(key, _)| key == k).map(|(_, v)| v);
+        assert_eq!(get("DB_HOST").as_deref(), Some("127.0.0.1"));
+        assert_eq!(get("DB_PORT").as_deref(), Some("3306"));
+        assert_eq!(get("DB_USER").as_deref(), Some("shop"));
+        assert_eq!(get("DB_PASSWORD"), Some(server_auth.password_for("shop")));
+    }
+
+    /// The listen host is handed out verbatim — a DNS name (a Service, for a
+    /// CronJob pod) is not resolved into an IP on the way to the script.
+    #[test]
+    fn wire_strategy_db_env_keeps_the_configured_listen_host() {
+        let (config, _g) = cfg("[kv]\nsecret = \"s3cr3t\"\n");
+        let mut config = config;
+        config.db.sqlite.as_mut().unwrap().proxy.mysql_listen = "ephpm-db.ns.svc:3306".into();
+        // The probe resolved the name to this address; the env must not carry it.
+        let strategy =
+            choose_strategy(&config, "shop", Some("10.0.0.7:3306".parse().unwrap())).expect("wire");
+        let vars = strategy.db_env_vars();
+        let host = vars.iter().find(|(k, _)| k == "DB_HOST").map(|(_, v)| v.as_str());
+        assert_eq!(host, Some("ephpm-db.ns.svc"));
+    }
+
+    /// Offline direct-open exports nothing: there is no listener for a raw
+    /// socket to reach, so a visibly absent `DB_*` beats a connection refused.
+    #[test]
+    fn offline_strategy_exports_no_db_env() {
+        let (config, _g) = cfg("[kv]\nsecret = \"s3cr3t\"\n");
+        let strategy = choose_strategy(&config, "shop", None).expect("offline");
+        assert!(matches!(strategy, Strategy::DirectOpen { .. }));
+        assert_eq!(strategy.db_env_vars(), Vec::new());
     }
 
     #[test]

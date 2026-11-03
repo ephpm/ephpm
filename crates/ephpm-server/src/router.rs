@@ -2249,6 +2249,15 @@ impl Router {
     /// `sapi_module.getenv`, deliberately: a process-global environment is
     /// shared by every worker thread and would be exactly the cross-tenant leak
     /// this design avoids. Tenants must read `$_SERVER['DB_PASSWORD']`.
+    ///
+    /// # One map, two deliveries
+    ///
+    /// The variable set comes from
+    /// [`per_site_db_env_vars`](crate::site_wire_auth::per_site_db_env_vars),
+    /// which `ephpm php --site` also exports into its process environment
+    /// (issue #689). This method only adds the per-request pieces: the
+    /// fail-closed key check and the cached password. Pinned by
+    /// `site_key_agreement::request_injection_is_the_shared_db_env_map`.
     fn build_per_site_db_env_vars(&self, site_key: &str) -> Vec<(String, String)> {
         let Some(wire) = &self.per_site_db_wire else {
             return Vec::new();
@@ -2269,25 +2278,9 @@ impl Router {
             derived
         };
 
-        let (host, port) = wire.listen.rsplit_once(':').unwrap_or(("127.0.0.1", "3306"));
-        // The database name is cosmetic here — the connection's database is
-        // fixed by the credential, and litewire answers `USE <db>` without
-        // switching anything. Set it to the site key so framework config and
-        // logs read sensibly.
-        vec![
-            ("DB_CONNECTION".into(), "mysql".into()),
-            ("DB_HOST".into(), host.into()),
-            ("DB_PORT".into(), port.into()),
-            ("DB_DATABASE".into(), site_key.into()),
-            ("DB_NAME".into(), site_key.into()),
-            ("DB_USER".into(), site_key.into()),
-            ("DB_USERNAME".into(), site_key.into()),
-            ("DB_PASSWORD".into(), password.clone()),
-            (
-                "DATABASE_URL".into(),
-                format!("mysql://{site_key}:{password}@{host}:{port}/{site_key}"),
-            ),
-        ]
+        // The map itself is shared with `ephpm php --site` (issue #689): one
+        // definition, so a cron script sees exactly what a request sees.
+        crate::site_wire_auth::per_site_db_env_vars(&wire.listen, site_key, &password)
     }
 
     /// Build `EPHPM_REDIS_*` environment variables for PHP injection.
@@ -15342,6 +15335,37 @@ echo "post response";
                 !dbdir.join("shop.local.db").exists(),
                 "the suffixed spelling must not mint a second database — issue #290"
             );
+        }
+
+        /// Issue #689: what a request's PHP sees in `$_SERVER['DB_*']` is
+        /// exactly the shared map `ephpm php --site` exports — same keys, same
+        /// order, same values — with the password the listener verifies. The
+        /// CLI side pins the other half (`site_db::tests`), so the two
+        /// deliveries cannot drift without one of these failing.
+        #[tokio::test]
+        async fn request_injection_is_the_shared_db_env_map() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let injected = router.build_per_site_db_env_vars("shop");
+            let shared = crate::site_wire_auth::per_site_db_env_vars(
+                "127.0.0.1:3306",
+                "shop",
+                &auth.password_for("shop"),
+            );
+            assert_eq!(injected, shared, "the router must inject the shared DB_* map verbatim");
+            // And a second request gets the same (cached) credential.
+            assert_eq!(router.build_per_site_db_env_vars("shop"), shared);
+            // Fail closed: no key, no credential (never a default account).
+            assert_eq!(router.build_per_site_db_env_vars(""), Vec::new());
         }
 
         /// Issue #291: a well-formed but unknown `Host` still gets the default

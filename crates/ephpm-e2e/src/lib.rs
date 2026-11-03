@@ -347,6 +347,25 @@ impl DbImportFixture {
         self._tempdir.path()
     }
 
+    /// Run `ephpm php --site <site> --config <cfg> <php_args…>` as a
+    /// subprocess and return its captured output — the cron-style invocation
+    /// (issue #689). Whether it takes the wire path (server up, `DB_*`
+    /// exported) or the offline direct-open (no `DB_*`) is the CLI's own
+    /// probe-based decision; release the port reservation first (as
+    /// [`import`](Self::import) does) so an offline run's probe is honest.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the subprocess cannot be spawned.
+    pub fn php(&self, php_args: &[&str]) -> Result<std::process::Output> {
+        Command::new(&self.binary)
+            .args(["php", "--site", &self.site, "--config"])
+            .arg(&self.config_path)
+            .args(php_args)
+            .output()
+            .with_context(|| format!("running `ephpm php --site` ({})", self.binary.display()))
+    }
+
     /// Run `ephpm db import <dump> --site <site> --config <cfg> <extra_args>`
     /// as a subprocess and return its captured output. The server must not be
     /// running (offline direct-open) — the state right after

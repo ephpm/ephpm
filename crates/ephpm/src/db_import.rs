@@ -341,10 +341,7 @@ fn open_dump(req: &ImportRequest) -> anyhow::Result<(BufReader<Box<dyn Read>>, D
 /// Resolve the backend binding strategy for `site`, probing the running
 /// server's MySQL listener exactly as `ephpm php --site` does.
 fn resolve_strategy(config: &Config, site: &str) -> anyhow::Result<Strategy> {
-    let listen =
-        config.db.sqlite.as_ref().map(|s| s.proxy.mysql_listen.clone()).unwrap_or_default();
-    let reachable = if listen.is_empty() { None } else { site_db::server_reachable(&listen) };
-    site_db::choose_strategy(config, site, reachable)
+    site_db::plan_site_db(config, site)
 }
 
 /// Build a [`StatementSink`] over the resolved backend.
@@ -360,7 +357,7 @@ fn build_sink(
                 .with_context(|| format!("opening the site database at {path}"))?;
             Ok(Box::new(sink))
         }
-        Strategy::Wire { addr, user, password } => {
+        Strategy::Wire { addr, user, password, .. } => {
             if matches!(dialect, Dialect::Pg) {
                 tracing::warn!(
                     "importing a PostgreSQL dump through the running server's MySQL listener: the \

@@ -330,6 +330,12 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// `/kv-put` round-trip). It reuses `DbImportFixture`, so it owns the database
 /// file offline exactly as `db_import` does.
 ///
+/// `php_site_env` (issue #689) is here for the same reason again: it runs
+/// `ephpm php --site` both offline (server down — must export no `DB_*`) and
+/// live (server up — `$_SERVER['DB_*']` must be the request-path map and a
+/// stock `mysqli` opened from it must reach the site's rows), over
+/// `DbImportFixture`.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
@@ -341,6 +347,7 @@ const SELF_MANAGED_SUITES: &[&str] = &[
     "kv_snapshot_restart",
     "db_import",
     "db_shell",
+    "php_site_env",
 ];
 
 /// Test suites that must be excluded from bare-process runs entirely.
