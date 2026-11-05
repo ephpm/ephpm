@@ -2885,8 +2885,8 @@ pub struct SqliteConfig {
 ///
 /// Every `interval`, each embedded database (the one `[db.sqlite] path` in
 /// single-node mode; every `<dir>/<site-key>.db` in per-site mode, open or
-/// not) is snapshotted through an in-process engine handle (the engine's
-/// `VACUUM INTO` recipe as a batched copy, bounded memory at any size) —
+/// not) is snapshotted with `VACUUM INTO` through an in-process engine handle
+/// (memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.2`) —
 /// never a second process on the file — gzipped and uploaded as
 /// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. **RPO = `interval`.**
 /// Objects older than `retention` are deleted after each successful upload

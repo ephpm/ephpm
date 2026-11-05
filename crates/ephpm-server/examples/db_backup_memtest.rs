@@ -133,8 +133,8 @@ async fn make(path: &Path, mb: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The engine's own `VACUUM INTO`, as `db_backup::snapshot_into` ran it
-/// before the batched copy (kept as the comparison baseline).
+/// The engine's own `VACUUM INTO` on a plain (ungated) handle — what
+/// `db_backup::snapshot_into` runs, minus the WAL-gate permit.
 async fn vacuum_into(src: &Path, dst: &Path) -> anyhow::Result<()> {
     let db = turso::Builder::new_local(src.to_str().context("path is not UTF-8")?)
         .build()

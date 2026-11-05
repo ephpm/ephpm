@@ -1,9 +1,9 @@
 //! `ephpm db restore` and `ephpm db backup list` — the restore half of the
 //! scheduled embedded-database backups (`[db.sqlite.backup]`, #686 Tier 0).
 //!
-//! A backup object is a gzip of a standard SQLite main file written by the
-//! backup's batched copy (`ephpm_server::db_backup::snapshot_into`).
-//! Restoring one is a **file install**, not an SQL replay:
+//! A backup object is a gzip of a standard SQLite main file written by
+//! `VACUUM INTO` (`ephpm_server::db_backup`). Restoring one is a **file
+//! install**, not an SQL replay:
 //!
 //! 1. Resolve the target the way `db import` / `db query` do (`--site`
 //!    validated fail-closed; single-node mode's one database is `default`).
@@ -468,7 +468,7 @@ mod tests {
         assert!(resolve_source(&config, "shop", &missing, None, &rt).is_err());
     }
 
-    /// End to end on a local artifact: a real `snapshot_into` copy,
+    /// End to end on a local artifact: a real `VACUUM INTO` snapshot,
     /// gzipped, is installed over the site's file (stale sidecars removed),
     /// and a corrupt artifact never touches the live file.
     #[test]

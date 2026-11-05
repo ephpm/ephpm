@@ -139,17 +139,23 @@ Turso itself refuses the switch while CDC capture is on (see below). On a
 single-node `pdo_mysql` connection the switch outside a transaction is still
 possible.
 
-## Page-1 allocation race (patched Turso 0.8.3)
+## Patched Turso 0.8.3: the page-1 allocation race and `VACUUM INTO` memory
 
 From v0.13.0, ePHPm builds Turso 0.8.3 from a fork rather
 than the crates.io release: the org mirror
-[ephpm/turso](https://github.com/ephpm/turso) at tag
-[`v0.8.3-ephpm.1`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.1)
-(branch `ephpm/v0.8.3`) — the v0.8.3 tag plus a backport of
+[ephpm/turso](https://github.com/ephpm/turso), branch `ephpm/v0.8.3`, at tag
+[`v0.8.3-ephpm.2`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.2)
+(v0.15.1; v0.13.0–v0.15.0 pinned `v0.8.3-ephpm.1`) — the v0.8.3 tag plus a
+backport of
 [tursodatabase/turso#10117](https://github.com/tursodatabase/turso/pull/10117),
-which is not yet in a Turso release. The crate versions stay 0.8.3; the swap is
-a `[patch.crates-io]` entry in ePHPm's workspace `Cargo.toml`, and it goes away
-once a Turso release carrying the fix is pinned.
+which is not yet in a Turso release, plus a batched `VACUUM INTO` target build:
+the stock engine builds the whole copy in one write transaction whose commit
+re-reads every spilled page and holds a WAL frame per page, so the statement
+needed ~2× the database resident (1.4 GB for a 688 MB file, 11.6 GB for 5.6 GB)
+and OOM-killed the scheduled backup on a 1.6 GB database; with the patch it is
+flat at ~53 MB at every size. The crate versions stay 0.8.3; the swap is a
+`[patch.crates-io]` entry in ePHPm's workspace `Cargo.toml`, and it goes away
+once a Turso release carrying both fixes is pinned.
 
 The bug: when several connections make the **first write to a fresh database
 file** at the same time — typically a new per-site database receiving
@@ -400,13 +406,11 @@ supported state is *ePHPm is the sole process on the file*.
 **Built in: scheduled snapshots to object storage (`[db.sqlite.backup]`).**
 Every `interval`, each embedded database — the one `[db.sqlite] path` in
 single-node mode, every `<dir>/<site-key>.db` in per-site mode, open or not —
-is snapshotted *inside the ePHPm process* — the engine's own `VACUUM INTO`
-recipe (schema and indexes replayed, rows copied under one read view, triggers
-and views last), run by ePHPm as a copy committed every 8 MiB / 20 000 rows
-with the output's WAL truncated as it goes, so the peak memory stays in the
-tens of MB whatever the database size (the engine's statement itself commits
-the whole copy at once, which on the pinned 0.8.3 re-reads every spilled page
-and holds a WAL frame per page: ~2× the file in RAM, an OOM kill at 1.6 GB) —
+is snapshotted *inside the ePHPm process* with the engine's own `VACUUM INTO`
+(memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.2`, which
+builds the copy in batches: ~53 MB of resident memory whatever the database
+size, where stock 0.8.3 committed the whole copy at once and needed ~2× the
+file — see [the patched-engine note](#patched-turso-083-the-page-1-allocation-race-and-vacuum-into-memory)),
 gzipped and uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects
 older than `retention` are deleted after each successful upload, always keeping
 the newest. The snapshot is read through an in-process engine handle,

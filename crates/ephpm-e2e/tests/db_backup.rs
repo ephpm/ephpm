@@ -1,7 +1,7 @@
 //! End-to-end `[db.sqlite.backup]` → object storage → `ephpm db restore`
 //! round-trip against a **real S3-compatible server**.
 //!
-//! The unit tests in `ephpm-server` prove the snapshot copy and the retention
+//! The unit tests in `ephpm-server` prove `VACUUM INTO` and the retention
 //! arithmetic, and the SigV4 signer is checked against an in-process mock.
 //! What none of them prove is the whole feature talking to a real object
 //! store: that the scheduled tick uploads an object a real `ListObjectsV2`
