@@ -93,6 +93,38 @@ encryption and a policy that limits who can read it. The object is readable
 by anyone who can read the bucket; that is the price of an artifact that
 opens with `sqlite3` when ePHPm is gone.
 
+### Memory and disk headroom
+
+Backups add a bounded, periodic cost on top of what the server already uses to
+serve requests — budget for it when you size the container or node, because a
+tick that runs out of memory is killed by the OS (an OOM, not a logged
+failure).
+
+- **Memory.** Each snapshot runs the engine's `VACUUM INTO` through a
+  short-lived in-process handle. As of the pinned Turso `v0.8.3-ephpm.2` that
+  stays **flat at about 53 MB resident whatever the database size** — stock
+  Turso 0.8.3 instead needed roughly **2× the file** (about 1.4 GB for a
+  688 MB database), which is what OOM-killed the container on a 1.6 GB database
+  before the fix. Up to **four databases are snapshotted at once** within a
+  tick (see `interval` in the
+  [reference](/reference/config/#dbsqlitebackup)), so the extra resident memory
+  while a tick runs is about `min(databases, 4) × 53 MB` — roughly **210 MB**
+  for four or more databases, **~53 MB** for a single-node server. Leave at
+  least that much headroom **above** the serving RSS. It is separate from PHP's
+  [per-request memory budget](/reference/config/#resource-aware-autotuning) and
+  is not drawn from it; the gzip streams from disk and the upload is a single
+  streamed `PutObject`, so neither adds materially to the peak.
+- **Disk.** Each snapshot is written to a private per-process staging directory
+  under the system temp dir, gzipped there, then deleted (on success *and* on
+  failure). A single database's transient high-water mark is one `VACUUM INTO`
+  copy of it (no larger than the file) **plus** its gzip, i.e. well under 2× the
+  file; and because up to four run at once, the temp filesystem's peak is about
+  `min(databases, 4)` of those copies together. Size it for the largest
+  databases accordingly. On a container with a small or memory-backed `/tmp`,
+  point the staging elsewhere by giving the process a larger `TMPDIR` (the
+  staging directory is created under the standard system temp dir, which
+  `TMPDIR` controls on Linux).
+
 ## 2. Check that it runs
 
 At startup the server logs what it will do:
