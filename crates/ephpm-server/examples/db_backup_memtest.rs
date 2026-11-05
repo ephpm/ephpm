@@ -11,6 +11,7 @@
 //! db_backup_memtest make   <db> <mb>     # build a ~<mb> MB database
 //! db_backup_memtest vacuum <src> <dst>   # the engine's VACUUM INTO
 //! db_backup_memtest copy   <src> <dst>   # db_backup::snapshot_into (the shipped path)
+//! db_backup_memtest verify <db>          # PRAGMA integrity_check, as `ephpm db restore` runs it
 //! ```
 //!
 //! Every subcommand prints `peak_rss_mb=` (Linux: `VmHWM`, the kernel's
@@ -52,9 +53,14 @@ fn main() -> anyhow::Result<()> {
             Path::new(&args[2]),
             Path::new(&args[3]),
         )),
+        // `PRAGMA integrity_check` on an artifact, as `ephpm db restore` runs it.
+        Some("verify") if args.len() == 3 => {
+            rt.block_on(ephpm_server::db_backup::verify_integrity(Path::new(&args[2])))
+        }
         _ => {
             eprintln!(
-                "usage: db_backup_memtest make <db> <mb> | vacuum <src> <dst> | copy <src> <dst>"
+                "usage: db_backup_memtest make <db> <mb> | vacuum <src> <dst> | copy <src> <dst> \
+                 | verify <db>"
             );
             std::process::exit(2);
         }
