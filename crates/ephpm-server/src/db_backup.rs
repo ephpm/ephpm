@@ -21,6 +21,17 @@
 //! ePHPm at all), *online* (the source is read under a `BEGIN` read view, no
 //! write pause), and restorable as a file install rather than an SQL replay.
 //!
+//! **Memory is bounded by the engine, and only as of the pinned Turso
+//! `v0.8.3-ephpm.2`.** Stock 0.8.3 builds the whole output inside one write
+//! transaction whose commit (`Pager::commit_wal_inner`) re-reads every spilled
+//! page and holds a WAL frame per page, so the statement needed ~2× the
+//! database resident (1.4 GB for a 688 MB file, 11.6 GB for 5.6 GB) and
+//! v0.15.0 OOM-killed the container on a 1.6 GB database. The pinned fork
+//! builds the target in batches, which keeps the peak flat at ~53 MB at every
+//! size — measured with `examples/db_backup_memtest.rs` and guarded by the
+//! ignored `snapshot_memory_is_bounded_regardless_of_database_size` test,
+//! which fails if the pin ever moves to a build without that change.
+//!
 //! The serving factories hold no handle a backup task can reach (single-node
 //! keeps its `Turso` behind the tracked backend; per-site keeps an LRU of
 //! serving factories, and a site that is not open has none), so each tick
@@ -1220,5 +1231,176 @@ mod tests {
         // And the trigger still fires in the restored copy.
         exec(&sconn, "INSERT INTO t (v) VALUES ('restored')").await;
         assert_eq!(count(&sconn, "SELECT COUNT(*) FROM log").await, in_snapshot + 1);
+    }
+
+    /// Every row of `sql`, each column rendered through `quote()`, so two
+    /// databases can be compared value by value.
+    async fn dump(conn: &turso::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut rows = conn.query(sql, ()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(
+                (0..row.column_count())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    /// The backup carries everything, end to end through the engine's
+    /// `VACUUM INTO`: every schema object verbatim (tables of each rowid
+    /// flavour, indexes, a view, a trigger), every row with its rowid, the
+    /// AUTOINCREMENT counter *as recorded* (not as implied by the surviving
+    /// rows), the header cookies and the page size — and nothing fires
+    /// during the copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_carries_the_schema_rows_rowids_and_counters_faithfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for sql in [
+            "PRAGMA user_version = 42",
+            "PRAGMA application_id = 7",
+            // INTEGER PRIMARY KEY: the column is the rowid.
+            "CREATE TABLE alias (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT, b BLOB, r REAL, n INTEGER)",
+            // A plain rowid table: the hidden rowid must survive, gaps and all.
+            // (WITHOUT ROWID is flag-gated experimental in the pinned engine.)
+            "CREATE TABLE plain (k TEXT NOT NULL, v TEXT)",
+            // A composite PK on a rowid table (no alias), odd identifiers.
+            "CREATE TABLE \"odd \"\"name\"\"\" (\"col a\" INTEGER, \"col\"\"b\" TEXT, PRIMARY KEY (\"col a\", \"col\"\"b\"))",
+            "CREATE TABLE log (what TEXT)",
+            "CREATE INDEX plain_k ON plain (k)",
+            "CREATE UNIQUE INDEX alias_v ON alias (v)",
+            "CREATE VIEW plain_view AS SELECT k FROM plain WHERE v IS NOT NULL",
+            "CREATE TRIGGER alias_ai AFTER INSERT ON alias BEGIN INSERT INTO log VALUES ('fired'); END",
+            "INSERT INTO alias (v, b, r, n) VALUES ('one', x'0102', 1.5, NULL)",
+            "INSERT INTO alias (v, b, r, n) VALUES ('two', NULL, -2.25, 7)",
+            "INSERT INTO alias (v, b, r, n) VALUES ('three', x'', 0.0, 0)",
+            // The counter keeps 3 even though row 3 is gone.
+            "DELETE FROM alias WHERE id = 3",
+            "INSERT INTO plain (rowid, k, v) VALUES (10, 'a', 'x')",
+            "INSERT INTO plain (rowid, k, v) VALUES (20, 'b', NULL)",
+            "INSERT INTO plain (rowid, k, v) VALUES (35, 'c', 'z')",
+            "INSERT INTO \"odd \"\"name\"\"\" VALUES (1, 'x'), (2, 'y')",
+            "DELETE FROM log",
+        ] {
+            exec(&conn, sql).await;
+        }
+        assert_eq!(count(&conn, "SELECT seq FROM sqlite_sequence WHERE name = 'alias'").await, 3);
+
+        let dest = dir.path().join("snap.db");
+        snapshot_into(&path, &dest).await.expect("snapshot");
+        assert!(!dest.with_extension("db-wal").exists(), "no -wal sidecar left");
+
+        let snap = turso::Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();
+        let sconn = snap.connect().unwrap();
+        let mut rows = sconn.query("PRAGMA integrity_check", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get_value(0).unwrap(), turso::Value::Text("ok".into()));
+        drop(rows);
+
+        // Schema: every user object, verbatim, in the same order.
+        let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+                          WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid";
+        assert_eq!(dump(&sconn, schema_sql).await, dump(&conn, schema_sql).await);
+        // Rows, with rowids.
+        for sql in [
+            "SELECT rowid, id, v, b, r, n FROM alias ORDER BY rowid",
+            "SELECT rowid, k, v FROM plain ORDER BY rowid",
+            "SELECT rowid, \"col a\", \"col\"\"b\" FROM \"odd \"\"name\"\"\" ORDER BY rowid",
+            "SELECT k FROM plain_view ORDER BY k",
+        ] {
+            assert_eq!(dump(&sconn, sql).await, dump(&conn, sql).await, "{sql}");
+        }
+        assert_eq!(
+            dump(&sconn, "SELECT rowid FROM plain ORDER BY rowid").await,
+            [["Integer(10)"], ["Integer(20)"], ["Integer(35)"]]
+        );
+        // The trigger did not fire during the copy, and still works after.
+        assert_eq!(count(&sconn, "SELECT COUNT(*) FROM log").await, 0);
+        exec(&sconn, "INSERT INTO alias (v) VALUES ('four')").await;
+        assert_eq!(count(&sconn, "SELECT COUNT(*) FROM log").await, 1);
+        // The AUTOINCREMENT counter was carried as recorded: the new row got id 4, not 3.
+        assert_eq!(count(&sconn, "SELECT id FROM alias WHERE v = 'four'").await, 4);
+        // Header cookies and page size.
+        assert_eq!(count(&sconn, "PRAGMA user_version").await, 42);
+        assert_eq!(count(&sconn, "PRAGMA application_id").await, 7);
+        assert_eq!(count(&sconn, "PRAGMA page_size").await, count(&conn, "PRAGMA page_size").await);
+        // The source read view was released: it can still be written.
+        exec(&conn, "INSERT INTO plain (k) VALUES ('after')").await;
+    }
+
+    /// `VmHWM` of this process in MB (Linux only).
+    #[cfg(target_os = "linux")]
+    fn vm_hwm_mb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    }
+
+    /// The property this module relies on the engine for: snapshotting a
+    /// database costs a bounded amount of resident memory, not a multiple
+    /// of its size. A ~127 MB database goes through `snapshot_into` (the
+    /// engine's `VACUUM INTO`) and the process high-water mark may grow by
+    /// at most [`SNAPSHOT_MEMORY_BOUND_MB`]. Stock Turso 0.8.3 grew it by
+    /// ~2× the file (about 250 MB here, 1.4 GB for a 688 MB file); the
+    /// pinned `v0.8.3-ephpm.2` builds the target in batches (measured +31 to
+    /// +42 MB here, ~53 MB absolute at 5.6 GB with
+    /// `examples/db_backup_memtest.rs`). This is the test that fails if the
+    /// engine pin ever moves to a build without that change. Ignored by
+    /// default (it writes ~250 MB and takes a while unoptimised); the nightly
+    /// linked suite runs ignored tests, one process each.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "writes ~200 MB; run deliberately or in the nightly suite"]
+    async fn snapshot_memory_is_bounded_regardless_of_database_size() {
+        const SNAPSHOT_MEMORY_BOUND_MB: u64 = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        exec(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v BLOB)").await;
+        exec(&conn, "CREATE INDEX t_k ON t (k)").await;
+        let mut insert = conn.prepare("INSERT INTO t (k, v) VALUES (?, ?)").await.unwrap();
+        let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut payload = vec![0u8; 1000];
+        for i in 0..96_000u32 {
+            if i % 1000 == 0 {
+                exec(&conn, "BEGIN").await;
+            }
+            for byte in &mut payload {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                *byte = (rng & 0xff) as u8;
+            }
+            insert.execute((format!("key-{i:08}"), payload.clone())).await.unwrap();
+            if i % 1000 == 999 {
+                exec(&conn, "COMMIT").await;
+            }
+        }
+        // (`query`, not `execute`: the pragma answers with a row.)
+        let _ = count(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
+        drop(insert);
+        drop(conn);
+        drop(db);
+        let size_mb = std::fs::metadata(&path).unwrap().len() / (1024 * 1024);
+        assert!(size_mb >= 96, "fixture is {size_mb} MB");
+
+        let before = vm_hwm_mb();
+        let dest = dir.path().join("snap.db");
+        snapshot_into(&path, &dest).await.expect("snapshot");
+        let after = vm_hwm_mb();
+        let grown = after.saturating_sub(before);
+        eprintln!("database {size_mb} MB; VmHWM {before} MB -> {after} MB (+{grown} MB)");
+        assert!(
+            grown <= SNAPSHOT_MEMORY_BOUND_MB,
+            "snapshotting a {size_mb} MB database grew the high-water mark by {grown} MB (bound {SNAPSHOT_MEMORY_BOUND_MB} MB)"
+        );
+        // The copy is the same data, packed by a fresh build (within 10 %).
+        let copy_mb = std::fs::metadata(&dest).unwrap().len() / (1024 * 1024);
+        assert!(copy_mb.abs_diff(size_mb) <= size_mb / 10, "copy is {copy_mb} MB for {size_mb} MB");
     }
 }
