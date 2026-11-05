@@ -401,12 +401,12 @@ supported state is *ePHPm is the sole process on the file*.
 Every `interval`, each embedded database — the one `[db.sqlite] path` in
 single-node mode, every `<dir>/<site-key>.db` in per-site mode, open or not —
 is snapshotted *inside the ePHPm process* — the engine's own `VACUUM INTO`
-recipe (schema replayed, rows copied under one read view, indexes built after
-the data, triggers and views last), run by ePHPm as a copy committed every
-8 MiB / 20 000 rows so the peak memory is a few tens of MB whatever the
-database size (the engine's statement itself commits the whole copy at once,
-which on the pinned 0.8.3 re-reads every spilled page and holds a WAL frame per
-page: ~2× the file in RAM, an OOM kill at 1.6 GB) —
+recipe (schema and indexes replayed, rows copied under one read view, triggers
+and views last), run by ePHPm as a copy committed every 8 MiB / 20 000 rows
+with the output's WAL truncated as it goes, so the peak memory stays in the
+tens of MB whatever the database size (the engine's statement itself commits
+the whole copy at once, which on the pinned 0.8.3 re-reads every spilled page
+and holds a WAL frame per page: ~2× the file in RAM, an OOM kill at 1.6 GB) —
 gzipped and uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects
 older than `retention` are deleted after each successful upload, always keeping
 the newest. The snapshot is read through an in-process engine handle,

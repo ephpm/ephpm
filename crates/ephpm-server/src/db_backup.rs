@@ -13,7 +13,8 @@
 //! The artifact is a **standard SQLite database file** built the way the
 //! engine's own `VACUUM INTO` builds one: the schema replayed from
 //! `sqlite_schema`, every table's rows copied under one source read view,
-//! indexes built after the data, triggers and views created last, and the
+//! indexes created with the tables (before the rows, as SQLite's own vacuum
+//! does — see [`snapshot_into`]), triggers and views created last, and the
 //! output finalised with a `TRUNCATE` checkpoint under full sync so it is one
 //! self-contained `.db` with no `-wal` sidecar. Chosen over the clustered
 //! path's logical dump because it is *faithful* (the dump deliberately skips
@@ -889,11 +890,12 @@ async fn sweep_retention(
 ///
 /// The copy is the engine's own `VACUUM INTO` recipe — schema replayed from
 /// `sqlite_schema`, rows copied table by table under one source read view,
-/// indexes built after the data, triggers and views created last — run from
-/// here instead of inside the engine so the output can be **committed in
-/// batches** ([`COPY_BATCH_BYTES`] / [`COPY_BATCH_ROWS`]). See the module
-/// docs for why that is the difference between megabytes and gigabytes of
-/// resident memory.
+/// triggers and views created last — run from here instead of inside the
+/// engine so the output can be **committed in batches** ([`COPY_BATCH_BYTES`]
+/// / [`COPY_BATCH_ROWS`]), its WAL truncated as it goes, and the indexes
+/// created before the rows so their pages ride those batches too. See the
+/// module docs for why that is the difference between megabytes and
+/// gigabytes of resident memory.
 ///
 /// # Errors
 ///
@@ -1021,25 +1023,31 @@ async fn copy_database_in_read_view(
         }
     }
 
-    // 1. Storage-backed tables, 2. their rows, 3. indexes (built once, over
-    // the full data), 4. triggers, views and virtual tables — after the
-    // data so no trigger fires on the copy.
+    // 1. Storage-backed tables, 2. their indexes, 3. the rows, 4. triggers,
+    // views and virtual tables — after the data so no trigger fires on the
+    // copy. Indexes go *before* the rows (SQLite's own vacuum.c order) and
+    // not after as the engine's statement does: a `CREATE INDEX` over the
+    // copied data is one transaction the size of the index, and the commit
+    // of that costs ~2× the index in RAM (measured: 260 MB at 5.6 GB, with
+    // the data phase batched; a WordPress `wp_postmeta` index is bigger
+    // than its rows). Built as the rows land, index pages are committed by
+    // the same batches.
     for entry in &tables {
         target
             .execute(&entry.sql, ())
             .await
             .with_context(|| format!("CREATE TABLE {}", entry.name))?;
     }
-    for entry in &tables {
-        copy_table_rows(source, target, entry).await?;
-    }
-    copy_sequences(source, target).await?;
     for entry in &indexes {
         target
             .execute(&entry.sql, ())
             .await
             .with_context(|| format!("CREATE INDEX {}", entry.name))?;
     }
+    for entry in &tables {
+        copy_table_rows(source, target, entry).await?;
+    }
+    copy_sequences(source, target).await?;
     for entry in &post_data {
         target.execute(&entry.sql, ()).await.with_context(|| {
             format!("CREATE {} {}", entry.kind.to_ascii_uppercase(), entry.name)
