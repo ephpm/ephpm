@@ -86,8 +86,9 @@ black-box sidecar ever was.
 > `turso =0.7.2` as of v0.7.1, `turso =0.8.2` in v0.12.0 (ephpm#535),
 > `turso =0.8.3` from v0.13.0 (litewire#47) — built from a
 > fork of the v0.8.3 tag carrying the page-1 allocation race fix
-> (tursodatabase/turso#10117; org mirror `ephpm/turso`, tag
-> `v0.8.3-ephpm.1`) via ePHPm's `[patch.crates-io]`) and ePHPm
+> (tursodatabase/turso#10117) and, from v0.15.1, the batched `VACUUM INTO`
+> target build (org mirror `ephpm/turso`, tag `v0.8.3-ephpm.2`) via
+> ePHPm's `[patch.crates-io]`) and ePHPm
 > builds it as the sole embedded engine.
 > Gate 2–4 evidence lives in `docs/turso-phase1-results.md`; Phase 2
 > design notes in `docs/turso-phase2-cdc-design.md`.
@@ -360,11 +361,15 @@ path is a **single ordered stream** with no schema-sync side channel.
 
 **Tier 0 (shipped): scheduled `.db` snapshots to object storage.**
 [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup) snapshots every
-embedded database with the engine's `VACUUM INTO` (supported by the pinned
-0.8.3 — the "vacuum missing" note in the verified facts above dates from
-0.7.0 and no longer holds for `VACUUM INTO`; in-place `VACUUM` is still
-screened off the tenant path) through a short-lived in-process gated
-handle, gzips it and uploads it as
+embedded database with the engine's `VACUUM INTO` (the pinned 0.8.3
+supports the statement — the "vacuum missing" note in the verified facts
+above dates from 0.7.0; memory-bounded in the engine as of the pinned
+`v0.8.3-ephpm.2`, whose batched target build replaces stock 0.8.3's
+single-transaction commit that re-read every spilled page and held a WAL
+frame per page, ~2× the file in RAM — v0.15.0 was OOM-killed on a 1.6 GB
+database, v0.15.1 is flat at ~53 MB; in-place `VACUUM` is still screened
+off the tenant path) through a short-lived in-process gated handle, gzips
+it and uploads it as
 `<s3_path>/<site>/<YYYYMMDDTHHMMSSZ>.db.gz`, with a retention sweep that
 always keeps the newest object; `ephpm db restore` installs one offline
 after a `PRAGMA integrity_check`. RPO = `interval`. Single-node and per-site
