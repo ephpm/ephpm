@@ -1200,8 +1200,12 @@ async fn copy_rows(
 /// on its own while a copy is running, so without this the index — and the
 /// `-wal` sidecar on disk — grow with the database: measured 395 MB of RSS
 /// on a 5.6 GB copy against 83 MB on a 688 MB one. Nothing reads the
-/// snapshot while it is written, so a truncate always succeeds.
-const COPY_CHECKPOINT_EVERY_BATCHES: u32 = 8;
+/// snapshot while it is written, so a truncate always succeeds. Kept short
+/// (two batches, ~16 MiB of log) because the staging writes run under
+/// `synchronous = OFF`: a container's memory limit also counts the dirty
+/// page cache, and a 64 MiB log plus its backfill in one burst was enough to
+/// OOM-kill a 128 MB cgroup while the process itself sat at 49 MB.
+const COPY_CHECKPOINT_EVERY_BATCHES: u32 = 2;
 
 /// `PRAGMA wal_checkpoint(TRUNCATE)` on the snapshot: every frame into the
 /// main file, the log reset to empty. A `busy` answer would leave frames in
