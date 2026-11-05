@@ -2885,8 +2885,9 @@ pub struct SqliteConfig {
 ///
 /// Every `interval`, each embedded database (the one `[db.sqlite] path` in
 /// single-node mode; every `<dir>/<site-key>.db` in per-site mode, open or
-/// not) is snapshotted with `VACUUM INTO` through an in-process engine handle
-/// — never a second process on the file — gzipped and uploaded as
+/// not) is snapshotted through an in-process engine handle (the engine's
+/// `VACUUM INTO` recipe as a batched copy, bounded memory at any size) —
+/// never a second process on the file — gzipped and uploaded as
 /// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. **RPO = `interval`.**
 /// Objects older than `retention` are deleted after each successful upload
 /// for that site, always keeping the newest. Restore with `ephpm db restore`.

@@ -557,7 +557,7 @@ Recorded only when `[db.sqlite.backup] enabled = true` ([config](/reference/conf
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_db_backup_total` | counter | `site`, `outcome` (`ok`, `snapshot_failed`, `upload_failed`) | Backups attempted, one per database per tick. `snapshot_failed` covers the `VACUUM INTO` and the gzip; `upload_failed` the `PutObject`. Each failure is also a `WARN` naming the site. |
+| `ephpm_db_backup_total` | counter | `site`, `outcome` (`ok`, `snapshot_failed`, `upload_failed`) | Backups attempted, one per database per tick. `snapshot_failed` covers the snapshot copy and the gzip; `upload_failed` the `PutObject`. Each failure is also a `WARN` naming the site. |
 | `ephpm_db_backup_duration_seconds` | histogram | `site` | Wall time of one successful backup: snapshot + gzip + upload (the retention sweep is not included). |
 | `ephpm_db_backup_last_bytes` | gauge | `site` | Compressed size of the last successfully uploaded object. |
 | `ephpm_db_backup_last_success_timestamp_seconds` | gauge | `site` | Unix time of the last successful upload; `time() - this` is the backup lag. |

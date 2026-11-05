@@ -360,9 +360,13 @@ path is a **single ordered stream** with no schema-sync side channel.
 
 **Tier 0 (shipped): scheduled `.db` snapshots to object storage.**
 [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup) snapshots every
-embedded database with the engine's `VACUUM INTO` (supported by the pinned
-0.8.3 — the "vacuum missing" note in the verified facts above dates from
-0.7.0 and no longer holds for `VACUUM INTO`; in-place `VACUUM` is still
+embedded database with the engine's `VACUUM INTO` recipe, run by ePHPm as a
+batched copy (the pinned 0.8.3 supports the statement — the "vacuum missing"
+note in the verified facts above dates from 0.7.0 — but its commit path
+re-reads every spilled page and builds a WAL frame per page before
+submitting, ~2× the file in RAM, so v0.15.0's direct `VACUUM INTO` was
+OOM-killed on a 1.6 GB database; the engine-side fix is a batched commit in
+`core/vdbe/vacuum.rs`, tracked for the fork; in-place `VACUUM` is still
 screened off the tenant path) through a short-lived in-process gated
 handle, gzips it and uploads it as
 `<s3_path>/<site>/<YYYYMMDDTHHMMSSZ>.db.gz`, with a retention sweep that

@@ -550,7 +550,7 @@ ephpm db restore --site <KEY> --config <FILE> --from <local .db or .db.gz> [--ye
 ```
 
 Installs a backup written by [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)
-— a gzip of a standard SQLite main file taken with `VACUUM INTO` — over a site's
+— a gzip of a standard SQLite main file, the backup's batched copy of the database — over a site's
 live database. It is a **file install**, not an SQL replay, and it is
 **offline only**: the command refuses while a server is running.
 

@@ -10,8 +10,8 @@ S3-compatible bucket, and brought back with `ephpm db restore`. This page is
 the from-zero walkthrough; the knob-by-knob reference is
 [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup), the commands are
 [`ephpm db restore` / `db backup list`](/reference/cli/db/#ephpm-db-restore),
-and the design (why `VACUUM INTO` inside the process, and why nothing else
-may touch the file) is in
+and the design (why the snapshot is taken inside the process, and why
+nothing else may touch the file) is in
 [Engines → Backups](/architecture/database/engines/#backups-and-why-external-sqlite-tools-lock-the-file).
 
 **What you get, stated plainly.** A restorable copy of each database every
@@ -98,7 +98,7 @@ opens with `sqlite3` when ePHPm is gone.
 At startup the server logs what it will do:
 
 ```text
-INFO embedded database backup enabled (VACUUM INTO snapshot → gzip → object storage; the object is not encrypted by ePHPm — use bucket-side encryption) bucket=ephpm-backups endpoint=https://s3.us-east-1.amazonaws.com prefix=ephpm/db interval_secs=900 retention_secs=1209600 databases=3 staging=/tmp/ephpm-db-backup-…
+INFO embedded database backup enabled (batched-copy snapshot → gzip → object storage; the object is not encrypted by ePHPm — use bucket-side encryption) bucket=ephpm-backups endpoint=https://s3.us-east-1.amazonaws.com prefix=ephpm/db interval_secs=900 retention_secs=1209600 databases=3 staging=/tmp/ephpm-db-backup-…
 ```
 
 `databases` counts the files that exist right now; a site whose database has
