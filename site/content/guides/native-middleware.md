@@ -121,7 +121,7 @@ config  = { api_key = "..." }
 | Key | Required | Meaning |
 |-----|----------|---------|
 | `library` | yes | Built-in name or shared library to load — bare name or explicit path (see below). Must not be empty. |
-| `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every request the chain sees — PHP **and** static files (see [Coverage](#coverage)). |
+| `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. The path matched is the one *after* any site `[[rewrite]]` has been applied (rewrites run before the chain — see [Chain semantics](#chain-semantics-v1)), not the original client path. Unset = every request the chain sees — PHP **and** static files (see [Coverage](#coverage)). |
 | `order` | yes | Chain position. Lower runs first; equal orders keep declaration order. |
 | `config` | no | Table serialised to JSON and handed to the module's `init`. For the built-in modules a key the module does not read is a startup error — see [Unknown `config` keys](#unknown-config-keys). |
 
@@ -261,9 +261,20 @@ three verdicts:
 
 v1 rules worth knowing:
 
-- **Every module sees the original request.** Rewrites are applied *after*
-  the whole chain ran — a later module does not observe an earlier module's
-  path/header overrides.
+- **Every module sees the original request.** A module's own **REWRITE**
+  verdict is applied *after* the whole chain ran — a later module does not
+  observe an earlier module's path/header overrides.
+- **Config `[[rewrite]]` rules run *before* the chain, not after.** A site
+  `[[rewrite]]` (or `[server] rewrite`) rewrites the request path before the
+  first mount is consulted, so every `match` glob is tested against the
+  **rewritten** target — not the original client path. This is the opposite
+  timing from the mid-chain **REWRITE** verdict above, and the two are easy to
+  conflate because they share the word. The practical consequence: a mount
+  meant to catch requests to a rewritten public alias must `match` the path
+  the rewrite *produces*. With `^/photos/(.*)$ → /api/photos/$1`, scope the
+  mount to `match = "/api/photos/*"`, not `"/photos/*"` — by the time the
+  chain runs, `/photos/x` is already `/api/photos/x` and a `/photos/*` mount
+  never fires.
 - **Header overrides reach PHP** as normal request headers (`HTTP_*` in
   `$_SERVER`), replacing any client-sent header of the same name — that's
   how `jwt`'s `claims_header` hands verified claims to PHP.
