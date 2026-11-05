@@ -124,7 +124,10 @@ async fn make(path: &Path, mb: u64) -> anyhow::Result<()> {
         (),
     )
     .await?;
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+    // `query`, not `execute`: the pragma answers with a row (busy, log,
+    // checkpointed), and `execute` refuses a row on some engine revisions.
+    let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+    while rows.next().await?.is_some() {}
     let size = std::fs::metadata(path)?.len();
     println!("made rows={rows} bytes={size}");
     Ok(())
