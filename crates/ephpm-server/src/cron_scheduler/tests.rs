@@ -71,14 +71,18 @@ impl JobExecutor for RecordingExec {
     fn run<'a>(
         &'a self,
         req: ExecRequest,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>> {
         let runs = Arc::clone(&self.runs);
         let sleep_ms = self.sleep_ms;
         Box::pin(async move {
             runs.lock().unwrap().push(req.job);
             if sleep_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                // Honour cancellation so a `replace` pre-emption resolves fast.
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {}
+                    () = cancel.cancelled() => return RunOutcome::Killed,
+                }
             }
             RunOutcome::Ok
         })
@@ -375,6 +379,54 @@ async fn forbid_policy_skips_an_overlapping_run() {
 
     assert_eq!(fire_count(&s, "slow").await, 1, "forbid runs the job only once");
     assert!(skip_count(&s, "slow").await >= 1, "the overlap was skipped");
+}
+
+#[tokio::test]
+async fn allow_policy_runs_overlapping() {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let executor: Arc<dyn JobExecutor> =
+        Arc::new(RecordingExec { runs: Arc::clone(&runs), sleep_ms: 400 });
+    let mut job = every_minute_job("overlap", None);
+    job.concurrency_policy = ConcurrencyPolicy::Allow;
+    let s = scheduler(
+        vec![job.clone()],
+        false,
+        "solo",
+        Arc::new(InMemLease::default()),
+        Arc::new(InMemCursor::default()),
+        executor,
+        4,
+    );
+    // Two distinct ticks while the first is still running → both run (allow).
+    s.try_fire(&job, at(2026, 1, 1, 0, 2)).await;
+    s.try_fire(&job, at(2026, 1, 1, 0, 3)).await;
+    assert_eq!(fire_count(&s, "overlap").await, 2, "allow runs both overlapping ticks");
+}
+
+#[tokio::test]
+async fn replace_policy_preempts_running() {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let executor: Arc<dyn JobExecutor> =
+        Arc::new(RecordingExec { runs: Arc::clone(&runs), sleep_ms: 5_000 });
+    let mut job = every_minute_job("repl", None);
+    job.concurrency_policy = ConcurrencyPolicy::Replace;
+    let s = scheduler(
+        vec![job.clone()],
+        false,
+        "solo",
+        Arc::new(InMemLease::default()),
+        Arc::new(InMemCursor::default()),
+        executor,
+        4,
+    );
+    // First run occupies the slot (5 s). A second tick with replace pre-empts
+    // it (the fake executor honours the cancel) and starts a fresh run.
+    s.try_fire(&job, at(2026, 1, 1, 0, 2)).await;
+    s.try_fire(&job, at(2026, 1, 1, 0, 3)).await;
+    assert_eq!(fire_count(&s, "repl").await, 2, "replace started a second run");
+    // Let the replacement settle; the first was killed, so exactly one remains.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(runs.lock().unwrap().len(), 2, "both runs were spawned (first killed)");
 }
 
 #[tokio::test]
