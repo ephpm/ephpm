@@ -90,6 +90,55 @@ set …`).
 So a raw-socket cron job is a job that runs **next to a reachable server**:
 the same host, the same container network, or the same pod.
 
+## Reaching the server's KV (cache warmers, nightly rebuilds)
+
+> **Experimental (new in 0.16.0).** The CLI KV wire needs a running server on
+> the same host; there is no offline mode. Everything here is implemented and
+> covered by tests.
+
+With the server up, `ephpm php --site <key>` also binds the `ephpm_kv_*`
+functions to that **running server's live KV** — the same per-vhost keyspace a
+request of that site reaches. A cache warmer or nightly rebuild run as
+`ephpm php --site shop …` writes entries the serving process then reads, and
+`ephpm_kv_set('warm:homepage', $html)` from the CLI is visible to the next
+web request that calls `ephpm_kv_get('warm:homepage')`. In a cluster, the write
+goes through the server's own store, so it **replicates to the other nodes**
+through the normal gossip path — no extra wiring.
+
+This is symmetric with the database binding and needs the same two things: a
+**running server** and the **same `[kv] secret`** (the per-site KV password is
+`HMAC-SHA256([kv] secret, site key)`, exactly like the wire DB password). It
+does **not** require the public `[kv.redis_compat]` listener to be enabled —
+the server exposes an always-available loopback-only endpoint for the
+co-located CLI, discovered through a small runtime file keyed on `sites_dir`
+(see [`[kv.redis_compat]`](/reference/config/#kvredis_compat)). Loopback only,
+per-site `AUTH`; the trust boundary is the one the DB wire documents (whoever
+can read the config can impersonate any tenant).
+
+**There is no offline KV.** The KV is a running server's in-memory state, so
+there is nothing to open when no server answers: `ephpm_kv_*` stays unattached
+and returns its failure values (the first call warns once). Branch on
+**`ephpm_kv_attached()`** rather than `function_exists('ephpm_kv_get')` — the
+functions always exist, so only the probe tells you whether a store is actually
+behind them:
+
+```php
+<?php
+// warm-cache.php — run as: ephpm php --site shop --config /etc/ephpm/ephpm.toml warm-cache.php
+if (!ephpm_kv_attached()) {
+    fwrite(STDERR, "no server KV reachable — is ephpm serve running?\n");
+    exit(1);
+}
+foreach (top_pages() as $slug => $html) {
+    ephpm_kv_set("warm:$slug", $html, 3600_000); // ttl in ms
+}
+```
+
+A `CronJob` pod is a separate pod, so the loopback endpoint is out of reach from
+there (the same constraint as the DB wire's loopback listener). The CLI KV wire
+is for a job co-located with the server — a sidecar, a systemd timer on the
+host, the same container.
+
 ## Running it on a timer
 
 ### systemd
@@ -233,11 +282,11 @@ credentials; it does not serialize runs.
 
 ## What `ephpm php --site` does not give a cron script
 
-- **No KV store.** `ephpm php` starts no KV, so `ephpm_kv_*` returns failure
-  values and the `ephpm` session handler persists nothing; see
-  [`ephpm php` → No KV store](/reference/cli/php/#no-kv-store-under-ephpm-php).
-  A script that needs the server's KV talks to its RESP listener with a Redis
-  client.
+- **No *offline* KV.** With a running server, `ephpm php --site` attaches
+  `ephpm_kv_*` to it (see [Reaching the server's KV](#reaching-the-servers-kv-cache-warmers-nightly-rebuilds)
+  above). With **no** server running there is no KV to attach to — the
+  functions return their failure values and the `ephpm` session handler
+  persists nothing. Branch on `ephpm_kv_attached()`.
 - **No sandbox.** The script runs as the user invoking `ephpm php`, with
   that user's filesystem view. [`ephpm exec`](/reference/cli/exec/) provides
   the sandbox and injects no credentials of its own; nesting
