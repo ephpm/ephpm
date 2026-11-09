@@ -2886,11 +2886,29 @@ pub struct SqliteConfig {
 /// Every `interval`, each embedded database (the one `[db.sqlite] path` in
 /// single-node mode; every `<dir>/<site-key>.db` in per-site mode, open or
 /// not) is snapshotted with `VACUUM INTO` through an in-process engine handle
-/// (memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.2`) —
+/// (memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.3`) —
 /// never a second process on the file — gzipped and uploaded as
 /// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. **RPO = `interval`.**
 /// Objects older than `retention` are deleted after each successful upload
 /// for that site, always keeping the newest. Restore with `ephpm db restore`.
+///
+/// # Memory headroom
+///
+/// Budget **roughly ~100 MB of extra resident memory per database being
+/// snapshotted** when you turn this on. The snapshot's peak does **not** grow
+/// with the database's total size (stock Turso 0.8.3 needed ~2× the file and
+/// OOM-killed large backups; the pinned engine fixed that): it is bounded by
+/// about `66 MiB + 2× the largest single index` in that database. A database
+/// whose largest index is small stays near the ~66 MiB floor — a 328 MiB
+/// TEXT-indexed database measured ~62 MB peak; a database carrying one very
+/// large index needs more, sized by that index, not the file.
+///
+/// Within a tick **up to four databases are snapshotted at once**
+/// (`BACKUP_CONCURRENCY` in `db_backup.rs`), so a **single-node** server pays
+/// the per-database figure once (~100 MB), while a **multi-tenant** server
+/// pays up to **4×** it at peak (≈400 MB for typical small-index sites, more
+/// if several large-index sites happen to tick together). Measure your own
+/// shape with `cargo run -p ephpm-server --example db_backup_memtest`.
 ///
 /// The object is a plain gzip of a standard SQLite file, **not** encrypted
 /// by ePHPm (unlike `[kv.snapshot]`, so that anything can open it when ePHPm

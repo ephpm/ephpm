@@ -93,6 +93,44 @@ encryption and a policy that limits who can read it. The object is readable
 by anyone who can read the bucket; that is the price of an artifact that
 opens with `sqlite3` when ePHPm is gone.
 
+## Memory headroom
+
+Turning backups on costs some extra RAM while a snapshot runs, so size the
+node for it. The good news is that **the cost does not grow with the database
+size** — the whole reason the snapshot runs inside the process (the pinned
+engine, `v0.8.3-ephpm.3`) instead of shelling out to `sqlite3`, whose
+`VACUUM INTO` needs roughly twice the file resident and OOM-killed large
+backups on earlier builds.
+
+**Per database, budget about ~100 MB of extra resident memory.** More
+precisely the peak is bounded by `~66 MiB + 2× the largest single index` in
+that database: a database whose largest index is small stays near the
+~66 MiB floor (a 328 MiB database with a TEXT index measured ~62 MB peak),
+and only an unusually large single index pushes it higher — and even then by
+twice *that index*, never by the file. It scales with your biggest index, not
+your data.
+
+**Multi-tenant servers snapshot up to four databases at once.** Within one
+tick ePHPm runs up to four backups concurrently (to overlap their disk and
+network waits), so the node-level peak is up to **4×** the per-database
+figure:
+
+| Mode | Databases per tick | Headroom to budget |
+|------|-------------------|--------------------|
+| Single-node (`[db.sqlite] path`) | 1 | **~100 MB** |
+| Per-site / multi-tenant (`[db.sqlite] dir`) | up to 4 at once | **up to ~400 MB** (small-index sites); `4 × (66 MiB + 2× largest index)` if sites carry large indexes |
+
+This is on top of the server's steady-state RSS, and only while a tick is in
+flight (ticks never overlap). To measure the numbers on your own data shape
+rather than trust the rule of thumb, run the harness that ships with the
+server:
+
+```sh
+# build a ~300 MB database, then measure the snapshot's peak RSS
+cargo run -p ephpm-server --example db_backup_memtest -- make  /tmp/t.db 300
+cargo run -p ephpm-server --example db_backup_memtest -- copy  /tmp/t.db /tmp/t-backup.db   # prints peak_rss_mb=
+```
+
 ## 2. Check that it runs
 
 At startup the server logs what it will do:
