@@ -4318,10 +4318,12 @@ static void ephpm_kv_warn_unwired(void)
      * "PHP Request Startup" instead of the calling function. */
     zend_error(E_WARNING,
         "%s(): no ePHPm KV store is attached to this process, so this call did nothing "
-        "and returned its failure value. `ephpm php` does not run the server's KV "
-        "store; reach a running server's KV through its RESP listener "
-        "([kv.redis_compat]) instead. Further ephpm_kv_* calls will not repeat "
-        "this warning", get_active_function_name());
+        "and returned its failure value. Under `ephpm php --site <key> --config <path>` "
+        "the CLI attaches to a RUNNING server's KV automatically (it needs the server up "
+        "and [kv] secret set); with no server running, or without --site/--config, there "
+        "is nothing to attach to. Call ephpm_kv_attached() to branch instead of assuming "
+        "the store is present. Further ephpm_kv_* calls will not repeat this warning",
+        get_active_function_name());
 }
 
 /* Strict UTF-8 check with the same acceptance as Rust's str::from_utf8: no
@@ -4406,6 +4408,19 @@ static int ephpm_kv_ttl_ms(zend_long ttl, long long *out)
 }
 
 /* ── PHP_FUNCTION implementations ─────────────────────────────── */
+
+/* ephpm_kv_attached(): bool — whether a KV store or wire endpoint is wired
+ * into this process, so a library can branch instead of relying on
+ * function_exists('ephpm_kv_get') (always true, even when unbound). True in
+ * the server (its local store), and under `ephpm php --site` once the CLI has
+ * attached to a running server's KV over the wire. It reports that the ops
+ * table is installed; per-request host matching (the unmatched-vhost case) is
+ * a separate concern handled by each op's own failure value. */
+PHP_FUNCTION(ephpm_kv_attached)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_BOOL(g_kv_ops.get != NULL);
+}
 
 PHP_FUNCTION(ephpm_kv_get)
 {
@@ -5391,6 +5406,9 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_pttl, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_flush_all, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_attached, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_wait, 0, 0, 3)
@@ -6697,6 +6715,7 @@ ZEND_END_ARG_INFO()
  * the CLI table (which adds the cli-SAPI-only functions) share one list —
  * a new native function added here lands in both automatically. */
 #define EPHPM_COMMON_FUNCTION_ENTRIES \
+    PHP_FE(ephpm_kv_attached,  arginfo_ephpm_kv_attached) \
     PHP_FE(ephpm_kv_get,       arginfo_ephpm_kv_get) \
     PHP_FE(ephpm_kv_set,       arginfo_ephpm_kv_set) \
     PHP_FE(ephpm_kv_setnx,     arginfo_ephpm_kv_setnx) \
