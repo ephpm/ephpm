@@ -179,6 +179,11 @@ pub(crate) const DB_BACKUP_ROUTE: &str = "/_ephpm/db/backup";
 /// listen`.
 pub(crate) const CRON_ROUTE: &str = "/_ephpm/cron";
 
+/// `POST /_ephpm/cron/run/<name>[?force=true]`: trigger a job now (honouring
+/// the per-tick lease unless `force`). A credential is required on every node
+/// (it runs a command). Answered in [`Router::handle_cron_run`].
+pub(crate) const CRON_RUN_PREFIX: &str = "/_ephpm/cron/run/";
+
 /// Warm-restart KV snapshot control: `GET` = status (gated like
 /// `/_ephpm/requests`), `POST` = write a snapshot now (a credential —
 /// `[server.diagnostics] token` or mTLS — is required on every node).
@@ -696,6 +701,9 @@ pub struct Router {
     /// **every** node (see [`crate::internal_access::InternalAccess::credential_always`]).
     /// Never lifted by `ephpm dev`.
     kv_snapshot_control_access: crate::internal_access::InternalAccess,
+    /// Gate for `POST /_ephpm/cron/run/<name>` (trigger a job now): same ACL
+    /// and token as the KV snapshot control, credential required on every node.
+    cron_control_access: crate::internal_access::InternalAccess,
     /// `false` when `[server.metrics] listen` moves the metrics endpoint and
     /// `/_ephpm/requests` to their own listener: the main listener then does
     /// not answer them (see [`Router::handle_metrics_listener`]).
@@ -1539,6 +1547,14 @@ impl Router {
                 "this endpoint changes the live KV store (a snapshot save or load), so it is \
                  served only with a credential, on every node.",
             ),
+            cron_control_access: crate::internal_access::InternalAccess::credential_always(
+                "[server.diagnostics]",
+                &config.server.diagnostics.allow,
+                &config.server.diagnostics.deny,
+                config.server.diagnostics.token.as_deref(),
+                "this endpoint runs a command (triggers a cron job), so it is served only with \
+                 a credential, on every node.",
+            ),
             internal_on_main: config.server.metrics.listen.is_none(),
             limiter,
             preview: config.server.preview,
@@ -2335,6 +2351,42 @@ impl Router {
         }
     }
 
+    /// `POST /_ephpm/cron/run/<name>` (see [`CRON_RUN_PREFIX`]): trigger a job
+    /// now, honouring the per-tick lease unless `force`. Credential required on
+    /// every node; `405` for a non-POST; `404` naming the knob when cron is off.
+    async fn handle_cron_run(
+        &self,
+        name: &str,
+        method: &hyper::Method,
+        client: &crate::internal_access::Client<'_>,
+        force: bool,
+    ) -> Response<ServerBody> {
+        let Some(svc) = &self.cron else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "404 Not Found: the distributed cron scheduler is off. Enable it with \
+                 [cron] enabled = true.",
+            );
+        };
+        if method != hyper::Method::POST {
+            return error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "405 Method Not Allowed: trigger a job with POST /_ephpm/cron/run/<name>.",
+            );
+        }
+        match self.cron_control_access.check(client) {
+            crate::internal_access::Verdict::Allow => {
+                let nodes = svc.membership().await;
+                let msg = svc.trigger_now(name, force, &nodes).await;
+                json_response_owned(
+                    StatusCode::OK,
+                    serde_json::json!({ "result": msg }).to_string(),
+                )
+            }
+            denied => self.cron_control_access.deny_response(denied),
+        }
+    }
+
     /// Inject per-site `pdo_mysql` credentials for the multi-tenant wire
     /// listener.
     ///
@@ -3126,6 +3178,15 @@ impl Router {
                 // runs on a blocking thread and is awaited here) and that
                 // accepts POST.
                 return Ok(self.handle_kv_snapshot(&uri_path, &method_ref, &client, false).await);
+            }
+            if let Some(name) = uri_path.strip_prefix(CRON_RUN_PREFIX) {
+                // Trigger a job now (async: queries membership, may run). The
+                // `force` query bypasses the per-tick lease.
+                let force = req.uri().query().is_some_and(|q| q.contains("force=true"));
+                return Ok((
+                    self.handle_cron_run(name, &method_ref, &client, force).await,
+                    "diagnostics",
+                ));
             }
             return Ok(self.handle_internal(&uri_path, &method_ref, &client));
         }

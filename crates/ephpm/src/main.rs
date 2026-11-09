@@ -38,6 +38,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod cron_cli;
 mod db_console;
 mod db_import;
 mod db_query;
@@ -284,6 +285,13 @@ enum Commands {
     Db {
         #[command(subcommand)]
         command: DbCommand,
+    },
+
+    /// Distributed scheduled jobs (`[cron]`): list configured jobs, show live
+    /// scheduler status, or trigger a job now.
+    Cron {
+        #[command(subcommand)]
+        command: cron_cli::CronCommand,
     },
 
     /// Inspect or manipulate the KV store on a running server
@@ -878,6 +886,12 @@ fn run() -> anyhow::Result<ExitCode> {
             exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
         }
         Some(Commands::Db { command }) => run_db(command),
+        // Cron CLI: `list` is standalone; `status`/`run-now` use a blocking
+        // HTTP client and so must run outside any tokio runtime.
+        Some(Commands::Cron { command }) => {
+            ensure_cli_tracing();
+            cron_cli::run(command)
+        }
         // Snapshot operations are blocking (file I/O, a blocking HTTP
         // client) and must run outside the tokio runtime the RESP commands
         // use.

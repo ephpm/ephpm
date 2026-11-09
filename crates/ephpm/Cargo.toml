@@ -45,6 +45,10 @@ clap.workspace = true
 # PHP-free by leaving the feature off).
 ephpm-analyze = { workspace = true, features = ["php"] }
 ephpm-config.workspace = true
+# Cron CLI (`ephpm cron list`): compute the next fire of a configured job's
+# schedule in its timezone (reuses ephpm-config's `CronSchedule`).
+chrono.workspace = true
+chrono-tz.workspace = true
 ephpm-db.workspace = true
 # Dump-file sanitizer + compatibility reporter backing `ephpm db import`
 # (src/db_import.rs). Pure Rust, no PHP, no network — the binary builds a
