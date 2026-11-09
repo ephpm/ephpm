@@ -327,6 +327,57 @@ mod tests {
         assert_eq!(out, RunOutcome::Timeout);
     }
 
+    /// C5 — the timeout does not merely *report* `Timeout`: the child is
+    /// actually killed. The child would write a marker after ~2 s; with a
+    /// 200 ms cap the marker must never appear, even well after the child's
+    /// natural finish time.
+    #[tokio::test]
+    async fn run_child_timeout_actually_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("done");
+        let marker_s = marker.to_string_lossy().into_owned();
+        let cancel = CancellationToken::new();
+        #[cfg(unix)]
+        let (prog, args) =
+            ("/bin/sh", vec!["-c".to_string(), format!("sleep 2; echo done > '{marker_s}'")]);
+        #[cfg(windows)]
+        let (prog, args) = (
+            "cmd",
+            vec!["/C".to_string(), format!("ping -n 3 127.0.0.1 >NUL & echo done > {marker_s}")],
+        );
+        let started = std::time::Instant::now();
+        let out =
+            run_child(std::path::Path::new(prog), &args, Duration::from_millis(200), &cancel).await;
+        assert_eq!(out, RunOutcome::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the kill returned promptly (SIGTERM honoured, no grace wait)"
+        );
+        // Past the point the child would have finished on its own.
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert!(!marker.exists(), "the child kept running past its timeout and wrote the marker");
+    }
+
+    /// G7 — argv is passed through verbatim: an element containing shell
+    /// metacharacters stays one argument (no shell ever interprets it).
+    #[test]
+    fn argv_elements_are_never_shell_interpreted() {
+        let req = ExecRequest {
+            job: "j".into(),
+            site: Some("shop".into()),
+            is_php: false,
+            command: vec!["wp".into(), "post list; rm -rf /".into(), "$(id)".into()],
+            config_path: None,
+            timeout: Duration::from_secs(60),
+        };
+        let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
+        // No `--config` without a config path; the argv tail is byte-identical.
+        assert_eq!(
+            args,
+            vec!["exec", "--site", "shop", "--", "wp", "post list; rm -rf /", "$(id)"]
+        );
+    }
+
     #[tokio::test]
     async fn run_child_cancel_preempts() {
         let cancel = CancellationToken::new();

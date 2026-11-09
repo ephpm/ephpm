@@ -260,6 +260,27 @@ mod tests {
         assert_eq!(jobs.len(), 3, "capped at max_jobs_per_site");
     }
 
+    /// E4 — a `jobs/` file whose `@schedule` is present but invalid (six
+    /// fields, i.e. a seconds field; or garbage) is ignored like a file with
+    /// no header, while its valid sibling is discovered. A `@timezone` on its
+    /// own enables nothing.
+    #[test]
+    fn invalid_schedule_header_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs_dir = dir.path().join(".ephpm/cron/jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+        fs::write(jobs_dir.join("seconds.php"), "<?php\n// @schedule */30 * * * * *\n").unwrap();
+        fs::write(jobs_dir.join("garbage.php"), "<?php\n// @schedule every day\n").unwrap();
+        fs::write(jobs_dir.join("tz-only.php"), "<?php\n// @timezone UTC\n").unwrap();
+        fs::write(jobs_dir.join("good.php"), "<?php\n// @schedule 5 4 * * *\n").unwrap();
+
+        let jobs = scan_site("s", dir.path(), &cadence(), 20);
+        assert_eq!(jobs.len(), 1, "only the valid header is a job: {jobs:?}");
+        assert_eq!(jobs[0].name, "site:s:dir:jobs:good.php");
+        assert_eq!(jobs[0].schedule.source(), "5 4 * * *");
+        assert_eq!(jobs[0].timezone, None);
+    }
+
     #[test]
     fn hash_and_star_comment_styles_parse() {
         let dir = tempfile::tempdir().unwrap();
