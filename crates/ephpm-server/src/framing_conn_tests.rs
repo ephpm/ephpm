@@ -42,6 +42,8 @@ async fn spawn_server() -> SocketAddr {
         cluster: ephpm_config::ClusterConfig::default(),
         middleware: Vec::new(),
         opcache: ephpm_config::OpcacheConfig::default(),
+        cron: ephpm_config::CronConfig::default(),
+        source_path: None,
     };
     let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
     let router = Arc::new(Router::new(&config, store, None, None, None, None, None));

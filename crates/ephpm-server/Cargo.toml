@@ -73,6 +73,10 @@ subtle.workspace = true
 # provider (#241) — a new edge, keeps `ring` out of the tree.
 aws-lc-rs = { workspace = true }
 getrandom.workspace = true
+# Cron scheduling (src/cron_scheduler/): calendar math over UTC instants and
+# IANA timezones. Same workspace pins ephpm-config uses for `CronSchedule`.
+chrono.workspace = true
+chrono-tz.workspace = true
 async-channel.workspace = true
 quinn.workspace = true
 h3.workspace = true
