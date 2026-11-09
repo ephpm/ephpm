@@ -377,6 +377,22 @@ These series are emitted by both the embedded SQLite paths and the MySQL/Postgre
 
 `ephpm_query_rows_total` is likewise narrower on the proxy paths, which report `0` where they cannot count rows rather than estimating: the default MySQL path has no row visibility at all, and the PostgreSQL path counts rows *returned* but not rows *affected* by a mutation. Statement coverage per path — including what the proxies deliberately do not record, such as prepared-statement executes and PostgreSQL extended-protocol traffic — is tabulated under [`[db.analysis]`](/reference/config/#dbanalysis) in the config reference.
 
+## Cron (scheduled jobs)
+
+These appear when `[cron] enabled = true`. Labelled `job`, `site` (`-` for a
+siteless job) and `tier` (`operator` or `directory`). The `skipped_total`
+series is also how exactly-once coverage is confirmed: the non-running nodes in
+a cluster count `not_owner`/`lease_lost`. See the
+[Distributed Cron design](/roadmap/distributed-cron/).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_cron_runs_started_total` | counter | `job`, `site`, `tier` | Runs started (won the gate + lease, child spawned). |
+| `ephpm_cron_runs_total` | counter | `job`, `site`, `tier`, `outcome` | Runs finished. `outcome` ∈ `ok`/`failed`/`timeout`/`killed`/`spawn_error`. |
+| `ephpm_cron_duration_seconds` | histogram | `job`, `site` | Run wall-clock duration. |
+| `ephpm_cron_skipped_total` | counter | `job`, `site`, `reason` | Ticks skipped. `reason` ∈ `overlap`/`lease_lost`/`not_owner`/`missed_valve`/`at_cap`. |
+| `ephpm_cron_last_schedule_timestamp_seconds` | gauge | `job`, `site` | Unix time of the last fired tick; `time() - this` is the staleness an alert watches. |
+
 ## Embedded database (WAL checkpoint gate)
 
 These appear whenever `[db.sqlite]` is configured, in every embedded-Turso mode. A sampler republishes them every 2 seconds for each **open** database. The WAL checkpoint gate is ePHPm's always-on, non-configurable workaround for Turso 0.8.3 never rewinding its `-wal` file while readers are active; see [Engines → WAL growth under load, and the checkpoint gate](/architecture/database/engines/#wal-growth-under-load-and-the-checkpoint-gate) for what it does. The gate is temporary (it will be replaced by a periodic `TRUNCATE` checkpoint once Turso's checkpoint can wait for readers), so only the two series an operator needs are exported.

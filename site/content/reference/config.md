@@ -1369,6 +1369,45 @@ application script — same as `auto_prepend_file`. Wrap logic in a function or
 [Native Middleware guide](/guides/native-middleware/#the-php-lane-experimental)
 for the cost measurements.
 
+## `[cron]`
+
+Declarative distributed scheduled jobs that run **exactly once across a
+cluster**, modelled on Kubernetes `CronJob`. Off by default. See the
+[Distributed Cron design](/roadmap/distributed-cron/) for the full model and the
+[scheduled-jobs guide](/guides/cron-and-scheduled-scripts/#native-distributed-cron-cron)
+for recipes. Clustered mode is experimental (lab-gated).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch. `false` ⇒ no scheduler runs at all. |
+| `timezone` | string | `"UTC"` | Default IANA timezone for jobs that omit their own. Coordination is always resolved to UTC instants. |
+| `max_concurrent` | int | `4` | Node-wide cap on simultaneously-running cron jobs. Must be `>= 1`. A due job at the cap is skipped (not queued), like a traditional cron. |
+| `directory_cron` | bool | `false` | Enable the per-site `.ephpm/cron/` directory tier for **every** site (operator opt-in; a tenant can never self-enable). Requires `[server] sites_dir`. |
+| `directory_cron_sites` | list | `[]` | Site keys for which the directory tier is enabled, unioned with `directory_cron`. |
+| `max_jobs_per_site` | int | `20` | Cap on directory-tier jobs discovered per site; extras ignored with a WARN. |
+| `directory_hourly` / `directory_daily` / `directory_weekly` / `directory_monthly` | string | `"0 * * * *"` / `"0 0 * * *"` / `"0 0 * * 0"` / `"0 0 1 * *"` | Override the fixed clock for each cadence subdirectory (a five-field cron expression). |
+
+### `[[cron.jobs]]`
+
+Each array-of-tables entry is one operator-defined job. Every field is validated
+at startup (fail-closed, naming the job).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | *(required)* | Unique identifier — the lease key, metric label, and log key. |
+| `site` | string | *(none)* | The vhost to run as. Present ⇒ runs as that tenant on the site's HRW owner. Absent ⇒ "siteless", runs on the elected cluster leader only. A site requires `[server] sites_dir` and an existing vhost directory. |
+| `schedule` | string | *(required)* | Five-field cron (`minute hour day-of-month month day-of-week`), one-minute granularity. |
+| `timezone` | string | `[cron] timezone` | Per-job IANA timezone override. |
+| `command` | list | *(required)* | The command argv (never a shell string). A first element ending in `.php` runs via `ephpm php --site` (DB bridge bound); otherwise via `ephpm exec --site` (sandbox), or spawned directly for a siteless job. A `.php` command with no `site` is a config error. |
+| `timeout` | string | `"1h"` | Wall-clock cap (`ms`/`s`/`m`/`h`/`d`); the child is killed when exceeded. Must be greater than zero. |
+| `concurrency_policy` | string | `"forbid"` | Overlap policy: `forbid`, `allow`, or `replace` (Kubernetes `concurrencyPolicy`). |
+| `starting_deadline` | string | *(unset)* | Kubernetes `startingDeadlineSeconds`. **Unset ⇒ no catch-up** (only the current tick fires). Set ⇒ the single most-recent missed tick within the window fires. |
+| `suspend` | bool | `false` | Kubernetes `suspend`: parsed and listed, but never fires. |
+
+The status endpoint is `GET /_ephpm/cron` (read-only, gated like
+`/_ephpm/db/backup`); `POST /_ephpm/cron/run/<name>` triggers a job now (a
+credential is required on every node). The `ephpm cron` CLI wraps both.
+
 ## `[opcache]`
 
 Governs the cluster-wide OPcache invalidation watcher (Phase 1 of the
