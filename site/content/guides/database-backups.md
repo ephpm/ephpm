@@ -294,18 +294,45 @@ source    = "primary"   # default: back up from the write node
 - Confirm the split with `ephpm_db_backup_skipped_total{site,reason}` on the
   nodes that are *not* responsible: it increments there each tick while the one
   responsible node uploads.
-- **Restore re-seeds the whole cluster.** A clustered backup carries the CDC
-  replication bookkeeping; `ephpm db restore` strips it so the file comes back as
-  clean origin data, and on restart the restored data re-seeds as the site's
-  origin and peers re-bootstrap onto it. Because of that, a clustered restore
-  requires **every node stopped** (the tool can only check the local node, so it
-  says so and asks you to confirm). Restore the whole-database case on the
-  lowest-ordinal node and start it first; the per-site case is still being
-  validated on live clusters — see the
-  [clustered-backup design note](/roadmap/clustered-db-backups/).
 
-See the design note for the exactly-once guarantees, the reconciliation, and
-what still needs multi-node lab validation before this is more than experimental.
+Two clustered topologies, and they are **not** equally mature:
+
+### Whole-database clustered — supported
+
+One shared database, an elected primary. `ephpm db restore` strips the CDC
+bookkeeping, which mints a **fresh log identity** on open; that forces every
+replica to re-bootstrap from the restored primary when it reconnects. To restore:
+stop every node, restore on the **lowest-ordinal node** (the one the election
+makes primary), and start it first. The whole cluster converges on the restored
+data.
+
+### Per-site clustered — EXPERIMENTAL, lab-pending
+
+Available only because you opted into the experimental
+[`[db.sqlite.replication] per_site = true`](/reference/config/#dbsqlitereplication-clustered-mode-only).
+The **backup** half works the same way — each site is snapshotted once, by its
+HRW owner (or a replica) — but the **restore** convergence is **not yet validated
+on a live cluster** and can silently lose a restore:
+
+- Startup logs a `WARN` naming this; `ephpm db restore` prints a loud warning
+  before it asks you to confirm.
+- The hazard: after the strip, the restored node re-seeds the site as its origin,
+  but whether the *cluster* converges onto it depends on this node settling with
+  a **dominating version epoch** when the cluster restarts. If a peer comes back
+  with a higher epoch for that site, it can overwrite the restore with **no
+  error**.
+- Until this is lab-validated, treat it as best-effort: stop **every** node, then
+  bring **the restored node up first** so it settles and publishes its epoch
+  before any peer rejoins. The planned `--reseed` mitigation (remove the site's
+  `.db` on every other node so they bootstrap from the restored one) is
+  **not yet implemented**.
+
+**A clustered restore re-seeds the whole cluster** either way, and the CLI can
+only check the local node — so it demands every node be stopped and asks you to
+confirm. See the
+[clustered-backup design note](/roadmap/clustered-db-backups/) for the
+exactly-once guarantees, the reconciliation, and the multi-node lab validation
+each topology still needs.
 
 ## What it does not do
 

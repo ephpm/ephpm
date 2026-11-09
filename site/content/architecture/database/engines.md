@@ -449,16 +449,20 @@ What it is and is not:
 - **The object is plaintext** (a gzip of a standard SQLite file, not the
   `[kv.snapshot]` AEAD envelope — so it needs no `[kv] secret` and opens
   anywhere). The bucket must carry server-side encryption and a tight policy.
-- **All modes, including clustered** (experimental). In single-node and
-  per-site-single mode the one holder backs each database up. In clustered mode
-  the scheduler gates each database on this node's election/HRW ownership so it
-  is snapshotted by exactly one node — the write node by default, or a non-write
-  holder with `[db.sqlite.backup] source = "replica"` — and `ephpm db restore`
-  strips the CDC replication bookkeeping the physical image carries so a restored
-  file re-seeds the cluster as clean origin data. A clustered restore re-seeds
-  the whole cluster and so requires every node stopped. See the
+- **All modes.** In single-node and per-site-single mode the one holder backs
+  each database up. In clustered mode the scheduler gates each database on this
+  node's election/HRW ownership so it is snapshotted by exactly one node — the
+  write node by default, or a non-write holder with `[db.sqlite.backup] source =
+  "replica"` — and `ephpm db restore` strips the CDC replication bookkeeping the
+  physical image carries so a restored file re-seeds the cluster as clean origin
+  data. A clustered restore re-seeds the whole cluster and so requires every node
+  stopped. **Whole-database clustered backup is supported** (the fresh log
+  identity the strip mints forces replicas to re-bootstrap); **per-site clustered
+  backup is experimental and lab-pending** — reachable only through the
+  experimental `per_site = true`, with restore convergence not yet validated on a
+  live cluster (startup and the restore command both warn). See the
   [clustered-backup design note](/roadmap/clustered-db-backups/) for the
-  exactly-once guarantees and the multi-node lab validation it still needs.
+  exactly-once guarantees and the multi-node lab validation each topology needs.
 
 The from-zero walkthrough — enabling it, credentials for S3/MinIO/R2, reading
 the listing and the status endpoint, retention, and a worked restore — is the

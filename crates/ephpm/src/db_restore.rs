@@ -69,10 +69,30 @@ pub struct ListRequest {
 struct Target {
     key: String,
     path: PathBuf,
-    /// The config runs a clustered embedded database. A restore then re-seeds
-    /// the whole cluster, so the confirmation and docs demand every node be
-    /// stopped — not just this one, which is all the offline probe can see.
-    clustered: bool,
+    /// `Some` when the config runs a **clustered** embedded database. A
+    /// restore then re-seeds the whole cluster, so the confirmation and docs
+    /// demand every node be stopped — not just this one, which is all the
+    /// offline probe can see. The kind separates the supported whole-database
+    /// path from the experimental per-site one.
+    cluster: Option<ClusterRestoreKind>,
+}
+
+/// Which clustered topology a restore target belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterRestoreKind {
+    /// Whole-database clustered: one shared database, an elected primary.
+    /// **Supported** — stripping the CDC bookkeeping mints a fresh log
+    /// identity, which forces every replica to re-bootstrap from the restored
+    /// primary on reconnect. Restore on the lowest-ordinal node and start it
+    /// first.
+    WholeDb,
+    /// Per-site clustered: an HRW owner per site. **Experimental** — the same
+    /// strip applies, but whether the cluster *converges* onto the restored
+    /// data depends on this node settling with a dominating `SiteVersion`
+    /// epoch across a whole-cluster restart, which is not yet lab-validated.
+    /// A returning peer with a higher epoch for the site could overwrite the
+    /// restore. The planned `--reseed` mitigation is not yet implemented.
+    PerSite,
 }
 
 /// What `--from` resolved to.
@@ -112,7 +132,8 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
             Ok(Target {
                 key: site.to_string(),
                 path: PathBuf::from(&sqlite.path),
-                clustered: matches!(mode, EmbeddedSqliteMode::Clustered),
+                cluster: matches!(mode, EmbeddedSqliteMode::Clustered)
+                    .then_some(ClusterRestoreKind::WholeDb),
             })
         }
         EmbeddedSqliteMode::PerSite | EmbeddedSqliteMode::PerSiteClustered => {
@@ -126,7 +147,8 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
             Ok(Target {
                 key: resolved.key,
                 path,
-                clustered: matches!(mode, EmbeddedSqliteMode::PerSiteClustered),
+                cluster: matches!(mode, EmbeddedSqliteMode::PerSiteClustered)
+                    .then_some(ClusterRestoreKind::PerSite),
             })
         }
         EmbeddedSqliteMode::None => {
@@ -280,17 +302,35 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
         target.path.display(),
         if exists { " (will be REPLACED)" } else { " (does not exist yet)" }
     );
-    if target.clustered {
-        println!(
-            "mode:    CLUSTERED — this re-seeds the whole cluster for this database. Every node \
-             must be stopped (this tool can only check the local node). On restart, the restored \
-             data re-seeds as the site's origin and peers re-bootstrap onto it."
-        );
-    }
-    let prompt = if target.clustered {
-        "This re-seeds the CLUSTER with the backup. Confirm every node is stopped."
-    } else {
-        "This replaces the live database with the backup."
+    let prompt = match target.cluster {
+        None => "This replaces the live database with the backup.",
+        Some(ClusterRestoreKind::WholeDb) => {
+            println!(
+                "mode:    CLUSTERED (whole-database) — this re-seeds the whole cluster for this \
+                 database. Every node must be stopped (this tool can only check the local node). \
+                 Restore on the lowest-ordinal node and start it first; on restart the restored \
+                 data re-seeds as the origin and every replica re-bootstraps onto it."
+            );
+            "This re-seeds the CLUSTER with the backup. Confirm every node is stopped."
+        }
+        Some(ClusterRestoreKind::PerSite) => {
+            println!(
+                "mode:    CLUSTERED (per-site) — EXPERIMENTAL, not yet validated on a live cluster."
+            );
+            eprintln!(
+                "WARNING: per-site clustered restore is EXPERIMENTAL. The backup's CDC \
+                 bookkeeping is stripped so this node re-seeds the site as its origin, but whether \
+                 the CLUSTER converges onto the restored data depends on this node settling with a \
+                 dominating version epoch when the cluster restarts. If a peer returns with a \
+                 higher epoch for this site, it can OVERWRITE the restore with no error — silent \
+                 divergence. Mitigations: stop EVERY node, then bring THIS node up FIRST so it \
+                 settles and publishes its epoch before any peer. The planned `--reseed` (which \
+                 removes the site's .db on every other node so they bootstrap from this one) is \
+                 NOT YET IMPLEMENTED. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
+            );
+            "This re-seeds the CLUSTER with an EXPERIMENTAL per-site restore. Confirm every node \
+             is stopped and you have read the warning above."
+        }
     };
     confirm(prompt, req.yes)?;
 
@@ -502,7 +542,11 @@ mod tests {
         let config = Config::load(&path).unwrap();
         let target = resolve_target(&config, "default").unwrap();
         assert_eq!(target.path, PathBuf::from("/var/lib/ephpm/one.db"));
-        assert!(target.clustered, "a clustered config must set the clustered flag");
+        assert_eq!(
+            target.cluster,
+            Some(ClusterRestoreKind::WholeDb),
+            "whole-DB clustered is the supported restore kind"
+        );
         // Still fail-closed on a non-`default` key in whole-DB mode.
         assert!(resolve_target(&config, "shop").is_err(), "whole-DB has only `default`");
     }
@@ -532,7 +576,11 @@ mod tests {
         let target = resolve_target(&config, "shop").unwrap();
         assert_eq!(target.key, "shop");
         assert_eq!(target.path, dbdir.join("shop.db"));
-        assert!(target.clustered);
+        assert_eq!(
+            target.cluster,
+            Some(ClusterRestoreKind::PerSite),
+            "per-site clustered is the experimental restore kind"
+        );
         assert!(resolve_target(&config, "ghost").is_err(), "unknown vhost still fail-closed");
     }
 

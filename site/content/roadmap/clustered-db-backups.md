@@ -12,6 +12,24 @@ weight = 24
 > [Database backups guide](/guides/database-backups/) and
 > [Engines → Backups](/architecture/database/engines/#supported-backups).
 
+## Maturity, up front
+
+The two clustered topologies are deliberately **not** shipped at the same
+confidence:
+
+- **Whole-database clustered backup — supported.** The strip mints a fresh log
+  identity, which forces replicas to re-bootstrap from the restored primary;
+  restore on the lowest-ordinal node and start it first. Deterministic and the
+  higher-confidence path.
+- **Per-site clustered backup — EXPERIMENTAL, lab-pending.** The backup half is
+  fine, but restore *convergence* depends on a `SiteVersion` epoch-dominance
+  property that unit tests cannot prove (below). To keep that gap from ever
+  shipping as production-ready, per-site clustered backup is reachable only
+  through the experimental `[db.sqlite.replication] per_site = true` opt-in, and
+  both **startup** and **`ephpm db restore`** warn loudly about it. The planned
+  `--reseed` mitigation is documented but **not built** — lab item 4 decides
+  whether it is needed.
+
 ## Where we are
 
 Scheduled backups ([`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup),
@@ -241,20 +259,26 @@ operating procedure is what engages them:
   primary with a fresh log id; every replica, on reconnect, sees a source-log
   change → proven divergence → re-bootstraps from the restored primary. The
   owner is predictable (lowest `node_id`), so the procedure is deterministic.
-- **Per-site clustered — supported, but convergence is epoch-dependent and
-  lab-gated.** The site's owner after restart is `hrw_owner`, which depends on
-  which nodes are alive first — not predictable offline. Convergence relies on
-  the restored node **settling first** and publishing a dominating `SiteVersion`
-  (`next_owner_epoch` bumps the epoch above every peer's). When a peer later
-  becomes HRW owner of the site, `decide_warm_settle` sees the restored node's
-  higher `SiteVersion` in gossip and catches up from it before serving, so the
-  restored data wins. This is correct *if* the restored node's epoch dominates
-  the epochs returning peers bring — which is the one cluster-durability property
-  unit tests cannot prove and the lab must (see below). The belt-and-suspenders
-  alternative, should the lab show epoch dominance is not reliable across a
-  whole-cluster restart, is a `--reseed` that removes the site's `.db` on every
-  other node so they come up cold and bootstrap from the restored owner; the
-  design keeps that option open but does not ship it unless the lab forces it.
+- **Per-site clustered — EXPERIMENTAL, gated and lab-pending.** The site's owner
+  after restart is `hrw_owner`, which depends on which nodes are alive first —
+  not predictable offline. Convergence relies on the restored node **settling
+  first** and publishing a dominating `SiteVersion` (`next_owner_epoch` bumps the
+  epoch above every peer's). When a peer later becomes HRW owner of the site,
+  `decide_warm_settle` sees the restored node's higher `SiteVersion` in gossip
+  and catches up from it before serving, so the restored data wins. This is
+  correct *only if* the restored node's epoch dominates the epochs returning
+  peers bring — which is the one cluster-durability property unit tests cannot
+  prove and the lab must (see below). **Because that gap is reachable, per-site
+  clustered backup must never present as production-ready.** It is reachable only
+  through the experimental `[db.sqlite.replication] per_site = true` opt-in, and
+  on top of that: startup logs a dedicated `WARN` naming the restore caveat, and
+  `ephpm db restore` prints a loud warning before the confirmation (the hazard,
+  the "bring this node up first" workaround, and the planned `--reseed`). The
+  belt-and-suspenders mitigation, should the lab show epoch dominance is not
+  reliable across a whole-cluster restart, is a `--reseed` that removes the
+  site's `.db` on every other node so they come up cold and bootstrap from the
+  restored owner — **documented as planned, not built**; lab item 4 decides
+  whether it is needed.
 
 ### Restore stays offline, and says what it does
 
@@ -357,9 +381,11 @@ dominance surviving a whole-cluster restart** (open question, flagged rather tha
 guessed): the restored node must settle and publish an epoch that dominates the
 epochs returning peers bring. If gossip has dropped the site's
 `kv:sqlite:ver:<site>` before the restored node settles, it could compute a
-*lower* epoch than a returning peer and lose. The lab round-trip (item 4) is the
-gate on this; if it is not reliable, the fallback is the `--reseed` that
-invalidates peer copies (removes their `<site>.db`) so the question does not
-arise. Whole-DB clustered restore does not have this dependency (the log-id
-change forces re-bootstrap directly), so it is the safer of the two and can ship
-first if per-site convergence needs more lab time.
+*lower* epoch than a returning peer and lose. Until the lab round-trip (item 4)
+settles this, per-site clustered backup ships **experimental-only** — reachable
+only through the experimental `per_site = true` opt-in, with a loud `WARN` at
+startup and at restore (implemented). The fallback, **if** the lab shows epoch
+dominance is not reliable, is a `--reseed` that invalidates peer copies (removes
+their `<site>.db`) so the question does not arise — **planned, not built**.
+Whole-DB clustered restore does not have this dependency (the log-id change
+forces re-bootstrap directly), so it is the supported path and ships now.

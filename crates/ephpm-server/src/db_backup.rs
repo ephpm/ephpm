@@ -803,6 +803,32 @@ impl DbBackupService {
             "embedded database backup enabled (VACUUM INTO snapshot → gzip → object storage; \
              the object is not encrypted by ePHPm — use bucket-side encryption)"
         );
+        // Whole-database clustered backup is the supported clustered path; the
+        // per-site variant is experimental and lab-pending (its restore
+        // convergence is not yet validated). Per-site clustered mode is only
+        // reachable because the operator opted into the experimental
+        // `[db.sqlite.replication] per_site = true`; make the backup-specific
+        // caveat loud so it can never be mistaken for production-ready.
+        match &svc.gate {
+            BackupGate::WholeDbClustered { .. } => tracing::info!(
+                "clustered database backup: whole-database mode — the supported clustered path. \
+                 The elected primary (or a replica, with source = \"replica\") snapshots the one \
+                 database; `ephpm db restore` re-seeds the cluster and replicas re-bootstrap from \
+                 the restored primary's fresh log identity."
+            ),
+            BackupGate::PerSiteClustered { .. } => tracing::warn!(
+                "clustered database backup: PER-SITE mode is EXPERIMENTAL and lab-pending. Each \
+                 site is snapshotted once by its owner (or a replica), but RESTORE convergence is \
+                 NOT yet validated on a live cluster — it relies on this node settling with a \
+                 dominating version epoch across a whole-cluster restart, and a returning peer \
+                 with a higher epoch could overwrite a restore silently (the planned `--reseed` \
+                 mitigation is not yet implemented). The SUPPORTED clustered backup path is \
+                 whole-database clustered mode. This runs only because you enabled the \
+                 experimental [db.sqlite.replication] per_site = true. See the clustered-backup \
+                 design note."
+            ),
+            BackupGate::Always => {}
+        }
         Ok(Some(svc))
     }
 

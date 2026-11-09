@@ -564,7 +564,14 @@ live database. It is a **file install**, not an SQL replay, and it is
    restore additionally **strips the CDC replication bookkeeping** the image
    carries (step 5a) so it re-seeds the cluster as clean origin data — but then
    the restore re-seeds *every* node for that database, so the whole cluster must
-   be stopped (the command can only check the local node and says so). See the
+   be stopped (the command can only check the local node and says so).
+   **Whole-database clustered** is supported — restore on the lowest-ordinal node
+   and start it first, and replicas re-bootstrap from the fresh log identity.
+   **Per-site clustered is EXPERIMENTAL**: the command prints a loud warning that
+   its restore convergence is not yet validated on a live cluster (a returning
+   peer with a higher `SiteVersion` epoch could overwrite the restore silently;
+   the planned `--reseed` mitigation is not yet implemented) and asks you to
+   confirm. See the
    [clustered-backup design note](/roadmap/clustered-db-backups/).
 2. **Picks the object.** With `--from s3://bucket[/prefix]` the objects under
    `<prefix>/<site>/` are listed and the newest with a timestamp **at or
