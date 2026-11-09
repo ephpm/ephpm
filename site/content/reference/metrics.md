@@ -579,6 +579,7 @@ Recorded only when `[db.sqlite.backup] enabled = true` ([config](/reference/conf
 | `ephpm_db_backup_last_success_timestamp_seconds` | gauge | `site` | Unix time of the last successful upload; `time() - this` is the backup lag. |
 | `ephpm_db_backup_retention_deleted_total` | counter | `site` | Objects deleted by the retention sweep (the newest is never one of them). |
 | `ephpm_db_backup_retention_errors_total` | counter | `site` | Retention sweeps that failed (a listing or a delete). The backup itself succeeded; the sweep is retried on the next tick. |
+| `ephpm_db_backup_skipped_total` | counter | `site`, `reason` (`not_primary`, `not_replica`, `not_owner`) | **Clustered modes only.** Databases this node did *not* back up this tick because another node is responsible. In clustered mode each database is snapshotted by exactly one node; this increments on every *other* node, so its presence is how you confirm exactly-once coverage. `not_primary`/`not_replica` on a whole-database cluster (by `[db.sqlite.backup] source`), `not_owner` on a per-site cluster. |
 
 ```promql
 # A site whose last good backup is older than two intervals (here: 15m).

@@ -374,10 +374,15 @@ off the tenant path) through a short-lived in-process gated handle, gzips
 it and uploads it as
 `<s3_path>/<site>/<YYYYMMDDTHHMMSSZ>.db.gz`, with a retention sweep that
 always keeps the newest object; `ephpm db restore` installs one offline
-after a `PRAGMA integrity_check`. RPO = `interval`. Single-node and per-site
-modes only; the object is plaintext (bucket-side encryption). The replica
-bootstrap deliberately keeps its logical dump: a physical image carries
-triggers, which a replica must not hold.
+after a `PRAGMA integrity_check`. RPO = `interval`. The object is plaintext
+(bucket-side encryption). The replica bootstrap deliberately keeps its logical
+dump: a physical image carries triggers, which a replica must not hold.
+**Clustered backup shipped as a follow-up (targeted v0.16.0):** the scheduler
+gates each database on election/HRW ownership so it is snapshotted by exactly
+one node (`[db.sqlite.backup] source` = `primary` | `replica`), and
+`ephpm db restore` strips the CDC replication bookkeeping a physical clustered
+image carries so a restored file re-seeds the cluster as clean origin data — see
+the [clustered-backup design note](/roadmap/clustered-db-backups/).
 
 #### Tier 1: point-in-time restore (planned)
 
@@ -389,15 +394,16 @@ at or before the target time, then replay generations up to it through
 `apply_batch`. Requires enabling CDC capture in the non-clustered modes
 (today only the clustered registries open with `enable_cdc_on_connect`),
 `turso_cdc` retention pruning (still deferred above), and generation
-compaction. Also deferred from Tier 0: **clustered-mode backup**
-(owner/primary-only scheduling so a site is shipped once, and an artifact
-that carries `turso_cdc` + `__ephpm_cdc_source` + `__litewire_cdc_watermark`
-bookkeeping a restore must reconcile with the lineage rules — today
-`enabled = true` with clustering is a startup refusal), a **live restore**
-(quiesce the site's serving handle, swap, reopen — today the restore is
-offline only), **boot-time auto-hydrate** (pull the newest object when a
-site's `.db` is absent at first open), and an opt-in `encrypt = true`
-reusing the KV snapshot primitives (same AEAD, HKDF from `[kv] secret`).
+compaction. (**Clustered-mode backup** — owner/primary-only scheduling so a
+database is shipped once, and strip-on-restore reconciliation of the
+`turso_cdc` + `__ephpm_cdc_source` + `__litewire_cdc_watermark` bookkeeping —
+was its own follow-up, shipped as a feature; see the
+[clustered-backup design note](/roadmap/clustered-db-backups/).) Still deferred
+from Tier 0: a **live restore** (quiesce the site's serving handle, swap,
+reopen — today the restore is offline only), **boot-time auto-hydrate** (pull
+the newest object when a site's `.db` is absent at first open), and an opt-in
+`encrypt = true` reusing the KV snapshot primitives (same AEAD, HKDF from
+`[kv] secret`).
 
 ### Phase 3 — default engine (a major-version decision)
 

@@ -70,27 +70,36 @@
 //!
 //! # Modes
 //!
-//! Single-node and per-site (single) only. Clustered modes are refused at
-//! startup by `Config::validate` (and again here): nothing schedules per
-//! owner/primary yet, so every node would ship every site once per
-//! interval, and the artifact would carry CDC bookkeeping
-//! (`turso_cdc`, `__ephpm_cdc_source`, `__litewire_cdc_watermark`) a restore
-//! must reconcile with the lineage rules.
+//! All modes. In single-node and per-site (single) mode this node holds the
+//! only copy and backs every database up ([`BackupGate::Always`]). In
+//! **clustered** modes [`BackupGate`] gates each database on this node's
+//! election/HRW ownership so it is snapshotted by exactly one node — the write
+//! node by default, or a non-write holder with `[db.sqlite.backup] source =
+//! "replica"`. A physical snapshot of a clustered database carries CDC
+//! bookkeeping (`turso_cdc`, `__ephpm_cdc_*`, `__litewire_cdc_watermark`);
+//! `ephpm db restore` strips it (see [`strip_cdc_bookkeeping`]) so a restored
+//! file re-seeds the cluster as clean origin data. See the clustered-backup
+//! design note.
 //!
 //! # Restore
 //!
 //! `ephpm db restore` (offline only in Tier 0; the CLI in
 //! `crates/ephpm/src/db_restore.rs`) picks the newest object at or before
-//! `--at`, downloads, gunzips, verifies with `PRAGMA integrity_check`, and
-//! renames over the site's `.db` — only when no server holds the file.
+//! `--at`, downloads, gunzips, strips the CDC bookkeeping a clustered image
+//! carries (a no-op on a single-node image), verifies with `PRAGMA
+//! integrity_check`, and renames over the site's `.db` — only when no server
+//! holds the file (a clustered restore re-seeds the whole cluster, so every
+//! node must be stopped).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
-use ephpm_config::Config;
+use ephpm_cluster::{ClusterHandle, NodeInfo, NodeState, hrw_owner};
+use ephpm_config::{BackupSource, Config};
 use litewire::Turso;
 use litewire::litewire_turso::offload;
 use metrics::{counter, gauge, histogram};
@@ -119,6 +128,11 @@ pub const METRIC_RETENTION_DELETED: &str = "ephpm_db_backup_retention_deleted_to
 /// Metric: retention sweeps that failed (listing or a delete). Never fatal
 /// to the backup itself.
 pub const METRIC_RETENTION_ERRORS: &str = "ephpm_db_backup_retention_errors_total";
+/// Metric: databases this node did **not** back up this tick because another
+/// node is responsible, by site and `reason` (`not_primary`, `not_replica`,
+/// `not_owner`). Only emitted in clustered modes; its presence on a node is
+/// how an operator confirms exactly-once coverage across the cluster.
+pub const METRIC_BACKUP_SKIPPED: &str = "ephpm_db_backup_skipped_total";
 
 /// How many databases are backed up at once within a tick. Each holds a
 /// WAL-gate permit on its own file and runs its `VACUUM INTO` on an
@@ -188,6 +202,177 @@ fn enumerate_site_databases(dir: &Path) -> Vec<Database> {
     out
 }
 
+/// Decides, each tick, which databases **this** node is responsible for
+/// snapshotting — so a clustered database is backed up by exactly one node
+/// instead of every node shipping every copy.
+///
+/// The ownership primitives already exist and the serving path uses them
+/// the same way: the whole-database primary is the `primary_view`
+/// `AtomicBool` the CDC election flips; a per-site owner is
+/// [`hrw_owner`]. There is no "am I the owner?" helper on
+/// [`ClusterHandle`], so this recomputes it from the membership view each
+/// tick (once, reused for every database), exactly as `settle_round` and
+/// `sql_forward::plan_serve` do.
+enum BackupGate {
+    /// Single-node or per-site (single): this node holds the only copy, so
+    /// it is responsible for every database, always.
+    Always,
+    /// Whole-database clustered: one database, replicated to every node. The
+    /// write node is the elected primary; the backup replica is the
+    /// lowest-ordinal alive non-primary node.
+    WholeDbClustered {
+        cluster: Arc<ClusterHandle>,
+        /// Shared with the CDC election: `true` iff this node is the current
+        /// single-database primary. Used for `source = "primary"`.
+        primary_view: Arc<AtomicBool>,
+        source: BackupSource,
+    },
+    /// Per-site clustered: each site has its own HRW owner; this node is
+    /// responsible for a site only when it is that site's backup node under
+    /// `source`.
+    PerSiteClustered { cluster: Arc<ClusterHandle>, source: BackupSource },
+}
+
+impl BackupGate {
+    /// A short label for the startup log, naming the scheduling mode.
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Always => "every-database (unclustered)",
+            Self::WholeDbClustered { source: BackupSource::Primary, .. } => {
+                "whole-database clustered, from the primary"
+            }
+            Self::WholeDbClustered { source: BackupSource::Replica, .. } => {
+                "whole-database clustered, from a replica"
+            }
+            Self::PerSiteClustered { source: BackupSource::Primary, .. } => {
+                "per-site clustered, from each site's owner"
+            }
+            Self::PerSiteClustered { source: BackupSource::Replica, .. } => {
+                "per-site clustered, from each site's replica"
+            }
+        }
+    }
+
+    /// Split `databases` into the ones this node must back up this tick and
+    /// the ones another node owns (each with a skip reason for the metric).
+    /// Reads the membership view at most once.
+    async fn partition(&self, databases: Vec<Database>) -> (Vec<Database>, Vec<(Database, Reason)>) {
+        match self {
+            Self::Always => (databases, Vec::new()),
+            Self::WholeDbClustered { cluster, primary_view, source } => {
+                let nodes = cluster.nodes().await;
+                let self_id = cluster.self_node().id;
+                let is_primary = primary_view.load(Ordering::Relaxed);
+                let responsible = whole_db_responsible(*source, is_primary, &self_id, &nodes);
+                let reason = match source {
+                    BackupSource::Primary => "not_primary",
+                    BackupSource::Replica => "not_replica",
+                };
+                partition_by(databases, |_| responsible, reason)
+            }
+            Self::PerSiteClustered { cluster, source } => {
+                let nodes = cluster.nodes().await;
+                let self_id = cluster.self_node().id;
+                partition_by(
+                    databases,
+                    |db| per_site_responsible(*source, &self_id, &db.site, &nodes),
+                    "not_owner",
+                )
+            }
+        }
+    }
+}
+
+/// A fixed skip reason string for [`METRIC_BACKUP_SKIPPED`].
+type Reason = &'static str;
+
+/// Partition `databases` by `keep`, tagging the skipped ones with `reason`.
+fn partition_by(
+    databases: Vec<Database>,
+    keep: impl Fn(&Database) -> bool,
+    reason: Reason,
+) -> (Vec<Database>, Vec<(Database, Reason)>) {
+    let mut responsible = Vec::new();
+    let mut skipped = Vec::new();
+    for db in databases {
+        if keep(&db) {
+            responsible.push(db);
+        } else {
+            skipped.push((db, reason));
+        }
+    }
+    (responsible, skipped)
+}
+
+/// Whether this node runs the **whole-database** backup, given the
+/// membership view and the election's primary flag.
+///
+/// `source = "primary"` follows the authoritative election (`is_primary`).
+/// `source = "replica"` deterministically picks the lowest-ordinal alive
+/// non-primary node — computed purely from membership so every node agrees
+/// without reading the election key — and falls back to the primary when no
+/// such node exists (a lone node in a cluster), so a database is never left
+/// unbacked.
+fn whole_db_responsible(
+    source: BackupSource,
+    is_primary: bool,
+    self_id: &str,
+    nodes: &[NodeInfo],
+) -> bool {
+    match source {
+        BackupSource::Primary => is_primary,
+        BackupSource::Replica => match backup_replica_whole_db(nodes) {
+            Some(id) => id == self_id,
+            None => is_primary,
+        },
+    }
+}
+
+/// The lowest-ordinal alive non-draining node that is **not** the naive
+/// primary (`alive[0]`): the whole-database backup replica. `None` when
+/// fewer than two such nodes are alive.
+fn backup_replica_whole_db(nodes: &[NodeInfo]) -> Option<String> {
+    let mut alive: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.state == NodeState::Alive && !n.draining)
+        .map(|n| n.id.as_str())
+        .collect();
+    alive.sort_unstable();
+    alive.get(1).map(|&s| s.to_string())
+}
+
+/// Whether this node runs the backup for **one site** in per-site clustered
+/// mode.
+///
+/// `source = "primary"` is the site's [`hrw_owner`]. `source = "replica"` is
+/// the highest-HRW alive non-owner holder (the 2nd-ranked HRW node), with the
+/// owner as the fallback when it is the only alive holder.
+fn per_site_responsible(
+    source: BackupSource,
+    self_id: &str,
+    site: &str,
+    nodes: &[NodeInfo],
+) -> bool {
+    let owner_is_self = hrw_owner(nodes, site).is_some_and(|o| o.id == self_id);
+    match source {
+        BackupSource::Primary => owner_is_self,
+        BackupSource::Replica => match backup_replica_per_site(nodes, site) {
+            Some(id) => id == self_id,
+            None => owner_is_self,
+        },
+    }
+}
+
+/// The per-site backup replica: the HRW owner of `site` among the alive
+/// nodes **with the real owner removed** — i.e. the 2nd-ranked HRW node.
+/// Reuses [`hrw_owner`] (and so its alive/draining filtering and tie-break)
+/// on the filtered slice. `None` when the owner is the only alive holder.
+fn backup_replica_per_site(nodes: &[NodeInfo], site: &str) -> Option<String> {
+    let owner_id = hrw_owner(nodes, site)?.id.clone();
+    let rest: Vec<NodeInfo> = nodes.iter().filter(|n| n.id != owner_id).cloned().collect();
+    hrw_owner(&rest, site).map(|n| n.id.clone())
+}
+
 /// A backup object as listed from the bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupObject {
@@ -236,8 +421,10 @@ pub struct SiteStatus {
 /// What one tick did.
 #[derive(Debug, Clone, Default)]
 pub struct TickReport {
-    /// Databases found.
+    /// Databases this node was responsible for (backed up or attempted).
     pub databases: usize,
+    /// Databases another node owns this tick, skipped here (clustered modes).
+    pub skipped: usize,
     /// Backed up and uploaded.
     pub ok: usize,
     /// Failed at the snapshot or the upload.
@@ -256,6 +443,9 @@ pub struct DbBackupService {
     interval: Duration,
     retention: Duration,
     source: DatabaseSource,
+    /// Per-tick "which databases is this node responsible for?" gate.
+    /// [`BackupGate::Always`] outside clustered mode.
+    gate: BackupGate,
     staging: PrivateStagingDir,
     /// Serialises ticks: one in flight at a time, never overlapping.
     running: tokio::sync::Mutex<()>,
@@ -521,12 +711,23 @@ impl DbBackupService {
     /// are off. Checks the mode, creates the private staging directory and
     /// the object client (credentials from the environment).
     ///
+    /// `cluster` and `primary_view` are needed only in clustered modes: they
+    /// gate which node snapshots each database (whole-database: the elected
+    /// primary / a replica; per-site: the site's HRW owner / a replica). In
+    /// single-node and per-site-single mode the gate is
+    /// [`BackupGate::Always`] and both arguments are ignored.
+    ///
     /// # Errors
     ///
-    /// A clustered mode, a missing `[db.sqlite] dir` in per-site mode, a
-    /// staging directory that cannot be created, missing credentials, or an
-    /// unparsable knob (which `Config::validate` normally catches first).
-    pub fn from_config(config: &Config) -> anyhow::Result<Option<Arc<Self>>> {
+    /// A missing `[db.sqlite] dir` in per-site mode, a clustered mode without
+    /// a running cluster handle, a staging directory that cannot be created,
+    /// missing credentials, or an unparsable knob (which `Config::validate`
+    /// normally catches first).
+    pub fn from_config(
+        config: &Config,
+        cluster: Option<&Arc<ClusterHandle>>,
+        primary_view: &Arc<AtomicBool>,
+    ) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(sqlite) = config.db.sqlite.as_ref() else {
             return Ok(None);
         };
@@ -534,25 +735,42 @@ impl DbBackupService {
         if !backup.enabled {
             return Ok(None);
         }
-        let source = match crate::embedded_sqlite_mode(config) {
+        // Clustered modes need the cluster handle to decide ownership.
+        let cluster_for = |mode: &str| -> anyhow::Result<Arc<ClusterHandle>> {
+            cluster.cloned().with_context(|| {
+                format!("[db.sqlite.backup] {mode} mode needs a running cluster, but none started")
+            })
+        };
+        let per_site_dir = || -> anyhow::Result<PathBuf> {
+            Ok(PathBuf::from(
+                sqlite
+                    .dir
+                    .as_deref()
+                    .context("[db.sqlite.backup] per-site mode requires [db.sqlite] dir")?,
+            ))
+        };
+        let (source, gate) = match crate::embedded_sqlite_mode(config) {
             EmbeddedSqliteMode::SingleNode => {
-                DatabaseSource::Single { path: PathBuf::from(&sqlite.path) }
+                (DatabaseSource::Single { path: PathBuf::from(&sqlite.path) }, BackupGate::Always)
             }
-            EmbeddedSqliteMode::PerSite => DatabaseSource::PerSite {
-                dir: PathBuf::from(
-                    sqlite
-                        .dir
-                        .as_deref()
-                        .context("[db.sqlite.backup] per-site mode requires [db.sqlite] dir")?,
-                ),
-            },
-            EmbeddedSqliteMode::Clustered | EmbeddedSqliteMode::PerSiteClustered => {
-                anyhow::bail!(
-                    "[db.sqlite.backup] enabled = true is not supported in clustered mode \
-                     (backups are not scheduled per owner/primary yet); set enabled = false on \
-                     cluster nodes"
-                )
+            EmbeddedSqliteMode::PerSite => {
+                (DatabaseSource::PerSite { dir: per_site_dir()? }, BackupGate::Always)
             }
+            EmbeddedSqliteMode::Clustered => (
+                DatabaseSource::Single { path: PathBuf::from(&sqlite.path) },
+                BackupGate::WholeDbClustered {
+                    cluster: cluster_for("whole-database clustered")?,
+                    primary_view: Arc::clone(primary_view),
+                    source: backup.backup_source(),
+                },
+            ),
+            EmbeddedSqliteMode::PerSiteClustered => (
+                DatabaseSource::PerSite { dir: per_site_dir()? },
+                BackupGate::PerSiteClustered {
+                    cluster: cluster_for("per-site clustered")?,
+                    source: backup.backup_source(),
+                },
+            ),
             EmbeddedSqliteMode::None => return Ok(None),
         };
         let (client, prefix) = object_client_from_config(config)?;
@@ -567,6 +785,7 @@ impl DbBackupService {
             interval,
             retention,
             source,
+            gate,
             staging,
             running: tokio::sync::Mutex::new(()),
             sites: Mutex::new(BTreeMap::new()),
@@ -579,6 +798,7 @@ impl DbBackupService {
             interval_secs = interval.as_secs(),
             retention_secs = retention.as_secs(),
             databases = svc.source.enumerate().len(),
+            scheduling = svc.gate.describe(),
             staging = %svc.staging.path().display(),
             "embedded database backup enabled (VACUUM INTO snapshot → gzip → object storage; \
              the object is not encrypted by ePHPm — use bucket-side encryption)"
@@ -625,13 +845,31 @@ impl DbBackupService {
         })
     }
 
-    /// Back up every database now. Waits for a tick already in flight.
+    /// Back up every database **this node is responsible for** now. Waits
+    /// for a tick already in flight. In clustered modes the ownership gate
+    /// filters the enumerated databases so each is snapshotted by exactly one
+    /// node; the rest are counted on [`METRIC_BACKUP_SKIPPED`].
     pub async fn run_now(&self) -> TickReport {
         let _guard = self.running.lock().await;
         let started = Instant::now();
-        let databases = self.source.enumerate();
-        let mut report = TickReport { databases: databases.len(), ..TickReport::default() };
-        tracing::debug!(databases = databases.len(), "database backup tick");
+        let found = self.source.enumerate();
+        let found_total = found.len();
+        let (databases, skipped) = self.gate.partition(found).await;
+        for (db, reason) in &skipped {
+            counter!(METRIC_BACKUP_SKIPPED, "site" => db.site.clone(), "reason" => *reason)
+                .increment(1);
+        }
+        let mut report = TickReport {
+            databases: databases.len(),
+            skipped: skipped.len(),
+            ..TickReport::default()
+        };
+        tracing::debug!(
+            responsible = databases.len(),
+            skipped = skipped.len(),
+            found = found_total,
+            "database backup tick"
+        );
 
         let permits = Arc::new(Semaphore::new(BACKUP_CONCURRENCY));
         let mut tasks: JoinSet<(String, Outcome)> = JoinSet::new();
@@ -724,6 +962,7 @@ impl DbBackupService {
                 "finished_at_unix": t.finished_at,
                 "finished_at": format_rfc3339(t.finished_at),
                 "databases": t.databases,
+                "skipped": t.skipped,
                 "ok": t.ok,
                 "failed": t.failed,
                 "elapsed_ms": u64::try_from(t.elapsed.as_millis()).unwrap_or(u64::MAX),
@@ -953,6 +1192,83 @@ pub async fn verify_integrity(path: &Path) -> anyhow::Result<()> {
     result
 }
 
+/// Reconcile a restored backup image for a cluster: drop the CDC /
+/// replication bookkeeping tables ([`crate::turso_cdc::CDC_BOOKKEEPING_TABLES`])
+/// a physical clustered snapshot carries, so the file comes back as **clean
+/// origin data** with no replication identity. Returns how many tables were
+/// dropped (0 for a single-node image, which carries none — then the file is
+/// not written at all).
+///
+/// Why this is mandatory for a clustered restore: a `VACUUM INTO` image keeps
+/// the source database's `__ephpm_cdc_log_id` and `__litewire_cdc_watermark`.
+/// Installed unchanged, `ensure_log_id` would keep the **old** log id (it only
+/// mints one when absent) and a peer would recognize the watermark and
+/// conclude nothing needs re-bootstrapping — the two copies then diverge
+/// silently. Stripping the identity forces `ensure_log_id` to mint a fresh
+/// one, `site_data_lineage` to stamp this node as the site's origin, and every
+/// peer holding the old copy to detect a different log id and re-bootstrap
+/// onto the restored data.
+///
+/// Only the curated CDC/replication set is dropped — **never**
+/// `__turso_internal_*` (the engine's autoincrement backing tables, valid
+/// physical state) or `sqlite_*`. Idempotent and safe on a single-node image
+/// (nothing matches → no write). Opens a plain (ungated, short-lived) handle
+/// and removes the `-wal`/`-shm` left beside the file; engine work runs under
+/// `offload::engine`.
+///
+/// # Errors
+///
+/// The file cannot be opened as a database, or a `DROP TABLE` was refused.
+pub async fn strip_cdc_bookkeeping(path: &Path) -> anyhow::Result<usize> {
+    let path_s = path.to_str().context("path is not UTF-8")?;
+    let result = offload::engine(async {
+        let db = turso::Builder::new_local(path_s)
+            .build()
+            .await
+            .with_context(|| format!("open {} to strip CDC bookkeeping", path.display()))?;
+        let conn = db.connect().context("connect")?;
+        // Probe first so a single-node image (no CDC tables) is never written
+        // to: a true no-op, mtime and sidecars untouched.
+        let mut present: Vec<&'static str> = Vec::new();
+        for &table in crate::turso_cdc::CDC_BOOKKEEPING_TABLES {
+            let mut rows = conn
+                .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,))
+                .await
+                .with_context(|| format!("probing for {table}"))?;
+            if rows.next().await.with_context(|| format!("reading probe for {table}"))?.is_some() {
+                present.push(table);
+            }
+        }
+        for &table in &present {
+            // Names are compile-time constants, never user input; the quotes
+            // guard the one non-`__` name (`turso_cdc`) in any case.
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), ())
+                .await
+                .with_context(|| format!("dropping {table}"))?;
+        }
+        // Fold the WAL back into the main file before this handle is dropped:
+        // the Turso SDK never checkpoints on drop, so the `DROP`s above (and
+        // any `-wal` the staged file arrived with) live only in the `-wal`
+        // until a checkpoint runs — and the caller removes the `-wal` next.
+        // Without this, removing it would discard the strip. Harmless when
+        // there is nothing to fold (the usual case: a `VACUUM INTO` image has
+        // no `-wal`).
+        let mut ck = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .context("checkpointing the reconciled file")?;
+        while ck.next().await.context("draining the checkpoint result")?.is_some() {}
+        anyhow::Ok(present.len())
+    })
+    .await;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        remove_quietly(Path::new(&sidecar));
+    }
+    result
+}
+
 /// Gzip `src` into `dst` (created or truncated), fsynced. Returns the
 /// compressed size. Blocking: call from `spawn_blocking`.
 ///
@@ -1013,6 +1329,225 @@ mod tests {
 
     fn obj(key: &str, size: u64) -> BackupObject {
         BackupObject { key: key.to_string(), timestamp: parse_key_timestamp(key).unwrap(), size }
+    }
+
+    /// An alive node with the given id (gossip address derived from it).
+    fn node(id: &str) -> NodeInfo {
+        NodeInfo {
+            id: id.to_string(),
+            gossip_addr: format!("10.0.0.1:{}", 7000 + id.len()),
+            state: NodeState::Alive,
+            data_port: Some(6000),
+            hrw_scheme: Some(2),
+            draining: false,
+        }
+    }
+
+    fn dead(id: &str) -> NodeInfo {
+        NodeInfo { state: NodeState::Dead, ..node(id) }
+    }
+
+    fn draining(id: &str) -> NodeInfo {
+        NodeInfo { draining: true, ..node(id) }
+    }
+
+    // ── Whole-database backup responsibility ────────────────────────────
+
+    #[test]
+    fn whole_db_primary_source_follows_the_election_flag() {
+        let nodes = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        // `source = "primary"` is exactly the election's primary_view, whoever
+        // we are.
+        assert!(whole_db_responsible(BackupSource::Primary, true, "ephpm-1", &nodes));
+        assert!(!whole_db_responsible(BackupSource::Primary, false, "ephpm-1", &nodes));
+    }
+
+    #[test]
+    fn whole_db_replica_is_the_second_lowest_ordinal() {
+        let nodes = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        assert_eq!(backup_replica_whole_db(&nodes).as_deref(), Some("ephpm-1"));
+        // Only the 2nd-lowest backs up in replica mode; the primary flag is
+        // ignored when a replica exists.
+        assert!(whole_db_responsible(BackupSource::Replica, false, "ephpm-1", &nodes));
+        assert!(!whole_db_responsible(BackupSource::Replica, true, "ephpm-0", &nodes));
+        assert!(!whole_db_responsible(BackupSource::Replica, false, "ephpm-2", &nodes));
+    }
+
+    #[test]
+    fn whole_db_replica_skips_dead_and_draining_and_falls_back_to_primary() {
+        // ephpm-0 primary, ephpm-1 dead, ephpm-2 draining → no eligible
+        // replica, so the primary covers it (coverage never drops to zero).
+        let nodes = [node("ephpm-0"), dead("ephpm-1"), draining("ephpm-2")];
+        assert_eq!(backup_replica_whole_db(&nodes), None);
+        assert!(whole_db_responsible(BackupSource::Replica, true, "ephpm-0", &nodes));
+        assert!(!whole_db_responsible(BackupSource::Replica, false, "ephpm-2", &nodes));
+    }
+
+    #[test]
+    fn whole_db_coverage_is_exactly_once_in_both_source_modes() {
+        let nodes = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        // Primary mode: the election names exactly one primary (here ephpm-0).
+        let primary = "ephpm-0";
+        let n = nodes
+            .iter()
+            .filter(|s| whole_db_responsible(BackupSource::Primary, s.id == primary, &s.id, &nodes))
+            .count();
+        assert_eq!(n, 1, "exactly one node backs up in primary mode");
+        // Replica mode: exactly the 2nd-lowest ordinal.
+        let n = nodes
+            .iter()
+            .filter(|s| whole_db_responsible(BackupSource::Replica, s.id == primary, &s.id, &nodes))
+            .count();
+        assert_eq!(n, 1, "exactly one node backs up in replica mode");
+    }
+
+    // ── Per-site backup responsibility ──────────────────────────────────
+
+    #[test]
+    fn per_site_primary_matches_hrw_owner() {
+        let nodes = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        for site in ["blog", "shop", "s001", "s002", "s003"] {
+            let owner = hrw_owner(&nodes, site).unwrap().id.clone();
+            for n in &nodes {
+                let expected = n.id == owner;
+                assert_eq!(
+                    per_site_responsible(BackupSource::Primary, &n.id, site, &nodes),
+                    expected,
+                    "site {site} node {}",
+                    n.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_site_replica_is_the_second_ranked_hrw_holder_and_never_the_owner() {
+        let nodes = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        for site in ["blog", "shop", "s001", "s002", "s003"] {
+            let owner = hrw_owner(&nodes, site).unwrap().id.clone();
+            let replica = backup_replica_per_site(&nodes, site).unwrap();
+            assert_ne!(replica, owner, "the backup replica is never the owner (site {site})");
+            // It is the HRW winner once the owner is removed.
+            let rest: Vec<NodeInfo> =
+                nodes.iter().filter(|n| n.id != owner).cloned().collect();
+            assert_eq!(replica, hrw_owner(&rest, site).unwrap().id);
+            // Exactly one node is responsible in replica mode.
+            let n = nodes
+                .iter()
+                .filter(|n| per_site_responsible(BackupSource::Replica, &n.id, site, &nodes))
+                .count();
+            assert_eq!(n, 1, "exactly one node backs up site {site} in replica mode");
+        }
+    }
+
+    #[test]
+    fn per_site_replica_falls_back_to_owner_when_it_is_the_only_holder() {
+        let nodes = [node("solo")];
+        let site = "blog";
+        assert_eq!(backup_replica_per_site(&nodes, site), None);
+        // With no non-owner alive, the owner covers it.
+        assert!(per_site_responsible(BackupSource::Replica, "solo", site, &nodes));
+    }
+
+    #[test]
+    fn per_site_coverage_survives_an_ownership_move() {
+        // Owner of a site, then add a node; whichever node HRW now names must
+        // be the single responsible one — no gap, no duplicate (steady state).
+        let three = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2")];
+        let four = [node("ephpm-0"), node("ephpm-1"), node("ephpm-2"), node("ephpm-3")];
+        for site in ["blog", "shop", "s001", "s002"] {
+            for membership in [&three[..], &four[..]] {
+                let responsible = membership
+                    .iter()
+                    .filter(|n| per_site_responsible(BackupSource::Primary, &n.id, site, membership))
+                    .count();
+                assert_eq!(responsible, 1, "exactly one owner for site {site}");
+            }
+        }
+    }
+
+    // ── Restore reconciliation: strip the CDC bookkeeping ────────────────
+
+    async fn exec_raw(conn: &turso::Connection, sql: &str) {
+        conn.execute(sql, ()).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    async fn table_exists(conn: &turso::Connection, name: &str) -> bool {
+        let mut rows = conn
+            .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (name,))
+            .await
+            .unwrap();
+        rows.next().await.unwrap().is_some()
+    }
+
+    /// A clustered-shaped image — real CDC bookkeeping tables plus user data
+    /// and a trigger — strips to a clean, serveable file that keeps the user
+    /// data and the trigger but none of the replication identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strip_reduces_a_clustered_image_to_clean_origin_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db");
+        {
+            let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            // User data + a trigger (which a backup must carry, unlike a dump).
+            exec_raw(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+            exec_raw(&conn, "CREATE TABLE log (id INTEGER)").await;
+            exec_raw(
+                &conn,
+                "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); END",
+            )
+            .await;
+            exec_raw(&conn, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+            // The CDC/replication bookkeeping a clustered database carries.
+            for table in crate::turso_cdc::CDC_BOOKKEEPING_TABLES {
+                exec_raw(&conn, &format!("CREATE TABLE \"{table}\" (k INTEGER, val TEXT)")).await;
+                exec_raw(&conn, &format!("INSERT INTO \"{table}\" VALUES (0, 'stale')")).await;
+            }
+        }
+
+        let dropped = strip_cdc_bookkeeping(&path).await.unwrap();
+        assert_eq!(dropped, crate::turso_cdc::CDC_BOOKKEEPING_TABLES.len());
+
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for table in crate::turso_cdc::CDC_BOOKKEEPING_TABLES {
+            assert!(!table_exists(&conn, table).await, "{table} must be gone after strip");
+        }
+        // User data + trigger survive.
+        assert!(table_exists(&conn, "t").await);
+        let mut rows = conn.query("SELECT v FROM t WHERE id = 1", ()).await.unwrap();
+        let row = rows.next().await.unwrap().expect("the kept row");
+        assert_eq!(format!("{:?}", row.get_value(0).unwrap()), "Text(\"kept\")");
+        assert!(table_exists(&conn, "log").await);
+        let mut trig = conn
+            .query("SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name = 't_ai'", ())
+            .await
+            .unwrap();
+        assert!(trig.next().await.unwrap().is_some(), "the trigger must survive the strip");
+        drop(conn);
+        drop(db);
+
+        // And it still verifies.
+        verify_integrity(&path).await.expect("stripped file is a valid database");
+    }
+
+    /// A single-node image has no CDC bookkeeping, so the strip is a no-op and
+    /// reports zero (and the content is untouched).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strip_is_a_noop_on_a_single_node_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.db");
+        {
+            let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            exec_raw(&conn, "CREATE TABLE t (v TEXT)").await;
+            exec_raw(&conn, "INSERT INTO t VALUES ('x')").await;
+        }
+        assert_eq!(strip_cdc_bookkeeping(&path).await.unwrap(), 0);
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_exists(&conn, "t").await);
     }
 
     #[test]

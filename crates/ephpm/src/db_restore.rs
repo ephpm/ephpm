@@ -69,6 +69,10 @@ pub struct ListRequest {
 struct Target {
     key: String,
     path: PathBuf,
+    /// The config runs a clustered embedded database. A restore then re-seeds
+    /// the whole cluster, so the confirmation and docs demand every node be
+    /// stopped — not just this one, which is all the offline probe can see.
+    clustered: bool,
 }
 
 /// What `--from` resolved to.
@@ -82,23 +86,36 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("could not load config {}", path.display()))
 }
 
-/// The site's database file under `config`, by mode. Fail-closed: an
-/// unknown or malformed key, or a clustered mode, is an error.
+/// The site's database file under `config`, by mode. Fail-closed: an unknown
+/// or malformed key is an error.
+///
+/// A clustered mode resolves to the same local file a single-node / per-site
+/// config would, and the restore strips the CDC replication bookkeeping the
+/// image carries so it re-seeds the cluster as clean origin data (see
+/// `db_backup::strip_cdc_bookkeeping` and the clustered-backup design note).
+/// The `clustered` flag drives the whole-cluster-stop confirmation.
 fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
     let sqlite = config.db.sqlite.as_ref().context(
         "`ephpm db restore` needs an embedded database ([db.sqlite]); this config has none",
     )?;
-    match embedded_sqlite_mode(config) {
-        EmbeddedSqliteMode::SingleNode => {
+    let mode = embedded_sqlite_mode(config);
+    // Whole-database modes (single-node and whole-DB clustered) share one
+    // `path` under the `default` site key; per-site modes resolve `<dir>/<key>.db`.
+    match mode {
+        EmbeddedSqliteMode::SingleNode | EmbeddedSqliteMode::Clustered => {
             if site != ephpm_server::wal_gate::DEFAULT_SITE_LABEL {
                 bail!(
-                    "this config serves one shared database (single-node mode), whose backups \
-                     are stored under the site key `default`; pass --site default"
+                    "this config serves one shared database, whose backups are stored under the \
+                     site key `default`; pass --site default"
                 );
             }
-            Ok(Target { key: site.to_string(), path: PathBuf::from(&sqlite.path) })
+            Ok(Target {
+                key: site.to_string(),
+                path: PathBuf::from(&sqlite.path),
+                clustered: matches!(mode, EmbeddedSqliteMode::Clustered),
+            })
         }
-        EmbeddedSqliteMode::PerSite => {
+        EmbeddedSqliteMode::PerSite | EmbeddedSqliteMode::PerSiteClustered => {
             let resolved = ephpm_server::router::resolve_sandbox_site(config, site)
                 .context("resolving --site against the configuration")?;
             let dir = sqlite.dir.as_deref().context(
@@ -106,14 +123,12 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
                  <key>.db); it is not set",
             )?;
             let path = Path::new(dir).join(format!("{}.db", resolved.key));
-            Ok(Target { key: resolved.key, path })
+            Ok(Target {
+                key: resolved.key,
+                path,
+                clustered: matches!(mode, EmbeddedSqliteMode::PerSiteClustered),
+            })
         }
-        EmbeddedSqliteMode::Clustered | EmbeddedSqliteMode::PerSiteClustered => bail!(
-            "this config is CLUSTERED: `ephpm db restore` installs a file on one node, which a \
-             replica set would discard or diverge from. Clustered restore is not implemented; \
-             restore on an unclustered node ([db.sqlite.replication] role = \"single\") and \
-             re-seed the cluster from it."
-        ),
         EmbeddedSqliteMode::None => {
             bail!(
                 "`ephpm db restore` needs an embedded database ([db.sqlite]); this config has none"
@@ -265,7 +280,19 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
         target.path.display(),
         if exists { " (will be REPLACED)" } else { " (does not exist yet)" }
     );
-    confirm("This replaces the live database with the backup.", req.yes)?;
+    if target.clustered {
+        println!(
+            "mode:    CLUSTERED — this re-seeds the whole cluster for this database. Every node \
+             must be stopped (this tool can only check the local node). On restart, the restored \
+             data re-seeds as the site's origin and peers re-bootstrap onto it."
+        );
+    }
+    let prompt = if target.clustered {
+        "This re-seeds the CLUSTER with the backup. Confirm every node is stopped."
+    } else {
+        "This replaces the live database with the backup."
+    };
+    confirm(prompt, req.yes)?;
 
     ensure_offline(&config)?;
     if let Some(parent) = target.path.parent() {
@@ -283,6 +310,28 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
     if let Err(e) = staged {
         remove_quietly(&tmp);
         return Err(e);
+    }
+
+    // Reconcile: strip the CDC/replication bookkeeping a clustered image
+    // carries, so the file re-seeds as clean origin data (a no-op on a
+    // single-node image, which carries none). Runs on the staged temp file,
+    // before verification, so the integrity check validates the final shape.
+    match rt.block_on(db_backup::strip_cdc_bookkeeping(&tmp)) {
+        Ok(0) => {}
+        Ok(dropped) => {
+            println!(
+                "reconciled: stripped {dropped} CDC replication table(s) so the restore re-seeds \
+                 as clean origin data"
+            );
+        }
+        Err(e) => {
+            remove_quietly(&tmp);
+            eprintln!(
+                "error: could not reconcile the backup's replication bookkeeping; the live \
+                 database was not touched: {e:#}"
+            );
+            return Ok(ExitCode::from(2));
+        }
     }
 
     // Verify before the live file is touched.
@@ -437,14 +486,54 @@ mod tests {
         assert!(format!("{err:#}").contains("default"), "{err:#}");
     }
 
+    /// Whole-database clustered now resolves the one `default` database and is
+    /// flagged clustered (so the restore re-seeds the cluster + strips CDC
+    /// bookkeeping), instead of being refused.
     #[test]
-    fn clustered_targets_are_refused() {
+    fn clustered_whole_db_target_resolves_and_is_flagged() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ephpm.toml");
-        fs::write(&path, "[db.sqlite]\n[cluster]\nenabled = true\nsecret = \"s\"\n").unwrap();
+        fs::write(
+            &path,
+            "[db.sqlite]\npath = \"/var/lib/ephpm/one.db\"\n[cluster]\nenabled = true\n\
+             secret = \"s\"\n",
+        )
+        .unwrap();
         let config = Config::load(&path).unwrap();
-        let err = resolve_target(&config, "default").unwrap_err();
-        assert!(format!("{err:#}").contains("CLUSTERED"), "{err:#}");
+        let target = resolve_target(&config, "default").unwrap();
+        assert_eq!(target.path, PathBuf::from("/var/lib/ephpm/one.db"));
+        assert!(target.clustered, "a clustered config must set the clustered flag");
+        // Still fail-closed on a non-`default` key in whole-DB mode.
+        assert!(resolve_target(&config, "shop").is_err(), "whole-DB has only `default`");
+    }
+
+    /// Per-site clustered resolves `<dir>/<key>.db` for a known vhost and is
+    /// flagged clustered.
+    #[test]
+    fn clustered_per_site_target_resolves_and_is_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sites = tmp.path().join("sites");
+        fs::create_dir_all(sites.join("shop")).unwrap();
+        let dbdir = tmp.path().join("db");
+        fs::create_dir_all(&dbdir).unwrap();
+        let path = tmp.path().join("ephpm.toml");
+        fs::write(
+            &path,
+            format!(
+                "[server]\ndocument_root = \"{d}\"\nsites_dir = \"{s}\"\n[db.sqlite]\ndir = \"{db}\"\n\
+                 [db.sqlite.replication]\nper_site = true\n[cluster]\nenabled = true\nsecret = \"s\"\n",
+                d = toml_path(tmp.path()),
+                s = toml_path(&sites),
+                db = toml_path(&dbdir),
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let target = resolve_target(&config, "shop").unwrap();
+        assert_eq!(target.key, "shop");
+        assert_eq!(target.path, dbdir.join("shop.db"));
+        assert!(target.clustered);
+        assert!(resolve_target(&config, "ghost").is_err(), "unknown vhost still fail-closed");
     }
 
     /// A local source needs no bucket; a missing file or `--at` is refused

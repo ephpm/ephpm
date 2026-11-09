@@ -558,10 +558,14 @@ live database. It is a **file install**, not an SQL replay, and it is
 
 1. **Resolves the target** fail-closed, as `db import` does: `--site` must name
    a vhost directory under `[server] sites_dir` (the file is
-   `[db.sqlite] dir/<key>.db`); in a single-node config the one database is
-   addressed as `--site default` (its backups are stored under that key). A
-   clustered config is refused — a file installed on one node would be
-   discarded or diverged from by the replica set.
+   `[db.sqlite] dir/<key>.db`); in a single-node or whole-database config the
+   one database is addressed as `--site default` (its backups are stored under
+   that key). A **clustered** config resolves the same local file and the
+   restore additionally **strips the CDC replication bookkeeping** the image
+   carries (step 5a) so it re-seeds the cluster as clean origin data — but then
+   the restore re-seeds *every* node for that database, so the whole cluster must
+   be stopped (the command can only check the local node and says so). See the
+   [clustered-backup design note](/roadmap/clustered-db-backups/).
 2. **Picks the object.** With `--from s3://bucket[/prefix]` the objects under
    `<prefix>/<site>/` are listed and the newest with a timestamp **at or
    before `--at`** is chosen (default: the newest of all). `--at` takes the
@@ -582,10 +586,16 @@ live database. It is a **file install**, not an SQL replay, and it is
    artifact. A live restore is **planned — not yet implemented**.
 5. **Downloads and verifies.** The object is downloaded to
    `<target>.restore-tmp.gz` next to the target (so the final rename stays on
-   one filesystem), gunzipped to `<target>.restore-tmp`, opened with the engine
-   and checked with `PRAGMA integrity_check`. Anything but `ok` deletes the
-   temporary file and exits `2` — **the live database is never touched by a
-   file that does not verify**.
+   one filesystem) and gunzipped to `<target>.restore-tmp`.
+   **5a. Reconciles (clustered images only).** The CDC replication bookkeeping a
+   clustered snapshot carries (`turso_cdc`, `__ephpm_cdc_*`,
+   `__litewire_cdc_watermark`) is dropped from the staged file — a no-op on a
+   single-node image, which carries none — so the restore mints a fresh log
+   identity on open and peers re-bootstrap onto it instead of silently diverging.
+   Then the staged file is opened with the engine and checked with
+   `PRAGMA integrity_check`. Anything but `ok` deletes the temporary file and
+   exits `2` — **the live database is never touched by a file that does not
+   verify**.
 6. **Installs.** The verified file is renamed over `<key>.db` (atomic replace),
    and a stale `<key>.db-wal` / `-shm` from the stopped server is deleted so it
    can never be replayed onto the new file. Start the server; the site serves
@@ -606,8 +616,8 @@ live database. It is a **file install**, not an SQL replay, and it is
 - `0` — restored.
 - `2` — the backup failed `PRAGMA integrity_check`; nothing was changed.
 - `1` — anything else: a server is running, no object at or before `--at`, an
-  invalid `--site`, a clustered config, a download or install error, or the
-  confirmation was declined.
+  invalid `--site`, a download or install error, or the confirmation was
+  declined.
 
 ### Examples
 

@@ -449,10 +449,16 @@ What it is and is not:
 - **The object is plaintext** (a gzip of a standard SQLite file, not the
   `[kv.snapshot]` AEAD envelope — so it needs no `[kv] secret` and opens
   anywhere). The bucket must carry server-side encryption and a tight policy.
-- **Single-node and per-site modes only.** With clustering enabled, startup
-  refuses `enabled = true`: nothing schedules per owner/primary yet, and the
-  artifact would carry CDC bookkeeping a restore must reconcile. Clustered
-  backup is a follow-up.
+- **All modes, including clustered** (experimental). In single-node and
+  per-site-single mode the one holder backs each database up. In clustered mode
+  the scheduler gates each database on this node's election/HRW ownership so it
+  is snapshotted by exactly one node — the write node by default, or a non-write
+  holder with `[db.sqlite.backup] source = "replica"` — and `ephpm db restore`
+  strips the CDC replication bookkeeping the physical image carries so a restored
+  file re-seeds the cluster as clean origin data. A clustered restore re-seeds
+  the whole cluster and so requires every node stopped. See the
+  [clustered-backup design note](/roadmap/clustered-db-backups/) for the
+  exactly-once guarantees and the multi-node lab validation it still needs.
 
 The from-zero walkthrough — enabling it, credentials for S3/MinIO/R2, reading
 the listing and the status endpoint, retention, and a worked restore — is the
@@ -467,8 +473,8 @@ cross-node **cluster replication** for high availability, not a backup to
 external storage — a node loss keeps committed data that was already shipped to
 a replica, but it gives no archive and no restore-to-a-point.)
 
-The alternatives below still apply — on a clustered node, or where object
-storage is not an option:
+The alternatives below still apply where object storage is not an option (or
+alongside the built-in backup on a clustered node):
 
 - **Stop-and-copy (the clean path).** A graceful `ephpm` shutdown runs
   `PRAGMA wal_checkpoint(TRUNCATE)` on every open database, so a cleanly stopped

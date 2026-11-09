@@ -108,11 +108,15 @@ it is not yet settled for. The bounds:
   during a move is therefore `interval + one tick`, not unbounded.
 
 The scheduler emits a per-database decision at `DEBUG` and a counter
-(`ephpm_db_backup_skipped_total{reason}` with `reason` ∈ `not_primary`,
-`not_owner`, `blocked`) so an operator can confirm each database is backed up by
-exactly one node and see the skip reason on every other node. `BACKUP_CONCURRENCY`
-(4) is unchanged; a per-site owner that owns many sites still processes at most
-four at once.
+(`ephpm_db_backup_skipped_total{site,reason}` with `reason` ∈ `not_primary`
+(whole-DB primary mode), `not_replica` (whole-DB replica mode), `not_owner`
+(per-site)) so an operator can confirm each database is backed up by exactly one
+node and see the skip reason on every other node. `BACKUP_CONCURRENCY` (4) is
+unchanged; a per-site owner that owns many sites still processes at most four at
+once. The scheduler gates on **ownership only**, not the serving gate — a
+not-yet-bootstrapped new owner usually has no `.db` file to enumerate yet, so it
+naturally does not back up an empty database; this is the "gap" above, bounded by
+one tick.
 
 A node that has announced a graceful drain (`NodeInfo::draining`) is already
 skipped by `hrw_owner`, so a draining node stops being backup-responsible the

@@ -19,9 +19,9 @@ may touch the file) is in
 after the chosen snapshot), kept for `retention`. Restore is **offline**
 (stop the server, install, start). It is not transaction-granularity
 point-in-time recovery — that is
-[planned, not yet implemented](/roadmap/turso-engine/#tier-1-point-in-time-restore-planned)
-— and it does not run on clustered nodes (startup refuses it there; see
-[limits](#what-it-does-not-do)).
+[planned, not yet implemented](/roadmap/turso-engine/#tier-1-point-in-time-restore-planned).
+It also runs on **clustered** nodes (each database is snapshotted by one node;
+restore re-seeds the cluster) — see [clustered mode](#clustered-mode) below.
 
 ## 1. Enable it
 
@@ -271,15 +271,44 @@ A restore into a site whose `.db` does not exist yet (a fresh host) works the
 same way — the target line says `(does not exist yet)` — which is how you
 move a site between servers.
 
+## Clustered mode
+
+Backups run on a cluster too (experimental, like clustered embedded SQLite
+itself). The only extra knob is **`source`**, which picks *which* node snapshots
+each database:
+
+```toml
+[db.sqlite.backup]
+enabled   = true
+s3_bucket = "ephpm-backups"
+source    = "primary"   # default: back up from the write node
+# source  = "replica"   # back up from a non-write holder instead
+```
+
+- Each database is snapshotted by **exactly one node** per interval, not by
+  every node. `source = "primary"` (default) runs it on the write node — the
+  elected primary in whole-database clustered mode, each site's HRW owner in
+  per-site clustered mode. `source = "replica"` runs it on a non-write holder
+  instead, sparing the write path the `VACUUM` I/O and the WAL pin, at the cost
+  of `interval + replication lag` as the recovery point.
+- Confirm the split with `ephpm_db_backup_skipped_total{site,reason}` on the
+  nodes that are *not* responsible: it increments there each tick while the one
+  responsible node uploads.
+- **Restore re-seeds the whole cluster.** A clustered backup carries the CDC
+  replication bookkeeping; `ephpm db restore` strips it so the file comes back as
+  clean origin data, and on restart the restored data re-seeds as the site's
+  origin and peers re-bootstrap onto it. Because of that, a clustered restore
+  requires **every node stopped** (the tool can only check the local node, so it
+  says so and asks you to confirm). Restore the whole-database case on the
+  lowest-ordinal node and start it first; the per-site case is still being
+  validated on live clusters — see the
+  [clustered-backup design note](/roadmap/clustered-db-backups/).
+
+See the design note for the exactly-once guarantees, the reconciliation, and
+what still needs multi-node lab validation before this is more than experimental.
+
 ## What it does not do
 
-- **Clustered nodes.** With `[cluster] enabled = true` (and `role = "auto"`,
-  or an explicit `primary`/`replica`), `enabled = true` is a startup error:
-  backups are not scheduled per owner/primary yet, and the artifact would
-  carry replication bookkeeping a restore cannot reconcile. `db restore`
-  refuses a clustered config for the same reason. On a cluster, use the
-  stop-and-copy or volume-snapshot paths in
-  [Engines → Backups](/architecture/database/engines/#supported-backups).
 - **A live restore**, a "run a backup now" endpoint, and boot-time
   auto-hydrate from the newest object are all
   [planned — not yet implemented](/roadmap/turso-engine/).
