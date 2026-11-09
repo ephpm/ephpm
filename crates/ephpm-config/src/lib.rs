@@ -10179,33 +10179,141 @@ listen = "0.0.0.0:8080"
         assert!(err.contains("no site"), "{err}");
     }
 
-    /// Bad schedule / timezone / timeout / policy each fail closed.
+    /// Bad schedule / timezone / timeout / policy each fail closed, and the
+    /// error names the job and the field so the operator can find it (G2/G3).
     #[test]
     fn cron_bad_fields_rejected() {
         let bad_sched =
             load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"nope\"\ncommand = [\"a\"]\n");
-        assert!(bad_sched.validate().is_err());
+        let err = bad_sched.validate().expect_err("bad schedule").to_string();
+        assert!(err.contains("\"j\" schedule"), "{err}");
 
         let bad_tz = load_toml(
             "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
              timezone = \"Mars/Olympus\"\ncommand = [\"a\"]\n",
         );
-        assert!(bad_tz.validate().is_err());
+        let err = bad_tz.validate().expect_err("bad timezone").to_string();
+        assert!(err.contains("\"j\" timezone") && err.contains("Mars/Olympus"), "{err}");
+
+        let bad_default_tz = load_toml(
+            "[cron]\ntimezone = \"Nowhere/Land\"\n\n[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n",
+        );
+        let err = bad_default_tz.validate().expect_err("bad [cron] timezone").to_string();
+        assert!(err.contains("[cron] timezone"), "{err}");
 
         let zero_timeout = load_toml(
             "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
              timeout = \"0\"\ncommand = [\"a\"]\n",
         );
-        assert!(zero_timeout.validate().is_err());
+        let err = zero_timeout.validate().expect_err("zero timeout").to_string();
+        assert!(err.contains("\"j\" timeout"), "{err}");
 
         let bad_policy = load_toml(
             "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
              concurrency_policy = \"queue\"\ncommand = [\"a\"]\n",
         );
-        assert!(bad_policy.validate().is_err());
+        let err = bad_policy.validate().expect_err("bad policy").to_string();
+        assert!(err.contains("concurrency_policy") && err.contains("queue"), "{err}");
 
         let zero_concurrency = load_toml("[cron]\nmax_concurrent = 0\n");
         assert!(zero_concurrency.validate().is_err());
+
+        let empty_command =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = []\n");
+        let err = empty_command.validate().expect_err("empty argv").to_string();
+        assert!(err.contains("non-empty argv"), "{err}");
+    }
+
+    /// A1 — one-minute granularity: a six-field (seconds) expression is
+    /// rejected at validation, naming the job and the field count.
+    #[test]
+    fn cron_seconds_field_is_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"fast\"\nschedule = \"*/30 * * * * *\"\ncommand = [\"a\"]\n",
+        );
+        let err = cfg.validate().expect_err("six fields must fail").to_string();
+        assert!(err.contains("\"fast\" schedule"), "{err}");
+        assert!(err.contains("exactly 5 fields") && err.contains("got 6"), "{err}");
+        // A directory-cadence override is held to the same grammar.
+        let cadence = load_toml("[cron]\ndirectory_hourly = \"0 * * * * *\"\n");
+        let err = cadence.validate().expect_err("six-field cadence").to_string();
+        assert!(err.contains("directory_hourly"), "{err}");
+    }
+
+    /// A5/A6 — a job that omits `timezone` resolves to `[cron] timezone`
+    /// (itself defaulting to UTC); a per-job `timezone` overrides it.
+    #[test]
+    fn cron_job_timezone_defaults_to_the_section_and_a_job_can_override_it() {
+        let cfg = load_toml(
+            "[cron]\ntimezone = \"Europe/Berlin\"\n\n\
+             [[cron.jobs]]\nname = \"inherits\"\nschedule = \"0 3 * * *\"\ncommand = [\"a\"]\n\n\
+             [[cron.jobs]]\nname = \"overrides\"\nschedule = \"0 3 * * *\"\n\
+             timezone = \"America/Chicago\"\ncommand = [\"a\"]\n",
+        );
+        cfg.validate().unwrap();
+        let default_tz = &cfg.cron.timezone;
+        assert_eq!(cfg.cron.jobs[0].timezone, None);
+        assert_eq!(
+            cfg.cron.jobs[0].timezone_resolved(default_tz).unwrap(),
+            chrono_tz::Europe::Berlin
+        );
+        assert_eq!(
+            cfg.cron.jobs[1].timezone_resolved(default_tz).unwrap(),
+            chrono_tz::America::Chicago
+        );
+        // No `[cron] timezone` at all → UTC.
+        let utc =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n");
+        assert_eq!(utc.cron.jobs[0].timezone_resolved(&utc.cron.timezone).unwrap(), chrono_tz::UTC);
+    }
+
+    /// G7 — `command` is an argv array, never a shell string: a string value
+    /// is a load (type) error naming the key; `.php` detection is on the first
+    /// element only and case-insensitive.
+    #[test]
+    fn cron_command_is_argv_not_a_shell_string() {
+        let err = load_error(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = \"sh -c 'wp cron'\"\n",
+        );
+        assert!(err.contains("command"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        std::fs::create_dir_all(sites.join("shop")).unwrap();
+        let cfg = load_toml(&format!(
+            "[server]\nsites_dir = {:?}\n\n\
+             [[cron.jobs]]\nname = \"php\"\nsite = \"shop\"\nschedule = \"* * * * *\"\n\
+             command = [\"Artisan.PHP\", \"schedule:run\"]\n\n\
+             [[cron.jobs]]\nname = \"bin\"\nsite = \"shop\"\nschedule = \"* * * * *\"\n\
+             command = [\"wp\", \"eval-file\", \"x.php\"]\n",
+            sites.to_string_lossy(),
+        ));
+        cfg.validate().unwrap();
+        assert!(cfg.cron.jobs[0].is_php_command(), "first element ends in .php (any case)");
+        assert!(!cfg.cron.jobs[1].is_php_command(), "a .php later in argv does not make it PHP");
+    }
+
+    /// `suspend` and `starting_deadline` parse to the documented types.
+    #[test]
+    fn cron_suspend_and_starting_deadline_parse() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             suspend = true\nstarting_deadline = \"10m\"\ntimeout = \"90s\"\n",
+        );
+        cfg.validate().unwrap();
+        let job = &cfg.cron.jobs[0];
+        assert!(job.suspend);
+        assert_eq!(
+            job.starting_deadline_duration().unwrap(),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(job.timeout_duration().unwrap(), std::time::Duration::from_secs(90));
+        let bad = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             starting_deadline = \"soon\"\n",
+        );
+        let err = bad.validate().expect_err("unparsable deadline").to_string();
+        assert!(err.contains("starting_deadline"), "{err}");
     }
 
     /// A per-site job requires `[server] sites_dir`, and the named vhost must
