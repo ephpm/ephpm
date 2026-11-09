@@ -14,9 +14,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use ephpm_cluster::{NodeInfo, NodeState};
 use ephpm_config::CronSchedule;
 
-use super::*;
 use self::exec::{ExecRequest, RunOutcome};
 use self::lease::{CursorStore, LeaseOutcome, LeaseStore};
+use super::*;
 
 // ── fakes ───────────────────────────────────────────────────────────────────
 
@@ -329,7 +329,8 @@ async fn clean_ownership_move_fires_once_per_tick_across_the_transition() {
 
 #[tokio::test]
 async fn lease_unreachable_fails_closed() {
-    let lease: Arc<dyn LeaseStore> = Arc::new(InMemLease { unreachable: true, ..Default::default() });
+    let lease: Arc<dyn LeaseStore> =
+        Arc::new(InMemLease { unreachable: true, ..Default::default() });
     let cursor: Arc<dyn CursorStore> = Arc::new(InMemCursor::default());
     cursor.set("j", at(2026, 1, 1, 0, 0));
     let s = scheduler(
@@ -401,4 +402,3 @@ async fn node_cap_skips_when_full() {
     let skips = skip_count(&s, "a").await + skip_count(&s, "b").await;
     assert!(skips >= 1, "the second job is skipped at_cap");
 }
-

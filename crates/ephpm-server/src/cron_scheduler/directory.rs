@@ -98,12 +98,7 @@ pub fn scan_site(
     ] {
         for script in php_files(&base.join(sub)) {
             let name = job_name(site_key, sub, &script);
-            jobs.push(DirectoryJob {
-                name,
-                script,
-                schedule: schedule.clone(),
-                timezone: None,
-            });
+            jobs.push(DirectoryJob { name, script, schedule: schedule.clone(), timezone: None });
         }
     }
 
@@ -139,10 +134,9 @@ pub fn scan_site(
 
 /// The site-scoped, unique job name for a directory file.
 fn job_name(site_key: &str, bucket: &str, script: &Path) -> String {
-    let file = script.file_name().map_or_else(
-        || "unknown.php".to_string(),
-        |f| f.to_string_lossy().into_owned(),
-    );
+    let file = script
+        .file_name()
+        .map_or_else(|| "unknown.php".to_string(), |f| f.to_string_lossy().into_owned());
     format!("site:{site_key}:dir:{bucket}:{file}")
 }
 
@@ -154,10 +148,7 @@ fn php_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("php"))
-        })
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("php")))
         .collect();
     files.sort();
     files
@@ -209,8 +200,9 @@ fn read_head(path: &Path, max: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
+    use super::*;
 
     fn cadence() -> CadenceSchedules {
         CadenceSchedules::new(None, None, None, None).unwrap()

@@ -155,9 +155,7 @@ impl JobExecutor for ChildExecutor {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = RunOutcome> + Send + 'a>> {
         let (program, args) = build_argv(&req, &self.exe);
-        Box::pin(async move {
-            run_child(&program, &args, req.timeout, &cancel).await
-        })
+        Box::pin(async move { run_child(&program, &args, req.timeout, &cancel).await })
     }
 }
 
@@ -301,28 +299,19 @@ mod tests {
         #[cfg(unix)]
         let (ok_prog, ok_args) = ("/bin/sh", vec!["-c".to_string(), "exit 0".to_string()]);
         #[cfg(windows)]
-        let (ok_prog, ok_args) =
-            ("cmd", vec!["/C".to_string(), "exit 0".to_string()]);
-        let out = run_child(
-            std::path::Path::new(ok_prog),
-            &ok_args,
-            Duration::from_secs(10),
-            &cancel,
-        )
-        .await;
+        let (ok_prog, ok_args) = ("cmd", vec!["/C".to_string(), "exit 0".to_string()]);
+        let out =
+            run_child(std::path::Path::new(ok_prog), &ok_args, Duration::from_secs(10), &cancel)
+                .await;
         assert_eq!(out, RunOutcome::Ok);
 
         #[cfg(unix)]
         let (bad_prog, bad_args) = ("/bin/sh", vec!["-c".to_string(), "exit 3".to_string()]);
         #[cfg(windows)]
         let (bad_prog, bad_args) = ("cmd", vec!["/C".to_string(), "exit 3".to_string()]);
-        let out = run_child(
-            std::path::Path::new(bad_prog),
-            &bad_args,
-            Duration::from_secs(10),
-            &cancel,
-        )
-        .await;
+        let out =
+            run_child(std::path::Path::new(bad_prog), &bad_args, Duration::from_secs(10), &cancel)
+                .await;
         assert_eq!(out, RunOutcome::Failed);
     }
 
@@ -332,15 +321,9 @@ mod tests {
         #[cfg(unix)]
         let (prog, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         #[cfg(windows)]
-        let (prog, args) =
-            ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
-        let out = run_child(
-            std::path::Path::new(prog),
-            &args,
-            Duration::from_millis(200),
-            &cancel,
-        )
-        .await;
+        let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
+        let out =
+            run_child(std::path::Path::new(prog), &args, Duration::from_millis(200), &cancel).await;
         assert_eq!(out, RunOutcome::Timeout);
     }
 
@@ -355,15 +338,9 @@ mod tests {
         #[cfg(unix)]
         let (prog, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         #[cfg(windows)]
-        let (prog, args) =
-            ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
-        let out = run_child(
-            std::path::Path::new(prog),
-            &args,
-            Duration::from_secs(30),
-            &cancel,
-        )
-        .await;
+        let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
+        let out =
+            run_child(std::path::Path::new(prog), &args, Duration::from_secs(30), &cancel).await;
         assert_eq!(out, RunOutcome::Killed);
     }
 

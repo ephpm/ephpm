@@ -89,17 +89,17 @@ pub fn evaluate(
 
 /// Truncate to the start of the minute.
 fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
-    ts.with_second(0)
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(ts)
+    ts.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(ts)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
     use chrono::TimeZone;
     use chrono_tz::UTC;
-    use std::time::Duration;
+
+    use super::*;
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()

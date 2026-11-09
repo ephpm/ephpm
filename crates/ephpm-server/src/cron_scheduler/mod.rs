@@ -43,11 +43,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use ::metrics::{counter, gauge, histogram};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use ephpm_cluster::{ClusterHandle, NodeInfo};
 use ephpm_config::{ConcurrencyPolicy, Config, CronSchedule};
-use ::metrics::{counter, gauge, histogram};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -635,7 +635,11 @@ fn enumerate_site_dirs(sites_dir: &std::path::Path) -> Vec<String> {
     out
 }
 
-fn job_status_json(job: &ResolvedJob, s: &JobStatus, cursor: Option<DateTime<Utc>>) -> serde_json::Value {
+fn job_status_json(
+    job: &ResolvedJob,
+    s: &JobStatus,
+    cursor: Option<DateTime<Utc>>,
+) -> serde_json::Value {
     let next = job.schedule.next_after(Utc::now(), job.tz);
     serde_json::json!({
         "name": job.name,
@@ -676,9 +680,8 @@ pub fn spawn(
         }
     };
 
-    let scheduler = Arc::new(CronScheduler::from_config(
-        config, cluster, self_id, lease, cursor, executor,
-    )?);
+    let scheduler =
+        Arc::new(CronScheduler::from_config(config, cluster, self_id, lease, cursor, executor)?);
 
     tracing::info!(
         jobs = scheduler.operator_jobs.len(),

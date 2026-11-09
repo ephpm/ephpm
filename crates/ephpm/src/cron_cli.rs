@@ -141,15 +141,12 @@ fn run_now(config_path: &PathBuf, name: &str, force: bool) -> anyhow::Result<Exi
     if let Some(token) = &config.server.diagnostics.token {
         req = req.bearer_auth(token);
     }
-    let resp = req.send().with_context(|| format!("failed to reach {url} — is the server running?"))?;
+    let resp =
+        req.send().with_context(|| format!("failed to reach {url} — is the server running?"))?;
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     println!("{body}");
-    if status.is_success() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        Ok(ExitCode::FAILURE)
-    }
+    if status.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::FAILURE) }
 }
 
 /// A GET against the diagnostics endpoint, with the bearer token if configured.
@@ -159,7 +156,8 @@ fn get(config: &Config, url: &str) -> anyhow::Result<String> {
     if let Some(token) = &config.server.diagnostics.token {
         req = req.bearer_auth(token);
     }
-    let resp = req.send().with_context(|| format!("failed to reach {url} — is the server running?"))?;
+    let resp =
+        req.send().with_context(|| format!("failed to reach {url} — is the server running?"))?;
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -172,12 +170,7 @@ fn get(config: &Config, url: &str) -> anyhow::Result<String> {
 /// listen` address when set (where the status endpoint moves), else
 /// `[server] listen`, as plain HTTP on the loopback interface.
 fn base_url(config: &Config) -> String {
-    let addr = config
-        .server
-        .metrics
-        .listen
-        .clone()
-        .unwrap_or_else(|| config.server.listen.clone());
+    let addr = config.server.metrics.listen.clone().unwrap_or_else(|| config.server.listen.clone());
     let port = addr.rsplit(':').next().unwrap_or("8080");
     format!("http://127.0.0.1:{port}")
 }

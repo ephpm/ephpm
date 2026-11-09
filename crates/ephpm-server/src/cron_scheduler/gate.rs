@@ -129,10 +129,8 @@ mod tests {
             .copied()
             .unwrap();
 
-        let drained: Vec<NodeInfo> = all
-            .iter()
-            .map(|id| if *id == owner { draining(id) } else { alive(id) })
-            .collect();
+        let drained: Vec<NodeInfo> =
+            all.iter().map(|id| if *id == owner { draining(id) } else { alive(id) }).collect();
         let new_owner = all
             .iter()
             .find(|id| responsible_for_site(&drained, id, site) == Responsibility::Yes)

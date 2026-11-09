@@ -3309,9 +3309,7 @@ impl CronJob {
     /// Does the command run PHP (first argv element ends in `.php`)?
     #[must_use]
     pub fn is_php_command(&self) -> bool {
-        self.command
-            .first()
-            .is_some_and(|c| c.to_ascii_lowercase().ends_with(".php"))
+        self.command.first().is_some_and(|c| c.to_ascii_lowercase().ends_with(".php"))
     }
 }
 
@@ -3342,9 +3340,8 @@ impl CronConfig {
             ("directory_monthly", &self.directory_monthly),
         ] {
             if let Some(expr) = value {
-                CronSchedule::parse(expr).map_err(|e| {
-                    ConfigError::Validation(format!("[cron] {knob}: {e}"))
-                })?;
+                CronSchedule::parse(expr)
+                    .map_err(|e| ConfigError::Validation(format!("[cron] {knob}: {e}")))?;
             }
         }
 
@@ -10154,10 +10151,7 @@ listen = "0.0.0.0:8080"
         assert!(job.site.is_none());
         assert!(!job.is_php_command());
         assert_eq!(job.timeout_duration().unwrap(), std::time::Duration::from_secs(3600));
-        assert_eq!(
-            job.concurrency_policy_parsed().unwrap(),
-            ConcurrencyPolicy::Forbid
-        );
+        assert_eq!(job.concurrency_policy_parsed().unwrap(), ConcurrencyPolicy::Forbid);
         assert!(job.starting_deadline_duration().unwrap().is_none());
     }
 
@@ -10188,9 +10182,8 @@ listen = "0.0.0.0:8080"
     /// Bad schedule / timezone / timeout / policy each fail closed.
     #[test]
     fn cron_bad_fields_rejected() {
-        let bad_sched = load_toml(
-            "[[cron.jobs]]\nname = \"j\"\nschedule = \"nope\"\ncommand = [\"a\"]\n",
-        );
+        let bad_sched =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"nope\"\ncommand = [\"a\"]\n");
         assert!(bad_sched.validate().is_err());
 
         let bad_tz = load_toml(

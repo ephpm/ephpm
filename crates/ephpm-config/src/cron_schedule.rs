@@ -130,10 +130,7 @@ impl CronSchedule {
         let month = local.month();
         let dow = local.weekday().num_days_from_sunday();
 
-        if !bit(self.minute, minute)
-            || !bit(self.hour, hour)
-            || !bit(self.month, month)
-        {
+        if !bit(self.minute, minute) || !bit(self.hour, hour) || !bit(self.month, month) {
             return false;
         }
         let day_of_month_hit = bit(self.dom, dom);
@@ -220,16 +217,14 @@ impl CronSchedule {
 ///
 /// Returns a message when the name is not a known IANA zone.
 pub fn parse_timezone(name: &str) -> Result<Tz, String> {
-    name.trim()
-        .parse::<Tz>()
-        .map_err(|_| format!("{name:?} is not a valid IANA timezone name (e.g. \"UTC\", \"America/Chicago\")"))
+    name.trim().parse::<Tz>().map_err(|_| {
+        format!("{name:?} is not a valid IANA timezone name (e.g. \"UTC\", \"America/Chicago\")")
+    })
 }
 
 /// Truncate to the start of the minute (seconds and nanoseconds to zero).
 fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
-    ts.with_second(0)
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(ts)
+    ts.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(ts)
 }
 
 /// Is bit `n` set in `mask`?
@@ -253,15 +248,8 @@ const MONTH_NAMES: [(&str, u32); 12] = [
     ("dec", 12),
 ];
 
-const DOW_NAMES: [(&str, u32); 7] = [
-    ("sun", 0),
-    ("mon", 1),
-    ("tue", 2),
-    ("wed", 3),
-    ("thu", 4),
-    ("fri", 5),
-    ("sat", 6),
-];
+const DOW_NAMES: [(&str, u32); 7] =
+    [("sun", 0), ("mon", 1), ("tue", 2), ("wed", 3), ("thu", 4), ("fri", 5), ("sat", 6)];
 
 /// Parse one cron field into a bitmask over `[min, max]`.
 fn parse_field(
@@ -294,19 +282,14 @@ fn parse_field(
         let (lo, hi) = if range_part == "*" {
             (min, max)
         } else if let Some((a, b)) = range_part.split_once('-') {
-            (
-                parse_value(a, name, field, names)?,
-                parse_value(b, name, field, names)?,
-            )
+            (parse_value(a, name, field, names)?, parse_value(b, name, field, names)?)
         } else {
             let v = parse_value(range_part, name, field, names)?;
             (v, v)
         };
 
         if lo < min || hi > max || lo > hi {
-            return Err(format!(
-                "{name} value out of range in {field:?} (allowed {min}..={max})"
-            ));
+            return Err(format!("{name} value out of range in {field:?} (allowed {min}..={max})"));
         }
         let mut v = lo;
         while v <= hi {
@@ -331,26 +314,23 @@ fn parse_value(
             return Ok(*v);
         }
     }
-    tok.parse::<u32>()
-        .map_err(|_| format!("invalid {name} value {tok:?} in {field:?}"))
+    tok.parse::<u32>().map_err(|_| format!("invalid {name} value {tok:?} in {field:?}"))
 }
 
 /// Compute the UTC instant for a given UTC wall-clock, for tests.
 #[cfg(test)]
 fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
     Utc.from_utc_datetime(
-        &chrono::NaiveDate::from_ymd_opt(y, mo, d)
-            .unwrap()
-            .and_hms_opt(h, mi, 0)
-            .unwrap(),
+        &chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono_tz::America::Chicago;
     use chrono_tz::UTC;
+
+    use super::*;
 
     #[test]
     fn rejects_wrong_field_count() {
@@ -455,10 +435,8 @@ mod tests {
         // First (earliest) 01:30 is CDT (UTC-5) = 06:30 UTC; the second is
         // CST (UTC-6) = 07:30 UTC.
         // Discover the two real UTC instants for ambiguous local 01:30.
-        let wall = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
-            .unwrap()
-            .and_hms_opt(1, 30, 0)
-            .unwrap();
+        let wall =
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(1, 30, 0).unwrap();
         let (earliest, latest) = match Chicago.from_local_datetime(&wall) {
             LocalResult::Ambiguous(a, b) => {
                 let ua = a.with_timezone(&Utc);
@@ -471,12 +449,7 @@ mod tests {
         assert!(!s.fires_at(latest, Chicago), "second occurrence does not");
 
         // And the window evaluation yields exactly one occurrence that day.
-        let occ = s.occurrences_in(
-            utc(2026, 11, 1, 0, 0),
-            utc(2026, 11, 1, 12, 0),
-            Chicago,
-            100,
-        );
+        let occ = s.occurrences_in(utc(2026, 11, 1, 0, 0), utc(2026, 11, 1, 12, 0), Chicago, 100);
         assert_eq!(occ, vec![earliest]);
     }
 

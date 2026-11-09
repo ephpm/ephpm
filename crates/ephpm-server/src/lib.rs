@@ -574,11 +574,15 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         .map(|h| h.self_node().id.clone())
         .or_else(|| effective_node_id.clone())
         .unwrap_or_else(|| "local".to_string());
-    let (cron_scheduler, cron_periodic) =
-        match cron_scheduler::spawn(&config, cluster_handle.clone(), cron_self_id, Arc::clone(&kv_store)) {
-            Some((scheduler, handle)) => (Some(scheduler), Some(handle)),
-            None => (None, None),
-        };
+    let (cron_scheduler, cron_periodic) = match cron_scheduler::spawn(
+        &config,
+        cluster_handle.clone(),
+        cron_self_id,
+        Arc::clone(&kv_store),
+    ) {
+        Some((scheduler, handle)) => (Some(scheduler), Some(handle)),
+        None => (None, None),
+    };
 
     let listeners = bind_listeners(
         &config,
