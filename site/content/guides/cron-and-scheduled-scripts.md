@@ -130,7 +130,7 @@ if (!ephpm_kv_attached()) {
     exit(1);
 }
 foreach (top_pages() as $slug => $html) {
-    ephpm_kv_set("warm:$slug", $html, 3600_000); // ttl in ms
+    ephpm_kv_set("warm:$slug", $html, 3600); // ttl in seconds (1 hour)
 }
 ```
 

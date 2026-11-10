@@ -1625,15 +1625,28 @@ fn remote_client() -> Option<&'static crate::kv_remote::RemoteKvClient> {
 }
 
 /// Run one RESP command against the installed remote client; `None` when no
-/// client is installed or the transport failed (logged once at debug — the
-/// per-op failure value is the user-visible signal, matching a local miss).
+/// client is installed or the command failed. The per-op failure value
+/// (`false`/`null`) is the user-visible signal, matching a local miss — but a
+/// dead server, a `-NOAUTH`/`-TRYAGAIN`, or an over-size value would otherwise
+/// be indistinguishable from a cache miss with nothing on stderr (the CLI's
+/// default log filter is `info`, above `debug`). So the **first** failure warns;
+/// the rest stay at debug to avoid spamming a script that polls.
 #[cfg(php_linked)]
 fn remote_cmd(args: &[&[u8]]) -> Option<ephpm_kv::resp::Frame> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
     let client = remote_client()?;
     match client.command(args) {
         Ok(frame) => Some(frame),
         Err(e) => {
-            tracing::debug!(error = %e, "ephpm php --site: remote KV command failed");
+            if WARNED.swap(true, Ordering::Relaxed) {
+                tracing::debug!(error = %e, "ephpm php --site: remote KV command failed");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "ephpm php --site: KV wire command failed; later failures log at debug"
+                );
+            }
             None
         }
     }

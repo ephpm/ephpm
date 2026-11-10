@@ -57,6 +57,21 @@ use serde::{Deserialize, Serialize};
 /// clients are co-located CLI/cron invocations, one connection each.
 const INTERNAL_MAX_CONNECTIONS: usize = 128;
 
+/// Largest single RESP input the internal endpoint accepts. Deliberately
+/// independent of (and far above) `[kv.redis_compat] max_input_buffer`: the
+/// in-process `ephpm_kv_*` path a request uses has no per-value cap, so a CLI
+/// cache-warmer writing a rendered page must not be cut off at the public
+/// listener's 1 MiB. Still bounds a runaway (a CLI is trusted but may be buggy).
+const INTERNAL_MAX_INPUT_BUFFER: usize = 64 * 1024 * 1024;
+
+/// Idle-close timeout for the internal endpoint: **off**. The public listener
+/// closes idle sockets after `[kv.redis_compat] idle_timeout_secs` (default
+/// 300), but a CLI/cron client legitimately sits between KV calls for minutes
+/// while it does DB or compute work; closing its connection mid-script makes the
+/// next `ephpm_kv_*` call fail once (then redial) — a silent one-shot failure on
+/// what is often a lock release. The ≤128 co-located clients are cheap to keep.
+const INTERNAL_IDLE_TIMEOUT_SECS: u64 = 0;
+
 /// The runtime discovery file's contents.
 #[derive(Debug, Serialize, Deserialize)]
 struct EndpointFile {
@@ -251,8 +266,8 @@ pub fn start(
         password: None,
         secret: config.kv.secret.clone(),
         max_connections: INTERNAL_MAX_CONNECTIONS,
-        max_input_buffer: config.kv.redis_compat.max_input_buffer,
-        idle_timeout_secs: config.kv.redis_compat.idle_timeout_secs,
+        max_input_buffer: INTERNAL_MAX_INPUT_BUFFER,
+        idle_timeout_secs: INTERNAL_IDLE_TIMEOUT_SECS,
     };
     let store = Arc::clone(store);
     let multi_tenant = multi_tenant.clone();
