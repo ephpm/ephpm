@@ -379,9 +379,6 @@ async fn first_tick_after_start_does_not_catch_up() {
 /// persists it, and `Decision::Idle` writes nothing, so every tick re-seeds to
 /// the new `now` and the window `(now, now]` stays empty forever: a job with no
 /// `cron:state:<job>` key never fires.
-#[ignore = "real bug: an absent cursor is re-seeded to `now` on every tick and never persisted, so \
-            a job with no cron:state key (fresh install / new directory file) never fires — see \
-            lost_cursor_fails_safe_to_window_starts_now's doc comment"]
 #[tokio::test]
 async fn lost_cursor_fails_safe_to_window_starts_now() {
     let cursor: Arc<InMemCursor> = Arc::new(InMemCursor::default());
@@ -1570,9 +1567,6 @@ fn directory_jobs_pass_the_same_gate_and_lease() {
 /// is keyed on the minute (`floor_minute`), so the two keys never collide and
 /// `run-now` double-fires with the scheduled run of the same tick (observed:
 /// fires = 2, result `triggered "j" (gated + leased)`).
-#[ignore = "real bug: trigger_now leases cron:lease:<job>:<Utc::now() seconds>, not the minute \
-            tick's key, so run-now double-fires with the scheduled run of the same minute — see \
-            run_now_takes_the_scheduled_ticks_lease's doc comment"]
 #[test]
 fn run_now_takes_the_scheduled_ticks_lease() {
     for _attempt in 0..3 {

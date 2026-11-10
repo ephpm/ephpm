@@ -88,7 +88,7 @@ pub fn evaluate(
 }
 
 /// Truncate to the start of the minute.
-fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn floor_minute(ts: DateTime<Utc>) -> DateTime<Utc> {
     ts.with_second(0).and_then(|t| t.with_nanosecond(0)).unwrap_or(ts)
 }
 

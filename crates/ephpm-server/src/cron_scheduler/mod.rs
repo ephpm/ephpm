@@ -382,7 +382,19 @@ impl CronScheduler {
             }
         }
 
-        let cursor = self.cursor.get(&job.name).unwrap_or(now);
+        let cursor = match self.cursor.get(&job.name) {
+            Some(c) => c,
+            None => {
+                // First sight of this job (fresh deploy, a newly dropped
+                // `.ephpm/cron/` file, or a cursor the clustered KV lost):
+                // record the window start so the next on-time tick has a
+                // non-empty window. No catch-up — the window starts at `now`,
+                // never in the past. Without this the window is forever
+                // `(now, now]` and the job never fires.
+                self.cursor.set(&job.name, now);
+                now
+            }
+        };
         match decision::evaluate(&job.schedule, job.tz, now, cursor, job.starting_deadline) {
             Decision::Idle => {}
             Decision::SkipDue { advance_to, valve } => {
@@ -584,7 +596,10 @@ impl CronScheduler {
         let Some(job) = jobs.iter().find(|j| j.name == name) else {
             return format!("no such job {name:?}");
         };
-        let tick_ts = Utc::now();
+        // Floor to the minute so the ad-hoc lease shares the scheduled tick's
+        // lease key (`cron:lease:<job>:<minute_epoch>`); otherwise run-now and
+        // the scheduled run take different keys and both fire.
+        let tick_ts = decision::floor_minute(Utc::now());
         if force {
             self.start_run(job, tick_ts).await;
             return format!("fired {name:?} (forced, lease bypassed)");
