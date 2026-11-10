@@ -422,10 +422,11 @@ supported state is *ePHPm is the sole process on the file*.
 Every `interval`, each embedded database — the one `[db.sqlite] path` in
 single-node mode, every `<dir>/<site-key>.db` in per-site mode, open or not —
 is snapshotted *inside the ePHPm process* with the engine's own `VACUUM INTO`
-(memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.2`, which
-builds the copy in batches: ~53 MB of resident memory whatever the database
-size, where stock 0.8.3 committed the whole copy at once and needed ~2× the
-file — see [the patched-engine note](#patched-turso-083-the-page-1-allocation-race-and-vacuum-into-memory)),
+(memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.3`, which
+builds the copy in batches with each index after its rows: the peak is bounded
+by `~66 MiB + 2× the largest single index`, not the database size, where stock
+0.8.3 committed the whole copy at once and needed ~2× the file — see
+[the patched-engine note](#patched-turso-083-the-page-1-allocation-race-and-vacuum-into-memory)),
 gzipped and uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects
 older than `retention` are deleted after each successful upload, always keeping
 the newest. The snapshot is read through an in-process engine handle,

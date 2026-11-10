@@ -96,8 +96,9 @@ opens with `sqlite3` when ePHPm is gone.
 ## Memory headroom
 
 Turning backups on costs some extra RAM while a snapshot runs, so size the
-node for it. The good news is that **the cost does not grow with the database
-size** — the whole reason the snapshot runs inside the process (the pinned
+node for it. The good news is that **the cost is not proportional to the
+database size** — it tracks your largest index, not the whole file, which is
+the whole reason the snapshot runs inside the process (the pinned
 engine, `v0.8.3-ephpm.3`) instead of shelling out to `sqlite3`, whose
 `VACUUM INTO` needs roughly twice the file resident and OOM-killed large
 backups on earlier builds.
