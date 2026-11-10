@@ -143,19 +143,34 @@ possible.
 
 From v0.13.0, ePHPm builds Turso 0.8.3 from a fork rather
 than the crates.io release: the org mirror
-[ephpm/turso](https://github.com/ephpm/turso), branch `ephpm/v0.8.3`, at tag
-[`v0.8.3-ephpm.2`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.2)
-(v0.15.1; v0.13.0–v0.15.0 pinned `v0.8.3-ephpm.1`) — the v0.8.3 tag plus a
+[ephpm/turso](https://github.com/ephpm/turso), at tag
+[`v0.8.3-ephpm.3`](https://github.com/ephpm/turso/releases/tag/v0.8.3-ephpm.3)
+(branch `ephpm/v0.8.3-vacuum-harden`; pinned from v0.15.2 — v0.15.1 pinned
+`v0.8.3-ephpm.2`, v0.13.0–v0.15.0 `v0.8.3-ephpm.1`) — the v0.8.3 tag plus a
 backport of
-[tursodatabase/turso#10117](https://github.com/tursodatabase/turso/pull/10117),
-which is not yet in a Turso release, plus a batched `VACUUM INTO` target build:
-the stock engine builds the whole copy in one write transaction whose commit
+[tursodatabase/turso#10117](https://github.com/tursodatabase/turso/pull/10117)
+(the page-1 race below, not yet in a Turso release) plus a hardened, batched
+`VACUUM INTO` target build (upstreamed as
+[tursodatabase/turso#11503](https://github.com/tursodatabase/turso/pull/11503)).
+The stock engine builds the whole copy in one write transaction whose commit
 re-reads every spilled page and holds a WAL frame per page, so the statement
 needed ~2× the database resident (1.4 GB for a 688 MB file, 11.6 GB for 5.6 GB)
-and OOM-killed the scheduled backup on a 1.6 GB database; with the patch it is
-flat at ~53 MB at every size. The crate versions stay 0.8.3; the swap is a
+and OOM-killed the scheduled backup on a 1.6 GB database. The fork builds the
+copy in batches into a temp file that is durably renamed into place only after
+its final checkpoint syncs — so a killed backup never leaves a half-written
+`.db` — and builds each index *after* its rows rather than before (bulk-sorted,
+the order SQLite itself uses; building indexes first turned every random or
+UUID key into a random B-tree insert, ~3× slower on exactly the slug/UUID
+shapes WordPress backups hit). The peak no longer grows with the database
+size: it is bounded by `~66 MiB + 2× the largest single index` — a few tens of
+MB for ordinary data, sized by the biggest index and never the file for the
+rest (the operator-facing numbers are under
+[memory headroom](/guides/database-backups/#memory-headroom)).
+`v0.8.3-ephpm.2` was flatter still (~53 MB at every size) but built indexes
+before rows; `.3` trades that flat profile for the bulk-sorted speed and for
+atomic, crash-safe output. The crate versions stay 0.8.3; the swap is a
 `[patch.crates-io]` entry in ePHPm's workspace `Cargo.toml`, and it goes away
-once a Turso release carrying both fixes is pinned.
+once a Turso release carrying the fixes is pinned.
 
 The bug: when several connections make the **first write to a fresh database
 file** at the same time — typically a new per-site database receiving
@@ -407,10 +422,11 @@ supported state is *ePHPm is the sole process on the file*.
 Every `interval`, each embedded database — the one `[db.sqlite] path` in
 single-node mode, every `<dir>/<site-key>.db` in per-site mode, open or not —
 is snapshotted *inside the ePHPm process* with the engine's own `VACUUM INTO`
-(memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.2`, which
-builds the copy in batches: ~53 MB of resident memory whatever the database
-size, where stock 0.8.3 committed the whole copy at once and needed ~2× the
-file — see [the patched-engine note](#patched-turso-083-the-page-1-allocation-race-and-vacuum-into-memory)),
+(memory-bounded in the engine as of the pinned Turso `v0.8.3-ephpm.3`, which
+builds the copy in batches with each index after its rows: the peak is bounded
+by `~66 MiB + 2× the largest single index`, not the database size, where stock
+0.8.3 committed the whole copy at once and needed ~2× the file — see
+[the patched-engine note](#patched-turso-083-the-page-1-allocation-race-and-vacuum-into-memory)),
 gzipped and uploaded as `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`; objects
 older than `retention` are deleted after each successful upload, always keeping
 the newest. The snapshot is read through an in-process engine handle,

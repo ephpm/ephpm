@@ -12,6 +12,14 @@ ignore = [
     # above our 1.88 MSRV, so migrating is a separate change. Remove this entry
     # when ephpm-analyze moves off serde_yaml_ng.
     "RUSTSEC-2024-0449",
+    # pin-utils 0.1.0 unmaintained (RUSTSEC-2026-0441). An informational notice,
+    # not a vulnerability: 0.1.0 is the crate's only/final release and the
+    # advisory lists "No safe upgrade is available". It is a deep transitive dep
+    # of hyper 1.x (→ axum / reqwest / hyper-rustls / litewire), the core HTTP
+    # stack — nothing ePHPm can swap out. The modern replacements (core::pin::pin!
+    # / pin-project) are hyper's call, not ours. Pre-existing on main, unrelated
+    # to any ePHPm change. Remove this entry when hyper drops pin-utils.
+    "RUSTSEC-2026-0441",
     # zip 2.4.2 (pulled only by vivacity-core, the `ephpm composer` installer;
     # still `zip = "=2.4.2"` in vivacity 0.23.0): SUID/SGID bits kept on
     # extraction (0367), symlink targets outside the destination (0368),
@@ -123,9 +131,9 @@ allow-git = [
     # [patch.crates-io] in Cargo.toml). Remove when it returns to a crates.io source.
     "https://github.com/ephpm/opensrv-mysql.git",
     # ePHPm org mirror of Turso 0.8.3 + the page-1 allocation race fix
-    # (upstream PR tursodatabase/turso#10117) + the batched VACUUM INTO target
-    # build (tag v0.8.3-ephpm.2; see the turso entries in [patch.crates-io] in
-    # Cargo.toml). Remove when a Turso release carrying both is pinned from
+    # (upstream PR tursodatabase/turso#10117) + the hardened batched VACUUM INTO
+    # target build (tag v0.8.3-ephpm.3; see the turso entries in [patch.crates-io]
+    # in Cargo.toml). Remove when a Turso release carrying these is pinned from
     # crates.io.
     "https://github.com/ephpm/turso.git",
 ]

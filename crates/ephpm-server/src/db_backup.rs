@@ -22,15 +22,17 @@
 //! write pause), and restorable as a file install rather than an SQL replay.
 //!
 //! **Memory is bounded by the engine, and only as of the pinned Turso
-//! `v0.8.3-ephpm.2`.** Stock 0.8.3 builds the whole output inside one write
+//! `v0.8.3-ephpm.3`.** Stock 0.8.3 builds the whole output inside one write
 //! transaction whose commit (`Pager::commit_wal_inner`) re-reads every spilled
 //! page and holds a WAL frame per page, so the statement needed ~2× the
 //! database resident (1.4 GB for a 688 MB file, 11.6 GB for 5.6 GB) and
 //! v0.15.0 OOM-killed the container on a 1.6 GB database. The pinned fork
-//! builds the target in batches, which keeps the peak flat at ~53 MB at every
-//! size — measured with `examples/db_backup_memtest.rs` and guarded by the
-//! ignored `snapshot_memory_is_bounded_regardless_of_database_size` test,
-//! which fails if the pin ever moves to a build without that change.
+//! builds the target in batches (and each index after its rows), which keeps
+//! the peak off the database size — bounded by ~`66 MiB + 2× the largest
+//! single index`, a few tens of MB for ordinary data — measured with
+//! `examples/db_backup_memtest.rs` and guarded by the ignored
+//! `snapshot_memory_is_bounded_regardless_of_database_size` test, which fails
+//! if the pin ever moves to a build without that change.
 //!
 //! The serving factories hold no handle a backup task can reach (single-node
 //! keeps its `Turso` behind the tracked backend; per-site keeps an LRU of
@@ -1346,8 +1348,9 @@ mod tests {
     /// engine's `VACUUM INTO`) and the process high-water mark may grow by
     /// at most [`SNAPSHOT_MEMORY_BOUND_MB`]. Stock Turso 0.8.3 grew it by
     /// ~2× the file (about 250 MB here, 1.4 GB for a 688 MB file); the
-    /// pinned `v0.8.3-ephpm.2` builds the target in batches (measured +31 to
-    /// +42 MB here, ~53 MB absolute at 5.6 GB with
+    /// pinned `v0.8.3-ephpm.3` builds the target in batches with each index
+    /// built after its rows, bounding the peak at ~`66 MiB + 2× the largest
+    /// index` (measured +31 to +42 MB here with
     /// `examples/db_backup_memtest.rs`). This is the test that fails if the
     /// engine pin ever moves to a build without that change. Ignored by
     /// default (it writes ~250 MB and takes a while unoptimised); the nightly
