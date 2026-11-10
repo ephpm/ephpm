@@ -56,9 +56,17 @@ use self::exec::{ExecRequest, JobExecutor, RunOutcome};
 use self::gate::Responsibility;
 use self::lease::{CursorStore, LeaseOutcome, LeaseStore};
 
-/// The margin added to a job's timeout to size its lease TTL, so the lease
-/// always outlives the run (a slow job's tick cannot be re-leased mid-run).
+/// The margin added to a job's lease-window estimate to size its lease TTL, so
+/// the lease always outlives the window in which two nodes could both try the
+/// same tick (a slow run, or a late catch-up).
 const LEASE_MARGIN: Duration = Duration::from_secs(60);
+
+/// Upper bound on a per-tick lease's TTL. A lease key is tick-scoped
+/// (`cron:lease:<job>:<minute>`), so a long TTL only means stale keys linger;
+/// this caps that so a pathologically large `starting_deadline` cannot pin them
+/// for an unbounded time. 7 days comfortably covers a daily/weekly catch-up
+/// window while keeping key lifetime finite.
+const MAX_LEASE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// How long to wait for a pre-empted (`replace`) run to die before starting the
 /// replacement.
@@ -115,13 +123,25 @@ impl ResolvedJob {
         self.site.as_deref().unwrap_or("-")
     }
 
-    fn exec_request(&self, config_path: Option<PathBuf>) -> ExecRequest {
+    fn exec_request(
+        &self,
+        config_path: Option<PathBuf>,
+        sites_dir: Option<&std::path::Path>,
+    ) -> ExecRequest {
+        // A per-site job runs with its site root as the working directory, so a
+        // relative command (e.g. `bin/cake.php`) resolves there rather than
+        // against the server's cwd — matching `ephpm exec`.
+        let cwd = match (&self.site, sites_dir) {
+            (Some(site), Some(dir)) => Some(dir.join(site)),
+            _ => None,
+        };
         ExecRequest {
             job: self.name.clone(),
             site: self.site.clone(),
             is_php: self.is_php,
             command: self.command.clone(),
             config_path,
+            cwd,
             timeout: self.timeout,
         }
     }
@@ -386,13 +406,18 @@ impl CronScheduler {
             Some(c) => c,
             None => {
                 // First sight of this job (fresh deploy, a newly dropped
-                // `.ephpm/cron/` file, or a cursor the clustered KV lost):
-                // record the window start so the next on-time tick has a
-                // non-empty window. No catch-up — the window starts at `now`,
-                // never in the past. Without this the window is forever
-                // `(now, now]` and the job never fires.
-                self.cursor.set(&job.name, now);
-                now
+                // `.ephpm/cron/` file, or a cursor the clustered KV lost). Seed
+                // the cursor to the start of the current minute (less a tick), so
+                // the first window is `(floor(now) - 1s, now]` — the current
+                // minute only. A tick whose instant *is* the current minute then
+                // still fires on time (seeding plain `now` would drop it whenever
+                // first sight lands a fraction of a second past the minute
+                // boundary), while nothing older is replayed — the lost-cursor
+                // fail-safe. Without any seed the window is forever `(now, now]`
+                // and the job never fires.
+                let start = decision::floor_minute(now) - chrono::Duration::seconds(1);
+                self.cursor.set(&job.name, start);
+                start
             }
         };
         match decision::evaluate(&job.schedule, job.tz, now, cursor, job.starting_deadline) {
@@ -443,7 +468,14 @@ impl CronScheduler {
         // Per-tick lease.
         let token = lease::mint_token(&self.self_id);
         let key = lease::lease_key(&job.name, tick_ts);
-        let ttl = job.timeout + LEASE_MARGIN;
+        // The lease must outlive the whole window in which two nodes could both
+        // try this same tick: a run as slow as `timeout`, and — with catch-up
+        // enabled — a peer firing it up to `starting_deadline` late after an
+        // ownership move or restart. Sizing it to just `timeout` let a lease
+        // expire inside a long catch-up window and the tick double-fire. Bounded
+        // so a very large deadline cannot pin tick-scoped keys indefinitely.
+        let window = job.timeout.max(job.starting_deadline.unwrap_or_default());
+        let ttl = (window + LEASE_MARGIN).min(MAX_LEASE_TTL);
         match self.lease.acquire(&key, &token, ttl) {
             LeaseOutcome::Acquired => self.start_run(job, tick_ts).await,
             LeaseOutcome::Held => {
@@ -496,7 +528,7 @@ impl CronScheduler {
 
         let cancel = CancellationToken::new();
         let id = self.running.register(&job.name, cancel.clone()).await;
-        let req = job.exec_request(self.config_path.clone());
+        let req = job.exec_request(self.config_path.clone(), self.sites_dir.as_deref());
         let executor = Arc::clone(&self.executor);
         let running = self.running.clone();
         let status = Arc::clone(&self.status);

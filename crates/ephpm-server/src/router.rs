@@ -5472,6 +5472,19 @@ impl Router {
             let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
             return self.handle_kv_snapshot(path, req.method(), &client, true).await.0;
         }
+        if let Some(name) = path.strip_prefix(CRON_RUN_PREFIX) {
+            // `POST /_ephpm/cron/run/<name>` lives here too, so `ephpm cron
+            // run-now` works when `[server.metrics] listen` is set — the CLI
+            // targets this listener for *every* `/_ephpm/cron` endpoint, and the
+            // status GET (below) already moved here. A POST, so it is carved out
+            // before the GET-only 405, mirroring the KV-snapshot block above and
+            // the main listener's dispatch; `handle_cron_run` applies the same
+            // ACL gate.
+            let name = name.to_string();
+            let force = req.uri().query().is_some_and(|q| q.contains("force=true"));
+            let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
+            return self.handle_cron_run(&name, req.method(), &client, force).await;
+        }
         if req.method() != hyper::Method::GET {
             return Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)

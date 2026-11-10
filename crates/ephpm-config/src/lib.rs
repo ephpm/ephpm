@@ -3377,11 +3377,23 @@ impl CronConfig {
             }
 
             // Parse-validate every lossily-typed field (errors name the job).
-            job.schedule_parsed()?;
-            job.timezone_resolved(&self.timezone)?;
+            let schedule = job.schedule_parsed()?;
+            let tz = job.timezone_resolved(&self.timezone)?;
             job.timeout_duration()?;
             job.starting_deadline_duration()?;
             job.concurrency_policy_parsed()?;
+
+            // Reject a syntactically valid but never-matching schedule (e.g.
+            // `0 0 31 2 *` — 31 February). It parses fine, but would never fire
+            // and would burn the full ~4-year `next_after` search on every tick,
+            // forever. Catch it once at startup instead.
+            if schedule.next_after(chrono::Utc::now(), tz).is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "[[cron.jobs]] {:?} schedule {:?} never fires (no matching time within four \
+                     years) — check the day-of-month / month combination",
+                    job.name, job.schedule
+                )));
+            }
 
             match &job.site {
                 Some(site) => {
@@ -10153,6 +10165,18 @@ listen = "0.0.0.0:8080"
         assert_eq!(job.timeout_duration().unwrap(), std::time::Duration::from_secs(3600));
         assert_eq!(job.concurrency_policy_parsed().unwrap(), ConcurrencyPolicy::Forbid);
         assert!(job.starting_deadline_duration().unwrap().is_none());
+    }
+
+    /// A syntactically valid but never-matching schedule (31 February) is
+    /// rejected at startup, not left to burn the full search every tick.
+    #[test]
+    fn cron_never_matching_schedule_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"never\"\nschedule = \"0 0 31 2 *\"\ncommand = [\"a\"]\n",
+        );
+        let err = cfg.validate().expect_err("a never-firing schedule must fail").to_string();
+        assert!(err.contains("never fires"), "{err}");
+        assert!(err.contains("\"never\""), "{err}");
     }
 
     /// Duplicate job names fail closed, naming the collision.

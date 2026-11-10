@@ -350,35 +350,35 @@ async fn single_node_fires_and_executes_command() {
 }
 
 #[tokio::test]
-async fn first_tick_after_start_does_not_catch_up() {
-    // With no cursor, it is seeded to `now`; the half-open window is empty, so
-    // nothing fires until the next matching tick (no catch-up on boot).
+async fn first_tick_after_start_fires_current_minute_without_catch_up() {
+    // With no cursor, it is seeded to `floor(now) - 1s`, so the first window is
+    // the current minute: an every-minute job first seen at 00:00:00 fires its
+    // on-time 00:00 tick exactly once — and nothing from before boot is replayed
+    // (no catch-up).
+    let cursor: Arc<InMemCursor> = Arc::new(InMemCursor::default());
     let s = scheduler(
         vec![every_minute_job("j", None)],
         false,
         "solo",
         Arc::new(InMemLease::default()),
-        Arc::new(InMemCursor::default()),
+        cursor.clone(),
         Arc::new(RecordingExec::default()),
         4,
     );
     s.tick(at(2026, 1, 1, 0, 0), &[]).await;
-    assert_eq!(fire_count(&s, "j").await, 0);
+    settle().await;
+    assert_eq!(fire_count(&s, "j").await, 1, "the current-minute tick fires on time");
+    assert_eq!(cursor.get("j"), Some(at(2026, 1, 1, 0, 0)), "cursor advanced to the fired tick");
 }
 
-/// D10 — a lost `lastScheduleTime` fails safe to "the window starts now": no
-/// backlog is replayed (not even with a generous `starting_deadline`), and the
-/// **next on-time tick fires**. Three jobs: strict daily, daily with a 7-day
-/// catch-up deadline, and every-minute.
+/// D10 — a lost `lastScheduleTime` fails safe: no backlog is replayed (not even
+/// with a generous `starting_deadline`), while a tick whose instant is the
+/// **current minute** still fires on time. The first-sight seed is
+/// `floor(now) - 1s`, so the first window is exactly the current minute. Three
+/// jobs: strict daily, daily with a 7-day catch-up deadline, and every-minute.
 ///
 /// This is also the shape of every job on a fresh install (no `cron:state:*`
 /// key yet) and of every newly dropped directory-tier file.
-///
-/// **Currently fails — real bug, left as the executable spec (run with
-/// `--ignored`).** `consider()` seeds a missing cursor as `now` but never
-/// persists it, and `Decision::Idle` writes nothing, so every tick re-seeds to
-/// the new `now` and the window `(now, now]` stays empty forever: a job with no
-/// `cron:state:<job>` key never fires.
 #[tokio::test]
 async fn lost_cursor_fails_safe_to_window_starts_now() {
     let cursor: Arc<InMemCursor> = Arc::new(InMemCursor::default());
@@ -395,20 +395,24 @@ async fn lost_cursor_fails_safe_to_window_starts_now() {
         4,
     );
 
-    // 09:00:05 on day 1, six hours past the 03:00 slot, cursor unknown: nothing
-    // is replayed.
+    // 09:00:05 on day 1, six hours past the 03:00 slot, cursor unknown. The
+    // daily jobs have no tick in the *current* minute, so nothing is replayed —
+    // the 7-day deadline does not drag in the long-past 03:00 slot. The
+    // every-minute job's 09:00 tick is the current minute, so it fires on time.
     s.tick(at_s(2026, 1, 1, 9, 0, 5), &[]).await;
     settle().await;
     assert_eq!(fire_count(&s, "daily").await, 0, "no backlog replay (strict)");
     assert_eq!(fire_count(&s, "daily-deadline").await, 0, "no backlog replay (deadline)");
     assert_eq!(skip_count(&s, "daily").await + skip_count(&s, "daily-deadline").await, 0);
+    assert_eq!(fire_count(&s, "minutely").await, 1, "the current-minute tick fires at first sight");
 
-    // The very next minute: the every-minute job is on time and fires once.
+    // The next minute: the every-minute job is on time again.
     s.tick(at_s(2026, 1, 1, 9, 1, 2), &[]).await;
     settle().await;
-    assert_eq!(fire_count(&s, "minutely").await, 1, "the next on-time minute fires");
+    assert_eq!(fire_count(&s, "minutely").await, 2, "the next on-time minute fires too");
 
-    // Day 2 at 03:00: both daily jobs are on time and fire exactly once.
+    // Day 2 at 03:00: both daily jobs are on time and fire exactly once — the
+    // long-past day-1 03:00 slot is never replayed.
     s.tick(at_s(2026, 1, 2, 3, 0, 3), &[]).await;
     settle().await;
     assert_eq!(fire_count(&s, "daily").await, 1, "the next on-time daily tick fires");
@@ -1281,7 +1285,8 @@ fn dir_scheduler(
 
 /// E1 + E2 — `.ephpm/cron/` is scanned live each tick (a file dropped after
 /// startup fires at the next cadence with no restart), and every directory
-/// job runs as PHP for **its** site (`ephpm php --site <site> -- <script>`).
+/// job runs as PHP for **its** site (`ephpm php --site <site> -f <script>`),
+/// with the site root as its working directory.
 #[tokio::test]
 async fn directory_jobs_are_discovered_live_and_run_as_php_for_their_site() {
     let sites = sites_fixture(&["shop"]);
@@ -1321,6 +1326,9 @@ async fn directory_jobs_are_discovered_live_and_run_as_php_for_their_site() {
     assert_eq!(req.site.as_deref(), Some("shop"), "runs as its own site");
     assert!(req.is_php, "directory jobs are PHP-only");
     assert_eq!(req.command, vec![script.to_string_lossy().into_owned()]);
+    // The child runs with the site root as cwd, so a relative script resolves
+    // there rather than against the server's working directory.
+    assert_eq!(req.cwd, Some(sites.path().join("shop")), "cwd is the site root");
     let (prog, args) = exec::build_argv(&req, Path::new("/usr/bin/ephpm"));
     assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
     assert_eq!(args[0], "php");

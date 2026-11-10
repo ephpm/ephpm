@@ -134,7 +134,10 @@ exactly once cluster-wide.
    cannot confirm ownership does not run (skip + WARN + `not_owner` metric).
 2. **Per-tick lease (handoff backstop).** Before executing, a node acquires
    `cron:lease:<job>:<tick_ts>` in the clustered KV via the atomic conditional
-   set (`SET key token NX EX ttl`, TTL ≈ `timeout` + margin). During a brief
+   set (`SET key token NX EX ttl`, TTL ≈ `max(timeout, starting_deadline)` +
+   margin, bounded — large enough that the lease outlives the whole window in
+   which two nodes could both try the same tick, including a late catch-up).
+   During a brief
    ownership-move overlap where two nodes both pass the gate, exactly one wins
    the tick. **Fail-closed** on an unreachable KV owner (skip, never "assume
    free"). The lease is **not released on success** — it TTLs out, so a
@@ -167,7 +170,9 @@ built from.
   nothing. No stampede.
 * **`lastScheduleTime`** lives in the clustered KV (`cron:state:<job>`), written
   on a successful start, so an ownership move resumes where the old owner left
-  off. A lost cursor is re-derived as "window starts now" (safe; skips catch-up).
+  off. A lost cursor (or a brand-new job / newly dropped file) is re-derived as
+  "the window is the current minute": a tick due *this* minute still fires on
+  time, but nothing older is replayed (safe; skips catch-up).
 * **`concurrency_policy`:** `forbid` (default) skips while a previous run is
   active; `allow` runs regardless; `replace` terminates the running instance
   (SIGTERM → grace → SIGKILL) then starts. `max_concurrent` caps simultaneous

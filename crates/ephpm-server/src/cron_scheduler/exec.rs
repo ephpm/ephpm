@@ -51,6 +51,10 @@ pub struct ExecRequest {
     pub command: Vec<String>,
     /// The config file to pass to `ephpm exec`/`ephpm php` children.
     pub config_path: Option<PathBuf>,
+    /// Working directory for the child, so a relative script/command
+    /// (`bin/cake.php`) resolves against the site root rather than the server's
+    /// cwd. `Some(site_root)` for a per-site job, `None` (inherit) otherwise.
+    pub cwd: Option<PathBuf>,
     /// Wall-clock cap.
     pub timeout: Duration,
 }
@@ -175,21 +179,30 @@ impl JobExecutor for ChildExecutor {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = RunOutcome> + Send + 'a>> {
         let (program, args) = build_argv(&req, &self.exe);
-        Box::pin(async move { run_child(&program, &args, req.timeout, &cancel).await })
+        let cwd = req.cwd.clone();
+        Box::pin(
+            async move { run_child(&program, &args, cwd.as_deref(), req.timeout, &cancel).await },
+        )
     }
 }
 
 /// Spawn `program args`, wait for it, and kill it on timeout or cancellation.
+/// `cwd`, when set, is the child's working directory (a per-site job's site
+/// root, so relative script paths resolve there, not against the server's cwd).
 ///
 /// stdout/stderr are inherited so a job's output reaches the server's logs.
 pub async fn run_child(
     program: &std::path::Path,
     args: &[String],
+    cwd: Option<&std::path::Path>,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> RunOutcome {
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
@@ -260,6 +273,7 @@ mod tests {
             is_php: false,
             command: vec!["maintenance".into(), "--sweep".into()],
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
+            cwd: None,
             timeout: Duration::from_secs(60),
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
@@ -275,6 +289,7 @@ mod tests {
             is_php: false,
             command: vec!["wp".into(), "cron".into(), "event".into()],
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
+            cwd: None,
             timeout: Duration::from_secs(60),
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
@@ -308,6 +323,7 @@ mod tests {
             is_php: true,
             command: vec!["artisan.php".into(), "schedule:run".into()],
             config_path: Some(PathBuf::from("/c.toml")),
+            cwd: None,
             timeout: Duration::from_secs(60),
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
@@ -342,6 +358,7 @@ mod tests {
             is_php: true,
             command: vec!["daily/cleanup.php".into()],
             config_path: None,
+            cwd: None,
             timeout: Duration::from_secs(60),
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
@@ -356,18 +373,28 @@ mod tests {
         let (ok_prog, ok_args) = ("/bin/sh", vec!["-c".to_string(), "exit 0".to_string()]);
         #[cfg(windows)]
         let (ok_prog, ok_args) = ("cmd", vec!["/C".to_string(), "exit 0".to_string()]);
-        let out =
-            run_child(std::path::Path::new(ok_prog), &ok_args, Duration::from_secs(10), &cancel)
-                .await;
+        let out = run_child(
+            std::path::Path::new(ok_prog),
+            &ok_args,
+            None,
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
         assert_eq!(out, RunOutcome::Ok);
 
         #[cfg(unix)]
         let (bad_prog, bad_args) = ("/bin/sh", vec!["-c".to_string(), "exit 3".to_string()]);
         #[cfg(windows)]
         let (bad_prog, bad_args) = ("cmd", vec!["/C".to_string(), "exit 3".to_string()]);
-        let out =
-            run_child(std::path::Path::new(bad_prog), &bad_args, Duration::from_secs(10), &cancel)
-                .await;
+        let out = run_child(
+            std::path::Path::new(bad_prog),
+            &bad_args,
+            None,
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
         assert_eq!(out, RunOutcome::Failed);
     }
 
@@ -379,7 +406,8 @@ mod tests {
         #[cfg(windows)]
         let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
         let out =
-            run_child(std::path::Path::new(prog), &args, Duration::from_millis(200), &cancel).await;
+            run_child(std::path::Path::new(prog), &args, None, Duration::from_millis(200), &cancel)
+                .await;
         assert_eq!(out, RunOutcome::Timeout);
     }
 
@@ -403,7 +431,8 @@ mod tests {
         );
         let started = std::time::Instant::now();
         let out =
-            run_child(std::path::Path::new(prog), &args, Duration::from_millis(200), &cancel).await;
+            run_child(std::path::Path::new(prog), &args, None, Duration::from_millis(200), &cancel)
+                .await;
         assert_eq!(out, RunOutcome::Timeout);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -424,6 +453,7 @@ mod tests {
             is_php: false,
             command: vec!["wp".into(), "post list; rm -rf /".into(), "$(id)".into()],
             config_path: None,
+            cwd: None,
             timeout: Duration::from_secs(60),
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
@@ -447,7 +477,8 @@ mod tests {
         #[cfg(windows)]
         let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
         let out =
-            run_child(std::path::Path::new(prog), &args, Duration::from_secs(30), &cancel).await;
+            run_child(std::path::Path::new(prog), &args, None, Duration::from_secs(30), &cancel)
+                .await;
         assert_eq!(out, RunOutcome::Killed);
     }
 
@@ -457,6 +488,7 @@ mod tests {
         let out = run_child(
             std::path::Path::new("/nonexistent/definitely/not/here"),
             &[],
+            None,
             Duration::from_secs(5),
             &cancel,
         )
