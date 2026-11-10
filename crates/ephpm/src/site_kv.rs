@@ -266,7 +266,16 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().unwrap().port();
         let path = ephpm_server::internal_kv::endpoint_path(&config).expect("path");
+        // Mirror what the server's writer produces: the per-user runtime dir
+        // exists, and the file is `0600` and owned by us — otherwise
+        // `read_endpoint`'s owner/mode check (Unix) refuses it.
+        std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir runtime dir");
         fs::write(&path, format!("{{\"port\":{port},\"pid\":1}}")).expect("write discovery");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+        }
 
         let strategy = plan_site_kv(&config, "shop");
         let _ = fs::remove_file(&path);

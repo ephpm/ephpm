@@ -45,6 +45,12 @@
 //! `O_EXCL` create and the owner/mode check on read together keep the file
 //! writable and trustable only by the uid that runs the server and the CLI.
 
+// The only `unsafe` here is `libc::geteuid()` (reading the current effective
+// uid to vet the runtime directory and discovery file) — argument-free and
+// always sound. The workspace lints `unsafe_code` to warn; allow it for this
+// module as `middleware.rs` / `tenant_ebpf.rs` do for their FFI.
+#![allow(unsafe_code)]
+
 use std::hash::{Hash as _, Hasher as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -109,10 +115,10 @@ pub fn endpoint_path(config: &Config) -> Option<PathBuf> {
 fn runtime_base_dir() -> PathBuf {
     #[cfg(unix)]
     {
-        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-            if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("ephpm");
-            }
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg).join("ephpm");
         }
         // SAFETY: `geteuid` takes no arguments and is always safe to call.
         let uid = unsafe { libc::geteuid() };
