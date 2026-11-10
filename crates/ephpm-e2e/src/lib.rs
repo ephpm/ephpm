@@ -470,6 +470,19 @@ impl DbImportFixture {
             .with_context(|| format!("running `ephpm php --site` ({})", self.binary.display()))
     }
 
+    /// Release the port reservation without importing, so a following offline
+    /// `ephpm php --site` sees a genuinely closed `mysql_listen` port and takes
+    /// the offline direct-open rather than the wire path (#673). Use when a test
+    /// drives the CLI offline but seeds no data of its own — otherwise the held
+    /// listener answers the CLI's probe and the run blocks on a MySQL handshake
+    /// that never completes. [`import`](Self::import) does this as a side effect;
+    /// this is the standalone form for tests that don't import.
+    pub fn go_offline(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+    }
+
     /// Run `ephpm db import <dump> --site <site> --config <cfg> <extra_args>`
     /// as a subprocess and return its captured output. The server must not be
     /// running (offline direct-open) — the state right after

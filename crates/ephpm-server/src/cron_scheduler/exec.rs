@@ -112,8 +112,28 @@ pub fn build_argv(req: &ExecRequest, exe: &std::path::Path) -> (PathBuf, Vec<Str
             }
             args.push("--site".to_string());
             args.push(site.clone());
-            args.push("--".to_string());
-            args.extend(req.command.iter().cloned());
+            if req.is_php {
+                // php-cli names the program with `-f`. A *leading* `--` instead
+                // (what this used to emit) is php's "read the program from
+                // stdin" signal — and the child's stdin is `Stdio::null()`, so
+                // php would compile an empty program, exit 0, and the job would
+                // be reported `ok` without ever running. `-f <script>` is
+                // unambiguous; a `--` after it guards any dashed script args.
+                let mut cmd = req.command.iter();
+                if let Some(script) = cmd.next() {
+                    args.push("-f".to_string());
+                    args.push(script.clone());
+                    let rest: Vec<String> = cmd.cloned().collect();
+                    if !rest.is_empty() {
+                        args.push("--".to_string());
+                        args.extend(rest);
+                    }
+                }
+            } else {
+                // `ephpm exec`: everything after `--` is the sandboxed command.
+                args.push("--".to_string());
+                args.extend(req.command.iter().cloned());
+            }
             (exe.to_path_buf(), args)
         }
         // Siteless: run the command directly on the leader.
@@ -276,7 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn argv_per_site_php_uses_php() {
+    fn argv_per_site_php_names_script_with_dash_f() {
+        // Regression (the double-`--` / stdin bug): a per-site `.php` job must
+        // name its script with `-f`, never with a *leading* `--`. `php -- …`
+        // reads the program from stdin, which under `Stdio::null()` compiles an
+        // empty program that exits 0 — the job would be reported `ok` without
+        // running. The dashed-arg guard `--` sits *after* the script only.
         let req = ExecRequest {
             job: "j".into(),
             site: Some("blog".into()),
@@ -287,9 +312,40 @@ mod tests {
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
-        assert_eq!(args[0], "php");
-        assert!(args.contains(&"--site".to_string()));
-        assert!(args.contains(&"blog".to_string()));
+        assert_eq!(
+            args,
+            vec![
+                "php",
+                "--config",
+                "/c.toml",
+                "--site",
+                "blog",
+                "-f",
+                "artisan.php",
+                "--",
+                "schedule:run",
+            ]
+        );
+        // The token right after the site is `-f`, not a bare `--`.
+        let site_pos = args.iter().position(|a| a == "blog").unwrap();
+        assert_eq!(args[site_pos + 1], "-f");
+        assert_ne!(args[site_pos + 1], "--");
+    }
+
+    #[test]
+    fn argv_per_site_php_single_script_has_no_trailing_separator() {
+        // A directory-tier job is a one-element command (just the script). No
+        // arguments ⇒ no trailing `--`; `php -f <script>` runs it directly.
+        let req = ExecRequest {
+            job: "j".into(),
+            site: Some("blog".into()),
+            is_php: true,
+            command: vec!["daily/cleanup.php".into()],
+            config_path: None,
+            timeout: Duration::from_secs(60),
+        };
+        let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
+        assert_eq!(args, vec!["php", "--site", "blog", "-f", "daily/cleanup.php"]);
     }
 
     #[tokio::test]

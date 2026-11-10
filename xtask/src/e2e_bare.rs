@@ -347,6 +347,11 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// stock `mysqli` opened from it must reach the site's rows), over
 /// `DbImportFixture`.
 ///
+/// `cron` (PR #698) is here for the same reason: it spawns a real
+/// `ephpm php --site -f <script>` — the distributed-cron executor's per-site
+/// invocation — and asserts the script actually runs (a leading `--` would make
+/// php read an empty program from the closed stdin and silently no-op).
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
@@ -360,6 +365,7 @@ const SELF_MANAGED_SUITES: &[&str] = &[
     "db_shell",
     "db_backup",
     "php_site_env",
+    "cron",
 ];
 
 /// Test suites that must be excluded from bare-process runs entirely.

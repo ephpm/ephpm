@@ -1325,7 +1325,10 @@ async fn directory_jobs_are_discovered_live_and_run_as_php_for_their_site() {
     assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
     assert_eq!(args[0], "php");
     assert_eq!(args[1..3], ["--site".to_string(), "shop".to_string()]);
-    assert_eq!(args[3], "--");
+    // `-f <script>`, never a leading `--` (which would make php read the
+    // program from stdin and the job silently no-op). See the regression test
+    // `exec::tests::argv_per_site_php_names_script_with_dash_f`.
+    assert_eq!(args[3], "-f");
     assert_eq!(args[4], script.to_string_lossy());
     // Removing the file stops it at the next scan — no restart either way.
     std::fs::remove_file(&script).unwrap();
