@@ -12,6 +12,12 @@ serde.workspace = true
 serde_json.workspace = true
 figment.workspace = true
 ipnet.workspace = true
+# Cron schedule parsing + IANA timezone validation for `[cron]` / `[[cron.jobs]]`.
+# The `CronSchedule` type (parse, DST-aware fire/next/window math) lives here
+# because `Config::validate` must reject a bad schedule or timezone at startup;
+# `ephpm-server`'s scheduler reuses the exact same type.
+chrono.workspace = true
+chrono-tz.workspace = true
 thiserror.workspace = true
 # Per-site `[[rewrite]]` rules compile to linear-time (non-backtracking)
 # regexes — see the workspace manifest for why that matters on the hot path.

@@ -293,8 +293,97 @@ credentials; it does not serialize runs.
   `ephpm php --site` inside it does not currently work with the config in
   `/etc/ephpm` (the sandbox hides that file on purpose).
 
+## Native distributed cron (`[cron]`)
+
+Everything above is the **external** pattern: your scheduler owns the timer,
+ePHPm runs the command. On a single node that is all you need. In a **cluster**
+it fires once per node — three nodes run the job three times — and it cannot
+follow a site to its owner. ePHPm's built-in scheduler closes that gap: it runs
+each job **exactly once across the cluster**, modelled on Kubernetes `CronJob`.
+It is experimental (clustered mode is lab-gated); see the
+[Distributed Cron design](/roadmap/distributed-cron/) for the full model and the
+honest partition limit.
+
+Declare jobs in `ephpm.toml`:
+
+```toml
+[cron]
+enabled = true
+
+[[cron.jobs]]
+name     = "laravel-schedule"
+site     = "blog"                     # runs on blog's owner, as that tenant
+schedule = "* * * * *"
+command  = ["artisan", "schedule:run"]
+timeout  = "5m"
+
+[[cron.jobs]]
+name     = "nightly-report"           # siteless → runs on the cluster leader
+schedule = "0 3 * * *"
+command  = ["report-generator", "--nightly"]
+```
+
+A job's `command` and `site` pick how it runs: a `.php` first element with a
+`site` goes through `ephpm php --site` (DB bridge bound); any other binary with a
+`site` goes through `ephpm exec --site` (tenant sandbox); a siteless job is
+spawned directly on the leader. Jobs fire once per cluster **while membership is
+stable and converged** — via an **ownership gate** (the site's HRW owner, or the
+leader) plus a **per-tick KV lease** that closes the brief window during an
+ownership move; both fail *closed* on each node's own membership view. What
+relaxes the guarantee is **divergent** views: across membership changes, node
+crashes and partitions two nodes can each believe they are the sole owner and
+each fire, so the guarantee relaxes to **at-least-once** — write jobs must be
+idempotent; the [design note](/roadmap/distributed-cron/) explains exactly why.
+See the [`[cron]` reference](/reference/config/#cron) for every field.
+
+Tenants on shared hosting can schedule their own PHP without `ephpm.toml` access
+once the operator opts their site in (`[cron] directory_cron_sites`): they drop
+files into `<site-root>/.ephpm/cron/{hourly,daily,weekly,monthly}/` or a
+`jobs/` file with a `// @schedule 0 3 * * *` header. These run through
+`ephpm php --site` under the **same data-plane sandbox as the site's HTTP PHP** —
+the identical `open_basedir` (the site container plus its private temp/session
+dirs), the `disable_functions` denylist, and the operator's `[php] ini_overrides`
+hardening. That is a filesystem + denylist sandbox, **not** an OS-level one: a
+directory-tier script shares the server's uid and network namespace, so — unlike
+a tagged HTTP request thread — it is **not** confined by the per-vhost egress
+(eBPF) layer, and a custom `[php] ini_file` is not replayed to it. For untrusted
+tenant code that needs the full process sandbox, schedule a non-PHP `command`
+(it runs through `ephpm exec --site`) instead. The directory tier stays opt-in
+per site (a dropped file does nothing until the operator enables it). They are
+picked up live.
+
+Inspect and trigger with the CLI:
+
+```bash
+ephpm cron list   --config /etc/ephpm/ephpm.toml     # schedule + next fire, standalone
+ephpm cron status --config /etc/ephpm/ephpm.toml     # live state from a running server
+ephpm cron run-now laravel-schedule --config /etc/ephpm/ephpm.toml  # fire now (leased)
+```
+
+### Migrating a Kubernetes `CronJob`
+
+| Kubernetes `CronJob` | ePHPm `[[cron.jobs]]` |
+|----------------------|-----------------------|
+| `schedule: "*/15 * * * *"` | `schedule = "*/15 * * * *"` (same syntax) |
+| `.spec.timeZone` (1.27+) | `timezone = "America/Phoenix"` (same DST policy) |
+| leader election + the controller decides when | the ownership gate: cron leader (siteless) or HRW owner (per-site) |
+| the coordination `Lease` | the per-tick KV lease, per `(job, tick)` |
+| `startingDeadlineSeconds: 120` | `starting_deadline = "120s"` (unset ⇒ no catch-up) |
+| the ">100 missed start times" guard | the `missed_valve` safety valve |
+| `concurrencyPolicy: Forbid/Allow/Replace` | `concurrency_policy = "forbid"/"allow"/"replace"` |
+| `suspend: true` | `suspend = true` |
+| `activeDeadlineSeconds` | `timeout` |
+| `kubectl create job --from=cronjob/x` | `ephpm cron run-now <name>` |
+
+Honest gaps vs k8s: no per-run container/cgroup, and no durable per-run backlog
+(the valve + `starting_deadline` bound catch-up instead). An operator needing
+guaranteed backlog replay keeps the job idempotent with a generous
+`starting_deadline`.
+
 ## See also
 
+- [Distributed Cron design](/roadmap/distributed-cron/) — the exactly-once model
+  and the partition limit
 - [`ephpm php`](/reference/cli/php/) — the CLI reference, including the
   strategy the `--site` binding picks and the `$_SERVER` contract
 - [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/) — how the

@@ -104,6 +104,14 @@ encoding_rs = "0.8"
 # resolves to zstd 0.14 / zstd-safe 8 and the advisories clear. See #648.
 zstd = "0.14"
 ipnet = "2"
+# Cron scheduling (`[cron]`): calendar math over explicit instants and IANA
+# timezones for the distributed scheduler. `chrono` is already in the graph
+# transitively; pinning it here (and `chrono-tz`, the tzdata lookup) keeps the
+# cron schedule parser/evaluator in `ephpm-config` and the scheduler in
+# `ephpm-server` on one copy. No `oldtime`/`serde` surface needed; `clock`
+# gives `Utc::now()` for the scheduler's "now". Pure Rust, no C, deny-clean.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = { version = "0.10", default-features = false }
 # CIDR membership for the `ip-allowlist` builtin middleware (IPv4 + IPv6).
 # Default features only (`serde` is opt-in and not enabled), so no extra
 # transitive deps beyond std IP parsing.

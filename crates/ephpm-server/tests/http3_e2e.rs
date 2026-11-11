@@ -107,6 +107,8 @@ fn test_config(document_root: &std::path::Path, max_body_size: u64) -> Config {
         cluster: ClusterConfig::default(),
         middleware: Vec::new(),
         opcache: ephpm_config::OpcacheConfig::default(),
+        cron: ephpm_config::CronConfig::default(),
+        source_path: None,
     }
 }
 

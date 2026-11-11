@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod body;
+pub mod cron_scheduler;
 pub mod db_backup;
 pub mod db_health;
 pub mod db_shutdown;
@@ -571,6 +572,25 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         .context("failed to set up embedded database backups")?;
     let db_backup_periodic = db_backup.as_ref().map(db_backup::DbBackupService::spawn_periodic);
 
+    // Distributed cron scheduler (`[cron]`): spawned here so it holds the same
+    // cluster handle and KV store the rest of the server uses. Disabled ⇒
+    // `None`, no task. The `Arc<CronScheduler>` is handed to the router for the
+    // `/_ephpm/cron` status endpoint; the loop `JoinHandle` is aborted at drain.
+    let cron_self_id = cluster_handle
+        .as_ref()
+        .map(|h| h.self_node().id.clone())
+        .or_else(|| effective_node_id.clone())
+        .unwrap_or_else(|| "local".to_string());
+    let (cron_scheduler, cron_periodic) = match cron_scheduler::spawn(
+        &config,
+        cluster_handle.clone(),
+        cron_self_id,
+        Arc::clone(&kv_store),
+    ) {
+        Some((scheduler, handle)) => (Some(scheduler), Some(handle)),
+        None => (None, None),
+    };
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -584,6 +604,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Arc::clone(&primary_view),
         kv_snapshot.clone(),
         db_backup.clone(),
+        cron_scheduler,
         dev_mode,
     )
     .await?;
@@ -722,6 +743,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // with the staging directory when the service drops); the object it was
     // writing, if any, is simply not there — the previous one is.
     if let Some(task) = db_backup_periodic {
+        task.abort();
+    }
+    // Stop the cron scheduler loop: a run already in flight is a detached child
+    // process the scheduler no longer supervises (abandoned, like a backup
+    // tick), but no new ticks fire.
+    if let Some(task) = cron_periodic {
         task.abort();
     }
 
@@ -871,6 +898,9 @@ async fn bind_listeners(
     // Scheduled database backups, for the `GET /_ephpm/db/backup` status
     // endpoint. `None` when `[db.sqlite.backup] enabled = false`.
     db_backup: Option<Arc<db_backup::DbBackupService>>,
+    // Distributed cron scheduler, for the `GET /_ephpm/cron` status endpoint.
+    // `None` when `[cron] enabled = false`.
+    cron_scheduler: Option<Arc<cron_scheduler::CronScheduler>>,
     // `ephpm dev`: lifts the multi-site credential requirement on the
     // internal endpoints (see `Router::with_dev_mode_access`).
     dev_mode: bool,
@@ -1164,6 +1194,7 @@ async fn bind_listeners(
         .with_primary_view(primary_view)
         .with_kv_snapshot(kv_snapshot)
         .with_db_backup(db_backup)
+        .with_cron(cron_scheduler)
         .with_websocket(websocket)
         .with_request_log(request_log)
         .with_dev_mode_access(dev_mode)
@@ -3541,6 +3572,8 @@ mod lib_tests {
             cluster: ephpm_config::ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None, None))
@@ -4178,6 +4211,8 @@ mod lib_tests {
             cluster: ephpm_config::ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None, None))

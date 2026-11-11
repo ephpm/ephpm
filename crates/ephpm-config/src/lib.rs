@@ -11,13 +11,16 @@ mod test_env;
 
 pub mod rewrite;
 
+pub mod cron_schedule;
+
+pub use cron_schedule::{CronSchedule, parse_timezone};
 pub use rewrite::{CompiledRewrite, RewriteOutcome, RewriteRule, RewriteSet};
 
 /// Top-level config sections — the only first segments an `EPHPM_*`
 /// environment variable can map to. Keep in sync with the fields of
 /// [`Config`] (pinned by `config_top_level_sections_match_struct`).
-const TOP_LEVEL_SECTIONS: [&str; 7] =
-    ["server", "php", "db", "kv", "cluster", "middleware", "opcache"];
+const TOP_LEVEL_SECTIONS: [&str; 8] =
+    ["server", "php", "db", "kv", "cluster", "middleware", "opcache", "cron"];
 
 /// `EPHPM_*` variables that are deliberately **not** configuration, so they
 /// must never trigger the "maps to no config key" startup warning. The names
@@ -258,6 +261,24 @@ pub struct Config {
     /// Governs cluster-wide OPcache invalidation. See [`OpcacheConfig`].
     #[serde(default)]
     pub opcache: OpcacheConfig,
+
+    /// Distributed scheduled jobs (`[cron]` + `[[cron.jobs]]`).
+    ///
+    /// Declarative cron that runs exactly once across a cluster. See
+    /// [`CronConfig`].
+    #[serde(default)]
+    pub cron: CronConfig,
+
+    /// The config file this was loaded from, if any.
+    ///
+    /// Set by [`Config::load`]; `None` for [`Config::default_config`] (dev
+    /// mode) and any programmatically-built config. The distributed cron
+    /// scheduler needs it to spawn `ephpm exec --config <path>` /
+    /// `ephpm php --config <path>` children that see the same configuration
+    /// this server did. Not a deserialized key (`#[serde(skip)]`), so it never
+    /// appears in TOML or the `EPHPM_*` env lane.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -3051,6 +3072,385 @@ fn default_db_backup_retention() -> String {
     "14d".to_string()
 }
 
+// ── Distributed cron (`[cron]` + `[[cron.jobs]]`) ───────────────────────────
+
+/// A job's overlap policy — the direct analogue of a Kubernetes
+/// `CronJob`'s `.spec.concurrencyPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyPolicy {
+    /// Skip the new run while the job's previous run is still active (default).
+    Forbid,
+    /// Start the new run regardless of a still-running previous one.
+    Allow,
+    /// Terminate the running instance (SIGTERM → grace → SIGKILL) then start.
+    Replace,
+}
+
+const CRON_CONCURRENCY_POLICIES: [&str; 3] = ["forbid", "allow", "replace"];
+
+/// `[cron]` — the distributed scheduler master switch and global guardrails.
+///
+/// When `enabled = true` the server runs an embedded scheduler that fires each
+/// `[[cron.jobs]]` entry (and, for opted-in sites, the per-site
+/// `.ephpm/cron/` directory tier) **exactly once across the cluster** per tick,
+/// modelled on Kubernetes `CronJob`. A job with a `site` runs on that site's
+/// HRW owner; a siteless job runs on the elected cluster leader; single-node
+/// runs everything here. See `site/content/roadmap/distributed-cron.md`.
+///
+/// Unknown keys are a startup error, as in every section.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CronConfig {
+    /// Master switch. `false` (default) ⇒ no scheduler runs at all.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Default IANA timezone for jobs that omit their own `timezone`.
+    /// Default: `"UTC"`. Coordination is always resolved to UTC instants, so
+    /// this is a convenience for writing wall-clock schedules, never used for
+    /// cross-node coordination directly.
+    #[serde(default = "default_cron_timezone")]
+    pub timezone: String,
+
+    /// Node-wide cap on simultaneously-running cron jobs. Must be `>= 1`.
+    /// When at the cap a due job is skipped (not queued) for this tick, like
+    /// a traditional cron under load. Default: `4`.
+    #[serde(default = "default_cron_max_concurrent")]
+    pub max_concurrent: u32,
+
+    /// Enable the per-site `.ephpm/cron/` directory tier for **every** site
+    /// (operator opt-in; a tenant can never self-enable). Default: `false`.
+    /// `directory_cron_sites` enables it for specific sites instead.
+    #[serde(default)]
+    pub directory_cron: bool,
+
+    /// Site keys for which the `.ephpm/cron/` directory tier is enabled,
+    /// unioned with `directory_cron`. Ignored when `directory_cron = true`.
+    /// Default: empty.
+    #[serde(default)]
+    pub directory_cron_sites: Vec<String>,
+
+    /// Cap on directory-tier jobs discovered per site; files beyond this are
+    /// ignored with a WARN. Default: `20`.
+    #[serde(default = "default_cron_max_jobs_per_site")]
+    pub max_jobs_per_site: u32,
+
+    /// Override the fixed clock for the directory `hourly/` cadence (default
+    /// `"0 * * * *"`, i.e. on the hour). A five-field cron expression.
+    #[serde(default)]
+    pub directory_hourly: Option<String>,
+
+    /// Override the fixed clock for the directory `daily/` cadence (default
+    /// `"0 0 * * *"`, i.e. midnight).
+    #[serde(default)]
+    pub directory_daily: Option<String>,
+
+    /// Override the fixed clock for the directory `weekly/` cadence (default
+    /// `"0 0 * * 0"`, i.e. Sunday midnight).
+    #[serde(default)]
+    pub directory_weekly: Option<String>,
+
+    /// Override the fixed clock for the directory `monthly/` cadence (default
+    /// `"0 0 1 * *"`, i.e. the 1st at midnight).
+    #[serde(default)]
+    pub directory_monthly: Option<String>,
+
+    /// Operator-defined jobs (`[[cron.jobs]]`).
+    #[serde(default)]
+    pub jobs: Vec<CronJob>,
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timezone: default_cron_timezone(),
+            max_concurrent: default_cron_max_concurrent(),
+            directory_cron: false,
+            directory_cron_sites: Vec::new(),
+            max_jobs_per_site: default_cron_max_jobs_per_site(),
+            directory_hourly: None,
+            directory_daily: None,
+            directory_weekly: None,
+            directory_monthly: None,
+            jobs: Vec::new(),
+        }
+    }
+}
+
+/// One operator-defined scheduled job (`[[cron.jobs]]`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CronJob {
+    /// Unique identifier — the lease key, metric label, and log key.
+    pub name: String,
+
+    /// The virtual host this job runs as. Present ⇒ it runs as that vhost on
+    /// the site's HRW owner with that tenant's `DB_*`/KV credentials. Absent ⇒
+    /// a "siteless" job that runs on the elected cluster leader only, with no
+    /// tenant credentials.
+    #[serde(default)]
+    pub site: Option<String>,
+
+    /// Five-field cron expression (minute hour day-of-month month day-of-week),
+    /// one-minute granularity.
+    pub schedule: String,
+
+    /// Per-job IANA timezone override of `[cron] timezone`.
+    #[serde(default)]
+    pub timezone: Option<String>,
+
+    /// The command and its arguments as an argv array (never a shell string).
+    /// A first element ending in `.php` runs through `ephpm php --site`
+    /// (DB bridge bound); any other first element runs through
+    /// `ephpm exec [--site]`. A `.php` command with no `site` is a config
+    /// error.
+    pub command: Vec<String>,
+
+    /// Wall-clock cap; the child is killed (SIGTERM → grace → SIGKILL) when it
+    /// is exceeded. Integer with a unit (`ms`, `s`, `m`, `h`, `d`). Must be
+    /// greater than zero. Default: `"1h"`.
+    #[serde(default = "default_cron_timeout")]
+    pub timeout: String,
+
+    /// Overlap policy: `forbid` (default), `allow`, or `replace`.
+    #[serde(default = "default_cron_concurrency_policy")]
+    pub concurrency_policy: String,
+
+    /// Kubernetes `startingDeadlineSeconds` analogue. **Unset (default) ⇒ no
+    /// catch-up**: only a tick that is current (within this minute) fires; a
+    /// missed tick is skipped. When set, the single most-recent missed
+    /// schedule within the deadline window fires; older ones are skipped.
+    #[serde(default)]
+    pub starting_deadline: Option<String>,
+
+    /// Kubernetes `suspend`: when `true` the job is never evaluated or fired
+    /// (but remains validated/listed). Default: `false`.
+    #[serde(default)]
+    pub suspend: bool,
+}
+
+fn default_cron_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_cron_max_concurrent() -> u32 {
+    4
+}
+
+fn default_cron_max_jobs_per_site() -> u32 {
+    20
+}
+
+fn default_cron_timeout() -> String {
+    "1h".to_string()
+}
+
+fn default_cron_concurrency_policy() -> String {
+    "forbid".to_string()
+}
+
+impl CronJob {
+    /// The parsed schedule.
+    ///
+    /// # Errors
+    ///
+    /// An invalid five-field cron expression.
+    pub fn schedule_parsed(&self) -> Result<CronSchedule, ConfigError> {
+        CronSchedule::parse(&self.schedule).map_err(|e| {
+            ConfigError::Validation(format!("[[cron.jobs]] {:?} schedule: {e}", self.name))
+        })
+    }
+
+    /// The resolved IANA timezone (the job's override, else the supplied
+    /// default).
+    ///
+    /// # Errors
+    ///
+    /// An invalid IANA timezone name.
+    pub fn timezone_resolved(&self, default_tz: &str) -> Result<chrono_tz::Tz, ConfigError> {
+        let name = self.timezone.as_deref().unwrap_or(default_tz);
+        parse_timezone(name).map_err(|e| {
+            ConfigError::Validation(format!("[[cron.jobs]] {:?} timezone: {e}", self.name))
+        })
+    }
+
+    /// The wall-clock timeout (always greater than zero).
+    ///
+    /// # Errors
+    ///
+    /// An unparsable or zero `timeout`.
+    pub fn timeout_duration(&self) -> Result<std::time::Duration, ConfigError> {
+        let label = format!("[[cron.jobs]] {:?} timeout", self.name);
+        let d = parse_duration_knob(&label, &self.timeout)?;
+        if d.is_zero() {
+            return Err(ConfigError::Validation(format!(
+                "{label} must be greater than zero (a cron run always has a wall-clock cap)"
+            )));
+        }
+        Ok(d)
+    }
+
+    /// The catch-up deadline, when set.
+    ///
+    /// # Errors
+    ///
+    /// An unparsable `starting_deadline`.
+    pub fn starting_deadline_duration(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        match &self.starting_deadline {
+            None => Ok(None),
+            Some(raw) => {
+                let label = format!("[[cron.jobs]] {:?} starting_deadline", self.name);
+                Ok(Some(parse_duration_knob(&label, raw)?))
+            }
+        }
+    }
+
+    /// The overlap policy.
+    ///
+    /// # Errors
+    ///
+    /// A `concurrency_policy` outside `forbid`/`allow`/`replace`.
+    pub fn concurrency_policy_parsed(&self) -> Result<ConcurrencyPolicy, ConfigError> {
+        match self.concurrency_policy.as_str() {
+            "forbid" => Ok(ConcurrencyPolicy::Forbid),
+            "allow" => Ok(ConcurrencyPolicy::Allow),
+            "replace" => Ok(ConcurrencyPolicy::Replace),
+            other => Err(ConfigError::Validation(format!(
+                "[[cron.jobs]] {:?} concurrency_policy must be one of {}, got {other:?}",
+                self.name,
+                CRON_CONCURRENCY_POLICIES.join(", "),
+            ))),
+        }
+    }
+
+    /// Does the command run PHP (first argv element ends in `.php`)?
+    #[must_use]
+    pub fn is_php_command(&self) -> bool {
+        self.command.first().is_some_and(|c| c.to_ascii_lowercase().ends_with(".php"))
+    }
+}
+
+impl CronConfig {
+    /// Validate the whole `[cron]` section against the server config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the offending job/field on
+    /// any problem: a duplicate or empty `name`, invalid schedule/timezone,
+    /// empty `command`, a zero/invalid `timeout`, an unknown
+    /// `concurrency_policy`, `max_concurrent < 1`, a `.php` command without a
+    /// `site`, or a `site`/directory tier used without `[server] sites_dir`.
+    pub fn validate(&self, server: &ServerConfig) -> Result<(), ConfigError> {
+        if self.max_concurrent < 1 {
+            return Err(ConfigError::Validation(
+                "[cron] max_concurrent must be at least 1".to_string(),
+            ));
+        }
+
+        // The default timezone and any directory-cadence overrides must parse.
+        parse_timezone(&self.timezone)
+            .map_err(|e| ConfigError::Validation(format!("[cron] timezone: {e}")))?;
+        for (knob, value) in [
+            ("directory_hourly", &self.directory_hourly),
+            ("directory_daily", &self.directory_daily),
+            ("directory_weekly", &self.directory_weekly),
+            ("directory_monthly", &self.directory_monthly),
+        ] {
+            if let Some(expr) = value {
+                CronSchedule::parse(expr)
+                    .map_err(|e| ConfigError::Validation(format!("[cron] {knob}: {e}")))?;
+            }
+        }
+
+        // The directory tier is per-site, so it needs a sites directory.
+        if (self.directory_cron || !self.directory_cron_sites.is_empty())
+            && server.sites_dir.is_none()
+        {
+            return Err(ConfigError::Validation(
+                "[cron] directory_cron / directory_cron_sites require [server] sites_dir \
+                 (the per-site document roots whose .ephpm/cron/ directories are scanned)"
+                    .to_string(),
+            ));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for job in &self.jobs {
+            if job.name.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "[[cron.jobs]] name must not be empty".to_string(),
+                ));
+            }
+            if !seen.insert(job.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "[[cron.jobs]] duplicate job name {:?}",
+                    job.name
+                )));
+            }
+            if job.command.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[[cron.jobs]] {:?} command must be a non-empty argv array",
+                    job.name
+                )));
+            }
+
+            // Parse-validate every lossily-typed field (errors name the job).
+            let schedule = job.schedule_parsed()?;
+            let tz = job.timezone_resolved(&self.timezone)?;
+            job.timeout_duration()?;
+            job.starting_deadline_duration()?;
+            job.concurrency_policy_parsed()?;
+
+            // Reject a syntactically valid but never-matching schedule (e.g.
+            // `0 0 31 2 *` — 31 February). It parses fine, but would never fire
+            // and would burn the full ~4-year `next_after` search on every tick,
+            // forever. Catch it once at startup instead.
+            if schedule.next_after(chrono::Utc::now(), tz).is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "[[cron.jobs]] {:?} schedule {:?} never fires (no matching time within four \
+                     years) — check the day-of-month / month combination",
+                    job.name, job.schedule
+                )));
+            }
+
+            match &job.site {
+                Some(site) => {
+                    let Some(sites_dir) = &server.sites_dir else {
+                        return Err(ConfigError::Validation(format!(
+                            "[[cron.jobs]] {:?} sets site = {:?} but [server] sites_dir is not \
+                             set — a per-site job needs the per-site document roots",
+                            job.name, site
+                        )));
+                    };
+                    // Fail closed: a per-site job must name a vhost that exists
+                    // under sites_dir (the vhost directory name is the key).
+                    if !sites_dir.join(site).is_dir() {
+                        return Err(ConfigError::Validation(format!(
+                            "[[cron.jobs]] {:?} site {:?} does not resolve to a virtual host \
+                             directory under {} (create the site before scheduling for it)",
+                            job.name,
+                            site,
+                            sites_dir.display(),
+                        )));
+                    }
+                }
+                None => {
+                    if job.is_php_command() {
+                        return Err(ConfigError::Validation(format!(
+                            "[[cron.jobs]] {:?} runs a .php command ({:?}) but has no site; a \
+                             siteless job runs a plain binary on the cluster leader — set a \
+                             site to run PHP as that tenant",
+                            job.name,
+                            job.command.first().map_or("", String::as_str),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Wire protocol frontend addresses for the `SQLite` proxy (`[db.sqlite.proxy]`).
 ///
 /// Unknown keys are rejected — see [`ReplicationConfig`]. A mis-typed listen
@@ -4914,11 +5314,12 @@ impl Config {
         #[cfg(test)]
         let _env_guard = test_env::read_guard();
 
-        let config = Figment::new()
+        let mut config: Self = Figment::new()
             .merge(Toml::file(path))
             .merge(Env::prefixed("EPHPM_").split("__"))
             .extract()
             .map_err(Box::new)?;
+        config.source_path = Some(path.clone());
         Ok(config)
     }
 
@@ -5722,6 +6123,12 @@ impl Config {
             rule.upstream_authority()
                 .map_err(|e| ConfigError::Validation(format!("[[server.proxy]] rule {i}: {e}")))?;
         }
+
+        // [cron] / [[cron.jobs]]: every schedule, timezone, duration, policy
+        // and site reference is validated up front (fail-closed), whether or
+        // not the scheduler is enabled, so a typo in a job that is currently
+        // suspended still fails startup rather than silently never firing.
+        self.cron.validate(&self.server)?;
 
         Ok(())
     }
@@ -9727,6 +10134,14 @@ listen = "0.0.0.0:8080"
                 "[[server.rewrite]]\nregex = \"^/l/(.*)$\"\nto = \"/l.php?i=${1}\"\nbogus_key = 1\n",
                 "bogus_key",
             ),
+            // A misspelt `[cron]` knob must not silently disable the scheduler.
+            ("[cron]", "[cron]\nenabledd = true\n", "enabledd"),
+            (
+                "[[cron.jobs]]",
+                "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
+                 command = [\"true\"]\nbogus_key = 1\n",
+                "bogus_key",
+            ),
         ];
 
         for (section, toml, key) in cases {
@@ -9737,6 +10152,251 @@ listen = "0.0.0.0:8080"
                  find the typo, got: {err}"
             );
         }
+    }
+
+    // ── [cron] / [[cron.jobs]] ───────────────────────────────────────────
+
+    /// Absent `[cron]` is the off default: no scheduler, UTC, cap 4.
+    #[test]
+    fn cron_defaults_are_off() {
+        let cfg = load_toml("");
+        assert!(!cfg.cron.enabled);
+        assert_eq!(cfg.cron.timezone, "UTC");
+        assert_eq!(cfg.cron.max_concurrent, 4);
+        assert_eq!(cfg.cron.max_jobs_per_site, 20);
+        assert!(cfg.cron.jobs.is_empty());
+        cfg.validate().unwrap();
+    }
+
+    /// A well-formed siteless job and its parsed accessors.
+    #[test]
+    fn cron_siteless_job_parses_and_validates() {
+        let cfg = load_toml(
+            "[cron]\nenabled = true\n\n[[cron.jobs]]\nname = \"cleanup\"\n\
+             schedule = \"*/15 * * * *\"\ncommand = [\"maintenance\", \"--sweep\"]\n",
+        );
+        cfg.validate().unwrap();
+        let job = &cfg.cron.jobs[0];
+        assert_eq!(job.name, "cleanup");
+        assert!(job.site.is_none());
+        assert!(!job.is_php_command());
+        assert_eq!(job.timeout_duration().unwrap(), std::time::Duration::from_secs(3600));
+        assert_eq!(job.concurrency_policy_parsed().unwrap(), ConcurrencyPolicy::Forbid);
+        assert!(job.starting_deadline_duration().unwrap().is_none());
+    }
+
+    /// A syntactically valid but never-matching schedule (31 February) is
+    /// rejected at startup, not left to burn the full search every tick.
+    #[test]
+    fn cron_never_matching_schedule_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"never\"\nschedule = \"0 0 31 2 *\"\ncommand = [\"a\"]\n",
+        );
+        let err = cfg.validate().expect_err("a never-firing schedule must fail").to_string();
+        assert!(err.contains("never fires"), "{err}");
+        assert!(err.contains("\"never\""), "{err}");
+    }
+
+    /// Duplicate job names fail closed, naming the collision.
+    #[test]
+    fn cron_duplicate_names_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             [[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"b\"]\n",
+        );
+        let err = cfg.validate().expect_err("duplicate names must fail").to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("\"j\""), "{err}");
+    }
+
+    /// A `.php` command with no site is a config error (siteless runs a plain
+    /// binary on the leader; PHP needs a tenant).
+    #[test]
+    fn cron_php_without_site_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
+             command = [\"artisan.php\", \"queue:work\"]\n",
+        );
+        let err = cfg.validate().expect_err("php without site must fail").to_string();
+        assert!(err.contains("no site"), "{err}");
+    }
+
+    /// Bad schedule / timezone / timeout / policy each fail closed, and the
+    /// error names the job and the field so the operator can find it (G2/G3).
+    #[test]
+    fn cron_bad_fields_rejected() {
+        let bad_sched =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"nope\"\ncommand = [\"a\"]\n");
+        let err = bad_sched.validate().expect_err("bad schedule").to_string();
+        assert!(err.contains("\"j\" schedule"), "{err}");
+
+        let bad_tz = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
+             timezone = \"Mars/Olympus\"\ncommand = [\"a\"]\n",
+        );
+        let err = bad_tz.validate().expect_err("bad timezone").to_string();
+        assert!(err.contains("\"j\" timezone") && err.contains("Mars/Olympus"), "{err}");
+
+        let bad_default_tz = load_toml(
+            "[cron]\ntimezone = \"Nowhere/Land\"\n\n[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n",
+        );
+        let err = bad_default_tz.validate().expect_err("bad [cron] timezone").to_string();
+        assert!(err.contains("[cron] timezone"), "{err}");
+
+        let zero_timeout = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
+             timeout = \"0\"\ncommand = [\"a\"]\n",
+        );
+        let err = zero_timeout.validate().expect_err("zero timeout").to_string();
+        assert!(err.contains("\"j\" timeout"), "{err}");
+
+        let bad_policy = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\n\
+             concurrency_policy = \"queue\"\ncommand = [\"a\"]\n",
+        );
+        let err = bad_policy.validate().expect_err("bad policy").to_string();
+        assert!(err.contains("concurrency_policy") && err.contains("queue"), "{err}");
+
+        let zero_concurrency = load_toml("[cron]\nmax_concurrent = 0\n");
+        assert!(zero_concurrency.validate().is_err());
+
+        let empty_command =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = []\n");
+        let err = empty_command.validate().expect_err("empty argv").to_string();
+        assert!(err.contains("non-empty argv"), "{err}");
+    }
+
+    /// A1 — one-minute granularity: a six-field (seconds) expression is
+    /// rejected at validation, naming the job and the field count.
+    #[test]
+    fn cron_seconds_field_is_rejected() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"fast\"\nschedule = \"*/30 * * * * *\"\ncommand = [\"a\"]\n",
+        );
+        let err = cfg.validate().expect_err("six fields must fail").to_string();
+        assert!(err.contains("\"fast\" schedule"), "{err}");
+        assert!(err.contains("exactly 5 fields") && err.contains("got 6"), "{err}");
+        // A directory-cadence override is held to the same grammar.
+        let cadence = load_toml("[cron]\ndirectory_hourly = \"0 * * * * *\"\n");
+        let err = cadence.validate().expect_err("six-field cadence").to_string();
+        assert!(err.contains("directory_hourly"), "{err}");
+    }
+
+    /// A5/A6 — a job that omits `timezone` resolves to `[cron] timezone`
+    /// (itself defaulting to UTC); a per-job `timezone` overrides it.
+    #[test]
+    fn cron_job_timezone_defaults_to_the_section_and_a_job_can_override_it() {
+        let cfg = load_toml(
+            "[cron]\ntimezone = \"Europe/Berlin\"\n\n\
+             [[cron.jobs]]\nname = \"inherits\"\nschedule = \"0 3 * * *\"\ncommand = [\"a\"]\n\n\
+             [[cron.jobs]]\nname = \"overrides\"\nschedule = \"0 3 * * *\"\n\
+             timezone = \"America/Chicago\"\ncommand = [\"a\"]\n",
+        );
+        cfg.validate().unwrap();
+        let default_tz = &cfg.cron.timezone;
+        assert_eq!(cfg.cron.jobs[0].timezone, None);
+        assert_eq!(
+            cfg.cron.jobs[0].timezone_resolved(default_tz).unwrap(),
+            chrono_tz::Europe::Berlin
+        );
+        assert_eq!(
+            cfg.cron.jobs[1].timezone_resolved(default_tz).unwrap(),
+            chrono_tz::America::Chicago
+        );
+        // No `[cron] timezone` at all → UTC.
+        let utc =
+            load_toml("[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n");
+        assert_eq!(utc.cron.jobs[0].timezone_resolved(&utc.cron.timezone).unwrap(), chrono_tz::UTC);
+    }
+
+    /// G7 — `command` is an argv array, never a shell string: a string value
+    /// is a load (type) error naming the key; `.php` detection is on the first
+    /// element only and case-insensitive.
+    #[test]
+    fn cron_command_is_argv_not_a_shell_string() {
+        let err = load_error(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = \"sh -c 'wp cron'\"\n",
+        );
+        assert!(err.contains("command"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        std::fs::create_dir_all(sites.join("shop")).unwrap();
+        let cfg = load_toml(&format!(
+            "[server]\nsites_dir = {:?}\n\n\
+             [[cron.jobs]]\nname = \"php\"\nsite = \"shop\"\nschedule = \"* * * * *\"\n\
+             command = [\"Artisan.PHP\", \"schedule:run\"]\n\n\
+             [[cron.jobs]]\nname = \"bin\"\nsite = \"shop\"\nschedule = \"* * * * *\"\n\
+             command = [\"wp\", \"eval-file\", \"x.php\"]\n",
+            sites.to_string_lossy(),
+        ));
+        cfg.validate().unwrap();
+        assert!(cfg.cron.jobs[0].is_php_command(), "first element ends in .php (any case)");
+        assert!(!cfg.cron.jobs[1].is_php_command(), "a .php later in argv does not make it PHP");
+    }
+
+    /// `suspend` and `starting_deadline` parse to the documented types.
+    #[test]
+    fn cron_suspend_and_starting_deadline_parse() {
+        let cfg = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             suspend = true\nstarting_deadline = \"10m\"\ntimeout = \"90s\"\n",
+        );
+        cfg.validate().unwrap();
+        let job = &cfg.cron.jobs[0];
+        assert!(job.suspend);
+        assert_eq!(
+            job.starting_deadline_duration().unwrap(),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(job.timeout_duration().unwrap(), std::time::Duration::from_secs(90));
+        let bad = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             starting_deadline = \"soon\"\n",
+        );
+        let err = bad.validate().expect_err("unparsable deadline").to_string();
+        assert!(err.contains("starting_deadline"), "{err}");
+    }
+
+    /// A per-site job requires `[server] sites_dir`, and the named vhost must
+    /// exist under it (fail-closed).
+    #[test]
+    fn cron_site_requires_sites_dir_and_existing_vhost() {
+        // No sites_dir → error.
+        let no_dir = load_toml(
+            "[[cron.jobs]]\nname = \"j\"\nsite = \"shop\"\nschedule = \"0 3 * * *\"\n\
+             command = [\"bin/cake.php\"]\n",
+        );
+        let err = no_dir.validate().expect_err("site needs sites_dir").to_string();
+        assert!(err.contains("sites_dir"), "{err}");
+
+        // sites_dir set but the vhost directory is missing → error naming it.
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        std::fs::create_dir_all(&sites).unwrap();
+        let toml = format!(
+            "[server]\nsites_dir = {:?}\n\n[[cron.jobs]]\nname = \"j\"\nsite = \"shop\"\n\
+             schedule = \"0 3 * * *\"\ncommand = [\"bin/cake.php\"]\n",
+            sites.to_string_lossy(),
+        );
+        let missing = load_toml(&toml);
+        let err = missing.validate().expect_err("missing vhost").to_string();
+        assert!(err.contains("shop"), "{err}");
+
+        // Create the vhost dir → validates, and a .php command with a site is
+        // allowed (runs via `ephpm php --site`).
+        std::fs::create_dir_all(sites.join("shop")).unwrap();
+        let ok = load_toml(&toml);
+        ok.validate().unwrap();
+        assert!(ok.cron.jobs[0].is_php_command());
+    }
+
+    /// The directory tier requires sites_dir.
+    #[test]
+    fn cron_directory_tier_requires_sites_dir() {
+        let cfg = load_toml("[cron]\ndirectory_cron = true\n");
+        let err = cfg.validate().expect_err("directory_cron needs sites_dir").to_string();
+        assert!(err.contains("sites_dir"), "{err}");
     }
 
     /// `[db.sqlite.backup]` absent (and present but off) is a usable default:

@@ -162,6 +162,7 @@ pub(crate) const INTERNAL_ROUTES: &[&str] = &[
     KV_SNAPSHOT_ROUTE,
     KV_SNAPSHOT_LOAD_ROUTE,
     DB_BACKUP_ROUTE,
+    CRON_ROUTE,
 ];
 
 /// Scheduled embedded-database backup status (`[db.sqlite.backup]`): `GET`
@@ -170,6 +171,18 @@ pub(crate) const INTERNAL_ROUTES: &[&str] = &[
 /// Tier 0. `404` naming the knob when backups are off. Moves to the metrics
 /// listener with `[server.metrics] listen`.
 pub(crate) const DB_BACKUP_ROUTE: &str = "/_ephpm/db/backup";
+
+/// Distributed cron status (`[cron]`): `GET` = JSON of every operator job
+/// (schedule, timezone, next fire, last run/outcome, `lastScheduleTime`, skip
+/// counts), gated like `/_ephpm/requests`. Read-only. `404` naming the knob
+/// when cron is off. Moves to the metrics listener with `[server.metrics]
+/// listen`.
+pub(crate) const CRON_ROUTE: &str = "/_ephpm/cron";
+
+/// `POST /_ephpm/cron/run/<name>[?force=true]`: trigger a job now (honouring
+/// the per-tick lease unless `force`). A credential is required on every node
+/// (it runs a command). Answered in [`Router::handle_cron_run`].
+pub(crate) const CRON_RUN_PREFIX: &str = "/_ephpm/cron/run/";
 
 /// Warm-restart KV snapshot control: `GET` = status (gated like
 /// `/_ephpm/requests`), `POST` = write a snapshot now (a credential —
@@ -688,6 +701,9 @@ pub struct Router {
     /// **every** node (see [`crate::internal_access::InternalAccess::credential_always`]).
     /// Never lifted by `ephpm dev`.
     kv_snapshot_control_access: crate::internal_access::InternalAccess,
+    /// Gate for `POST /_ephpm/cron/run/<name>` (trigger a job now): same ACL
+    /// and token as the KV snapshot control, credential required on every node.
+    cron_control_access: crate::internal_access::InternalAccess,
     /// `false` when `[server.metrics] listen` moves the metrics endpoint and
     /// `/_ephpm/requests` to their own listener: the main listener then does
     /// not answer them (see [`Router::handle_metrics_listener`]).
@@ -912,6 +928,9 @@ pub struct Router {
     /// Scheduled database backups (`[db.sqlite.backup]`), for the
     /// `/_ephpm/db/backup` status endpoint. `None` = backups are off.
     db_backup: Option<Arc<crate::db_backup::DbBackupService>>,
+    /// Distributed cron scheduler (`[cron]`), for the `/_ephpm/cron` status
+    /// endpoint. `None` = cron is off.
+    cron: Option<Arc<crate::cron_scheduler::CronScheduler>>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -1528,6 +1547,14 @@ impl Router {
                 "this endpoint changes the live KV store (a snapshot save or load), so it is \
                  served only with a credential, on every node.",
             ),
+            cron_control_access: crate::internal_access::InternalAccess::credential_always(
+                "[server.diagnostics]",
+                &config.server.diagnostics.allow,
+                &config.server.diagnostics.deny,
+                config.server.diagnostics.token.as_deref(),
+                "this endpoint runs a command (triggers a cron job), so it is served only with \
+                 a credential, on every node.",
+            ),
             internal_on_main: config.server.metrics.listen.is_none(),
             limiter,
             preview: config.server.preview,
@@ -1599,6 +1626,7 @@ impl Router {
             primary_view: Arc::new(AtomicBool::new(true)),
             kv_snapshot: None,
             db_backup: None,
+            cron: None,
         };
 
         // Read every known site's override once, now: it seeds the cache (so the
@@ -2269,6 +2297,38 @@ impl Router {
         self
     }
 
+    /// Attach the distributed cron scheduler, for the `GET /_ephpm/cron`
+    /// status endpoint.
+    #[must_use]
+    pub fn with_cron(
+        mut self,
+        scheduler: Option<Arc<crate::cron_scheduler::CronScheduler>>,
+    ) -> Self {
+        self.cron = scheduler;
+        self
+    }
+
+    /// `GET /_ephpm/cron` (see [`CRON_ROUTE`]): the cron status JSON, gated
+    /// like `/_ephpm/requests`; `404` naming the knob when cron is off.
+    fn handle_cron_status(
+        &self,
+        client: &crate::internal_access::Client<'_>,
+    ) -> Response<ServerBody> {
+        let Some(svc) = &self.cron else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "404 Not Found: the distributed cron scheduler is off. Enable it with \
+                 [cron] enabled = true.",
+            );
+        };
+        match self.diagnostics_access.check(client) {
+            crate::internal_access::Verdict::Allow => {
+                json_response_owned(StatusCode::OK, svc.status_json())
+            }
+            denied => self.diagnostics_access.deny_response(denied),
+        }
+    }
+
     /// `GET /_ephpm/db/backup` (see [`DB_BACKUP_ROUTE`]): the backup status
     /// JSON, gated like `/_ephpm/requests`; `404` naming the knob when
     /// backups are off.
@@ -2288,6 +2348,42 @@ impl Router {
                 json_response_owned(StatusCode::OK, svc.status_json())
             }
             denied => self.diagnostics_access.deny_response(denied),
+        }
+    }
+
+    /// `POST /_ephpm/cron/run/<name>` (see [`CRON_RUN_PREFIX`]): trigger a job
+    /// now, honouring the per-tick lease unless `force`. Credential required on
+    /// every node; `405` for a non-POST; `404` naming the knob when cron is off.
+    async fn handle_cron_run(
+        &self,
+        name: &str,
+        method: &hyper::Method,
+        client: &crate::internal_access::Client<'_>,
+        force: bool,
+    ) -> Response<ServerBody> {
+        let Some(svc) = &self.cron else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "404 Not Found: the distributed cron scheduler is off. Enable it with \
+                 [cron] enabled = true.",
+            );
+        };
+        if method != hyper::Method::POST {
+            return error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "405 Method Not Allowed: trigger a job with POST /_ephpm/cron/run/<name>.",
+            );
+        }
+        match self.cron_control_access.check(client) {
+            crate::internal_access::Verdict::Allow => {
+                let nodes = svc.membership().await;
+                let (fired, msg) = svc.trigger_now(name, force, &nodes).await;
+                json_response_owned(
+                    StatusCode::OK,
+                    serde_json::json!({ "fired": fired, "result": msg }).to_string(),
+                )
+            }
+            denied => self.cron_control_access.deny_response(denied),
         }
     }
 
@@ -2713,25 +2809,20 @@ impl Router {
     /// own temp/session writes; it never widens another tenant's access.
     fn ensure_vhost_private_dirs(&self, document_root: &Path) -> VhostPrivateDirs {
         let state_root = vhost_state_root(document_root);
-        let temp = state_root.join("tmp");
-        let sessions = state_root.join("sessions");
-
-        if !self.ensured_vhost_dirs.contains(&state_root) {
-            for dir in [&temp, &sessions] {
-                if let Err(e) = create_private_dir(dir) {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        error = %e,
-                        "failed to create per-vhost private directory; \
-                         this tenant's temp/session writes may fail"
-                    );
-                }
-            }
-            write_vhost_marker(&state_root, document_root);
-            self.ensured_vhost_dirs.insert(state_root.clone());
+        // Already ensured this process: return the paths without touching the
+        // filesystem again. The creation itself lives in the Router-free
+        // `ensure_vhost_private_dirs_at`, shared with the out-of-request
+        // `--site` CLI path so both derive the same dirs (issue #698).
+        if self.ensured_vhost_dirs.contains(&state_root) {
+            return VhostPrivateDirs {
+                temp: state_root.join("tmp"),
+                sessions: state_root.join("sessions"),
+                state_root,
+            };
         }
-
-        VhostPrivateDirs { state_root, temp, sessions }
+        let dirs = ensure_vhost_private_dirs_at(document_root);
+        self.ensured_vhost_dirs.insert(dirs.state_root.clone());
+        dirs
     }
 
     /// Handle an incoming HTTP request.
@@ -3082,6 +3173,15 @@ impl Router {
                 // runs on a blocking thread and is awaited here) and that
                 // accepts POST.
                 return Ok(self.handle_kv_snapshot(&uri_path, &method_ref, &client, false).await);
+            }
+            if let Some(name) = uri_path.strip_prefix(CRON_RUN_PREFIX) {
+                // Trigger a job now (async: queries membership, may run). The
+                // `force` query bypasses the per-tick lease.
+                let force = req.uri().query().is_some_and(|q| q.contains("force=true"));
+                return Ok((
+                    self.handle_cron_run(name, &method_ref, &client, force).await,
+                    "diagnostics",
+                ));
             }
             return Ok(self.handle_internal(&uri_path, &method_ref, &client));
         }
@@ -5367,6 +5467,19 @@ impl Router {
             let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
             return self.handle_kv_snapshot(path, req.method(), &client, true).await.0;
         }
+        if let Some(name) = path.strip_prefix(CRON_RUN_PREFIX) {
+            // `POST /_ephpm/cron/run/<name>` lives here too, so `ephpm cron
+            // run-now` works when `[server.metrics] listen` is set — the CLI
+            // targets this listener for *every* `/_ephpm/cron` endpoint, and the
+            // status GET (below) already moved here. A POST, so it is carved out
+            // before the GET-only 405, mirroring the KV-snapshot block above and
+            // the main listener's dispatch; `handle_cron_run` applies the same
+            // ACL gate.
+            let name = name.to_string();
+            let force = req.uri().query().is_some_and(|q| q.contains("force=true"));
+            let client = self.internal_client(&req, remote_addr, is_tls, mtls_verified);
+            return self.handle_cron_run(&name, req.method(), &client, force).await;
+        }
         if req.method() != hyper::Method::GET {
             return Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -5400,10 +5513,14 @@ impl Router {
         if path == DB_BACKUP_ROUTE {
             return self.handle_db_backup_status(&client);
         }
+        if path == CRON_ROUTE {
+            return self.handle_cron_status(&client);
+        }
         error_response(
             StatusCode::NOT_FOUND,
             "404 Not Found: this is the ePHPm metrics listener; it serves only the metrics \
-             path, /_ephpm/requests, /_ephpm/db/backup and /_ephpm/kv/snapshot[/load].",
+             path, /_ephpm/requests, /_ephpm/db/backup, /_ephpm/cron and \
+             /_ephpm/kv/snapshot[/load].",
         )
     }
 
@@ -5601,6 +5718,18 @@ impl Router {
                 "diagnostics",
             ),
             DB_BACKUP_ROUTE => (self.handle_db_backup_status(client), "diagnostics"),
+
+            // Distributed cron status: with the diagnostics, follows
+            // `[server.metrics] listen` the same way.
+            CRON_ROUTE if !self.internal_on_main => (
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found: the cron status is served on the separate metrics \
+                     listener ([server.metrics] listen), not on this one.",
+                ),
+                "diagnostics",
+            ),
+            CRON_ROUTE => (self.handle_cron_status(client), "diagnostics"),
 
             "/_ephpm/requests" => match self.request_log {
                 Some(ref log) => match self.diagnostics_access.check(client) {
@@ -7487,7 +7616,7 @@ pub fn resolve_sandbox_site(config: &Config, key: &str) -> anyhow::Result<Sandbo
 
     let sites_dir = config.server.sites_dir.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "[server] sites_dir is not configured — `ephpm exec --site` requires \
+            "[server] sites_dir is not configured — `--site` requires \
              multi-tenant (vhost) mode; there is no per-site sandbox to enter in \
              single-site mode"
         )
@@ -7525,6 +7654,76 @@ pub fn resolve_sandbox_site(config: &Config, key: &str) -> anyhow::Result<Sandbo
         document_root: roots.document_root,
         state_root,
         open_basedir,
+    })
+}
+
+/// Create (idempotently, `0700` on Unix) a vhost's private `tmp/` and
+/// `sessions/` directories under its state root and return their paths —
+/// the Router-free core of [`Router::ensure_vhost_private_dirs`].
+///
+/// The request path caches which state roots it has already ensured; an
+/// out-of-request caller (`ephpm php --site`) has no such cache and calls this
+/// directly. Creation failures are logged and swallowed exactly as on the
+/// request path: the paths are returned regardless so the caller still narrows
+/// `open_basedir` away from the shared system temp.
+fn ensure_vhost_private_dirs_at(container: &Path) -> VhostPrivateDirs {
+    let state_root = vhost_state_root(container);
+    let temp = state_root.join("tmp");
+    let sessions = state_root.join("sessions");
+    for dir in [&temp, &sessions] {
+        if let Err(e) = create_private_dir(dir) {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to create per-vhost private directory; \
+                 this tenant's temp/session writes may fail"
+            );
+        }
+    }
+    write_vhost_marker(&state_root, container);
+    VhostPrivateDirs { state_root, temp, sessions }
+}
+
+/// The PHP filesystem-sandbox INI directives an out-of-request `--site` caller
+/// must apply to reproduce the request path's per-tenant isolation.
+///
+/// These mirror exactly the four `set_request_ini` calls `Router::handle`
+/// makes for a vhost request — `open_basedir`, `sys_temp_dir`, `upload_tmp_dir`
+/// and `session.save_path`. An `ephpm php --site` one-shot has no per-request
+/// hook, so it passes them as `-d` defines instead; the values are
+/// byte-identical because both go through [`resolve_sandbox_site`] /
+/// [`ensure_vhost_private_dirs_at`].
+pub struct SandboxIniDefines {
+    /// `open_basedir` — the `container:state_root` filesystem boundary.
+    pub open_basedir: String,
+    /// `sys_temp_dir` — this tenant's private temp directory.
+    pub sys_temp_dir: String,
+    /// `upload_tmp_dir` — the same private temp directory.
+    pub upload_tmp_dir: String,
+    /// `session.save_path` — this tenant's private session directory.
+    pub session_save_path: String,
+}
+
+/// Resolve the filesystem-sandbox INI directives for `--site <key>`, creating
+/// the tenant's private temp/session directories the same way a request does.
+///
+/// This is the filesystem half of the `--site` sandbox; the caller composes
+/// `disable_functions` separately (it owns the operator/hardening config).
+///
+/// # Errors
+///
+/// Propagates [`resolve_sandbox_site`]'s fail-closed errors: an invalid key, a
+/// single-site config (no tenant to sandbox), or a key with no matching vhost
+/// directory.
+pub fn site_sandbox_ini_defines(config: &Config, key: &str) -> anyhow::Result<SandboxIniDefines> {
+    let site = resolve_sandbox_site(config, key)?;
+    let dirs = ensure_vhost_private_dirs_at(&site.container);
+    let temp = dirs.temp.to_string_lossy().into_owned();
+    Ok(SandboxIniDefines {
+        open_basedir: site.open_basedir,
+        sys_temp_dir: temp.clone(),
+        upload_tmp_dir: temp,
+        session_save_path: dirs.sessions.to_string_lossy().into_owned(),
     })
 }
 
@@ -7876,6 +8075,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, None, None, None)
     }
@@ -8205,6 +8406,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, limiter, None, None)
     }
@@ -8243,6 +8446,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let limiter = Some(Arc::new(crate::rate_limit::Limiter::new(limits)));
         Router::new(&config, test_store(), None, None, limiter, None, None)
@@ -8278,6 +8483,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
 
         let site = super::resolve_sandbox_site(&config, "shop").unwrap();
@@ -8303,6 +8510,53 @@ mod tests {
         let mut single = config;
         single.server.sites_dir = None;
         assert!(super::resolve_sandbox_site(&single, "shop").is_err());
+    }
+
+    /// `site_sandbox_ini_defines` (the `ephpm php --site` sandbox, issue #698)
+    /// returns the same `open_basedir` a request gets and private temp/session
+    /// dirs under the state root, and creates them — so a `--site` CLI/cron run
+    /// is confined exactly as the site's HTTP PHP is.
+    #[test]
+    fn site_sandbox_ini_defines_matches_request_and_creates_private_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let sites_dir = root.path().join("sites");
+        fs::create_dir_all(sites_dir.join("shop")).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: root.path().join("docroot"),
+                sites_dir: Some(sites_dir.clone()),
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
+        };
+
+        let site = super::resolve_sandbox_site(&config, "shop").unwrap();
+        let defines = super::site_sandbox_ini_defines(&config, "shop").unwrap();
+
+        // open_basedir is byte-identical to the request path's value.
+        assert_eq!(defines.open_basedir, site.open_basedir);
+        // The container is in the basedir; the system temp is NOT (that is the
+        // whole point — a tenant cron script cannot read outside its vhost).
+        assert!(defines.open_basedir.contains(&site.container.display().to_string()));
+        // temp/session targets live under the tenant's state root, so they fall
+        // inside open_basedir, and they were created (0700 on Unix).
+        assert!(Path::new(&defines.sys_temp_dir).starts_with(&site.state_root));
+        assert_eq!(defines.sys_temp_dir, defines.upload_tmp_dir);
+        assert!(Path::new(&defines.session_save_path).starts_with(&site.state_root));
+        assert!(Path::new(&defines.sys_temp_dir).is_dir(), "temp dir created");
+        assert!(Path::new(&defines.session_save_path).is_dir(), "sessions dir created");
+
+        // Fails closed for an unknown/invalid site, same as resolve_sandbox_site.
+        assert!(super::site_sandbox_ini_defines(&config, "ghost").is_err());
+        assert!(super::site_sandbox_ini_defines(&config, "../etc").is_err());
     }
 
     /// `[server] preview = true` stamps `X-Ephpm-Preview: 1` on every
@@ -9016,6 +9270,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = 1;
         let pool = crate::worker_pool::WorkerPool::spawn(
@@ -9079,6 +9335,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = 1;
         let zero_worker_pool = || {
@@ -9218,6 +9476,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = 5;
         assert!(config.php.worker.stream_threshold > 0, "streaming must be enabled for this test");
@@ -9312,6 +9572,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = timeout_secs;
         let pool = crate::worker_pool::WorkerPool::spawn(
@@ -9484,6 +9746,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -9627,6 +9891,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         // Short request deadline so the never-answering pool becomes a 504
         // without waiting out the 300s default (paused clock auto-advances).
@@ -9804,6 +10070,14 @@ mod tests {
                     let (status, _) = probe(router, "POST", path).await;
                     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "POST {path}");
                 }
+                // Cron is off on these routers: the server's own 404 naming the
+                // knob; a POST is a plain 405 (read-only endpoint).
+                CRON_ROUTE => {
+                    assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+                    assert!(body.contains("[cron]"), "{path}: {body}");
+                    let (status, _) = probe(router, "POST", path).await;
+                    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "POST {path}");
+                }
                 other => panic!(
                     "INTERNAL_ROUTES gained {other} with no assertion here — pin what it must \
                      answer, in every mode, before shipping it"
@@ -9915,6 +10189,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = 1;
         let pool = crate::worker_pool::WorkerPool::spawn(
@@ -9963,6 +10239,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.timeouts.request = 1;
         let pool = crate::worker_pool::WorkerPool::spawn(
@@ -10040,6 +10318,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.metrics.enabled = true;
         config.server.metrics.path = "/_ephpm/metrics".to_string();
@@ -10082,6 +10362,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.metrics.enabled = true;
         tweak(&mut config);
@@ -10632,6 +10914,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.php.concurrency = 1;
         config.php.queue_depth = 1;
@@ -10845,6 +11129,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, None, None, None)
     }
@@ -10869,6 +11155,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.static_files.etag = true;
         // Only the PHP-linked ETag-cache tests use this router, and the cache
@@ -11127,6 +11415,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, None, None, None)
     }
@@ -11286,6 +11576,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, None, None, None)
     }
@@ -11348,6 +11640,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         Router::new(&config, test_store(), None, None, None, None, None)
     }
@@ -11499,6 +11793,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -11524,6 +11820,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -11781,6 +12079,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 3000);
@@ -11801,6 +12101,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 8080);
@@ -11823,6 +12125,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
@@ -11842,6 +12146,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(!router.open_basedir);
@@ -11887,6 +12193,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -11906,6 +12214,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
@@ -11929,6 +12239,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
@@ -12207,6 +12519,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -12309,6 +12623,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.validate().expect("the Sendy single-site config must validate");
         Router::new(&config, test_store(), None, None, None, None, None)
@@ -12462,6 +12778,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -12518,6 +12836,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -12648,6 +12968,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 9090);
@@ -12688,6 +13010,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.static_files.etag = static_etag;
         config.server.php_etag_cache.enabled = true;
@@ -12786,6 +13110,8 @@ mod tests {
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         config.server.php_etag_cache.enabled = true;
         config.server.timeouts.request = 1;
@@ -13307,6 +13633,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13333,6 +13661,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13360,6 +13690,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13387,6 +13719,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13411,6 +13745,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13439,6 +13775,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13581,6 +13919,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13627,6 +13967,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -13729,6 +14071,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             Router::new(&config, test_store(), None, None, None, None, None)
         }
@@ -15113,6 +15457,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -15170,6 +15516,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -15223,6 +15571,8 @@ echo "post response";
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
@@ -15268,6 +15618,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             // The real server runs `validate()` first; mirror it so a test
             // fixture can never rely on a map `serve` would have refused.
@@ -15454,6 +15806,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             assert!(config.validate().is_err(), "validate() must refuse the traversal target");
             // Bypass it deliberately.
@@ -15585,6 +15939,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             let router = Router::new(&config, test_store(), None, None, None, None, None);
             assert!(router.per_site_db, "fixture must run in per-site database mode");
@@ -16079,6 +16435,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             let global = test_store();
             let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
@@ -16203,6 +16561,8 @@ echo "post response";
                 cluster: ClusterConfig::default(),
                 middleware: Vec::new(),
                 opcache: ephpm_config::OpcacheConfig::default(),
+                cron: ephpm_config::CronConfig::default(),
+                source_path: None,
             };
             let global = test_store();
             let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
@@ -16884,6 +17244,8 @@ data: two
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
         };
 
         config.server.timeouts.request = 0;

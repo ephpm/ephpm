@@ -73,6 +73,10 @@ subtle.workspace = true
 # provider (#241) — a new edge, keeps `ring` out of the tree.
 aws-lc-rs = { workspace = true }
 getrandom.workspace = true
+# Cron scheduling (src/cron_scheduler/): calendar math over UTC instants and
+# IANA timezones. Same workspace pins ephpm-config uses for `CronSchedule`.
+chrono.workspace = true
+chrono-tz.workspace = true
 async-channel.workspace = true
 quinn.workspace = true
 h3.workspace = true
@@ -153,6 +157,11 @@ tokio = { workspace = true, features = ["test-util"] }
 # to the tree. Works on `#[tokio::test]`, which a bare Mutex guard held across
 # an await does not.
 serial_test.workspace = true
+# `DebuggingRecorder`: a thread-local metrics recorder the cron scheduler tests
+# install with `metrics::with_local_recorder` to assert which `reason` label
+# each skip path emits. Already in the tree via metrics-exporter-prometheus,
+# so this adds no new crate.
+metrics-util = "0.19"
 # Real MySQL client for the handle-reuse experiment: PHP's `pdo_mysql` opens a
 # connection per request, and the only way to observe what that does to
 # litewire's session-worker free-list is to drive the wire frontend with a
