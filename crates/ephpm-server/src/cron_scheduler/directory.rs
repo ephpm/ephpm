@@ -7,8 +7,13 @@
 //! prefix, so it is never web-served.
 //!
 //! Two run-parts styles, both **PHP-only** (every file runs as
-//! `ephpm php --site <that site>` — the tenant can already run arbitrary PHP in
-//! its app, so scheduling PHP in its own sandbox grants nothing new):
+//! `ephpm php --site <that site>`, which applies the SAME `open_basedir` +
+//! `disable_functions` sandbox as that site's HTTP PHP — issue #698, see
+//! `crate::router::site_sandbox_ini_defines` and `ephpm::site_sandbox_cli_defines`.
+//! The tenant can already run arbitrary PHP in its app, so scheduling PHP that
+//! runs under its own web sandbox grants no new privilege — an invariant this
+//! must preserve: a `--site` run that skipped that sandbox would let a tenant
+//! cron script read the config and every other tenant's derived credentials):
 //!
 //! * **cadence subdirectories** `hourly/ daily/ weekly/ monthly/` — every
 //!   `*.php` runs on that cadence at the fixed clock (operator-overridable);

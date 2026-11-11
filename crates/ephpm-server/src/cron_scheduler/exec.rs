@@ -7,7 +7,10 @@
 //!
 //! * **PHP, per-site** (first arg ends in `.php`): `ephpm php --site <k>
 //!   --config <p> -- <argv>` — the inner process binds the `ephpm_db_*` bridge
-//!   so the job gets the tenant's `DB_*`/KV credentials.
+//!   so the job gets the tenant's `DB_*`/KV credentials, and `ephpm php --site`
+//!   applies the SAME `open_basedir` + `disable_functions` sandbox as that
+//!   site's HTTP PHP (issue #698), so a tenant-authored script cannot escape its
+//!   vhost. (Data-plane sandbox; the binary lane below adds the OS-level one.)
 //! * **binary, per-site**: `ephpm exec --site <k> --config <p> -- <argv>` — the
 //!   tenant sandbox (uid drop + Landlock + egress, Linux).
 //! * **siteless** (cluster-global, leader-only): the `command` is spawned

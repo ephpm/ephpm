@@ -1,4 +1,4 @@
-//! The per-tick lease and the schedule cursor — the second exactly-once layer,
+//! The per-tick lease and the schedule cursor — the second coordination layer,
 //! and the one piece of durable scheduler state.
 //!
 //! Before executing a tick, the scheduler acquires a lease keyed on
@@ -8,6 +8,13 @@
 //! handoff where two nodes both pass the gate for the same tick, exactly one
 //! wins the lease. **Fail closed** — an unreachable key owner is
 //! [`LeaseOutcome::Unavailable`], i.e. *skip, do not run*, never *assume free*.
+//!
+//! The backstop is only as strong as membership agreement: the `set_nx` is
+//! arbitrated by the node `hash(key) mod sorted-alive-nodes` resolves to *in the
+//! caller's own view*, so two nodes that disagree on the alive set (a partition,
+//! or a join/leave mid-tick) can pick different arbiters and both acquire. The
+//! lease prevents double-fire under a converged view, not across membership
+//! changes — see the honest guarantee in the crate module docs.
 //!
 //! The lease is deliberately **not released on success**: it TTLs out (at
 //! `tick_ts`-unique granularity), so a crash-restart in the same tick cannot

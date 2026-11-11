@@ -1572,12 +1572,9 @@ fn directory_jobs_pass_the_same_gate_and_lease() {
 /// `trigger_now` reads the wall clock, so the test pins the scheduled fire to
 /// `floor_minute(Utc::now())` and retries if the minute rolls over in between.
 ///
-/// **Currently fails — real bug, left as the executable spec (run with
-/// `--ignored`).** `trigger_now` builds its lease key from `Utc::now()` at
-/// second granularity (`cron:lease:<job>:<now_secs>`), while the scheduled tick
-/// is keyed on the minute (`floor_minute`), so the two keys never collide and
-/// `run-now` double-fires with the scheduled run of the same tick (observed:
-/// fires = 2, result `triggered "j" (gated + leased)`).
+/// `trigger_now` floors `Utc::now()` to the minute (`mod.rs`), so its ad-hoc
+/// lease shares the scheduled tick's key `cron:lease:<job>:<minute_epoch>` and
+/// the second run of the same minute is refused rather than double-firing.
 #[test]
 fn run_now_takes_the_scheduled_ticks_lease() {
     for _attempt in 0..3 {
@@ -1598,7 +1595,7 @@ fn run_now_takes_the_scheduled_ticks_lease() {
             s.try_fire(&job, tick_ts).await; // the scheduled run of this minute
             settle().await; // ...which has finished (no `forbid` overlap in play)
             assert!(lease.holder(&lease::lease_key("j", tick_ts)).is_some());
-            let msg = s.trigger_now("j", false, &[]).await;
+            let (_fired, msg) = s.trigger_now("j", false, &[]).await;
             settle().await;
             let conclusive = floor_minute(Utc::now()) == tick_ts;
             (fire_count(&s, "j").await, msg, conclusive)
@@ -1621,42 +1618,62 @@ fn run_now_takes_the_scheduled_ticks_lease() {
 /// Unknown names are reported, not fired.
 #[test]
 fn run_now_force_bypasses_the_lease_and_plain_run_now_honours_it() {
-    let ((plain_fires, plain_msg, forced_fires, forced_msg, unknown_msg, runs), snap) =
-        with_metrics(|| async {
-            let lease: Arc<dyn LeaseStore> =
-                Arc::new(InMemLease { unreachable: true, ..Default::default() });
-            let exec = Arc::new(RecordingExec::default());
-            let s = scheduler(
-                vec![every_minute_job("j", None)],
-                false,
-                "solo",
-                lease,
-                Arc::new(InMemCursor::default()),
-                exec.clone(),
-                4,
-            );
-            let plain_msg = s.trigger_now("j", false, &[]).await;
-            settle().await;
-            let plain_fires = fire_count(&s, "j").await;
-            let forced_msg = s.trigger_now("j", true, &[]).await;
-            settle().await;
-            let forced_fires = fire_count(&s, "j").await;
-            let unknown_msg = s.trigger_now("nope", true, &[]).await;
-            settle().await;
-            (
-                plain_fires,
-                plain_msg,
-                forced_fires,
-                forced_msg,
-                unknown_msg,
-                exec.runs.lock().unwrap().len(),
-            )
-        });
+    let (
+        (
+            plain_ran,
+            plain_fires,
+            plain_msg,
+            forced_ran,
+            forced_fires,
+            forced_msg,
+            unknown_ran,
+            unknown_msg,
+            runs,
+        ),
+        snap,
+    ) = with_metrics(|| async {
+        let lease: Arc<dyn LeaseStore> =
+            Arc::new(InMemLease { unreachable: true, ..Default::default() });
+        let exec = Arc::new(RecordingExec::default());
+        let s = scheduler(
+            vec![every_minute_job("j", None)],
+            false,
+            "solo",
+            lease,
+            Arc::new(InMemCursor::default()),
+            exec.clone(),
+            4,
+        );
+        let (plain_ran, plain_msg) = s.trigger_now("j", false, &[]).await;
+        settle().await;
+        let plain_fires = fire_count(&s, "j").await;
+        let (forced_ran, forced_msg) = s.trigger_now("j", true, &[]).await;
+        settle().await;
+        let forced_fires = fire_count(&s, "j").await;
+        let (unknown_ran, unknown_msg) = s.trigger_now("nope", true, &[]).await;
+        settle().await;
+        (
+            plain_ran,
+            plain_fires,
+            plain_msg,
+            forced_ran,
+            forced_fires,
+            forced_msg,
+            unknown_ran,
+            unknown_msg,
+            exec.runs.lock().unwrap().len(),
+        )
+    });
+    assert!(!plain_ran, "plain run-now did not fire: {plain_msg}");
     assert_eq!(plain_fires, 0, "plain run-now honours the (unreachable) lease: {plain_msg}");
-    assert!(plain_msg.contains("gated + leased"), "{plain_msg}");
+    // The message now names the actual outcome (unreachable lease, fail-closed)
+    // instead of the old blanket "gated + leased" that fired-or-not alike.
+    assert!(plain_msg.contains("lease owner unreachable"), "{plain_msg}");
     assert_eq!(skips(&snap, "j", metrics::SKIP_LEASE_LOST), 1);
+    assert!(forced_ran, "--force reports a real run: {forced_msg}");
     assert_eq!(forced_fires, 1, "--force bypasses the lease: {forced_msg}");
     assert!(forced_msg.contains("forced"), "{forced_msg}");
+    assert!(!unknown_ran, "an unknown job did not fire: {unknown_msg}");
     assert!(unknown_msg.contains("no such job"), "{unknown_msg}");
     assert_eq!(runs, 1, "exactly the forced run executed");
 }

@@ -1435,6 +1435,9 @@ fn run_php(
     // script come back as php-cli rather than as `ephpm` (php_personality).
     php_personality::export_for_children(false);
 
+    // `-d` sandbox defines for a --site run, prepended to argv below. Empty
+    // without --site (bare `ephpm php` is unchanged).
+    let mut sandbox_args: Vec<String> = Vec::new();
     // Hold the runtime for the whole PHP execution when a --site backend is
     // bound: the bridge captured its `Handle` and `block_on`s onto it from PHP.
     let db_runtime = match site {
@@ -1451,6 +1454,11 @@ fn run_php(
             }
             let cfg = ephpm_config::Config::load(&config_path)
                 .with_context(|| format!("loading configuration from {}", config_path.display()))?;
+            // Apply the SAME per-tenant PHP sandbox a vhost HTTP request gets —
+            // open_basedir + private temp/session dirs + disable_functions —
+            // before running any tenant PHP (issue #698). Fails closed on an
+            // invalid --site key (same derivation as the DB bind below).
+            sandbox_args = site_sandbox_cli_defines(&cfg, &site_key)?;
             // Plan first (a thread-free TCP probe), then export the per-site
             // `DB_*` credentials into the environment — php-cli's `$_SERVER`
             // is the environment, so this is how a raw-mysqli cron script
@@ -1482,7 +1490,11 @@ fn run_php(
         }
     };
 
-    let exit_code = ephpm_php::PhpRuntime::cli_main(args);
+    // Prepend the --site sandbox defines (empty for a bare `ephpm php`) so the
+    // tenant's PHP cannot escape its open_basedir / denylist; an operator's own
+    // trailing `-d` in `args` still wins (php-cli is last-define-wins).
+    let full_args: Vec<String> = sandbox_args.into_iter().chain(args.iter().cloned()).collect();
+    let exit_code = ephpm_php::PhpRuntime::cli_main(&full_args);
     if exit_code.is_ok() {
         let _ = ephpm_php::PhpRuntime::shutdown();
     }
@@ -1920,6 +1932,65 @@ fn compose_disable_functions(
     }
 
     if ordered.is_empty() { None } else { Some(ordered.join(",")) }
+}
+
+/// Build the `-d` sandbox INI defines for an `ephpm php --site` invocation so a
+/// CLI/cron script runs under the SAME per-tenant isolation a vhost HTTP
+/// request gets (issue #698): `open_basedir` + private temp/session dirs (the
+/// filesystem boundary) and the composed `disable_functions` denylist
+/// (shell-exec family + multi-tenant hardening).
+///
+/// Without these the `--site` child ran at the server uid with no basedir and
+/// shell exec enabled — a tenant-authored directory-tier cron script could
+/// `file_get_contents()` the config file and, from `[kv] secret`, derive every
+/// other tenant's `pdo_mysql`/KV password, or shell out past the basedir.
+///
+/// `disable_functions` is composed with an **empty** capability carve-out: a
+/// one-shot CLI has no per-request gate to enforce a granted capability, so
+/// failing closed (disabling it) is the only choice that is never *less*
+/// restrictive than the request path. The defines are **prepended** to argv by
+/// the caller, so an operator's own trailing `-d open_basedir=` /
+/// `-d disable_functions=` still wins (php-cli is last-define-wins), while a
+/// tenant — who never controls argv, only the script body — cannot loosen them.
+fn site_sandbox_cli_defines(
+    config: &ephpm_config::Config,
+    site_key: &str,
+) -> anyhow::Result<Vec<String>> {
+    let fs = ephpm_server::router::site_sandbox_ini_defines(config, site_key)?;
+    let mut out: Vec<String> = Vec::new();
+    for (k, v) in [
+        ("open_basedir", fs.open_basedir.as_str()),
+        ("sys_temp_dir", fs.sys_temp_dir.as_str()),
+        ("upload_tmp_dir", fs.upload_tmp_dir.as_str()),
+        ("session.save_path", fs.session_save_path.as_str()),
+    ] {
+        out.push("-d".to_string());
+        out.push(format!("{k}={v}"));
+    }
+
+    // disable_functions: the same baseline the serve path composes
+    // (`compose_disable_functions` call site), with no per-site capability
+    // carve-out (`gated` empty — see the doc comment above).
+    let disable_shell =
+        config.server.sites_dir.is_some() && config.server.effective_disable_shell_exec();
+    let hardening =
+        config.server.sites_dir.is_some() && config.server.effective_multi_tenant_hardening();
+    let include_reachability_block = !config.server.effective_network_egress_externally_managed();
+    let cluster_invalidation =
+        config.opcache.effective_cluster_invalidation(config.cluster.enabled);
+    let operator_df = collect_operator_disable_functions(&config.php.ini_overrides);
+    if let Some(df) = compose_disable_functions(
+        &operator_df,
+        disable_shell,
+        hardening,
+        include_reachability_block,
+        cluster_invalidation,
+        &std::collections::HashSet::new(),
+    ) {
+        out.push("-d".to_string());
+        out.push(format!("disable_functions={df}"));
+    }
+    Ok(out)
 }
 
 /// What a set of per-site capability grants resolves to against the effective
@@ -4476,5 +4547,59 @@ mod malloc_override_tests {
             assert_eq!(CStr::from_ptr(s).to_bytes(), b"mimalloc-override");
             libc::free(s.cast());
         }
+    }
+}
+
+#[cfg(test)]
+mod site_sandbox_tests {
+    use super::*;
+
+    /// A minimal multi-tenant config (`sites_dir` with a `shop` vhost) loaded
+    /// the real way, so the effective security flags resolve exactly as in
+    /// production.
+    fn multi_tenant_cfg() -> (ephpm_config::Config, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sites = tmp.path().join("sites");
+        std::fs::create_dir_all(sites.join("shop")).expect("vhost dir");
+        let to_toml = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        let body = format!(
+            "[server]\ndocument_root = \"{}\"\nsites_dir = \"{}\"\n",
+            to_toml(tmp.path()),
+            to_toml(&sites),
+        );
+        let path = tmp.path().join("ephpm.toml");
+        std::fs::write(&path, body).expect("write config");
+        let config = ephpm_config::Config::load(&path).expect("load config");
+        (config, tmp)
+    }
+
+    /// The security property behind issue #698: a multi-tenant `ephpm php --site`
+    /// run is sandboxed with the SAME `open_basedir` + `disable_functions` the
+    /// site's HTTP PHP gets, so a tenant-authored cron script cannot read the
+    /// config file (and from `[kv] secret` derive every tenant's credentials) or
+    /// shell out past its basedir.
+    #[test]
+    fn site_defines_set_open_basedir_and_disable_shell_exec() {
+        let (config, _g) = multi_tenant_cfg();
+        let defines = site_sandbox_cli_defines(&config, "shop").expect("defines");
+        let joined = defines.join(" ");
+
+        // Emitted as `-d key=value` pairs (every other element is `-d`).
+        assert!(defines.iter().any(|a| a == "-d"), "emits -d defines: {joined}");
+        assert!(
+            defines.iter().any(|a| a.starts_with("open_basedir=")),
+            "confines the filesystem: {joined}"
+        );
+        let df = defines
+            .iter()
+            .find(|a| a.starts_with("disable_functions="))
+            .unwrap_or_else(|| panic!("disables functions: {joined}"));
+        for f in ["system", "shell_exec", "proc_open", "passthru"] {
+            assert!(df.contains(f), "disable_functions blocks {f}: {df}");
+        }
+
+        // Fails closed on an unknown / traversal-shaped --site key.
+        assert!(site_sandbox_cli_defines(&config, "ghost").is_err());
+        assert!(site_sandbox_cli_defines(&config, "../etc").is_err());
     }
 }

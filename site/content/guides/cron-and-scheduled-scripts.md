@@ -277,17 +277,23 @@ command  = ["report-generator", "--nightly"]
 A job's `command` and `site` pick how it runs: a `.php` first element with a
 `site` goes through `ephpm php --site` (DB bridge bound); any other binary with a
 `site` goes through `ephpm exec --site` (tenant sandbox); a siteless job is
-spawned directly on the leader. Jobs fire once per cluster via an **ownership
-gate** (the site's HRW owner, or the leader) plus a **per-tick KV lease** that
-closes the brief window during an ownership move — and both fail *closed*, so an
-uncertain node skips rather than double-fires. See the
-[`[cron]` reference](/reference/config/#cron) for every field.
+spawned directly on the leader. Jobs fire once per cluster **while membership is
+stable and converged** — via an **ownership gate** (the site's HRW owner, or the
+leader) plus a **per-tick KV lease** that closes the brief window during an
+ownership move; both fail *closed*. Across membership changes, node crashes and
+partitions the guarantee relaxes to **at-least-once**, so write jobs to be
+idempotent — the [design note](/roadmap/distributed-cron/) explains exactly why.
+See the [`[cron]` reference](/reference/config/#cron) for every field.
 
 Tenants on shared hosting can schedule their own PHP without `ephpm.toml` access
 once the operator opts their site in (`[cron] directory_cron_sites`): they drop
 files into `<site-root>/.ephpm/cron/{hourly,daily,weekly,monthly}/` or a
-`jobs/` file with a `// @schedule 0 3 * * *` header. These run in the tenant's
-own sandbox — zero new privilege — and are picked up live.
+`jobs/` file with a `// @schedule 0 3 * * *` header. These run through
+`ephpm php --site` under the **same sandbox as the site's HTTP PHP** — the
+identical `open_basedir` (the site container plus its private temp/session dirs)
+and `disable_functions` denylist — so a tenant cron script can reach nothing its
+own web requests cannot, and the directory tier stays opt-in per site (a dropped
+file does nothing until the operator enables it). They are picked up live.
 
 Inspect and trigger with the CLI:
 

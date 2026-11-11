@@ -1,8 +1,9 @@
-//! Distributed per-site cron — a declarative scheduler that runs each job
-//! **exactly once across a cluster**, modelled faithfully on Kubernetes
-//! `CronJob`.
+//! Distributed per-site cron — a declarative scheduler modelled faithfully on
+//! Kubernetes `CronJob`, running each job **exactly once while cluster
+//! membership is stable and converged, and at-least-once across membership
+//! changes, node crashes and partitions**. Write jobs to be idempotent.
 //!
-//! # Exactly-once, two layers
+//! # Two layers
 //!
 //! 1. **Ownership gate** ([`gate`], the primary guarantee): a node only
 //!    *considers* a job it owns — a job with a `site` on that site's HRW owner,
@@ -14,10 +15,30 @@
 //!    both pass the gate, exactly one wins the tick. Fail-closed on an
 //!    unreachable KV owner.
 //!
-//! This is **exactly-once under stable membership and across clean ownership
-//! moves; at-most-once-biased (skip on uncertainty) during a partition** — a
-//! gossip KV cannot offer linearizable CAS, and fail-closed is the deliberate
-//! trade. The design doc states the limit plainly.
+//! # The guarantee, stated honestly
+//!
+//! The lease rides the **gossip KV**, an AP store: a `set_nx` is a single-arbiter
+//! RPC to `hash(key) mod sorted-alive-nodes` **computed from the caller's own
+//! membership view**. So the lease is exactly as strong as membership agreement,
+//! and that bounds what cron can promise:
+//!
+//! * **Stable, converged membership** — one agreed arbiter per key, one agreed
+//!   owner per job: exactly-once.
+//! * **Partition** — once failure detection declares the far side dead (seconds),
+//!   an isolated node becomes HRW owner *and* arbiter of its own view and fires
+//!   everything it owns. This is **at-least-once, not at-most-once**: the
+//!   isolated node does not skip.
+//! * **Membership changes / crashes** — two seconds-wide double-fire windows
+//!   remain even without a partition: (1) on a plain join/leave, nodes ticking
+//!   within clock-skew of each other can briefly disagree on the arbiter and both
+//!   acquire; (2) if the firing node is also the key's arbiter and crashes before
+//!   its fire-and-forget cursor write propagates, a new owner re-fires that tick.
+//!
+//! A gossip KV cannot offer linearizable CAS, so closing these would need a
+//! consensus lease store (rejected: "KV is not a broker"). Idempotent jobs are
+//! the contract. A per-job `require_quorum` opt-in (planned) would close the
+//! isolated-*minority* partition case only — not (1) or (2). The design doc
+//! states the limit plainly.
 //!
 //! # Mechanism (Kubernetes `CronJob` port)
 //!
@@ -440,14 +461,18 @@ impl CronScheduler {
         }
     }
 
-    async fn try_fire(&self, job: &ResolvedJob, tick_ts: DateTime<Utc>) {
+    /// Attempt to fire `job` for `tick_ts`, applying the concurrency policy, the
+    /// node-wide cap and the per-tick lease. Returns what actually happened so a
+    /// caller (`trigger_now`) can report it accurately; the scheduling tick
+    /// loop ignores it (its outcome is already recorded as a metric/skip).
+    async fn try_fire(&self, job: &ResolvedJob, tick_ts: DateTime<Utc>) -> FireOutcome {
         // Concurrency policy.
         match job.concurrency_policy {
             ConcurrencyPolicy::Forbid => {
                 if self.running.is_running(&job.name).await {
                     self.record_skip(job, metrics::SKIP_OVERLAP).await;
                     self.cursor.set(&job.name, tick_ts);
-                    return;
+                    return FireOutcome::SkippedOverlap;
                 }
             }
             ConcurrencyPolicy::Allow => {}
@@ -462,7 +487,7 @@ impl CronScheduler {
         if self.running.at_cap() {
             self.record_skip(job, metrics::SKIP_AT_CAP).await;
             self.cursor.set(&job.name, tick_ts);
-            return;
+            return FireOutcome::SkippedAtCap;
         }
 
         // Per-tick lease.
@@ -477,11 +502,15 @@ impl CronScheduler {
         let window = job.timeout.max(job.starting_deadline.unwrap_or_default());
         let ttl = (window + LEASE_MARGIN).min(MAX_LEASE_TTL);
         match self.lease.acquire(&key, &token, ttl) {
-            LeaseOutcome::Acquired => self.start_run(job, tick_ts).await,
+            LeaseOutcome::Acquired => {
+                self.start_run(job, tick_ts).await;
+                FireOutcome::Started
+            }
             LeaseOutcome::Held => {
                 // Another node won this tick (handoff window): skip, do not
                 // advance the cursor — the winner advances the shared cursor.
                 self.record_skip(job, metrics::SKIP_LEASE_LOST).await;
+                FireOutcome::LeaseHeld
             }
             LeaseOutcome::Unavailable => {
                 tracing::warn!(
@@ -489,6 +518,7 @@ impl CronScheduler {
                     "cron: lease owner unreachable; skipping this tick (fail-closed)"
                 );
                 self.record_skip(job, metrics::SKIP_LEASE_LOST).await;
+                FireOutcome::LeaseUnavailable
             }
         }
     }
@@ -621,24 +651,67 @@ impl CronScheduler {
         .to_string()
     }
 
-    /// Fire one job now (honouring the per-tick lease unless `force`). Returns a
-    /// short human message. Used by `POST /_ephpm/cron/run/<name>`.
-    pub async fn trigger_now(&self, name: &str, force: bool, nodes: &[NodeInfo]) -> String {
+    /// Fire one job now (honouring the per-tick lease unless `force`). Used by
+    /// `POST /_ephpm/cron/run/<name>`.
+    ///
+    /// Returns `(fired, message)`: `fired` is whether the job actually started
+    /// (so a caller can set a non-zero exit code on a no-op), and `message` is a
+    /// short human line describing exactly what happened. A plain run-now shares
+    /// the scheduled tick's per-minute lease, so it is a no-op if that tick
+    /// already ran this minute — the message says so rather than claiming a run.
+    pub async fn trigger_now(&self, name: &str, force: bool, nodes: &[NodeInfo]) -> (bool, String) {
         let jobs = self.jobs_for_tick(nodes);
         let Some(job) = jobs.iter().find(|j| j.name == name) else {
-            return format!("no such job {name:?}");
+            return (false, format!("no such job {name:?}"));
         };
         // Floor to the minute so the ad-hoc lease shares the scheduled tick's
         // lease key (`cron:lease:<job>:<minute_epoch>`); otherwise run-now and
         // the scheduled run take different keys and both fire.
         let tick_ts = decision::floor_minute(Utc::now());
         if force {
+            // `--force` bypasses the per-minute lease (and the overlap/cap
+            // gates) and starts a run unconditionally.
             self.start_run(job, tick_ts).await;
-            return format!("fired {name:?} (forced, lease bypassed)");
+            return (true, format!("ran {name:?} now (forced; bypassed this minute's lease)"));
         }
-        self.try_fire(job, tick_ts).await;
-        format!("triggered {name:?} (gated + leased)")
+        let outcome = self.try_fire(job, tick_ts).await;
+        let message = match outcome {
+            FireOutcome::Started => format!("ran {name:?} now"),
+            FireOutcome::SkippedOverlap => format!(
+                "skipped {name:?}: already running (concurrencyPolicy=Forbid) — \
+                 use --force to run anyway"
+            ),
+            FireOutcome::SkippedAtCap => format!(
+                "skipped {name:?}: this node is at its concurrent-run cap — \
+                 use --force to run anyway"
+            ),
+            FireOutcome::LeaseHeld => format!(
+                "skipped {name:?}: this minute's tick already holds the lease — \
+                 use --force to run it again"
+            ),
+            FireOutcome::LeaseUnavailable => format!(
+                "skipped {name:?}: lease owner unreachable (fail-closed) — \
+                 use --force to run anyway"
+            ),
+        };
+        (outcome == FireOutcome::Started, message)
     }
+}
+
+/// What [`CronScheduler::try_fire`] did with a tick — reported by
+/// [`CronScheduler::trigger_now`] and ignored by the scheduling loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireOutcome {
+    /// The run was started (lease acquired, or forced).
+    Started,
+    /// Skipped: a previous run is still going and `concurrencyPolicy=Forbid`.
+    SkippedOverlap,
+    /// Skipped: this node is already at its concurrent-run cap.
+    SkippedAtCap,
+    /// Skipped: another node holds this minute's lease.
+    LeaseHeld,
+    /// Skipped: the lease owner was unreachable (fail-closed).
+    LeaseUnavailable,
 }
 
 /// Resolve one operator `CronJob` into a `ResolvedJob`.

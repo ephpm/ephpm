@@ -2377,10 +2377,10 @@ impl Router {
         match self.cron_control_access.check(client) {
             crate::internal_access::Verdict::Allow => {
                 let nodes = svc.membership().await;
-                let msg = svc.trigger_now(name, force, &nodes).await;
+                let (fired, msg) = svc.trigger_now(name, force, &nodes).await;
                 json_response_owned(
                     StatusCode::OK,
-                    serde_json::json!({ "result": msg }).to_string(),
+                    serde_json::json!({ "fired": fired, "result": msg }).to_string(),
                 )
             }
             denied => self.cron_control_access.deny_response(denied),
@@ -2809,25 +2809,20 @@ impl Router {
     /// own temp/session writes; it never widens another tenant's access.
     fn ensure_vhost_private_dirs(&self, document_root: &Path) -> VhostPrivateDirs {
         let state_root = vhost_state_root(document_root);
-        let temp = state_root.join("tmp");
-        let sessions = state_root.join("sessions");
-
-        if !self.ensured_vhost_dirs.contains(&state_root) {
-            for dir in [&temp, &sessions] {
-                if let Err(e) = create_private_dir(dir) {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        error = %e,
-                        "failed to create per-vhost private directory; \
-                         this tenant's temp/session writes may fail"
-                    );
-                }
-            }
-            write_vhost_marker(&state_root, document_root);
-            self.ensured_vhost_dirs.insert(state_root.clone());
+        // Already ensured this process: return the paths without touching the
+        // filesystem again. The creation itself lives in the Router-free
+        // `ensure_vhost_private_dirs_at`, shared with the out-of-request
+        // `--site` CLI path so both derive the same dirs (issue #698).
+        if self.ensured_vhost_dirs.contains(&state_root) {
+            return VhostPrivateDirs {
+                temp: state_root.join("tmp"),
+                sessions: state_root.join("sessions"),
+                state_root,
+            };
         }
-
-        VhostPrivateDirs { state_root, temp, sessions }
+        let dirs = ensure_vhost_private_dirs_at(document_root);
+        self.ensured_vhost_dirs.insert(dirs.state_root.clone());
+        dirs
     }
 
     /// Handle an incoming HTTP request.
@@ -7662,6 +7657,76 @@ pub fn resolve_sandbox_site(config: &Config, key: &str) -> anyhow::Result<Sandbo
     })
 }
 
+/// Create (idempotently, `0700` on Unix) a vhost's private `tmp/` and
+/// `sessions/` directories under its state root and return their paths —
+/// the Router-free core of [`Router::ensure_vhost_private_dirs`].
+///
+/// The request path caches which state roots it has already ensured; an
+/// out-of-request caller (`ephpm php --site`) has no such cache and calls this
+/// directly. Creation failures are logged and swallowed exactly as on the
+/// request path: the paths are returned regardless so the caller still narrows
+/// `open_basedir` away from the shared system temp.
+fn ensure_vhost_private_dirs_at(container: &Path) -> VhostPrivateDirs {
+    let state_root = vhost_state_root(container);
+    let temp = state_root.join("tmp");
+    let sessions = state_root.join("sessions");
+    for dir in [&temp, &sessions] {
+        if let Err(e) = create_private_dir(dir) {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to create per-vhost private directory; \
+                 this tenant's temp/session writes may fail"
+            );
+        }
+    }
+    write_vhost_marker(&state_root, container);
+    VhostPrivateDirs { state_root, temp, sessions }
+}
+
+/// The PHP filesystem-sandbox INI directives an out-of-request `--site` caller
+/// must apply to reproduce the request path's per-tenant isolation.
+///
+/// These mirror exactly the four `set_request_ini` calls `Router::handle`
+/// makes for a vhost request — `open_basedir`, `sys_temp_dir`, `upload_tmp_dir`
+/// and `session.save_path`. An `ephpm php --site` one-shot has no per-request
+/// hook, so it passes them as `-d` defines instead; the values are
+/// byte-identical because both go through [`resolve_sandbox_site`] /
+/// [`ensure_vhost_private_dirs_at`].
+pub struct SandboxIniDefines {
+    /// `open_basedir` — the `container:state_root` filesystem boundary.
+    pub open_basedir: String,
+    /// `sys_temp_dir` — this tenant's private temp directory.
+    pub sys_temp_dir: String,
+    /// `upload_tmp_dir` — the same private temp directory.
+    pub upload_tmp_dir: String,
+    /// `session.save_path` — this tenant's private session directory.
+    pub session_save_path: String,
+}
+
+/// Resolve the filesystem-sandbox INI directives for `--site <key>`, creating
+/// the tenant's private temp/session directories the same way a request does.
+///
+/// This is the filesystem half of the `--site` sandbox; the caller composes
+/// `disable_functions` separately (it owns the operator/hardening config).
+///
+/// # Errors
+///
+/// Propagates [`resolve_sandbox_site`]'s fail-closed errors: an invalid key, a
+/// single-site config (no tenant to sandbox), or a key with no matching vhost
+/// directory.
+pub fn site_sandbox_ini_defines(config: &Config, key: &str) -> anyhow::Result<SandboxIniDefines> {
+    let site = resolve_sandbox_site(config, key)?;
+    let dirs = ensure_vhost_private_dirs_at(&site.container);
+    let temp = dirs.temp.to_string_lossy().into_owned();
+    Ok(SandboxIniDefines {
+        open_basedir: site.open_basedir,
+        sys_temp_dir: temp.clone(),
+        upload_tmp_dir: temp,
+        session_save_path: dirs.sessions.to_string_lossy().into_owned(),
+    })
+}
+
 /// Per-vhost private state root — the parent directory that holds this
 /// tenant's `tmp/` and `sessions/` subdirectories.
 ///
@@ -8445,6 +8510,53 @@ mod tests {
         let mut single = config;
         single.server.sites_dir = None;
         assert!(super::resolve_sandbox_site(&single, "shop").is_err());
+    }
+
+    /// `site_sandbox_ini_defines` (the `ephpm php --site` sandbox, issue #698)
+    /// returns the same `open_basedir` a request gets and private temp/session
+    /// dirs under the state root, and creates them — so a `--site` CLI/cron run
+    /// is confined exactly as the site's HTTP PHP is.
+    #[test]
+    fn site_sandbox_ini_defines_matches_request_and_creates_private_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let sites_dir = root.path().join("sites");
+        fs::create_dir_all(sites_dir.join("shop")).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: root.path().join("docroot"),
+                sites_dir: Some(sites_dir.clone()),
+                ..ServerConfig::default()
+            },
+            php: test_php_config(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
+        };
+
+        let site = super::resolve_sandbox_site(&config, "shop").unwrap();
+        let defines = super::site_sandbox_ini_defines(&config, "shop").unwrap();
+
+        // open_basedir is byte-identical to the request path's value.
+        assert_eq!(defines.open_basedir, site.open_basedir);
+        // The container is in the basedir; the system temp is NOT (that is the
+        // whole point — a tenant cron script cannot read outside its vhost).
+        assert!(defines.open_basedir.contains(&site.container.display().to_string()));
+        // temp/session targets live under the tenant's state root, so they fall
+        // inside open_basedir, and they were created (0700 on Unix).
+        assert!(Path::new(&defines.sys_temp_dir).starts_with(&site.state_root));
+        assert_eq!(defines.sys_temp_dir, defines.upload_tmp_dir);
+        assert!(Path::new(&defines.session_save_path).starts_with(&site.state_root));
+        assert!(Path::new(&defines.sys_temp_dir).is_dir(), "temp dir created");
+        assert!(Path::new(&defines.session_save_path).is_dir(), "sessions dir created");
+
+        // Fails closed for an unknown/invalid site, same as resolve_sandbox_site.
+        assert!(super::site_sandbox_ini_defines(&config, "ghost").is_err());
+        assert!(super::site_sandbox_ini_defines(&config, "../etc").is_err());
     }
 
     /// `[server] preview = true` stamps `X-Ephpm-Preview: 1` on every

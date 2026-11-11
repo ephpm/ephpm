@@ -144,11 +144,34 @@ exactly once cluster-wide.
    crash-restart in the same tick cannot re-run it and a peer that has not yet
    seen the advanced cursor cannot steal it (at-most-once bias).
 
-**Honest limit.** This is **exactly-once under stable membership and across
-clean ownership moves; at-most-once-biased (skip on uncertainty) during a
-partition.** A gossip KV cannot offer linearizable compare-and-set, so a network
-partition that splits the lease owner from a would-be runner makes the runner
-*skip*, not double-fire. That is the deliberate trade.
+**Honest limit.** This is **exactly-once while membership is stable and
+converged; at-least-once across membership changes, node crashes and
+partitions.** Write jobs to be idempotent.
+
+The lease rides the gossip KV, an AP store — a `set_nx` is arbitrated by the
+node `hash(key) mod sorted-alive-nodes` resolves to *in the caller's own
+membership view*, so its strength is exactly the strength of membership
+agreement. A gossip KV cannot offer linearizable compare-and-set, which bounds
+the guarantee three ways:
+
+* **Partition.** Before failure detection declares the far side dead, a would-be
+  runner that cannot reach the lease owner *skips* (fail-closed). But **after**
+  detection (seconds), an isolated node becomes HRW owner *and* arbiter of its
+  own view and fires everything it owns — so a partition is **at-least-once**,
+  not at-most-once. (An earlier version of this page claimed the isolated node
+  skips; that was wrong.)
+* **Plain join/leave.** Two nodes ticking within clock-skew of each other can
+  briefly disagree on the alive set, pick different arbiters, and both acquire
+  the tick.
+* **Owner-is-arbiter crash.** If the firing node is also the key's arbiter and
+  crashes before its fire-and-forget cursor write propagates, a new owner sees no
+  lease and re-fires that tick.
+
+Closing these would need a consensus (CP) lease store — rejected on purpose ("KV
+is not a broker"). A per-job `require_quorum` opt-in (planned, not yet
+implemented) would refuse to fire from an isolated **minority**, closing the
+partition case for that job at the cost of possibly *missing* a run; it does not
+close the join/leave or crash windows. Idempotency is the contract.
 
 ## 4. Scheduler mechanism (Kubernetes `CronJob` port)
 

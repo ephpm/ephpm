@@ -145,8 +145,26 @@ fn run_now(config_path: &PathBuf, name: &str, force: bool) -> anyhow::Result<Exi
         req.send().with_context(|| format!("failed to reach {url} — is the server running?"))?;
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
-    println!("{body}");
-    if status.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::FAILURE) }
+    // Print just the human message when the body is the expected JSON, else the
+    // raw body (an error page from an older/different endpoint).
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    match parsed.as_ref().and_then(|v| v.get("result")).and_then(serde_json::Value::as_str) {
+        Some(msg) => println!("{msg}"),
+        None => println!("{body}"),
+    }
+    if !status.is_success() {
+        return Ok(ExitCode::FAILURE);
+    }
+    // A 200 still reports whether the job actually fired: a no-op run-now (lease
+    // already held, overlap, at cap) returns `"fired": false`, so a shell script
+    // can tell a real run from a skip. An older server without the field keeps
+    // the prior behaviour (success on any 200).
+    let fired = parsed
+        .as_ref()
+        .and_then(|v| v.get("fired"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if fired { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::FAILURE) }
 }
 
 /// A GET against the diagnostics endpoint, with the bearer token if configured.
