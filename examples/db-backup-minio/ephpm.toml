@@ -1,0 +1,50 @@
+# Scheduled embedded-database backups to S3-compatible object storage.
+#
+# ePHPm snapshots each embedded SQLite database every `interval` with
+# `VACUUM INTO` (memory-bounded in the pinned Turso engine), gzips it, and
+# uploads it as  <s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz.  Restore with
+# `ephpm db restore`.  RPO = `interval`.
+#
+# This example points at the local MinIO in compose.yaml. For a real provider
+# see the variants at the bottom of this file and the README.
+
+[server]
+listen        = "0.0.0.0:8080"
+document_root = "/app/www"
+
+# Single-node embedded database (one shared file). Backups cover this file; its
+# site key is `default`.  (Per-site/multi-tenant mode backs up every
+# <dir>/<key>.db instead — same [db.sqlite.backup] block.)
+[db.sqlite]
+path = "/app/data/app.db"
+
+# ---------------------------------------------------------------------------
+# Scheduled backups.
+# ---------------------------------------------------------------------------
+[db.sqlite.backup]
+enabled   = true
+s3_bucket = "ephpm-backups"
+# s3_path defaults to "ephpm/db"; objects land at ephpm/db/default/<ts>.db.gz
+interval  = "1m"      # fast for the demo — RPO in prod is minutes to hours
+retention = "1h"      # delete objects older than this (the newest is always kept)
+
+# --- MinIO (this example) --------------------------------------------------
+endpoint   = "http://minio:9000"
+region     = "us-east-1"
+path_style = true     # MinIO needs path-style addressing (endpoint/bucket/key)
+
+# --- Real-provider variants (replace the three MinIO lines above) ----------
+#
+# AWS S3 — omit `endpoint`/`path_style` entirely; just set the region:
+#   region = "us-west-2"
+#
+# Cloudflare R2:
+#   endpoint   = "https://<account-id>.r2.cloudflarestorage.com"
+#   region     = "auto"
+#   path_style = true
+#
+# Credentials ALWAYS come from the environment, never this file:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN).
+# Startup fails if `enabled = true` and none are set. The uploaded object is a
+# plain gzip of a standard SQLite file — NOT encrypted by ePHPm — so give the
+# bucket server-side encryption and a tight access policy.
