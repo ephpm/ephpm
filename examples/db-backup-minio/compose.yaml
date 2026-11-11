@@ -1,0 +1,91 @@
+# ePHPm scheduled embedded-database backups → MinIO (S3-compatible), end to end.
+#
+#   docker compose up -d
+#   # watch backup objects appear every minute:
+#   #   MinIO console  http://localhost:9001   (user/pass: minioadmin / minioadmin)
+#   #   app            http://localhost:8080
+#
+# Flow:
+#   minio          S3-compatible object store + web console
+#   createbucket   one-shot: makes the `ephpm-backups` bucket
+#   seed           one-shot: writes a row into the embedded DB *offline*
+#                  (`ephpm db query`) so there is real data to back up
+#   ephpm          serves the app AND runs the [db.sqlite.backup] loop, uploading
+#                  a gzipped VACUUM INTO snapshot to MinIO every `interval`
+
+name: ephpm-db-backup-minio
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Create the destination bucket once MinIO is up.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/ephpm-backups
+        echo "bucket ready"
+
+  # Seed the embedded database with a row BEFORE the server starts. `ephpm db
+  # query` opens the file directly (offline, single-writer) — so there's real
+  # data in the first backup. A real app would instead write through pdo_mysql /
+  # the ephpm_db_* bridge while serving; see the DB guide.
+  seed:
+    image: ephpm/ephpm:v0.16.0-php8.5.12
+    volumes:
+      - app-data:/app/data
+      - ./ephpm.toml:/app/ephpm.toml:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        ephpm db query --site default -c /app/ephpm.toml -e \
+          "CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY, at TEXT DEFAULT CURRENT_TIMESTAMP); INSERT INTO visits DEFAULT VALUES;"
+        echo "seeded"
+
+  ephpm:
+    image: ephpm/ephpm:v0.16.0-php8.5.12
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+    # Credentials for the S3 upload come from the environment only (never the
+    # config file). Here they are MinIO's root credentials.
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    command: ["ephpm", "serve", "--config", "/app/ephpm.toml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - app-data:/app/data
+      - ./www:/app/www:ro
+      - ./ephpm.toml:/app/ephpm.toml:ro
+
+volumes:
+  minio-data:
+  app-data:

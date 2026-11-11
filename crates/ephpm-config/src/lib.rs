@@ -10624,6 +10624,8 @@ listen = "0.0.0.0:8080"
             "examples/php-middleware/demo/ephpm.toml",
             "examples/rust-middleware/demo/ephpm.toml",
             "examples/wordpress-compose/ephpm.toml",
+            "examples/cron/ephpm.toml",
+            "examples/db-backup-minio/ephpm.toml",
             "tests/ephpm-test.toml",
             "tests/smoke/ephpm-laravel.toml",
             "tests/smoke/ephpm-symfony.toml",

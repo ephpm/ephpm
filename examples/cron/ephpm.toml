@@ -1,0 +1,100 @@
+# ePHPm native scheduled jobs — the `[cron]` section.
+#
+# ePHPm has a built-in scheduler: declare jobs here and the running server
+# fires them on a standard five-field cron schedule. No systemd timer, Docker
+# Compose loop, or Kubernetes CronJob sidecar required.
+#
+#   ephpm serve --config ephpm.toml      # the scheduler runs inside serve
+#   ephpm cron list   -c ephpm.toml      # schedule + next fire (standalone)
+#   ephpm cron status -c ephpm.toml      # live state from the running server
+#   ephpm cron run-now wp-cron -c ephpm.toml   # fire a job now (leased)
+#
+# This example is multi-tenant (per-site document roots under `sites_dir`), so
+# a per-site job can run as a specific tenant with that tenant's DB_* / KV
+# credentials already in the environment — exactly what `ephpm php --site`
+# provides. Create the site directories under `sites_dir` before scheduling for
+# them: a per-site job whose `site` has no vhost directory is refused at
+# startup (fail-closed).
+
+[server]
+listen               = "0.0.0.0:8080"
+# Multi-tenant: each subdirectory of sites_dir is one virtual host. The
+# directory name is the site key. e.g. /srv/sites/blog, /srv/sites/shop.
+sites_dir            = "/srv/sites"
+sites_domain_suffix  = ".example.com"   # blog.example.com -> site key "blog"
+
+# Per-site embedded databases: one <key>.db per vhost under this dir. A per-site
+# PHP cron job (wp-cron, artisan schedule:run) binds its own tenant database.
+[db.sqlite]
+dir           = "/srv/db"
+max_open_dbs  = 64
+
+# Required for the per-site credential derivation that lets a cron PHP job
+# authenticate to the running server as its tenant. Keep it secret; anyone who
+# can read it can impersonate any tenant. Load it from a file/secret in prod.
+[kv]
+secret = "change-me-to-a-long-random-string"
+
+# ---------------------------------------------------------------------------
+# The scheduler.
+# ---------------------------------------------------------------------------
+[cron]
+enabled        = true     # master switch — OFF by default
+timezone       = "UTC"    # default schedule timezone; per-job override below
+max_concurrent = 4        # cap on jobs running at once on this node
+
+# Opt specific sites into the directory tier (below): scripts dropped into
+# <site>/.ephpm/cron/{hourly,daily,weekly,monthly}/ run on that cadence with no
+# config change. Leave empty (or set `directory_cron = true` for ALL sites) to
+# disable. The directory tier is a filesystem sandbox, not an OS-level one.
+directory_cron_sites = ["blog"]
+
+# --- Per-site PHP: WordPress wp-cron, run as the `blog` tenant every 5 min ---
+[[cron.jobs]]
+name     = "wp-cron"
+site     = "blog"                         # runs on blog's owner, as that tenant
+schedule = "*/5 * * * *"
+# First arg ends in .php -> dispatched as `ephpm php --site blog` (tenant DB
+# bridge bound, DB_* exported). `command` is an argv array, never a shell string.
+command  = ["wp-cron.php"]
+timeout  = "2m"
+
+# --- Per-site Laravel scheduler, run as the `shop` tenant every minute --------
+[[cron.jobs]]
+name               = "laravel-schedule"
+site               = "shop"
+schedule           = "* * * * *"
+command            = ["artisan", "schedule:run"]   # non-.php -> `ephpm exec --site shop`
+timeout            = "5m"
+concurrency_policy = "forbid"             # default: never overlap a previous run
+                                          #   allow   = run even if the last is still going
+                                          #   replace = kill the running one and start fresh
+
+# --- Per-site, with a timezone and a catch-up window --------------------------
+[[cron.jobs]]
+name              = "shop-nightly-rollup"
+site              = "shop"
+schedule          = "0 2 * * *"           # 02:00 ...
+timezone          = "America/Denver"      # ... in the tenant's local time
+command           = ["artisan", "reports:rollup"]
+timeout           = "30m"
+# If the owner was down at 02:00, still run when it comes back up — but only
+# within this window of the scheduled time. Unset => only the current tick fires.
+starting_deadline = "1h"
+
+# --- Siteless: a plain binary on the cluster leader (no tenant credentials) ----
+[[cron.jobs]]
+name     = "nightly-report"
+# no `site` -> siteless: runs once on the lowest-ordinal alive node. A siteless
+# job may not be a .php command (there is no tenant to run it as).
+schedule = "0 3 * * *"
+command  = ["report-generator", "--nightly"]
+timeout  = "1h"
+
+# --- Temporarily parked: parsed and listed, but never fires while suspended ----
+[[cron.jobs]]
+name     = "data-export"
+site     = "shop"
+schedule = "0 4 * * 1"                    # Mondays 04:00
+command  = ["artisan", "export:weekly"]
+suspend  = true
