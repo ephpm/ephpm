@@ -7616,7 +7616,7 @@ pub fn resolve_sandbox_site(config: &Config, key: &str) -> anyhow::Result<Sandbo
 
     let sites_dir = config.server.sites_dir.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "[server] sites_dir is not configured — `ephpm exec --site` requires \
+            "[server] sites_dir is not configured — `--site` requires \
              multi-tenant (vhost) mode; there is no per-site sandbox to enter in \
              single-site mode"
         )

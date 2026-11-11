@@ -64,14 +64,43 @@ before PHP runs, so `wp`, `artisan`, migrations, and seeders built on the
 
 | Option | Meaning |
 |--------|---------|
-| `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database. Validated fail-closed (an unknown or malformed key is rejected). |
+| `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database **and applies that tenant's PHP sandbox** (`open_basedir` + `disable_functions` + operator `ini_overrides` — see [The per-site PHP sandbox](#the-per-site-php-sandbox) below). Validated fail-closed (an unknown or malformed key is rejected). |
 | `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. On its own it does nothing: `ephpm php --config <path> …` without `--site` prints a warning on stderr that `--config` has no effect without `--site`, ignores it, and runs PHP normally. |
 
 Both are ePHPm's own options and must appear **before** the PHP program and its
 arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
 and everything after them — including a `--` separator and any `--site` a script
 itself wants — is passed to PHP untouched. Without `--site`, `ephpm php` runs
-with no database bound, exactly as before.
+with no database bound and no sandbox, exactly as before.
+
+### The per-site PHP sandbox
+
+Since [#698](https://github.com/ephpm/ephpm/issues/698) `--site` also applies
+that tenant's **PHP sandbox** before running your program — the same
+`open_basedir` (the site container plus its private temp/session dirs), the same
+composed `disable_functions` denylist (shell-exec family + multi-tenant
+hardening), and the operator's `[php] ini_overrides` — so a directory-tier cron
+job cannot read the config file (and, from `[kv] secret`, derive another
+tenant's credentials) or shell out past its basedir. Two consequences for
+operators:
+
+- **A program outside the site container (or its private state root) is refused
+  by `open_basedir`.** A tool that lives inside the site — e.g. a Composer-
+  installed `vendor/bin/wp` run from the site directory — is fine; a *global*
+  binary (a system-wide `wp`/`composer`) is not. To run one against a tenant,
+  widen the basedir with a trailing `-d open_basedir=…` **after** the PHP
+  program: those options are last-define-wins and only the operator, never the
+  tenant's script body, controls argv.
+- **This is the data-plane sandbox only.** It is `open_basedir` + a denylist, not
+  an OS-level sandbox: the `--site` child shares the server's uid and network
+  namespace, so it is **not** confined by the per-vhost egress (eBPF) layer, and
+  a custom `[php] ini_file` is **not** replayed to it (only `ini_overrides` are).
+  For untrusted tenant code that needs the full process sandbox, run it through
+  [`ephpm exec --site`](../exec/) instead.
+
+On Windows the sandbox path values are emitted quoted (the `open_basedir`
+separator is `;`, a php.ini comment character); the filesystem boundary is the
+same as on Linux.
 
 ```bash
 # Offline (no server) — opens the site's own .db file directly:

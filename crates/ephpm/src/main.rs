@@ -1937,13 +1937,32 @@ fn compose_disable_functions(
 /// Build the `-d` sandbox INI defines for an `ephpm php --site` invocation so a
 /// CLI/cron script runs under the SAME per-tenant isolation a vhost HTTP
 /// request gets (issue #698): `open_basedir` + private temp/session dirs (the
-/// filesystem boundary) and the composed `disable_functions` denylist
-/// (shell-exec family + multi-tenant hardening).
+/// filesystem boundary), every operator `[php] ini_overrides` hardening line,
+/// and the composed `disable_functions` denylist (shell-exec family +
+/// multi-tenant hardening).
 ///
 /// Without these the `--site` child ran at the server uid with no basedir and
 /// shell exec enabled — a tenant-authored directory-tier cron script could
 /// `file_get_contents()` the config file and, from `[kv] secret`, derive every
 /// other tenant's `pdo_mysql`/KV password, or shell out past the basedir.
+///
+/// Parity with the request path, and the deliberate exceptions:
+///
+/// * **Operator `[php] ini_overrides`** (e.g. `allow_url_fopen=0`,
+///   `disable_classes=…`, `enable_dl=0`) are replayed as `-d` — the serve path
+///   writes them into the generated php.ini, so without this a hardened
+///   deployment's cron child was strictly *weaker* than its HTTP requests. The
+///   four sandbox-managed keys and `disable_functions` are **not** taken from
+///   the override list (the router owns them; an override of them would make
+///   the sandbox override-controlled — see `router::resolve_sandbox_site`). A
+///   custom `[php] ini_file` is **not** replayed (it is an arbitrary php.ini the
+///   CLI cannot reconstruct as `-d` pairs); an operator relying on `ini_file`
+///   for tenant hardening should run untrusted cron under `ephpm exec --site`,
+///   which sandboxes the whole process. Documented in `reference/cli/php.md`.
+/// * **`open_basedir` is applied unconditionally**, even where
+///   `[server] open_basedir = false` turns it off for HTTP: a one-shot cron
+///   child is exactly where the basedir is wanted, and applying it is only ever
+///   *more* restrictive than the request path, never less.
 ///
 /// `disable_functions` is composed with an **empty** capability carve-out: a
 /// one-shot CLI has no per-request gate to enforce a granted capability, so
@@ -1956,8 +1975,40 @@ fn site_sandbox_cli_defines(
     config: &ephpm_config::Config,
     site_key: &str,
 ) -> anyhow::Result<Vec<String>> {
+    // Keys the router owns: never taken from operator `ini_overrides`, so an
+    // override cannot widen the sandbox. (`disable_functions` is folded into the
+    // composed union below; the four path keys come from the resolved vhost
+    // state.)
+    const SANDBOX_MANAGED_KEYS: [&str; 5] = [
+        "open_basedir",
+        "sys_temp_dir",
+        "upload_tmp_dir",
+        "session.save_path",
+        "disable_functions",
+    ];
+
+    // Validate the --site key fail-closed and resolve/create the vhost's private
+    // temp/session dirs (the same derivation the request path uses).
     let fs = ephpm_server::router::site_sandbox_ini_defines(config, site_key)?;
     let mut out: Vec<String> = Vec::new();
+
+    // Operator `[php] ini_overrides` hardening, replayed exactly as the serve
+    // path writes them into the generated php.ini — minus the sandbox-managed
+    // keys — so the cron child is confined as HTTP is. Emitted BEFORE the
+    // sandbox defines below, which therefore win (php-cli is last-define-wins).
+    for [k, v] in &config.php.ini_overrides {
+        if SANDBOX_MANAGED_KEYS.iter().any(|m| k.trim().eq_ignore_ascii_case(m)) {
+            continue;
+        }
+        out.push("-d".to_string());
+        out.push(format!("{k}={v}"));
+    }
+
+    // The four filesystem-sandbox directives. The path values are quoted +
+    // forward-slashed on Windows so the ';' open_basedir separator (and a path
+    // with a space) survives the php.ini grammar the SAPI parses a `-d` value
+    // with — see `cli_ini_path_value`. The request path does not need this: it
+    // installs the value with `zend_alter_ini_entry` (no parsing).
     for (k, v) in [
         ("open_basedir", fs.open_basedir.as_str()),
         ("sys_temp_dir", fs.sys_temp_dir.as_str()),
@@ -1965,12 +2016,13 @@ fn site_sandbox_cli_defines(
         ("session.save_path", fs.session_save_path.as_str()),
     ] {
         out.push("-d".to_string());
-        out.push(format!("{k}={v}"));
+        out.push(format!("{k}={}", cli_ini_path_value(v, cfg!(windows))));
     }
 
     // disable_functions: the same baseline the serve path composes
     // (`compose_disable_functions` call site), with no per-site capability
-    // carve-out (`gated` empty — see the doc comment above).
+    // carve-out (`gated` empty — see the doc comment above). Emitted LAST so the
+    // composed union wins over any operator attempt.
     let disable_shell =
         config.server.sites_dir.is_some() && config.server.effective_disable_shell_exec();
     let hardening =
@@ -1991,6 +2043,27 @@ fn site_sandbox_cli_defines(
         out.push(format!("disable_functions={df}"));
     }
     Ok(out)
+}
+
+/// Format a resolved sandbox path as a php.ini `-d` value that survives the
+/// grammar the CLI SAPI parses a `-d` value with on every platform.
+///
+/// The request path installs `open_basedir` with `zend_alter_ini_entry` (no
+/// parsing); the CLI installs it through `-d`, which the SAPI appends to
+/// `sapi_module.ini_entries` and PHP parses as php.ini text. On Windows the
+/// `open_basedir` separator is `;` (the platform `PATH_SEPARATOR`), which
+/// php.ini treats as a comment start — so an unquoted `C:\site;C:\state` is
+/// silently truncated to `C:\site`, dropping the vhost's private temp/session
+/// root (a path under a username with a space is a second hazard). Quoting the
+/// value (the SAPI passes a leading `"` through untouched) moves the `;` and the
+/// space inside the quotes, and forward slashes avoid backslash escaping there
+/// while staying valid `open_basedir` entries on Windows (matching
+/// `ephpm_php::shared`'s Windows ini paths).
+///
+/// On non-Windows the value is returned unchanged: `:` separates `open_basedir`
+/// and is not special in a php.ini value.
+fn cli_ini_path_value(raw: &str, windows: bool) -> String {
+    if windows { format!("\"{}\"", raw.replace('\\', "/")) } else { raw.to_string() }
 }
 
 /// What a set of per-site capability grants resolves to against the effective
@@ -4601,5 +4674,84 @@ mod site_sandbox_tests {
         // Fails closed on an unknown / traversal-shaped --site key.
         assert!(site_sandbox_cli_defines(&config, "ghost").is_err());
         assert!(site_sandbox_cli_defines(&config, "../etc").is_err());
+    }
+
+    /// Fix #2 (issue #698): operator `[php] ini_overrides` hardening IS carried
+    /// into the `--site` child (so a hardened deployment's cron child is
+    /// confined as its HTTP requests are), but the four sandbox-managed keys and
+    /// `disable_functions` are taken from the router / the composed union —
+    /// never from the override list — so a stray (or hostile) override of them
+    /// cannot widen the basedir or re-enable a blocked function.
+    #[test]
+    fn operator_ini_overrides_are_carried_but_sandbox_keys_are_router_owned() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sites = tmp.path().join("sites");
+        std::fs::create_dir_all(sites.join("shop")).expect("vhost dir");
+        let to_toml = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        let body = format!(
+            "[server]\ndocument_root = \"{}\"\nsites_dir = \"{}\"\n\n\
+             [php]\nini_overrides = [\n  \
+             [\"allow_url_fopen\", \"0\"],\n  \
+             [\"open_basedir\", \"/\"],\n  \
+             [\"disable_functions\", \"\"],\n\
+             ]\n",
+            to_toml(tmp.path()),
+            to_toml(&sites),
+        );
+        let path = tmp.path().join("ephpm.toml");
+        std::fs::write(&path, body).expect("write config");
+        let config = ephpm_config::Config::load(&path).expect("load config");
+
+        let defines = site_sandbox_cli_defines(&config, "shop").expect("defines");
+        let pairs: Vec<&str> =
+            defines.iter().filter(|a| a.as_str() != "-d").map(String::as_str).collect();
+
+        // The operator's non-sandbox hardening line is replayed.
+        assert!(
+            pairs.contains(&"allow_url_fopen=0"),
+            "operator ini_overrides replayed into the CLI: {pairs:?}"
+        );
+        // The operator's attempt to widen open_basedir from ini_overrides is
+        // dropped — the ONLY open_basedir define is the router's container
+        // value, never the override's `/`.
+        let basedirs: Vec<&str> =
+            pairs.iter().copied().filter(|p| p.starts_with("open_basedir=")).collect();
+        assert_eq!(basedirs.len(), 1, "exactly one open_basedir define: {pairs:?}");
+        assert_ne!(basedirs[0], "open_basedir=/", "the override never reaches open_basedir");
+        assert!(
+            basedirs[0].contains("shop"),
+            "open_basedir is the router's container: {}",
+            basedirs[0]
+        );
+        // disable_functions is the composed union, not the operator's empty
+        // string — the denylist is never override-cleared.
+        let df = pairs
+            .iter()
+            .find(|p| p.starts_with("disable_functions="))
+            .expect("composed disable_functions present");
+        assert!(df.contains("shell_exec"), "composed denylist, not the override: {df}");
+    }
+
+    /// Fix #1 (issue #698): on Windows the `open_basedir` separator is `;`, which
+    /// php.ini — the grammar a `-d` value is parsed with — treats as a comment
+    /// start, so an unquoted value loses its private state root. The value must
+    /// be quoted + forward-slashed; non-Windows passes through unchanged.
+    #[test]
+    fn windows_path_value_is_quoted_and_forward_slashed() {
+        assert_eq!(
+            cli_ini_path_value("C:\\sites\\shop;C:\\Temp\\state", true),
+            "\"C:/sites/shop;C:/Temp/state\"",
+            "the ';' separator survives inside the quotes"
+        );
+        assert_eq!(
+            cli_ini_path_value("C:\\Users\\Jane Doe\\tmp", true),
+            "\"C:/Users/Jane Doe/tmp\"",
+            "a path with a space is protected too"
+        );
+        assert_eq!(
+            cli_ini_path_value("/sites/shop:/var/state", false),
+            "/sites/shop:/var/state",
+            "non-Windows is unchanged (':' is not special in a php.ini value)"
+        );
     }
 }
