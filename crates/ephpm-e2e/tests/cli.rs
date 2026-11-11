@@ -661,6 +661,28 @@ fn kv_functions_warn_once_when_no_store_is_attached() {
     assert_eq!(run.code, 0, "a warning must not change the exit status, got {}", run.code);
 }
 
+/// `ephpm_kv_attached()` (#700) reports whether a KV store/endpoint is wired
+/// into this process, so a library can branch instead of relying on
+/// `function_exists('ephpm_kv_get')` (always true, even when unbound). Plain
+/// `ephpm php` (no `--site`, no running server) has nothing to attach to, so it
+/// must report `false` — and, unlike a KV op, the probe itself emits no
+/// "unattached" warning (it is the thing you call to avoid that warning).
+#[test]
+fn kv_attached_is_false_with_no_server() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-r", "var_dump(ephpm_kv_attached()); echo 'END';"], "");
+    let combined = run.output();
+    assert!(combined.contains("bool(false)"), "attached must be false with no server:\n{combined}");
+    assert!(combined.contains("END"), "execution must continue:\n{combined}");
+    assert!(
+        !combined.contains("no ePHPm KV store is attached"),
+        "the probe itself must not emit the unattached warning:\n{combined}"
+    );
+    assert_eq!(run.code, 0, "the probe must not change the exit status, got {}", run.code);
+}
+
 // ── php-cli conformance cluster: #335 / #336 / #338 / #339 / #340 ───────────
 //
 // Each of these was found by the nightly CLI conformance harness

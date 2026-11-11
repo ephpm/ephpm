@@ -51,6 +51,7 @@ mod kv_snapshot_cli;
 mod php_personality;
 mod service;
 mod site_db;
+mod site_kv;
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
@@ -1454,6 +1455,12 @@ fn run_php(
                 .build()
                 .context("failed to build the database runtime for `ephpm php --site`")?;
             let offline = site_db::bind_site_db(&site_key, strategy, runtime.handle())?;
+            // Also bind ephpm_kv_* to the running server's live KV over the
+            // loopback wire (#700). Best-effort and independent of the DB
+            // binding: a missing KV endpoint must never fail a --site run that
+            // only needed the database, so this neither errors nor uses the
+            // runtime (the RESP client is blocking).
+            site_kv::bind_site_kv(site_kv::plan_site_kv(&cfg, &site_key));
             Some((runtime, offline))
         }
         None => {

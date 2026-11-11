@@ -1599,6 +1599,822 @@ pub fn set_store(_store: std::sync::Arc<ephpm_kv::store::Store>) {
     // No-op in stub mode.
 }
 
+// ── Remote KV ops (the `ephpm php --site` CLI wire, issue #700) ──────────
+//
+// A second `EphpmKvOps` table whose store-touching callbacks forward each op
+// to a running server's internal KV endpoint over RESP
+// ([`crate::kv_remote::RemoteKvClient`]) instead of a local `Store`. It reuses
+// this module's staging buffers (`stage_value`, `stage_list`) and the three
+// buffer-reading callbacks (`kv_get_result`, `kv_list_item`, `kv_site_context`)
+// unchanged — those never touch the store, only the thread-locals C reads right
+// after a staging op. So only the ~34 store-touching ops are re-pointed; the
+// get/list staging contract C relies on is identical on both tables.
+//
+// `wait` has no RESP equivalent (it is a versioned in-process blocking wait for
+// request-scoped coordination, not something a cron script does), so the remote
+// `wait` always reports a timeout. Every other op maps to a command the
+// server's RESP dispatcher already serves.
+
+#[cfg(php_linked)]
+static REMOTE_KV: OnceLock<crate::kv_remote::RemoteKvClient> = OnceLock::new();
+
+/// The remote client backing the CLI wire, or `None` before one is installed.
+#[cfg(php_linked)]
+fn remote_client() -> Option<&'static crate::kv_remote::RemoteKvClient> {
+    REMOTE_KV.get()
+}
+
+/// Run one RESP command against the installed remote client; `None` when no
+/// client is installed or the command failed. The per-op failure value
+/// (`false`/`null`) is the user-visible signal, matching a local miss — but a
+/// dead server, a `-NOAUTH`/`-TRYAGAIN`, or an over-size value would otherwise
+/// be indistinguishable from a cache miss with nothing on stderr (the CLI's
+/// default log filter is `info`, above `debug`). So the **first** failure warns;
+/// the rest stay at debug to avoid spamming a script that polls.
+#[cfg(php_linked)]
+fn remote_cmd(args: &[&[u8]]) -> Option<ephpm_kv::resp::Frame> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let client = remote_client()?;
+    match client.command(args) {
+        Ok(frame) => Some(frame),
+        Err(e) => {
+            if WARNED.swap(true, Ordering::Relaxed) {
+                tracing::debug!(error = %e, "ephpm php --site: remote KV command failed");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "ephpm php --site: KV wire command failed; later failures log at debug"
+                );
+            }
+            None
+        }
+    }
+}
+
+#[cfg(php_linked)]
+use ephpm_kv::resp::Frame as RespFrame;
+
+/// Resolve the installed remote client and a UTF-8 key, or return `$fail` from
+/// the enclosing remote op. The companion of [`store_and_key`] for the wire
+/// table. Defined before its first use (macros are textual).
+#[cfg(php_linked)]
+macro_rules! remote_store_and_key {
+    ($key:expr, $len:expr, $fail:expr) => {{
+        // Safety: every op's `key` points to `key_len` bytes of a PHP string
+        // parameter, valid for the duration of the call.
+        let Some(key) = (unsafe { key_arg($key, $len) }) else {
+            return $fail;
+        };
+        let Some(client) = remote_client() else {
+            return $fail;
+        };
+        (client, key)
+    }};
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_get(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"GET", key.as_bytes()]) {
+        Some(RespFrame::Bulk(b)) => i32::from(stage_value(b.as_ref())),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_set(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `val` points to `val_len` bytes of PHP string data.
+    let val = unsafe { bytes_arg(val, val_len) };
+    let ms = ttl_ms.to_string();
+    let reply = if ttl_ms > 0 {
+        remote_cmd(&[b"SET", key.as_bytes(), val, b"PX", ms.as_bytes()])
+    } else {
+        remote_cmd(&[b"SET", key.as_bytes(), val])
+    };
+    i32::from(matches!(reply, Some(RespFrame::Simple(_))))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_set_nx(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `val` points to `val_len` bytes of PHP string data.
+    let val = unsafe { bytes_arg(val, val_len) };
+    let ms = ttl_ms.to_string();
+    // `SET key val NX [PX ms]` → +OK inserted, nil already present. The
+    // owner-unreachable (-1) outcome the local op can report is a cluster
+    // internal the server resolves before replying, so the wire only ever
+    // sees inserted/not-inserted.
+    let reply = if ttl_ms > 0 {
+        remote_cmd(&[b"SET", key.as_bytes(), val, b"NX", b"PX", ms.as_bytes()])
+    } else {
+        remote_cmd(&[b"SET", key.as_bytes(), val, b"NX"])
+    };
+    i32::from(matches!(reply, Some(RespFrame::Simple(_))))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_del(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_long {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"DEL", key.as_bytes()]) {
+        Some(RespFrame::Integer(n)) => std::os::raw::c_long::try_from(n).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_del_if_eq(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    token: *const std::os::raw::c_char,
+    token_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `token` points to `token_len` bytes of PHP string data.
+    let token = unsafe { bytes_arg(token, token_len) };
+    i32::from(remote_cmd(&[b"DELIFEQ", key.as_bytes(), token]) == Some(RespFrame::Integer(1)))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_exists(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"EXISTS", key.as_bytes()]) {
+        Some(RespFrame::Integer(n)) => i32::from(n > 0),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_incr_by(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    delta: std::os::raw::c_longlong,
+    result: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    let d = delta.to_string();
+    match remote_cmd(&[b"INCRBY", key.as_bytes(), d.as_bytes()]) {
+        Some(RespFrame::Integer(v)) => {
+            // Safety: `result` points to a `long long` local in our C code.
+            unsafe { *result = v };
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_expire(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Non-positive is refused locally without a round trip; match that.
+    if ttl_ms <= 0 {
+        return 0;
+    }
+    let ms = ttl_ms.to_string();
+    i32::from(
+        remote_cmd(&[b"PEXPIRE", key.as_bytes(), ms.as_bytes()]) == Some(RespFrame::Integer(1)),
+    )
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_pttl(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -2);
+    match remote_cmd(&[b"PTTL", key.as_bytes()]) {
+        Some(RespFrame::Integer(ms)) => ms,
+        _ => -2,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_flush_all() -> std::os::raw::c_int {
+    i32::from(matches!(remote_cmd(&[b"FLUSHDB"]), Some(RespFrame::Simple(_))))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_wait(
+    _key: *const std::os::raw::c_char,
+    _key_len: usize,
+    _last_version: std::os::raw::c_longlong,
+    _timeout_ms: std::os::raw::c_longlong,
+    _new_version: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    // No RESP equivalent: ephpm_kv_wait() is an in-process versioned wait for
+    // request-scoped coordination, not a cron primitive. Report a timeout (the
+    // documented "nothing changed" answer) rather than inventing a result.
+    0
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_getdel(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"GETDEL", key.as_bytes()]) {
+        Some(RespFrame::Bulk(b)) => i32::from(stage_value(b.as_ref())),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_getex(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    let ms = ttl_ms.to_string();
+    let reply = if ttl_ms > 0 {
+        remote_cmd(&[b"GETEX", key.as_bytes(), b"PX", ms.as_bytes()])
+    } else if ttl_ms == 0 {
+        remote_cmd(&[b"GETEX", key.as_bytes(), b"PERSIST"])
+    } else {
+        return 0;
+    };
+    match reply {
+        Some(RespFrame::Bulk(b)) => i32::from(stage_value(b.as_ref())),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_persist(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    i32::from(remote_cmd(&[b"PERSIST", key.as_bytes()]) == Some(RespFrame::Integer(1)))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_set_if_eq(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    expected: *const std::os::raw::c_char,
+    expected_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: both point to their lengths of PHP string data.
+    let (expected, val) = unsafe { (bytes_arg(expected, expected_len), bytes_arg(val, val_len)) };
+    let ms = ttl_ms.to_string();
+    // `SET key val IFEQ expected [KEEPTTL | PX ms]`; ttl_ms: -1 keep, 0 none, >0 set.
+    let reply = match ttl_ms {
+        -1 => remote_cmd(&[b"SET", key.as_bytes(), val, b"IFEQ", expected, b"KEEPTTL"]),
+        0 => remote_cmd(&[b"SET", key.as_bytes(), val, b"IFEQ", expected]),
+        ms_val if ms_val > 0 => {
+            remote_cmd(&[b"SET", key.as_bytes(), val, b"IFEQ", expected, b"PX", ms.as_bytes()])
+        }
+        _ => return 0,
+    };
+    i32::from(matches!(reply, Some(RespFrame::Simple(_))))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_append(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -1);
+    // Safety: `val` points to `val_len` bytes of PHP string data.
+    let val = unsafe { bytes_arg(val, val_len) };
+    match remote_cmd(&[b"APPEND", key.as_bytes(), val]) {
+        Some(RespFrame::Integer(n)) => n,
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_strlen(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"STRLEN", key.as_bytes()]) {
+        Some(RespFrame::Integer(n)) => n,
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_key_type(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"TYPE", key.as_bytes()]) {
+        Some(RespFrame::Simple(s)) => match s.as_str() {
+            "string" => 1,
+            "hash" => 2,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_scan(
+    cursor: std::os::raw::c_ulonglong,
+    pattern: *const std::os::raw::c_char,
+    pattern_len: usize,
+    count: std::os::raw::c_longlong,
+    next: *mut std::os::raw::c_ulonglong,
+) -> std::os::raw::c_longlong {
+    if remote_client().is_none() {
+        return -1;
+    }
+    let cursor_s = cursor.to_string();
+    let count_s = count.max(1).to_string();
+    let mut args: Vec<&[u8]> = vec![b"SCAN", cursor_s.as_bytes()];
+    // Safety: `pattern` points to `pattern_len` bytes of PHP string data.
+    let pattern = if pattern.is_null() {
+        None
+    } else {
+        match unsafe { key_arg(pattern, pattern_len) } {
+            Some(p) => Some(p),
+            None => return -1,
+        }
+    };
+    if let Some(p) = pattern {
+        args.push(b"MATCH");
+        args.push(p.as_bytes());
+    }
+    args.push(b"COUNT");
+    args.push(count_s.as_bytes());
+
+    let Some(RespFrame::Array(items)) = remote_cmd(&args) else {
+        return -1;
+    };
+    // SCAN replies `[next-cursor, [keys...]]`.
+    let (Some(RespFrame::Bulk(cur)), Some(RespFrame::Array(keys))) = (items.first(), items.get(1))
+    else {
+        return -1;
+    };
+    let Ok(next_cursor) = std::str::from_utf8(cur.as_ref()).unwrap_or("").parse::<u64>() else {
+        return -1;
+    };
+    let staged = stage_list(keys.iter().map(|f| match f {
+        RespFrame::Bulk(b) => Some(b.clone()),
+        _ => None,
+    }));
+    if staged >= 0 {
+        // Safety: `next` points to an `unsigned long long` local in our C code.
+        unsafe { *next = next_cursor };
+    }
+    staged
+}
+
+// ── Remote hashes ────────────────────────────────────────────────────────
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hget(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    match remote_cmd(&[b"HGET", key.as_bytes(), field.as_bytes()]) {
+        Some(RespFrame::Bulk(b)) => i32::from(stage_value(b.as_ref())),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+#[allow(clippy::too_many_arguments, reason = "a C ABI: parallel arrays plus an out-pointer")]
+unsafe extern "C" fn remote_kv_hset(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    vals: *const *const std::os::raw::c_char,
+    val_lens: *const usize,
+    n: usize,
+    added: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: the C side passes `n` entries in each array, each covering its
+    // length, valid for this call.
+    let (Some(fields), Some(vals)) =
+        (unsafe { str_list(fields, field_lens, n) }, unsafe { bytes_list(vals, val_lens, n) })
+    else {
+        return 0;
+    };
+    let mut args: Vec<&[u8]> = vec![b"HSET", key.as_bytes()];
+    for (f, v) in fields.iter().zip(&vals) {
+        args.push(f.as_bytes());
+        args.push(v);
+    }
+    match remote_cmd(&args) {
+        Some(RespFrame::Integer(count)) => {
+            // Safety: `added` points to a `long long` local in our C code.
+            unsafe { *added = count };
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hsetnx(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `field`/`val` point to their lengths of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    let val = unsafe { bytes_arg(val, val_len) };
+    i32::from(
+        remote_cmd(&[b"HSETNX", key.as_bytes(), field.as_bytes(), val])
+            == Some(RespFrame::Integer(1)),
+    )
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hmget(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -1);
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return -1;
+    };
+    let mut args: Vec<&[u8]> = vec![b"HMGET", key.as_bytes()];
+    for f in &fields {
+        args.push(f.as_bytes());
+    }
+    match remote_cmd(&args) {
+        Some(RespFrame::Array(items)) => stage_frames(&items),
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hgetall(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -1);
+    match remote_cmd(&[b"HGETALL", key.as_bytes()]) {
+        Some(RespFrame::Array(items)) => stage_frames(&items),
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hkeys_vals(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    which: std::os::raw::c_int,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -1);
+    let cmd: &[u8] = if which == 0 { b"HKEYS" } else { b"HVALS" };
+    match remote_cmd(&[cmd, key.as_bytes()]) {
+        Some(RespFrame::Array(items)) => stage_frames(&items),
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hdel(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return 0;
+    };
+    let mut args: Vec<&[u8]> = vec![b"HDEL", key.as_bytes()];
+    for f in &fields {
+        args.push(f.as_bytes());
+    }
+    match remote_cmd(&args) {
+        Some(RespFrame::Integer(removed)) => removed,
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hexists(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    i32::from(
+        remote_cmd(&[b"HEXISTS", key.as_bytes(), field.as_bytes()]) == Some(RespFrame::Integer(1)),
+    )
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hlen(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    match remote_cmd(&[b"HLEN", key.as_bytes()]) {
+        Some(RespFrame::Integer(n)) => n,
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hincr_by(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+    delta: std::os::raw::c_longlong,
+    result: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    let d = delta.to_string();
+    match remote_cmd(&[b"HINCRBY", key.as_bytes(), field.as_bytes(), d.as_bytes()]) {
+        Some(RespFrame::Integer(v)) => {
+            // Safety: `result` points to a `long long` local in our C code.
+            unsafe { *result = v };
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hexpire(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    fields: *const *const std::os::raw::c_char,
+    field_lens: *const usize,
+    n: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -1);
+    if ttl_ms <= 0 {
+        return -1;
+    }
+    // Safety: `n` entries per array, each covering its length.
+    let Some(fields) = (unsafe { str_list(fields, field_lens, n) }) else {
+        return -1;
+    };
+    let ms = ttl_ms.to_string();
+    let n_s = n.to_string();
+    // `HPEXPIRE key ms FIELDS n f1 f2 ...` → array of per-field codes.
+    let mut args: Vec<&[u8]> =
+        vec![b"HPEXPIRE", key.as_bytes(), ms.as_bytes(), b"FIELDS", n_s.as_bytes()];
+    for f in &fields {
+        args.push(f.as_bytes());
+    }
+    match remote_cmd(&args) {
+        Some(RespFrame::Array(codes)) => {
+            let set = codes
+                .iter()
+                .filter(|c| **c == RespFrame::Integer(ephpm_kv::store::field_code::UPDATED))
+                .count();
+            std::os::raw::c_longlong::try_from(set).unwrap_or(i64::MAX)
+        }
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hpttl(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_longlong {
+    let (_client, key) = remote_store_and_key!(key, key_len, -2);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return -2;
+    };
+    // `HPTTL key FIELDS 1 field` → single-element array.
+    match remote_cmd(&[b"HPTTL", key.as_bytes(), b"FIELDS", b"1", field.as_bytes()]) {
+        Some(RespFrame::Array(codes)) => match codes.first() {
+            Some(RespFrame::Integer(ms)) => *ms,
+            _ => -2,
+        },
+        _ => -2,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_hpersist(
+    key: *const std::os::raw::c_char,
+    key_len: usize,
+    field: *const std::os::raw::c_char,
+    field_len: usize,
+) -> std::os::raw::c_int {
+    let (_client, key) = remote_store_and_key!(key, key_len, 0);
+    // Safety: `field` points to `field_len` bytes of PHP string data.
+    let Some(field) = (unsafe { key_arg(field, field_len) }) else {
+        return 0;
+    };
+    match remote_cmd(&[b"HPERSIST", key.as_bytes(), b"FIELDS", b"1", field.as_bytes()]) {
+        Some(RespFrame::Array(codes)) => i32::from(
+            codes.first() == Some(&RespFrame::Integer(ephpm_kv::store::field_code::UPDATED)),
+        ),
+        _ => 0,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_mget(
+    keys: *const *const std::os::raw::c_char,
+    key_lens: *const usize,
+    n: usize,
+) -> std::os::raw::c_longlong {
+    if remote_client().is_none() {
+        return -1;
+    }
+    // Safety: `n` entries per array, each covering its length.
+    let Some(keys) = (unsafe { str_list(keys, key_lens, n) }) else {
+        return -1;
+    };
+    let mut args: Vec<&[u8]> = vec![b"MGET"];
+    for k in &keys {
+        args.push(k.as_bytes());
+    }
+    match remote_cmd(&args) {
+        Some(RespFrame::Array(items)) => stage_frames(&items),
+        _ => -1,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn remote_kv_mset(
+    keys: *const *const std::os::raw::c_char,
+    key_lens: *const usize,
+    vals: *const *const std::os::raw::c_char,
+    val_lens: *const usize,
+    n: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    if remote_client().is_none() {
+        return 0;
+    }
+    // Safety: `n` entries per array, each covering its length.
+    let (Some(keys), Some(vals)) =
+        (unsafe { str_list(keys, key_lens, n) }, unsafe { bytes_list(vals, val_lens, n) })
+    else {
+        return 0;
+    };
+    if ttl_ms > 0 {
+        // MSET has no TTL; match the local loop (per-pair SET, non-atomic).
+        let ms = ttl_ms.to_string();
+        for (k, v) in keys.iter().zip(&vals) {
+            if !matches!(
+                remote_cmd(&[b"SET", k.as_bytes(), v, b"PX", ms.as_bytes()]),
+                Some(RespFrame::Simple(_))
+            ) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    let mut args: Vec<&[u8]> = vec![b"MSET"];
+    for (k, v) in keys.iter().zip(&vals) {
+        args.push(k.as_bytes());
+        args.push(v);
+    }
+    i32::from(matches!(remote_cmd(&args), Some(RespFrame::Simple(_))))
+}
+
+/// Stage an array of RESP reply frames as this thread's list result: a `Bulk`
+/// becomes a present item, anything else (a `Null`) a null item. Returns the
+/// item count, or `-1` when the staging buffer is gone (thread teardown).
+#[cfg(php_linked)]
+fn stage_frames(items: &[RespFrame]) -> std::os::raw::c_longlong {
+    stage_list(items.iter().map(|f| match f {
+        RespFrame::Bulk(b) => Some(b.clone()),
+        _ => None,
+    }))
+}
+
+/// The remote (CLI wire) ops table. Store-touching callbacks forward to the
+/// running server over RESP; the three buffer-reading callbacks
+/// (`get_result`, `list_item`, `site_context`) are shared with [`KV_OPS`]
+/// unchanged, since they read only the thread-local staging buffers this
+/// module's remote ops fill exactly as the local ops do.
+#[cfg(php_linked)]
+pub static REMOTE_KV_OPS: EphpmKvOps = EphpmKvOps {
+    get: Some(remote_kv_get),
+    get_result: Some(kv_get_result),
+    set: Some(remote_kv_set),
+    set_nx: Some(remote_kv_set_nx),
+    del: Some(remote_kv_del),
+    exists: Some(remote_kv_exists),
+    incr_by: Some(remote_kv_incr_by),
+    expire: Some(remote_kv_expire),
+    pttl: Some(remote_kv_pttl),
+    flush_all: Some(remote_kv_flush_all),
+    wait: Some(remote_kv_wait),
+    del_if_eq: Some(remote_kv_del_if_eq),
+    site_context: Some(kv_site_context),
+    list_item: Some(kv_list_item),
+    hget: Some(remote_kv_hget),
+    hset: Some(remote_kv_hset),
+    hsetnx: Some(remote_kv_hsetnx),
+    hmget: Some(remote_kv_hmget),
+    hgetall: Some(remote_kv_hgetall),
+    hkeys_vals: Some(remote_kv_hkeys_vals),
+    hdel: Some(remote_kv_hdel),
+    hexists: Some(remote_kv_hexists),
+    hlen: Some(remote_kv_hlen),
+    hincr_by: Some(remote_kv_hincr_by),
+    hexpire: Some(remote_kv_hexpire),
+    hpttl: Some(remote_kv_hpttl),
+    hpersist: Some(remote_kv_hpersist),
+    mget: Some(remote_kv_mget),
+    mset: Some(remote_kv_mset),
+    getdel: Some(remote_kv_getdel),
+    getex: Some(remote_kv_getex),
+    persist: Some(remote_kv_persist),
+    set_if_eq: Some(remote_kv_set_if_eq),
+    append: Some(remote_kv_append),
+    str_len: Some(remote_kv_strlen),
+    key_type: Some(remote_kv_key_type),
+    scan: Some(remote_kv_scan),
+};
+
+/// Install the remote KV client backing the wire ops table. First call wins
+/// (mirrors [`set_store`]); returns whether this call installed it.
+#[cfg(php_linked)]
+pub fn set_remote_store(client: crate::kv_remote::RemoteKvClient) -> bool {
+    let installed = REMOTE_KV.set(client).is_ok();
+    if installed {
+        tracing::debug!("remote KV client registered for PHP native functions");
+    }
+    installed
+}
+
+/// Stub `set_remote_store` when PHP is not linked.
+#[cfg(not(php_linked))]
+pub fn set_remote_store(_client: crate::kv_remote::RemoteKvClient) -> bool {
+    // No-op in stub mode; the client simply isn't wired to any PHP functions.
+    false
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 //
 // These tests exercise the Rust callback layer (`kv_get`, `kv_set`, etc.)

@@ -19,6 +19,7 @@ mod handoff_gate;
 pub mod http3;
 mod idle;
 pub mod internal_access;
+pub mod internal_kv;
 pub mod kv_snapshot;
 pub mod metrics;
 pub mod metrics_listener;
@@ -148,6 +149,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
 
     // Start background services.
     let (kv_store, multi_tenant_kv, _kv_handle) = start_kv_service(&config)?;
+
+    // Internal loopback KV endpoint for the `ephpm php --site` CLI wire (#700).
+    // Bound only when multi-tenant with `[kv] secret` (the same bar as the DB
+    // CLI wire); held for the whole server lifetime so its discovery file is
+    // removed on graceful shutdown.
+    let _internal_kv_endpoint = internal_kv::start(&config, &kv_store, multi_tenant_kv.as_ref());
 
     // Wire the KV store into the middleware host table (a no-op when no
     // middleware is mounted), then load the chain — fail fast at startup on

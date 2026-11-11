@@ -128,17 +128,31 @@ in `/etc/ephpm`. The sandbox denies that directory on purpose, so the inner
 [`ephpm exec` → Database access](../exec/#database-access). Run
 `ephpm php --site` as the operator instead.
 
-## No KV store under `ephpm php`
+## The KV store under `ephpm php`
 
-`ephpm php` runs PHP without starting the server, so there is no KV store behind
-the [`ephpm_kv_*` functions](/guides/kv-from-php/) (`--site` binds the database
-bridge only). The functions are defined, but every call returns its failure
-value (`null` / `false` / `0` / `-2`) and the first call in the process emits an
-`E_WARNING` saying no KV store is attached. `session.save_handler = ephpm` is
-backed by the same store, so under `ephpm php` it starts every session empty and
-persists nothing (it does not emit that warning). To
-read or write a running server's KV from a script, connect to its RESP listener
-(`[kv.redis_compat]`) with a Redis client, or use [`ephpm kv`](../kv/).
+How the [`ephpm_kv_*` functions](/guides/kv-from-php/) behave depends on whether
+you pass `--site` **and** a server is running:
+
+- **`ephpm php --site <key> --config <path>`, with a server running** (new in
+  0.16.0, experimental): the CLI attaches `ephpm_kv_*` to that **running
+  server's live KV** over a loopback wire, so a cron script reads and writes the
+  server's per-vhost KV and its writes replicate across the cluster. Needs the
+  same `[kv] secret` as the server (the same bar as the database wire); it does
+  **not** need `[kv.redis_compat]` enabled. See
+  [Cron & scheduled scripts → Reaching the server's KV](/guides/cron-and-scheduled-scripts/#reaching-the-servers-kv-cache-warmers-nightly-rebuilds).
+- **Plain `ephpm php`, or no server running**: there is no KV to attach to. The
+  functions are defined, but every call returns its failure value (`null` /
+  `false` / `0` / `-2`) and the first call in the process emits an `E_WARNING`
+  saying no KV store is attached. `session.save_handler = ephpm` is backed by
+  the same store, so it starts every session empty and persists nothing (no
+  warning).
+
+Because the functions always **exist** (`function_exists('ephpm_kv_get')` is
+always true), a script that needs to branch should call **`ephpm_kv_attached():
+bool`** — it reports whether a store or wire endpoint is actually wired in, and
+unlike a KV op it emits no warning. An operator can also reach a running
+server's KV out of band through its RESP listener (`[kv.redis_compat]`) with a
+Redis client or [`ephpm kv`](../kv/).
 
 ## Drop-in for the stock `php` CLI
 

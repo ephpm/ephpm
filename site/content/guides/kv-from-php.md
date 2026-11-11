@@ -55,6 +55,7 @@ ephpm_kv_flush_all();                          // empties this site's store (see
 
 | Function | Returns | Notes |
 |---|---|---|
+| `ephpm_kv_attached()` | `bool` | `true` when a KV store is actually wired behind these functions — an in-process store under `ephpm serve`, or the running server's loopback endpoint under `ephpm php --site`. The `ephpm_kv_*` functions always exist, so this is the correct availability probe (not `function_exists`). *v0.16+* |
 | `ephpm_kv_get(string $key)` | `?string` | `null` on a miss. |
 | `ephpm_kv_set(string $key, string $value, int $ttl = 0)` | `bool` | `$ttl` in seconds; `0` or negative means no expiry. |
 | `ephpm_kv_setnx(string $key, string $value, int $ttl = 0)` | `bool` | `true` only if the key did not exist (atomic; in a cluster decided by the key's owner node, see [Locks in a cluster](#locks-in-a-cluster)). Same `$ttl` rules as `set`. |

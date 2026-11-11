@@ -8,6 +8,7 @@ pub mod db_bridge;
 pub mod handoff;
 pub mod jit_metrics;
 pub mod kv_bridge;
+pub mod kv_remote;
 pub mod opcode;
 pub mod request;
 pub mod response;
@@ -2475,6 +2476,38 @@ impl PhpRuntime {
         #[cfg(not(php_linked))]
         if registered {
             tracing::debug!("remote db wire backend registered (stub mode, no PHP wiring)");
+        }
+    }
+
+    /// Register a remote KV client backing the PHP native `ephpm_kv_*`
+    /// functions — the `ephpm php --site` CLI KV wire (issue #700).
+    ///
+    /// Unlike [`Self::set_kv_store`] (a local [`ephpm_kv::store::Store`] the
+    /// bridge reads directly), a remote client forwards each op over RESP to a
+    /// running server's internal KV endpoint, so an out-of-band CLI/cron script
+    /// reads and writes the *server's* live KV — and its writes replicate across
+    /// the cluster through the server's own store. Used only by the CLI when it
+    /// detects a running server; the server itself never installs a remote
+    /// client. Mutually exclusive with `set_kv_store` — first registration
+    /// wins.
+    ///
+    /// In stub mode (no `php_linked`) this is a no-op (the client is dropped).
+    pub fn set_remote_kv_ops(client: kv_remote::RemoteKvClient) {
+        #[cfg(php_linked)]
+        {
+            if kv_bridge::set_remote_store(client) {
+                // Safety: REMOTE_KV_OPS is a static with a stable address.
+                // ephpm_set_kv_ops copies the struct into the C global — the
+                // pointer only needs to be valid for the duration of this call.
+                unsafe { ffi::ephpm_set_kv_ops(&kv_bridge::REMOTE_KV_OPS) };
+                tracing::info!("remote KV wire client wired to PHP native functions");
+            }
+        }
+
+        #[cfg(not(php_linked))]
+        {
+            let _ = client;
+            tracing::debug!("remote KV wire client registered (stub mode, no PHP wiring)");
         }
     }
 

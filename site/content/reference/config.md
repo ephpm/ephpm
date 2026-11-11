@@ -1201,6 +1201,25 @@ Notable gaps, all deliberate:
 | `max_input_buffer` | usize (bytes) | `1048576` (1 MiB) | Per-connection input buffer cap (like Redis `client-query-buffer-limit`). Not counted against `[kv] memory_limit`. |
 | `idle_timeout_secs` | u64 | `300` | Close RESP connections idle this long, freeing their buffers. `0` = never. |
 
+#### Internal loopback KV endpoint (CLI wire)
+
+Independently of `[kv.redis_compat]`, a server running in multi-tenant mode
+(`[server] sites_dir`) with `[kv] secret` set binds a **second, always-on RESP
+listener on an ephemeral loopback port** for the co-located
+[`ephpm php --site`](/reference/cli/php/#the-kv-store-under-ephpm-php) CLI (the
+KV wire, new in 0.16.0, experimental). It reuses the same per-site `AUTH` and
+the same per-vhost stores as the public listener, so a CLI write lands in — and
+replicates from — the exact keyspace a request reaches. It is **not**
+configurable and has no bearing on `[kv.redis_compat]` (which stays off by
+default): it exists only so the CLI KV wire works whenever the database CLI wire
+does. The server advertises its ephemeral port in a runtime file at
+`<temp-dir>/ephpm-kv-endpoint-<hash>.json` (`<hash>` derived from the canonical
+`sites_dir`, created `0600` on Unix), written at startup and removed on
+graceful shutdown; the CLI, which has the same `--config`, derives the same path
+and probes the port before using it, so a stale file is harmless. Loopback only;
+same trust boundary as `[kv] secret` (whoever can read the config can
+impersonate any tenant).
+
 ### `[kv.snapshot]`
 
 Warm-restart snapshots: an encrypted copy of every live key (default store and every per-site store) written at graceful shutdown and loaded at the next start, so a restarted node serves warm instead of cold. **A cache warm-up, not durability** — nothing is written between snapshots, and a snapshot that does not verify is ignored (cold start). Design and format: [KV snapshots](/architecture/kv-snapshots/); setup: [Warm restarts](/guides/kv-warm-restart/).
