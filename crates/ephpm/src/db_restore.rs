@@ -7,10 +7,12 @@
 //!
 //! 1. Resolve the target the way `db import` / `db query` do (`--site`
 //!    validated fail-closed; single-node mode's one database is `default`).
-//! 2. Pick the object: the newest under `<prefix>/<site>/` with a timestamp
-//!    at or before `--at` (default: the newest), or a local `.db` /
-//!    `.db.gz`. Print the choice and the target, and require `--yes` or a
-//!    TTY confirmation before touching anything.
+//! 2. Pick the object: from a backup store (an `s3://bucket[/prefix]` URL, a
+//!    local backup **directory**, or the configured `[db.sqlite.backup]`
+//!    destination), the newest under `<prefix>/<site>/` with a timestamp at or
+//!    before `--at` (default: the newest); or a single local `.db` / `.db.gz`
+//!    **file** named directly. Print the choice and the target, and require
+//!    `--yes` or a TTY confirmation before touching anything.
 //! 3. **Offline only.** Refuse while a server holds the file: the MySQL
 //!    listener (`[db.sqlite.proxy] mysql_listen`) and the HTTP listener
 //!    (`[server] listen`) are both probed, so a bridge-only server with the
@@ -30,8 +32,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, bail};
 use ephpm_config::Config;
+use ephpm_server::backup_store::{BackupStore, LocalBackupStore};
 use ephpm_server::db_backup::{self, BackupObject};
-use ephpm_server::s3::{S3Client, S3Location};
+use ephpm_server::s3::S3Location;
 use ephpm_server::{EmbeddedSqliteMode, embedded_sqlite_mode};
 
 use crate::site_db;
@@ -43,8 +46,10 @@ pub struct RestoreRequest {
     pub site: String,
     /// The config file.
     pub config: PathBuf,
-    /// `s3://bucket[/prefix]`, or a local `.db` / `.db.gz` file.
-    pub from: String,
+    /// `s3://bucket[/prefix]`, a local backup **directory**, or a local `.db`
+    /// / `.db.gz` **file**. `None` uses the configured `[db.sqlite.backup]`
+    /// destination (S3 bucket or local `dir`).
+    pub from: Option<String>,
     /// Restore the newest object at or before this time.
     pub at: Option<String>,
     /// Skip the confirmation.
@@ -103,7 +108,10 @@ enum ClusterRestoreKind {
 
 /// What `--from` resolved to.
 enum Source {
-    Object { client: S3Client, object: BackupObject },
+    /// A backup store (S3 bucket or local directory): the newest object at or
+    /// before `--at` was selected from it.
+    Object { client: BackupStore, object: BackupObject },
+    /// A single local `.db` / `.db.gz` file named directly.
     Local { path: PathBuf, gzip: bool },
 }
 
@@ -166,23 +174,33 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
     }
 }
 
-/// Resolve `from` to an object (newest at or before `at`) or a local file.
+/// Resolve `from` to an object (newest at or before `at`) in a backup store,
+/// or a single local file. `None` uses the configured destination.
+///
+/// `--from` resolves, in order: a plain local **file** (`.db`/`.db.gz`, the
+/// direct-install path); an `s3://bucket[/prefix]` URL; a local **directory**
+/// (a `BackupStore::Local` rooted there, listed like the s3:// path). With no
+/// `--from`, the configured `[db.sqlite.backup]` destination (S3 bucket or
+/// local `dir`) is used.
 fn resolve_source(
     config: &Config,
     site: &str,
-    from: &str,
+    from: Option<&str>,
     at: Option<&str>,
     rt: &tokio::runtime::Runtime,
 ) -> anyhow::Result<Source> {
-    if !from.starts_with("s3://") {
+    // A single local file named directly (not an s3:// URL and an existing
+    // regular file) is installed verbatim — the original `--from <file>` path.
+    if let Some(from) = from
+        && !from.starts_with("s3://")
+        && PathBuf::from(from).is_file()
+    {
         let path = PathBuf::from(from);
-        anyhow::ensure!(path.is_file(), "{from}: no such file");
-        anyhow::ensure!(at.is_none(), "--at only applies to an s3:// source");
+        anyhow::ensure!(at.is_none(), "--at only applies to a store (s3:// or a directory) source");
         let gzip = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
         return Ok(Source::Local { path, gzip });
     }
-    let (bucket, prefix) = S3Location::parse_url(from)?;
-    let client = db_backup::object_client_for_bucket(config, bucket)?;
+    let (client, prefix) = resolve_store(config, from)?;
     let at = match at {
         Some(s) => Some(db_backup::parse_timestamp(s).with_context(|| {
             format!(
@@ -192,26 +210,54 @@ fn resolve_source(
         })?),
         None => None,
     };
+    let location = client.dir_uri(&db_backup::site_prefix(&prefix, site));
     let objects = rt
         .block_on(db_backup::list_site_backups(&client, &prefix, site))
-        .with_context(|| format!("listing {from}/{site}/"))?;
+        .with_context(|| format!("listing {location}"))?;
     let object =
         db_backup::select_at_or_before(&objects, at).cloned().with_context(|| match at {
             Some(at) => format!(
-                "no backup of site {site:?} at or before {} under {}/{site}/ ({} objects, the \
+                "no backup of site {site:?} at or before {} under {location} ({} objects, the \
                  oldest is {})",
                 db_backup::format_rfc3339(at),
-                from.trim_end_matches('/'),
                 objects.len(),
                 objects
                     .first()
                     .map_or_else(|| "none".to_string(), |o| db_backup::format_rfc3339(o.timestamp)),
             ),
-            None => {
-                format!("no backup of site {site:?} under {}/{site}/", from.trim_end_matches('/'))
-            }
+            None => format!("no backup of site {site:?} under {location}"),
         })?;
     Ok(Source::Object { client, object })
+}
+
+/// Resolve `from` to a backup store + key prefix: `s3://bucket[/prefix]`, a
+/// local directory, or (with `None`) the configured `[db.sqlite.backup]`
+/// destination. The prefix under a local directory is the configured `s3_path`
+/// (default `ephpm/db`), so objects are found at `<dir>/<prefix>/<site>/…`.
+fn resolve_store(config: &Config, from: Option<&str>) -> anyhow::Result<(BackupStore, String)> {
+    match from {
+        None => db_backup::object_client_from_config(config).context(
+            "pass --from (s3://bucket/prefix, a local backup directory, or a .db/.db.gz file), \
+             or configure [db.sqlite.backup]",
+        ),
+        Some(from) if from.starts_with("s3://") => {
+            let (bucket, prefix) = S3Location::parse_url(from)?;
+            Ok((BackupStore::S3(db_backup::object_client_for_bucket(config, bucket)?), prefix))
+        }
+        Some(from) => {
+            let path = PathBuf::from(from);
+            anyhow::ensure!(
+                path.is_dir(),
+                "{from}: not an s3:// URL, an existing local directory, or a backup file"
+            );
+            let prefix = config
+                .db
+                .sqlite
+                .as_ref()
+                .map_or_else(|| "ephpm/db".to_string(), |s| s.backup.prefix());
+            Ok((BackupStore::Local(LocalBackupStore::new(path)), prefix))
+        }
+    }
 }
 
 /// `Some(addr)` when something accepts a TCP connection at `listen`
@@ -289,13 +335,12 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
     let config = load_config(&req.config)?;
     let target = resolve_target(&config, &req.site)?;
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-    let source = resolve_source(&config, &target.key, &req.from, req.at.as_deref(), &rt)?;
+    let source = resolve_source(&config, &target.key, req.from.as_deref(), req.at.as_deref(), &rt)?;
 
     let description = match &source {
         Source::Object { client, object } => format!(
-            "s3://{}/{} (taken {}, {} bytes compressed)",
-            client.location().bucket,
-            object.key,
+            "{} (taken {}, {} bytes compressed)",
+            client.object_uri(&object.key),
             db_backup::format_rfc3339(object.timestamp),
             object.size
         ),
@@ -456,19 +501,8 @@ pub fn run_list(req: &ListRequest) -> anyhow::Result<ExitCode> {
     let config = load_config(&req.config)?;
     let target = resolve_target(&config, &req.site)?;
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-    let (client, prefix) = match &req.from {
-        Some(from) => {
-            let (bucket, prefix) = S3Location::parse_url(from)?;
-            (db_backup::object_client_for_bucket(&config, bucket)?, prefix)
-        }
-        None => db_backup::object_client_from_config(&config)
-            .context("pass --from s3://bucket/prefix, or enable [db.sqlite.backup]")?,
-    };
-    let location = format!(
-        "s3://{}/{}/",
-        client.location().bucket,
-        db_backup::site_prefix(&prefix, &target.key)
-    );
+    let (client, prefix) = resolve_store(&config, req.from.as_deref())?;
+    let location = client.dir_uri(&db_backup::site_prefix(&prefix, &target.key));
     let objects = rt
         .block_on(db_backup::list_site_backups(&client, &prefix, &target.key))
         .with_context(|| format!("listing {location}"))?;
@@ -616,16 +650,83 @@ mod tests {
         let file = tmp.path().join("x.db.gz");
         fs::write(&file, b"not really gzip").unwrap();
         let from = file.to_string_lossy().into_owned();
-        match resolve_source(&config, "shop", &from, None, &rt).unwrap() {
+        match resolve_source(&config, "shop", Some(&from), None, &rt).unwrap() {
             Source::Local { path, gzip } => {
                 assert_eq!(path, file);
                 assert!(gzip);
             }
             Source::Object { .. } => panic!("local"),
         }
-        assert!(resolve_source(&config, "shop", &from, Some("2026-01-01"), &rt).is_err());
+        assert!(resolve_source(&config, "shop", Some(&from), Some("2026-01-01"), &rt).is_err());
+        // A non-existent path that is neither a file nor a directory is refused.
         let missing = tmp.path().join("nope.db").to_string_lossy().into_owned();
-        assert!(resolve_source(&config, "shop", &missing, None, &rt).is_err());
+        assert!(resolve_source(&config, "shop", Some(&missing), None, &rt).is_err());
+    }
+
+    /// A local backup **directory** as `--from` lists and selects objects just
+    /// like the s3:// path: a snapshot written under `<dir>/<prefix>/<site>/`
+    /// is found, newest-at-or-before honoured, and installed over the site file.
+    #[test]
+    fn restore_from_a_local_directory() {
+        let (config, tmp) = per_site_config();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // A real snapshot, gzipped, placed at the store's key for `shop`.
+        let source = tmp.path().join("source.db");
+        rt.block_on(async {
+            let db = litewire::Turso::open(source.to_str().unwrap()).await.unwrap();
+            let conn = db.raw_connection().unwrap();
+            conn.execute("CREATE TABLE t (v TEXT)", ()).await.unwrap();
+            conn.execute("INSERT INTO t VALUES ('from a dir')", ()).await.unwrap();
+        });
+        let snap = tmp.path().join("snap.db");
+        rt.block_on(db_backup::snapshot_into(&source, &snap)).unwrap();
+        let gz = tmp.path().join("snap.db.gz");
+        db_backup::gzip_file(&snap, &gz).unwrap();
+
+        // Lay it down under <backup_dir>/ephpm/db/shop/<ts>.db.gz (the default
+        // prefix), the same shape the server writes.
+        let backup_dir = tmp.path().join("backups");
+        let key = db_backup::object_key("ephpm/db", "shop", 1_700_000_000);
+        let dest = backup_dir.join(&key);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(&gz, &dest).unwrap();
+
+        // resolve_source finds it via the directory.
+        let from = backup_dir.to_string_lossy().into_owned();
+        match resolve_source(&config, "shop", Some(&from), None, &rt).unwrap() {
+            Source::Object { object, .. } => assert_eq!(object.key, key),
+            Source::Local { .. } => panic!("a directory resolves to a store, not a single file"),
+        }
+
+        // And a full restore installs it.
+        let live = tmp.path().join("db").join("shop.db");
+        let cfg = fs::read_to_string(tmp.path().join("ephpm.toml")).unwrap();
+        let free = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        fs::write(
+            tmp.path().join("ephpm.toml"),
+            cfg.replace("[server]\n", &format!("[server]\nlisten = \"127.0.0.1:{}\"\n", free()))
+                + &format!("[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:{}\"\n", free()),
+        )
+        .unwrap();
+        let req = RestoreRequest {
+            site: "shop".into(),
+            config: tmp.path().join("ephpm.toml"),
+            from: Some(from),
+            at: None,
+            yes: true,
+        };
+        assert_eq!(run_restore(&req).unwrap(), ExitCode::SUCCESS);
+        rt.block_on(async {
+            let db = litewire::Turso::open(live.to_str().unwrap()).await.unwrap();
+            let conn = db.raw_connection().unwrap();
+            let mut rows = conn.query("SELECT v FROM t", ()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the restored row");
+            assert_eq!(format!("{:?}", row.get_value(0).unwrap()), "Text(\"from a dir\")");
+        });
     }
 
     /// End to end on a local artifact: a real `VACUUM INTO` snapshot,
@@ -658,7 +759,7 @@ mod tests {
         let req = RestoreRequest {
             site: "shop".into(),
             config: tmp.path().join("ephpm.toml"),
-            from: gz.to_string_lossy().into_owned(),
+            from: Some(gz.to_string_lossy().into_owned()),
             at: None,
             yes: true,
         };
@@ -697,7 +798,7 @@ mod tests {
         let junk_gz = tmp.path().join("junk.db.gz");
         db_backup::gzip_file(&junk, &junk_gz).unwrap();
         let before = fs::read(&live).unwrap();
-        let req = RestoreRequest { from: junk_gz.to_string_lossy().into_owned(), ..req };
+        let req = RestoreRequest { from: Some(junk_gz.to_string_lossy().into_owned()), ..req };
         let code = run_restore(&req).unwrap();
         assert_eq!(code, ExitCode::from(2));
         assert_eq!(fs::read(&live).unwrap(), before, "the live database was not touched");
@@ -717,7 +818,7 @@ mod tests {
         let req = RestoreRequest {
             site: "shop".into(),
             config: tmp.path().join("ephpm.toml"),
-            from: file.to_string_lossy().into_owned(),
+            from: Some(file.to_string_lossy().into_owned()),
             at: None,
             yes: false,
         };

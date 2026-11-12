@@ -1,4 +1,5 @@
 pub mod acme;
+pub mod backup_store;
 pub mod body;
 pub mod cron_scheduler;
 pub mod db_backup;

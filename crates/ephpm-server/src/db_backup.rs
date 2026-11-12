@@ -109,6 +109,7 @@ use metrics::{counter, gauge, histogram};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::backup_store::{BackupStore, LocalBackupStore};
 use crate::kv_snapshot::PrivateStagingDir;
 use crate::s3::{ObjectMeta, ObjectSettings, S3Client};
 use crate::{EmbeddedSqliteMode, wal_gate};
@@ -453,7 +454,7 @@ pub struct TickReport {
 /// The running server's backup lifecycle. One per process, built by
 /// [`DbBackupService::from_config`] when `[db.sqlite.backup] enabled`.
 pub struct DbBackupService {
-    client: Arc<S3Client>,
+    client: Arc<BackupStore>,
     prefix: String,
     interval: Duration,
     retention: Duration,
@@ -471,7 +472,7 @@ pub struct DbBackupService {
 impl std::fmt::Debug for DbBackupService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbBackupService")
-            .field("bucket", &self.client.location().bucket)
+            .field("destination", &self.client.describe())
             .field("prefix", &self.prefix)
             .field("interval", &self.interval)
             .field("retention", &self.retention)
@@ -504,12 +505,17 @@ pub fn object_client_for_bucket(config: &Config, bucket: String) -> anyhow::Resu
     S3Client::for_bucket(&object_settings(config), bucket, "[db.sqlite.backup]")
 }
 
-/// The client and key prefix `[db.sqlite.backup]` describes.
+/// The backup store and key prefix `[db.sqlite.backup]` describes — a local
+/// directory when `dir` is set, otherwise the configured S3 bucket.
+///
+/// `Config::validate` enforces that exactly one of `dir` / `s3_bucket` is set
+/// when `enabled`, so by the time this runs the choice is unambiguous.
 ///
 /// # Errors
 ///
-/// Backups not enabled, no bucket, or missing credentials.
-pub fn object_client_from_config(config: &Config) -> anyhow::Result<(S3Client, String)> {
+/// Backups not enabled, neither destination set, or (S3 only) missing
+/// credentials.
+pub fn object_client_from_config(config: &Config) -> anyhow::Result<(BackupStore, String)> {
     let backup = &config
         .db
         .sqlite
@@ -517,14 +523,17 @@ pub fn object_client_from_config(config: &Config) -> anyhow::Result<(S3Client, S
         .context("[db.sqlite] is not configured, so there is no embedded database to back up")?
         .backup;
     anyhow::ensure!(backup.enabled, "[db.sqlite.backup] enabled is false");
+    if let Some(dir) = backup.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        return Ok((BackupStore::Local(LocalBackupStore::new(dir)), backup.prefix()));
+    }
     let bucket = backup
         .s3_bucket
         .as_deref()
         .map(str::trim)
         .filter(|b| !b.is_empty())
-        .context("[db.sqlite.backup] s3_bucket is not set")?
+        .context("[db.sqlite.backup] neither dir nor s3_bucket is set")?
         .to_string();
-    Ok((object_client_for_bucket(config, bucket)?, backup.prefix()))
+    Ok((BackupStore::S3(object_client_for_bucket(config, bucket)?), backup.prefix()))
 }
 
 /// `<prefix>/<site>` (or `<site>` with an empty prefix): the directory of
@@ -694,7 +703,7 @@ pub fn retention_victims(
 ///
 /// The listing failed.
 pub async fn list_site_backups(
-    client: &S3Client,
+    client: &BackupStore,
     prefix: &str,
     site: &str,
 ) -> anyhow::Result<Vec<BackupObject>> {
@@ -828,16 +837,16 @@ impl DbBackupService {
             last_tick: Mutex::new(None),
         });
         tracing::info!(
-            bucket = %svc.client.location().bucket,
-            endpoint = %svc.client.location().endpoint,
+            destination = %svc.client.describe(),
             prefix = %svc.prefix,
             interval_secs = interval.as_secs(),
             retention_secs = retention.as_secs(),
             databases = svc.source.enumerate().len(),
             scheduling = svc.gate.describe(),
             staging = %svc.staging.path().display(),
-            "embedded database backup enabled (VACUUM INTO snapshot → gzip → object storage; \
-             the object is not encrypted by ePHPm — use bucket-side encryption)"
+            "embedded database backup enabled (VACUUM INTO snapshot → gzip → destination; \
+             the object is not encrypted by ePHPm — use bucket-side encryption, or restrict the \
+             local directory's permissions)"
         );
         // Whole-database clustered backup is the supported clustered path; the
         // per-site variant is experimental and lab-pending. "Supported" here
@@ -1003,7 +1012,7 @@ impl DbBackupService {
                     serde_json::json!({
                         "at_unix": u.at,
                         "at": format_rfc3339(u.at),
-                        "object": format!("s3://{}/{}", self.client.location().bucket, u.key),
+                        "object": self.client.object_uri(&u.key),
                         "bytes": u.bytes,
                         "elapsed_ms": u64::try_from(u.elapsed.as_millis()).unwrap_or(u64::MAX),
                     })
@@ -1020,8 +1029,9 @@ impl DbBackupService {
             })
             .collect();
         serde_json::json!({
-            "bucket": self.client.location().bucket,
-            "endpoint": self.client.location().endpoint,
+            "bucket": self.client.status_bucket(),
+            "endpoint": self.client.status_endpoint(),
+            "dir": self.client.status_dir(),
             "prefix": self.prefix,
             "interval_secs": self.interval.as_secs(),
             "retention_secs": self.retention.as_secs(),
@@ -1070,7 +1080,7 @@ struct Outcome {
 /// Snapshot, gzip, upload and sweep one database. Records the metrics and
 /// the log lines; the staging files are removed on every path.
 async fn backup_one(
-    client: &S3Client,
+    client: &BackupStore,
     prefix: &str,
     retention: Duration,
     staging: &Path,
@@ -1221,7 +1231,7 @@ async fn backup_one(
 /// Delete every object of `site` the retention policy says to; returns how
 /// many. Stops at the first failed delete (the rest are retried next tick).
 async fn sweep_retention(
-    client: &S3Client,
+    client: &BackupStore,
     prefix: &str,
     site: &str,
     retention: Duration,

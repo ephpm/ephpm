@@ -705,13 +705,16 @@ enum DbCommand {
         config: PathBuf,
 
         /// `s3://bucket[/prefix]` (credentials from AWS_ACCESS_KEY_ID /
-        /// AWS_SECRET_ACCESS_KEY), or a local `.db` / `.db.gz` file.
+        /// AWS_SECRET_ACCESS_KEY), a local backup **directory**, or a local
+        /// `.db` / `.db.gz` **file**. Omit to use the configured
+        /// `[db.sqlite.backup]` destination (S3 bucket or local `dir`).
         #[arg(long)]
-        from: String,
+        from: Option<String>,
 
         /// Restore the newest backup taken at or before this time:
         /// `YYYYMMDDTHHMMSSZ` (as the objects are named),
-        /// `YYYY-MM-DDTHH:MM:SSZ`, or `YYYY-MM-DD`. s3:// sources only.
+        /// `YYYY-MM-DDTHH:MM:SSZ`, or `YYYY-MM-DD`. Store sources (s3:// or a
+        /// directory) only.
         #[arg(long)]
         at: Option<String>,
 
