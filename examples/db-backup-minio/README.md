@@ -66,9 +66,11 @@ docker compose start ephpm
   successful upload, but the **newest object is always kept** regardless of age.
 - **Memory headroom**: budget roughly ~100 MB extra resident per database being
   snapshotted; a multi-tenant server snapshots up to 4 databases at once.
-- **Not for clustered mode**: with clustering enabled, startup refuses backups,
-  and `ephpm db restore` refuses a clustered config (restore on an unclustered
-  node, `[db.sqlite.replication] role = "single"`).
+- **Clustered mode** (v0.16.1+): backups run from each database's write node by
+  default (`source = "primary"`) or a non-write holder (`source = "replica"`),
+  gated so each database is shipped by exactly one node. Clustered mode is
+  experimental. `ephpm db restore` is offline and installs a file on one node —
+  run it on an unclustered node (`[db.sqlite.replication] role = "single"`).
 
 Reference: the `[db.sqlite.backup]` section of
 `site/content/reference/config.md`.

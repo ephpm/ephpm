@@ -4,11 +4,13 @@ type = "docs"
 weight = 24
 +++
 
-> **Status: design — targeted for v0.16.0.** This page is the design note the
-> clustered-backup work is built against; it is reviewed before feature code
-> lands. Clustered embedded-SQLite mode is itself **experimental** (Turso is
+> **Status: shipped in v0.16.1.** This page is the design note the
+> clustered-backup work was built against; it is kept as the architecture
+> reference. Clustered embedded-SQLite mode is itself **experimental** (Turso is
 > Beta upstream, per-site CDC layers on top), so clustered backup inherits that
-> label. What is *shipped* today — single-node and per-site backups — is in the
+> label — whole-database clustered backup is supported, per-site clustered
+> backup is experimental (see below). Operational usage — including single-node
+> and per-site backups — is in the
 > [Database backups guide](/guides/database-backups/) and
 > [Engines → Backups](/architecture/database/engines/#supported-backups).
 

@@ -2940,8 +2940,14 @@ pub struct SqliteConfig {
 /// optional `AWS_SESSION_TOKEN`) in the environment only — never from this
 /// file, never logged; startup fails with `enabled = true` and none set.
 ///
-/// Single-node and per-site modes only: with clustering enabled startup
-/// refuses (`Config::validate`) rather than ship every site once per node.
+/// Works in every embedded mode. In clustered modes each database is
+/// snapshotted by exactly one node — its write node by default
+/// (`source = "primary"`), or a non-write holder with `source = "replica"` —
+/// gated on election/HRW ownership so no database is shipped twice per
+/// interval, and `ephpm db restore` strips the CDC replication bookkeeping a
+/// physical snapshot carries so a restored file re-seeds the cluster as clean
+/// origin data. Clustered mode is itself experimental (Turso is Beta
+/// upstream), so clustered backup is too.
 ///
 /// Unknown keys are a startup error, as in every section.
 #[derive(Debug, Deserialize, Clone)]
@@ -6109,12 +6115,11 @@ impl Config {
 
         // [db.sqlite.backup]: `enabled` is the switch, so everything it needs
         // is checked up front — a bucket, parsable non-zero cadence and
-        // retention, a well-formed endpoint — rather than at the first tick,
-        // fifteen minutes after a start that logged "backup enabled".
-        // Clustered modes are refused outright: nothing schedules per
-        // owner/primary yet, so every node would ship every site once per
-        // interval, and the artifact would carry CDC bookkeeping a restore
-        // cannot reconcile. See the roadmap for the clustered follow-up.
+        // retention, a well-formed endpoint, a recognized `source` — rather
+        // than at the first tick, fifteen minutes after a start that logged
+        // "backup enabled". Clustered modes are allowed (see the note below the
+        // checks): the scheduler gates each database on this node's ownership so
+        // it is shipped by exactly one node.
         if let Some(sqlite) = self.db.sqlite.as_ref()
             && sqlite.backup.enabled
         {
