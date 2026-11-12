@@ -213,6 +213,14 @@ struct SiteRegistry {
 struct ShippingState {
     /// Live subscribers: opaque id → the `change_id` shipped to it.
     cursors: DashMap<u64, i64>,
+    /// Live subscribers: opaque id → the `change_id` that subscriber has
+    /// reported **durably applied** (the drain-handover gate, v0.16.2). Seeded
+    /// at the subscriber's `Subscribe` watermark (a true lower bound on its
+    /// applied position) and advanced by `Frame::Applied` acks. Held as a
+    /// shared `Arc<AtomicI64>` so the serve loop's upstream-ack reader task can
+    /// advance it after the [`SubscriberGuard`] has removed the map entry on
+    /// detach, without leaking a stale entry.
+    applied_cursors: DashMap<u64, Arc<AtomicI64>>,
     /// Source of the opaque ids above.
     next_id: AtomicU64,
     /// Highest `change_id` seen in this site's own CDC log. Monotonic
@@ -267,6 +275,9 @@ fn shipping_state(site: &str) -> Arc<ShippingState> {
 pub struct SubscriberGuard {
     state: Arc<ShippingState>,
     id: u64,
+    /// This subscriber's applied-watermark slot, shared with any
+    /// [`AppliedRecorder`] handed to the serve loop's ack reader.
+    applied: Arc<AtomicI64>,
 }
 
 impl SubscriberGuard {
@@ -283,13 +294,66 @@ impl SubscriberGuard {
         self.state.observe_head(commit_change_id);
         self.state.refresh_shipped();
     }
+
+    /// A `Send + 'static` handle that advances this subscriber's applied
+    /// watermark, for the serve loop's upstream-ack reader task (a different
+    /// task than the one that holds this guard). The guard's `Drop` removes the
+    /// registry slot; a late `record` after that writes only to the shared
+    /// `Arc` the map no longer references, so it cannot leak a stale entry.
+    #[must_use]
+    pub fn applied_recorder(&self) -> AppliedRecorder {
+        AppliedRecorder { slot: Arc::clone(&self.applied) }
+    }
 }
 
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
         self.state.cursors.remove(&self.id);
+        self.state.applied_cursors.remove(&self.id);
         self.state.refresh_shipped();
     }
+}
+
+/// A `Send + 'static` handle to advance one subscriber's applied watermark from
+/// the CDC serve loop's upstream-ack reader task. See
+/// [`SubscriberGuard::applied_recorder`].
+#[derive(Clone)]
+pub struct AppliedRecorder {
+    slot: Arc<AtomicI64>,
+}
+
+impl AppliedRecorder {
+    /// Advance the applied watermark to `change_id` (monotonic — acks only move
+    /// forward, and a reordered older ack is ignored).
+    pub fn record(&self, change_id: i64) {
+        self.slot.fetch_max(change_id, Ordering::Relaxed);
+    }
+}
+
+/// The whole-database drain gate's view of replica catch-up for one site.
+pub struct DrainCatchup {
+    /// Live subscribers (replicas currently attached).
+    pub subscribers: usize,
+    /// The minimum applied watermark across those subscribers — `None` when
+    /// there are none. Each subscriber's value is seeded at its `Subscribe`
+    /// watermark and advanced by `Frame::Applied` acks, so it is always a true
+    /// lower bound on what that replica has durably applied.
+    pub min_applied: Option<i64>,
+}
+
+/// Snapshot the drain catch-up state for `site`: how many replicas are attached
+/// and the slowest one's applied watermark. The drain gate closes the channel
+/// once there are no subscribers, or the min applied has reached the head it
+/// sampled.
+#[must_use]
+pub fn drain_catchup_state(site: &str) -> DrainCatchup {
+    let Some(entry) = REGISTRY.shipping.get(site) else {
+        return DrainCatchup { subscribers: 0, min_applied: None };
+    };
+    let state = entry.value();
+    let subscribers = state.cursors.len();
+    let min_applied = state.applied_cursors.iter().map(|e| e.value().load(Ordering::Relaxed)).min();
+    DrainCatchup { subscribers, min_applied }
 }
 
 /// Attach a subscriber of `site` that has announced `from_change_id` as its
@@ -302,8 +366,13 @@ pub fn attach_subscriber(site: &str, from_change_id: i64) -> SubscriberGuard {
     let state = shipping_state(site);
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     state.cursors.insert(id, from_change_id);
+    // Seed the applied watermark at the subscribe position — the replica has
+    // durably applied at least this far — so the drain gate has a true lower
+    // bound even before the first `Frame::Applied` ack arrives.
+    let applied = Arc::new(AtomicI64::new(from_change_id));
+    state.applied_cursors.insert(id, Arc::clone(&applied));
     state.refresh_shipped();
-    SubscriberGuard { state, id }
+    SubscriberGuard { state, id, applied }
 }
 
 /// Record a directly observed `MAX(turso_cdc.change_id)` of `site`'s log.
@@ -701,6 +770,47 @@ mod tests {
             "a dead replica must show a growing lag, not a frozen one"
         );
         assert_eq!(rendered(METRIC_SUBSCRIBERS, site), Some(0));
+
+        forget_site(site);
+    }
+
+    /// The drain gate's catch-up view: min applied across live subscribers,
+    /// seeded at each subscribe watermark, advanced by acks (monotonically),
+    /// and cleared on detach.
+    #[test]
+    fn drain_catchup_tracks_min_applied_and_clears_on_detach() {
+        let site = "drain.example";
+        let empty = drain_catchup_state(site);
+        assert_eq!(empty.subscribers, 0);
+        assert_eq!(empty.min_applied, None, "no subscribers → nothing to wait for");
+
+        let a = attach_subscriber(site, 100); // seeded applied = 100
+        let b = attach_subscriber(site, 200); // seeded applied = 200
+        let c = drain_catchup_state(site);
+        assert_eq!(c.subscribers, 2);
+        assert_eq!(c.min_applied, Some(100), "min across the seeded watermarks");
+
+        // b acks forward; a is still the slow one.
+        b.applied_recorder().record(500);
+        assert_eq!(drain_catchup_state(site).min_applied, Some(100));
+
+        // a catches up; the min is now the lower of the two current positions.
+        a.applied_recorder().record(450);
+        assert_eq!(drain_catchup_state(site).min_applied, Some(450));
+
+        // Monotonic: a reordered older ack never walks it back.
+        a.applied_recorder().record(400);
+        assert_eq!(drain_catchup_state(site).min_applied, Some(450));
+
+        drop(a);
+        let after = drain_catchup_state(site);
+        assert_eq!(after.subscribers, 1);
+        assert_eq!(after.min_applied, Some(500), "detach clears the slow slot");
+
+        drop(b);
+        let gone = drain_catchup_state(site);
+        assert_eq!(gone.subscribers, 0);
+        assert_eq!(gone.min_applied, None);
 
         forget_site(site);
     }

@@ -360,6 +360,13 @@ const HEAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Heartbeat interval on primary-side subscribers.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often a replica coalesces its `Frame::Applied` catch-up acks on the
+/// active apply path (the drain-handover gate, v0.16.2). Well below
+/// [`HEARTBEAT_INTERVAL`], so acks stay frequent relative to heartbeats yet
+/// cheap under a write-heavy stream; the final value is flushed on the next
+/// `Ping` if a burst coalesced it away.
+const APPLIED_ACK_INTERVAL: Duration = Duration::from_millis(250);
+
 /// How long a replica waits for the primary's [`Frame::Hello`] before
 /// declaring the stream broken. Generous — the Hello is the primary's
 /// first write after accepting the stream — but bounded, so a peer that
@@ -377,10 +384,10 @@ const RESOLVE_ROLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Frame types carried on the CDC replication wire.
 ///
-/// The stream is not symmetric: [`Frame::Subscribe`] only ever travels
-/// replica → primary and is only ever valid as the first frame;
-/// [`Frame::Batch`] and [`Frame::Ping`] only ever travel primary →
-/// replica. They share one enum so both directions share one codec.
+/// The stream is not symmetric: [`Frame::Subscribe`] and [`Frame::Applied`]
+/// only ever travel replica → primary ([`Subscribe`](Frame::Subscribe) only as
+/// the first frame); [`Frame::Batch`] and [`Frame::Ping`] only ever travel
+/// primary → replica. They share one enum so both directions share one codec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Frame {
     /// **Primary → replica, first frame on every stream.** Identifies
@@ -400,6 +407,16 @@ enum Frame {
         log_id: String,
         #[serde(default)]
         epoch: u64,
+        /// Whether this primary consumes [`Frame::Applied`] acks from the
+        /// replica (the drain-handover catch-up gate, v0.16.2). A pre-v0.16.2
+        /// primary sends no field → decodes `false`, and the replica then stays
+        /// silent after `Subscribe` exactly as before — so the upstream half of
+        /// the stream never carries an `Applied` an old primary would choke on,
+        /// and the gate on a new primary simply falls back to its timeout for an
+        /// old (never-reporting) replica. `#[serde(default)]`, the fail-safe
+        /// direction, needs no handshake-version bump.
+        #[serde(default)]
+        applied_acks: bool,
     },
     /// **Replica → primary, sent after [`Frame::Hello`].** The replica's
     /// applied watermark **in the log the Hello named**. The primary
@@ -408,6 +425,16 @@ enum Frame {
     /// what makes a reconnect (or a warm restart) safe without a
     /// snapshot.
     Subscribe { from_change_id: i64 },
+    /// **Replica → primary, sent periodically after [`Frame::Subscribe`]**
+    /// (only when the primary's `Hello` set `applied_acks`). The highest
+    /// `change_id` this replica has **durably applied** from the log the Hello
+    /// named — distinct from the *shipped* cursor the primary already tracks,
+    /// which can lead applied by a flow-control window plus one in-flight
+    /// `apply_batch`. The drain-handover gate waits on the min of these across
+    /// live subscribers before the draining primary closes its channel, so a
+    /// primary deleted right after a graceful drain never loses a
+    /// shipped-but-not-yet-applied tail.
+    Applied { change_id: i64 },
     /// A committed transaction batch. `rows` mirrors
     /// [`litewire_turso::cdc::TxnBatch::rows`].
     Batch { rows: Vec<WireCdcRow> },
@@ -1103,7 +1130,7 @@ fn spawn_head_sampler(
 ///
 /// Returns an error if the first frame is not a valid `Subscribe`, if a
 /// `turso_cdc` poll fails, or if the stream breaks.
-pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
     stream: S,
     mgmt: &Turso,
     local_log_id: &str,
@@ -1114,20 +1141,31 @@ pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 /// [`serve_subscriber`] for one named site: the shipping metrics (subscriber
 /// count, head, shipped cursor, lag) are recorded under `site`, so the
 /// per-site clustered path's sites never mix their logs' positions.
-async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut stream: S,
+async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
+    stream: S,
     mgmt: &Turso,
     local_log_id: &str,
     site: &str,
 ) -> anyhow::Result<()> {
+    // Split so the ship loop (write half) can run while a child task drains the
+    // replica's upstream `Applied` acks (read half) without either blocking the
+    // other. The two halves are independent; `read_frame`/`write_frame` each
+    // take only the bound they need.
+    let (mut rd, mut wr) = tokio::io::split(stream);
+
     // Carry this owner's persisted ownership epoch (#654) so the replica can
     // adopt it durably — the crux that lets a promoted replica out-rank a
     // returning owner's stale copy without depending on a live gossip advert.
+    // `applied_acks: true` advertises that this primary consumes the replica's
+    // `Frame::Applied` catch-up acks (the drain-handover gate, v0.16.2).
     let epoch = read_owner_epoch(mgmt).await;
-    write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string(), epoch })
-        .await
-        .context("send hello frame")?;
-    let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
+    write_frame(
+        &mut wr,
+        &Frame::Hello { log_id: local_log_id.to_string(), epoch, applied_acks: true },
+    )
+    .await
+    .context("send hello frame")?;
+    let from = match read_frame(&mut rd).await.context("read subscribe frame")? {
         Frame::Subscribe { from_change_id } => from_change_id,
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
     };
@@ -1139,6 +1177,28 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // are unwound by the guard's Drop rather than by a detach call this
     // function has no single place to make.
     let subscriber = cdc_metrics::attach_subscriber(site, from);
+
+    // After `Subscribe`, the replica's only upstream frame is `Frame::Applied`
+    // (its durably-applied watermark). Drain it on a child task so the ship
+    // loop never blocks on a read; the recorder shares the subscriber's state
+    // by `Arc`, and the task is aborted when this function returns on any path
+    // (the `AbortOnDrop` guard). A pre-v0.16.2 replica sends nothing, so the
+    // task simply blocks harmlessly on its first read until the stream ends.
+    let recorder = subscriber.applied_recorder();
+    let reader = tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(Frame::Applied { change_id }) => recorder.record(change_id),
+                // A well-behaved replica sends only `Applied` here; ignore
+                // anything else defensively rather than tearing the stream.
+                Ok(_) => {}
+                // Stream closed or broken — the ship loop's next write sees it
+                // too and returns; nothing more to drain.
+                Err(_) => break,
+            }
+        }
+    });
+    let _reader_guard = AbortOnDrop(reader);
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
@@ -1175,7 +1235,7 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 let rows = batch.rows.len();
                 let frame =
                     Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                write_frame(&mut stream, &frame).await?;
+                write_frame(&mut wr, &frame).await?;
                 // Recorded only after the frame is on the wire: counting
                 // a batch we then failed to write would overstate how far
                 // this subscriber has actually got.
@@ -1194,7 +1254,7 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
-                    write_frame(&mut stream, &Frame::Ping).await?;
+                    write_frame(&mut wr, &Frame::Ping).await?;
                     idle_since = tokio::time::Instant::now();
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -1337,8 +1397,8 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
              mixed-version clustered nodes are not supported"
         )
     })?;
-    let (source_log_id, source_epoch) = match hello.context("read hello frame")? {
-        Frame::Hello { log_id, epoch } => (log_id, epoch),
+    let (source_log_id, source_epoch, primary_acks) = match hello.context("read hello frame")? {
+        Frame::Hello { log_id, epoch, applied_acks } => (log_id, epoch, applied_acks),
         other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
     };
     anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
@@ -1368,7 +1428,7 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         source_log = %source_log_id,
         "CDC replica: subscribed"
     );
-    consume_frames(stream, factory, apply_conn, site).await
+    consume_frames(stream, factory, apply_conn, site, primary_acks).await
 }
 
 async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -1376,7 +1436,17 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
+    // Whether the primary advertised (via `Hello.applied_acks`) that it consumes
+    // `Frame::Applied` catch-up acks. A pre-v0.16.2 primary sets this `false`,
+    // and we stay silent after `Subscribe` exactly as before.
+    ack_applied: bool,
 ) -> anyhow::Result<()> {
+    // Coalesce `Applied` acks: at most one per `APPLIED_ACK_INTERVAL` on the
+    // active path, plus a flush on each `Ping` so the primary learns our final
+    // applied watermark promptly once writes stop (the drain-gate case).
+    let mut latest_applied: i64 = -1;
+    let mut last_acked: i64 = -1;
+    let mut last_ack_at: Option<tokio::time::Instant> = None;
     loop {
         let frame = read_frame(stream).await?;
         match frame {
@@ -1423,6 +1493,20 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             row_count,
                             started.elapsed(),
                         );
+                        // Report our durably-applied watermark upstream so the
+                        // primary's drain gate can wait on it. Coalesced to one
+                        // per `APPLIED_ACK_INTERVAL`; the final value is flushed
+                        // on the next `Ping` if the coalescer suppressed it.
+                        latest_applied = change_id;
+                        if ack_applied
+                            && last_ack_at.is_none_or(|t| t.elapsed() >= APPLIED_ACK_INTERVAL)
+                        {
+                            write_frame(stream, &Frame::Applied { change_id })
+                                .await
+                                .context("send applied ack")?;
+                            last_acked = change_id;
+                            last_ack_at = Some(tokio::time::Instant::now());
+                        }
                     }
                     Err(e) => {
                         // Deliberately does NOT touch the watermark
@@ -1435,9 +1519,23 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     }
                 }
             }
-            Frame::Ping => {}
+            Frame::Ping => {
+                // Idle flush: if the coalescer suppressed our most recent
+                // applied watermark, report it now so a fully-caught-up replica
+                // still tells the primary promptly — the drain gate waits on it.
+                if ack_applied && latest_applied > last_acked {
+                    write_frame(stream, &Frame::Applied { change_id: latest_applied })
+                        .await
+                        .context("send applied ack on ping")?;
+                    last_acked = latest_applied;
+                    last_ack_at = Some(tokio::time::Instant::now());
+                }
+            }
             Frame::Subscribe { .. } => {
                 anyhow::bail!("primary sent a Subscribe frame; wrong direction");
+            }
+            Frame::Applied { .. } => {
+                anyhow::bail!("primary sent an Applied frame; wrong direction");
             }
             Frame::Hello { .. } => {
                 anyhow::bail!("primary sent a second Hello frame; only valid as the first frame");
@@ -5517,11 +5615,41 @@ mod tests {
     #[tokio::test]
     async fn hello_frame_roundtrips() {
         let (mut client, mut server) = tokio::io::duplex(65536);
-        write_frame(&mut client, &Frame::Hello { log_id: "abc123".into(), epoch: 0 })
-            .await
-            .unwrap();
+        write_frame(
+            &mut client,
+            &Frame::Hello { log_id: "abc123".into(), epoch: 0, applied_acks: false },
+        )
+        .await
+        .unwrap();
         match read_frame(&mut server).await.unwrap() {
             Frame::Hello { log_id, .. } => assert_eq!(log_id, "abc123"),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_frame_roundtrips() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+        write_frame(&mut client, &Frame::Applied { change_id: 4242 }).await.unwrap();
+        match read_frame(&mut server).await.unwrap() {
+            Frame::Applied { change_id } => assert_eq!(change_id, 4242),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// Back-compat: a pre-v0.16.2 `Hello` on the wire carries neither `epoch`
+    /// nor `applied_acks`; both `#[serde(default)]` to the fail-safe values, so
+    /// a new node decodes an old primary's Hello without error and treats it as
+    /// "does not consume applied acks".
+    #[test]
+    fn old_hello_decodes_with_defaults() {
+        let frame: Frame = serde_json::from_str(r#"{"Hello":{"log_id":"old"}}"#).unwrap();
+        match frame {
+            Frame::Hello { log_id, epoch, applied_acks } => {
+                assert_eq!(log_id, "old");
+                assert_eq!(epoch, 0, "epoch defaults to 0");
+                assert!(!applied_acks, "applied_acks defaults to false");
+            }
             other => panic!("expected Hello, got {other:?}"),
         }
     }
