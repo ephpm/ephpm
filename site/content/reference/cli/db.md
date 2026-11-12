@@ -15,10 +15,12 @@ subcommands:
 - [`db restore`](#ephpm-db-restore) — install a scheduled backup
   (`[db.sqlite.backup]`) or a local `.db`/`.db.gz` over a site's database.
 - [`db backup list`](#ephpm-db-backup-list) — list a site's backup objects.
+- [`db dump`](#ephpm-db-dump) — snapshot a site's database to a local file on
+  demand (offline `VACUUM INTO` → gzip).
 
 `import`, `query` and `shell` resolve the target the same way [`ephpm php --site`](../php/#binding-a-virtual-hosts-database-site)
 does and obey the same single-writer rule (see [Transport & mode](#transport--mode-shared));
-`restore` is offline-only. `db export` is **planned — not yet implemented**.
+`restore` and `dump` are offline-only. `db export` is **planned — not yet implemented**.
 
 ## `ephpm db import`
 
@@ -666,6 +668,31 @@ location: s3://ephpm-backups/ephpm/db/blog/
 taken (UTC)                     bytes key
 2026-03-01T08:45:00Z          1048231 ephpm/db/blog/20260301T084500Z.db.gz
 2026-03-01T09:00:00Z          1049920 ephpm/db/blog/20260301T090000Z.db.gz
+```
+
+## `ephpm db dump`
+
+```bash
+ephpm db dump --site <KEY> --config <FILE> --out <FILE> [--no-gzip]
+```
+
+Snapshots a virtual host's embedded database to a local file on demand — a
+`VACUUM INTO` of the live file, gzipped by default (`--no-gzip` writes a raw
+`.db`). For ad-hoc backups or seeding a blue-green / failover test. The site key
+resolves as for `db restore` (`default` for a single-node or whole-database
+config, the vhost directory name in per-site mode).
+
+**Offline only** — refused while a server holds the database open (the same
+single-writer rule as `db restore`), so a second process cannot `VACUUM INTO`
+the file. For snapshots of a *running* node, use scheduled backups
+([`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)), which can write to a
+local `dir` as well as S3. The output is a plain gzip of a standard SQLite file
+— restore it with `ephpm db restore --from <file>` — and is **not** encrypted by
+ePHPm; protect it yourself.
+
+```text
+$ ephpm db dump --site blog --config ephpm.toml --out blog-20260301.db.gz
+dumped site "blog" → blog-20260301.db.gz (1048231 bytes gzipped)
 ```
 
 ## See also
