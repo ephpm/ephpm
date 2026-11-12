@@ -10530,7 +10530,8 @@ listen = "0.0.0.0:8080"
             ));
             cfg.validate()
         };
-        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n").expect("clustered auto now allowed");
+        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n")
+            .expect("clustered auto now allowed");
         clustered("[cluster]\nenabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"primary\"\n")
             .expect("clustered primary now allowed");
         clustered("[cluster]\nenabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"replica\"\n")

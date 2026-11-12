@@ -327,7 +327,7 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
                  -wal/-shm on EVERY OTHER node so they cold-bootstrap from the restored node; (4) \
                  start the restored node FIRST, then the wiped replicas; (5) verify each replica \
                  re-bootstrapped (its log shows \"snapshot bootstrap complete\" / \
-                 ephpm_cdc_bootstrap_total{outcome=\"ok\"}), since a node skipped at step 3 looks \
+                 ephpm_cdc_bootstrap_total{{outcome=\"ok\"}}), since a node skipped at step 3 looks \
                  healthy but serves the mix. The automatic `--reseed` that performs step 3 is NOT \
                  YET IMPLEMENTED. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
             );

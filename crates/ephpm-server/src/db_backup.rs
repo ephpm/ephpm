@@ -268,7 +268,10 @@ impl BackupGate {
     /// Split `databases` into the ones this node must back up this tick and
     /// the ones another node owns (each with a skip reason for the metric).
     /// Reads the membership view at most once.
-    async fn partition(&self, databases: Vec<Database>) -> (Vec<Database>, Vec<(Database, Reason)>) {
+    async fn partition(
+        &self,
+        databases: Vec<Database>,
+    ) -> (Vec<Database>, Vec<(Database, Reason)>) {
         match self {
             Self::Always => (databases, Vec::new()),
             Self::WholeDbClustered { cluster, primary_view, source } => {
@@ -950,7 +953,8 @@ impl DbBackupService {
             tasks.spawn(async move {
                 // The semaphore is never closed, so `acquire_owned` cannot fail.
                 let _permit = permits.acquire_owned().await;
-                let outcome = backup_one(&client, &prefix, retention, &staging, &db, clustered).await;
+                let outcome =
+                    backup_one(&client, &prefix, retention, &staging, &db, clustered).await;
                 (db.site, outcome)
             });
         }
@@ -1602,8 +1606,7 @@ mod tests {
             let replica = backup_replica_per_site(&nodes, site).unwrap();
             assert_ne!(replica, owner, "the backup replica is never the owner (site {site})");
             // It is the HRW winner once the owner is removed.
-            let rest: Vec<NodeInfo> =
-                nodes.iter().filter(|n| n.id != owner).cloned().collect();
+            let rest: Vec<NodeInfo> = nodes.iter().filter(|n| n.id != owner).cloned().collect();
             assert_eq!(replica, hrw_owner(&rest, site).unwrap().id);
             // Exactly one node is responsible in replica mode.
             let n = nodes
@@ -1633,7 +1636,9 @@ mod tests {
             for membership in [&three[..], &four[..]] {
                 let responsible = membership
                     .iter()
-                    .filter(|n| per_site_responsible(BackupSource::Primary, &n.id, site, membership))
+                    .filter(|n| {
+                        per_site_responsible(BackupSource::Primary, &n.id, site, membership)
+                    })
                     .count();
                 assert_eq!(responsible, 1, "exactly one owner for site {site}");
             }
@@ -1735,10 +1740,7 @@ mod tests {
             exec_raw(&conn, "CREATE TABLE posts (id INTEGER PRIMARY KEY)").await;
             exec_raw(&conn, "CREATE TABLE \"__ephpm_cdc_log_id\" (id TEXT)").await;
         }
-        assert!(
-            snapshot_has_user_data(&warm).await.unwrap(),
-            "a copy with a user table has data"
-        );
+        assert!(snapshot_has_user_data(&warm).await.unwrap(), "a copy with a user table has data");
     }
 
     /// A single-node image has no CDC bookkeeping, so the strip is a no-op and
