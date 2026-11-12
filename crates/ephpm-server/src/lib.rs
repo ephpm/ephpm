@@ -618,7 +618,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         channel_handle.as_ref(),
         &query_stats,
         &db_health,
-        primary_view,
+        Arc::clone(&primary_view),
         per_site_cluster,
     )
     .await?;
@@ -721,6 +721,30 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Whole-database clustered primary: wait for every attached replica to apply
+    // the CDC head before the channel closes, so a primary deleted right after
+    // this graceful drain does not lose its shipped-but-not-yet-applied tail
+    // (v0.16.2). Run as LATE as possible — right before `channel.shutdown()`
+    // below, after the KV handoff/snapshot and the cron abort — to shrink the
+    // window in which a straggler commits after the gate (F2). The channel is
+    // still open and the replication drivers still ship here (they stop only at
+    // `stop_replication_drivers()` below). Gate on **whole-database** clustered
+    // mode specifically (`EmbeddedSqliteMode::Clustered`), not every
+    // `is_clustered_sqlite`: per-site clustered is a different variant that never
+    // registers `WHOLE_DB_MGMT` yet sets `primary_view` on every node, so a
+    // broader predicate would spin the full timeout on every per-site shutdown
+    // (R1). Non-primaries are not the writer and skip it.
+    //
+    // This shrinks but does not eliminate the straggler window — the wire
+    // listener is not stopped here, so a detached cron child or an operator's
+    // wire client could still commit during/after the gate. Fully closing that
+    // (stopping the listener before the gate) is a tracked follow-up; the
+    // graceful blue-green flow (no such writers) is covered.
+    let whole_db_drain = cluster_handle.as_ref().filter(|_| {
+        embedded_sqlite_mode(&config) == EmbeddedSqliteMode::Clustered
+            && primary_view.load(std::sync::atomic::Ordering::Relaxed)
+    });
+
     // Requests are drained. Hand this node's large KV values to the peers
     // that take over their replica slots — while gossip still lists this
     // node and the data plane is still up on both ends. Then the snapshot.
@@ -770,6 +794,19 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // sites' new owners have pulled what they need from it (`drain`).
     if let Some(leave) = leave {
         leave.await_handover().await;
+    }
+    // Whole-database primary: the last step before the channel closes (F2) —
+    // wait for replicas to apply the CDC head. `expect_replicas` is whether
+    // gossip still lists an alive peer, so a replica that dropped mid-drain is
+    // waited for rather than closed past (F3).
+    if let Some(cluster) = whole_db_drain {
+        let self_id = cluster.self_node().id;
+        let expect_replicas = cluster
+            .nodes()
+            .await
+            .iter()
+            .any(|n| n.id != self_id && n.state == ephpm_cluster::NodeState::Alive);
+        turso_cdc::drain_whole_db_primary(expect_replicas).await;
     }
     if let Some(channel) = &channel_handle {
         channel.shutdown();

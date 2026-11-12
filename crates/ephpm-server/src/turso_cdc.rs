@@ -360,6 +360,15 @@ const HEAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Heartbeat interval on primary-side subscribers.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The hard ceiling the whole-database drain-handover gate waits for replicas to
+/// apply the sampled head before it closes the channel anyway (v0.16.2). Same
+/// ceiling as `drain::MAX_HANDOVER`: a dead or pre-v0.16.2 (never-acking) replica
+/// must never hang a drain forever.
+const DRAIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the drain-handover gate re-checks replica applied watermarks.
+const DRAIN_CATCHUP_POLL: Duration = Duration::from_millis(100);
+
 /// How long a replica waits for the primary's [`Frame::Hello`] before
 /// declaring the stream broken. Generous — the Hello is the primary's
 /// first write after accepting the stream — but bounded, so a peer that
@@ -377,10 +386,10 @@ const RESOLVE_ROLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Frame types carried on the CDC replication wire.
 ///
-/// The stream is not symmetric: [`Frame::Subscribe`] only ever travels
-/// replica → primary and is only ever valid as the first frame;
-/// [`Frame::Batch`] and [`Frame::Ping`] only ever travel primary →
-/// replica. They share one enum so both directions share one codec.
+/// The stream is not symmetric: [`Frame::Subscribe`] and [`Frame::Applied`]
+/// only ever travel replica → primary ([`Subscribe`](Frame::Subscribe) only as
+/// the first frame); [`Frame::Batch`] and [`Frame::Ping`] only ever travel
+/// primary → replica. They share one enum so both directions share one codec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Frame {
     /// **Primary → replica, first frame on every stream.** Identifies
@@ -400,6 +409,16 @@ enum Frame {
         log_id: String,
         #[serde(default)]
         epoch: u64,
+        /// Whether this primary consumes [`Frame::Applied`] acks from the
+        /// replica (the drain-handover catch-up gate, v0.16.2). A pre-v0.16.2
+        /// primary sends no field → decodes `false`, and the replica then stays
+        /// silent after `Subscribe` exactly as before — so the upstream half of
+        /// the stream never carries an `Applied` an old primary would choke on,
+        /// and the gate on a new primary simply falls back to its timeout for an
+        /// old (never-reporting) replica. `#[serde(default)]`, the fail-safe
+        /// direction, needs no handshake-version bump.
+        #[serde(default)]
+        applied_acks: bool,
     },
     /// **Replica → primary, sent after [`Frame::Hello`].** The replica's
     /// applied watermark **in the log the Hello named**. The primary
@@ -408,6 +427,16 @@ enum Frame {
     /// what makes a reconnect (or a warm restart) safe without a
     /// snapshot.
     Subscribe { from_change_id: i64 },
+    /// **Replica → primary, sent periodically after [`Frame::Subscribe`]**
+    /// (only when the primary's `Hello` set `applied_acks`). The highest
+    /// `change_id` this replica has **durably applied** from the log the Hello
+    /// named — distinct from the *shipped* cursor the primary already tracks,
+    /// which can lead applied by a flow-control window plus one in-flight
+    /// `apply_batch`. The drain-handover gate waits on the min of these across
+    /// live subscribers before the draining primary closes its channel, so a
+    /// primary deleted right after a graceful drain never loses a
+    /// shipped-but-not-yet-applied tail.
+    Applied { change_id: i64 },
     /// A committed transaction batch. `rows` mirrors
     /// [`litewire_turso::cdc::TxnBatch::rows`].
     Batch { rows: Vec<WireCdcRow> },
@@ -610,6 +639,11 @@ pub async fn start_clustered_turso_cdc(
             .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
     );
     wal_gate::DatabaseProbe::register(wal_gate::DEFAULT_SITE_LABEL, db_path, &mgmt_factory);
+    // Register the mgmt factory for the drain-handover gate's fresh-head read
+    // (v0.16.2). `set` only takes the first value: whole-database clustered mode
+    // builds exactly one mgmt factory per process, so a second call (there is
+    // none) would be ignored rather than replace it.
+    let _ = WHOLE_DB_MGMT.set(Arc::clone(&mgmt_factory));
 
     // Establish this database's persistent CDC log identity (issue #315)
     // BEFORE the election runs. Done on EVERY node, not just the primary:
@@ -1061,6 +1095,163 @@ fn spawn_head_sampler(
 }
 
 // ---------------------------------------------------------------------------
+// Whole-database drain-handover catch-up gate (v0.16.2).
+// ---------------------------------------------------------------------------
+
+/// The whole-database mgmt Turso factory, registered once by
+/// [`start_clustered_turso_cdc`] so [`drain_whole_db_primary`] can read a
+/// **fresh** `MAX(turso_cdc.change_id)` at drain time. The sampled head gauge
+/// the gate also watches can lag the true head by up to [`HEAD_SAMPLE_INTERVAL`]
+/// (it moves only on a ship or the 1 s sampler tick), so a write committed in
+/// the last instant before the drain would be invisible to the gauge alone and
+/// could let the gate close below the true head. Reading the exact head here
+/// closes that window.
+static WHOLE_DB_MGMT: std::sync::OnceLock<Arc<Turso>> = std::sync::OnceLock::new();
+
+/// Read the exact `MAX(turso_cdc.change_id)` from the registered whole-database
+/// mgmt factory, under the WAL-gate permit (a raw connection has no busy
+/// timeout). `None` if the factory is not registered or the read fails — the
+/// gate then falls back to the sampled gauge, never blocking on an error.
+async fn fresh_cdc_head() -> Option<i64> {
+    let mgmt = WHOLE_DB_MGMT.get()?;
+    let conn = mgmt.raw_connection().ok()?;
+    let _permit = mgmt.wal_gate_permit().await;
+    off_runtime(current_max_change_id(&conn)).await.ok()
+}
+
+/// Outcome of the whole-database drain catch-up wait, for the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainCatchupOutcome {
+    /// No replica was attached — nothing could be lost by closing now.
+    NoSubscribers,
+    /// Every attached replica applied up to the sampled head.
+    CaughtUp { head: i64, waited: Duration },
+    /// Gave up at [`DRAIN_CATCHUP_TIMEOUT`] with replicas still behind.
+    TimedOut { head: i64, min_applied: Option<i64>, subscribers: usize, waited: Duration },
+}
+
+/// The pure wait: start from `seed` (a fresh exact `MAX(change_id)`, so the last
+/// write before the drain is never missed — F1), then poll `head` (the sampled
+/// gauge) and `catchup` every [`DRAIN_CATCHUP_POLL`], keeping the max head seen,
+/// until the slowest replica's applied watermark reaches it — bounded by
+/// [`DRAIN_CATCHUP_TIMEOUT`]. Re-reading the head each poll catches a write the
+/// still-running drivers ship during the wait. `expect_replicas` is whether
+/// gossip lists any alive peer: when true, a transient drop to zero subscribers
+/// is NOT treated as "caught up" — the gate waits for the replica to re-attach
+/// and catch up (F3), rather than closing on a reconnect gap and silently losing
+/// its tail. Factored out so the loop can be driven on a paused clock in tests.
+async fn drain_catchup_wait<H, C>(
+    seed: Option<i64>,
+    mut head: H,
+    catchup: C,
+    expect_replicas: bool,
+) -> DrainCatchupOutcome
+where
+    H: FnMut() -> Option<i64>,
+    C: Fn() -> cdc_metrics::DrainCatchup,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + DRAIN_CATCHUP_TIMEOUT;
+    let mut target: Option<i64> = seed;
+    loop {
+        if let Some(h) = head() {
+            target = Some(target.map_or(h, |t| t.max(h)));
+        }
+        let st = catchup();
+        if st.subscribers == 0 && !expect_replicas {
+            // No replica attached and no alive peer that should have one —
+            // nothing could be lost by closing now.
+            return DrainCatchupOutcome::NoSubscribers;
+        }
+        // `None` target = no head ever observed = no writes to catch up to.
+        // A subscriber count of 0 while peers are expected is NOT caught up: a
+        // replica dropped mid-gate must re-attach and reach the head first.
+        let caught = st.subscribers > 0
+            && match target {
+                None => true,
+                Some(t) => st.min_applied.is_some_and(|m| m >= t),
+            };
+        if caught {
+            return DrainCatchupOutcome::CaughtUp {
+                head: target.unwrap_or(0),
+                waited: started.elapsed(),
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return DrainCatchupOutcome::TimedOut {
+                head: target.unwrap_or(0),
+                min_applied: st.min_applied,
+                subscribers: st.subscribers,
+                waited: started.elapsed(),
+            };
+        }
+        tokio::time::sleep(DRAIN_CATCHUP_POLL).await;
+    }
+}
+
+/// Before a draining whole-database primary closes its cluster channel, wait
+/// until every attached replica has **durably applied** the CDC head — so a
+/// primary deleted right after a graceful drain never loses a
+/// shipped-but-not-yet-applied tail (the blue-green failover gap). The target is
+/// a **fresh exact** `MAX(turso_cdc.change_id)` read here (not only the sampled
+/// gauge, which can lag the true head by up to `HEAD_SAMPLE_INTERVAL` and would
+/// miss the very last write — F1), re-maxed each poll with the gauge so a write
+/// the still-running drivers ship during the wait is also caught. Call this as
+/// late in shutdown as possible — right before `channel.shutdown()`, after the
+/// other drain steps — so writers abandoned by the HTTP drain cannot commit
+/// after it returns (F2). `expect_replicas` = gossip lists an alive peer: when
+/// true, a transient drop to zero subscribers keeps the gate waiting rather than
+/// closing on a reconnect gap (F3). Bounded by [`DRAIN_CATCHUP_TIMEOUT`]: a dead
+/// or pre-v0.16.2 (never-acking) replica is WARNed about (and counted) and the
+/// channel closes anyway rather than hanging shutdown forever.
+pub async fn drain_whole_db_primary(expect_replicas: bool) {
+    if WHOLE_DB_MGMT.get().is_none() {
+        // No whole-database CDC mgmt factory registered in this process — this
+        // is not a whole-DB clustered primary (e.g. a per-site clustered node,
+        // which sets `primary_view` on every node but runs a different path).
+        // Belt-and-braces against a caller predicate that is too broad (R1).
+        return;
+    }
+    if cdc_metrics::drain_catchup_state(DEFAULT_SITE).subscribers == 0 && !expect_replicas {
+        return; // no replica attached and no alive peer — nothing to wait for
+    }
+    let seed = fresh_cdc_head().await;
+    tracing::info!(
+        head = ?seed,
+        "CDC whole-database drain: waiting for replicas to apply the head"
+    );
+    let outcome = drain_catchup_wait(
+        seed,
+        || cdc_metrics::current_head(DEFAULT_SITE),
+        || cdc_metrics::drain_catchup_state(DEFAULT_SITE),
+        expect_replicas,
+    )
+    .await;
+    match outcome {
+        DrainCatchupOutcome::NoSubscribers => {}
+        DrainCatchupOutcome::CaughtUp { head, waited } => {
+            cdc_metrics::record_drain_catchup(waited, false);
+            tracing::info!(
+                head,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "CDC whole-database drain: all replicas caught up; closing channel"
+            );
+        }
+        DrainCatchupOutcome::TimedOut { head, min_applied, subscribers, waited } => {
+            cdc_metrics::record_drain_catchup(waited, true);
+            tracing::warn!(
+                head,
+                ?min_applied,
+                subscribers,
+                waited_secs = waited.as_secs(),
+                "CDC whole-database drain: closing channel with replicas still behind their \
+                 primary; their un-applied tail may be lost if this primary is now deleted"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Primary: one tailer per subscriber. (Subscriber-side accept is
 // registered up in `start_clustered_turso_cdc` so it exists across role
 // transitions.)
@@ -1103,7 +1294,7 @@ fn spawn_head_sampler(
 ///
 /// Returns an error if the first frame is not a valid `Subscribe`, if a
 /// `turso_cdc` poll fails, or if the stream breaks.
-pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
     stream: S,
     mgmt: &Turso,
     local_log_id: &str,
@@ -1114,20 +1305,31 @@ pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 /// [`serve_subscriber`] for one named site: the shipping metrics (subscriber
 /// count, head, shipped cursor, lag) are recorded under `site`, so the
 /// per-site clustered path's sites never mix their logs' positions.
-async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut stream: S,
+async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
+    stream: S,
     mgmt: &Turso,
     local_log_id: &str,
     site: &str,
 ) -> anyhow::Result<()> {
+    // Split so the ship loop (write half) can run while a child task drains the
+    // replica's upstream `Applied` acks (read half) without either blocking the
+    // other. The two halves are independent; `read_frame`/`write_frame` each
+    // take only the bound they need.
+    let (mut rd, mut wr) = tokio::io::split(stream);
+
     // Carry this owner's persisted ownership epoch (#654) so the replica can
     // adopt it durably — the crux that lets a promoted replica out-rank a
     // returning owner's stale copy without depending on a live gossip advert.
+    // `applied_acks: true` advertises that this primary consumes the replica's
+    // `Frame::Applied` catch-up acks (the drain-handover gate, v0.16.2).
     let epoch = read_owner_epoch(mgmt).await;
-    write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string(), epoch })
-        .await
-        .context("send hello frame")?;
-    let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
+    write_frame(
+        &mut wr,
+        &Frame::Hello { log_id: local_log_id.to_string(), epoch, applied_acks: true },
+    )
+    .await
+    .context("send hello frame")?;
+    let from = match read_frame(&mut rd).await.context("read subscribe frame")? {
         Frame::Subscribe { from_change_id } => from_change_id,
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
     };
@@ -1139,6 +1341,35 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // are unwound by the guard's Drop rather than by a detach call this
     // function has no single place to make.
     let subscriber = cdc_metrics::attach_subscriber(site, from);
+
+    // After `Subscribe`, the replica's only upstream frame is `Frame::Applied`
+    // (its durably-applied watermark). Drain it on a child task so the ship
+    // loop never blocks on a read; the recorder shares the subscriber's state
+    // by `Arc`, and the task is aborted when this function returns on any path
+    // (the `AbortOnDrop` guard). A pre-v0.16.2 replica sends nothing, so the
+    // task simply blocks harmlessly on its first read until the stream ends.
+    let recorder = subscriber.applied_recorder();
+    let reader = tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(Frame::Applied { change_id }) => recorder.record(change_id),
+                // A well-behaved replica sends only `Applied` here; ignore
+                // anything else defensively rather than tearing the stream.
+                Ok(_) => {}
+                // Stream closed (normal: the replica went away) or a decode
+                // error (a future upstream frame an old primary can't read).
+                // Either way the reader is done; the ship loop's next write sees
+                // the close too and returns. Logged at debug — a clean EOF here
+                // is the common, benign case, so it must not WARN on every
+                // normal replica disconnect.
+                Err(e) => {
+                    tracing::debug!("CDC applied-ack reader ended: {e:#}");
+                    break;
+                }
+            }
+        }
+    });
+    let _reader_guard = AbortOnDrop(reader);
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
@@ -1175,7 +1406,7 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 let rows = batch.rows.len();
                 let frame =
                     Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                write_frame(&mut stream, &frame).await?;
+                write_frame(&mut wr, &frame).await?;
                 // Recorded only after the frame is on the wire: counting
                 // a batch we then failed to write would overstate how far
                 // this subscriber has actually got.
@@ -1194,7 +1425,7 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
-                    write_frame(&mut stream, &Frame::Ping).await?;
+                    write_frame(&mut wr, &Frame::Ping).await?;
                     idle_since = tokio::time::Instant::now();
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
@@ -1337,8 +1568,8 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
              mixed-version clustered nodes are not supported"
         )
     })?;
-    let (source_log_id, source_epoch) = match hello.context("read hello frame")? {
-        Frame::Hello { log_id, epoch } => (log_id, epoch),
+    let (source_log_id, source_epoch, primary_acks) = match hello.context("read hello frame")? {
+        Frame::Hello { log_id, epoch, applied_acks } => (log_id, epoch, applied_acks),
         other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
     };
     anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
@@ -1368,7 +1599,7 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         source_log = %source_log_id,
         "CDC replica: subscribed"
     );
-    consume_frames(stream, factory, apply_conn, site).await
+    consume_frames(stream, factory, apply_conn, site, primary_acks).await
 }
 
 async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -1376,6 +1607,10 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
+    // Whether the primary advertised (via `Hello.applied_acks`) that it consumes
+    // `Frame::Applied` catch-up acks. A pre-v0.16.2 primary sets this `false`,
+    // and we stay silent after `Subscribe` exactly as before.
+    ack_applied: bool,
 ) -> anyhow::Result<()> {
     loop {
         let frame = read_frame(stream).await?;
@@ -1423,6 +1658,20 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             row_count,
                             started.elapsed(),
                         );
+                        // Report our durably-applied watermark upstream, one
+                        // small frame per applied batch, so the primary's drain
+                        // gate learns it promptly. One ack per batch (vs
+                        // coalescing) keeps the primary's view current without a
+                        // delay that would make every drain wait for the next
+                        // heartbeat; the frame is ~30 bytes next to the batch it
+                        // follows. Sent only after the apply above committed, so
+                        // it never reports a watermark we have not durably
+                        // applied.
+                        if ack_applied {
+                            write_frame(stream, &Frame::Applied { change_id })
+                                .await
+                                .context("send applied ack")?;
+                        }
                     }
                     Err(e) => {
                         // Deliberately does NOT touch the watermark
@@ -1438,6 +1687,9 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             Frame::Ping => {}
             Frame::Subscribe { .. } => {
                 anyhow::bail!("primary sent a Subscribe frame; wrong direction");
+            }
+            Frame::Applied { .. } => {
+                anyhow::bail!("primary sent an Applied frame; wrong direction");
             }
             Frame::Hello { .. } => {
                 anyhow::bail!("primary sent a second Hello frame; only valid as the first frame");
@@ -5517,13 +5769,172 @@ mod tests {
     #[tokio::test]
     async fn hello_frame_roundtrips() {
         let (mut client, mut server) = tokio::io::duplex(65536);
-        write_frame(&mut client, &Frame::Hello { log_id: "abc123".into(), epoch: 0 })
-            .await
-            .unwrap();
+        write_frame(
+            &mut client,
+            &Frame::Hello { log_id: "abc123".into(), epoch: 0, applied_acks: false },
+        )
+        .await
+        .unwrap();
         match read_frame(&mut server).await.unwrap() {
             Frame::Hello { log_id, .. } => assert_eq!(log_id, "abc123"),
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn applied_frame_roundtrips() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+        write_frame(&mut client, &Frame::Applied { change_id: 4242 }).await.unwrap();
+        match read_frame(&mut server).await.unwrap() {
+            Frame::Applied { change_id } => assert_eq!(change_id, 4242),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// Back-compat: a pre-v0.16.2 `Hello` on the wire carries neither `epoch`
+    /// nor `applied_acks`; both `#[serde(default)]` to the fail-safe values, so
+    /// a new node decodes an old primary's Hello without error and treats it as
+    /// "does not consume applied acks".
+    #[test]
+    fn old_hello_decodes_with_defaults() {
+        let frame: Frame = serde_json::from_str(r#"{"Hello":{"log_id":"old"}}"#).unwrap();
+        match frame {
+            Frame::Hello { log_id, epoch, applied_acks } => {
+                assert_eq!(log_id, "old");
+                assert_eq!(epoch, 0, "epoch defaults to 0");
+                assert!(!applied_acks, "applied_acks defaults to false");
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_returns_immediately_with_no_subscribers_and_no_peers() {
+        // No replica attached AND no alive peer — nothing could be lost.
+        let outcome = drain_catchup_wait(
+            None,
+            || Some(100),
+            || cdc_metrics::DrainCatchup { subscribers: 0, min_applied: None },
+            false,
+        )
+        .await;
+        assert_eq!(outcome, DrainCatchupOutcome::NoSubscribers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_waits_until_applied_reaches_head() {
+        let start = tokio::time::Instant::now();
+        // The replica is behind (50 < head 100) until 1s of virtual time passes,
+        // then catches up. The gate must block until then, no longer.
+        let outcome = drain_catchup_wait(
+            None,
+            || Some(100),
+            move || {
+                let caught = start.elapsed() >= Duration::from_secs(1);
+                cdc_metrics::DrainCatchup {
+                    subscribers: 1,
+                    min_applied: Some(if caught { 100 } else { 50 }),
+                }
+            },
+            true,
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::CaughtUp { head, waited } => {
+                assert_eq!(head, 100);
+                assert!(
+                    waited >= Duration::from_secs(1) && waited < Duration::from_secs(2),
+                    "should return just after catch-up, waited {waited:?}"
+                );
+            }
+            other => panic!("expected CaughtUp, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_times_out_on_a_lagging_or_silent_replica() {
+        // A replica stuck below the head — also models a pre-v0.16.2 replica
+        // that never acks (its seeded applied stays below head): the gate must
+        // give up at the timeout rather than hang shutdown forever.
+        let outcome = drain_catchup_wait(
+            None,
+            || Some(100),
+            || cdc_metrics::DrainCatchup { subscribers: 1, min_applied: Some(50) },
+            true,
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::TimedOut { head, min_applied, subscribers, waited } => {
+                assert_eq!(head, 100);
+                assert_eq!(min_applied, Some(50));
+                assert_eq!(subscribers, 1);
+                assert!(waited >= DRAIN_CATCHUP_TIMEOUT, "waited {waited:?}");
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    /// F1: the fresh `seed` head is the authoritative target even when the
+    /// sampled gauge has not caught up (`head()` returns `None`). A replica at
+    /// 50 with seed 100 must NOT be declared caught up — the gauge alone would
+    /// have missed the last write.
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_uses_the_fresh_seed_head_not_only_the_gauge() {
+        let outcome = drain_catchup_wait(
+            Some(100),
+            || None, // gauge never observed the last write
+            || cdc_metrics::DrainCatchup { subscribers: 1, min_applied: Some(50) },
+            true,
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::TimedOut { head, min_applied, .. } => {
+                assert_eq!(head, 100, "the fresh seed, not the (absent) gauge, is the target");
+                assert_eq!(min_applied, Some(50));
+            }
+            other => panic!("expected TimedOut (replica below the seed head), got {other:?}"),
+        }
+    }
+
+    /// F3: a transient drop to zero subscribers while a peer is still alive is
+    /// NOT "caught up" — the gate keeps waiting (and times out) rather than
+    /// closing the channel on a reconnect gap and silently losing the tail.
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_waits_through_a_reconnect_gap_when_peers_are_expected() {
+        let outcome = drain_catchup_wait(
+            Some(100),
+            || Some(100),
+            || cdc_metrics::DrainCatchup { subscribers: 0, min_applied: None },
+            true, // a peer is alive, so the missing subscriber should re-attach
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::TimedOut { subscribers, .. } => {
+                assert_eq!(
+                    subscribers, 0,
+                    "no replica ever re-attached → timed out, not closed early"
+                );
+            }
+            other => panic!("expected TimedOut (never closed on the gap), got {other:?}"),
+        }
+    }
+
+    /// R1 belt-and-braces: with no whole-database CDC mgmt factory registered in
+    /// this process — the state on a per-site clustered node, which still sets
+    /// `primary_view` on every node — `drain_whole_db_primary` returns
+    /// immediately instead of spinning the full timeout (which would fire a
+    /// false WARN + metric on every per-site shutdown). `WHOLE_DB_MGMT` is never
+    /// set in unit tests (no `start_clustered_turso_cdc` runs here).
+    #[tokio::test(start_paused = true)]
+    async fn drain_whole_db_primary_is_a_noop_without_a_registered_factory() {
+        assert!(WHOLE_DB_MGMT.get().is_none(), "no whole-DB factory in the unit-test process");
+        let start = tokio::time::Instant::now();
+        // expect_replicas = true would otherwise keep the gate waiting to the bound.
+        drain_whole_db_primary(true).await;
+        assert!(
+            start.elapsed() < DRAIN_CATCHUP_TIMEOUT,
+            "must early-return without the registered factory, not wait the timeout"
+        );
     }
 
     /// A database's log identity is generated once and survives reopening
