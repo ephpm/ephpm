@@ -1486,6 +1486,33 @@ const LOG_WATERMARKS_TABLE: &str = "__ephpm_cdc_watermarks";
 /// excluded from snapshot dumps and the cold-start check.
 const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
 
+/// Every CDC / replication bookkeeping table a clustered database carries
+/// that a single-node database does not — the change-capture log and the
+/// ePHPm/litewire cursor tables.
+///
+/// These all live **inside** the `.db` file, so a physical `VACUUM INTO`
+/// backup of a clustered database captures them. `ephpm db restore` strips
+/// exactly this set from a restored image (`db_backup::strip_cdc_bookkeeping`)
+/// so the file comes back as clean origin data: a fresh `__ephpm_cdc_log_id`
+/// is minted on open and `site_data_lineage` stamps the node as the site's
+/// origin. This does not on its own re-converge a running cluster — a replica
+/// still holding old data treats the fresh log id as a failover and tails on
+/// top of it — so a clustered restore is an experimental, manual wipe-the-
+/// replicas procedure in this release (see `ephpm db restore`).
+///
+/// **Not** `__turso_internal_*`: those are the engine's own autoincrement
+/// backing tables — valid physical state that must survive the strip — which
+/// is why the restore uses this curated list rather than the broad `__`
+/// predicate [`is_internal_object`] uses for the *logical* dump.
+pub const CDC_BOOKKEEPING_TABLES: &[&str] = &[
+    "turso_cdc",
+    LOG_ID_TABLE,
+    SOURCE_LOG_TABLE,
+    LOG_WATERMARKS_TABLE,
+    EPOCH_TABLE,
+    WATERMARK_TABLE,
+];
+
 /// Read this database's persistent CDC log identity, generating and
 /// storing a fresh random one if none exists yet.
 ///

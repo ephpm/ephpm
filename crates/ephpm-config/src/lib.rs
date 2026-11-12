@@ -2940,8 +2940,16 @@ pub struct SqliteConfig {
 /// optional `AWS_SESSION_TOKEN`) in the environment only — never from this
 /// file, never logged; startup fails with `enabled = true` and none set.
 ///
-/// Single-node and per-site modes only: with clustering enabled startup
-/// refuses (`Config::validate`) rather than ship every site once per node.
+/// Works in every embedded mode. In clustered modes each database is
+/// snapshotted by exactly one node — its write node by default
+/// (`source = "primary"`), or a non-write holder with `source = "replica"` —
+/// gated on election/HRW ownership so no database is shipped twice per
+/// interval, and `ephpm db restore` strips the CDC replication bookkeeping a
+/// physical snapshot carries so the installed file is clean origin data.
+/// Restoring INTO a running cluster is experimental and manual — replicas do
+/// not auto-converge, so every node is stopped and every other node's copy
+/// wiped (see `ephpm db restore`). Clustered mode is itself experimental (Turso
+/// is Beta upstream), so clustered backup is too.
 ///
 /// Unknown keys are a startup error, as in every section.
 #[derive(Debug, Deserialize, Clone)]
@@ -2994,6 +3002,22 @@ pub struct DbBackupConfig {
     /// `endpoint` is set, `false` for AWS S3.
     #[serde(default)]
     pub path_style: Option<bool>,
+
+    /// **Which node snapshots each clustered database.** `"primary"`
+    /// (default) backs a database up from its write node — the elected
+    /// primary in whole-database clustered mode, the site's HRW owner in
+    /// per-site clustered mode — for the freshest recovery point; the
+    /// `VACUUM INTO` read and its WAL pin land on that write-critical node.
+    /// `"replica"` backs it up from a non-write holder instead (a
+    /// non-primary node, or a non-owner node that holds a current copy of
+    /// the site), sparing the write path the I/O and the WAL pin at the
+    /// cost of `interval + replication lag` as the recovery point. A typo
+    /// is a startup error naming the accepted values. **Only meaningful in
+    /// clustered mode** — single-node and per-site-single servers have one
+    /// holder, so this is ignored there (there is nowhere else to run it).
+    /// Default: `"primary"`.
+    #[serde(default = "default_db_backup_source")]
+    pub source: String,
 }
 
 impl Default for DbBackupConfig {
@@ -3007,8 +3031,24 @@ impl Default for DbBackupConfig {
             endpoint: None,
             region: default_kv_snapshot_region(),
             path_style: None,
+            source: default_db_backup_source(),
         }
     }
+}
+
+/// Which node runs a clustered database's scheduled backup.
+///
+/// The typed form of [`DbBackupConfig::source`], resolved by
+/// [`DbBackupConfig::backup_source`]. Ignored outside clustered mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupSource {
+    /// Back up from the write node — the whole-database primary, or a
+    /// site's HRW owner. Freshest recovery point.
+    Primary,
+    /// Back up from a non-write holder — a non-primary node, or a non-owner
+    /// node that holds a current copy of the site. Recovery point lags by
+    /// replication lag; the write path is spared the `VACUUM` I/O.
+    Replica,
 }
 
 impl DbBackupConfig {
@@ -3042,6 +3082,21 @@ impl DbBackupConfig {
         Ok(d)
     }
 
+    /// The [`BackupSource`] this config selects, mapped lossily: anything
+    /// other than a case-insensitive `"replica"` is [`BackupSource::Primary`]
+    /// (the default). `Config::validate` rejects an unrecognized value up
+    /// front, so by the time this is called the string is already known-good;
+    /// defaulting to `Primary` here is the fail-safe direction (back up from
+    /// the write node, never silently skip a database).
+    #[must_use]
+    pub fn backup_source(&self) -> BackupSource {
+        if self.source.trim().eq_ignore_ascii_case("replica") {
+            BackupSource::Replica
+        } else {
+            BackupSource::Primary
+        }
+    }
+
     /// How long objects are kept.
     ///
     /// # Errors
@@ -3063,6 +3118,13 @@ impl DbBackupConfig {
 fn default_db_backup_s3_path() -> String {
     "ephpm/db".to_string()
 }
+
+fn default_db_backup_source() -> String {
+    "primary".to_string()
+}
+
+/// Every accepted `[db.sqlite.backup] source` value.
+const DB_BACKUP_SOURCES: [&str; 2] = ["primary", "replica"];
 
 fn default_db_backup_interval() -> String {
     "15m".to_string()
@@ -6055,12 +6117,11 @@ impl Config {
 
         // [db.sqlite.backup]: `enabled` is the switch, so everything it needs
         // is checked up front — a bucket, parsable non-zero cadence and
-        // retention, a well-formed endpoint — rather than at the first tick,
-        // fifteen minutes after a start that logged "backup enabled".
-        // Clustered modes are refused outright: nothing schedules per
-        // owner/primary yet, so every node would ship every site once per
-        // interval, and the artifact would carry CDC bookkeeping a restore
-        // cannot reconcile. See the roadmap for the clustered follow-up.
+        // retention, a well-formed endpoint, a recognized `source` — rather
+        // than at the first tick, fifteen minutes after a start that logged
+        // "backup enabled". Clustered modes are allowed (see the note below the
+        // checks): the scheduler gates each database on this node's ownership so
+        // it is shipped by exactly one node.
         if let Some(sqlite) = self.db.sqlite.as_ref()
             && sqlite.backup.enabled
         {
@@ -6091,21 +6152,28 @@ impl Config {
             }
             backup.interval()?;
             backup.retention()?;
-            let role = sqlite.replication.role.as_str();
-            let clustered =
-                role == "primary" || role == "replica" || (role == "auto" && self.cluster.enabled);
-            if clustered {
-                return Err(ConfigError::Validation(
-                    "[db.sqlite.backup] enabled = true is not supported in clustered mode \
-                     ([cluster] enabled = true with [db.sqlite.replication] role = \"auto\", or \
-                     role = \"primary\" / \"replica\"): backups are not yet scheduled per \
-                     owner/primary, so every node would upload every database once per interval, \
-                     and the snapshot would carry replication bookkeeping a restore cannot \
-                     reconcile. Set [db.sqlite.backup] enabled = false on cluster nodes, or set \
-                     [db.sqlite.replication] role = \"single\" to run this node unclustered."
-                        .to_string(),
-                ));
+            // `source` selects which node snapshots each clustered database.
+            // Fail closed on a typo (a silently-dropped value would run the
+            // default, which is the lossily-parsed-mode-string trap). In
+            // single-node / per-site-single mode there is one holder, so the
+            // value has no effect — but it is still validated so a config
+            // written for a cluster does not surprise an operator who later
+            // turns clustering on.
+            if !DB_BACKUP_SOURCES.iter().any(|s| s.eq_ignore_ascii_case(backup.source.trim())) {
+                return Err(ConfigError::Validation(format!(
+                    "[db.sqlite.backup] source must be one of {}, got {:?}",
+                    DB_BACKUP_SOURCES.join(", "),
+                    backup.source,
+                )));
             }
+            // Clustered backup is allowed (v0.16.1): the scheduler gates each
+            // database on this node's election/HRW ownership so it is
+            // snapshotted by exactly one node, and `ephpm db restore` strips
+            // the CDC replication bookkeeping a physical snapshot carries so the
+            // installed file is clean origin data. Restoring INTO a cluster is
+            // experimental and manual (replicas do not auto-converge; see the
+            // restore prompt / design note). Clustered mode is itself
+            // experimental (Turso is Beta upstream), so clustered backup is too.
         }
 
         // [[server.proxy]]: validate every rule at startup so a bad upstream,
@@ -10453,26 +10521,51 @@ listen = "0.0.0.0:8080"
         validate("enabled = true\ns3_bucket = \"ephpm-backups\"\nretention = \"30d\"\n")
             .expect("a complete single-node section validates");
 
-        // Clustered: refused, every way clustering can be selected.
-        let clustered = |extra: &str| -> String {
+        // Clustered backup is now allowed (v0.16.0: owner/primary-gated
+        // scheduling + strip-on-restore reconciliation), every way clustering
+        // can be selected.
+        let clustered = |extra: &str| {
             let cfg = load_toml(&format!(
                 "[db.sqlite]\n[db.sqlite.backup]\nenabled = true\ns3_bucket = \"b\"\n{extra}"
             ));
-            cfg.validate().expect_err("clustered + backup must refuse").to_string()
+            cfg.validate()
         };
-        let err = clustered("[cluster]\nenabled = true\nsecret = \"s\"\n");
-        assert!(err.contains("clustered"), "{err}");
-        let err = clustered("[db.sqlite.replication]\nrole = \"primary\"\n");
-        assert!(err.contains("clustered"), "{err}");
-        let err = clustered("[db.sqlite.replication]\nrole = \"replica\"\n");
-        assert!(err.contains("clustered"), "{err}");
-        // `role = "single"` forces single-node even with clustering on, so
-        // backups are allowed there.
-        let cfg = load_toml(
-            "[db.sqlite]\n[db.sqlite.backup]\nenabled = true\ns3_bucket = \"b\"\n[cluster]\n\
-             enabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"single\"\n",
-        );
-        cfg.validate().expect("role = single is unclustered");
+        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n")
+            .expect("clustered auto now allowed");
+        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"primary\"\n")
+            .expect("clustered primary now allowed");
+        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"replica\"\n")
+            .expect("clustered replica now allowed");
+        // `role = "single"` forces single-node even with clustering on; still
+        // allowed, as before.
+        clustered("[cluster]\nenabled = true\nsecret = \"s\"\n[db.sqlite.replication]\nrole = \"single\"\n")
+            .expect("role = single is unclustered");
+
+        // `source`: parsed, default primary, rejected on a typo, accepted
+        // case-insensitively.
+        validate("enabled = true\ns3_bucket = \"b\"\nsource = \"replica\"\n")
+            .expect("source = replica is accepted");
+        validate("enabled = true\ns3_bucket = \"b\"\nsource = \"PRIMARY\"\n")
+            .expect("source is case-insensitive");
+        let err = validate("enabled = true\ns3_bucket = \"b\"\nsource = \"leader\"\n").unwrap_err();
+        assert!(err.contains("source"), "{err}");
+        assert!(err.contains("primary, replica"), "{err}");
+    }
+
+    /// The default `source` is `primary`, and the typed accessor maps the
+    /// strings (and anything unrecognized, fail-safe) correctly.
+    #[test]
+    fn db_backup_source_defaults_to_primary_and_maps() {
+        let dflt = DbBackupConfig::default();
+        assert_eq!(dflt.source, "primary");
+        assert_eq!(dflt.backup_source(), BackupSource::Primary);
+        let replica = DbBackupConfig { source: "replica".into(), ..DbBackupConfig::default() };
+        assert_eq!(replica.backup_source(), BackupSource::Replica);
+        let caps = DbBackupConfig { source: "Replica".into(), ..DbBackupConfig::default() };
+        assert_eq!(caps.backup_source(), BackupSource::Replica);
+        // Unrecognized is fail-safe (validate() would have rejected it first).
+        let junk = DbBackupConfig { source: "leader".into(), ..DbBackupConfig::default() };
+        assert_eq!(junk.backup_source(), BackupSource::Primary);
     }
 
     /// `d` is a duration unit (`retention = "14d"`), alongside the others.

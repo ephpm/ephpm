@@ -566,10 +566,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
 
     // Scheduled embedded-database backups (`[db.sqlite.backup]`): the task
     // opens its own gated engine handle per database per tick, so it needs
-    // nothing from the serving factories and can start now. Clustered modes
-    // were refused by `Config::validate`.
-    let db_backup = db_backup::DbBackupService::from_config(&config)
-        .context("failed to set up embedded database backups")?;
+    // nothing from the serving factories and can start now. In clustered
+    // modes it gates each database on this node's election/HRW ownership
+    // (whole-DB: the shared `primary_view`; per-site: `hrw_owner`) so each is
+    // snapshotted by exactly one node.
+    let db_backup =
+        db_backup::DbBackupService::from_config(&config, cluster_handle.as_ref(), &primary_view)
+            .context("failed to set up embedded database backups")?;
     let db_backup_periodic = db_backup.as_ref().map(db_backup::DbBackupService::spawn_periodic);
 
     // Distributed cron scheduler (`[cron]`): spawned here so it holds the same

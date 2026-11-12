@@ -579,6 +579,7 @@ Recorded only when `[db.sqlite.backup] enabled = true` ([config](/reference/conf
 | `ephpm_db_backup_last_success_timestamp_seconds` | gauge | `site` | Unix time of the last successful upload; `time() - this` is the backup lag. |
 | `ephpm_db_backup_retention_deleted_total` | counter | `site` | Objects deleted by the retention sweep (the newest is never one of them). |
 | `ephpm_db_backup_retention_errors_total` | counter | `site` | Retention sweeps that failed (a listing or a delete). The backup itself succeeded; the sweep is retried on the next tick. |
+| `ephpm_db_backup_skipped_total` | counter | `site`, `reason` (`not_primary`, `not_replica`, `not_owner`, `empty_snapshot`) | **Clustered modes only.** Databases this node did *not* back up this tick. `not_primary`/`not_replica` (whole-database cluster, by `[db.sqlite.backup] source`) and `not_owner` (per-site cluster) mean another node is responsible — this increments on every *other* node, so its presence is how you confirm exactly-once coverage. `empty_snapshot` means this node *was* responsible but its copy held no user tables (a cold / still-bootstrapping replica or an unsettled new owner); the empty image is not shipped, so it can never become the newest object and overwrite the last good backup. |
 
 ```promql
 # A site whose last good backup is older than two intervals (here: 15m).
