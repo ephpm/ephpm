@@ -1205,6 +1205,13 @@ where
 /// or pre-v0.16.2 (never-acking) replica is WARNed about (and counted) and the
 /// channel closes anyway rather than hanging shutdown forever.
 pub async fn drain_whole_db_primary(expect_replicas: bool) {
+    if WHOLE_DB_MGMT.get().is_none() {
+        // No whole-database CDC mgmt factory registered in this process — this
+        // is not a whole-DB clustered primary (e.g. a per-site clustered node,
+        // which sets `primary_view` on every node but runs a different path).
+        // Belt-and-braces against a caller predicate that is too broad (R1).
+        return;
+    }
     if cdc_metrics::drain_catchup_state(DEFAULT_SITE).subscribers == 0 && !expect_replicas {
         return; // no replica attached and no alive peer — nothing to wait for
     }
@@ -5910,6 +5917,24 @@ mod tests {
             }
             other => panic!("expected TimedOut (never closed on the gap), got {other:?}"),
         }
+    }
+
+    /// R1 belt-and-braces: with no whole-database CDC mgmt factory registered in
+    /// this process — the state on a per-site clustered node, which still sets
+    /// `primary_view` on every node — `drain_whole_db_primary` returns
+    /// immediately instead of spinning the full timeout (which would fire a
+    /// false WARN + metric on every per-site shutdown). `WHOLE_DB_MGMT` is never
+    /// set in unit tests (no `start_clustered_turso_cdc` runs here).
+    #[tokio::test(start_paused = true)]
+    async fn drain_whole_db_primary_is_a_noop_without_a_registered_factory() {
+        assert!(WHOLE_DB_MGMT.get().is_none(), "no whole-DB factory in the unit-test process");
+        let start = tokio::time::Instant::now();
+        // expect_replicas = true would otherwise keep the gate waiting to the bound.
+        drain_whole_db_primary(true).await;
+        assert!(
+            start.elapsed() < DRAIN_CATCHUP_TIMEOUT,
+            "must early-return without the registered factory, not wait the timeout"
+        );
     }
 
     /// A database's log identity is generated once and survives reopening

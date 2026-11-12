@@ -725,14 +725,23 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // the CDC head before the channel closes, so a primary deleted right after
     // this graceful drain does not lose its shipped-but-not-yet-applied tail
     // (v0.16.2). Run as LATE as possible — right before `channel.shutdown()`
-    // below, after the KV handoff/snapshot and the cron abort — so writers the
-    // HTTP drain abandoned (PHP threads, cron children) cannot commit after the
-    // gate returns (F2). The channel is still open and the replication drivers
-    // still ship here (they stop only at `stop_replication_drivers()` below).
-    // KV-only clustered has no CDC head and a non-primary is not the writer, so
-    // both skip it.
+    // below, after the KV handoff/snapshot and the cron abort — to shrink the
+    // window in which a straggler commits after the gate (F2). The channel is
+    // still open and the replication drivers still ship here (they stop only at
+    // `stop_replication_drivers()` below). Gate on **whole-database** clustered
+    // mode specifically (`EmbeddedSqliteMode::Clustered`), not every
+    // `is_clustered_sqlite`: per-site clustered is a different variant that never
+    // registers `WHOLE_DB_MGMT` yet sets `primary_view` on every node, so a
+    // broader predicate would spin the full timeout on every per-site shutdown
+    // (R1). Non-primaries are not the writer and skip it.
+    //
+    // This shrinks but does not eliminate the straggler window — the wire
+    // listener is not stopped here, so a detached cron child or an operator's
+    // wire client could still commit during/after the gate. Fully closing that
+    // (stopping the listener before the gate) is a tracked follow-up; the
+    // graceful blue-green flow (no such writers) is covered.
     let whole_db_drain = cluster_handle.as_ref().filter(|_| {
-        config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled))
+        embedded_sqlite_mode(&config) == EmbeddedSqliteMode::Clustered
             && primary_view.load(std::sync::atomic::Ordering::Relaxed)
     });
 
