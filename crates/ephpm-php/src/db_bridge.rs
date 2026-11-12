@@ -3528,6 +3528,13 @@ mod screen_tests {
         // VACUUM slipped (Finding 3). Now the `;` splits and VACUUM is caught.
         rejected("SELECT [a#b]; VACUUM");
         rejected("SELECT 1 # x\n; VACUUM");
+        // A leading `#` line under the standard rule is NOT a hiding comment:
+        // the screen allows it, and that is safe because the only engine on
+        // this path (Turso) lexes `#…` as `TK_ILLEGAL`, so the parser errors
+        // and nothing executes — and no standard-rule path hands raw
+        // leading-`#` tenant text to the engine. Pinned so any future change
+        // to treat `#` as a standard-rule comment is a deliberate one.
+        allowed("# x\nVACUUM");
     }
 
     /// Finding 1 (#710 round 2): in the MySQL dialect a `--` is a comment only
@@ -3553,6 +3560,13 @@ mod screen_tests {
         rejected_mysql("SELECT 1 --1;ATTACH DATABASE 'x' AS y");
         rejected_mysql("SELECT 1 --1;PRAGMA writable_schema = 1");
         rejected_mysql("SELECT 1 --1;PRAGMA main.data_store_directory = '/tmp'");
+        // The other `--`-not-a-comment shapes sqlparser splits: only a single
+        // space introduces a comment, so a tab, a following quote, or a third
+        // dash all leave `--` as `Minus` tokens and expose the `;` — documents
+        // exactly why the rule is space-only and not any-whitespace.
+        rejected_mysql("SELECT 1 --\t1;PRAGMA journal_mode = 'mvcc'");
+        rejected_mysql("SELECT 1 --'x';VACUUM");
+        rejected_mysql("SELECT 1 ---1;ATTACH DATABASE 'x' AS y");
         // A real MySQL comment (`--` then a space) still comments to EOL, so a
         // `;` inside it is genuinely commented out and the input is one
         // statement — allowed on the MySQL rule, matching the executor.
