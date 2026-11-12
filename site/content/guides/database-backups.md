@@ -351,7 +351,7 @@ manual wipe. The procedure is then:
    election makes primary).
 3. Start the restored node **first**, then the others — each auto-converges.
 4. Verify each replica re-bootstrapped (`ephpm_cdc_bootstrap_total{outcome="ok"}`
-   / the "snapshot bootstrap complete" log line).
+   / the "reseed re-bootstrap complete" log line).
 
 `--reseed` requires **every** node on v0.16.2+; an older replica ignores the
 signal and stays divergent (fail-safe, not corruption), so a mixed-version

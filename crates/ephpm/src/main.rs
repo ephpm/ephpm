@@ -781,8 +781,8 @@ enum DbBackupCommand {
         #[arg(long, short = 'c')]
         config: PathBuf,
 
-        /// `s3://bucket[/prefix]` to list instead of the configured
-        /// `[db.sqlite.backup]` bucket and `s3_path`.
+        /// `s3://bucket[/prefix]` or a local backup directory to list instead
+        /// of the configured `[db.sqlite.backup]` destination (bucket or `dir`).
         #[arg(long)]
         from: Option<String>,
 

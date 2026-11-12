@@ -93,7 +93,7 @@ against MySQL 8.4.11.
 | String comparison | `_ci` collations are case-insensitive | Binary (case-sensitive) for `=`, `UNIQUE`, `ORDER BY`. `LIKE` is case-insensitive for ASCII on both |
 | `''` into an INT column (non-strict mode) | stored as `0` | stored as `''` (text). `n = 0` is false, `ORDER BY` puts it after every number, `SUM` / `n + 1` count it as 0 |
 | `sql_mode` | enforced (default `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,...`) | **reported, not enforced**. Default `''`. A session `SET sql_mode` is read back by `@@sql_mode` |
-| Bare columns next to `GROUP BY` | error under `ONLY_FULL_GROUP_BY`; otherwise an indeterminate row | first row in scan order. With `MIN()`/`MAX()` in the same select, the rusqlite engine picks the min/max row and Turso does not. Don't rely on it |
+| Bare columns next to `GROUP BY` | error under `ONLY_FULL_GROUP_BY`; otherwise an indeterminate row | first row in scan order. With `MIN()`/`MAX()` in the same select, Turso does **not** pick the min/max row for the bare columns. Don't rely on it |
 | `SELECT ... FOR UPDATE` | row locks; a second claimer waits | no row locks (single writer). A second transaction writing the same row gets a busy error instead of waiting |
 | Affected rows of an `UPDATE` that changes nothing | 0 (rows *changed*) | rows *matched* (as with `CLIENT_FOUND_ROWS`) |
 | Affected rows of an `ON DUPLICATE KEY UPDATE` that updates | 2 | 1 |
