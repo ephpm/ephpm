@@ -619,8 +619,9 @@ async fn an_unreachable_primary_increments_the_dial_error_counter() {
         l.local_addr().unwrap()
     };
 
-    // The production replica driver, pointed at nothing.
-    let driver = tokio::spawn(run_replica(mgmt, dead_addr, channel));
+    // The production replica driver, pointed at nothing. `1 << 30` snapshot-fetch
+    // bound (unused here — it only applies to a reseed re-bootstrap).
+    let driver = tokio::spawn(run_replica(mgmt, dead_addr, channel, 1 << 30));
 
     let observed = eventually(
         || async {

@@ -382,8 +382,9 @@ election/HRW ownership so it is snapshotted by exactly one node
 (`[db.sqlite.backup] source` = `primary` | `replica`), and `ephpm db restore`
 strips the CDC replication bookkeeping a physical clustered image carries so the
 installed file is clean origin data. Restoring *into* a running cluster is
-experimental and manual (replicas do not auto-converge; automatic `--reseed`
-planned) — see the
+experimental (whole-database restore gained automatic convergence via `ephpm db
+restore --reseed` in v0.16.2 — it stamps a reseed generation so replicas
+force-discard and cold re-bootstrap; per-site restore is still manual) — see the
 [clustered-backup design note](/roadmap/clustered-db-backups/).
 
 #### Tier 1: point-in-time restore (planned)

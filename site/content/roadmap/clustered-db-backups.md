@@ -31,15 +31,25 @@ a replica does **not** auto-converge onto a restored node.
 > replica; a non-owner per-site replica returns `TailOnly` while a lineage is
 > recorded), so it keeps its old rows and tails the restored log on top of them.
 > Convergence therefore requires **manually wiping every other node's `.db`**
-> before restart (the planned `--reseed`). The passages below that describe
-> "log-id change → proven divergence → re-bootstrap" are retained as the
-> *original design intent*; the implemented behaviour is the correction here.
+> before restart — or, since **v0.16.2**, the `--reseed` flag, which automates
+> exactly that for whole-database clustered restores (see below). The passages
+> below that describe "log-id change → proven divergence → re-bootstrap" are
+> retained as the *original design intent*; the implemented behaviour is the
+> correction here.
 
-- **Whole-database clustered backup — supported; restore experimental + manual.**
-  The snapshot is deterministic and exactly-once. Restoring reseeds no replica
-  automatically: stop every node, restore on the lowest-ordinal node, wipe every
-  other node's `.db`/`-wal`/`-shm`, start the restored node first, and verify
-  each replica re-bootstrapped. `--reseed` (automatic step 3) is **not built**.
+- **Whole-database clustered backup — supported; restore experimental.** The
+  snapshot is deterministic and exactly-once. **Since v0.16.2, `ephpm db restore
+  --reseed` converges the cluster automatically:** it stamps a monotonic reseed
+  generation into the restored image, which the restored node advertises in its
+  CDC `Hello`/snapshot header; every replica that sees a newer generation
+  force-discards its own database and cold re-bootstraps from the restored node.
+  The procedure is then: stop every node, `ephpm db restore --reseed` on the
+  lowest-ordinal node, start it **first**, then the others (which auto-converge),
+  and verify each via `ephpm_cdc_bootstrap_total{outcome="ok"}`. `--reseed`
+  requires **every node on v0.16.2+** — an older replica ignores the signal and
+  stays divergent (fail-safe, not corruption). Without `--reseed` the original
+  manual procedure still applies: wipe every other node's `.db`/`-wal`/`-shm`
+  before restart.
 - **Per-site clustered backup — EXPERIMENTAL.** The backup half snapshots each
   site once by its HRW owner (`source = "replica"` is not yet supported here and
   falls back to the owner with a `WARN`). Restore uses the same manual wipe
@@ -277,14 +287,21 @@ on top of its old rows. Stripping + ownership placement is not enough on its own
 `TailOnly`s rather than re-bootstraps. The operating procedure must also **wipe
 the replicas** so they come up cold:
 
-- **Whole-DB clustered — backup supported; restore experimental + manual.**
-  Restore the stripped image on the **lowest-ordinal node** (the one the election
-  makes primary) with the cluster stopped. Then **delete the `.db`/`-wal`/`-shm`
-  on every other node** so each comes up *cold* and `maybe_bootstrap_cold_replica`
-  fetches the restored primary's snapshot. Start the restored node first, then the
-  wiped replicas, and verify each re-bootstrapped. Skipping the wipe leaves a
-  replica tailing the restore on top of its old rows (a mix) — a later failover
-  then loses the restore. `--reseed` (automatic wipe) is **not yet built**.
+- **Whole-DB clustered — backup supported; restore experimental.** Restore the
+  stripped image on the **lowest-ordinal node** (the one the election makes
+  primary) with the cluster stopped. **Since v0.16.2, pass `--reseed`:** it
+  stamps a monotonic reseed generation into the image, which the restored node
+  advertises in its CDC `Hello`/snapshot header. Every replica that sees a newer
+  generation than it has adopted force-discards its own database and cold
+  re-bootstraps from the restored node — the automatic replacement for the manual
+  wipe. Start the restored node first, then the others, and verify each converged
+  (`ephpm_cdc_bootstrap_total{outcome="ok"}`). `--reseed` requires every node on
+  **v0.16.2+**; an older replica ignores the signal and stays divergent
+  (fail-safe, not corruption). *Without* `--reseed` the manual procedure still
+  applies: **delete the `.db`/`-wal`/`-shm` on every other node** so each comes
+  up *cold* and `maybe_bootstrap_cold_replica` fetches the restored primary's
+  snapshot — skipping that wipe leaves a replica tailing the restore on top of
+  its old rows (a mix), which a later failover then loses.
 - **Per-site clustered — EXPERIMENTAL, gated and lab-pending.** The site's owner
   after restart is `hrw_owner`, which depends on which nodes are alive first —
   not predictable offline. Convergence relies on the restored node **settling

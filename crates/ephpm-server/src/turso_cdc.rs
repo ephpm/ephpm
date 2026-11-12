@@ -419,6 +419,18 @@ enum Frame {
         /// direction, needs no handshake-version bump.
         #[serde(default)]
         applied_acks: bool,
+        /// The serving owner's adopted **reseed generation** (`ephpm db restore
+        /// --reseed`, v0.16.2, [`RESEED_GEN_TABLE`]): a monotonic unix-millisecond
+        /// stamp minted on the restored node. A replica that sees a generation
+        /// **strictly greater** than it has adopted ([`read_local_reseed_gen`])
+        /// force-discards its local data and cold re-bootstraps from this owner
+        /// ([`reseed_bootstrap`]) before tailing — the automatic whole-database
+        /// restore convergence. `#[serde(default, skip_serializing_if)]` so a
+        /// zero generation is omitted from the wire (byte-identical to a
+        /// pre-v0.16.2 `Hello`) and a pre-v0.16.2 owner's `Hello` decodes it `0`
+        /// — nothing to reseed, the fail-safe direction.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        reseed_gen: u64,
     },
     /// **Replica → primary, sent after [`Frame::Hello`].** The replica's
     /// applied watermark **in the log the Hello named**. The primary
@@ -818,8 +830,12 @@ pub async fn start_clustered_turso_cdc(
     );
 
     // Kick off role-appropriate work for the initial role.
-    let initial_driver =
-        tokio::spawn(start_role(initial_role, Arc::clone(&mgmt_factory), channel.clone()));
+    let initial_driver = tokio::spawn(start_role(
+        initial_role,
+        Arc::clone(&mgmt_factory),
+        channel.clone(),
+        max_snapshot_bytes,
+    ));
 
     // Role-change watcher. The previous role's driver is aborted before
     // the new one starts: a flapping election would otherwise pile up
@@ -836,7 +852,12 @@ pub async fn start_clustered_turso_cdc(
                 tracing::info!(?new_role, "CDC replication: role change detected");
                 is_primary.store(matches!(new_role, Role::Primary), Ordering::Relaxed);
                 current.abort();
-                current = tokio::spawn(start_role(new_role, Arc::clone(&mgmt), channel.clone()));
+                current = tokio::spawn(start_role(
+                    new_role,
+                    Arc::clone(&mgmt),
+                    channel.clone(),
+                    max_snapshot_bytes,
+                ));
             }
         }));
     } else {
@@ -1023,7 +1044,12 @@ async fn determine_role(
     }
 }
 
-async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::ChannelHandle) {
+async fn start_role(
+    role: Role,
+    mgmt: Arc<Turso>,
+    channel: ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
+) {
     match role {
         Role::Primary => {
             // Nothing to drive: on the primary, each inbound subscriber
@@ -1035,7 +1061,7 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
             );
         }
         Role::Replica { primary_addr } => {
-            if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
+            if let Err(e) = run_replica(mgmt, primary_addr, channel, max_snapshot_bytes).await {
                 tracing::error!("CDC replica loop exited: {e:#}");
             }
         }
@@ -1323,9 +1349,14 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 
     // `applied_acks: true` advertises that this primary consumes the replica's
     // `Frame::Applied` catch-up acks (the drain-handover gate, v0.16.2).
     let epoch = read_owner_epoch(mgmt).await;
+    // Carry this node's adopted reseed generation (v0.16.2) so a replica still
+    // holding pre-restore data converges automatically: it force-discards and
+    // cold re-bootstraps when this is strictly greater than what it has adopted.
+    // `0` on a cluster that has never been reseeded — nothing to converge.
+    let reseed_gen = read_owner_reseed_gen(mgmt).await;
     write_frame(
         &mut wr,
-        &Frame::Hello { log_id: local_log_id.to_string(), epoch, applied_acks: true },
+        &Frame::Hello { log_id: local_log_id.to_string(), epoch, applied_acks: true, reseed_gen },
     )
     .await
     .context("send hello frame")?;
@@ -1451,6 +1482,26 @@ impl std::fmt::Display for WatermarkResolution {
     }
 }
 
+/// Returned by [`subscribe_and_consume_site`] (before it would `Subscribe`) when
+/// the serving owner advertised a reseed generation newer than this replica has
+/// adopted (`ephpm db restore --reseed`, v0.16.2). Carried as a downcastable
+/// anyhow error — the same intercept pattern as [`WatermarkResolution`] — so
+/// [`run_replica`] drives [`reseed_bootstrap`] (force-discard + cold
+/// re-bootstrap) instead of treating it as a stream failure. `generation` is the
+/// owner's advertised value, which the re-bootstrap adopts on success.
+#[derive(Debug, Clone, Copy)]
+struct ReseedRequired {
+    generation: u64,
+}
+
+impl std::fmt::Display for ReseedRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reseed generation {} requires a forced cold re-bootstrap", self.generation)
+    }
+}
+
+impl std::error::Error for ReseedRequired {}
+
 /// The replica driver: dial the primary's `cdc/default` stream, announce
 /// the local watermark, apply what arrives, and retry forever.
 ///
@@ -1467,6 +1518,9 @@ pub async fn run_replica(
     mgmt: Arc<Turso>,
     primary_addr: SocketAddr,
     channel: ephpm_cluster::ChannelHandle,
+    // `[db.sqlite.replication] max_snapshot_bytes`: bounds a reseed re-bootstrap's
+    // snapshot fetch, the same way it bounds the cold-start bootstrap.
+    max_snapshot_bytes: u64,
 ) -> anyhow::Result<()> {
     // The replica's local Turso engine serves reads via litewire; writes
     // arrive only through apply_batch, keyed by monotonic watermark. The
@@ -1497,16 +1551,66 @@ pub async fn run_replica(
                         tracing::info!("CDC replica: primary closed stream cleanly");
                     }
                     Err(e) => {
+                        // The owner advertised a newer reseed generation
+                        // (`ephpm db restore --reseed`): force-discard the
+                        // local copy and cold re-bootstrap from the owner,
+                        // reusing the existing snapshot fetch/install
+                        // primitives, then loop back to tail. A failed
+                        // re-bootstrap just retries on the next iteration
+                        // (the generation is still unadopted, so the next
+                        // Hello re-signals it) — the local data is only
+                        // discarded inside `install_snapshot`, after the
+                        // replacement snapshot has been fetched and vetted.
+                        if let Some(req) = e.downcast_ref::<ReseedRequired>() {
+                            let generation = req.generation;
+                            cdc_metrics::record_connect_outcome("reseed");
+                            tracing::warn!(
+                                generation,
+                                primary = %primary_addr,
+                                "CDC replica: primary advertised a newer reseed generation; \
+                                 force-discarding local data and cold re-bootstrapping from the \
+                                 primary (ephpm db restore --reseed)"
+                            );
+                            match reseed_bootstrap(
+                                &mgmt,
+                                &apply_conn,
+                                primary_addr,
+                                &channel,
+                                max_snapshot_bytes,
+                                generation,
+                            )
+                            .await
+                            {
+                                Ok(()) => tracing::info!(
+                                    generation,
+                                    "CDC replica: reseed re-bootstrap complete; resuming tail"
+                                ),
+                                Err(be) => {
+                                    // Count a failed reseed as a failed bootstrap
+                                    // so the documented convergence metric
+                                    // (`ephpm_cdc_bootstrap_total{outcome}`)
+                                    // reflects a replica stuck looping on a
+                                    // reseed (e.g. the DB exceeds
+                                    // `max_snapshot_bytes`), not only a cold one.
+                                    cdc_metrics::record_bootstrap("failed");
+                                    tracing::warn!(
+                                        generation,
+                                        "CDC replica: reseed re-bootstrap failed (will retry): {be:#}"
+                                    );
+                                }
+                            }
+                        }
                         // Failures of the local watermark bookkeeping keep
                         // their own outcome label — they mean "this node
                         // cannot ground a cursor", which an operator debugs
                         // very differently from a broken network stream.
-                        if e.downcast_ref::<WatermarkResolution>().is_some() {
+                        else if e.downcast_ref::<WatermarkResolution>().is_some() {
                             cdc_metrics::record_connect_outcome("watermark_error");
+                            tracing::warn!("CDC replica stream error: {e:#}");
                         } else {
                             cdc_metrics::record_connect_outcome("stream_error");
+                            tracing::warn!("CDC replica stream error: {e:#}");
                         }
-                        tracing::warn!("CDC replica stream error: {e:#}");
                     }
                 }
             }
@@ -1551,16 +1655,23 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
-    subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE).await
+    // `whole_db = true`: the reseed force-discard signal is honored ONLY on the
+    // whole-database path (the only one `--reseed` can stamp). See F4.
+    subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE, true).await
 }
 
 /// [`subscribe_and_consume`] for one named site: the applied-watermark gauge
-/// is recorded under `site`.
+/// is recorded under `site`. `whole_db` is whether this is the whole-database
+/// replica path (vs a per-site one): the reseed force-discard predicate is
+/// evaluated only when true, so a per-site replica can never be forced to
+/// discard — even if a vhost is named `default` or a reseed-stamped file is
+/// mis-placed into a per-site directory (F4).
 async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
+    whole_db: bool,
 ) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
         anyhow::anyhow!(
@@ -1568,16 +1679,45 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
              mixed-version clustered nodes are not supported"
         )
     })?;
-    let (source_log_id, source_epoch, primary_acks) = match hello.context("read hello frame")? {
-        Frame::Hello { log_id, epoch, applied_acks } => (log_id, epoch, applied_acks),
-        other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
-    };
+    let (source_log_id, source_epoch, primary_acks, source_reseed_gen) =
+        match hello.context("read hello frame")? {
+            Frame::Hello { log_id, epoch, applied_acks, reseed_gen } => {
+                (log_id, epoch, applied_acks, reseed_gen)
+            }
+            other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
+        };
     anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
     // Adopt the owner's ownership epoch durably (#654) before applying its
     // stint, so if this replica is later promoted its own SiteVersion already
     // reflects the stint its data descends from — independent of whether the
     // owner's short-lived gossip advertisement is still live at that time.
     adopt_site_epoch(factory, source_epoch).await;
+
+    // Whole-database automatic reseed convergence (v0.16.2). Before resolving a
+    // watermark or subscribing, check whether the owner advertised a reseed
+    // generation **strictly greater** than this node has adopted — the signal
+    // that `ephpm db restore --reseed` installed fresh origin data on the owner
+    // and this replica must force-discard its old copy and cold re-bootstrap.
+    // The forced discard itself is driven by `run_replica` (reusing the existing
+    // fetch → vet → discard → apply snapshot primitives), so we return a typed,
+    // downcastable error here — the same pattern as `WatermarkResolution` — and
+    // never send `Subscribe`. A table-absent / zero generation reads `0`, so an
+    // ordinary promotion or failover (which re-advertises the adopted max) has
+    // `incoming == adopted` and never triggers a discard.
+    // Whole-database path only (F4): `--reseed` can never stamp a per-site file,
+    // so a per-site replica must never be forced to discard — skip the read and
+    // the predicate entirely there rather than relying on the generation being 0.
+    if whole_db {
+        let adopted_reseed_gen = {
+            let _permit = factory.wal_gate_permit().await;
+            off_runtime(read_local_reseed_gen(apply_conn))
+                .await
+                .context("read local reseed generation")?
+        };
+        if reseed_decision(source_reseed_gen, adopted_reseed_gen) {
+            return Err(anyhow::Error::new(ReseedRequired { generation: source_reseed_gen }));
+        }
+    }
 
     let watermark = {
         let _permit = factory.wal_gate_permit().await;
@@ -1738,6 +1878,20 @@ const LOG_WATERMARKS_TABLE: &str = "__ephpm_cdc_watermarks";
 /// excluded from snapshot dumps and the cold-start check.
 const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
 
+/// Table holding this node's adopted **reseed generation** (v0.16.2): the
+/// monotonic unix-millisecond stamp minted by `ephpm db restore --reseed` on the
+/// restored node and carried in [`Frame::Hello`] / [`SnapshotHeader`]. A whole-
+/// database replica that sees a generation **strictly greater** than it has
+/// adopted force-discards its local data and cold re-bootstraps
+/// ([`run_replica`] → [`reseed_bootstrap`]), then adopts the generation
+/// ([`write_local_reseed_gen`], `max(local, received)`) so it never discards
+/// twice for the same restore. `__`-prefixed and written through the mgmt
+/// connection (capture off), like the other CDC bookkeeping tables, so it is
+/// excluded from snapshot dumps and the cold-start check — and a **plain**
+/// restore drops it via [`strip_cdc_bookkeeping`](crate::db_backup::strip_cdc_bookkeeping),
+/// leaving generation `0`, so only an explicit `--reseed` ever forces a discard.
+const RESEED_GEN_TABLE: &str = "__ephpm_cdc_reseed_gen";
+
 /// Every CDC / replication bookkeeping table a clustered database carries
 /// that a single-node database does not — the change-capture log and the
 /// ePHPm/litewire cursor tables.
@@ -1762,6 +1916,7 @@ pub const CDC_BOOKKEEPING_TABLES: &[&str] = &[
     SOURCE_LOG_TABLE,
     LOG_WATERMARKS_TABLE,
     EPOCH_TABLE,
+    RESEED_GEN_TABLE,
     WATERMARK_TABLE,
 ];
 
@@ -1956,6 +2111,101 @@ async fn adopt_site_epoch(factory: &Turso, received: u64) {
     }
 }
 
+/// Whether a replica advertising adopted generation `adopted` must force-discard
+/// and cold re-bootstrap because the serving owner advertised `incoming`.
+///
+/// **Strictly greater only.** Equal (an ordinary promotion or failover, where a
+/// promoted node re-advertises the generation it adopted) and lower both return
+/// `false` — the fail-safe direction: a discard happens only when a restore has
+/// genuinely minted a newer generation than this node has seen.
+fn reseed_decision(incoming: u64, adopted: u64) -> bool {
+    incoming > adopted
+}
+
+/// Read this node's adopted reseed generation ([`RESEED_GEN_TABLE`]). `0` when
+/// the table does not exist (never reseeded — the common case and the fail-safe
+/// value: it loses every [`reseed_decision`], so nothing is discarded). Mirrors
+/// [`read_site_epoch`]. `pub(crate)` so the restore strip-stamp path's test can
+/// read back the generation it wrote through the one authoritative reader.
+///
+/// # Errors
+///
+/// The underlying table read fails (a missing table is not an error — it is `0`).
+pub(crate) async fn read_local_reseed_gen(conn: &turso::Connection) -> anyhow::Result<u64> {
+    // F2: on the REPLICA side `0` is the value that *enables* the discard (it
+    // loses `incoming > adopted` only when incoming is also 0). So — unlike the
+    // epoch reader, where 0 is the fail-safe — a read error here must NOT read
+    // back as 0 and force a spurious re-bootstrap. Probe `sqlite_schema`
+    // explicitly to tell "never reseeded" (the real 0 case) from a transient
+    // failure, propagate every other error (→ stream error → retry, no
+    // discard), and refuse a non-numeric value rather than defaulting it to 0.
+    let mut probe = conn
+        .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (RESEED_GEN_TABLE,))
+        .await
+        .context("cdc: probe for the reseed-generation table")?;
+    if probe.next().await.context("cdc: read the reseed-table probe")?.is_none() {
+        return Ok(0); // the table does not exist — this node was never reseeded
+    }
+    let mut stmt = conn
+        .prepare(&format!("SELECT generation FROM {RESEED_GEN_TABLE} WHERE id = 0"))
+        .await
+        .context("cdc: prepare the reseed-generation read")?;
+    let mut rows = stmt.query(()).await.context("cdc: query the reseed generation")?;
+    match rows.next().await.context("cdc: read the reseed generation")? {
+        Some(row) => match row.get_value(0).context("cdc: reseed-generation value")? {
+            turso::Value::Text(s) => {
+                s.parse().with_context(|| format!("cdc: reseed generation {s:?} is not a u64"))
+            }
+            other => anyhow::bail!("cdc: reseed generation has an unexpected type: {other:?}"),
+        },
+        None => Ok(0), // table present but row 0 unset (stamp always writes it)
+    }
+}
+
+/// Persist this node's adopted reseed generation. Stored as text (same row-0
+/// shape as the other bookkeeping tables) so [`read_single_text`] reads it back.
+/// `pub(crate)` so the restore strip-stamp path
+/// ([`stamp_reseed_generation`](crate::db_backup::stamp_reseed_generation)) writes
+/// the table through the one authoritative schema. Mirrors [`write_site_epoch`].
+///
+/// # Errors
+///
+/// The table cannot be created or the row cannot be written.
+pub(crate) async fn write_local_reseed_gen(
+    conn: &turso::Connection,
+    generation: u64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {RESEED_GEN_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                generation TEXT NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create reseed-generation table")?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {RESEED_GEN_TABLE} (id, generation) VALUES (0, ?)"),
+        (generation.to_string(),),
+    )
+    .await
+    .context("cdc: write reseed generation")?;
+    Ok(())
+}
+
+/// This serving owner's adopted reseed generation, for the [`Frame::Hello`] /
+/// [`SnapshotHeader`] it sends a replica. `0` on any error or when the table
+/// does not exist (a cluster that has never been reseeded). A `0` never triggers
+/// a discard, so a best-effort read here is fail-safe. Opens its own gated raw
+/// connection so it never races the stream connection. Mirrors
+/// [`read_owner_epoch`].
+async fn read_owner_reseed_gen(mgmt: &Turso) -> u64 {
+    let Ok(conn) = mgmt.raw_connection() else { return 0 };
+    let _permit = mgmt.wal_gate_permit().await;
+    off_runtime(read_local_reseed_gen(&conn)).await.unwrap_or(0)
+}
+
 /// The watermark we had reached in `log_id`, from the per-log history.
 /// `0` when we have never followed that log.
 async fn read_log_watermark(conn: &turso::Connection, log_id: &str) -> anyhow::Result<i64> {
@@ -2123,6 +2373,19 @@ struct SnapshotHeader {
     /// the fail-safe direction.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     epoch: u64,
+    /// The serving owner's adopted **reseed generation** (`ephpm db restore
+    /// --reseed`, v0.16.2, [`RESEED_GEN_TABLE`]) at the moment the snapshot was
+    /// produced. A cold replica that installs this dump adopts it ([`apply_snapshot`]),
+    /// so a node reseeded via snapshot bootstrap (rather than the `Hello`-driven
+    /// [`reseed_bootstrap`]) still records the generation and will not discard
+    /// again for the same restore.
+    ///
+    /// Backward compatible both ways, exactly like `epoch`: omitted from the wire
+    /// when `0` (so a normal header stays byte-identical to an older node's), and
+    /// an older node's header parses with it `0` — which adopts nothing, the
+    /// fail-safe direction.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    reseed_gen: u64,
 }
 
 /// `skip_serializing_if` predicate for [`SnapshotHeader::epoch`] (keeps a
@@ -2228,15 +2491,17 @@ async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
     // bootstrap simply times out and retries (the documented long-transaction
     // behaviour) instead of a raw `BEGIN` failing against the exclusive
     // window. Released before the dump is written to the stream.
-    let (watermark, dump, epoch) = {
+    let (watermark, dump, epoch, reseed_gen) = {
         let _permit = mgmt.wal_gate_permit().await;
         off_runtime(async {
-            // The dump and the epoch are read under the one permit and the one
-            // read view, so the snapshot carries the owner's epoch as of the
-            // same instant its bytes were captured (#654).
+            // The dump, the epoch and the reseed generation are read under the one
+            // permit and the one read view, so the snapshot carries the owner's
+            // epoch (#654) and reseed generation (v0.16.2) as of the same instant
+            // its bytes were captured.
             let (watermark, dump) = produce_snapshot(&conn).await?;
             let epoch = read_site_epoch(&conn).await?;
-            anyhow::Ok((watermark, dump, epoch))
+            let reseed_gen = read_local_reseed_gen(&conn).await?;
+            anyhow::Ok((watermark, dump, epoch, reseed_gen))
         })
         .await
         .context("snapshot: produce dump")?
@@ -2248,6 +2513,7 @@ async fn serve_snapshot_inner<S: AsyncWriteExt + Unpin>(
         log_id: local_log_id.to_string(),
         no_copy: false,
         epoch,
+        reseed_gen,
     };
     write_snapshot_header(stream, &header).await?;
 
@@ -2277,6 +2543,7 @@ async fn serve_no_copy<S: AsyncWriteExt + Unpin>(stream: &mut S) -> anyhow::Resu
         log_id: String::new(),
         no_copy: true,
         epoch: 0,
+        reseed_gen: 0,
     };
     write_snapshot_header(stream, &header).await?;
     write_snapshot_chunk(stream, &[]).await?;
@@ -2507,6 +2774,21 @@ async fn apply_snapshot(
         let local = read_site_epoch(conn).await.context("snapshot: read local epoch")?;
         if header.epoch > local {
             write_site_epoch(conn, header.epoch).await.context("snapshot: adopt epoch")?;
+        }
+    }
+    // Adopt the source owner's reseed generation (v0.16.2), in the same install
+    // transaction, `max(local, received)` — never backwards; a received `0`
+    // adopts nothing. This path covers a node that converges via a *cold*
+    // snapshot bootstrap (the `Hello`-driven `reseed_bootstrap` persists the
+    // generation itself); recording it here means such a node will not discard
+    // again for the same restore.
+    if header.reseed_gen > 0 {
+        let local =
+            read_local_reseed_gen(conn).await.context("snapshot: read local reseed generation")?;
+        if header.reseed_gen > local {
+            write_local_reseed_gen(conn, header.reseed_gen)
+                .await
+                .context("snapshot: adopt reseed generation")?;
         }
     }
     Ok(())
@@ -2932,6 +3214,87 @@ async fn fetch_and_apply_snapshot_on(
     // replica's watermark gauge is correct before the CDC tail starts.
     cdc_metrics::record_applied_watermark(DEFAULT_SITE, header.watermark);
     Ok(header.watermark)
+}
+
+/// Force-discard this replica's local data and cold re-bootstrap from the
+/// primary, then adopt the owner's reseed `generation` so it never discards
+/// again for the same restore (`ephpm db restore --reseed`, v0.16.2).
+///
+/// Whole-database only (dials `snapshot/default`). Reuses the ordinary snapshot
+/// primitives **verbatim** so there is one discard path, not two:
+/// [`fetch_snapshot`] (fetch → the bytes are only buffered, nothing is touched
+/// yet) then [`install_snapshot`] with `discard_local = true` (which runs
+/// [`snapshot_may_replace_local_data`] before dropping anything, so an empty /
+/// degenerate dump is refused rather than wiping to nothing). The whole thing
+/// keeps the fetch → vet → discard → apply order: the local tables are dropped
+/// only inside `install_snapshot`'s transaction, after the replacement dump has
+/// arrived and been vetted.
+///
+/// The generation is adopted **after** the install commits. A crash in between
+/// leaves the (unadopted) generation re-signalled by the next `Hello`, so the
+/// idempotent reseed simply repeats — never a half-converged state.
+///
+/// # Errors
+///
+/// The snapshot fetch fails, the primary answers `no_copy` (refused — never
+/// discard for an empty snapshot), the install is rejected (allowlist / empty-
+/// snapshot gate), or the generation cannot be persisted.
+async fn reseed_bootstrap(
+    factory: &Turso,
+    apply_conn: &litewire::litewire_turso::TursoConnection,
+    primary_addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
+    generation: u64,
+) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    // Fetch first — nothing local is touched until the dump is in hand and vetted.
+    let (header, dump, received) = fetch_snapshot(
+        primary_addr,
+        channel,
+        max_snapshot_bytes,
+        &snapshot_stream_type(DEFAULT_SITE),
+    )
+    .await
+    .context("reseed: fetch replacement snapshot")?;
+    anyhow::ensure!(
+        !header.no_copy,
+        "reseed: the primary answered that it holds no copy of the database; refusing to discard \
+         local data to replace it with nothing"
+    );
+    {
+        // Raw apply connection: take the factory's WAL-gate permit for the
+        // install (the discard + apply run in one transaction inside
+        // `install_snapshot`), and run the engine work off the runtime.
+        let _permit = factory.wal_gate_permit().await;
+        off_runtime(install_snapshot(apply_conn, &header, &dump, true))
+            .await
+            .context("reseed: install replacement snapshot")?;
+    }
+    // Adopt the generation only after the install committed. `install_snapshot`
+    // already adopted the snapshot HEADER's generation (max) inside its txn, and
+    // the header can be NEWER than the Hello's `generation` if the primary was
+    // re-stamped in between — so adopt `max(local, generation)` here rather than
+    // overwriting, never lowering the just-installed header value (F3). The
+    // reseed-gen table is `__`-prefixed, so the discard left it intact.
+    {
+        let _permit = factory.wal_gate_permit().await;
+        off_runtime(async {
+            let local = read_local_reseed_gen(apply_conn).await?;
+            if generation > local {
+                write_local_reseed_gen(apply_conn, generation).await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("reseed: persist adopted generation")?;
+    }
+    cdc_metrics::record_snapshot_received(received, started.elapsed());
+    cdc_metrics::record_applied_watermark(DEFAULT_SITE, header.watermark);
+    // Counted as a bootstrap so operators verify convergence the documented way
+    // (`ephpm_cdc_bootstrap_total{outcome="ok"}`), the same as a cold bootstrap.
+    cdc_metrics::record_bootstrap("ok");
+    Ok(())
 }
 
 /// Dial `primary_addr` and receive a snapshot **without applying it**, returning
@@ -5169,7 +5532,8 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    subscribe_and_consume_site(&mut stream, factory, &conn, site).await
+    // `whole_db = false`: per-site replicas never honor the reseed signal (F4).
+    subscribe_and_consume_site(&mut stream, factory, &conn, site, false).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
@@ -5585,6 +5949,7 @@ mod tests {
             log_id: "snap-log-id".to_string(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         let chunk_a = b"hello ".to_vec();
         let chunk_b = b"world".to_vec();
@@ -5771,12 +6136,15 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(65536);
         write_frame(
             &mut client,
-            &Frame::Hello { log_id: "abc123".into(), epoch: 0, applied_acks: false },
+            &Frame::Hello { log_id: "abc123".into(), epoch: 0, applied_acks: false, reseed_gen: 7 },
         )
         .await
         .unwrap();
         match read_frame(&mut server).await.unwrap() {
-            Frame::Hello { log_id, .. } => assert_eq!(log_id, "abc123"),
+            Frame::Hello { log_id, reseed_gen, .. } => {
+                assert_eq!(log_id, "abc123");
+                assert_eq!(reseed_gen, 7, "reseed generation round-trips");
+            }
             other => panic!("expected Hello, got {other:?}"),
         }
     }
@@ -5791,21 +6159,58 @@ mod tests {
         }
     }
 
-    /// Back-compat: a pre-v0.16.2 `Hello` on the wire carries neither `epoch`
-    /// nor `applied_acks`; both `#[serde(default)]` to the fail-safe values, so
-    /// a new node decodes an old primary's Hello without error and treats it as
-    /// "does not consume applied acks".
+    /// Back-compat: a pre-v0.16.2 `Hello` on the wire carries neither `epoch`,
+    /// `applied_acks` nor `reseed_gen`; all `#[serde(default)]` to the fail-safe
+    /// values, so a new node decodes an old primary's Hello without error and
+    /// treats it as "does not consume applied acks, nothing to reseed".
     #[test]
     fn old_hello_decodes_with_defaults() {
         let frame: Frame = serde_json::from_str(r#"{"Hello":{"log_id":"old"}}"#).unwrap();
         match frame {
-            Frame::Hello { log_id, epoch, applied_acks } => {
+            Frame::Hello { log_id, epoch, applied_acks, reseed_gen } => {
                 assert_eq!(log_id, "old");
                 assert_eq!(epoch, 0, "epoch defaults to 0");
                 assert!(!applied_acks, "applied_acks defaults to false");
+                assert_eq!(reseed_gen, 0, "reseed_gen defaults to 0 (nothing to reseed)");
             }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    /// A `Hello` with a zero reseed generation serialises byte-identically to a
+    /// pre-v0.16.2 one: the field is skipped entirely, so no older peer sees an
+    /// unexpected key and the wire is unchanged until a cluster is actually
+    /// reseeded.
+    #[test]
+    fn zero_reseed_gen_is_omitted_from_the_hello_wire() {
+        let json = serde_json::to_string(&Frame::Hello {
+            log_id: "l".into(),
+            epoch: 4,
+            applied_acks: true,
+            reseed_gen: 0,
+        })
+        .unwrap();
+        assert!(!json.contains("reseed_gen"), "{json}");
+        // A non-zero generation is present.
+        let json2 = serde_json::to_string(&Frame::Hello {
+            log_id: "l".into(),
+            epoch: 4,
+            applied_acks: true,
+            reseed_gen: 99,
+        })
+        .unwrap();
+        assert!(json2.contains("\"reseed_gen\":99"), "{json2}");
+    }
+
+    /// `reseed_decision` discards only on a strictly greater generation —
+    /// equal (an ordinary promotion/failover) and lower never force a discard.
+    #[test]
+    fn reseed_decision_only_on_strictly_greater() {
+        assert!(reseed_decision(5, 4), "a newer generation forces a reseed");
+        assert!(reseed_decision(1, 0), "first reseed over a never-reseeded node");
+        assert!(!reseed_decision(4, 4), "equal (promotion/failover) never reseeds");
+        assert!(!reseed_decision(3, 4), "a stale/lower generation never reseeds");
+        assert!(!reseed_decision(0, 0), "a never-reseeded cluster never reseeds");
     }
 
     #[tokio::test(start_paused = true)]
@@ -6216,6 +6621,7 @@ mod tests {
             log_id: "peer-log".into(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         assert!(
             validate_snapshot_dump("").is_ok(),
@@ -6292,6 +6698,7 @@ mod tests {
             log_id: "new-owner-log".into(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         let failing = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
                        INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n\
@@ -6334,6 +6741,7 @@ mod tests {
             log_id: "new-owner-log".into(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         let dump = snapshot_dump_with_rows(500);
         {
@@ -6384,6 +6792,7 @@ mod tests {
             log_id: "owner-log".into(),
             no_copy: false,
             epoch,
+            reseed_gen: 0,
         };
 
         // Installing an owner's snapshot carrying epoch 5 adopts it durably.
@@ -6405,6 +6814,87 @@ mod tests {
         // A pre-#654 header (epoch 0) adopts nothing and leaves it untouched.
         install_snapshot(&conn, &header(0), dump, true).await.unwrap();
         assert_eq!(read_site_epoch(&conn).await.unwrap(), 9, "a zero-epoch header adopts nothing");
+    }
+
+    /// **v0.16.2 reseed-generation adoption.** A node installing an owner's
+    /// snapshot adopts the owner's reseed generation ([`RESEED_GEN_TABLE`]) in
+    /// the same install transaction, `max(local, received)`: a higher generation
+    /// is taken, a lower one never lowers it, and a zero (pre-v0.16.2 / plain-
+    /// restored) header adopts nothing. This is the cold-bootstrap arm of the
+    /// reseed signal (the `Hello`-driven path persists the generation itself);
+    /// `__`-prefixed, so a `discard_local` install leaves the adopted value
+    /// intact across a re-bootstrap.
+    #[tokio::test]
+    async fn install_snapshot_adopts_the_reseed_generation_and_never_lowers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        let dump = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'owner');\n";
+        let header = |reseed_gen| SnapshotHeader {
+            watermark: 40,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+            epoch: 0,
+            reseed_gen,
+        };
+
+        install_snapshot(&conn, &header(1_700_000_000_500), dump, true).await.unwrap();
+        assert_eq!(
+            read_local_reseed_gen(&conn).await.unwrap(),
+            1_700_000_000_500,
+            "reseed generation adopted from the header"
+        );
+
+        // A lower generation never lowers it.
+        install_snapshot(&conn, &header(1_700_000_000_000), dump, true).await.unwrap();
+        assert_eq!(read_local_reseed_gen(&conn).await.unwrap(), 1_700_000_000_500);
+
+        // A higher one is adopted.
+        install_snapshot(&conn, &header(1_700_000_001_000), dump, true).await.unwrap();
+        assert_eq!(read_local_reseed_gen(&conn).await.unwrap(), 1_700_000_001_000);
+
+        // A zero (plain-restored / pre-v0.16.2) header adopts nothing.
+        install_snapshot(&conn, &header(0), dump, true).await.unwrap();
+        assert_eq!(
+            read_local_reseed_gen(&conn).await.unwrap(),
+            1_700_000_001_000,
+            "a zero reseed generation adopts nothing"
+        );
+    }
+
+    /// **The reseed discard never wipes to nothing.** `reseed_bootstrap` uses
+    /// `install_snapshot(.., discard_local = true)` verbatim, which runs
+    /// `snapshot_may_replace_local_data` before dropping anything — so an empty
+    /// (degenerate / `no_copy`) dump over live data is refused and the local
+    /// rows survive. This is the safety floor under the force-discard.
+    #[tokio::test]
+    async fn reseed_install_refuses_to_discard_live_data_for_an_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('keep me')", ()).await.unwrap();
+
+        let empty_header = SnapshotHeader {
+            watermark: 0,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+            epoch: 0,
+            reseed_gen: 1_700_000_000_000,
+        };
+        // Empty dump + discard_local + live data → refused by the degenerate-
+        // snapshot gate, the local tables untouched.
+        assert!(
+            install_snapshot(&conn, &empty_header, "", true).await.is_err(),
+            "discarding live data for an empty snapshot must be refused"
+        );
+        assert_eq!(row_count(&conn, "posts").await, 1, "the local row survived the refusal");
     }
 
     /// A dump of `rows` rows of the `posts` table, shaped like
@@ -6438,6 +6928,7 @@ mod tests {
             log_id: "owner-log".into(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         install_snapshot(&conn, &header, &snapshot_dump_with_rows(20_000), false).await.unwrap();
         assert_eq!(row_count(&conn, "posts").await, 20_000);
@@ -6669,6 +7160,7 @@ mod tests {
                 log_id: log_id.to_string(),
                 no_copy: false,
                 epoch: 0,
+                reseed_gen: 0,
             },
             dump: "CREATE TABLE t (a);".to_string(),
             received: 19,
@@ -6738,6 +7230,7 @@ mod tests {
             log_id: "stalling-log".to_string(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         write_snapshot_header(&mut peer, &header).await.unwrap();
         write_snapshot_chunk(&mut peer, b"CREATE TABLE t(x);").await.unwrap();
@@ -6784,9 +7277,13 @@ mod tests {
             log_id: "l".into(),
             no_copy: false,
             epoch: 0,
+            reseed_gen: 0,
         };
         let json = serde_json::to_string(&normal).unwrap();
         assert!(!json.contains("no_copy"), "{json}");
+        // v0.16.2: a zero reseed generation is omitted too, so the header stays
+        // byte-identical to a pre-v0.16.2 node's on the wire.
+        assert!(!json.contains("reseed_gen"), "{json}");
 
         let old = serde_json::to_vec(&OldSnapshotHeader {
             watermark: 3,
@@ -6803,6 +7300,7 @@ mod tests {
             log_id: String::new(),
             no_copy: true,
             epoch: 0,
+            reseed_gen: 0,
         };
         let parsed_by_old: OldSnapshotHeader =
             serde_json::from_slice(&serde_json::to_vec(&refusal).unwrap()).unwrap();

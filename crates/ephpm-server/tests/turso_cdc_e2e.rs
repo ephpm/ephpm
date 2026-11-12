@@ -155,7 +155,9 @@ fn spawn_replica_on_channel(
     channel: ChannelHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
+        // `1 << 30` (1 GiB) snapshot-fetch bound, matching the other e2e drivers;
+        // only consulted by a reseed re-bootstrap, which these tests do not trigger.
+        if let Err(e) = run_replica(mgmt, primary_addr, channel, 1 << 30).await {
             eprintln!("replica driver exited: {e:#}");
         }
     })
