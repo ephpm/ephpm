@@ -715,26 +715,26 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             Some(leave)
         }
         Some(cluster) => {
-            // Whole-database clustered primary: before the channel closes, wait
-            // for every attached replica to apply the CDC head, so a primary
-            // deleted right after this graceful drain does not lose its
-            // shipped-but-not-yet-applied tail (v0.16.2; the channel is still
-            // open and the replication drivers still ship here). KV-only
-            // clustered has no CDC head and skips it; so does a non-primary.
-            if config
-                .db
-                .sqlite
-                .as_ref()
-                .is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled))
-                && primary_view.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                turso_cdc::drain_whole_db_primary().await;
-            }
             cluster.flush_gossip_writer().await;
             None
         }
         None => None,
     };
+
+    // Whole-database clustered primary: wait for every attached replica to apply
+    // the CDC head before the channel closes, so a primary deleted right after
+    // this graceful drain does not lose its shipped-but-not-yet-applied tail
+    // (v0.16.2). Run as LATE as possible — right before `channel.shutdown()`
+    // below, after the KV handoff/snapshot and the cron abort — so writers the
+    // HTTP drain abandoned (PHP threads, cron children) cannot commit after the
+    // gate returns (F2). The channel is still open and the replication drivers
+    // still ship here (they stop only at `stop_replication_drivers()` below).
+    // KV-only clustered has no CDC head and a non-primary is not the writer, so
+    // both skip it.
+    let whole_db_drain = cluster_handle.as_ref().filter(|_| {
+        config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled))
+            && primary_view.load(std::sync::atomic::Ordering::Relaxed)
+    });
 
     // Requests are drained. Hand this node's large KV values to the peers
     // that take over their replica slots — while gossip still lists this
@@ -785,6 +785,19 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // sites' new owners have pulled what they need from it (`drain`).
     if let Some(leave) = leave {
         leave.await_handover().await;
+    }
+    // Whole-database primary: the last step before the channel closes (F2) —
+    // wait for replicas to apply the CDC head. `expect_replicas` is whether
+    // gossip still lists an alive peer, so a replica that dropped mid-drain is
+    // waited for rather than closed past (F3).
+    if let Some(cluster) = whole_db_drain {
+        let self_id = cluster.self_node().id;
+        let expect_replicas = cluster
+            .nodes()
+            .await
+            .iter()
+            .any(|n| n.id != self_id && n.state == ephpm_cluster::NodeState::Alive);
+        turso_cdc::drain_whole_db_primary(expect_replicas).await;
     }
     if let Some(channel) = &channel_handle {
         channel.shutdown();

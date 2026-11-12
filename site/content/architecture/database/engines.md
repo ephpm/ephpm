@@ -358,8 +358,9 @@ incumbent-protection and log-identity guards.)
 
 Because replication is async, a primary that is **abruptly killed** with
 un-shipped or un-applied batches loses that tail — the promoted replica
-continues from what it had. A **graceful drain is lossless**: as of **v0.16.1** a
-draining whole-database primary waits (up to 30 s) for every attached replica to
+continues from what it had. A **graceful drain is lossless when every replica is
+attached and applies the head within 30 s**: as of **v0.16.2** a draining
+whole-database primary waits (up to that bound) for every attached replica to
 apply its CDC head before it closes the cluster channel
 (`ephpm_cdc_drain_catchup_seconds`; an `ephpm_cdc_drain_catchup_timeouts_total`
 increment means a replica was still behind). So the safe way to retire a primary
@@ -368,6 +369,15 @@ the old one — is to **drain it** (a normal graceful shutdown) and let a replic
 promote, **not** to kill or delete it abruptly. If you will then delete the
 node's volume, first confirm that drain did not increment
 `ephpm_cdc_drain_catchup_timeouts_total`.
+
+> **Size the supervisor grace period.** The gate waits *outside* the
+> `[server.timeouts] shutdown` budget, so total graceful shutdown is now up to
+> `shutdown + 30 s (gate) + KV handoff/snapshot + WAL checkpoint`. If your
+> supervisor sends `SIGKILL` sooner — e.g. Kubernetes
+> `terminationGracePeriodSeconds`, default **30 s** — the kill can land *inside*
+> the gate and turn a graceful drain back into an abrupt kill (losing the tail,
+> with no warning fired). Set the supervisor's grace to comfortably exceed
+> `shutdown + 30 s` for whole-database clustered primaries.
 
 **Busy databases report as busy.** Every clustered wire factory captures its
 sessions' writes into the change log, and Turso runs the capture pragma as a
