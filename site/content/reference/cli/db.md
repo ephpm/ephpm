@@ -547,8 +547,8 @@ including a worked `/kv-put` cache pre-warm.
 ## `ephpm db restore`
 
 ```bash
-ephpm db restore --site <KEY> --config <FILE> --from s3://bucket[/prefix] [--at <TIME>] [--yes]
-ephpm db restore --site <KEY> --config <FILE> --from <local .db or .db.gz> [--yes]
+ephpm db restore --site <KEY> --config <FILE> [--from <s3://bucket[/prefix] | DIR | FILE>] [--at <TIME>] [--yes]
+ephpm db restore --site default --config <FILE> --reseed [--from …] [--yes]   # whole-DB clustered: auto-converge the cluster
 ```
 
 Installs a backup written by [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)
@@ -565,27 +565,32 @@ live database. It is a **file install**, not an SQL replay, and it is
    that key). A **clustered** config resolves the same local file and the
    restore additionally **strips the CDC replication bookkeeping** the image
    carries (step 5a) so the installed file is clean origin data. Restoring into a
-   cluster installs the file on **one** node and is **experimental and manual for
-   both topologies**: replicas do **not** auto-converge onto it — a replica
-   restarted with its old database tails the restored log *on top of* its old
-   rows. So the whole cluster must be stopped and every other node's
-   `.db`/`-wal`/`-shm` **wiped** so they cold-bootstrap. The command prints the
-   full procedure (restore on the lowest-ordinal node, wipe the others, start the
-   restored node first, verify each re-bootstrapped) and asks you to confirm; it
-   can only check the local node and says so. **Per-site clustered** adds a
-   hazard: a returning peer with a higher `SiteVersion` epoch could overwrite the
-   restore silently. The automatic `--reseed` (which performs the wipe) is **not
-   yet implemented**. See the
+   cluster installs the file on **one** node and is **experimental**: replicas do
+   **not** auto-converge onto it — a replica restarted with its old database
+   tails the restored log *on top of* its old rows. So the whole cluster must be
+   stopped, and convergence then needs one of two things. On **whole-database
+   clustered**, pass `--reseed` (every node on v0.16.2+): it stamps a reseed
+   generation into the restored image so every replica force-discards its own
+   data and cold re-bootstraps from the restored node automatically — restore on
+   the lowest-ordinal node, start it first, and the others converge. Without
+   `--reseed`, convergence is the manual wipe: every other node's
+   `.db`/`-wal`/`-shm` must be **deleted** so they cold-bootstrap. The command
+   prints the full procedure and asks you to confirm; it can only check the local
+   node and says so. **Per-site clustered** is still manual (no `--reseed` yet)
+   and adds a hazard: a returning peer with a higher `SiteVersion` epoch could
+   overwrite the restore silently. See the
    [clustered-backup design note](/roadmap/clustered-db-backups/).
-2. **Picks the object.** With `--from s3://bucket[/prefix]` the objects under
-   `<prefix>/<site>/` are listed and the newest with a timestamp **at or
+2. **Picks the object.** With a store source (`--from s3://bucket[/prefix]`, a
+   local backup directory, or `--from` omitted to use the configured
+   `[db.sqlite.backup]` destination) the objects under `<prefix>/<site>/` are
+   listed and the newest with a timestamp **at or
    before `--at`** is chosen (default: the newest of all). `--at` takes the
    compact form the objects are named with (`20260301T120000Z`),
    `YYYY-MM-DDTHH:MM:SSZ`, or a date (`2026-03-01` = midnight UTC). The
    endpoint, region and addressing style come from `[db.sqlite.backup]` in
    `--config` (the bucket may differ from the configured one); the credentials
-   from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. A local `--from` path is
-   used as is (`.gz` is gunzipped).
+   from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. A local `--from` **file**
+   is used as is (`.gz` is gunzipped).
 3. **Prints the plan** — site, source (object, time taken, size), target and
    whether it exists — and asks for a typed `yes` on a terminal. Without a
    terminal it refuses unless `--yes` is given. Nothing has been touched yet.
@@ -620,9 +625,10 @@ live database. It is a **file install**, not an SQL replay, and it is
 |------|---------|---------|
 | `--site <KEY>` | (required) | Vhost directory name under `[server] sites_dir`, or `default` for a single-node config |
 | `-c`, `--config <FILE>` | (required) | Config with `[server] sites_dir`, `[db.sqlite]` and the `[db.sqlite.backup]` endpoint/region |
-| `--from <SOURCE>` | (required) | `s3://bucket[/prefix]` (the prefix is the configured `s3_path`), or a local `.db` / `.db.gz` |
-| `--at <TIME>` | newest | Restore the newest object taken at or before this UTC time; `s3://` sources only |
+| `--from <SOURCE>` | configured dest. | `s3://bucket[/prefix]` (the prefix is the configured `s3_path`), a local backup **directory**, or a local `.db` / `.db.gz` **file**. Omit to use the configured `[db.sqlite.backup]` destination (S3 bucket or local `dir`) |
+| `--at <TIME>` | newest | Restore the newest object taken at or before this UTC time; store sources (`s3://` or a directory) only |
 | `-y`, `--yes` | off | Skip the confirmation (required when stdin is not a terminal) |
+| `--reseed` | off | **Whole-database clustered only** (rejected in single-node and per-site modes): also stamp a reseed generation into the restored image so every replica force-discards its data and cold re-bootstraps from this node on restart — the automatic replacement for the manual "wipe every other node's `.db`" step. Requires every node on v0.16.2+ (an older replica ignores the signal and stays divergent — fail-safe, not corruption) |
 
 ### Exit codes
 
@@ -648,7 +654,7 @@ ephpm db restore --site default --config ephpm.toml --from /backups/20260301T090
 ## `ephpm db backup list`
 
 ```bash
-ephpm db backup list --site <KEY> --config <FILE> [--from s3://bucket[/prefix]] [--json]
+ephpm db backup list --site <KEY> --config <FILE> [--from <s3://bucket[/prefix] | DIR>] [--json]
 ```
 
 Lists a site's backup objects — time taken (UTC), compressed size and key —

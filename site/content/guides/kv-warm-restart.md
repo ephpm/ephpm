@@ -79,7 +79,7 @@ Mount a volume at `path` and let Docker send `SIGTERM` with enough grace:
 docker run -d --name app \
   -v ephpm-kv:/var/lib/ephpm/kv \
   --stop-signal SIGTERM --stop-timeout 90 \
-  ghcr.io/ephpm/ephpm:latest
+  ephpm/ephpm:latest
 ```
 
 `docker stop` / `docker compose down` are graceful; `docker kill` is not.
@@ -109,7 +109,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: ephpm
-          image: ghcr.io/ephpm/ephpm:latest
+          image: ephpm/ephpm:latest
           args: ["serve", "--config", "/etc/ephpm/ephpm.toml"]
           ports:
             - containerPort: 8080
@@ -201,7 +201,7 @@ spec:
       terminationGracePeriodSeconds: 120   # drain + snapshot write + upload
       containers:
         - name: ephpm
-          image: ghcr.io/ephpm/ephpm:latest
+          image: ephpm/ephpm:latest
           args: ["serve", "--config", "/etc/ephpm/ephpm.toml"]
           envFrom:
             - secretRef:

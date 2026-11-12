@@ -31,7 +31,7 @@ We evaluated embedding existing databases (Redis, Dragonfly, KeyDB, Garnet) and 
 | TTL / expiry | Standard | Background sweeper + lazy expiry on access. |
 | Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, `hash % nodes` key ownership, cross-node routing with replication. |
 | PHP access | RoadRunner: Goridge RPC. Swoole: shared memory API. | SAPI function calls — zero serialization, zero network hop for local keys. |
-| Persistence | Optional | **Planned — not yet implemented.** Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
+| Persistence | Optional | Optional encrypted **warm-restart snapshot** (`[kv.snapshot]`, v0.13.0) — written at graceful shutdown and loaded before the listeners open, so a restart serves warm. A cache warm-up, **not** durability (no AOF; this is a cache, not a database). |
 | Redis protocol compat | Not required | Optional RESP listener (TCP) so existing Redis clients and tools work for cache-style commands. Not a full Redis: see the gaps under [Redis Protocol](#1-redis-protocol-resp--redis-compatible-for-caching-not-a-redis-replacement). |
 
 ---

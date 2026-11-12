@@ -73,13 +73,17 @@ docker compose start ephpm
   snapshotted; a multi-tenant server snapshots up to 4 databases at once.
 - **Clustered mode** (v0.16.1+, experimental): backups run from each database's
   write node by default (`source = "primary"`) or a non-write holder
-  (`source = "replica"`, whole-database only), gated so each database is shipped
-  by exactly one node. Restoring **into** a cluster is experimental and manual —
+  (`source = "replica"`, whole-database only; per-site clustered coerces
+  `"replica"` to the owner with a WARN), gated so each database is shipped
+  by exactly one node. Restoring **into** a cluster is experimental —
   `ephpm db restore` installs the file on one node and replicas do **not**
-  auto-converge, so you must stop every node, restore on the lowest-ordinal
-  node, wipe every other node's `.db`/`-wal`/`-shm`, then start the restored
-  node first (the command prints the exact procedure). This single-node example
-  restores simply offline on the one node.
+  auto-converge. On **whole-database clustered**, `ephpm db restore --reseed`
+  (every node on v0.16.2+) converges the cluster for you: stop every node,
+  restore `--reseed` on the lowest-ordinal node, start it first, and the others
+  force-discard and cold re-bootstrap. Without `--reseed` (or in per-site
+  clustered mode, which has no `--reseed` yet) it is manual — wipe every other
+  node's `.db`/`-wal`/`-shm` before restart (the command prints the exact
+  procedure). This single-node example restores simply offline on the one node.
 
 Reference: the `[db.sqlite.backup]` section of
 `site/content/reference/config.md`.

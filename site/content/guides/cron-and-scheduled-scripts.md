@@ -167,11 +167,11 @@ A second service on the same image and network, looping on the interval:
 ```yaml
 services:
   web:
-    image: ghcr.io/ephpm/ephpm:latest
+    image: ephpm/ephpm:latest
     command: ["ephpm", "serve", "--config", "/etc/ephpm/ephpm.toml"]
     volumes: [ "./ephpm.toml:/etc/ephpm/ephpm.toml:ro", "./sites:/srv/sites", "./db:/var/lib/ephpm/db" ]
   sendy-cron:
-    image: ghcr.io/ephpm/ephpm:latest
+    image: ephpm/ephpm:latest
     network_mode: "service:web"          # share web's loopback: 127.0.0.1:3306 is the server
     entrypoint: ["sh", "-c"]
     command:
@@ -205,14 +205,14 @@ spec:
     spec:
       containers:
         - name: ephpm
-          image: ghcr.io/ephpm/ephpm:latest
+          image: ephpm/ephpm:latest
           args: ["serve", "--config", "/etc/ephpm/ephpm.toml"]
           volumeMounts:
             - { name: config, mountPath: /etc/ephpm, readOnly: true }
             - { name: sites,  mountPath: /srv/sites }
             - { name: db,     mountPath: /var/lib/ephpm/db }
         - name: sendy-cron
-          image: ghcr.io/ephpm/ephpm:latest
+          image: ephpm/ephpm:latest
           command: ["sh", "-c"]
           args:
             - |

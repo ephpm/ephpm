@@ -378,7 +378,7 @@ Meta-commands: `/dialect [D]`, `/format [F]`, `/tables`, `/schema <table>`, `/kv
 
 ## `ephpm db restore`
 
-Installs a scheduled backup ([`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)) — or a local `.db` / `.db.gz` — over a site's embedded database. Picks the newest object at or before `--at`, downloads and gunzips it next to the target, verifies it with `PRAGMA integrity_check`, and only then renames it over `<key>.db`. **Offline only**: refused while a server is running. Prints the plan and asks for a typed `yes` unless `--yes`. Clustered configs are refused. See the [full `db` reference](db/#ephpm-db-restore).
+Installs a scheduled backup ([`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)) — or a local `.db` / `.db.gz` — over a site's embedded database. Picks the newest object at or before `--at`, downloads and gunzips it next to the target, verifies it with `PRAGMA integrity_check`, and only then renames it over `<key>.db`. **Offline only**: refused while a server is running. Prints the plan and asks for a typed `yes` unless `--yes`. A clustered config is **accepted** with an extra confirmation and an EXPERIMENTAL, manual caveat: installing a backup does not converge the cluster on its own. Whole-database clustered has `--reseed` (every node on v0.16.2+) to converge automatically; otherwise every other node's database must be wiped. See the [full `db` reference](db/#ephpm-db-restore).
 
 ```bash
 ephpm db restore --site blog --config ephpm.toml --from s3://ephpm-backups/ephpm/db --at 2026-03-01T09:30:00Z
@@ -508,7 +508,7 @@ The log file is at the path in [Where things live](#where-things-live). On macOS
 | `analyze` | `0` pass, `2` quarantine, `3` deny, `1` internal error. See [`analyze`](analyze/). |
 | `exec` | The command's own exit status once it has started, `1` if setup fails. See [`exec`](exec/#exit-status). |
 | `db query`, `db shell` | `0` on success (`db shell` always exits `0` once running — per-statement errors are printed and the session continues). `1` when the transport cannot be established (single-writer violation, bad `--site`, server auth failure) or, for `db query`, when a statement is rejected or errors. |
-| `db restore` | `0` restored; `2` the backup failed `PRAGMA integrity_check` (nothing changed); `1` a server is running, no object at or before `--at`, a bad `--site`, a clustered config, or a download/install error. See [`db restore`](db/#ephpm-db-restore). |
+| `db restore` | `0` restored; `2` the backup failed `PRAGMA integrity_check` (nothing changed); `1` a server is running, no object at or before `--at`, a bad `--site`, `--reseed` passed outside whole-database clustered mode, or a download/install error. See [`db restore`](db/#ephpm-db-restore). |
 | `kv` | `0` on success. Server replies such as `(nil)`, `(empty)` or `key does not exist` count as success. `1` if the server answers with an error (`-ERR`, `-NOAUTH`, …), which is printed as `error: ...` on stderr. |
 | `deploy`, `cache reset` | `0` on success, `1` if the RESP listener is unreachable or returns an error |
 | `install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs` | `0` on success, `1` on any failure (`error: service command failed: ...` on stderr) |
@@ -527,9 +527,10 @@ Any other failure, such as a connection error, an unreadable config, or an inval
 ephpm                Local dev server (same as `ephpm dev`)
 ephpm serve          Start the production server (--config/--listen/--document-root/-v)
 ephpm dev            Development server (--port/--document-root/--sites/--xdebug)
-ephpm php            Run the embedded PHP CLI (pure passthrough)
+ephpm php            Run the embedded PHP CLI (--site/--config bind a vhost's DB; else passthrough)
 ephpm composer       Embedded vivacity installer: install/update/require/remove/dump-autoload
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
+ephpm kv snapshot    Warm-restart snapshots (inspect/verify/save/load/status)
 ephpm analyze        Static analysis + fail-closed deploy gate (--format/--profile/--fail-on/
                      --level/--since/--baseline/--cache-dir/--no-cache)
 ephpm deploy         Cluster-wide OPcache invalidation (--site/--all/--rev)
@@ -541,8 +542,10 @@ ephpm db query       Run one SQL statement and print the result (--site/--config
                      --dialect/--format/--read-only/--maintenance/-e)
 ephpm db shell       Interactive SQL REPL (--site/--config/--dialect/--read-only/
                      --maintenance; /dialect /format /tables /schema /kv /kv-put /help /quit)
-ephpm db restore     Install a [db.sqlite.backup] object (or a local .db/.db.gz) over a
-                     site's database, offline (--site/--config/--from/--at/--yes)
+ephpm db restore     Install a [db.sqlite.backup] object (or a local .db/.db.gz/dir) over
+                     a site's database, offline (--site/--config/--from/--at/--yes/--reseed)
+ephpm db dump        Snapshot a site's database to a local .db.gz on demand, offline
+                     (--site/--config/--out/--no-gzip)
 ephpm db backup list List a site's backup objects (--site/--config/--from/--json)
 
 ephpm install        Install + start the system service (--user/--group)

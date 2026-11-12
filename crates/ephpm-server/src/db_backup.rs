@@ -90,9 +90,11 @@
 //! holds the file. Restoring into a cluster installs the file on **one** node:
 //! replicas do **not** auto-converge onto it (a replica still holding its old
 //! database tails the restored log as an ordinary failover), so every node
-//! must be stopped and every other node's `.db`/`-wal`/`-shm` wiped before
-//! restart — an **experimental**, manual procedure for both topologies in this
-//! release (the automatic `--reseed` is planned). See the design note.
+//! must be stopped. Whole-database clustered has `ephpm db restore --reseed`
+//! (v0.16.2) to converge the cluster automatically (every node on v0.16.2+);
+//! without it, and for the still-manual per-site topology, every other node's
+//! `.db`/`-wal`/`-shm` must be wiped before restart — **experimental**. See
+//! the design note.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -863,8 +865,9 @@ impl DbBackupService {
                  into a cluster is EXPERIMENTAL and manual: replicas do NOT auto-converge onto a \
                  restored node — stop every node, restore on the lowest-ordinal node, wipe every \
                  other node's .db/-wal/-shm so they cold-bootstrap, then start the restored node \
-                 first (the automatic `--reseed` is not yet implemented). See `ephpm db restore` \
-                 and the clustered-backup design note."
+                 first — or pass `ephpm db restore --reseed` (every node on v0.16.2+) to converge \
+                 the cluster automatically instead of wiping. See `ephpm db restore` and the \
+                 clustered-backup design note."
             ),
             BackupGate::PerSiteClustered { .. } => tracing::warn!(
                 "clustered database backup: PER-SITE mode is EXPERIMENTAL and lab-pending. Each \
@@ -1341,11 +1344,12 @@ pub async fn verify_integrity(path: &Path) -> anyhow::Result<()> {
 /// that still holds its old database treats the fresh log id as an ordinary
 /// failover (`maybe_bootstrap_cold_replica` re-bootstraps only a *cold*
 /// replica) and keeps its old rows while tailing the restored log on top.
-/// Converging a cluster onto a restore is therefore a manual, experimental
-/// procedure in this release — stop every node and wipe each other node's
-/// `.db`/`-wal`/`-shm` so it cold-bootstraps from the restored node (the
-/// automatic `--reseed` is planned). See `ephpm db restore` and the design
-/// note.
+/// Converging a cluster onto a restore is therefore a manual (or, for
+/// whole-database clustered, `--reseed`-driven) procedure — stop every node,
+/// and either run `ephpm db restore --reseed` (whole-database only, every node
+/// on v0.16.2+) so replicas force-discard and cold re-bootstrap automatically,
+/// or wipe each other node's `.db`/`-wal`/`-shm` so it cold-bootstraps from the
+/// restored node. See `ephpm db restore` and the design note.
 ///
 /// Only the curated CDC/replication set is dropped — **never**
 /// `__turso_internal_*` (the engine's autoincrement backing tables, valid

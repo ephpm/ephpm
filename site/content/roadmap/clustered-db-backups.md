@@ -406,13 +406,14 @@ unit-validated + lab-pending, never cluster-validated):**
    interval, and the drained/dead node stops.
 4. **A real clustered backup → restore → re-serve round trip** — write data,
    back up, change the data, stop the cluster, restore the earlier backup on the
-   lowest-ordinal node, **wipe every other node's `.db`/`-wal`/`-shm`** (the
-   manual stand-in for `--reseed`), start the restored node first then the wiped
-   peers, and confirm **every node** serves the restored data (each peer
-   cold-bootstrapped; no node silently kept the newer copy or tailed on top of
-   it). This is the test that proves the reconciliation, and it is also what an
-   eventual `--reseed` must automate; the negative case (skip the wipe → a peer
-   serves the old+new mix) is the regression guard.
+   lowest-ordinal node, **wipe every other node's `.db`/`-wal`/`-shm`** (or, on
+   whole-database clustered, run `ephpm db restore --reseed`, which automates
+   that wipe), start the restored node first then the wiped peers, and confirm
+   **every node** serves the restored data (each peer cold-bootstrapped; no node
+   silently kept the newer copy or tailed on top of it). This is the test that
+   proves the reconciliation, and it is also what `--reseed` (shipped for
+   whole-database clustered in v0.16.2) automates; the negative case (skip the
+   wipe → a peer serves the old+new mix) is the regression guard.
 5. **WAL behavior on a write-hot primary during backup** — a `VACUUM INTO` on a
    write-hot whole-DB primary / per-site owner does not unbound the `-wal`, and
    `source = "replica"` moves the WAL pin off the write node (measure
@@ -431,7 +432,12 @@ epochs returning peers bring. If gossip has dropped the site's
 settles this, per-site clustered backup ships **experimental-only** — reachable
 only through the experimental `per_site = true` opt-in, with a loud `WARN` at
 startup and at restore (implemented). The fallback, **if** the lab shows epoch
-dominance is not reliable, is a `--reseed` that invalidates peer copies (removes
-their `<site>.db`) so the question does not arise — **planned, not built**.
-Whole-DB clustered restore does not have this dependency (the log-id change
-forces re-bootstrap directly), so it is the supported path and ships now.
+dominance is not reliable, is a per-site `--reseed` that invalidates peer copies
+(removes their `<site>.db`) so the question does not arise — **planned, not
+built** (per-site only; the whole-database `--reseed` below has shipped).
+Whole-DB clustered restore does not have this `SiteVersion`-epoch dependency: a
+*plain* restore still does **not** converge a warm replica on its own (the
+replica keeps its old rows and tails the restored log on top), but `ephpm db
+restore --reseed` (shipped v0.16.2, whole-database only) stamps a reseed
+generation that makes every replica force-discard and cold re-bootstrap from the
+restored node — so whole-DB is the supported path and ships now.

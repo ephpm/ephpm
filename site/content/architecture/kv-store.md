@@ -173,7 +173,7 @@ Cluster-tier writes carry a version number. Local hot-key cache entries store th
 
 ## Failure modes
 
-- **Eviction storm** — large bulk writes can push the store over `memory_limit`, triggering rapid eviction. Symptoms: p99 read latency rising as shards rebalance. The KV store exports no Prometheus metrics today (no eviction counter, no memory gauge; `ephpm_kv_evictions_total` is planned, not implemented). `INFO` over RESP reports `used_memory`. Mitigation: raise `memory_limit`, enable compression, or use TTLs more aggressively.
+- **Eviction storm** — large bulk writes can push the store over `memory_limit`, triggering rapid eviction. Symptoms: p99 read latency rising as shards rebalance. The KV store exports no eviction/memory Prometheus metrics today (no eviction counter, no memory gauge; `ephpm_kv_evictions_total` is planned, not implemented) — though the warm-restart and peer-handoff paths do (`ephpm_kv_snapshot_*`, `ephpm_kv_handoff_*`, `ephpm_kv_cold_reads_total`). `INFO` over RESP reports `used_memory`. Mitigation: raise `memory_limit`, enable compression, or use TTLs more aggressively.
 - **Compression failure on read** — corrupted entry. Read returns an error. Rare; usually indicates an upstream bug (e.g. compression algorithm changed without a flush).
 - **Cluster split brain on writes** — async replication means a partitioned node can serve stale reads after a partition heals. The next gossip update invalidates the stale entry. Sync mode avoids this at the cost of write latency.
 
