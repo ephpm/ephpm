@@ -728,6 +728,34 @@ enum DbCommand {
         #[command(subcommand)]
         command: DbBackupCommand,
     },
+
+    /// Snapshot a virtual host's embedded database to a local file on demand —
+    /// a `VACUUM INTO` of the live file, gzipped — for an ad-hoc backup or to
+    /// seed a blue-green / failover test.
+    ///
+    /// Offline only: refused while a server holds the database open. For
+    /// snapshots of a *running* node use scheduled backups
+    /// (`[db.sqlite.backup]`), which can write to a local `dir`. The output is
+    /// a plain gzip of a standard SQLite file — restore it with
+    /// `ephpm db restore --from <file>` — and is **not** encrypted by ePHPm.
+    Dump {
+        /// The vhost key (directory name under `[server] sites_dir`), or
+        /// `default` for a single-node config's one database.
+        #[arg(long)]
+        site: String,
+
+        /// The ephpm config file.
+        #[arg(long, short = 'c')]
+        config: PathBuf,
+
+        /// The output file (`<name>.db.gz`, or `<name>.db` with `--no-gzip`).
+        #[arg(long, short = 'o')]
+        out: PathBuf,
+
+        /// Write an uncompressed `.db` instead of a gzip.
+        #[arg(long)]
+        no_gzip: bool,
+    },
 }
 
 /// `ephpm db backup <COMMAND>`.
@@ -1040,6 +1068,9 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
         }
         DbCommand::Backup { command: DbBackupCommand::List { site, config, from, json } } => {
             db_restore::run_list(&db_restore::ListRequest { site, config, from, json })
+        }
+        DbCommand::Dump { site, config, out, no_gzip } => {
+            db_restore::run_dump(&db_restore::DumpRequest { site, config, out, gzip: !no_gzip })
         }
     }
 }

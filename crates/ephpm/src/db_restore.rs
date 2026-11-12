@@ -69,6 +69,19 @@ pub struct ListRequest {
     pub json: bool,
 }
 
+/// `ephpm db dump`.
+#[derive(Debug)]
+pub struct DumpRequest {
+    /// The vhost key (`default` in single-node mode).
+    pub site: String,
+    /// The config file.
+    pub config: PathBuf,
+    /// The output file.
+    pub out: PathBuf,
+    /// Gzip the snapshot (the default); `false` writes a raw `.db`.
+    pub gzip: bool,
+}
+
 /// Where the live database for `site` is.
 #[derive(Debug)]
 struct Target {
@@ -533,6 +546,68 @@ pub fn run_list(req: &ListRequest) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Run `ephpm db dump`: snapshot the site's embedded database to a local file
+/// (`VACUUM INTO` → optional gzip). Offline only — the same single-writer rule
+/// as restore — since a second process cannot `VACUUM INTO` a file the server
+/// holds open. Blocking; call outside any async runtime.
+///
+/// # Errors
+///
+/// The config cannot be loaded, the site does not resolve to an existing
+/// database file, a server is running, the snapshot or gzip fails, or the
+/// output cannot be written.
+pub fn run_dump(req: &DumpRequest) -> anyhow::Result<ExitCode> {
+    let config = load_config(&req.config)?;
+    // Resolve the site's database file (any mode — a dump is a read-only
+    // physical snapshot of this node's copy, so clustered is fine; the raw
+    // image carries its CDC bookkeeping, which `ephpm db restore` strips).
+    let target = resolve_target(&config, &req.site)?;
+    anyhow::ensure!(
+        target.path.is_file(),
+        "site {:?} has no database file at {} yet",
+        target.key,
+        target.path.display()
+    );
+    ensure_offline(&config)?;
+
+    let out = &req.out;
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    // `VACUUM INTO` a temp sibling of the output, then gzip (or move) it into
+    // place, so a failure never leaves a half-written output.
+    let tmp = sidecar(out, ".dump-tmp");
+    remove_quietly(&tmp);
+    if let Err(e) = rt.block_on(db_backup::snapshot_into(&target.path, &tmp)) {
+        remove_quietly(&tmp);
+        return Err(e)
+            .with_context(|| format!("snapshotting {} with VACUUM INTO", target.path.display()));
+    }
+
+    if req.gzip {
+        let bytes = match db_backup::gzip_file(&tmp, out) {
+            Ok(b) => b,
+            Err(e) => {
+                remove_quietly(&tmp);
+                remove_quietly(out);
+                return Err(e).context("gzipping the snapshot");
+            }
+        };
+        remove_quietly(&tmp);
+        println!("dumped site {:?} → {} ({bytes} bytes gzipped)", target.key, out.display());
+    } else {
+        std::fs::rename(&tmp, out)
+            .with_context(|| format!("moving the snapshot to {}", out.display()))?;
+        println!("dumped site {:?} → {}", target.key, out.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -661,6 +736,63 @@ mod tests {
         // A non-existent path that is neither a file nor a directory is refused.
         let missing = tmp.path().join("nope.db").to_string_lossy().into_owned();
         assert!(resolve_source(&config, "shop", Some(&missing), None, &rt).is_err());
+    }
+
+    /// `ephpm db dump` offline-snapshots the live file: `--no-gzip` yields a
+    /// valid standalone SQLite file, the default yields a gzip of one.
+    #[test]
+    fn dump_writes_a_snapshot_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbfile = tmp.path().join("one.db");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let db = litewire::Turso::open(dbfile.to_str().unwrap()).await.unwrap();
+            let conn = db.raw_connection().unwrap();
+            conn.execute("CREATE TABLE t (v TEXT)", ()).await.unwrap();
+            conn.execute("INSERT INTO t VALUES ('dumped')", ()).await.unwrap();
+        });
+        drop(rt); // release the setup handle before the dump opens the file
+
+        // Single-node config; listen on a just-freed port so `ensure_offline`
+        // sees nothing bound, and keep the wire listener out of the probe.
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfgpath = tmp.path().join("ephpm.toml");
+        fs::write(
+            &cfgpath,
+            format!(
+                "[server]\nlisten = \"127.0.0.1:{free}\"\n[db.sqlite]\npath = \"{}\"\n\
+                 [db.sqlite.proxy]\nmysql_wire_enabled = false\n",
+                toml_path(&dbfile),
+            ),
+        )
+        .unwrap();
+
+        // --no-gzip → a real SQLite file (magic header).
+        let raw = tmp.path().join("dump.db");
+        run_dump(&DumpRequest {
+            site: "default".into(),
+            config: cfgpath.clone(),
+            out: raw.clone(),
+            gzip: false,
+        })
+        .unwrap();
+        let head = fs::read(&raw).unwrap();
+        assert!(head.starts_with(b"SQLite format 3\0"), "raw dump is a SQLite file");
+
+        // default → a gzip of one (gzip magic).
+        let gz = tmp.path().join("dump.db.gz");
+        run_dump(&DumpRequest {
+            site: "default".into(),
+            config: cfgpath,
+            out: gz.clone(),
+            gzip: true,
+        })
+        .unwrap();
+        let g = fs::read(&gz).unwrap();
+        assert_eq!(&g[..2], &[0x1f, 0x8b], "gzipped dump has the gzip magic");
     }
 
     /// A local backup **directory** as `--from` lists and selects objects just
