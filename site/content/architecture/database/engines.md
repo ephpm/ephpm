@@ -347,6 +347,28 @@ replication unconditionally. Because the Turso engine is Beta upstream and the
 CDC path is manually (not yet CI-) validated, treat clustered mode as
 experimental and tested on Linux/macOS.
 
+### Primary failover and graceful drain
+
+Replication is **asynchronous** — a write commits on the primary and ships to
+replicas in the background. The whole-database primary is deterministically the
+**lowest-node-id alive node**; there is no `promote`/`stepdown` command, so a
+replica **auto-promotes** once the current primary's process exits and gossip
+marks it dead. (Two primaries cannot coexist: lowest-id determinism plus the
+incumbent-protection and log-identity guards.)
+
+Because replication is async, a primary that is **abruptly killed** with
+un-shipped or un-applied batches loses that tail — the promoted replica
+continues from what it had. A **graceful drain is lossless**: as of **v0.16.1** a
+draining whole-database primary waits (up to 30 s) for every attached replica to
+apply its CDC head before it closes the cluster channel
+(`ephpm_cdc_drain_catchup_seconds`; an `ephpm_cdc_drain_catchup_timeouts_total`
+increment means a replica was still behind). So the safe way to retire a primary
+— e.g. a **blue-green cutover**: add a node, let it cold-bootstrap, then retire
+the old one — is to **drain it** (a normal graceful shutdown) and let a replica
+promote, **not** to kill or delete it abruptly. If you will then delete the
+node's volume, first confirm that drain did not increment
+`ephpm_cdc_drain_catchup_timeouts_total`.
+
 **Busy databases report as busy.** Every clustered wire factory captures its
 sessions' writes into the change log, and Turso runs the capture pragma as a
 *write* transaction. Until litewire#51 that pragma ran when a session opened.

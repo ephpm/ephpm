@@ -1182,6 +1182,7 @@ pub async fn drain_whole_db_primary() {
     match outcome {
         DrainCatchupOutcome::NoSubscribers => {}
         DrainCatchupOutcome::CaughtUp { head, waited } => {
+            cdc_metrics::record_drain_catchup(waited, false);
             tracing::info!(
                 head,
                 waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
@@ -1189,6 +1190,7 @@ pub async fn drain_whole_db_primary() {
             );
         }
         DrainCatchupOutcome::TimedOut { head, min_applied, subscribers, waited } => {
+            cdc_metrics::record_drain_catchup(waited, true);
             tracing::warn!(
                 head,
                 ?min_applied,

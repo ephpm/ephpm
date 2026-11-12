@@ -175,6 +175,12 @@ pub const METRIC_REPLICA_CONNECTS: &str = "ephpm_cdc_replica_connects_total";
 pub const METRIC_BOOTSTRAP: &str = "ephpm_cdc_bootstrap_total";
 /// Counter: snapshot dump bytes received during bootstrap.
 pub const METRIC_SNAPSHOT_BYTES_RECEIVED: &str = "ephpm_cdc_snapshot_bytes_received_total";
+/// Histogram: how long the whole-database drain-handover gate waited for
+/// replicas to apply the head, one observation per drain (v0.16.2).
+pub const METRIC_DRAIN_CATCHUP_SECONDS: &str = "ephpm_cdc_drain_catchup_seconds";
+/// Counter: drains that closed the channel at the timeout with replicas still
+/// behind (a tail may have been lost if the primary was then deleted).
+pub const METRIC_DRAIN_CATCHUP_TIMEOUTS: &str = "ephpm_cdc_drain_catchup_timeouts_total";
 
 /// The `site` label value of the whole-database clustered mode, which
 /// replicates one database over `cdc/default`. Same value as
@@ -363,6 +369,16 @@ pub fn current_head(site: &str) -> Option<i64> {
     let entry = REGISTRY.shipping.get(site)?;
     let state = entry.value();
     state.head_seen.load(Ordering::Relaxed).then(|| state.head.load(Ordering::Relaxed))
+}
+
+/// Record one whole-database drain-handover gate outcome: the wait duration
+/// (histogram), and the timeout counter when it closed with replicas still
+/// behind the head.
+pub fn record_drain_catchup(waited: Duration, timed_out: bool) {
+    histogram!(METRIC_DRAIN_CATCHUP_SECONDS).record(waited.as_secs_f64());
+    if timed_out {
+        counter!(METRIC_DRAIN_CATCHUP_TIMEOUTS).increment(1);
+    }
 }
 
 /// Attach a subscriber of `site` that has announced `from_change_id` as its
@@ -586,6 +602,7 @@ pub fn init() {
         METRIC_ROWS_APPLIED,
         METRIC_APPLY_ERRORS,
         METRIC_SNAPSHOT_BYTES_RECEIVED,
+        METRIC_DRAIN_CATCHUP_TIMEOUTS,
     ] {
         counter!(name).increment(0);
     }
