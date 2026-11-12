@@ -28,3 +28,12 @@ tempfile = "3"
 # gets tested as two virtual hosts.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+[dev-dependencies]
+# MySQL client for the cluster_failover suite: writes/reads rows through a
+# node's whole-database `[db.sqlite.proxy] mysql_listen` listener. `minimal-rust`
+# is deliberate — it gives flate2 a pure-Rust backend and pulls in NO TLS stack
+# (no native-tls/openssl, no rustls/ring), which matters because this crate (like
+# its reqwest dep) is built without a system TLS library; loopback needs none.
+# Already in the main workspace lock at 0.34 via the litewire stack.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
