@@ -1434,6 +1434,20 @@ fn scan_statements(sql: &str, backslash_escapes: bool) -> Result<(), String> {
                     i += 1;
                 }
             }
+            // MySQL/MariaDB `#` line comment, to end-of-line. Unlike `--` it
+            // needs no following whitespace (matching MySQL's lexer), and like
+            // `--` it is only a comment here at the top level — a `#` inside a
+            // string or quoted identifier is consumed by the quote arm above
+            // and never reaches this match. Without this, a `#` that MySQL
+            // treats as a comment was scanned as ordinary bytes: a `#`-hidden
+            // `;` desynced statement splitting, and a leading `#` line left the
+            // forbidden verb on the next line unseen by `check_statement`.
+            b'#' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
                 loop {
@@ -1488,12 +1502,12 @@ fn check_statement(stmt: &str) -> Result<(), String> {
             }
         }
         // A read is the bare name and nothing after it (whitespace and
-        // comments are already skipped). SQLite's grammar gives a value two
+        // comments — `--`, `/* */` and MySQL's `#` — are already skipped by
+        // `strip_leading_noise`). SQLite's grammar gives a value two
         // introducers, `= value` and `(value)`, but anything else trailing the
-        // name is treated as an assignment too: it is not a valid read, and
-        // the bridge screens MySQL-dialect text *before* translation, where a
-        // `#` comment this scanner does not model could otherwise sit between
-        // the name and the `=`.
+        // name is treated as an assignment too: it is not a valid read, so the
+        // conservative rule stands even for a spelling no comment style
+        // covers.
         let assigns = !after_name.is_empty();
         if assigns {
             for part in &parts {
@@ -1662,6 +1676,10 @@ fn strip_leading_noise(stmt: &str) -> &str {
     loop {
         s = s.trim_start();
         if let Some(rest) = s.strip_prefix("--") {
+            let Some(nl) = rest.find('\n') else { return "" };
+            s = &rest[nl + 1..];
+        } else if let Some(rest) = s.strip_prefix('#') {
+            // MySQL/MariaDB `#` line comment — to end-of-line, like `--`.
             let Some(nl) = rest.find('\n') else { return "" };
             s = &rest[nl + 1..];
         } else if let Some(rest) = s.strip_prefix("/*") {
@@ -3404,6 +3422,62 @@ mod screen_tests {
         rejected("SELECT 1 /* ; */ ; VACUUM");
     }
 
+    /// MySQL/MariaDB `#` line comments (#684). Before the scanner modelled
+    /// `#`, a tenant could hide a forbidden verb behind a leading `#` line:
+    /// `strip_leading_noise` left the `#…` in place, `leading_keyword` read an
+    /// empty keyword off the `#`, and the forbidden statement on the next line
+    /// sailed through. A `#`-hidden `;` also mis-split statements. Both routes
+    /// — the `screen_sql_mysql` path (the one that sees pre-translation MySQL
+    /// text) and the shared `screen_sql` scanner — now treat `#` as a comment
+    /// to end-of-line, exactly like `--`.
+    #[test]
+    fn hash_line_comments_are_modeled() {
+        let allowed_mysql = |sql: &str| {
+            assert!(screen_sql_mysql(sql).is_ok(), "expected MySQL-rule screen to allow `{sql}`");
+        };
+        let rejected_mysql = |sql: &str| {
+            assert!(screen_sql_mysql(sql).is_err(), "expected MySQL-rule screen to refuse `{sql}`");
+        };
+
+        // (a) A forbidden verb exposed by a leading `#` comment line is still
+        // caught — this is the concrete bypass. Before the fix both returned
+        // Ok because the `#…` line left `leading_keyword` empty.
+        rejected_mysql("# set up\nATTACH DATABASE 'evil.db' AS evil");
+        rejected_mysql("SELECT 1;\n# harmless\nATTACH DATABASE 'x' AS y");
+        rejected_mysql("SELECT 1;  # harmless\nVACUUM");
+        // The same through the SQLite-rule scanner.
+        rejected("# note\nVACUUM");
+        rejected("SELECT 1; # a comment\nATTACH DATABASE 'x' AS y");
+
+        // (b) A `#` inside a string literal or quoted identifier is DATA, not a
+        // comment — it must not start one, and the forbidden verb that follows
+        // the closing quote in a real second statement is still caught.
+        allowed_mysql("SELECT '# not a comment' AS note");
+        allowed_mysql("INSERT INTO t (a) VALUES ('#hashtag')");
+        allowed_mysql("SELECT `col#name` FROM t");
+        rejected_mysql("SELECT '#'; VACUUM");
+        rejected("SELECT '#'; ATTACH DATABASE 'x' AS y");
+
+        // (c) A `#` comment at the end of a statement runs only to end-of-line
+        // and must not swallow the next statement: the `;` on the following
+        // line still splits, and a following benign statement still passes
+        // while a following forbidden one is still refused.
+        allowed_mysql("SELECT 1 # trailing\n; SELECT 2");
+        allowed_mysql("SELECT * FROM t # VACUUM everything\n WHERE a = 1");
+        rejected_mysql("SELECT 1 # trailing\n; VACUUM");
+
+        // A `#` comment runs only to end-of-line. A `;VACUUM` on the SAME line
+        // is entirely commented out — MySQL never runs it, so it is allowed
+        // (before the fix the scanner split on that `;` and wrongly rejected).
+        // The same `; VACUUM` on the NEXT line is a real statement and refused.
+        allowed_mysql("SELECT 1 #;VACUUM");
+        rejected_mysql("SELECT 1 #;VACUUM\n; VACUUM");
+        // A legitimate read with a trailing `#` comment now passes (it was a
+        // false rejection before `strip_leading_noise` skipped `#`), matching
+        // the `--` and `/* */` reads in `journal_mode_read_still_passes`.
+        allowed("PRAGMA journal_mode # trailing comment");
+    }
+
     #[test]
     fn truncated_quote_or_comment_is_rejected_conservatively() {
         rejected("SELECT 'unterminated");
@@ -3560,9 +3634,9 @@ mod screen_tests {
             // The stress-run reproduction, as one multi-statement string.
             "BEGIN; PRAGMA journal_mode='mvcc'; INSERT INTO t VALUES (1); COMMIT;",
             "SELECT 1; PRAGMA journal_mode = mvcc",
-            // MySQL-dialect `#` comment between name and value: not modelled
-            // by the scanner, so anything trailing the name counts as an
-            // assignment rather than a read.
+            // MySQL-dialect `#` comment between name and value: the scanner
+            // models `#` to end-of-line, so the comment is skipped and the
+            // `= mvcc` on the next line is still seen as an assignment.
             "PRAGMA journal_mode # c\n = mvcc",
         ] {
             assert_eq!(
