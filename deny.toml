@@ -3,14 +3,17 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
-    # rustls-pemfile unmaintained — transitive dep, awaiting upstream migration
+    # rustls-pemfile unmaintained (RUSTSEC-2025-0134). A *direct* dependency of
+    # ephpm-server (cert/key PEM loading), not transitive — the migration to
+    # rustls-pki-types' built-in PEM parsing is ours to do, not upstream's.
+    # Remove this entry once ephpm-server drops rustls-pemfile.
     "RUSTSEC-2025-0134",
     # unsafe-libyaml unmaintained (repo archived; "no safe upgrade available").
-    # Pulled only by serde_yaml_ng in ephpm-analyze, which parses one file: the
-    # operator's own `.ephpm-analyze.yml`. It is an unmaintained notice, not a
-    # vulnerability. The suggested replacement (serde-saphyr) needs Rust 1.89,
-    # above our 1.88 MSRV, so migrating is a separate change. Remove this entry
-    # when ephpm-analyze moves off serde_yaml_ng.
+    # Pulled by serde_yaml_ng, a dependency of both ephpm-analyze (which parses
+    # the operator's own `.ephpm-analyze.yml`) and the `ephpm` crate. It is an
+    # unmaintained notice, not a vulnerability. The suggested replacement
+    # (serde-saphyr) needs Rust 1.89, above our 1.88 MSRV, so migrating is a
+    # separate change. Remove this entry when both crates move off serde_yaml_ng.
     "RUSTSEC-2024-0449",
     # pin-utils 0.1.0 unmaintained (RUSTSEC-2026-0441). An informational notice,
     # not a vulnerability: 0.1.0 is the crate's only/final release and the

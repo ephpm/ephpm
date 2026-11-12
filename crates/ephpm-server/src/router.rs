@@ -17055,10 +17055,10 @@ data: two
             compression_with(StreamingCompression::Sse),
         );
         assert!(resp.headers().get("content-encoding").is_none());
-        tx.send(Bytes::from_static(b" raw")).await.unwrap();
+        tx.send(Bytes::from_static(b"\x00\x01raw")).await.unwrap();
         drop(tx);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b" raw");
+        assert_eq!(&body[..], b"\x00\x01raw");
     }
 
     // -- a bailout mid-stream must break the response, not finish it ----

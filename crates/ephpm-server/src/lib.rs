@@ -275,6 +275,9 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         let applied = ephpm_cluster::clustered_store::new_applied_write_map();
         let cluster_handle = Arc::new(handle);
 
+        // Publish live gossip membership as the `ephpm_cluster_nodes` gauge.
+        spawn_cluster_membership_sampler(Arc::clone(&cluster_handle));
+
         // The router the data plane serves. It also answers peer warm-up
         // pulls (`OP_SHARE`) from the handoff source when `[kv.snapshot]
         // peer_handoff` is on, and is the router this node's own pull and
@@ -824,6 +827,37 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         );
     }
     served
+}
+
+/// How often the `ephpm_cluster_nodes` gauge is refreshed from gossip
+/// membership. Short enough that the e2e convergence check (which retries for
+/// 30 s) settles on a stable value quickly, without adding meaningful load.
+const CLUSTER_MEMBERSHIP_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn a background task that publishes the alive cluster-member count as the
+/// `ephpm_cluster_nodes` gauge on a fixed cadence.
+///
+/// Reads membership through [`ephpm_cluster::ClusterHandle::nodes`] — the same
+/// accessor the cron scheduler and peer handoff already use — so it stays off
+/// the replication hot path. Spawned once per clustered process; a single-node
+/// process never calls this, so the gauge is only ever emitted while clustered.
+/// The count includes this node itself (gossip always lists self as alive).
+fn spawn_cluster_membership_sampler(cluster: Arc<ephpm_cluster::ClusterHandle>) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CLUSTER_MEMBERSHIP_SAMPLE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let alive = cluster
+                .nodes()
+                .await
+                .into_iter()
+                .filter(|n| n.state == ephpm_cluster::NodeState::Alive)
+                .count();
+            // Leading `::` — `crate::metrics` shadows the external crate here.
+            ::metrics::gauge!("ephpm_cluster_nodes").set(alive as f64);
+        }
+    });
 }
 
 /// Resolve which cluster-channel features are enabled on this node.

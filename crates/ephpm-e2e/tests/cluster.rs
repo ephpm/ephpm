@@ -180,50 +180,45 @@ async fn cluster_nodes_discover_each_other() {
 
             let body = resp.text().await.expect("failed to read metrics body");
 
-            // Look for the cluster membership gauge. The metrics crate emits
-            // this as ephpm_cluster_nodes if the server records it, but even
-            // without a dedicated cluster metric, the fact that /metrics
-            // returns 200 on all nodes is meaningful. Check for build_info as
-            // a sanity check that metrics work.
+            // Metrics must be working at all.
             if !body.contains("ephpm_build_info") {
                 last_error = format!("node {i}: /metrics missing ephpm_build_info");
                 all_converged = false;
                 break;
             }
 
-            // If there is a cluster_nodes gauge, validate it shows the expected count.
-            // Otherwise we rely on the KV replication test below for convergence proof.
-            if let Some(line) = body.lines().find(|l| {
-                l.contains("ephpm_cluster_nodes") && !l.starts_with('#')
-            }) {
-                // Parse the gauge value (last token on the line).
-                if let Some(val_str) = line.split_whitespace().last()
-                    && let Ok(count) = val_str.parse::<f64>()
-                    && (count as usize) < expected
-                {
-                    last_error =
-                        format!("node {i}: ephpm_cluster_nodes = {count}, want >= {expected}");
-                    all_converged = false;
-                    break;
-                }
+            // The cluster membership gauge must be present on every clustered
+            // node, and once gossip converges it reports the full cluster size
+            // (the gauge counts alive members including self). A missing gauge
+            // is a hard failure now, not a soft pass.
+            let Some(line) = body
+                .lines()
+                .find(|l| l.contains("ephpm_cluster_nodes") && !l.starts_with('#'))
+            else {
+                last_error = format!("node {i}: /metrics missing ephpm_cluster_nodes gauge");
+                all_converged = false;
+                break;
+            };
+
+            // Parse the gauge value (last token on the line).
+            let count = line
+                .split_whitespace()
+                .last()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or_else(|| {
+                    panic!("node {i}: unparseable ephpm_cluster_nodes line: {line:?}")
+                }) as usize;
+            if count < expected {
+                last_error =
+                    format!("node {i}: ephpm_cluster_nodes = {count}, want >= {expected}");
+                all_converged = false;
+                break;
             }
         }
 
         if all_converged {
             return;
         }
-    }
-
-    // If we never found a cluster_nodes metric but all nodes serve /metrics,
-    // that is still valid — there just is not a dedicated metric yet. The KV
-    // replication test provides the stronger convergence proof.
-    if last_error.contains("ephpm_cluster_nodes") {
-        eprintln!(
-            "warning: ephpm_cluster_nodes metric not at expected count after retries: {last_error}"
-        );
-        eprintln!("this may be expected if the metric is not yet implemented — cluster_kv_replication provides convergence proof");
-        // Do not fail — defer to KV replication test.
-        return;
     }
 
     panic!("cluster nodes did not converge after 30s: {last_error}");

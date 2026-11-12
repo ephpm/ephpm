@@ -1720,8 +1720,8 @@ impl ClusteredStore {
     /// Record a remote fetch and potentially promote a key to the hot
     /// cache.
     ///
-    /// Called when a TCP fetch completes (Phase 7). For now, exposed
-    /// for testing.
+    /// Called on the live read path whenever a TCP fetch from a peer
+    /// completes (Phase 7); also exercised directly by unit tests.
     pub fn track_remote_fetch(&self, key: &str, value: &[u8]) {
         if !self.config.hot_key_cache {
             return;
