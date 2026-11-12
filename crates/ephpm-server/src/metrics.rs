@@ -6,7 +6,7 @@
 //! Call [`init`] once at startup. Pass the returned [`PrometheusHandle`] into
 //! [`Router`](crate::router::Router) so the `/metrics` endpoint can serve it.
 
-use ::metrics::gauge;
+use ::metrics::{describe_gauge, gauge};
 use anyhow::Context;
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -149,6 +149,15 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
         "version" => env!("CARGO_PKG_VERSION")
     )
     .set(1.0);
+
+    // Cluster membership gauge — described here so a HELP line is present, but
+    // never sampled on a single node: its value is set on a cadence by the
+    // sampler in `serve()` only while clustered (see
+    // `spawn_cluster_membership_sampler`), so a single-node scrape omits it.
+    describe_gauge!(
+        "ephpm_cluster_nodes",
+        "Number of cluster members this node currently sees as alive (includes self)."
+    );
 
     Ok(handle)
 }

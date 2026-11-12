@@ -211,18 +211,18 @@ mod tests {
 
     /// An `EXPLAIN`-wrapped `ATTACH` must not execute on the wire path either.
     ///
-    /// Asserts only that it *fails*, deliberately, because which layer refuses
-    /// it is mid-flight: today the leading keyword parses as `EXPLAIN` so our
-    /// screen waves it through and the engine refuses it; once #287 lands,
-    /// `screen_sql` sees through the wrapper and the refusal becomes ours.
-    /// Verified by test-merging #287 locally — all three forms below come back
-    /// as "not permitted on the tenant database path" with no change here,
-    /// because this decorator calls the very function #287 fixes.
+    /// Asserts only that it *fails*, deliberately. #287 has landed:
+    /// `screen_sql` now strips the leading `EXPLAIN` / `EXPLAIN QUERY PLAN`
+    /// wrapper (see `db_bridge::strip_explain_prefixes`) and refuses the
+    /// `ATTACH` itself, so all three forms below come back as "not permitted on
+    /// the tenant database path" — this decorator calls that very function.
+    /// (Before #287 the leading keyword parsed as `EXPLAIN`, our screen waved
+    /// it through, and the engine refused it one layer deeper.)
     ///
-    /// Pinning the message would make this test fail on one side of that merge
-    /// or the other. The security property — an `EXPLAIN` wrapper never buys a
-    /// tenant a cross-database `ATTACH` — holds on both sides, so that is what
-    /// is asserted.
+    /// The test still pins only *that it fails*, not the exact message. The
+    /// security property — an `EXPLAIN` wrapper never buys a tenant a
+    /// cross-database `ATTACH` — is what must not regress, and keeping the
+    /// assertion off the wording leaves it stable if the message changes again.
     #[tokio::test]
     async fn explain_wrapped_attach_does_not_execute() {
         let conn = screened().await.connect().await.expect("connect");
