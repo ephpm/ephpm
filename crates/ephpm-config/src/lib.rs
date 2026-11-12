@@ -2945,9 +2945,11 @@ pub struct SqliteConfig {
 /// (`source = "primary"`), or a non-write holder with `source = "replica"` —
 /// gated on election/HRW ownership so no database is shipped twice per
 /// interval, and `ephpm db restore` strips the CDC replication bookkeeping a
-/// physical snapshot carries so a restored file re-seeds the cluster as clean
-/// origin data. Clustered mode is itself experimental (Turso is Beta
-/// upstream), so clustered backup is too.
+/// physical snapshot carries so the installed file is clean origin data.
+/// Restoring INTO a running cluster is experimental and manual — replicas do
+/// not auto-converge, so every node is stopped and every other node's copy
+/// wiped (see `ephpm db restore`). Clustered mode is itself experimental (Turso
+/// is Beta upstream), so clustered backup is too.
 ///
 /// Unknown keys are a startup error, as in every section.
 #[derive(Debug, Deserialize, Clone)]
@@ -6164,12 +6166,13 @@ impl Config {
                     backup.source,
                 )));
             }
-            // Clustered backup is allowed as of v0.16.0: the scheduler gates
-            // each database on this node's election/HRW ownership so it is
+            // Clustered backup is allowed (v0.16.1): the scheduler gates each
+            // database on this node's election/HRW ownership so it is
             // snapshotted by exactly one node, and `ephpm db restore` strips
-            // the CDC replication bookkeeping a physical snapshot carries so a
-            // restored file re-seeds the cluster as clean origin data. See the
-            // clustered-database-backups design note. Clustered mode is itself
+            // the CDC replication bookkeeping a physical snapshot carries so the
+            // installed file is clean origin data. Restoring INTO a cluster is
+            // experimental and manual (replicas do not auto-converge; see the
+            // restore prompt / design note). Clustered mode is itself
             // experimental (Turso is Beta upstream), so clustered backup is too.
         }
 

@@ -70,10 +70,11 @@ struct Target {
     key: String,
     path: PathBuf,
     /// `Some` when the config runs a **clustered** embedded database. A
-    /// restore then re-seeds the whole cluster, so the confirmation and docs
-    /// demand every node be stopped — not just this one, which is all the
-    /// offline probe can see. The kind separates the supported whole-database
-    /// path from the experimental per-site one.
+    /// restore then installs the file on this node only; replicas do not
+    /// auto-converge onto it, so the confirmation and docs demand every node be
+    /// stopped and every other node's `.db` wiped — not just this one, which is
+    /// all the offline probe can see. The kind only distinguishes the two
+    /// topologies for the message; both are experimental and manual.
     cluster: Option<ClusterRestoreKind>,
 }
 
@@ -81,17 +82,22 @@ struct Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClusterRestoreKind {
     /// Whole-database clustered: one shared database, an elected primary.
-    /// **Supported** — stripping the CDC bookkeeping mints a fresh log
-    /// identity, which forces every replica to re-bootstrap from the restored
-    /// primary on reconnect. Restore on the lowest-ordinal node and start it
-    /// first.
+    /// **Experimental** — stripping the CDC bookkeeping mints a fresh log
+    /// identity so the restored node serves clean origin data, but a replica
+    /// still holding its old database treats that fresh log id as an ordinary
+    /// failover (`maybe_bootstrap_cold_replica` re-bootstraps only a *cold*
+    /// replica) and keeps its old rows, tailing the restored log on top. So the
+    /// cluster converges only if every other node's `.db`/`-wal`/`-shm` is
+    /// wiped before restart; the automatic `--reseed` is not yet implemented.
+    /// Restore on the lowest-ordinal node and start it first.
     WholeDb,
     /// Per-site clustered: an HRW owner per site. **Experimental** — the same
-    /// strip applies, but whether the cluster *converges* onto the restored
-    /// data depends on this node settling with a dominating `SiteVersion`
-    /// epoch across a whole-cluster restart, which is not yet lab-validated.
-    /// A returning peer with a higher epoch for the site could overwrite the
-    /// restore. The planned `--reseed` mitigation is not yet implemented.
+    /// strip applies, but a per-site non-owner that still holds the site also
+    /// tails the restored log on top of its old rows (`plan_replica_attempt`
+    /// returns `TailOnly` while a lineage is recorded), and a returning peer
+    /// with a higher `SiteVersion` epoch could overwrite the restore silently.
+    /// Convergence needs the same wipe procedure as whole-database; the planned
+    /// `--reseed` mitigation is not yet implemented.
     PerSite,
 }
 
@@ -111,9 +117,10 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
 ///
 /// A clustered mode resolves to the same local file a single-node / per-site
 /// config would, and the restore strips the CDC replication bookkeeping the
-/// image carries so it re-seeds the cluster as clean origin data (see
+/// image carries so the installed file is clean origin data (see
 /// `db_backup::strip_cdc_bookkeeping` and the clustered-backup design note).
-/// The `clustered` flag drives the whole-cluster-stop confirmation.
+/// The `clustered` flag drives the whole-cluster-stop + wipe-replicas
+/// confirmation (replicas do not auto-converge; see `ClusterRestoreKind`).
 fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
     let sqlite = config.db.sqlite.as_ref().context(
         "`ephpm db restore` needs an embedded database ([db.sqlite]); this config has none",
@@ -306,30 +313,46 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
         None => "This replaces the live database with the backup.",
         Some(ClusterRestoreKind::WholeDb) => {
             println!(
-                "mode:    CLUSTERED (whole-database) — this re-seeds the whole cluster for this \
-                 database. Every node must be stopped (this tool can only check the local node). \
-                 Restore on the lowest-ordinal node and start it first; on restart the restored \
-                 data re-seeds as the origin and every replica re-bootstraps onto it."
+                "mode:    CLUSTERED (whole-database) — EXPERIMENTAL. This installs the backup on \
+                 THIS node only; replicas do NOT auto-converge onto it."
             );
-            "This re-seeds the CLUSTER with the backup. Confirm every node is stopped."
+            eprintln!(
+                "WARNING: whole-database clustered restore is EXPERIMENTAL and does not reseed \
+                 replicas automatically. A replica restarted with its old database still present \
+                 treats the restored log as an ordinary failover: it KEEPS its old rows and \
+                 applies the restored node's new writes ON TOP of them — a silent mix, not the \
+                 restored data — and a later primary failover can then lose the restore \
+                 cluster-wide with only a WARN. Required procedure: (1) stop EVERY node; (2) \
+                 restore on the lowest-ordinal node; (3) DELETE the database file and its \
+                 -wal/-shm on EVERY OTHER node so they cold-bootstrap from the restored node; (4) \
+                 start the restored node FIRST, then the wiped replicas; (5) verify each replica \
+                 re-bootstrapped (its log shows \"snapshot bootstrap complete\" / \
+                 ephpm_cdc_bootstrap_total{outcome=\"ok\"}), since a node skipped at step 3 looks \
+                 healthy but serves the mix. The automatic `--reseed` that performs step 3 is NOT \
+                 YET IMPLEMENTED. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
+            );
+            "This installs an EXPERIMENTAL whole-database clustered restore on THIS node. Confirm \
+             every node is stopped and you will wipe every replica's database before starting it."
         }
         Some(ClusterRestoreKind::PerSite) => {
             println!(
                 "mode:    CLUSTERED (per-site) — EXPERIMENTAL, not yet validated on a live cluster."
             );
             eprintln!(
-                "WARNING: per-site clustered restore is EXPERIMENTAL. The backup's CDC \
-                 bookkeeping is stripped so this node re-seeds the site as its origin, but whether \
-                 the CLUSTER converges onto the restored data depends on this node settling with a \
-                 dominating version epoch when the cluster restarts. If a peer returns with a \
-                 higher epoch for this site, it can OVERWRITE the restore with no error — silent \
-                 divergence. Mitigations: stop EVERY node, then bring THIS node up FIRST so it \
-                 settles and publishes its epoch before any peer. The planned `--reseed` (which \
-                 removes the site's .db on every other node so they bootstrap from this one) is \
-                 NOT YET IMPLEMENTED. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
+                "WARNING: per-site clustered restore is EXPERIMENTAL and does not reseed peers \
+                 automatically. The strip re-seeds the site as this node's origin, but a peer that \
+                 still holds the site tails the restored log ON TOP of its old rows (a mix), and a \
+                 peer returning with a higher SiteVersion epoch could OVERWRITE the restore with \
+                 no error. Required procedure, same as whole-database: (1) stop EVERY node; (2) \
+                 restore on this node; (3) DELETE this site's <key>.db and its -wal/-shm on EVERY \
+                 OTHER node so they cold-bootstrap from here; (4) start THIS node FIRST, then the \
+                 wiped peers; (5) verify each peer re-bootstrapped the site. The planned \
+                 `--reseed` (which performs step 3) is NOT YET IMPLEMENTED. \
+                 See https://ephpm.dev/roadmap/clustered-db-backups/ ."
             );
-            "This re-seeds the CLUSTER with an EXPERIMENTAL per-site restore. Confirm every node \
-             is stopped and you have read the warning above."
+            "This installs an EXPERIMENTAL per-site clustered restore on THIS node. Confirm every \
+             node is stopped and you will wipe this site's database on every other node before \
+             starting it."
         }
     };
     confirm(prompt, req.yes)?;
@@ -527,8 +550,8 @@ mod tests {
     }
 
     /// Whole-database clustered now resolves the one `default` database and is
-    /// flagged clustered (so the restore re-seeds the cluster + strips CDC
-    /// bookkeeping), instead of being refused.
+    /// flagged clustered (so the restore prompts for the whole-cluster stop +
+    /// replica wipe and strips CDC bookkeeping), instead of being refused.
     #[test]
     fn clustered_whole_db_target_resolves_and_is_flagged() {
         let tmp = tempfile::tempdir().unwrap();
@@ -545,7 +568,7 @@ mod tests {
         assert_eq!(
             target.cluster,
             Some(ClusterRestoreKind::WholeDb),
-            "whole-DB clustered is the supported restore kind"
+            "whole-DB clustered resolves to the whole-database restore kind"
         );
         // Still fail-closed on a non-`default` key in whole-DB mode.
         assert!(resolve_target(&config, "shop").is_err(), "whole-DB has only `default`");

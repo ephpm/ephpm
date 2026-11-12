@@ -377,12 +377,14 @@ always keeps the newest object; `ephpm db restore` installs one offline
 after a `PRAGMA integrity_check`. RPO = `interval`. The object is plaintext
 (bucket-side encryption). The replica bootstrap deliberately keeps its logical
 dump: a physical image carries triggers, which a replica must not hold.
-**Clustered backup shipped as a follow-up (targeted v0.16.0):** the scheduler
-gates each database on election/HRW ownership so it is snapshotted by exactly
-one node (`[db.sqlite.backup] source` = `primary` | `replica`), and
-`ephpm db restore` strips the CDC replication bookkeeping a physical clustered
-image carries so a restored file re-seeds the cluster as clean origin data — see
-the [clustered-backup design note](/roadmap/clustered-db-backups/).
+**Clustered backup shipped in v0.16.1:** the scheduler gates each database on
+election/HRW ownership so it is snapshotted by exactly one node
+(`[db.sqlite.backup] source` = `primary` | `replica`), and `ephpm db restore`
+strips the CDC replication bookkeeping a physical clustered image carries so the
+installed file is clean origin data. Restoring *into* a running cluster is
+experimental and manual (replicas do not auto-converge; automatic `--reseed`
+planned) — see the
+[clustered-backup design note](/roadmap/clustered-db-backups/).
 
 #### Tier 1: point-in-time restore (planned)
 

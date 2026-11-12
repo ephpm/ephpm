@@ -562,16 +562,18 @@ live database. It is a **file install**, not an SQL replay, and it is
    one database is addressed as `--site default` (its backups are stored under
    that key). A **clustered** config resolves the same local file and the
    restore additionally **strips the CDC replication bookkeeping** the image
-   carries (step 5a) so it re-seeds the cluster as clean origin data — but then
-   the restore re-seeds *every* node for that database, so the whole cluster must
-   be stopped (the command can only check the local node and says so).
-   **Whole-database clustered** is supported — restore on the lowest-ordinal node
-   and start it first, and replicas re-bootstrap from the fresh log identity.
-   **Per-site clustered is EXPERIMENTAL**: the command prints a loud warning that
-   its restore convergence is not yet validated on a live cluster (a returning
-   peer with a higher `SiteVersion` epoch could overwrite the restore silently;
-   the planned `--reseed` mitigation is not yet implemented) and asks you to
-   confirm. See the
+   carries (step 5a) so the installed file is clean origin data. Restoring into a
+   cluster installs the file on **one** node and is **experimental and manual for
+   both topologies**: replicas do **not** auto-converge onto it — a replica
+   restarted with its old database tails the restored log *on top of* its old
+   rows. So the whole cluster must be stopped and every other node's
+   `.db`/`-wal`/`-shm` **wiped** so they cold-bootstrap. The command prints the
+   full procedure (restore on the lowest-ordinal node, wipe the others, start the
+   restored node first, verify each re-bootstrapped) and asks you to confirm; it
+   can only check the local node and says so. **Per-site clustered** adds a
+   hazard: a returning peer with a higher `SiteVersion` epoch could overwrite the
+   restore silently. The automatic `--reseed` (which performs the wipe) is **not
+   yet implemented**. See the
    [clustered-backup design note](/roadmap/clustered-db-backups/).
 2. **Picks the object.** With `--from s3://bucket[/prefix]` the objects under
    `<prefix>/<site>/` are listed and the newest with a timestamp **at or
@@ -597,9 +599,11 @@ live database. It is a **file install**, not an SQL replay, and it is
    **5a. Reconciles (clustered images only).** The CDC replication bookkeeping a
    clustered snapshot carries (`turso_cdc`, `__ephpm_cdc_*`,
    `__litewire_cdc_watermark`) is dropped from the staged file — a no-op on a
-   single-node image, which carries none — so the restore mints a fresh log
-   identity on open and peers re-bootstrap onto it instead of silently diverging.
-   Then the staged file is opened with the engine and checked with
+   single-node image, which carries none — so the restored node mints a fresh log
+   identity on open and serves clean origin data. (This does not by itself make a
+   running cluster converge: peers still holding old data must be wiped so they
+   cold-bootstrap — see step 1.) Then the staged file is opened with the engine
+   and checked with
    `PRAGMA integrity_check`. Anything but `ok` deletes the temporary file and
    exits `2` — **the live database is never touched by a file that does not
    verify**.

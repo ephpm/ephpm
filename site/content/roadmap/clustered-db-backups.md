@@ -16,21 +16,36 @@ weight = 24
 
 ## Maturity, up front
 
-The two clustered topologies are deliberately **not** shipped at the same
-confidence:
+Separate the two halves. **Taking the backup** — snapshotting the right database
+from exactly one node, exactly once per interval, into a valid standalone
+artifact — is the supported, shipped part (whole-database) / experimental part
+(per-site). **Restoring *into* a running cluster** is experimental for **both**
+topologies, because of a correction to the original design (see the box below):
+a replica does **not** auto-converge onto a restored node.
 
-- **Whole-database clustered backup — supported.** The strip mints a fresh log
-  identity, which forces replicas to re-bootstrap from the restored primary;
-  restore on the lowest-ordinal node and start it first. Deterministic and the
-  higher-confidence path.
-- **Per-site clustered backup — EXPERIMENTAL, lab-pending.** The backup half is
-  fine, but restore *convergence* depends on a `SiteVersion` epoch-dominance
-  property that unit tests cannot prove (below). To keep that gap from ever
-  shipping as production-ready, per-site clustered backup is reachable only
-  through the experimental `[db.sqlite.replication] per_site = true` opt-in, and
-  both **startup** and **`ephpm db restore`** warn loudly about it. The planned
-  `--reseed` mitigation is documented but **not built** — lab item 4 decides
-  whether it is needed.
+> **Correction (v0.16.1).** This note was written assuming that a restored
+> node's **fresh log identity** would make every replica "detect a different log
+> id → re-bootstrap → converge". That is **not** how the engine behaves. A
+> replica that still holds its old database treats a new log id as an ordinary
+> **failover** (`maybe_bootstrap_cold_replica` re-bootstraps only a *cold*
+> replica; a non-owner per-site replica returns `TailOnly` while a lineage is
+> recorded), so it keeps its old rows and tails the restored log on top of them.
+> Convergence therefore requires **manually wiping every other node's `.db`**
+> before restart (the planned `--reseed`). The passages below that describe
+> "log-id change → proven divergence → re-bootstrap" are retained as the
+> *original design intent*; the implemented behaviour is the correction here.
+
+- **Whole-database clustered backup — supported; restore experimental + manual.**
+  The snapshot is deterministic and exactly-once. Restoring reseeds no replica
+  automatically: stop every node, restore on the lowest-ordinal node, wipe every
+  other node's `.db`/`-wal`/`-shm`, start the restored node first, and verify
+  each replica re-bootstrapped. `--reseed` (automatic step 3) is **not built**.
+- **Per-site clustered backup — EXPERIMENTAL.** The backup half snapshots each
+  site once by its HRW owner (`source = "replica"` is not yet supported here and
+  falls back to the owner with a `WARN`). Restore uses the same manual wipe
+  procedure, plus a `SiteVersion` epoch-dominance hazard (below). Reachable only
+  through the experimental `[db.sqlite.replication] per_site = true` opt-in; both
+  **startup** and **`ephpm db restore`** warn loudly.
 
 ## Where we are
 
@@ -127,16 +142,20 @@ it is not yet settled for. The bounds:
   `Blocked`/`Pending`) skips the tick. The next tick covers it. Worst-case RPO
   during a move is therefore `interval + one tick`, not unbounded.
 
-The scheduler emits a per-database decision at `DEBUG` and a counter
+The scheduler emits a tick summary at `DEBUG` and a counter
 (`ephpm_db_backup_skipped_total{site,reason}` with `reason` ∈ `not_primary`
 (whole-DB primary mode), `not_replica` (whole-DB replica mode), `not_owner`
-(per-site)) so an operator can confirm each database is backed up by exactly one
-node and see the skip reason on every other node. `BACKUP_CONCURRENCY` (4) is
-unchanged; a per-site owner that owns many sites still processes at most four at
-once. The scheduler gates on **ownership only**, not the serving gate — a
-not-yet-bootstrapped new owner usually has no `.db` file to enumerate yet, so it
-naturally does not back up an empty database; this is the "gap" above, bounded by
-one tick.
+(per-site), and `empty_snapshot`) so an operator can confirm each database is
+backed up by exactly one node and see the skip reason on every other node.
+`BACKUP_CONCURRENCY` (4) is unchanged; a per-site owner that owns many sites
+still processes at most four at once. The scheduler gates on **ownership only**,
+not the serving gate — so a not-yet-bootstrapped new owner (or a cold whole-DB
+replica) *is* ownership-responsible and would otherwise snapshot an empty file.
+Its on-disk `.db` exists (the mgmt registry creates it on announce), so the
+snapshot is taken but the **staged artifact is checked for user tables and an
+empty one is skipped** with `reason = empty_snapshot` — never uploaded, so an
+empty image can never become the newest object and the last good backup stays.
+This is the "gap" above, bounded by one tick.
 
 A node that has announced a graceful drain (`NodeInfo::draining`) is already
 skipped by `hrw_owner`, so a draining node stops being backup-responsible the
@@ -252,15 +271,20 @@ becomes owner, the restored node tails the old owner and **the restore is
 silently lost.**
 
 The restored data must therefore end up on the node that **serves the site as
-owner**. The mechanisms that make that happen are already in the engine, and the
-operating procedure is what engages them:
+owner**, *and* every other node must be prevented from tailing the restored log
+on top of its old rows. Stripping + ownership placement is not enough on its own
+— see the correction box at the top: a replica that still holds old data
+`TailOnly`s rather than re-bootstraps. The operating procedure must also **wipe
+the replicas** so they come up cold:
 
-- **Whole-DB clustered — supported and the higher-confidence path.** Restore the
-  stripped image on the **lowest-ordinal node** (the one the election makes
-  primary) with the cluster stopped, then start that node first. It comes up as
-  primary with a fresh log id; every replica, on reconnect, sees a source-log
-  change → proven divergence → re-bootstraps from the restored primary. The
-  owner is predictable (lowest `node_id`), so the procedure is deterministic.
+- **Whole-DB clustered — backup supported; restore experimental + manual.**
+  Restore the stripped image on the **lowest-ordinal node** (the one the election
+  makes primary) with the cluster stopped. Then **delete the `.db`/`-wal`/`-shm`
+  on every other node** so each comes up *cold* and `maybe_bootstrap_cold_replica`
+  fetches the restored primary's snapshot. Start the restored node first, then the
+  wiped replicas, and verify each re-bootstrapped. Skipping the wipe leaves a
+  replica tailing the restore on top of its old rows (a mix) — a later failover
+  then loses the restore. `--reseed` (automatic wipe) is **not yet built**.
 - **Per-site clustered — EXPERIMENTAL, gated and lab-pending.** The site's owner
   after restart is `hrw_owner`, which depends on which nodes are alive first —
   not predictable offline. Convergence relies on the restored node **settling
@@ -364,11 +388,14 @@ unit-validated + lab-pending, never cluster-validated):**
    owner) and confirm the new owner picks up backup responsibility within one
    interval, and the drained/dead node stops.
 4. **A real clustered backup → restore → re-serve round trip** — write data,
-   back up, change the data, stop the cluster, restore the earlier backup
-   (whole-DB on the lowest-ordinal node; per-site per the procedure above), start
-   the cluster, and confirm **every node** serves the restored data (the peers
-   re-bootstrapped; no node silently kept the newer copy). This is the test that
-   proves the reconciliation and the `SiteVersion`-epoch convergence for per-site.
+   back up, change the data, stop the cluster, restore the earlier backup on the
+   lowest-ordinal node, **wipe every other node's `.db`/`-wal`/`-shm`** (the
+   manual stand-in for `--reseed`), start the restored node first then the wiped
+   peers, and confirm **every node** serves the restored data (each peer
+   cold-bootstrapped; no node silently kept the newer copy or tailed on top of
+   it). This is the test that proves the reconciliation, and it is also what an
+   eventual `--reseed` must automate; the negative case (skip the wipe → a peer
+   serves the old+new mix) is the regression guard.
 5. **WAL behavior on a write-hot primary during backup** — a `VACUUM INTO` on a
    write-hot whole-DB primary / per-site owner does not unbound the `-wal`, and
    `source = "replica"` moves the WAL pin off the write node (measure

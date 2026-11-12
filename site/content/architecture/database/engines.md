@@ -454,13 +454,16 @@ What it is and is not:
   node's election/HRW ownership so it is snapshotted by exactly one node — the
   write node by default, or a non-write holder with `[db.sqlite.backup] source =
   "replica"` — and `ephpm db restore` strips the CDC replication bookkeeping the
-  physical image carries so a restored file re-seeds the cluster as clean origin
-  data. A clustered restore re-seeds the whole cluster and so requires every node
-  stopped. **Whole-database clustered backup is supported** (the fresh log
-  identity the strip mints forces replicas to re-bootstrap); **per-site clustered
-  backup is experimental and lab-pending** — reachable only through the
-  experimental `per_site = true`, with restore convergence not yet validated on a
-  live cluster (startup and the restore command both warn). See the
+  physical image carries so the installed file is clean origin data.
+  **Whole-database clustered backup is supported** (exactly-once scheduling, a
+  valid standalone artifact); **per-site clustered backup is experimental**
+  (reachable only through the experimental `per_site = true`; `source = "replica"`
+  there falls back to the owner with a `WARN`). **Restoring *into* a cluster is
+  experimental and manual for both topologies**: replicas do not auto-converge
+  onto a restored node (one still holding old data tails the restore on top of
+  it), so every node must be stopped and every other node's `.db` wiped so they
+  cold-bootstrap — the command prints the procedure, and the automatic `--reseed`
+  is not yet built. See the
   [clustered-backup design note](/roadmap/clustered-db-backups/) for the
   exactly-once guarantees and the multi-node lab validation each topology needs.
 

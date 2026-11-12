@@ -20,8 +20,9 @@ after the chosen snapshot), kept for `retention`. Restore is **offline**
 (stop the server, install, start). It is not transaction-granularity
 point-in-time recovery — that is
 [planned, not yet implemented](/roadmap/turso-engine/#tier-1-point-in-time-restore-planned).
-It also runs on **clustered** nodes (each database is snapshotted by one node;
-restore re-seeds the cluster) — see [clustered mode](#clustered-mode) below.
+It also runs on **clustered** nodes (each database is snapshotted by exactly one
+node; restoring into a cluster is experimental and manual) — see
+[clustered mode](#clustered-mode) below.
 
 ## 1. Enable it
 
@@ -295,41 +296,50 @@ source    = "primary"   # default: back up from the write node
   nodes that are *not* responsible: it increments there each tick while the one
   responsible node uploads.
 
-Two clustered topologies, and they are **not** equally mature:
+The **backup** side — taking a correct, exactly-once snapshot from the right
+node — works in both clustered topologies (whole-database is the supported path;
+per-site is experimental). **Restoring *into* a running cluster is a different
+matter and is experimental for both**, because replicas do **not** auto-converge
+onto a restored node.
 
-### Whole-database clustered — supported
+### Whole-database clustered — backup supported, restore experimental + manual
 
-One shared database, an elected primary. `ephpm db restore` strips the CDC
-bookkeeping, which mints a **fresh log identity** on open; that forces every
-replica to re-bootstrap from the restored primary when it reconnects. To restore:
-stop every node, restore on the **lowest-ordinal node** (the one the election
-makes primary), and start it first. The whole cluster converges on the restored
-data.
+One shared database, an elected primary. The **backup** is supported: the
+primary (or a replica, with `source = "replica"`) snapshots the one database
+exactly once per interval, and the artifact is a valid standalone SQLite file.
 
-### Per-site clustered — EXPERIMENTAL, lab-pending
+**Restore does not reseed replicas automatically.** `ephpm db restore` strips
+the CDC bookkeeping so the restored node serves clean origin data — but a
+replica restarted with its **old database still present** treats the fresh log
+identity as an ordinary failover: it keeps its old rows and applies the restored
+node's new writes *on top of them* (a mix), and a later primary failover can
+then lose the restore cluster-wide with only a `WARN`. So the required procedure
+is manual:
+
+1. Stop **every** node.
+2. Restore on the **lowest-ordinal node** (the one the election makes primary).
+3. **Delete** the database file and its `-wal`/`-shm` on **every other node** so
+   they cold-bootstrap from the restored node.
+4. Start the restored node **first**, then the wiped replicas.
+5. Verify each replica re-bootstrapped (`ephpm_cdc_bootstrap_total{outcome="ok"}`
+   / the "snapshot bootstrap complete" log line) — a node skipped at step 3 looks
+   healthy but serves the mix.
+
+The automatic `--reseed` that performs step 3 is **not yet implemented**.
+
+### Per-site clustered — EXPERIMENTAL
 
 Available only because you opted into the experimental
 [`[db.sqlite.replication] per_site = true`](/reference/config/#dbsqlitereplication-clustered-mode-only).
-The **backup** half works the same way — each site is snapshotted once, by its
-HRW owner (or a replica) — but the **restore** convergence is **not yet validated
-on a live cluster** and can silently lose a restore:
+Each site is snapshotted once by its HRW owner (`source = "replica"` is not yet
+supported here and falls back to the owner with a `WARN`). Restore is
+experimental with the **same manual wipe procedure** as whole-database, plus an
+extra hazard: a peer returning with a higher `SiteVersion` epoch for the site
+could overwrite the restore with **no error**. `ephpm db restore` prints the
+full procedure before it asks you to confirm.
 
-- Startup logs a `WARN` naming this; `ephpm db restore` prints a loud warning
-  before it asks you to confirm.
-- The hazard: after the strip, the restored node re-seeds the site as its origin,
-  but whether the *cluster* converges onto it depends on this node settling with
-  a **dominating version epoch** when the cluster restarts. If a peer comes back
-  with a higher epoch for that site, it can overwrite the restore with **no
-  error**.
-- Until this is lab-validated, treat it as best-effort: stop **every** node, then
-  bring **the restored node up first** so it settles and publishes its epoch
-  before any peer rejoins. The planned `--reseed` mitigation (remove the site's
-  `.db` on every other node so they bootstrap from the restored one) is
-  **not yet implemented**.
-
-**A clustered restore re-seeds the whole cluster** either way, and the CLI can
-only check the local node — so it demands every node be stopped and asks you to
-confirm. See the
+The CLI can only check the local node, so a clustered restore demands every node
+be stopped and asks you to confirm. See the
 [clustered-backup design note](/roadmap/clustered-db-backups/) for the
 exactly-once guarantees, the reconciliation, and the multi-node lab validation
 each topology still needs.

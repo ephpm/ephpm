@@ -1494,9 +1494,11 @@ const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
 /// backup of a clustered database captures them. `ephpm db restore` strips
 /// exactly this set from a restored image (`db_backup::strip_cdc_bookkeeping`)
 /// so the file comes back as clean origin data: a fresh `__ephpm_cdc_log_id`
-/// is minted on open, `site_data_lineage` stamps the node as the site's
-/// origin, and peers holding the old copy see a different log id and
-/// re-bootstrap onto the restored data.
+/// is minted on open and `site_data_lineage` stamps the node as the site's
+/// origin. This does not on its own re-converge a running cluster — a replica
+/// still holding old data treats the fresh log id as a failover and tails on
+/// top of it — so a clustered restore is an experimental, manual wipe-the-
+/// replicas procedure in this release (see `ephpm db restore`).
 ///
 /// **Not** `__turso_internal_*`: those are the engine's own autoincrement
 /// backing tables — valid physical state that must survive the strip — which

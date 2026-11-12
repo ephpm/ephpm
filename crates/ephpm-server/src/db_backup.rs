@@ -77,9 +77,8 @@
 //! node by default, or a non-write holder with `[db.sqlite.backup] source =
 //! "replica"`. A physical snapshot of a clustered database carries CDC
 //! bookkeeping (`turso_cdc`, `__ephpm_cdc_*`, `__litewire_cdc_watermark`);
-//! `ephpm db restore` strips it (see [`strip_cdc_bookkeeping`]) so a restored
-//! file re-seeds the cluster as clean origin data. See the clustered-backup
-//! design note.
+//! `ephpm db restore` strips it (see [`strip_cdc_bookkeeping`]) so the restored
+//! file is clean origin data. See the clustered-backup design note.
 //!
 //! # Restore
 //!
@@ -88,8 +87,12 @@
 //! `--at`, downloads, gunzips, strips the CDC bookkeeping a clustered image
 //! carries (a no-op on a single-node image), verifies with `PRAGMA
 //! integrity_check`, and renames over the site's `.db` — only when no server
-//! holds the file (a clustered restore re-seeds the whole cluster, so every
-//! node must be stopped).
+//! holds the file. Restoring into a cluster installs the file on **one** node:
+//! replicas do **not** auto-converge onto it (a replica still holding its old
+//! database tails the restored log as an ordinary failover), so every node
+//! must be stopped and every other node's `.db`/`-wal`/`-shm` wiped before
+//! restart — an **experimental**, manual procedure for both topologies in this
+//! release (the automatic `--reseed` is planned). See the design note.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -234,6 +237,15 @@ enum BackupGate {
 }
 
 impl BackupGate {
+    /// Whether this gate runs in a clustered mode (where a local copy can be
+    /// cold / mid-bootstrap and must not be shipped empty — see the
+    /// `empty_snapshot` skip in [`backup_one`]). `Always` is single-node /
+    /// per-site-single: the one holder's copy is authoritative, an empty
+    /// database there is legitimately empty and is backed up as-is.
+    fn is_clustered(&self) -> bool {
+        !matches!(self, Self::Always)
+    }
+
     /// A short label for the startup log, naming the scheduling mode.
     fn describe(&self) -> &'static str {
         match self {
@@ -764,13 +776,34 @@ impl DbBackupService {
                     source: backup.backup_source(),
                 },
             ),
-            EmbeddedSqliteMode::PerSiteClustered => (
-                DatabaseSource::PerSite { dir: per_site_dir()? },
-                BackupGate::PerSiteClustered {
-                    cluster: cluster_for("per-site clustered")?,
-                    source: backup.backup_source(),
-                },
-            ),
+            EmbeddedSqliteMode::PerSiteClustered => {
+                // F2: `source = "replica"` is not yet supported in per-site
+                // clustered mode. The replica picker selects an HRW rank-2 node
+                // purely from membership, which may not hold the site's copy —
+                // and there is no owner-fallback yet — so the site would be
+                // silently unbacked (no node enumerates it, no skip metric
+                // fires). Until a holder signal exists, fall back to each site's
+                // owner (primary) with a loud WARN so no site goes unbacked.
+                let source = match backup.backup_source() {
+                    BackupSource::Replica => {
+                        tracing::warn!(
+                            "[db.sqlite.backup] source = \"replica\" is NOT yet supported in \
+                             per-site clustered mode (a site held only on its owner would be \
+                             silently unbacked); backing up from each site's OWNER instead. See \
+                             the clustered-backup design note."
+                        );
+                        BackupSource::Primary
+                    }
+                    BackupSource::Primary => BackupSource::Primary,
+                };
+                (
+                    DatabaseSource::PerSite { dir: per_site_dir()? },
+                    BackupGate::PerSiteClustered {
+                        cluster: cluster_for("per-site clustered")?,
+                        source,
+                    },
+                )
+            }
             EmbeddedSqliteMode::None => return Ok(None),
         };
         let (client, prefix) = object_client_from_config(config)?;
@@ -804,17 +837,22 @@ impl DbBackupService {
              the object is not encrypted by ePHPm — use bucket-side encryption)"
         );
         // Whole-database clustered backup is the supported clustered path; the
-        // per-site variant is experimental and lab-pending (its restore
-        // convergence is not yet validated). Per-site clustered mode is only
-        // reachable because the operator opted into the experimental
-        // `[db.sqlite.replication] per_site = true`; make the backup-specific
-        // caveat loud so it can never be mistaken for production-ready.
+        // per-site variant is experimental and lab-pending. "Supported" here
+        // means the backup side only — exactly-once scheduling and a valid
+        // standalone artifact. Restoring INTO a cluster is experimental and
+        // manual for both topologies (replicas do not auto-converge; see the
+        // restore prompt / design note); make that caveat loud so it can never
+        // be mistaken for production-ready.
         match &svc.gate {
             BackupGate::WholeDbClustered { .. } => tracing::info!(
-                "clustered database backup: whole-database mode — the supported clustered path. \
-                 The elected primary (or a replica, with source = \"replica\") snapshots the one \
-                 database; `ephpm db restore` re-seeds the cluster and replicas re-bootstrap from \
-                 the restored primary's fresh log identity."
+                "clustered database backup: whole-database mode — the supported clustered backup \
+                 path (exactly-once scheduling, a valid standalone snapshot). The elected primary \
+                 (or a replica, with source = \"replica\") snapshots the one database. RESTORING \
+                 into a cluster is EXPERIMENTAL and manual: replicas do NOT auto-converge onto a \
+                 restored node — stop every node, restore on the lowest-ordinal node, wipe every \
+                 other node's .db/-wal/-shm so they cold-bootstrap, then start the restored node \
+                 first (the automatic `--reseed` is not yet implemented). See `ephpm db restore` \
+                 and the clustered-backup design note."
             ),
             BackupGate::PerSiteClustered { .. } => tracing::warn!(
                 "clustered database backup: PER-SITE mode is EXPERIMENTAL and lab-pending. Each \
@@ -897,6 +935,7 @@ impl DbBackupService {
             "database backup tick"
         );
 
+        let clustered = self.gate.is_clustered();
         let permits = Arc::new(Semaphore::new(BACKUP_CONCURRENCY));
         let mut tasks: JoinSet<(String, Outcome)> = JoinSet::new();
         for db in databases {
@@ -911,7 +950,7 @@ impl DbBackupService {
             tasks.spawn(async move {
                 // The semaphore is never closed, so `acquire_owned` cannot fail.
                 let _permit = permits.acquire_owned().await;
-                let outcome = backup_one(&client, &prefix, retention, &staging, &db).await;
+                let outcome = backup_one(&client, &prefix, retention, &staging, &db, clustered).await;
                 (db.site, outcome)
             });
         }
@@ -1032,6 +1071,7 @@ async fn backup_one(
     retention: Duration,
     staging: &Path,
     db: &Database,
+    clustered: bool,
 ) -> Outcome {
     let started = Instant::now();
     let site = db.site.clone();
@@ -1043,18 +1083,67 @@ async fn backup_one(
     let staging_db = staging.join(format!("{stem}.db"));
     let staging_gz = staging.join(format!("{stem}{OBJECT_SUFFIX}"));
 
-    // 1. Snapshot (engine, under the WAL-gate permit) then 2. gzip
-    //    (blocking thread). The permit is released inside `snapshot_into`,
-    //    before any of this.
-    let compressed = match snapshot_into(&db.path, &staging_db).await {
-        Ok(()) => {
-            let (src, dst) = (staging_db.clone(), staging_gz.clone());
-            tokio::task::spawn_blocking(move || gzip_file(&src, &dst))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("gzip task failed: {e}")))
+    // 1. Snapshot (engine, under the WAL-gate permit). The permit is released
+    //    inside `snapshot_into`, before any of this.
+    if let Err(e) = snapshot_into(&db.path, &staging_db).await {
+        remove_quietly(&staging_db);
+        counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "snapshot_failed")
+            .increment(1);
+        tracing::warn!(site = %site, path = %db.path.display(), "database backup snapshot FAILED: {e:#}");
+        outcome.error =
+            Some(LastError { at: now_unix(), stage: "snapshot_failed", message: format!("{e:#}") });
+        return outcome;
+    }
+
+    // 1a. (F5) In clustered modes, never ship a snapshot with no user tables.
+    //     A cold / still-bootstrapping replica — or a new owner whose handoff
+    //     has not settled — holds only its CDC bookkeeping, so its snapshot is
+    //     empty; uploading it would make an EMPTY image the NEWEST object,
+    //     which `ephpm db restore` would then pick, and whose retention sweep
+    //     (run only after a successful upload, always keeping the newest) would
+    //     delete the last good backup. Skipping uploads and sweeps nothing, so
+    //     the last good object survives untouched. Checked on the staged
+    //     artifact itself (not the live file) so the result cannot race a
+    //     concurrent re-bootstrap that drops tables between check and snapshot.
+    //     `Always` (single-node / per-site-single) is exempt: an empty database
+    //     there is legitimately empty and still worth a backup.
+    if clustered {
+        match snapshot_has_user_data(&staging_db).await {
+            Ok(true) => {}
+            Ok(false) => {
+                remove_quietly(&staging_db);
+                counter!(METRIC_BACKUP_SKIPPED, "site" => site.clone(), "reason" => "empty_snapshot")
+                    .increment(1);
+                tracing::info!(
+                    site = %site,
+                    path = %db.path.display(),
+                    "database backup SKIPPED: clustered snapshot has no user tables (cold or \
+                     unsettled copy); the last good object is kept"
+                );
+                return outcome;
+            }
+            Err(e) => {
+                // Cannot tell whether the image has data — fail safe by not
+                // shipping a possibly-empty one; retried next tick.
+                remove_quietly(&staging_db);
+                counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "snapshot_failed")
+                    .increment(1);
+                tracing::warn!(site = %site, path = %db.path.display(), "database backup: could not inspect snapshot for user tables: {e:#}");
+                outcome.error = Some(LastError {
+                    at: now_unix(),
+                    stage: "snapshot_failed",
+                    message: format!("inspecting snapshot for user tables: {e:#}"),
+                });
+                return outcome;
+            }
         }
-        Err(e) => Err(e),
-    };
+    }
+
+    // 2. gzip (blocking thread).
+    let (src, dst) = (staging_db.clone(), staging_gz.clone());
+    let compressed = tokio::task::spawn_blocking(move || gzip_file(&src, &dst))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("gzip task failed: {e}")));
     remove_quietly(&staging_db);
     let compressed = match compressed {
         Ok(bytes) => bytes,
@@ -1062,7 +1151,7 @@ async fn backup_one(
             remove_quietly(&staging_gz);
             counter!(METRIC_BACKUP_TOTAL, "site" => site.clone(), "outcome" => "snapshot_failed")
                 .increment(1);
-            tracing::warn!(site = %site, path = %db.path.display(), "database backup snapshot FAILED: {e:#}");
+            tracing::warn!(site = %site, path = %db.path.display(), "database backup gzip FAILED: {e:#}");
             outcome.error = Some(LastError {
                 at: now_unix(),
                 stage: "snapshot_failed",
@@ -1228,12 +1317,21 @@ pub async fn verify_integrity(path: &Path) -> anyhow::Result<()> {
 /// Why this is mandatory for a clustered restore: a `VACUUM INTO` image keeps
 /// the source database's `__ephpm_cdc_log_id` and `__litewire_cdc_watermark`.
 /// Installed unchanged, `ensure_log_id` would keep the **old** log id (it only
-/// mints one when absent) and a peer would recognize the watermark and
-/// conclude nothing needs re-bootstrapping — the two copies then diverge
-/// silently. Stripping the identity forces `ensure_log_id` to mint a fresh
-/// one, `site_data_lineage` to stamp this node as the site's origin, and every
-/// peer holding the old copy to detect a different log id and re-bootstrap
-/// onto the restored data.
+/// mints one when absent), so the restored node would publish the stale
+/// identity and could not be told apart from an unrestored copy. Stripping the
+/// identity forces `ensure_log_id` to mint a fresh one and `site_data_lineage`
+/// to stamp this node as the site's origin, so the restored node serves clean
+/// origin data.
+///
+/// Note this does **not** by itself make a running cluster converge: a replica
+/// that still holds its old database treats the fresh log id as an ordinary
+/// failover (`maybe_bootstrap_cold_replica` re-bootstraps only a *cold*
+/// replica) and keeps its old rows while tailing the restored log on top.
+/// Converging a cluster onto a restore is therefore a manual, experimental
+/// procedure in this release — stop every node and wipe each other node's
+/// `.db`/`-wal`/`-shm` so it cold-bootstraps from the restored node (the
+/// automatic `--reseed` is planned). See `ephpm db restore` and the design
+/// note.
 ///
 /// Only the curated CDC/replication set is dropped — **never**
 /// `__turso_internal_*` (the engine's autoincrement backing tables, valid
@@ -1283,7 +1381,23 @@ pub async fn strip_cdc_bookkeeping(path: &Path) -> anyhow::Result<usize> {
             .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
             .await
             .context("checkpointing the reconciled file")?;
+        // First column is `busy` (1 = the checkpoint could not fold the WAL
+        // back because it was pinned). The `DROP`s live only in the `-wal`
+        // until this checkpoint runs, and the caller removes the `-wal` next —
+        // so a busy checkpoint here would silently discard the strip and ship
+        // an image that still carries the CDC bookkeeping. Fail closed: the
+        // caller leaves the live database untouched on an error.
+        let busy = match ck.next().await.context("reading the checkpoint result")? {
+            Some(row) => matches!(row.get_value(0)?, turso::Value::Integer(1)),
+            None => false,
+        };
         while ck.next().await.context("draining the checkpoint result")?.is_some() {}
+        if busy {
+            anyhow::bail!(
+                "checkpoint of the reconciled file was blocked (busy); refusing to remove its \
+                 -wal, which would discard the CDC strip"
+            );
+        }
         anyhow::Ok(present.len())
     })
     .await;
@@ -1293,6 +1407,40 @@ pub async fn strip_cdc_bookkeeping(path: &Path) -> anyhow::Result<usize> {
         remove_quietly(Path::new(&sidecar));
     }
     result
+}
+
+/// Whether a database file holds at least one user (non-bookkeeping) table —
+/// the same predicate `turso_cdc::local_db_is_cold` / `list_user_tables` use:
+/// excludes `sqlite_*`, `__`-prefixed bookkeeping (log id / watermark / source)
+/// and `turso_cdc`. A clustered snapshot with no user tables is a cold or
+/// still-bootstrapping replica copy (or an unsettled new owner) that holds only
+/// its CDC bookkeeping; [`backup_one`] refuses to ship such an image (F5).
+///
+/// # Errors
+///
+/// The file cannot be opened as a database or the probe query fails.
+async fn snapshot_has_user_data(path: &Path) -> anyhow::Result<bool> {
+    let path_s = path.to_str().context("path is not UTF-8")?;
+    offload::engine(async {
+        let db = turso::Builder::new_local(path_s)
+            .build()
+            .await
+            .with_context(|| format!("open {} to inspect for user tables", path.display()))?;
+        let conn = db.connect().context("connect")?;
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM sqlite_schema \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 AND name NOT LIKE '\\_\\_%' ESCAPE '\\' \
+                 AND name != 'turso_cdc' LIMIT 1",
+                (),
+            )
+            .await
+            .context("probing for user tables")?;
+        let has = rows.next().await.context("reading the user-table probe")?.is_some();
+        anyhow::Ok(has)
+    })
+    .await
 }
 
 /// Gzip `src` into `dst` (created or truncated), fsynced. Returns the
@@ -1556,6 +1704,41 @@ mod tests {
 
         // And it still verifies.
         verify_integrity(&path).await.expect("stripped file is a valid database");
+    }
+
+    /// F5: a snapshot that holds only CDC bookkeeping (a cold / still-
+    /// bootstrapping replica's copy) reports no user data and is refused by the
+    /// clustered backup path; one with a real table reports data and is shipped.
+    #[tokio::test]
+    async fn snapshot_has_user_data_distinguishes_cold_from_populated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Cold copy: only bookkeeping tables, no user tables.
+        let cold = dir.path().join("cold.db");
+        {
+            let db = turso::Builder::new_local(cold.to_str().unwrap()).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            for table in crate::turso_cdc::CDC_BOOKKEEPING_TABLES {
+                exec_raw(&conn, &format!("CREATE TABLE \"{table}\" (k INTEGER)")).await;
+            }
+        }
+        assert!(
+            !snapshot_has_user_data(&cold).await.unwrap(),
+            "a bookkeeping-only copy has no user data"
+        );
+
+        // Populated copy: a real user table (plus bookkeeping) has data.
+        let warm = dir.path().join("warm.db");
+        {
+            let db = turso::Builder::new_local(warm.to_str().unwrap()).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            exec_raw(&conn, "CREATE TABLE posts (id INTEGER PRIMARY KEY)").await;
+            exec_raw(&conn, "CREATE TABLE \"__ephpm_cdc_log_id\" (id TEXT)").await;
+        }
+        assert!(
+            snapshot_has_user_data(&warm).await.unwrap(),
+            "a copy with a user table has data"
+        );
     }
 
     /// A single-node image has no CDC bookkeeping, so the strip is a no-op and
