@@ -750,9 +750,14 @@ turso = { version = "=0.8.3", default-features = false }
 # across the 0.21→0.25 range. 0.26 is a MINOR jump that touched
 # vivacity-core/-resolver/-autoload substantially (fetch, store, clone,
 # classmap), so treat `cargo deny check` + `cargo check` as the real gate. What
-# is re-checked: vivacity 0.26.2 still pins `zip =2.4.2`, so the zip RUSTSEC
+# is re-checked: vivacity 0.26.3 still pins `zip =2.4.2`, so the zip RUSTSEC
 # ignores in deny.toml still apply unchanged.
-vivacity = { version = "=0.26.2", default-features = false, features = ["rustls-tls-no-provider"] }
+# SECURITY: 0.26.3 keeps a package's declared `bin` inside the package directory
+# — 0.26.2 could write a bin outside the package boundary (a path-containment
+# issue for `ephpm composer`). 0.26.3 is a patch over 0.26.2 (bin placement +
+# classmap/proxy ordering), no new transitive crate / C dep (it drops several:
+# chrono-tz, phf, radix_trie), zip pin unchanged.
+vivacity = { version = "=0.26.3", default-features = false, features = ["rustls-tls-no-provider"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
