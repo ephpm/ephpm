@@ -47,6 +47,31 @@ That is the whole AWS S3 case: `region` defaults to `us-east-1` (set it to
 the bucket's region), `endpoint` defaults to `https://s3.<region>.amazonaws.com`
 and addressing is virtual-hosted.
 
+### A local directory instead of a bucket
+
+The destination can also be a **local filesystem directory** — set `dir`
+instead of `s3_bucket` (exactly one of the two). The same snapshot + gzip +
+retention loop then writes objects under
+`<dir>/<s3_path>/<site-key>/<ts>.db.gz` (atomically: temp file → fsync →
+rename), with **no** AWS credentials and none of the S3 addressing knobs
+(`endpoint`/`region`/`path_style` do not apply, and `endpoint` alongside `dir`
+is a startup error):
+
+```toml
+[db.sqlite.backup]
+enabled   = true
+dir       = "/var/backups/ephpm"     # local directory instead of s3_bucket
+retention = "14d"
+```
+
+This is handy for simple on-disk backups and for exercising a blue-green /
+failover drill locally without standing up MinIO. Restore and list read it
+back the same way — `ephpm db restore --from /var/backups/ephpm` and
+`ephpm db backup list --from /var/backups/ephpm` — and both default to the
+configured `dir` when `--from` is omitted. Keep the directory on durable
+storage and restrict its permissions: as with the bucket, the object is a
+plain gzip of a standard SQLite file and is **not** encrypted by ePHPm.
+
 ### Credentials
 
 Credentials come **only** from the environment of the `ephpm` process —

@@ -2936,9 +2936,20 @@ pub struct SqliteConfig {
 /// is gone and no `[kv] secret` is needed): the bucket must carry server-side
 /// encryption and a tight policy.
 ///
-/// Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+
-/// optional `AWS_SESSION_TOKEN`) in the environment only — never from this
-/// file, never logged; startup fails with `enabled = true` and none set.
+/// The destination is **either** an S3-compatible bucket ([`s3_bucket`]) **or**
+/// a local filesystem directory ([`dir`]); set exactly one when `enabled`.
+/// With `dir`, objects are written under `<dir>/<s3_path>/<site-key>/…`
+/// atomically, no AWS credentials are needed, and the S3 addressing knobs are
+/// ignored — handy for on-disk backups and local blue-green / failover
+/// testing.
+///
+/// [`s3_bucket`]: Self::s3_bucket
+/// [`dir`]: Self::dir
+///
+/// Credentials (S3 only) come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+/// (+ optional `AWS_SESSION_TOKEN`) in the environment only — never from this
+/// file, never logged; startup fails with `enabled = true`, an `s3_bucket`
+/// destination and none set.
 ///
 /// Works in every embedded mode. In clustered modes each database is
 /// snapshotted by exactly one node — its write node by default
@@ -2960,10 +2971,23 @@ pub struct DbBackupConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Destination bucket (a lowercase S3 bucket name). **Required** when
-    /// `enabled = true`. Default: `None`.
+    /// Destination bucket (a lowercase S3 bucket name). Set **exactly one**
+    /// of this or [`dir`](Self::dir) when `enabled = true`. Default: `None`.
     #[serde(default)]
     pub s3_bucket: Option<String>,
+
+    /// Local-filesystem destination directory, as an alternative to
+    /// [`s3_bucket`](Self::s3_bucket). When set, every backup object is
+    /// written under this directory at
+    /// `<dir>/<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz` (the same key
+    /// shape S3 uses), atomically (temp file → fsync → rename). Needs **no**
+    /// AWS credentials, and the `endpoint` / `region` / `path_style` S3
+    /// addressing knobs do not apply (setting `endpoint` alongside `dir` is a
+    /// startup error). Useful for simple on-disk backups and for local
+    /// blue-green / failover testing. Set **exactly one** of this or
+    /// `s3_bucket` when `enabled = true`. Default: `None`.
+    #[serde(default)]
+    pub dir: Option<String>,
 
     /// Key prefix inside the bucket; objects land at
     /// `<s3_path>/<site-key>/<YYYYMMDDTHHMMSSZ>.db.gz`. Leading and trailing
@@ -3025,6 +3049,7 @@ impl Default for DbBackupConfig {
         Self {
             enabled: false,
             s3_bucket: None,
+            dir: None,
             s3_path: default_db_backup_s3_path(),
             interval: default_db_backup_interval(),
             retention: default_db_backup_retention(),
@@ -6127,28 +6152,63 @@ impl Config {
         {
             let backup = &sqlite.backup;
             let bucket = backup.s3_bucket.as_deref().map(str::trim).unwrap_or_default();
-            let bucket_ok = !bucket.is_empty()
-                && bucket
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
-            if !bucket_ok {
-                return Err(ConfigError::Validation(format!(
-                    "[db.sqlite.backup] enabled = true requires s3_bucket (a lowercase S3 bucket \
-                     name), got {bucket:?}"
-                )));
-            }
-            if let Some(endpoint) = backup.endpoint.as_deref()
-                && !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
-            {
-                return Err(ConfigError::Validation(format!(
-                    "[db.sqlite.backup] endpoint must be an origin such as \
-                     \"https://minio.internal:9000\", got {endpoint:?}"
-                )));
-            }
-            if backup.region.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "[db.sqlite.backup] region must not be empty".to_string(),
-                ));
+            let dir = backup.dir.as_deref().map(str::trim).unwrap_or_default();
+            // Exactly one destination: an S3 bucket or a local directory. Both
+            // or neither is a fail-closed error (a dropped-or-defaulted choice
+            // is the silent-no-op trap every mode knob in this file avoids).
+            match (!bucket.is_empty(), !dir.is_empty()) {
+                (true, true) => {
+                    return Err(ConfigError::Validation(
+                        "[db.sqlite.backup] set exactly one destination: s3_bucket OR dir, not \
+                         both"
+                            .to_string(),
+                    ));
+                }
+                (false, false) => {
+                    return Err(ConfigError::Validation(
+                        "[db.sqlite.backup] enabled = true requires a destination: set s3_bucket \
+                         (an S3-compatible bucket) or dir (a local directory)"
+                            .to_string(),
+                    ));
+                }
+                (true, false) => {
+                    let bucket_ok = bucket.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'
+                    });
+                    if !bucket_ok {
+                        return Err(ConfigError::Validation(format!(
+                            "[db.sqlite.backup] s3_bucket must be a lowercase S3 bucket name, got \
+                             {bucket:?}"
+                        )));
+                    }
+                    if let Some(endpoint) = backup.endpoint.as_deref()
+                        && !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
+                    {
+                        return Err(ConfigError::Validation(format!(
+                            "[db.sqlite.backup] endpoint must be an origin such as \
+                             \"https://minio.internal:9000\", got {endpoint:?}"
+                        )));
+                    }
+                    if backup.region.trim().is_empty() {
+                        return Err(ConfigError::Validation(
+                            "[db.sqlite.backup] region must not be empty".to_string(),
+                        ));
+                    }
+                }
+                (false, true) => {
+                    // A local directory needs no credentials and no S3
+                    // addressing. `endpoint` set alongside `dir` is almost
+                    // certainly a mistake (two destinations crossed), so reject
+                    // it rather than silently ignore it. `region`/`path_style`
+                    // keep their defaults and are simply unused.
+                    if backup.endpoint.is_some() {
+                        return Err(ConfigError::Validation(
+                            "[db.sqlite.backup] endpoint does not apply to a local dir \
+                             destination; remove endpoint, or use s3_bucket instead of dir"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
             backup.interval()?;
             backup.retention()?;
@@ -10550,6 +10610,38 @@ listen = "0.0.0.0:8080"
         let err = validate("enabled = true\ns3_bucket = \"b\"\nsource = \"leader\"\n").unwrap_err();
         assert!(err.contains("source"), "{err}");
         assert!(err.contains("primary, replica"), "{err}");
+    }
+
+    /// A local-directory destination (`dir`) is an alternative to `s3_bucket`:
+    /// exactly one is required, both is an error, neither is an error, and the
+    /// S3 addressing knobs (`endpoint`) do not apply to `dir`.
+    #[test]
+    fn db_backup_local_dir_destination_is_validated() {
+        let validate = |body: &str| -> Result<(), String> {
+            let cfg = load_toml(&format!("[db.sqlite]\n[db.sqlite.backup]\n{body}"));
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        // dir only → ok (no bucket, no credentials needed).
+        validate("enabled = true\ndir = \"/var/backups/ephpm\"\n")
+            .expect("a local dir destination validates");
+        // s3_bucket only → ok (unchanged).
+        validate("enabled = true\ns3_bucket = \"b\"\n")
+            .expect("an s3 bucket destination validates");
+        // Both → error naming the exclusivity.
+        let err = validate("enabled = true\ns3_bucket = \"b\"\ndir = \"/tmp/x\"\n").unwrap_err();
+        assert!(err.contains("exactly one"), "{err}");
+        // Neither → error naming both options.
+        let err = validate("enabled = true\n").unwrap_err();
+        assert!(err.contains("s3_bucket") && err.contains("dir"), "{err}");
+        // dir + endpoint → error (crossed destinations).
+        let err = validate("enabled = true\ndir = \"/tmp/x\"\nendpoint = \"http://minio:9000\"\n")
+            .unwrap_err();
+        assert!(err.contains("endpoint") && err.contains("local dir"), "{err}");
+        // dir with interval/retention still validated the same way.
+        let err = validate("enabled = true\ndir = \"/tmp/x\"\ninterval = \"0\"\n").unwrap_err();
+        assert!(err.contains("interval"), "{err}");
+        // The default (no dir) is None.
+        assert_eq!(DbBackupConfig::default().dir, None);
     }
 
     /// The default `source` is `primary`, and the typed accessor maps the

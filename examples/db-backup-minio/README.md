@@ -7,6 +7,11 @@ example uploads to a local **MinIO** so you can try it with no cloud account;
 the same config block works against AWS S3 or Cloudflare R2 — see
 [`ephpm.toml`](./ephpm.toml).
 
+> For a purely local setup with no object store at all, set `dir = "/some/path"`
+> instead of `s3_bucket` (and drop the `endpoint`/`region`/credentials): backups
+> are then written to that local directory, and `db restore`/`db backup list`
+> read it back with `--from /some/path`.
+
 ## Run it
 
 ```bash
