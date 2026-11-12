@@ -1496,6 +1496,27 @@ pub async fn stamp_reseed_generation(path: &Path, generation: u64) -> anyhow::Re
     result
 }
 
+/// Read the reseed generation a database file currently carries (`0` if it has
+/// none). Used by `ephpm db restore --reseed` to floor a new generation above
+/// the one this node already holds, so a second reseed on a lagging clock still
+/// out-ranks the prior one (F1).
+///
+/// # Errors
+///
+/// The file cannot be opened as a database, or the generation read fails.
+pub async fn read_reseed_generation(path: &Path) -> anyhow::Result<u64> {
+    let path_s = path.to_str().context("path is not UTF-8")?;
+    offload::engine(async {
+        let db = turso::Builder::new_local(path_s)
+            .build()
+            .await
+            .with_context(|| format!("open {} to read the reseed generation", path.display()))?;
+        let conn = db.connect().context("connect")?;
+        crate::turso_cdc::read_local_reseed_gen(&conn).await
+    })
+    .await
+}
+
 /// Whether a database file holds at least one user (non-bookkeeping) table —
 /// the same predicate `turso_cdc::local_db_is_cold` / `list_user_tables` use:
 /// excludes `sqlite_*`, `__`-prefixed bookkeeping (log id / watermark / source)

@@ -441,6 +441,20 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
              node is stopped and every node runs v0.16.2+ before starting the cluster."
         }
         Some(ClusterRestoreKind::WholeDb) => {
+            // F5: once a cluster has been reseeded, a PLAIN restore strips this
+            // node back to generation 0 while any un-wiped replica keeps the
+            // higher generation — a later failover to such a replica then
+            // force-discards the restore. Warn and steer to --reseed.
+            if target.path.is_file()
+                && rt.block_on(db_backup::read_reseed_generation(&target.path)).unwrap_or(0) > 0
+            {
+                eprintln!(
+                    "WARNING: this database carries a reseed generation (the cluster was reseeded \
+                     before). A PLAIN restore does not re-converge a reseeded cluster and can be \
+                     silently UNDONE by a later failover to a node still holding the newer \
+                     generation — use --reseed instead."
+                );
+            }
             println!(
                 "mode:    CLUSTERED (whole-database) — EXPERIMENTAL. This installs the backup on \
                  THIS node only; replicas do NOT auto-converge onto it (pass --reseed to automate \
@@ -533,13 +547,27 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
     // reseed table) and before verification, so the integrity check sees the
     // final shape.
     if req.reseed {
-        let generation = u64::try_from(
+        let now_ms = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
+        // Floor the new generation above the one this node already carries (F1):
+        // a second `--reseed` on a node whose clock lags a prior reseed must
+        // still out-rank it, or replicas that adopted the higher generation
+        // would silently not converge. `target.path` still holds the pre-restore
+        // live file here (the rename is below), so it carries that generation.
+        // Best-effort: an unreadable prior is treated as 0 (we then use the
+        // clock). `prior + 1` guarantees `generation >= 1`, so it is never the
+        // inert 0 a pre-epoch clock could otherwise produce.
+        let prior = if target.path.is_file() {
+            rt.block_on(db_backup::read_reseed_generation(&target.path)).unwrap_or(0)
+        } else {
+            0
+        };
+        let generation = now_ms.max(prior.saturating_add(1));
         if let Err(e) = rt.block_on(db_backup::stamp_reseed_generation(&tmp, generation)) {
             remove_quietly(&tmp);
             eprintln!(

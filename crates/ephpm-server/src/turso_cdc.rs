@@ -1585,10 +1585,19 @@ pub async fn run_replica(
                                     generation,
                                     "CDC replica: reseed re-bootstrap complete; resuming tail"
                                 ),
-                                Err(be) => tracing::warn!(
-                                    generation,
-                                    "CDC replica: reseed re-bootstrap failed (will retry): {be:#}"
-                                ),
+                                Err(be) => {
+                                    // Count a failed reseed as a failed bootstrap
+                                    // so the documented convergence metric
+                                    // (`ephpm_cdc_bootstrap_total{outcome}`)
+                                    // reflects a replica stuck looping on a
+                                    // reseed (e.g. the DB exceeds
+                                    // `max_snapshot_bytes`), not only a cold one.
+                                    cdc_metrics::record_bootstrap("failed");
+                                    tracing::warn!(
+                                        generation,
+                                        "CDC replica: reseed re-bootstrap failed (will retry): {be:#}"
+                                    );
+                                }
                             }
                         }
                         // Failures of the local watermark bookkeeping keep
@@ -1646,16 +1655,23 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
-    subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE).await
+    // `whole_db = true`: the reseed force-discard signal is honored ONLY on the
+    // whole-database path (the only one `--reseed` can stamp). See F4.
+    subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE, true).await
 }
 
 /// [`subscribe_and_consume`] for one named site: the applied-watermark gauge
-/// is recorded under `site`.
+/// is recorded under `site`. `whole_db` is whether this is the whole-database
+/// replica path (vs a per-site one): the reseed force-discard predicate is
+/// evaluated only when true, so a per-site replica can never be forced to
+/// discard — even if a vhost is named `default` or a reseed-stamped file is
+/// mis-placed into a per-site directory (F4).
 async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
+    whole_db: bool,
 ) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
         anyhow::anyhow!(
@@ -1688,14 +1704,19 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // never send `Subscribe`. A table-absent / zero generation reads `0`, so an
     // ordinary promotion or failover (which re-advertises the adopted max) has
     // `incoming == adopted` and never triggers a discard.
-    let adopted_reseed_gen = {
-        let _permit = factory.wal_gate_permit().await;
-        off_runtime(read_local_reseed_gen(apply_conn))
-            .await
-            .context("read local reseed generation")?
-    };
-    if reseed_decision(source_reseed_gen, adopted_reseed_gen) {
-        return Err(anyhow::Error::new(ReseedRequired { generation: source_reseed_gen }));
+    // Whole-database path only (F4): `--reseed` can never stamp a per-site file,
+    // so a per-site replica must never be forced to discard — skip the read and
+    // the predicate entirely there rather than relying on the generation being 0.
+    if whole_db {
+        let adopted_reseed_gen = {
+            let _permit = factory.wal_gate_permit().await;
+            off_runtime(read_local_reseed_gen(apply_conn))
+                .await
+                .context("read local reseed generation")?
+        };
+        if reseed_decision(source_reseed_gen, adopted_reseed_gen) {
+            return Err(anyhow::Error::new(ReseedRequired { generation: source_reseed_gen }));
+        }
     }
 
     let watermark = {
@@ -2111,9 +2132,33 @@ fn reseed_decision(incoming: u64, adopted: u64) -> bool {
 ///
 /// The underlying table read fails (a missing table is not an error — it is `0`).
 pub(crate) async fn read_local_reseed_gen(conn: &turso::Connection) -> anyhow::Result<u64> {
-    match read_single_text(conn, RESEED_GEN_TABLE, "generation").await? {
-        Some(s) => Ok(s.parse().unwrap_or(0)),
-        None => Ok(0),
+    // F2: on the REPLICA side `0` is the value that *enables* the discard (it
+    // loses `incoming > adopted` only when incoming is also 0). So — unlike the
+    // epoch reader, where 0 is the fail-safe — a read error here must NOT read
+    // back as 0 and force a spurious re-bootstrap. Probe `sqlite_schema`
+    // explicitly to tell "never reseeded" (the real 0 case) from a transient
+    // failure, propagate every other error (→ stream error → retry, no
+    // discard), and refuse a non-numeric value rather than defaulting it to 0.
+    let mut probe = conn
+        .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (RESEED_GEN_TABLE,))
+        .await
+        .context("cdc: probe for the reseed-generation table")?;
+    if probe.next().await.context("cdc: read the reseed-table probe")?.is_none() {
+        return Ok(0); // the table does not exist — this node was never reseeded
+    }
+    let mut stmt = conn
+        .prepare(&format!("SELECT generation FROM {RESEED_GEN_TABLE} WHERE id = 0"))
+        .await
+        .context("cdc: prepare the reseed-generation read")?;
+    let mut rows = stmt.query(()).await.context("cdc: query the reseed generation")?;
+    match rows.next().await.context("cdc: read the reseed generation")? {
+        Some(row) => match row.get_value(0).context("cdc: reseed-generation value")? {
+            turso::Value::Text(s) => {
+                s.parse().with_context(|| format!("cdc: reseed generation {s:?} is not a u64"))
+            }
+            other => anyhow::bail!("cdc: reseed generation has an unexpected type: {other:?}"),
+        },
+        None => Ok(0), // table present but row 0 unset (stamp always writes it)
     }
 }
 
@@ -3226,13 +3271,23 @@ async fn reseed_bootstrap(
             .await
             .context("reseed: install replacement snapshot")?;
     }
-    // Adopt the generation only after the install committed. `__`-prefixed, so the
-    // discard in `install_snapshot` left it intact for this write to overwrite.
+    // Adopt the generation only after the install committed. `install_snapshot`
+    // already adopted the snapshot HEADER's generation (max) inside its txn, and
+    // the header can be NEWER than the Hello's `generation` if the primary was
+    // re-stamped in between — so adopt `max(local, generation)` here rather than
+    // overwriting, never lowering the just-installed header value (F3). The
+    // reseed-gen table is `__`-prefixed, so the discard left it intact.
     {
         let _permit = factory.wal_gate_permit().await;
-        off_runtime(write_local_reseed_gen(apply_conn, generation))
-            .await
-            .context("reseed: persist adopted generation")?;
+        off_runtime(async {
+            let local = read_local_reseed_gen(apply_conn).await?;
+            if generation > local {
+                write_local_reseed_gen(apply_conn, generation).await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("reseed: persist adopted generation")?;
     }
     cdc_metrics::record_snapshot_received(received, started.elapsed());
     cdc_metrics::record_applied_watermark(DEFAULT_SITE, header.watermark);
@@ -5477,7 +5532,8 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    subscribe_and_consume_site(&mut stream, factory, &conn, site).await
+    // `whole_db = false`: per-site replicas never honor the reseed signal (F4).
+    subscribe_and_consume_site(&mut stream, factory, &conn, site, false).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
