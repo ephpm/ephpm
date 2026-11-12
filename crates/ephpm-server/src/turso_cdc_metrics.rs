@@ -356,6 +356,15 @@ pub fn drain_catchup_state(site: &str) -> DrainCatchup {
     DrainCatchup { subscribers, min_applied }
 }
 
+/// The highest `change_id` observed in `site`'s CDC log (the sampled head), or
+/// `None` if none has been observed yet — the drain gate's catch-up target.
+#[must_use]
+pub fn current_head(site: &str) -> Option<i64> {
+    let entry = REGISTRY.shipping.get(site)?;
+    let state = entry.value();
+    state.head_seen.load(Ordering::Relaxed).then(|| state.head.load(Ordering::Relaxed))
+}
+
 /// Attach a subscriber of `site` that has announced `from_change_id` as its
 /// applied watermark, returning the guard that keeps it counted.
 ///

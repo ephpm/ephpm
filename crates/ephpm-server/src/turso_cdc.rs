@@ -367,6 +367,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// `Ping` if a burst coalesced it away.
 const APPLIED_ACK_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The hard ceiling the whole-database drain-handover gate waits for replicas to
+/// apply the sampled head before it closes the channel anyway (v0.16.2). Same
+/// ceiling as `drain::MAX_HANDOVER`: a dead or pre-v0.16.2 (never-acking) replica
+/// must never hang a drain forever.
+const DRAIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the drain-handover gate re-checks replica applied watermarks.
+const DRAIN_CATCHUP_POLL: Duration = Duration::from_millis(100);
+
 /// How long a replica waits for the primary's [`Frame::Hello`] before
 /// declaring the stream broken. Generous — the Hello is the primary's
 /// first write after accepting the stream — but bounded, so a peer that
@@ -1085,6 +1094,111 @@ fn spawn_head_sampler(
             }
         }
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Whole-database drain-handover catch-up gate (v0.16.2).
+// ---------------------------------------------------------------------------
+
+/// Outcome of the whole-database drain catch-up wait, for the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainCatchupOutcome {
+    /// No replica was attached — nothing could be lost by closing now.
+    NoSubscribers,
+    /// Every attached replica applied up to the sampled head.
+    CaughtUp { head: i64, waited: Duration },
+    /// Gave up at [`DRAIN_CATCHUP_TIMEOUT`] with replicas still behind.
+    TimedOut { head: i64, min_applied: Option<i64>, subscribers: usize, waited: Duration },
+}
+
+/// The pure wait: poll `head` and `catchup` every [`DRAIN_CATCHUP_POLL`] until
+/// there are no subscribers or the slowest replica's applied watermark reaches
+/// the head, bounded by [`DRAIN_CATCHUP_TIMEOUT`]. The head is **re-read each
+/// poll** and the max kept, so any committed-but-not-yet-shipped write the
+/// primary ships during the wait (the drivers keep running through this gate)
+/// raises the target rather than being missed. Both inputs are cheap synchronous
+/// reads of the CDC metrics; factored out so the loop can be driven on a paused
+/// clock in tests.
+async fn drain_catchup_wait<H, C>(mut head: H, catchup: C) -> DrainCatchupOutcome
+where
+    H: FnMut() -> Option<i64>,
+    C: Fn() -> cdc_metrics::DrainCatchup,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + DRAIN_CATCHUP_TIMEOUT;
+    let mut target: Option<i64> = None;
+    loop {
+        if let Some(h) = head() {
+            target = Some(target.map_or(h, |t| t.max(h)));
+        }
+        let st = catchup();
+        if st.subscribers == 0 {
+            return DrainCatchupOutcome::NoSubscribers;
+        }
+        // `None` target = no head ever observed = no writes to catch up to.
+        let caught = match target {
+            None => true,
+            Some(t) => st.min_applied.is_some_and(|m| m >= t),
+        };
+        if caught {
+            return DrainCatchupOutcome::CaughtUp {
+                head: target.unwrap_or(0),
+                waited: started.elapsed(),
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return DrainCatchupOutcome::TimedOut {
+                head: target.unwrap_or(0),
+                min_applied: st.min_applied,
+                subscribers: st.subscribers,
+                waited: started.elapsed(),
+            };
+        }
+        tokio::time::sleep(DRAIN_CATCHUP_POLL).await;
+    }
+}
+
+/// Before a draining whole-database primary closes its cluster channel, wait
+/// until every attached replica has **durably applied** the CDC head — so a
+/// primary deleted right after a graceful drain never loses a
+/// shipped-but-not-yet-applied tail (the blue-green failover gap). Reads the
+/// head from the CDC metrics, which the still-running head sampler keeps current
+/// (≤ `HEAD_SAMPLE_INTERVAL`) and every ship bumps immediately; the gate
+/// re-reads it each poll, so a write the primary ships during the wait is caught.
+/// The preceding HTTP drain has already stopped this node's in-process write
+/// sources (PHP requests and the shared wire backend). Bounded by
+/// [`DRAIN_CATCHUP_TIMEOUT`]: a dead or pre-v0.16.2 (never-acking) replica is
+/// WARNed about and the channel closes anyway rather than hanging shutdown.
+pub async fn drain_whole_db_primary() {
+    if cdc_metrics::drain_catchup_state(DEFAULT_SITE).subscribers == 0 {
+        return; // no replica attached — nothing to wait for
+    }
+    tracing::info!("CDC whole-database drain: waiting for replicas to apply the head");
+    let outcome = drain_catchup_wait(
+        || cdc_metrics::current_head(DEFAULT_SITE),
+        || cdc_metrics::drain_catchup_state(DEFAULT_SITE),
+    )
+    .await;
+    match outcome {
+        DrainCatchupOutcome::NoSubscribers => {}
+        DrainCatchupOutcome::CaughtUp { head, waited } => {
+            tracing::info!(
+                head,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "CDC whole-database drain: all replicas caught up; closing channel"
+            );
+        }
+        DrainCatchupOutcome::TimedOut { head, min_applied, subscribers, waited } => {
+            tracing::warn!(
+                head,
+                ?min_applied,
+                subscribers,
+                waited_secs = waited.as_secs(),
+                "CDC whole-database drain: closing channel with replicas still behind their \
+                 primary; their un-applied tail may be lost if this primary is now deleted"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5651,6 +5765,65 @@ mod tests {
                 assert!(!applied_acks, "applied_acks defaults to false");
             }
             other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_returns_immediately_with_no_subscribers() {
+        let outcome = drain_catchup_wait(
+            || Some(100),
+            || cdc_metrics::DrainCatchup { subscribers: 0, min_applied: None },
+        )
+        .await;
+        assert_eq!(outcome, DrainCatchupOutcome::NoSubscribers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_waits_until_applied_reaches_head() {
+        let start = tokio::time::Instant::now();
+        // The replica is behind (50 < head 100) until 1s of virtual time passes,
+        // then catches up. The gate must block until then, no longer.
+        let outcome = drain_catchup_wait(
+            || Some(100),
+            move || {
+                let caught = start.elapsed() >= Duration::from_secs(1);
+                cdc_metrics::DrainCatchup {
+                    subscribers: 1,
+                    min_applied: Some(if caught { 100 } else { 50 }),
+                }
+            },
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::CaughtUp { head, waited } => {
+                assert_eq!(head, 100);
+                assert!(
+                    waited >= Duration::from_secs(1) && waited < Duration::from_secs(2),
+                    "should return just after catch-up, waited {waited:?}"
+                );
+            }
+            other => panic!("expected CaughtUp, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gate_times_out_on_a_lagging_or_silent_replica() {
+        // A replica stuck below the head — also models a pre-v0.16.2 replica
+        // that never acks (its seeded applied stays below head): the gate must
+        // give up at the timeout rather than hang shutdown forever.
+        let outcome = drain_catchup_wait(
+            || Some(100),
+            || cdc_metrics::DrainCatchup { subscribers: 1, min_applied: Some(50) },
+        )
+        .await;
+        match outcome {
+            DrainCatchupOutcome::TimedOut { head, min_applied, subscribers, waited } => {
+                assert_eq!(head, 100);
+                assert_eq!(min_applied, Some(50));
+                assert_eq!(subscribers, 1);
+                assert!(waited >= DRAIN_CATCHUP_TIMEOUT, "waited {waited:?}");
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
         }
     }
 

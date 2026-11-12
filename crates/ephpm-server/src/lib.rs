@@ -618,7 +618,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         channel_handle.as_ref(),
         &query_stats,
         &db_health,
-        primary_view,
+        Arc::clone(&primary_view),
         per_site_cluster,
     )
     .await?;
@@ -715,6 +715,21 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             Some(leave)
         }
         Some(cluster) => {
+            // Whole-database clustered primary: before the channel closes, wait
+            // for every attached replica to apply the CDC head, so a primary
+            // deleted right after this graceful drain does not lose its
+            // shipped-but-not-yet-applied tail (v0.16.2; the channel is still
+            // open and the replication drivers still ship here). KV-only
+            // clustered has no CDC head and skips it; so does a non-primary.
+            if config
+                .db
+                .sqlite
+                .as_ref()
+                .is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled))
+                && primary_view.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                turso_cdc::drain_whole_db_primary().await;
+            }
             cluster.flush_gossip_writer().await;
             None
         }
