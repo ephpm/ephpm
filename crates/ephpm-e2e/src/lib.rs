@@ -677,8 +677,18 @@ pub struct ClusterFixture {
 }
 
 struct ClusterFixtureNode {
+    /// `Some` while the node runs; `None` once it has been stopped (by
+    /// [`ClusterFixture::stop_node`]) or taken by `Drop`. Keyed on this so a
+    /// node stopped mid-test is never terminated twice.
     child: Option<Child>,
     base_url: String,
+    /// `host:port` of this node's `[db.sqlite.proxy] mysql_listen` listener —
+    /// the whole-database shared MySQL wire frontend. See
+    /// [`ClusterFixture::mysql_addrs`].
+    mysql_addr: String,
+    /// This node's `stderr.log` under the fixture tempdir, so a failing test
+    /// can inline the node's own diagnostics (see [`ClusterFixture::stderr_tail`]).
+    stderr_path: PathBuf,
 }
 
 impl ClusterFixture {
@@ -731,13 +741,14 @@ impl ClusterFixture {
             let config_path = node_dir.join("ephpm.toml");
             fs::write(&config_path, config).context("write config")?;
 
+            let stderr_path = node_dir.join("stderr.log");
             let stdout =
                 fs::File::create(node_dir.join("stdout.log")).context("open stdout log")?;
-            let stderr =
-                fs::File::create(node_dir.join("stderr.log")).context("open stderr log")?;
+            let stderr = fs::File::create(&stderr_path).context("open stderr log")?;
 
             // Hand this node's ports off: release its probes, spawn at once.
             let http_port = ports.http;
+            let mysql_port = ports.mysql;
             ports.lease.release();
             let child = Command::new(ephpm_binary)
                 .args(["serve", "--config"])
@@ -750,6 +761,8 @@ impl ClusterFixture {
             nodes.push(ClusterFixtureNode {
                 child: Some(child),
                 base_url: format!("http://127.0.0.1:{http_port}"),
+                mysql_addr: format!("127.0.0.1:{mysql_port}"),
+                stderr_path,
             });
         }
 
@@ -784,6 +797,62 @@ impl ClusterFixture {
     #[must_use]
     pub fn base_urls(&self) -> Vec<&str> {
         self.nodes.iter().map(|n| n.base_url.as_str()).collect()
+    }
+
+    /// `host:port` of each node's whole-database MySQL wire listener
+    /// (`[db.sqlite.proxy] mysql_listen`), in spawn order — the same order as
+    /// [`base_urls`](Self::base_urls), so index `i` is the same node in both.
+    ///
+    /// In whole-database clustered mode this is the *shared* `pdo_mysql`
+    /// listener: litewire's `MysqlFrontend::new` (the `Fixed` backend source),
+    /// which does not authenticate — a client connects with any username and an
+    /// empty password and reaches the node's local replicated database. Reads
+    /// work on any node; writes must go to the elected primary (a write landing
+    /// on a replica is applied to its local file, which is never captured into
+    /// CDC and would silently diverge).
+    #[must_use]
+    pub fn mysql_addrs(&self) -> Vec<&str> {
+        self.nodes.iter().map(|n| n.mysql_addr.as_str()).collect()
+    }
+
+    /// Gracefully stop one node (SIGTERM, then SIGKILL after a grace period,
+    /// via [`terminate`]) and leave the rest of the cluster running.
+    ///
+    /// SIGTERM is the trigger for ephpm's graceful shutdown, so on a whole-
+    /// database clustered primary this runs the CDC drain gate
+    /// (`drain_whole_db_primary`) before the cluster channel closes — which is
+    /// exactly the path the failover harness exercises.
+    ///
+    /// The node's `child` handle is taken, so the fixture's `Drop` will not try
+    /// to terminate it a second time. Stopping an index that is already stopped
+    /// (or out of range) is a no-op.
+    pub fn stop_node(&mut self, index: usize) {
+        if let Some(node) = self.nodes.get_mut(index)
+            && let Some(mut child) = node.child.take()
+        {
+            terminate(&mut child);
+        }
+    }
+
+    /// The last `max_lines` lines of node `index`'s `stderr.log`, for inlining
+    /// into a test failure message.
+    ///
+    /// The fixture keeps every node's scratch directory alive for its whole
+    /// lifetime (`_tempdir`), so unlike the start-time path this can be read
+    /// after the node has been stopped — the log file outlives the process.
+    #[must_use]
+    pub fn stderr_tail(&self, index: usize, max_lines: usize) -> String {
+        let Some(node) = self.nodes.get(index) else {
+            return format!("(no node at index {index})");
+        };
+        match fs::read_to_string(&node.stderr_path) {
+            Ok(contents) => {
+                let lines: Vec<&str> = contents.lines().collect();
+                let start = lines.len().saturating_sub(max_lines);
+                lines[start..].join("\n")
+            }
+            Err(e) => format!("(stderr.log unreadable: {e})"),
+        }
     }
 }
 

@@ -333,24 +333,31 @@ One shared database, an elected primary. The **backup** is supported: the
 primary (or a replica, with `source = "replica"`) snapshots the one database
 exactly once per interval, and the artifact is a valid standalone SQLite file.
 
-**Restore does not reseed replicas automatically.** `ephpm db restore` strips
-the CDC bookkeeping so the restored node serves clean origin data — but a
-replica restarted with its **old database still present** treats the fresh log
-identity as an ordinary failover: it keeps its old rows and applies the restored
-node's new writes *on top of them* (a mix), and a later primary failover can
-then lose the restore cluster-wide with only a `WARN`. So the required procedure
-is manual:
+`ephpm db restore` strips the CDC bookkeeping so the restored node serves clean
+origin data. The hazard it has to defeat: a replica restarted with its **old
+database still present** treats the fresh log identity as an ordinary failover —
+it keeps its old rows and applies the restored node's new writes *on top of them*
+(a mix), and a later primary failover can then lose the restore cluster-wide with
+only a `WARN`.
+
+**Use `--reseed` (v0.16.2+).** It stamps a monotonic reseed generation into the
+restored image, which the restored node advertises in its CDC `Hello`/snapshot
+header. Any replica that sees a strictly newer generation **force-discards its
+local data and cold re-bootstraps** from the restored node automatically — no
+manual wipe. The procedure is then:
 
 1. Stop **every** node.
-2. Restore on the **lowest-ordinal node** (the one the election makes primary).
-3. **Delete** the database file and its `-wal`/`-shm` on **every other node** so
-   they cold-bootstrap from the restored node.
-4. Start the restored node **first**, then the wiped replicas.
-5. Verify each replica re-bootstrapped (`ephpm_cdc_bootstrap_total{outcome="ok"}`
-   / the "snapshot bootstrap complete" log line) — a node skipped at step 3 looks
-   healthy but serves the mix.
+2. `ephpm db restore --reseed …` on the **lowest-ordinal node** (the one the
+   election makes primary).
+3. Start the restored node **first**, then the others — each auto-converges.
+4. Verify each replica re-bootstrapped (`ephpm_cdc_bootstrap_total{outcome="ok"}`
+   / the "snapshot bootstrap complete" log line).
 
-The automatic `--reseed` that performs step 3 is **not yet implemented**.
+`--reseed` requires **every** node on v0.16.2+; an older replica ignores the
+signal and stays divergent (fail-safe, not corruption), so a mixed-version
+cluster must fall back to the manual wipe: after step 2 (without `--reseed`),
+**delete** the database file and its `-wal`/`-shm` on every other node before
+starting them, so they cold-bootstrap from the restored node.
 
 ### Per-site clustered — EXPERIMENTAL
 
@@ -388,3 +395,30 @@ shipped binary: schedule, key layout, `db backup list`, the status endpoint,
 `db restore` newest and `--at`, the retention sweep, and the
 server-is-running refusal. `cargo xtask e2e --tests db_backup` on a host
 with `podman` or `docker`; it skips, loudly, where there is neither.
+
+### Clustered failover harness (graceful drain → promote → no loss)
+
+`crates/ephpm-e2e/tests/cluster_failover.rs` is the live validation for the
+v0.16.2 **drain gate** (#701): it proves a *graceful* drain of a whole-database
+clustered primary promotes a replica **without losing any already-written data**.
+It spawns a 3-node cluster on loopback, finds the elected primary via
+`/_ephpm/primary`, writes rows through that node's `pdo_mysql` wire listener,
+waits for them to replicate to a replica, then SIGTERMs the primary — which runs
+the drain gate (`drain_whole_db_primary`: it holds the cluster channel open until
+every attached replica has applied the CDC head). It then waits for a survivor to
+be promoted and asserts every written row is present on the new primary.
+
+It is **opt-in** and timing-sensitive, so it is kept out of the gating E2E leg —
+it runs only when **both** environment variables are set:
+
+```bash
+EPHPM_CLUSTER_FAILOVER=1 \
+EPHPM_BINARY=./target/release/ephpm \
+EPHPM_DOCROOT=./crates/ephpm-e2e/tests/docroot \
+  cargo test -p ephpm-e2e --test cluster_failover -- --nocapture
+```
+
+Without the opt-in (or without a built binary) it prints a clear `SKIP` and
+passes, so a bare `cargo test` is unaffected. Clustered Turso is Linux/macOS +
+experimental, so the harness **skips on Windows**. A matching live `--reseed`
+convergence sub-test is planned for v0.16.3.
