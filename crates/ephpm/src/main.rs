@@ -721,6 +721,16 @@ enum DbCommand {
         /// Do not ask for confirmation.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// **Whole-database clustered only.** Also converge the cluster: stamp
+        /// a reseed generation into the restored image so every replica
+        /// force-discards its old data and cold re-bootstraps from this node on
+        /// restart — the automatic replacement for the manual "wipe every other
+        /// node's `.db`" step. Requires every node on v0.16.2+ (an older replica
+        /// ignores the signal and stays divergent — fail-safe, not corruption).
+        /// Rejected in single-node and per-site modes.
+        #[arg(long)]
+        reseed: bool,
     },
 
     /// Scheduled backup objects (`[db.sqlite.backup]`).
@@ -1063,8 +1073,15 @@ fn run_db(command: DbCommand) -> anyhow::Result<ExitCode> {
                 maintenance,
             })
         }
-        DbCommand::Restore { site, config, from, at, yes } => {
-            db_restore::run_restore(&db_restore::RestoreRequest { site, config, from, at, yes })
+        DbCommand::Restore { site, config, from, at, yes, reseed } => {
+            db_restore::run_restore(&db_restore::RestoreRequest {
+                site,
+                config,
+                from,
+                at,
+                yes,
+                reseed,
+            })
         }
         DbCommand::Backup { command: DbBackupCommand::List { site, config, from, json } } => {
             db_restore::run_list(&db_restore::ListRequest { site, config, from, json })

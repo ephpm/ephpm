@@ -576,8 +576,10 @@ pub fn record_apply_error() {
 
 /// Record a replica subscribe attempt by terminal outcome, so each
 /// attempt increments exactly one series. `outcome` is `closed`,
-/// `dial_error`, `stream_error` or `watermark_error`; reconnect rate is
-/// the sum across all four.
+/// `dial_error`, `stream_error`, `watermark_error` or `reseed` (v0.16.2:
+/// the primary advertised a newer reseed generation, so the attempt ended
+/// in a forced cold re-bootstrap rather than a tail); reconnect rate is the
+/// sum across all of them.
 pub fn record_connect_outcome(outcome: &'static str) {
     counter!(METRIC_REPLICA_CONNECTS, "outcome" => outcome).increment(1);
 }
@@ -612,7 +614,7 @@ pub fn init() {
     for status in ["ok", "error"] {
         counter!(METRIC_SNAPSHOTS_SERVED, "status" => status).increment(0);
     }
-    for outcome in ["closed", "dial_error", "stream_error", "watermark_error"] {
+    for outcome in ["closed", "dial_error", "stream_error", "watermark_error", "reseed"] {
         counter!(METRIC_REPLICA_CONNECTS, "outcome" => outcome).increment(0);
     }
     for outcome in ["ok", "skipped", "failed"] {

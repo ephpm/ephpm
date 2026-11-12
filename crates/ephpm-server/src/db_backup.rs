@@ -1423,6 +1423,79 @@ pub async fn strip_cdc_bookkeeping(path: &Path) -> anyhow::Result<usize> {
     result
 }
 
+/// Stamp a restored **whole-database clustered** image with a reseed generation
+/// ([`crate::turso_cdc::RESEED_GEN_TABLE`], written via
+/// [`crate::turso_cdc::write_local_reseed_gen`]) so that, after `ephpm db restore
+/// --reseed`, every replica force-discards its old copy and cold re-bootstraps
+/// from this node automatically — the convergence the manual wipe-every-replica
+/// procedure used to do by hand (v0.16.2).
+///
+/// `generation` is a monotonic unix-millisecond stamp. The serving node
+/// advertises it in `Frame::Hello` / `SnapshotHeader`; a replica that sees a
+/// **strictly greater** generation than it has adopted re-bootstraps. Because a
+/// plain restore first [`strip_cdc_bookkeeping`]s this table away (generation
+/// `0`), only an explicit `--reseed` ever forces a discard.
+///
+/// Call order in the restore flow: **after** `strip_cdc_bookkeeping` (which
+/// drops any reseed table the source image carried) and **before**
+/// [`verify_integrity`], on the staged temp file, so the integrity check
+/// validates the final shape. Mirrors `strip_cdc_bookkeeping`'s
+/// `TRUNCATE`-checkpoint-and-fail-closed-on-busy logic: the write lives only in
+/// the `-wal` until the checkpoint folds it back, and the caller removes the
+/// `-wal` next, so a busy checkpoint that could not fold it is a hard error
+/// rather than a silently-discarded stamp.
+///
+/// Opens a plain (ungated, short-lived) handle and removes the `-wal`/`-shm`
+/// left beside the file; engine work runs under `offload::engine`.
+///
+/// # Errors
+///
+/// The file cannot be opened as a database, the generation cannot be written, or
+/// the fold-back checkpoint was blocked (busy).
+pub async fn stamp_reseed_generation(path: &Path, generation: u64) -> anyhow::Result<()> {
+    let path_s = path.to_str().context("path is not UTF-8")?;
+    let result = offload::engine(async {
+        let db = turso::Builder::new_local(path_s)
+            .build()
+            .await
+            .with_context(|| format!("open {} to stamp the reseed generation", path.display()))?;
+        let conn = db.connect().context("connect")?;
+        crate::turso_cdc::write_local_reseed_gen(&conn, generation)
+            .await
+            .context("writing the reseed generation")?;
+        // Fold the WAL back into the main file before the handle is dropped (the
+        // Turso SDK never checkpoints on drop): the write above lives only in the
+        // `-wal` until a checkpoint runs, and the caller removes the `-wal` next.
+        let mut ck = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .context("checkpointing the stamped file")?;
+        // First column is `busy` (1 = the WAL could not be folded back because it
+        // was pinned). A busy checkpoint here would let the caller drop a `-wal`
+        // that still holds the stamp. Fail closed; the caller leaves the live
+        // database untouched on an error.
+        let busy = match ck.next().await.context("reading the checkpoint result")? {
+            Some(row) => matches!(row.get_value(0)?, turso::Value::Integer(1)),
+            None => false,
+        };
+        while ck.next().await.context("draining the checkpoint result")?.is_some() {}
+        if busy {
+            anyhow::bail!(
+                "checkpoint of the stamped file was blocked (busy); refusing to remove its -wal, \
+                 which would discard the reseed generation"
+            );
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        remove_quietly(Path::new(&sidecar));
+    }
+    result
+}
+
 /// Whether a database file holds at least one user (non-bookkeeping) table —
 /// the same predicate `turso_cdc::local_db_is_cold` / `list_user_tables` use:
 /// excludes `sqlite_*`, `__`-prefixed bookkeeping (log id / watermark / source)
@@ -1769,6 +1842,49 @@ mod tests {
         let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
         let conn = db.connect().unwrap();
         assert!(table_exists(&conn, "t").await);
+    }
+
+    /// `ephpm db restore --reseed` stamps a monotonic generation into the staged
+    /// image after the strip and before verification: the strip removes any
+    /// reseed table the source carried, the stamp writes a fresh one, the reader
+    /// sees the new value, user data survives, and the file still verifies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stamp_reseed_generation_round_trips_after_strip_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db");
+        {
+            let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            exec_raw(&conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+            exec_raw(&conn, "INSERT INTO t (id, v) VALUES (1, 'kept')").await;
+            // A source image carrying a STALE reseed table (as a reseeded node's
+            // backup would): the strip must drop it before the fresh stamp.
+            for table in crate::turso_cdc::CDC_BOOKKEEPING_TABLES {
+                exec_raw(&conn, &format!("CREATE TABLE \"{table}\" (k INTEGER, val TEXT)")).await;
+                exec_raw(&conn, &format!("INSERT INTO \"{table}\" VALUES (0, 'stale')")).await;
+            }
+        }
+
+        // The restore order: strip first (drops the stale reseed table), then stamp.
+        strip_cdc_bookkeeping(&path).await.unwrap();
+        let generation = 1_700_000_123_456_u64;
+        stamp_reseed_generation(&path, generation).await.unwrap();
+
+        // The stamped file still verifies.
+        verify_integrity(&path).await.expect("stamped file is a valid database");
+
+        // The reader sees exactly the stamped generation, and user data survives.
+        let db = turso::Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            crate::turso_cdc::read_local_reseed_gen(&conn).await.unwrap(),
+            generation,
+            "the stamped reseed generation reads back"
+        );
+        assert!(table_exists(&conn, "t").await);
+        let mut rows = conn.query("SELECT v FROM t WHERE id = 1", ()).await.unwrap();
+        let row = rows.next().await.unwrap().expect("the kept row");
+        assert_eq!(format!("{:?}", row.get_value(0).unwrap()), "Text(\"kept\")");
     }
 
     #[test]
