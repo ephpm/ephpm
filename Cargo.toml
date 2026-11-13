@@ -877,7 +877,7 @@ mysql_common = { git = "https://github.com/ephpm/rust_mysql_common.git", rev = "
 # write fails). Fixed upstream by PR tursodatabase/turso#10117, not yet
 # released. The pin is the ePHPm org mirror github.com/ephpm/turso, branch
 # `ephpm/v0.8.3-vacuum-harden` off `ephpm/v0.8.3`, annotated tag
-# `v0.8.3-ephpm.3` (pinned below by `rev` so the lock is exact; the tag names
+# `v0.8.3-ephpm.4` (pinned below by `rev` so the lock is exact; the tag names
 # the same commit): the v0.8.3 tag plus the page-1 regression tests and the
 # backported fix (holds `init_lock` across the whole page-1 write and re-checks
 # under it; `v0.8.3-ephpm.1`), then MEMORY: a memory-bound test for
@@ -899,18 +899,28 @@ mysql_common = { git = "https://github.com/ephpm/rust_mysql_common.git", rev = "
 # (1.4 GB for a 688 MB file, 11.6 GB for 5.6 GB) and OOM-killed
 # `[db.sqlite.backup]` on a 1.6 GB database; with this pin peak RSS is bounded
 # by ~66 MiB + 2x the largest single index rather than by the database, flat
-# across sizes for an index-free database (ephpm#692, #693). Crate versions stay
+# across sizes for an index-free database (ephpm#692, #693). And then CONSISTENCY
+# (`v0.8.3-ephpm.4`): `VACUUM INTO`'s Init ran `BEGIN`, which opens no read
+# transaction on the source, so the nested copy statements served from the
+# connection's stale page cache and the copy could drop rows another connection
+# committed before the backup ran — a torn, internally-inconsistent snapshot
+# under concurrent writes (`ephpm db dump` and clustered backups of a busy
+# primary). Init now begins the source read transaction before the output file
+# is created (non-MVCC sources), mirroring SQLite's sqlite3BtreeBeginTrans;
+# backport of upstream PR tursodatabase/turso#11808, issue #11753, with the
+# regression test `test_vacuum_into_reads_latest_committed_snapshot`. Crate
+# versions stay
 # 0.8.3 so this patch replaces the published crates in place and the
 # `turso = "=0.8.3"` requirements (here and in litewire) still resolve. Every
 # turso crate the lockfile pulls from crates.io is patched so no crates.io
 # 0.8.3 copy remains beside the fork. Remove this block (and the deny.toml
-# allow-git entry) once a Turso release carrying both fixes is pinned.
-turso = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_core = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_ext = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_macros = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_parser = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_sdk_kit_macros = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_sync_engine = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
-turso_sync_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "3c4f07fdc6782fec11a742d4e127a4bc14213fb2" }
+# allow-git entry) once a Turso release carrying these fixes is pinned.
+turso = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_core = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_ext = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_macros = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_parser = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_sdk_kit_macros = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_sync_engine = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
+turso_sync_sdk_kit = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
