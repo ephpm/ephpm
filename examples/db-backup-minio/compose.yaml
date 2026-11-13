@@ -53,7 +53,7 @@ services:
   # data in the first backup. A real app would instead write through pdo_mysql /
   # the ephpm_db_* bridge while serving; see the DB guide.
   seed:
-    image: ephpm/ephpm:v0.16.3-php8.5.12
+    image: ephpm/ephpm:v0.16.4-php8.5.12
     volumes:
       - app-data:/app/data
       - ./ephpm.toml:/app/ephpm.toml:ro
@@ -67,7 +67,7 @@ services:
         echo "seeded"
 
   ephpm:
-    image: ephpm/ephpm:v0.16.3-php8.5.12
+    image: ephpm/ephpm:v0.16.4-php8.5.12
     depends_on:
       createbucket:
         condition: service_completed_successfully
