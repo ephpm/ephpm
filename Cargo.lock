@@ -1858,7 +1858,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc 0.2.189",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4129,7 +4129,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4241,7 +4241,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4718,7 +4718,7 @@ dependencies = [
  "errno",
  "libc 0.2.189",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4731,7 +4731,7 @@ dependencies = [
  "errno",
  "libc 0.2.189",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4826,7 +4826,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5272,6 +5272,7 @@ dependencies = [
  "cfg-if",
  "libc 0.2.189",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -5415,7 +5416,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5920,7 +5921,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "thiserror 2.0.20",
  "tracing",
@@ -5933,7 +5934,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "aegis",
  "aes",
@@ -6005,7 +6006,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -6015,7 +6016,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6025,7 +6026,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "bitflags",
  "memchr",
@@ -6039,7 +6040,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -6055,7 +6056,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6065,7 +6066,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6087,7 +6088,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.8.3"
-source = "git+https://github.com/ephpm/turso.git?rev=3c4f07fdc6782fec11a742d4e127a4bc14213fb2#3c4f07fdc6782fec11a742d4e127a4bc14213fb2"
+source = "git+https://github.com/ephpm/turso.git?rev=af76b60dc486d6f73175465c962059643f2bfea4#af76b60dc486d6f73175465c962059643f2bfea4"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -6651,7 +6652,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

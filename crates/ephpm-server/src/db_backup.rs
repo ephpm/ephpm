@@ -2132,6 +2132,73 @@ mod tests {
         assert_eq!(count(&sconn, "SELECT COUNT(*) FROM log").await, in_snapshot + 1);
     }
 
+    /// Regression guard for tursodatabase/turso#11753 (fixed by the
+    /// `v0.8.3-ephpm.4` pin). `VACUUM INTO` must copy the source's current
+    /// committed state, not the source connection's stale page cache. Before
+    /// the fix, Init ran `BEGIN` without opening a read transaction, so under
+    /// concurrent writes the copy could be *torn* — a trigger's bookkeeping
+    /// table (`log`) out of step with the table it mirrors (`t`) — or *stale*,
+    /// holding fewer rows than were durable at the instant the backup was
+    /// asked for. A single snapshot hits the torn window only rarely, which is
+    /// why the existing consistency test missed it; this loops the snapshot
+    /// against a steady writer, where the bug surfaced within ~25 iterations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacuum_into_snapshot_is_fresh_under_concurrent_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.db");
+        let serving = wal_gate::builder_with_gate(Turso::builder(path.to_str().unwrap()))
+            .build()
+            .await
+            .unwrap();
+        let setup = serving.raw_connection().unwrap();
+        exec(&setup, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").await;
+        exec(&setup, "CREATE TABLE log (id INTEGER)").await;
+        exec(
+            &setup,
+            "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); END",
+        )
+        .await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_conn = serving.raw_connection().unwrap();
+        let writer = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    exec(&writer_conn, &format!("INSERT INTO t (v) VALUES ('w {n}')")).await;
+                    n += 1;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let probe = serving.raw_connection().unwrap();
+        for i in 0..25 {
+            // Rows that are already durable at the instant we ask for a backup.
+            let committed_before = count(&probe, "SELECT COUNT(*) FROM t").await;
+            let dest = dir.path().join(format!("snap-{i}.db"));
+            snapshot_into(&path, &dest).await.expect("snapshot");
+
+            let snap = turso::Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();
+            let s = snap.connect().unwrap();
+            let mut rows = s.query("PRAGMA integrity_check", ()).await.unwrap();
+            let ok = rows.next().await.unwrap().unwrap();
+            assert_eq!(ok.get_value(0).unwrap(), turso::Value::Text("ok".into()), "iter {i}");
+            drop(rows);
+            let t = count(&s, "SELECT COUNT(*) FROM t").await;
+            let lg = count(&s, "SELECT COUNT(*) FROM log").await;
+            assert_eq!(t, lg, "iter {i}: torn read, log {lg} != t {t}");
+            assert!(
+                t >= committed_before,
+                "iter {i}: STALE snapshot — {t} rows, but {committed_before} were committed \
+                 before the call (tursodatabase/turso#11753)"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+    }
+
     /// Every row of `sql`, each column rendered through `quote()`, so two
     /// databases can be compared value by value.
     async fn dump(conn: &turso::Connection, sql: &str) -> Vec<Vec<String>> {
