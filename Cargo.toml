@@ -660,7 +660,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # `tinyint(1)` are rewritten to `TINYINT(1)` at CREATE time and reported as
 # `tinyint(1)` so ORM bool detection works (new tables only; existing INTEGER
 # columns keep reporting `bigint`).
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "1b2312f3c2be5511f5f14152a82961b8bbfee415", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "9e87fbabc31aed7449a515172e4b60297f85eed7", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)
