@@ -471,8 +471,15 @@ pub(crate) struct DirectSink {
     /// The dialect the statements are in — selects the translator and the
     /// screen's string-escaping rule.
     dialect: Dialect,
-    // Keep the backend alive for the connection's lifetime.
-    _backend: SharedBackend,
+    /// Reopen the engine connection after every successful `COMMIT` (the import
+    /// path only). Drops the old connection's prepared-statement cache so a long
+    /// import stays bounded by one batch — see [`DirectSink::reconnect`]. The
+    /// interactive console keeps its one connection, so this is `false` there.
+    reconnect_on_commit: bool,
+    /// The backend the engine connection is opened from. Kept alive for the
+    /// connection's lifetime and reused to reopen a fresh connection between
+    /// batches.
+    backend: SharedBackend,
 }
 
 impl DirectSink {
@@ -488,7 +495,13 @@ impl DirectSink {
         handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         let backend = open_offline_backend(path, &handle)?;
-        Self::from_backend(backend, dialect, handle, true)
+        let mut sink = Self::from_backend(backend, dialect, handle, true)?;
+        // The import drives one connection for the whole run and COMMITs per
+        // `--batch-size`. Reopen the connection on each commit so its (unbounded,
+        // no-eviction) prepared-statement cache cannot grow with every distinct
+        // literal statement in a multi-million-row dump.
+        sink.reconnect_on_commit = true;
+        Ok(sink)
     }
 
     /// Bind a sink over an already-open `backend`. The console opens the file
@@ -512,7 +525,28 @@ impl DirectSink {
             Some(lw) => DirectInner::Translating(Session::new(conn, lw)),
             None => DirectInner::Native(conn),
         };
-        Ok(Self { inner, handle, screen, dialect, _backend: backend })
+        Ok(Self { inner, handle, screen, dialect, reconnect_on_commit: false, backend })
+    }
+
+    /// Reopen the engine connection from the backend, dropping the old one.
+    ///
+    /// Called after a successful `COMMIT` on the import path (so never inside a
+    /// transaction — the new connection reads the just-committed data from the
+    /// file and WAL). The dropped `turso::Connection` takes its prepared-statement
+    /// cache with it: the Turso SDK interns every statement text with no eviction,
+    /// and litewire prepares every statement cached, so a dump of millions of
+    /// distinct literal `INSERT`s would otherwise grow one cache entry per row and
+    /// run the resident set out of memory. Reopening per batch bounds it instead.
+    /// Connecting is cheap on this engine, so the per-batch cost is negligible.
+    fn reconnect(&mut self) -> Result<(), SinkError> {
+        let conn = self.handle.block_on(self.backend.connect()).map_err(|e| {
+            SinkError::message(format!("reopening the site database connection: {e}"))
+        })?;
+        self.inner = match lw_dialect(self.dialect) {
+            Some(lw) => DirectInner::Translating(Session::new(conn, lw)),
+            None => DirectInner::Native(conn),
+        };
+        Ok(())
     }
 
     /// Execute `sql`, discarding any result set (the import / transaction-control
@@ -564,7 +598,11 @@ impl StatementSink for DirectSink {
         self.exec_inner("BEGIN")
     }
     fn commit(&mut self) -> Result<(), SinkError> {
-        self.exec_inner("COMMIT")
+        self.exec_inner("COMMIT")?;
+        if self.reconnect_on_commit {
+            self.reconnect()?;
+        }
+        Ok(())
     }
     fn rollback(&mut self) -> Result<(), SinkError> {
         self.exec_inner("ROLLBACK")
@@ -814,5 +852,71 @@ mod tests {
         assert!(format!("{err:#}").contains("not a single-byte charset"), "{err:#}");
         let err = resolve_utf8_policy(Stop, None, Some("klingon")).unwrap_err();
         assert!(format!("{err:#}").contains("unknown charset"), "{err:#}");
+    }
+
+    /// The v0.16.5 fix for the `db import` OOM on a large, heavily-row-ed table.
+    /// The Turso SDK's prepared-statement cache has no eviction and litewire
+    /// prepares every statement cached, so a dump of millions of *distinct
+    /// literal* `INSERT`s grew that cache one entry per row until the box OOM'd —
+    /// independent of `--batch-size`, WAL size, or index shape. The import sink
+    /// now reopens its connection after every `COMMIT`, dropping the cache per
+    /// batch. This proves the reopen loses no committed row and that a session
+    /// opened after a reconnect still sees a table created on a since-closed
+    /// connection — and that the console sink (`from_backend`) does NOT reopen.
+    #[test]
+    fn import_sink_reconnects_between_batches_without_losing_committed_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbfile = tmp.path().join("sendy.db");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let mut sink =
+            DirectSink::open(dbfile.to_str().unwrap(), Dialect::MySql, rt.handle().clone())
+                .expect("open the staging database offline");
+        // The import path reopens the connection per batch; the console does not.
+        assert!(sink.reconnect_on_commit, "db import must reopen the connection between batches");
+
+        // Batch 1 creates the table and commits — which drops the connection the
+        // table was created on and reopens a fresh one.
+        sink.begin().unwrap();
+        sink.exec("CREATE TABLE skipped (id INTEGER PRIMARY KEY, email TEXT)").unwrap();
+        for id in 0..100 {
+            sink.exec(&format!("INSERT INTO skipped VALUES ({id}, 'user{id}@example.com')"))
+                .unwrap();
+        }
+        sink.commit().unwrap();
+
+        // Later batches run on post-reconnect sessions that never saw the CREATE
+        // TABLE directly — they must still find the committed schema and keep
+        // inserting, committing (and reconnecting) each time.
+        for batch in 1..5 {
+            sink.begin().unwrap();
+            for j in 0..100 {
+                let id = batch * 100 + j;
+                sink.exec(&format!("INSERT INTO skipped VALUES ({id}, 'user{id}@example.com')"))
+                    .unwrap();
+            }
+            sink.commit().unwrap();
+        }
+
+        // All 500 rows survived the four reconnects, read on a connection opened
+        // after the last COMMIT.
+        let counted = sink.query_rows("SELECT COUNT(*) FROM skipped").unwrap();
+        match counted.rows[0][0] {
+            Cell::Integer(n) => assert_eq!(n, 500, "every committed row must survive reconnects"),
+            _ => panic!("COUNT(*) should return an integer"),
+        }
+        let spot = sink.query_rows("SELECT email FROM skipped WHERE id = 347").unwrap();
+        match &spot.rows[0][0] {
+            Cell::Text(s) => assert_eq!(s, "user347@example.com"),
+            _ => panic!("email should be text"),
+        }
+
+        // The console sink (`from_backend`) keeps its one connection across
+        // commits — the reconnect is scoped to the import path only.
+        let console_file = tmp.path().join("console.db");
+        let backend = open_offline_backend(console_file.to_str().unwrap(), rt.handle()).unwrap();
+        let console =
+            DirectSink::from_backend(backend, Dialect::MySql, rt.handle().clone(), true).unwrap();
+        assert!(!console.reconnect_on_commit, "the console must not reopen between commits");
     }
 }
