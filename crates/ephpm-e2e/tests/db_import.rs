@@ -473,3 +473,86 @@ async fn pgdump_dry_run_reports_compatibility() {
     // COPY block must have converted cleanly rather than erroring.
     assert_eq!(report.summary.error, 0, "dry run must record no execution errors: {report:?}");
 }
+
+/// The v0.16.5 memory fix, end to end: importing a dump with a very large table
+/// must stay memory-bounded. The embedded engine's per-connection prepared-
+/// statement cache has no eviction, so before the fix a dump of hundreds of
+/// thousands of **distinct literal** `INSERT`s grew the import's resident set
+/// with the row count and OOM'd small hosts — independent of `--batch-size`,
+/// WAL size, or index shape. The sink now reopens its connection after each
+/// committed batch, dropping that cache per batch, so peak RSS tracks
+/// `--batch-size`, not table size.
+///
+/// Imports 300k single-row INSERTs into an **indexed** table and asserts, on the
+/// Linux legs, that the import process's peak RSS (`/proc/self VmHWM`) stays
+/// well under a ceiling the unbounded-cache behavior would blow past, and on
+/// every platform that all rows landed. (Measured ~50 MB with the fix; the
+/// unbounded cache was hundreds of MB at this row count.)
+#[tokio::test]
+async fn large_import_stays_memory_bounded() {
+    let Some(binary) = ephpm_binary_env() else {
+        eprintln!("EPHPM_BINARY not set — skipping large-import memory guard");
+        return;
+    };
+
+    let mut fixture =
+        DbImportFixture::prepare(&binary, "bulk", VHOST_INDEX_PHP).expect("prepare fixture");
+
+    const ROWS: usize = 300_000;
+    // With the fix: a flat ~50–150 MB regardless of ROWS. Without it: baseline +
+    // one cache entry per distinct statement (hundreds of MB at this count).
+    // 300 MiB separates the two regimes with wide margin on both sides.
+    const CEILING_KIB: u64 = 300 * 1024;
+
+    // Generate the dump straight to disk (an indexed table, ROWS distinct
+    // single-row INSERTs — the `sendy.skipped_emails` shape that OOM'd).
+    let dump_path = fixture.scratch_dir().join("bulk.sql");
+    {
+        use std::io::Write as _;
+        let mut w =
+            std::io::BufWriter::new(std::fs::File::create(&dump_path).expect("create dump"));
+        writeln!(w, "-- MySQL dump 10.13  Distrib 8.0.36, for Linux (x86_64)").unwrap();
+        writeln!(w, "DROP TABLE IF EXISTS `skipped`;").unwrap();
+        writeln!(
+            w,
+            "CREATE TABLE `skipped` (`id` int NOT NULL, `email` varchar(190) NOT NULL, \
+             PRIMARY KEY (`id`), KEY `email_idx` (`email`)) ENGINE=InnoDB;"
+        )
+        .unwrap();
+        for i in 1..=ROWS {
+            writeln!(w, "INSERT INTO `skipped` VALUES ({i},'user{i}@example.com');").unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    let (out, peak_kib) = fixture
+        .import_sampling_rss(&dump_path, &["--dialect", "mysql", "--batch-size", "1000"])
+        .expect("run import");
+    assert!(
+        out.status.success(),
+        "import exited {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Every row landed (read back offline through the engine).
+    let rows = query_json(
+        &fixture
+            .query(&["--format", "json", "SELECT COUNT(*) AS n FROM skipped"])
+            .expect("run db query"),
+    );
+    assert_eq!(rows[0]["n"], ROWS, "every imported row must be present: {rows:?}");
+
+    // Peak RSS is bounded by the batch, not the table (Linux legs report it).
+    if let Some(kib) = peak_kib {
+        eprintln!("large import peak RSS: {} MiB for {ROWS} rows", kib / 1024);
+        assert!(
+            kib < CEILING_KIB,
+            "import of {ROWS} rows peaked at {} MiB, over the {} MiB ceiling — the per-batch \
+             connection reopen (statement-cache bound) has regressed",
+            kib / 1024,
+            CEILING_KIB / 1024,
+        );
+    }
+}

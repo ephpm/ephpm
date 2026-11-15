@@ -514,6 +514,46 @@ impl DbImportFixture {
             .with_context(|| format!("running `ephpm db import` ({})", self.binary.display()))
     }
 
+    /// Like [`import`](Self::import) but samples the import process's peak
+    /// resident set, returning `(output, peak_rss_kib)`.
+    ///
+    /// On Linux `peak_rss_kib` is the kernel's `VmHWM` high-water mark read from
+    /// `/proc/<pid>/status`, sampled until the child exits; on other platforms it
+    /// is `None` (the bare-process E2E memory guard runs on the Linux legs).
+    /// stdout/stderr are redirected to files in the scratch dir so the sampling
+    /// loop can never deadlock on a full child pipe.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the subprocess cannot be spawned or waited on.
+    pub fn import_sampling_rss(
+        &mut self,
+        dump: &Path,
+        extra_args: &[&str],
+    ) -> Result<(std::process::Output, Option<u64>)> {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        let out_path = self.scratch_dir().join("import-stdout.log");
+        let err_path = self.scratch_dir().join("import-stderr.log");
+        let mut child = self
+            .command()
+            .args(["db", "import"])
+            .arg(dump)
+            .args(["--site", &self.site, "--config"])
+            .arg(&self.config_path)
+            .args(extra_args)
+            .stdout(Stdio::from(fs::File::create(&out_path).context("import stdout log")?))
+            .stderr(Stdio::from(fs::File::create(&err_path).context("import stderr log")?))
+            .spawn()
+            .with_context(|| format!("spawning `ephpm db import` ({})", self.binary.display()))?;
+        let peak = sample_peak_rss(&mut child);
+        let status = child.wait().context("waiting for `ephpm db import`")?;
+        let stdout = fs::read(&out_path).unwrap_or_default();
+        let stderr = fs::read(&err_path).unwrap_or_default();
+        Ok((std::process::Output { status, stdout, stderr }, peak))
+    }
+
     /// Start the node serving the imported site and wait for health.
     ///
     /// # Errors
@@ -540,6 +580,44 @@ impl DbImportFixture {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+/// Sample a child process's peak resident set (KiB) until it exits.
+///
+/// Linux-only via `/proc/<pid>/status` `VmHWM` (the kernel's monotonic
+/// high-water mark); returns `None` on other platforms. Samples every 20 ms, so
+/// the reported peak trails the true peak by at most one interval — ample for a
+/// bounded-vs-unbounded assertion.
+fn sample_peak_rss(child: &mut Child) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status_path = format!("/proc/{}/status", child.id());
+        let mut peak: u64 = 0;
+        loop {
+            if let Ok(s) = fs::read_to_string(&status_path) {
+                for line in s.lines() {
+                    if let Some(rest) = line.strip_prefix("VmHWM:") {
+                        if let Some(kib) =
+                            rest.split_whitespace().next().and_then(|n| n.parse::<u64>().ok())
+                        {
+                            peak = peak.max(kib);
+                        }
+                    }
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+        (peak > 0).then_some(peak)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        None
     }
 }
 
