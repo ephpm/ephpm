@@ -714,7 +714,7 @@ alt_svc_max_age = 86400
 > WordPress admin's raise to `256M` fails under `memory_limit = "128M"`; set
 > `memory_limit_max = "512M"` to allow it. The autotuned limit is capped at
 > `1024M`. Each refused raise logs one WARN. See
-> [Upgrading to v0.13.1](/getting-started/install/#upgrading-to-v0131).
+> [Upgrading → v0.13.1](/upgrading/#v0131).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
