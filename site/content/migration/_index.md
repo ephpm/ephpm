@@ -11,3 +11,5 @@ Moving an existing PHP app to ePHPm.
 - **[Docker Compose](docker-compose/)**
 - **[Shared Hosting (cPanel, etc.)](shared-hosting/)**
 - **[Laravel Forge](laravel-forge/)**
+
+Already running ePHPm and upgrading it to a newer version? See the [Upgrading](/upgrading/) guide.

@@ -116,58 +116,9 @@ To run the server in the foreground without registering a service (useful for de
 sudo ephpm serve --config /etc/ephpm/ephpm.toml
 ```
 
-## Upgrading to v0.13.1
+## Upgrading an existing install
 
-v0.13.1 changes how PHP's per-request `memory_limit` is set and bounds what a
-script can raise it to. Check these before upgrading:
-
-- **An explicit `[php] memory_limit` is now honoured in `ephpm serve`.**
-  Through v0.13.0 serve mode silently replaced it with the autotuned value on
-  Linux and Windows. A config that says `memory_limit = "128M"` — including
-  the config written by `ephpm install` on older versions, Windows services
-  among them — now really runs every request at 128M. Remove the line to keep
-  autotuning, or set the value you want.
-- **Runtime raises above `[php] memory_limit_max` are refused.** The ceiling
-  defaults to the `memory_limit` PHP started with. `ini_set('memory_limit', …)`
-  above it, including `-1`, returns `false` and the limit stays. WordPress, for
-  example, raises admin requests to `256M`; with `memory_limit = "128M"` that
-  raise now fails and the request runs at 128M. To allow it, set
-  `memory_limit_max = "512M"` (or whatever headroom your apps need).
-- **The autotuned per-request `memory_limit` is capped at `1024M`.** On a large
-  host it used to be a share of all memory (many GB). Set `memory_limit`
-  explicitly if an app genuinely needs more.
-- **Each refused raise logs one WARN** (`ePHPm refused memory_limit=…`).
-
-Details: [`memory_limit` and `memory_limit_max`](/reference/config/#php).
-
-It also tightens HTTP request parsing:
-
-- **HTTP request framing is stricter (request smuggling).** The following are now `400` (with `Connection: close`):
-  - `Content-Length` together with `Transfer-Encoding`;
-  - any `Transfer-Encoding` other than a single `chunked`;
-  - an HTTP/1.1 request without `Host`, or with two;
-  - an absolute-form target whose authority differs from `Host`.
-
-  A malformed chunked body is `400`, no longer `413`. Every request sent with `Transfer-Encoding` closes its connection after the response. Details: [HTTP request framing](/architecture/security/#http-request-framing-request-smuggling).
-
-## Upgrading from 0.6.x
-
-v0.7.0 replaced the embedded SQLite engine: the rusqlite (SQLite C engine)
-backend and the sqld sidecar were removed, and the in-process
-[Turso engine](/architecture/database/engines/) is now the only embedded
-engine. For an upgrading node:
-
-- **Your `.db` files open in place** — a cleanly-shut-down 0.6.x database
-  (WAL or rollback journal) needs no dump/reload. **Stop the old node cleanly
-  before upgrading**: a hot `-wal` left by a hard crash was not verified to
-  replay through Turso.
-- **`[db.sqlite] engine = "sqlite"` (or `"rusqlite"`) is now a hard startup
-  error** with a migration message — remove the `engine` key or set it to
-  `"turso"`. The removed `[db.sqlite.sqld]` block and `cdc_experimental` flag
-  log deprecation warnings and have no effect.
-
-Details and caveats (including non-UTF-8 `TEXT`):
-[Database Engines → Opening existing `.db` files](/architecture/database/engines/#opening-existing-sqlite--rusqlite-db-files).
+Upgrading ePHPm from an earlier version is a drop-in binary (or Docker image) swap — re-running `ephpm install` keeps your config. A few releases need a config change or a careful restart (the v0.13.1 `memory_limit` bounding and stricter HTTP framing, the v0.9.0 `[php]` key rename, the v0.7.0 engine switch from 0.6.x). All of it, newest-first, is in the [**Upgrading**](/upgrading/) guide — read every section between your current version and your target.
 
 ## Uninstall
 
