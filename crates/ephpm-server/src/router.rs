@@ -6592,12 +6592,51 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
 /// at the single ingest point shared by the fpm and worker dispatch paths,
 /// guarantees a client-forged value can never surface as `$_SERVER['HTTP_*']`
 /// even when the JWT middleware is skipped by its `match` glob (or absent).
+///
+/// **Multiple `Cookie` fields are folded into one, joined with `"; "`.** An
+/// HTTP/2 or HTTP/3 client MAY split its cookies across several `cookie` header
+/// fields for better HPACK/QPACK compression (RFC 9113 §8.2.3, RFC 9114 §4.2.1,
+/// RFC 7540 §8.1.2.5), and a recipient handing the request to a non-HTTP/2
+/// context — here the PHP SAPI — MUST concatenate them with the two-octet
+/// `"; "` delimiter first. Browsers do this routinely over h2/h3, so without
+/// the fold `$_COOKIE` and the middleware `Cookie` accessor would see only the
+/// first field (and `$_SERVER['HTTP_COOKIE']`, registered per occurrence, only
+/// the last) — dropping cookies and breaking session auth for real browsers
+/// while single-header clients (curl, HTTP/1.1, a re-folding proxy) worked.
+/// Folding at this one shared point fixes every consumer consistently. The
+/// fold is transport-agnostic: an HTTP/1.1 client that sent two `Cookie` lines
+/// would be handled identically (browsers simply never do).
 fn extract_headers(headers: &hyper::HeaderMap, strip: &[String]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| !strip.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)))
-        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
-        .collect()
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    // Index in `out` of the single folded `cookie` entry, once seen.
+    let mut cookie_idx: Option<usize> = None;
+    for (name, value) in headers {
+        if strip.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)) {
+            continue;
+        }
+        let value = value.to_str().unwrap_or("").to_string();
+        if name.as_str().eq_ignore_ascii_case("cookie") {
+            if let Some(i) = cookie_idx {
+                // A later `cookie` field: append to the first one with "; ",
+                // skipping empties so the result never has a dangling delimiter.
+                if !value.is_empty() {
+                    let folded = &mut out[i].1;
+                    if folded.is_empty() {
+                        *folded = value;
+                    } else {
+                        folded.push_str("; ");
+                        folded.push_str(&value);
+                    }
+                }
+                continue;
+            }
+            // First `cookie` field: push it normally and remember where it
+            // landed so later fields fold into it, in received order.
+            cookie_idx = Some(out.len());
+        }
+        out.push((name.to_string(), value));
+    }
+    out
 }
 
 /// Map an HTTP method to a `&'static str` metrics label.
@@ -8803,6 +8842,61 @@ mod tests {
         // Legitimate headers are preserved untouched.
         assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")));
         assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("user-agent")));
+    }
+
+    /// Collect every `cookie` value from an extracted header list.
+    fn cookie_values(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// RFC 9113 §8.2.3 / RFC 9114 §4.2.1: an h2/h3 client may split its cookies
+    /// across several `cookie` fields; ingest must fold them into ONE entry,
+    /// joined with "; ", so `$_COOKIE` and `$_SERVER['HTTP_COOKIE']` (registered
+    /// per occurrence) both see every cookie. This is the browser-over-h2 login
+    /// bug.
+    #[test]
+    fn multiple_cookie_fields_fold_with_semicolon_space() {
+        let mut incoming = hyper::HeaderMap::new();
+        incoming.append("cookie", "PHPSESSID=aaa".parse().unwrap());
+        incoming.append("cookie", "logged_in=X".parse().unwrap());
+        incoming.insert("Host", "app.example".parse().unwrap());
+
+        let folded = extract_headers(&incoming, &[]);
+
+        // Exactly one cookie entry, holding both cookies in received order —
+        // so no downstream consumer can pick a different single field.
+        assert_eq!(cookie_values(&folded), vec!["PHPSESSID=aaa; logged_in=X"], "{folded:?}");
+        assert!(folded.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")));
+    }
+
+    /// A single `cookie` field (curl default, HTTP/1.1, a re-folding proxy) is
+    /// passed through byte-identical — the fix must not regress the common case.
+    #[test]
+    fn single_cookie_field_is_unchanged() {
+        let mut incoming = hyper::HeaderMap::new();
+        incoming.insert("cookie", "PHPSESSID=aaa; logged_in=X".parse().unwrap());
+
+        let folded = extract_headers(&incoming, &[]);
+
+        assert_eq!(cookie_values(&folded), vec!["PHPSESSID=aaa; logged_in=X"]);
+    }
+
+    /// Empty `cookie` fields never produce a dangling `"; "` delimiter.
+    #[test]
+    fn empty_cookie_fields_do_not_produce_dangling_delimiters() {
+        let mut incoming = hyper::HeaderMap::new();
+        incoming.append("cookie", "".parse().unwrap());
+        incoming.append("cookie", "a=1".parse().unwrap());
+        incoming.append("cookie", "".parse().unwrap());
+        incoming.append("cookie", "b=2".parse().unwrap());
+
+        let folded = extract_headers(&incoming, &[]);
+
+        assert_eq!(cookie_values(&folded), vec!["a=1; b=2"]);
     }
 
     // ── Request timeline (/_ephpm/requests) ──────────────────────────

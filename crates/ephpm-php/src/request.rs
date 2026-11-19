@@ -382,10 +382,12 @@ struct AuthVars<'a> {
 /// The `Authorization` header value for this request: the **first** one,
 /// matched case-insensitively.
 ///
-/// "First wins" matches [`cookie_string_from_headers`]; a duplicated
-/// `Authorization` header is malformed (RFC 9110 §5.3 forbids list-combining a
-/// non-list field) and picking deterministically keeps ePHPm from disagreeing
-/// with a front proxy that made the same choice.
+/// A duplicated `Authorization` header is malformed — RFC 9110 §5.3 forbids
+/// list-combining a non-list field — so picking the first deterministically
+/// keeps ePHPm from disagreeing with a front proxy that made the same choice.
+/// This is the opposite of `Cookie`, which RFC 9113 §8.2.3 requires be *folded*
+/// across fields (see [`cookie_string_from_headers`]); `Authorization` is a
+/// singleton, so folding it would be wrong.
 fn authorization_header(headers: &[(String, String)]) -> Option<&str> {
     headers
         .iter()
@@ -650,18 +652,33 @@ pub fn build_server_variables_c(
     vars
 }
 
-/// Extract the cookie string from request headers (first `Cookie` header,
-/// case-insensitive; empty string if absent).
+/// Join every `Cookie` header value (case-insensitive, in received order) into
+/// one string with the two-octet `"; "` delimiter; empty string if absent.
 ///
-/// Shared by [`PhpRequest::cookie_string`] and the worker dispatch path so
-/// both derive the cookie data identically.
+/// An HTTP/2 or HTTP/3 client MAY split its cookies across several `cookie`
+/// fields (RFC 9113 §8.2.3), which MUST be concatenated with `"; "` before the
+/// request reaches a non-HTTP/2 context like the PHP SAPI — never truncated to
+/// the first field. The router already folds these at ingest (`extract_headers`
+/// in `ephpm-server`), so in the live path this sees a single entry; it folds
+/// here too as defence-in-depth and so the function is correct for any caller
+/// that assembles the slice itself. Shared by [`PhpRequest::cookie_string`] and
+/// the worker dispatch path so both derive the cookie data identically.
 #[must_use]
 pub fn cookie_string_from_headers(headers: &[(String, String)]) -> String {
-    headers
+    let mut out = String::new();
+    for (_, value) in headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        if value.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(value);
+    }
+    out
 }
 
 /// Build the CGI-style `$_SERVER` key for an HTTP header name in one
@@ -1291,6 +1308,27 @@ mod tests {
         let mut req = make_request();
         req.headers.push(("COOKIE".into(), "token=xyz".into()));
         assert_eq!(req.cookie_string(), "token=xyz");
+    }
+
+    #[test]
+    fn test_cookie_string_folds_multiple_fields() {
+        // RFC 9113 §8.2.3: multiple `Cookie` fields (an h2/h3 client splitting
+        // cookies for HPACK/QPACK) must be joined with "; ", never truncated to
+        // the first — this is defence-in-depth behind the router's ingest fold.
+        let mut req = make_request();
+        req.headers.push(("Cookie".into(), "PHPSESSID=aaa".into()));
+        req.headers.push(("cookie".into(), "logged_in=X".into()));
+        assert_eq!(req.cookie_string(), "PHPSESSID=aaa; logged_in=X");
+    }
+
+    #[test]
+    fn test_cookie_string_skips_empty_fields() {
+        let mut req = make_request();
+        req.headers.push(("Cookie".into(), String::new()));
+        req.headers.push(("Cookie".into(), "a=1".into()));
+        req.headers.push(("Cookie".into(), String::new()));
+        req.headers.push(("Cookie".into(), "b=2".into()));
+        assert_eq!(req.cookie_string(), "a=1; b=2");
     }
 
     #[test]
