@@ -707,10 +707,7 @@ pub fn build_server_variables_c(
 #[must_use]
 pub fn cookie_string_from_headers(headers: &[(String, String)]) -> String {
     let mut out = String::new();
-    for (_, value) in headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-    {
+    for (_, value) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("cookie")) {
         if value.is_empty() {
             continue;
         }

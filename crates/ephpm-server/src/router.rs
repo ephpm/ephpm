@@ -5375,12 +5375,7 @@ impl Router {
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
             .map_or(is_tls, |proto| {
-                proto
-                    .split(',')
-                    .next()
-                    .unwrap_or(proto)
-                    .trim()
-                    .eq_ignore_ascii_case("https")
+                proto.split(',').next().unwrap_or(proto).trim().eq_ignore_ascii_case("https")
             });
 
         (SocketAddr::new(real_ip, remote_addr.port()), is_https)
