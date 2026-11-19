@@ -23,6 +23,15 @@ ignore = [
     # / pin-project) are hyper's call, not ours. Pre-existing on main, unrelated
     # to any ePHPm change. Remove this entry when hyper drops pin-utils.
     "RUSTSEC-2026-0441",
+    # chrono (RUSTSEC-2026-0543) and chrono-tz (RUSTSEC-2026-0555): both are
+    # "unmaintained" notices, not vulnerabilities. chrono is a direct, pervasive
+    # workspace dependency (timestamps, request logging, metrics) and chrono-tz
+    # backs timezone handling; there is no drop-in replacement at our MSRV.
+    # Informational advisories freshly published to the RustSec DB — pre-existing
+    # on main, unrelated to any ePHPm change. Remove if chrono/chrono-tz regain a
+    # maintained status or we migrate off them.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
     # zip 2.4.2 (pulled only by vivacity-core, the `ephpm composer` installer;
     # still `zip = "=2.4.2"` in vivacity 0.23.0): SUID/SGID bits kept on
     # extraction (0367), symlink targets outside the destination (0368),
@@ -45,6 +54,25 @@ ignore = [
     # on main (zip =2.4.2 is unchanged by the 0.25→0.26.2 vivacity bump); fixed
     # by zip >= 9.0.0, remove with the three above when vivacity moves to it.
     "RUSTSEC-2026-0429",
+    # RUSTSEC-2026-0548 (same zip 2.4.2): `ZipStreamReader::visit`/`extract` and
+    # `read_zipfile_from_stream` extract under the entry's LOCAL-header name
+    # without comparing it to the central directory, so a crafted archive can
+    # write files under names an inspection via `ZipArchive` never saw. Not
+    # reached for the same reason as 0367/0368/0369/0429: vivacity's
+    # `extract::extract_zip` opens entries with `ZipArchive`/`by_index`, i.e. by
+    # their CENTRAL-DIRECTORY names — the side the advisory itself calls safe —
+    # and never constructs a `ZipStreamReader`. Pre-existing on main (zip =2.4.2
+    # is unchanged by any ePHPm change); fixed by zip >= 9.0.5, which needs a
+    # vivacity release — remove with the four above when vivacity moves to it.
+    "RUSTSEC-2026-0548",
+    # RUSTSEC-2026-0545 (same zip 2.4.2): zip's AES decryption returns entry
+    # bytes without verifying the HMAC authentication tag when the ciphertext
+    # ends early or is empty. Only reachable for AES-ENCRYPTED zip entries;
+    # vivacity extracts Composer dist archives (plain, unencrypted zips from
+    # packagist/GitHub) and never supplies a decryption password, so the AES
+    # read path is not exercised. Pre-existing on main; fixed by zip >= 9.0.x,
+    # which needs a vivacity release — remove with the zip entries above.
+    "RUSTSEC-2026-0545",
     # RESOLVED (do not re-add): RUSTSEC-2026-0391 (zstd), RUSTSEC-2026-0398 and
     # RUSTSEC-2026-0403 (zstd-safe) are fixed by zstd 0.14.3 / zstd-safe 8.2.0,
     # now in the graph: the workspace `zstd = "0.14"` bump plus org forks of

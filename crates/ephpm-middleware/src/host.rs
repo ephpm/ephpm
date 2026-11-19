@@ -86,10 +86,42 @@ impl RequestCtx {
             gate_repo: CString::default(),
             is_secure: false,
             body: Vec::new(),
-            headers: headers
-                .iter()
-                .map(|(n, v)| (cstr(&n.to_ascii_lowercase()), cstr(v)))
-                .collect(),
+            // Combine repeated fields into one value per (lowercased) name, in
+            // received order, so `request_header` returns the whole field — not
+            // just the first occurrence — honouring the ABI contract (values
+            // "pre-joined per HTTP list semantics") and RFC 9110 §5.3. A module
+            // reading `X-Forwarded-For` behind an appending proxy must see every
+            // line, not the client-controlled first one. List fields join with
+            // ", "; `Cookie` with "; " (done here too, so a module's correctness
+            // does not hinge on the router's ingest fold); the singletons
+            // `host` / `authorization` / `content-type` / `content-length` keep
+            // the first field, since a duplicate singleton is malformed.
+            headers: {
+                let mut combined: Vec<(String, String)> = Vec::with_capacity(headers.len());
+                for (n, v) in headers {
+                    let name = n.to_ascii_lowercase();
+                    let delim: Option<&str> = match name.as_str() {
+                        "content-type" | "content-length" | "authorization" | "host" => None,
+                        "cookie" => Some("; "),
+                        _ => Some(", "),
+                    };
+                    if let Some(existing) = combined.iter_mut().find(|(k, _)| *k == name) {
+                        if let Some(delim) = delim
+                            && !v.is_empty()
+                        {
+                            if existing.1.is_empty() {
+                                existing.1.clone_from(v);
+                            } else {
+                                existing.1.push_str(delim);
+                                existing.1.push_str(v);
+                            }
+                        }
+                    } else {
+                        combined.push((name, v.clone()));
+                    }
+                }
+                combined.iter().map(|(n, v)| (cstr(n), cstr(v))).collect()
+            },
         }
     }
 
@@ -876,6 +908,35 @@ mod tests {
 
     fn ctx() -> RequestCtx {
         RequestCtx::new("GET", "/hook", "", "203.0.113.4", "srv", &[])
+    }
+
+    /// `request_header` must return the WHOLE field when a client sends it more
+    /// than once (RFC 9110 §5.3), not just the first occurrence — otherwise a
+    /// module reading `X-Forwarded-For` behind an appending proxy would act on
+    /// the client-controlled first line. List fields join with ", ", `Cookie`
+    /// with "; ", and singletons (`Host`) keep the first field.
+    #[test]
+    fn request_header_combines_repeated_fields() {
+        let ctx = RequestCtx::new(
+            "GET",
+            "/x",
+            "",
+            "203.0.113.4",
+            "srv",
+            &[
+                ("X-Forwarded-For".into(), "10.0.0.1".into()),
+                ("x-forwarded-for".into(), "198.51.100.4".into()),
+                ("Cookie".into(), "a=1".into()),
+                ("cookie".into(), "b=2".into()),
+                ("Host".into(), "first.example".into()),
+                ("Host".into(), "second.example".into()),
+            ],
+        );
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(req.header("X-Forwarded-For"), Some("10.0.0.1, 198.51.100.4"));
+        assert_eq!(req.header("Cookie"), Some("a=1; b=2"));
+        assert_eq!(req.header("Host"), Some("first.example"));
     }
 
     /// The process-global store as the callbacks see it.

@@ -235,7 +235,7 @@ Build the K8s resources and test cluster membership.
 - [x] HEAD on static file returns Content-Length with empty body
 - [ ] POST to static file returns 405
 - [ ] Content-Length matches actual body length
-- [ ] Duplicate headers handled
+- [x] Duplicate headers handled (cookie fold + repeated-field combining — unit-tested in `router`/`request`/`host`)
 - [x] Very long query string (~4KB) accepted
 - [ ] Empty User-Agent accepted
 - [ ] Connection: close honored
