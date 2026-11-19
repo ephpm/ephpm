@@ -313,8 +313,11 @@ async fn handle_request(
 
 /// Header fields RFC 9114 §4.2 forbids in HTTP/3 messages.
 ///
-/// h3 rejects these on *requests* (a malformed request is a stream error), but
-/// it does not filter *responses* — it QPACK-encodes whatever it is handed. A
+/// On *requests*, ePHPm's own `framing::reject` enforces this (the `h3` crate
+/// does **not** filter connection-specific fields — unlike the `h2` crate — so
+/// the shared framing check in `router::handle` is the only thing protecting
+/// the h3 request path; see `framing.rs`). This constant covers the *response*
+/// side, which nothing else filters — h3 QPACK-encodes whatever it is handed. A
 /// PHP script calling `header('Connection: close')`, or a
 /// `[server.response] headers` entry setting one of these, would therefore put
 /// an illegal field on the wire and a strict client would reset the stream.

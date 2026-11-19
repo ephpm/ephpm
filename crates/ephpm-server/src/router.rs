@@ -4161,8 +4161,13 @@ impl Router {
         };
         let protocol = format!("{:?}", req.version());
         let mut headers = extract_headers(req.headers(), &self.ingest_strip_headers);
-        let content_type =
-            req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+        // Lossy, not `to_str().ok()`: a `Content-Type` with a non-ASCII
+        // parameter (e.g. a UTF-8 multipart `name=`) must not vanish — see the
+        // obs-text handling in `extract_headers`.
+        let content_type = req
+            .headers()
+            .get("content-type")
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
         let server_name = extract_server_name(&req);
 
         // Reject oversized request bodies before reading.
@@ -5359,11 +5364,24 @@ impl Router {
 
         let real_ip = self.forwarded_client_ip(req).unwrap_or(remote_addr.ip());
 
+        // `X-Forwarded-Proto` may carry a chained list (`https, http`) when the
+        // request crossed several proxies; the de-facto convention (nginx,
+        // Envoy) is that the FIRST element is the scheme the client used. Match
+        // on that element, trimming OWS, rather than the whole value — else a
+        // chained `https, http` read as not-HTTPS and PHP saw `HTTPS` unset on a
+        // genuinely secure request.
         let is_https = req
             .headers()
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .map_or(is_tls, |proto| proto.eq_ignore_ascii_case("https"));
+            .map_or(is_tls, |proto| {
+                proto
+                    .split(',')
+                    .next()
+                    .unwrap_or(proto)
+                    .trim()
+                    .eq_ignore_ascii_case("https")
+            });
 
         (SocketAddr::new(real_ip, remote_addr.port()), is_https)
     }
@@ -5536,7 +5554,7 @@ impl Router {
         // lowercased at construction, so each entry compare is a plain byte
         // equality rather than a per-entry `eq_ignore_ascii_case`.
         let host_lc = host.to_ascii_lowercase();
-        let host_no_port = host_lc.split(':').next().unwrap_or(&host_lc);
+        let host_no_port = split_host_port(&host_lc).0;
         let is_trusted = self
             .trusted_hosts
             .iter()
@@ -6614,7 +6632,16 @@ fn extract_headers(headers: &hyper::HeaderMap, strip: &[String]) -> Vec<(String,
         if strip.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)) {
             continue;
         }
-        let value = value.to_str().unwrap_or("").to_string();
+        // Decode the value lossily rather than discarding it. `to_str()` errs on
+        // any byte outside printable ASCII (RFC 9110 §5.5 obs-text), so a header
+        // carrying a raw UTF-8 byte — a `Cookie` whose value holds an unencoded
+        // UTF-8 char, a `Referer` with a non-ASCII path, a `User-Agent` — would
+        // otherwise be emptied to `""` and the whole field lost (on the `cookie`
+        // path, every cookie in that field). `from_utf8_lossy` keeps valid UTF-8
+        // (the real-world case) byte-for-byte and maps stray bytes to U+FFFD,
+        // never dropping the field. RFC 3875 §4.1.18 requires the value pass
+        // through to the CGI/SAPI environment.
+        let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
         if name.as_str().eq_ignore_ascii_case("cookie") {
             if let Some(i) = cookie_idx {
                 // A later `cookie` field: append to the first one with "; ",
@@ -6837,7 +6864,7 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
         .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h))
+        .map(|h| split_host_port(h).0)
         .filter(|h| !h.is_empty())
     {
         return host.to_string();
@@ -6867,7 +6894,33 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
 /// trailing dot), which is what lets the wire path apply this to a username and
 /// land on the same key the router injected.
 pub(crate) fn normalize_host_key(host: &str) -> String {
-    host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
+    split_host_port(host).0.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Split a `Host`/authority value into `(host, port)`, honouring IPv6 literals.
+///
+/// `Host = uri-host [ ":" port ]` and `uri-host` may be a bracketed `IP-literal`
+/// (RFC 9110 §7.2, RFC 3986 §3.2.2), so a bare `split(':')` turns `[::1]:8080`
+/// into `"["` — breaking `SERVER_NAME`, the vhost key, and `trusted_hosts`
+/// matching for every IPv6-literal client. A bracketed literal is returned WITH
+/// its brackets (`[::1]`), the form `trusted_hosts` is written in and a vhost
+/// dir is named by. For an unbracketed host the trailing `":port"` is split off
+/// only when the host part has no other colon — otherwise it is itself a bare
+/// IPv6 literal (which cannot carry a port) and is kept whole.
+fn split_host_port(host: &str) -> (&str, Option<&str>) {
+    if host.starts_with('[') {
+        // IP-literal: the host runs through the closing ']'.
+        if let Some(close) = host.find(']') {
+            let host_part = &host[..=close];
+            let port = host[close + 1..].strip_prefix(':').filter(|p| !p.is_empty());
+            return (host_part, port);
+        }
+        return (host, None); // malformed: no closing bracket
+    }
+    match host.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, Some(p)),
+        _ => (host, None),
+    }
 }
 
 /// The KV scope `ephpm_kv_*` gets for one PHP request.
@@ -8897,6 +8950,47 @@ mod tests {
         let folded = extract_headers(&incoming, &[]);
 
         assert_eq!(cookie_values(&folded), vec!["a=1; b=2"]);
+    }
+
+    /// RFC 9110 §5.5 obs-text: a header value carrying raw UTF-8 bytes must not
+    /// be emptied at ingest. `to_str()` rejects any byte > 0x7E, so a `Cookie`
+    /// with an unencoded UTF-8 value used to be dropped whole (logging the user
+    /// out); `from_utf8_lossy` keeps valid UTF-8 intact.
+    #[test]
+    fn non_ascii_header_values_survive_ingest_as_utf8() {
+        let mut incoming = hyper::HeaderMap::new();
+        incoming.insert(
+            "cookie",
+            hyper::header::HeaderValue::from_bytes("a=café; PHPSESSID=x".as_bytes()).unwrap(),
+        );
+        incoming.insert(
+            "referer",
+            hyper::header::HeaderValue::from_bytes("http://h/café".as_bytes()).unwrap(),
+        );
+
+        let out = extract_headers(&incoming, &[]);
+
+        assert_eq!(cookie_values(&out), vec!["a=café; PHPSESSID=x"]);
+        assert_eq!(
+            out.iter().find(|(n, _)| n.eq_ignore_ascii_case("referer")).map(|(_, v)| v.as_str()),
+            Some("http://h/café"),
+        );
+    }
+
+    /// RFC 9110 §7.2 / RFC 3986 §3.2.2: a `Host` may be a bracketed IPv6 literal
+    /// with an optional port; a bare `split(':')` mangled it to `"["`.
+    #[test]
+    fn split_host_port_handles_ipv6_and_ports() {
+        assert_eq!(split_host_port("[::1]:8080"), ("[::1]", Some("8080")));
+        assert_eq!(split_host_port("[::1]"), ("[::1]", None));
+        assert_eq!(split_host_port("[2001:db8::1]:443"), ("[2001:db8::1]", Some("443")));
+        assert_eq!(split_host_port("example.com:80"), ("example.com", Some("80")));
+        assert_eq!(split_host_port("example.com"), ("example.com", None));
+        // A bare (unbracketed) IPv6 literal cannot carry a port — kept whole.
+        assert_eq!(split_host_port("::1"), ("::1", None));
+        // The shared vhost-key normalization must preserve the literal.
+        assert_eq!(normalize_host_key("[::1]:8080"), "[::1]");
+        assert_eq!(normalize_host_key("Example.COM:80."), "example.com");
     }
 
     // ── Request timeline (/_ephpm/requests) ──────────────────────────

@@ -636,10 +636,51 @@ pub fn build_server_variables_c(
 
     // Map HTTP headers to $_SERVER variables. The canonical names get static
     // keys; everything else is one byte-pass allocation (see cgi_header_key).
+    //
+    // Repeated fields are combined into a SINGLE value per key, in received
+    // order (RFC 3875 §4.1.18 "the server MUST rewrite [repeated fields] as a
+    // single value having the same semantics"; RFC 9110 §5.3). Without this,
+    // one entry per occurrence reached `php_register_variable`, whose last-wins
+    // overwrite silently dropped every field but the last — so a second
+    // `X-Forwarded-For` from an appending proxy hid the client's line. List
+    // fields join with ", "; `Cookie` with "; " (already folded at ingest, kept
+    // here as defence); the singletons `CONTENT_TYPE` / `CONTENT_LENGTH` /
+    // `HTTP_AUTHORIZATION` / `HTTP_HOST` keep the first field, because a
+    // duplicate singleton is malformed and combining it would corrupt the value
+    // (e.g. two HTTP/2 `content-length: 0` frames → `"0, 0"`). This also makes
+    // the fpm `$_SERVER` byte-identical to the worker lane, which already
+    // combines (see `ephpm_worker_fill_str_array`).
+    let mut header_vars: Vec<(Cow<'static, CStr>, String)> = Vec::with_capacity(headers.len());
     for (name, value) in headers {
-        if let Some(key) = cgi_header_key_c(name) {
-            push(key, owned(value));
+        let Some(key) = cgi_header_key_c(name) else {
+            continue;
+        };
+        // `None` = singleton (keep first); `Some(delim)` = combine.
+        let delim: Option<&str> = match key.to_bytes() {
+            b"CONTENT_TYPE" | b"CONTENT_LENGTH" | b"HTTP_AUTHORIZATION" | b"HTTP_HOST" => None,
+            b"HTTP_COOKIE" => Some("; "),
+            _ => Some(", "),
+        };
+        if let Some(existing) = header_vars.iter_mut().find(|(k, _)| k.to_bytes() == key.to_bytes())
+        {
+            // A repeat: combine per `delim`, or ignore for a singleton. Empty
+            // values never introduce a dangling delimiter.
+            if let Some(delim) = delim
+                && !value.is_empty()
+            {
+                if existing.1.is_empty() {
+                    existing.1.clone_from(value);
+                } else {
+                    existing.1.push_str(delim);
+                    existing.1.push_str(value);
+                }
+            }
+        } else {
+            header_vars.push((key, value.clone()));
         }
+    }
+    for (key, value) in header_vars {
+        push(key, owned(&value));
     }
 
     // Append extra environment variables (e.g. EPHPM_REDIS_* credentials).
@@ -1329,6 +1370,39 @@ mod tests {
         req.headers.push(("Cookie".into(), String::new()));
         req.headers.push(("Cookie".into(), "b=2".into()));
         assert_eq!(req.cookie_string(), "a=1; b=2");
+    }
+
+    #[test]
+    fn repeated_list_headers_combine_in_server_variables() {
+        // RFC 3875 §4.1.18 / RFC 9110 §5.3: repeated list fields are combined
+        // into ONE $_SERVER value with ", " (not last-wins). A second
+        // X-Forwarded-For from an appending proxy must not hide the client line.
+        let mut req = make_request();
+        req.headers.push(("X-Forwarded-For".into(), "10.0.0.1".into()));
+        req.headers.push(("X-Forwarded-For".into(), "198.51.100.4".into()));
+        req.headers.push(("Accept".into(), "text/html".into()));
+        req.headers.push(("accept".into(), "*/*".into()));
+        let vars = req.server_variables();
+
+        assert_eq!(find_var(&vars, "HTTP_X_FORWARDED_FOR"), Some("10.0.0.1, 198.51.100.4"));
+        assert_eq!(find_var(&vars, "HTTP_ACCEPT"), Some("text/html, */*"));
+        // Exactly one entry per key, so php_register_variable cannot overwrite.
+        let count = |k: &str| vars.iter().filter(|(key, _)| key == k).count();
+        assert_eq!(count("HTTP_X_FORWARDED_FOR"), 1);
+        assert_eq!(count("HTTP_ACCEPT"), 1);
+    }
+
+    #[test]
+    fn repeated_singleton_headers_keep_first_in_server_variables() {
+        // Content-Length is a singleton; two HTTP/2 `content-length: 0` frames
+        // must keep the first, never combine into "0, 0".
+        let mut req = make_request();
+        req.headers.push(("Content-Length".into(), "0".into()));
+        req.headers.push(("Content-Length".into(), "0".into()));
+        let vars = req.server_variables();
+
+        assert_eq!(find_var(&vars, "CONTENT_LENGTH"), Some("0"));
+        assert_eq!(vars.iter().filter(|(k, _)| k == "CONTENT_LENGTH").count(), 1);
     }
 
     #[test]
