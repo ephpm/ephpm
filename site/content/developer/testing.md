@@ -399,7 +399,7 @@ CONTAINER_ENGINE=docker cargo xtask e2e --php-version 8.4
 
 ## GitHub Actions
 
-The E2E workflow (`.github/workflows/e2e.yml`) runs a matrix of PHP 8.3, 8.4 and 8.5:
+The E2E workflow (`.github/workflows/e2e.yml`) runs a matrix of PHP 8.3, 8.4, 8.5 and 8.6:
 
 ```yaml
 concurrency:
@@ -408,7 +408,7 @@ concurrency:
 strategy:
   fail-fast: false
   matrix:
-    php: ["8.3", "8.5", "8.4"]
+    php: ["8.3", "8.5", "8.4", "8.6"]
 steps:
   - cargo xtask e2e --php-version ${{ matrix.php }}
 ```

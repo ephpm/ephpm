@@ -189,7 +189,7 @@ don't:
 
 | Dimension | ePHPm's build |
 |---|---|
-| PHP minor version | The release you downloaded (8.3 / 8.4 / 8.5 — one binary per minor) |
+| PHP minor version | The release you downloaded (8.3 / 8.4 / 8.5 / 8.6 — one binary per minor) |
 | Thread safety | **ZTS** on every platform (Linux, macOS and Windows) |
 | libc (Linux) | **glibc** — release binaries are glibc-dynamic (`<arch>-unknown-linux-gnu`) |
 | Windows | Only the **shared-engine** build (`cargo xtask release --target windows --variant shared`) can load extension DLLs; the default static `ephpm.exe` cannot. DLLs must be ZTS x64 builds for the official windows.php.net PHP of the same minor and VS toolset (`vs16` for 8.3, `vs17` for 8.4+) |

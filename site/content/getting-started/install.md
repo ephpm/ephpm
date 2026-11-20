@@ -32,7 +32,7 @@ docker run -p 8080:8080 \
 | Tag | What it tracks |
 |-----|----------------|
 | `ephpm/ephpm:latest` | Rolling latest release with the default PHP minor |
-| `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` / `ephpm/ephpm:8.3` | Rolling latest stable release pinned to a PHP minor |
+| `ephpm/ephpm:8.6` / `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` / `ephpm/ephpm:8.3` | Rolling latest stable release pinned to a PHP minor |
 | `ephpm/ephpm:vX.Y.Z` | Pinned ePHPm release with the default PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5` | Pinned release × rolling PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5.13` | Pinned release × pinned PHP patch (fully reproducible) |
@@ -73,7 +73,7 @@ Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, 
 
 > Single-node SQLite (the in-process Turso engine), the MySQL/Postgres proxy, and everything else work normally on Windows. Clustered SQLite (Turso CDC replication) is untested on Windows.
 
-### TAILCALL build — experimental, PHP 8.5 only
+### TAILCALL build — experimental, PHP 8.5 and 8.6
 
 A release may additionally carry a second Windows archive:
 
@@ -81,7 +81,7 @@ A release may additionally carry a second Windows archive:
 ephpm-vX.Y.Z+php8.5.13-windows-x86_64-tailcall.tar.gz
 ```
 
-Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux (GCC) builds get. macOS is a clang build, not GCC, so it never gets HYBRID: PHP 8.5 there runs the TAILCALL VM, while 8.3/8.4 fall back to the same slow `CALL` VM.
+Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux (GCC) builds get. macOS is a clang build, not GCC, so it never gets HYBRID: PHP 8.5 and 8.6 there run the TAILCALL VM, while 8.3/8.4 fall back to the same slow `CALL` VM.
 
 Measured against the default MSVC Windows binary, end-to-end through ePHPm (Ryzen 9 5950X):
 
@@ -91,7 +91,7 @@ Measured against the default MSVC Windows binary, end-to-end through ePHPm (Ryze
 Status and caveats:
 
 - **Experimental.** Its release-CI leg is non-gating, so a given release can ship without this archive. The MSVC binary remains the default and supported Windows build.
-- **PHP 8.5 only** — the TAILCALL VM does not exist in PHP 8.3/8.4.
+- **PHP 8.5 and 8.6** — the TAILCALL VM does not exist in PHP 8.3/8.4.
 - Install is identical: extract and run `.\ephpm.exe install`.
 - The build pipeline hard-gates on the VM kind (it disassembles `zend_vm_kind()` out of the PHP static lib and requires `ZEND_VM_KIND_TAILCALL`), so an archive named `-tailcall` cannot silently contain the CALL VM.
 
@@ -161,7 +161,7 @@ cargo xtask release --target windows   # → target\x86_64-pc-windows-msvc\relea
 
 The SDK download is the same php-sdk release, with a prebuilt static `php8embed.lib` for Windows. It links statically, so `ephpm.exe` is a single self-contained binary — there is no DLL to deploy alongside it.
 
-To build the experimental [TAILCALL variant](#tailcall-build--experimental-php-85-only) from source (PHP 8.5 only):
+To build the experimental [TAILCALL variant](#tailcall-build--experimental-php-85-and-86) from source (PHP 8.5 or 8.6):
 
 ```powershell
 cargo xtask release --target windows --variant clang
