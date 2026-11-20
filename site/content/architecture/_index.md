@@ -1734,7 +1734,7 @@ Client ◄──HTTP──────────────┘
 
 ### CI Matrix
 
-One binary per PHP version per platform (static linking). CI matrix builds for PHP 8.4 and 8.5 across all supported platforms.
+One binary per PHP version per platform (static linking). CI matrix builds for PHP 8.3, 8.4, 8.5 and 8.6 across all supported platforms.
 
 **Platform matrix:**
 
