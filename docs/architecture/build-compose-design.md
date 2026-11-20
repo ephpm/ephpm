@@ -51,7 +51,7 @@ they are not this document's subject.
 `cargo xtask release` (`xtask/src/main.rs`):
 
 - `PHP_SDK_VERSIONS` (line ~12) pins one full PHP version per minor
-  (8.3/8.4/8.5). `ensure_php_sdk_for()` downloads
+  (8.3/8.4/8.5/8.6). `ensure_php_sdk_for()` downloads
   `php-sdk-<ver>-<os>-<arch>[-gnu].tar.gz` from `github.com/ephpm/php-sdk`
   releases into `php-sdk/<ver>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix
   applies on Linux) and `release_native()` builds

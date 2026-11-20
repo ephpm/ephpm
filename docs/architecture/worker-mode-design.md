@@ -397,7 +397,7 @@ path — we are not inventing new reset logic, we are *subtracting* the
 preservation.** Rejected: there is no supported PHP API to shut down a request
 while preserving the executor's symbol tables. `shutdown_executor()` is
 all-or-nothing. Any attempt to "shut down but keep classes" means reaching into
-Zend internals that change between 8.3/8.4/8.5 — a maintenance and correctness
+Zend internals that change between 8.3/8.4/8.5/8.6 — a maintenance and correctness
 nightmare across the CI matrix.
 
 **Option C — full per-iteration shutdown/startup (i.e. fpm behavior).**

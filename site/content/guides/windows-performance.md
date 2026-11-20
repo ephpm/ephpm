@@ -36,7 +36,7 @@ that.
 
 ### The TAILCALL build
 
-> **v0.7.3, experimental, PHP 8.5 only.** Tracked in
+> **v0.7.3, experimental, PHP 8.5 and 8.6.** Tracked in
 > [#329](https://github.com/ephpm/ephpm/issues/329); status and exact
 > artifact names below may shift while the lane soaks — check the release
 > notes of the version you download.
@@ -81,7 +81,7 @@ kind is fixed when PHP is compiled — there is no `opcache.vm_kind` or
 - Release builds from source select it with `cargo xtask release --target
   windows --variant clang` (pending the #329 integration; on a released
   v0.7.3 the prebuilt artifact is the supported route).
-- **PHP 8.5 only.** The TAILCALL VM does not exist in PHP 8.3/8.4; those
+- **PHP 8.5 and 8.6.** The TAILCALL VM does not exist in PHP 8.3/8.4; those
   minors stay MSVC/CALL.
 - Experimental means experimental: the clang lane is new, non-gating in CI,
   and has had less soak time than the MSVC artifact. Run your own test suite
@@ -377,4 +377,4 @@ opcache_validate_timestamps = false
 
 Run it with `ephpm serve --config ephpm.toml`, deploy code with
 `ephpm deploy` (or `ephpm cache reset`), and for CPU-heavy workloads on
-PHP 8.5, try the experimental `-tailcall` artifact.
+PHP 8.5 or 8.6, try the experimental `-tailcall` artifact.

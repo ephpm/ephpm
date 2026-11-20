@@ -745,7 +745,7 @@ alt_svc_max_age = 86400
 
 ### PHP's hard memory limit
 
-Applies to PHP 8.3.36, 8.4.27, 8.5.12 and later (the fix for
+Applies to PHP 8.3.36, 8.4.27, 8.5.12, 8.6.0 and later (the fix for
 CVE-2026-109618/109619). Older SDKs keep the old behaviour: exceeding
 `memory_limit` is an immediate fatal error and a `500`.
 
