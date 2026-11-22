@@ -65,7 +65,7 @@ before PHP runs, so `wp`, `artisan`, migrations, and seeders built on the
 | Option | Meaning |
 |--------|---------|
 | `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database **and applies that tenant's PHP sandbox** (`open_basedir` + `disable_functions` + operator `ini_overrides` — see [The per-site PHP sandbox](#the-per-site-php-sandbox) below). Validated fail-closed (an unknown or malformed key is rejected). |
-| `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. On its own it does nothing: `ephpm php --config <path> …` without `--site` prints a warning on stderr that `--config` has no effect without `--site`, ignores it, and runs PHP normally. |
+| `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. On its own (without `--site`) it still loads [`[php] extensions`](#php-extensions) from the config — so the CLI runs with the server's extension set — but does **not** locate a site database; it prints a warning on stderr saying so and runs PHP normally. |
 
 Both are ePHPm's own options and must appear **before** the PHP program and its
 arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
@@ -156,6 +156,31 @@ in `/etc/ephpm`. The sandbox denies that directory on purpose, so the inner
 `ephpm php` cannot read its config. See
 [`ephpm exec` → Database access](../exec/#database-access). Run
 `ephpm php --site` as the operator instead.
+
+## PHP extensions
+
+When `--config <path>` is supplied, `ephpm php` loads the config's
+[`[php] extensions`](/guides/php-extensions/) — the dynamically-linked `.so`
+extensions (redis, mongodb, Xdebug, …) the server loads — so a CLI run gets the
+**same** extension set the HTTP server has. Each configured extension is applied
+as a startup-time `-d extension=…` / `-d zend_extension=…` define, exactly as if
+you had typed it on the command line (multiple `extension=` directives
+accumulate, so every listed extension loads). Without `--config`, a bare
+`ephpm php` loads only the extensions compiled into the binary.
+
+This is independent of `--site`: extensions are a process-wide `[php]` property,
+not per-tenant, so they load whether or not a site database is bound. That means
+`wp`, `artisan`, migrations, seeders and cron scripts run against the same
+engine the server does, without repeating each `-d` flag by hand.
+
+Platform notes: the Linux and macOS releases are glibc/dylib-dynamic and load
+extensions via `dlopen`. On Windows only the **shared-engine build**
+(`cargo xtask release --target windows --variant shared`) can load extension
+DLLs; the default static Windows build **refuses** a non-empty `[php] extensions`
+at startup (it links PHP statically and a reachable `php8ts.dll` would attach a
+second engine and crash) — the same refusal the server path has always applied.
+The [ABI contract](/guides/php-extensions/#the-abi-contract) is identical to the
+server's: the `.so`/DLL must be a ZTS build for the matching PHP minor.
 
 ## The KV store under `ephpm php`
 

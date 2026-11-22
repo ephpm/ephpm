@@ -168,6 +168,12 @@ matching PHP minor. For one-off CLI use,
 `ephpm php -d zend_extension=/path/to/xdebug.so` works too (see
 [`ephpm php`](/reference/cli/php/)).
 
+`ephpm php --config <path>` also loads `[php] extensions` straight from the
+config, so `wp`, `artisan`, migrations and cron scripts run with the **same**
+extension set the server has — no need to repeat each one as a `-d` flag. This
+works with or without `--site` (extensions are a global `[php]` property, not
+per-tenant). See [`ephpm php`](/reference/cli/php/).
+
 For step debugging — `ephpm dev --xdebug`, IDE setup, and how debugging
 works in worker mode — see [Debugging with Xdebug](/guides/xdebug/).
 

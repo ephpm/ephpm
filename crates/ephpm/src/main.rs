@@ -1490,6 +1490,15 @@ fn run_php(
     // `-d` sandbox defines for a --site run, prepended to argv below. Empty
     // without --site (bare `ephpm php` is unchanged).
     let mut sandbox_args: Vec<String> = Vec::new();
+    // `-d extension=`/`-d zend_extension=` defines from `[php] extensions`,
+    // applied whenever `--config` is supplied (with or without `--site`):
+    // extensions are a global `[php]` property, so a CLI run gets the same
+    // dynamically-loaded extension set the server has. Prepended ahead of the
+    // sandbox defines and the user's args so an operator's own trailing `-d`
+    // still wins (php-cli is last-define-wins; `extension=` directives
+    // accumulate — see `ephpm_cli_add_ini_define`). Empty for a bare
+    // `ephpm php` (no `--config`), so that path is unchanged.
+    let mut ext_args: Vec<String> = Vec::new();
     // Hold the runtime for the whole PHP execution when a --site backend is
     // bound: the bridge captured its `Handle` and `block_on`s onto it from PHP.
     let db_runtime = match site {
@@ -1506,6 +1515,12 @@ fn run_php(
             }
             let cfg = ephpm_config::Config::load(&config_path)
                 .with_context(|| format!("loading configuration from {}", config_path.display()))?;
+            // `[php] extensions` (global, not per-tenant): load the same
+            // dynamically-linked extensions the server does.
+            for line in extension_ini_lines(&cfg)? {
+                ext_args.push("-d".to_string());
+                ext_args.push(line);
+            }
             // Apply the SAME per-tenant PHP sandbox a vhost HTTP request gets —
             // open_basedir + private temp/session dirs + disable_functions —
             // before running any tenant PHP (issue #698). Fails closed on an
@@ -1537,21 +1552,38 @@ fn run_php(
             Some((runtime, offline))
         }
         None => {
-            // `--config` alone does nothing — it only locates a site's database.
-            // Say so rather than ignoring it silently.
-            if config.is_some() {
+            // `--config` without `--site` still applies the global
+            // `[php] extensions` (a process-wide property, not per-tenant), so a
+            // bare `wp`/`artisan`/cron run gets the server's extension set. It
+            // does NOT locate a site database — that needs `--site`.
+            if let Some(config_path) = &config {
+                if !config_path.exists() {
+                    anyhow::bail!("configuration file not found: {}", config_path.display());
+                }
+                let cfg = ephpm_config::Config::load(config_path).with_context(|| {
+                    format!("loading configuration from {}", config_path.display())
+                })?;
+                for line in extension_ini_lines(&cfg)? {
+                    ext_args.push("-d".to_string());
+                    ext_args.push(line);
+                }
                 eprintln!(
-                    "warning: `ephpm php --config` has no effect without `--site`; ignoring it"
+                    "warning: `ephpm php --config` without `--site` loads `[php] extensions` but \
+                     does not locate a site database; pass `--site <key>` for that"
                 );
             }
             None
         }
     };
 
-    // Prepend the --site sandbox defines (empty for a bare `ephpm php`) so the
-    // tenant's PHP cannot escape its open_basedir / denylist; an operator's own
-    // trailing `-d` in `args` still wins (php-cli is last-define-wins).
-    let full_args: Vec<String> = sandbox_args.into_iter().chain(args.iter().cloned()).collect();
+    // Prepend the extension defines, then the --site sandbox defines (both
+    // empty for a bare `ephpm php`), ahead of the user's args: extensions first
+    // so any extension-specific ini in the sandbox/overrides still applies, the
+    // sandbox defines so the tenant's PHP cannot escape its open_basedir /
+    // denylist, and the user's own trailing `-d` in `args` last so it still
+    // wins (php-cli is last-define-wins).
+    let full_args: Vec<String> =
+        ext_args.into_iter().chain(sandbox_args).chain(args.iter().cloned()).collect();
     let exit_code = ephpm_php::PhpRuntime::cli_main(&full_args);
     if exit_code.is_ok() {
         let _ = ephpm_php::PhpRuntime::shutdown();
@@ -2441,6 +2473,80 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     run_with_config(config, verbose, false)
 }
 
+/// The error `extension_ini_lines` bails with on a Windows build that links PHP
+/// statically and so cannot load extension DLLs. Shared verbatim by the serve
+/// path and the CLI.
+const WINDOWS_STATIC_EXTENSION_REFUSAL: &str = "[php] extensions is not supported by this Windows build: it links PHP statically and cannot \
+     load extension DLLs. Use the shared-engine build (`cargo xtask release --target windows \
+     --variant shared`), or remove [php] extensions";
+
+/// Whether this build refuses `[php] extensions` because it links PHP
+/// statically on Windows: the extension DLLs import `php8ts.dll`, and when some
+/// `php8ts.dll` is reachable the load attaches a second PHP engine and crashes
+/// the process.
+///
+/// `abi_present` is whether a libphp is actually linked
+/// (`PhpRuntime::abi().is_some()`) — threaded in rather than read here so the
+/// decision is unit-testable in stub mode, where no libphp is linked and the
+/// refusal must never fire. The shared-engine Windows build loads extension
+/// DLLs fine, so it is exempt. On non-Windows targets this is always `false`.
+fn windows_static_refuses_extensions(abi_present: bool) -> bool {
+    cfg!(windows) && abi_present && !ephpm_php::shared::SharedRuntime::is_shared_build()
+}
+
+/// Resolve `[php] extensions` into the `extension=`/`zend_extension=` php.ini
+/// load lines that load them, shared by the serve path (which writes them into
+/// the generated php.ini) and the `ephpm php` CLI (which replays each as a
+/// `-d <line>` pair).
+///
+/// Returns an empty vector when no extensions are configured. On the default
+/// Windows build — which links PHP statically and cannot load extension DLLs
+/// (they import `php8ts.dll`, and when some `php8ts.dll` is reachable the load
+/// attaches a second PHP engine and crashes the process) — a non-empty list is
+/// refused with the same message the serve path has always emitted.
+///
+/// A bare name rides PHP's `extension_dir` search (`extension=redis`); a path
+/// loads verbatim (`extension=/path/to/imagick.so`). A library that exports
+/// `zend_extension_entry` (Xdebug, OPcache-style) is emitted as
+/// `zend_extension=` instead — with an absolute path, since PHP resolves a
+/// relative `zend_extension` against `extension_dir` (see [`ext_ini`]). ABI
+/// mismatches (PHP minor / ZTS / libc) are rejected by PHP at startup with an
+/// explicit API-version error.
+///
+/// # Errors
+///
+/// On the Windows static build with a non-empty list, when the current
+/// directory cannot be read, or when an entry resolves to a value that cannot
+/// be written as an ini line (a line break or NUL).
+fn extension_ini_lines(config: &ephpm_config::Config) -> anyhow::Result<Vec<String>> {
+    if config.php.extensions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let abi = ephpm_php::PhpRuntime::abi();
+    if windows_static_refuses_extensions(abi.is_some()) {
+        anyhow::bail!("{}", WINDOWS_STATIC_EXTENSION_REFUSAL);
+    }
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let ext_dir = ext_ini::effective_extension_dir(
+        &config.php.ini_overrides,
+        abi.as_ref().and_then(|a| a.default_extension_dir.as_deref()),
+    );
+    let mut lines = Vec::with_capacity(config.php.extensions.len());
+    for ext in &config.php.extensions {
+        let line = ext_ini::resolve_extension_line(ext, &cwd, ext_dir.as_deref());
+        let ini_line = line.ini_line()?;
+        if line.directive == ext_ini::LoadDirective::ZendExtension {
+            tracing::info!(
+                entry = %ext,
+                line = %ini_line,
+                "[php] extensions: loading as a Zend extension (exports zend_extension_entry)"
+            );
+        }
+        lines.push(ini_line);
+    }
+    Ok(lines)
+}
+
 /// Shared HTTP server startup path used by both `serve` (production) and
 /// `dev` (developer) entry points. Initialises tracing, applies PHP ini
 /// overrides, boots the embedded PHP runtime in single-threaded mode, then
@@ -2789,41 +2895,8 @@ fn run_with_config(
             // extension_dir (see `ext_ini`). ABI mismatches (PHP minor / ZTS
             // / libc) are rejected by PHP at startup with an explicit
             // API-version error.
-            if !config.php.extensions.is_empty() {
-                let abi = ephpm_php::PhpRuntime::abi();
-                // The default Windows build links PHP statically: it cannot
-                // load extension DLLs (they import php8ts.dll), and when some
-                // php8ts.dll is reachable the load attaches a second PHP
-                // engine and crashes the process. Refuse instead.
-                if cfg!(windows)
-                    && abi.is_some()
-                    && !ephpm_php::shared::SharedRuntime::is_shared_build()
-                {
-                    anyhow::bail!(
-                        "[php] extensions is not supported by this Windows build: it links PHP \
-                         statically and cannot load extension DLLs. Use the shared-engine build \
-                         (`cargo xtask release --target windows --variant shared`), or remove \
-                         [php] extensions"
-                    );
-                }
-                let cwd = std::env::current_dir().context("failed to read current directory")?;
-                let ext_dir = ext_ini::effective_extension_dir(
-                    &config.php.ini_overrides,
-                    abi.as_ref().and_then(|a| a.default_extension_dir.as_deref()),
-                );
-                for ext in &config.php.extensions {
-                    let line = ext_ini::resolve_extension_line(ext, &cwd, ext_dir.as_deref());
-                    let ini_line = line.ini_line()?;
-                    if line.directive == ext_ini::LoadDirective::ZendExtension {
-                        tracing::info!(
-                            entry = %ext,
-                            line = %ini_line,
-                            "[php] extensions: loading as a Zend extension (exports \
-                             zend_extension_entry)"
-                        );
-                    }
-                    let _ = writeln!(content, "{ini_line}");
-                }
+            for ini_line in extension_ini_lines(&config)? {
+                let _ = writeln!(content, "{ini_line}");
             }
             if let Some(base) = &config.php.ini_file {
                 let base_content = std::fs::read_to_string(base).with_context(|| {
@@ -3746,6 +3819,69 @@ mod php_arg_tests {
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A `Config` whose only non-default setting is `[php] extensions`.
+    fn config_with_extensions(extensions: &[&str]) -> ephpm_config::Config {
+        ephpm_config::Config {
+            php: ephpm_config::PhpConfig {
+                extensions: extensions.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extension_ini_lines_emits_extension_load_directives() {
+        // A bare name with no resolvable extension_dir and a non-existent path
+        // both resolve to plain, quoted `extension=` lines, in order. (Zend
+        // classification needs a real library to inspect, covered by `ext_ini`
+        // itself; here no file exists so every entry stays `extension=`.)
+        let config = config_with_extensions(&["redis", "/abs/path/imagick.so"]);
+
+        // The Windows static build refuses the whole feature. A stub-mode test
+        // links no libphp, so the refusal never fires here (abi() is None); on
+        // a hypothetical linked Windows build this test would exit early.
+        if windows_static_refuses_extensions(ephpm_php::PhpRuntime::abi().is_some()) {
+            return;
+        }
+        let lines = extension_ini_lines(&config).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "extension=\"redis\"".to_string(),
+                "extension=\"/abs/path/imagick.so\"".to_string(),
+            ]
+        );
+
+        // No extensions configured -> no lines, so a bare `ephpm php` (and any
+        // config without `[php] extensions`) is unchanged.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(extension_ini_lines(&ephpm_config::Config::default()).unwrap(), empty);
+    }
+
+    #[test]
+    fn windows_static_build_refuses_extensions() {
+        // The refusal message is self-contained and names the fix.
+        assert!(WINDOWS_STATIC_EXTENSION_REFUSAL.contains("links PHP statically"));
+        assert!(WINDOWS_STATIC_EXTENSION_REFUSAL.contains("--variant shared"));
+
+        // A stub build (no libphp) never refuses, on any platform.
+        assert!(!windows_static_refuses_extensions(false));
+        // With a libphp linked, the decision matches the serve path: refuse
+        // only on a Windows build that is not the shared-engine build.
+        assert_eq!(
+            windows_static_refuses_extensions(true),
+            cfg!(windows) && !ephpm_php::shared::SharedRuntime::is_shared_build()
+        );
+
+        // Where the refusal applies, the shared helper bails with that message.
+        if windows_static_refuses_extensions(ephpm_php::PhpRuntime::abi().is_some()) {
+            let config = config_with_extensions(&["redis"]);
+            let err = extension_ini_lines(&config).unwrap_err().to_string();
+            assert_eq!(err, WINDOWS_STATIC_EXTENSION_REFUSAL);
+        }
     }
 
     #[test]

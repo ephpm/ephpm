@@ -37,8 +37,23 @@
 //! The probe script (`tests/fixtures/ext-probe.php`, served as `/ext-probe.php`)
 //! reports which of the catalog extensions loaded and whether each is
 //! functional (a real round-trip, not just `extension_loaded`).
+//!
+//! ## CLI counterpart
+//!
+//! `ephpm php --config <path>` honors `[php] extensions` too, so a
+//! `wp`/`artisan`/cron run gets the same dynamically-loaded extension set the
+//! server has. [`cli_config_loads_php_extensions`] proves it by spawning the
+//! binary directly — `ephpm php --config <cfg> -r "var_dump(extension_loaded(…))"`
+//! — against a config that lists the catalog `.so` files. The harness supplies
+//! the binary via `EPHPM_EXT_BINARY` and the ABI-matched catalog directory via
+//! `EPHPM_EXT_DIR` (the same catalog the HTTP fixture mounts); the test
+//! self-skips (passes) when either is unset. Like the HTTP proof, this only
+//! runs in the nightly/e2e harness — never in the local stub-mode suite, which
+//! has no libphp and no catalog.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Base URL of the extension-loaded instance, or `None` to skip.
 fn ext_url() -> Option<String> {
@@ -98,6 +113,69 @@ async fn shared_extensions_load_and_function() {
             functional.get(*fkey),
             Some(&true),
             "extension `{ext}` loaded but its functional probe `{fkey}` was not true; functional = {functional:?}",
+        );
+    }
+}
+
+/// Binary + ABI-matched catalog directory for the CLI extension proof, or
+/// `None` to skip.
+fn cli_ext_fixture() -> Option<(PathBuf, PathBuf)> {
+    let binary = std::env::var("EPHPM_EXT_BINARY").ok().filter(|s| !s.is_empty())?;
+    let dir = std::env::var("EPHPM_EXT_DIR").ok().filter(|s| !s.is_empty())?;
+    Some((PathBuf::from(binary), PathBuf::from(dir)))
+}
+
+/// `ephpm php --config <cfg>` loads `[php] extensions` from the config — the
+/// CLI's extension set matches the server's.
+///
+/// Spawns the real binary once per catalog extension with
+/// `-r "var_dump(extension_loaded('<ext>'))"` against a generated config that
+/// lists the catalog `.so` files under `[php] extensions`, and asserts each
+/// prints `bool(true)`. Proves the `-d extension=` defines the CLI prepends
+/// reach PHP's module startup (and that multiple `extension=` directives
+/// accumulate — every listed extension loads, not just the last).
+#[test]
+fn cli_config_loads_php_extensions() {
+    let Some((binary, ext_dir)) = cli_ext_fixture() else {
+        eprintln!("EPHPM_EXT_BINARY / EPHPM_EXT_DIR unset — skipping CLI extension E2E");
+        return;
+    };
+
+    // A config whose only job is to list the catalog `.so` files under
+    // [php] extensions, each as an absolute path (no extension_dir search) and
+    // forward-slashed so the path is a clean TOML basic string on any host.
+    use std::fmt::Write as _;
+    let mut toml = String::from("[php]\nextensions = [\n");
+    for (ext, _) in EXPECTED {
+        let so = ext_dir.join(format!("{ext}.so"));
+        assert!(so.is_file(), "catalog is missing {}: {}", ext, so.display());
+        let _ = writeln!(toml, "    \"{}\",", so.to_string_lossy().replace('\\', "/"));
+    }
+    toml.push_str("]\n");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("ephpm.toml");
+    std::fs::write(&cfg, toml).expect("write config");
+
+    for (ext, _) in EXPECTED {
+        let out = Command::new(&binary)
+            .arg("php")
+            .arg("--config")
+            .arg(&cfg)
+            .arg("-r")
+            .arg(format!("var_dump(extension_loaded('{ext}'));"))
+            .output()
+            .unwrap_or_else(|e| panic!("spawning `ephpm php --config -r` failed: {e}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "`ephpm php --config -r` exited non-zero for `{ext}`\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        assert!(
+            stdout.contains("bool(true)"),
+            "extension `{ext}` was not loaded by `ephpm php --config` — `[php] extensions` did not \
+             reach the CLI\nstdout:\n{stdout}\nstderr:\n{stderr}",
         );
     }
 }
