@@ -322,50 +322,78 @@ fn real_bailout_after_an_exit_bailout_with_a_status_is_still_a_bailout() {
     assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");
 }
 
-/// `exit()` inside a destroyed fiber's `finally` ends the request.
+/// Whether this build's PHP carries the CVE-2026-129474 fiber-exit rework, so
+/// that `exit()` inside a destroyed fiber's `finally` *propagates and ends the
+/// request cleanly* instead of being swallowed.
+///
+/// The rework was backported to **8.4.28 / 8.5.13 / 8.6.0, but not to the 8.3
+/// branch** — 8.3.37 still swallows the exit. That split is not a guess: the
+/// nightly linked-test matrix proved 8.3.37 keeps the old behaviour on every
+/// platform while 8.4.28 / 8.5.13 / 8.6.0 have the new one. So the gate is
+/// per-branch at the security-release patch level, not a flat minor check (an
+/// earlier version-blind pin made this test fail on 8.3).
+fn fiber_finally_exit_propagates() -> bool {
+    let v = PhpRuntime::php_version();
+    let mut parts = v.split('.').map(|p| p.trim_matches(|c: char| !c.is_ascii_digit()));
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    match (major, minor) {
+        (8, 3) => false,               // not backported to 8.3 — 8.3.37 still swallows
+        (8, 4) => patch >= 28,         // 8.4.28
+        (8, 5) => patch >= 13,         // 8.5.13
+        _ => (major, minor) >= (8, 6), // 8.6.0 GA and anything newer
+    }
+}
+
+/// `exit()` inside a destroyed fiber's `finally`.
 ///
 /// Destroying a suspended fiber (`unset($f)`) runs its `finally` blocks. Up to
-/// PHP 8.5.12 an `exit()` there was *swallowed* — the engine discarded it and
-/// the main script carried on — so this test used to pin that a swallowed exit
-/// must not vouch for a genuine bailout later in the same phase (it OOMed after
-/// the fiber and asserted `Bailout`).
+/// the Nov-2026 security release an `exit()` there was *swallowed* — the engine
+/// discarded it and the main script carried on. CVE-2026-129474 (an engine
+/// use-after-free in the exit/bailout path that also reworked how `exit()`
+/// unwinds out of a fiber) changed that on the branches it was backported to
+/// (8.4.28 / 8.5.13 / 8.6.0 — **but not 8.3**, see
+/// [`fiber_finally_exit_propagates`]): the `exit()` now propagates and ends the
+/// request cleanly, exactly like an `exit()` anywhere else — php-fpm and
+/// `php -S` deliver the output produced so far with the status the script set,
+/// and so does ePHPm (classified `SCRIPT_EXIT`, not a bailout).
 ///
-/// The Nov-2026 security release (CVE-2026-129474, an engine use-after-free in
-/// the exit/bailout path that also reworked how `exit()` unwinds out of a
-/// fiber; shipped in 8.3.37 / 8.4.28 / 8.5.13 / 8.6.0) changed that: the
-/// `exit()` now propagates and terminates the request cleanly, exactly like an
-/// `exit()` anywhere else. php-fpm and `php -S` deliver the output produced so
-/// far with the status the script set, and so does ePHPm — the exit is
-/// classified as a normal end of the request (`SCRIPT_EXIT`), not a bailout.
+/// So the assertion is version-gated:
+/// - **new behaviour** — the request is delivered with the fiber's output and
+///   the status set before it, and nothing after `unset($f)` runs;
+/// - **old behaviour** — the swallowed exit lets the script run on into the OOM
+///   tripwire, whose genuine bailout is reported; the swallowed exit must not
+///   have vouched for it (the original contract of this test).
 ///
-/// So the assertion now pins the *new* behaviour: the request is delivered with
-/// the fiber's output and the status set before it, and nothing after
-/// `unset($f)` runs. The trailing OOM is a version-agnostic tripwire — it is
-/// reached only if the exit were (wrongly) swallowed again, in which case the
-/// result would flip back to `Bailout` and this test would fail loudly. The
-/// "a real bailout after an exit is still a bailout" contract stays covered by
-/// `real_bailout_after_an_exit_bailout_is_still_a_bailout` and
+/// Either way the "a real bailout after an exit is still a bailout" contract
+/// stays covered by `real_bailout_after_an_exit_bailout_is_still_a_bailout` and
 /// `real_bailout_in_shutdown_after_a_plain_exit_is_still_a_bailout`, which put
-/// the two events in different request phases (still reachable post-change).
+/// the two events in different request phases.
 #[test]
 #[serial]
 fn exit_in_a_destroyed_fibers_finally_ends_the_request() {
-    let resp = ok(
-        "fiber_finally_exit.php",
-        &format!(
-            "<?php
-            http_response_code(201);
-            echo 'before-fiber';
-            $f = new Fiber(function () {{ try {{ Fiber::suspend(); }} finally {{ echo '|finally'; exit; }} }});
-            $f->start();
-            unset($f);
-            echo '|UNREACHABLE';
-            {OOM}"
-        ),
+    let name = "fiber_finally_exit.php";
+    let body = format!(
+        "<?php
+        http_response_code(201);
+        echo 'before-fiber';
+        $f = new Fiber(function () {{ try {{ Fiber::suspend(); }} finally {{ echo '|finally'; exit; }} }});
+        $f->start();
+        unset($f);
+        echo '|UNREACHABLE';
+        {OOM}"
     );
-    assert_eq!(resp.status, 201);
-    assert_eq!(text(&resp), "before-fiber|finally");
-    assert!(!text(&resp).contains("UNREACHABLE"), "the fiber exit must end the request");
+
+    if fiber_finally_exit_propagates() {
+        let resp = ok(name, &body);
+        assert_eq!(resp.status, 201);
+        assert_eq!(text(&resp), "before-fiber|finally");
+        assert!(!text(&resp).contains("UNREACHABLE"), "the fiber exit must end the request");
+    } else {
+        let r = run(name, &body);
+        assert!(matches!(r, Err(PhpError::Bailout(_))), "swallowed-exit branch: got {r:?}");
+    }
 }
 
 /// The same, with the exit in the main script body (no bailout there at all).
