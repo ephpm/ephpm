@@ -322,25 +322,50 @@ fn real_bailout_after_an_exit_bailout_with_a_status_is_still_a_bailout() {
     assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");
 }
 
-/// An exit() that the engine swallows inside a frame — a destroyed fiber's
-/// `finally` calling exit() — lets the script carry on. It must not vouch for
-/// a real bailout later in the same phase.
+/// `exit()` inside a destroyed fiber's `finally` ends the request.
+///
+/// Destroying a suspended fiber (`unset($f)`) runs its `finally` blocks. Up to
+/// PHP 8.5.12 an `exit()` there was *swallowed* — the engine discarded it and
+/// the main script carried on — so this test used to pin that a swallowed exit
+/// must not vouch for a genuine bailout later in the same phase (it OOMed after
+/// the fiber and asserted `Bailout`).
+///
+/// The Nov-2026 security release (CVE-2026-129474, an engine use-after-free in
+/// the exit/bailout path that also reworked how `exit()` unwinds out of a
+/// fiber; shipped in 8.3.37 / 8.4.28 / 8.5.13 / 8.6.0) changed that: the
+/// `exit()` now propagates and terminates the request cleanly, exactly like an
+/// `exit()` anywhere else. php-fpm and `php -S` deliver the output produced so
+/// far with the status the script set, and so does ePHPm — the exit is
+/// classified as a normal end of the request (`SCRIPT_EXIT`), not a bailout.
+///
+/// So the assertion now pins the *new* behaviour: the request is delivered with
+/// the fiber's output and the status set before it, and nothing after
+/// `unset($f)` runs. The trailing OOM is a version-agnostic tripwire — it is
+/// reached only if the exit were (wrongly) swallowed again, in which case the
+/// result would flip back to `Bailout` and this test would fail loudly. The
+/// "a real bailout after an exit is still a bailout" contract stays covered by
+/// `real_bailout_after_an_exit_bailout_is_still_a_bailout` and
+/// `real_bailout_in_shutdown_after_a_plain_exit_is_still_a_bailout`, which put
+/// the two events in different request phases (still reachable post-change).
 #[test]
 #[serial]
-fn swallowed_exit_does_not_mask_a_later_bailout() {
-    let r = run(
-        "fiber_exit_then_oom.php",
+fn exit_in_a_destroyed_fibers_finally_ends_the_request() {
+    let resp = ok(
+        "fiber_finally_exit.php",
         &format!(
             "<?php
             http_response_code(201);
-            $f = new Fiber(function () {{ try {{ Fiber::suspend(); }} finally {{ exit; }} }});
+            echo 'before-fiber';
+            $f = new Fiber(function () {{ try {{ Fiber::suspend(); }} finally {{ echo '|finally'; exit; }} }});
             $f->start();
             unset($f);
-            echo 'PARTIAL';
+            echo '|UNREACHABLE';
             {OOM}"
         ),
     );
-    assert!(matches!(r, Err(PhpError::Bailout(_))), "got {r:?}");
+    assert_eq!(resp.status, 201);
+    assert_eq!(text(&resp), "before-fiber|finally");
+    assert!(!text(&resp).contains("UNREACHABLE"), "the fiber exit must end the request");
 }
 
 /// The same, with the exit in the main script body (no bailout there at all).
