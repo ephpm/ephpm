@@ -71,7 +71,9 @@ Both are ePHPm's own options and must appear **before** the PHP program and its
 arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
 and everything after them — including a `--` separator and any `--site` a script
 itself wants — is passed to PHP untouched. Without `--site`, `ephpm php` runs
-with no database bound and no sandbox, exactly as before.
+with no database bound and no per-tenant sandbox (a bare `ephpm php` with no
+`--config` is byte-for-byte the old behavior); passing `--config` on its own
+still loads that config's [`[php] extensions`](#php-extensions).
 
 ### The per-site PHP sandbox
 
@@ -170,8 +172,17 @@ accumulate, so every listed extension loads). Without `--config`, a bare
 
 This is independent of `--site`: extensions are a process-wide `[php]` property,
 not per-tenant, so they load whether or not a site database is bound. That means
-`wp`, `artisan`, migrations, seeders and cron scripts run against the same
-engine the server does, without repeating each `-d` flag by hand.
+`wp`, `artisan`, migrations, seeders and cron scripts load the same extension
+set the server does, without repeating each `-d` flag by hand.
+
+What `--config` carries depends on `--site`. The **extensions** always load
+(and a bare-name entry resolves against `extension_dir` from `[php]
+ini_overrides`, which the CLI prepends for you). Their **settings** — other
+`[php] ini_overrides` (`xdebug.mode`, `redis.*`, …) and a custom `[php]
+ini_file` — are replayed to PHP **only with `--site`** (as that tenant's
+sandbox). On a no-`--site` run only the extensions load, not those ini
+settings; pass them yourself as trailing `-d key=value` flags if you need them,
+or run with `--site`.
 
 Platform notes: the Linux and macOS releases are glibc/dylib-dynamic and load
 extensions via `dlopen`. On Windows only the **shared-engine build**

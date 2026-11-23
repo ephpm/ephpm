@@ -42,14 +42,31 @@
 //!
 //! `ephpm php --config <path>` honors `[php] extensions` too, so a
 //! `wp`/`artisan`/cron run gets the same dynamically-loaded extension set the
-//! server has. [`cli_config_loads_php_extensions`] proves it by spawning the
-//! binary directly — `ephpm php --config <cfg> -r "var_dump(extension_loaded(…))"`
-//! — against a config that lists the catalog `.so` files. The harness supplies
-//! the binary via `EPHPM_EXT_BINARY` and the ABI-matched catalog directory via
-//! `EPHPM_EXT_DIR` (the same catalog the HTTP fixture mounts); the test
-//! self-skips (passes) when either is unset. Like the HTTP proof, this only
-//! runs in the nightly/e2e harness — never in the local stub-mode suite, which
-//! has no libphp and no catalog.
+//! server has. Two tests prove it by spawning the binary directly —
+//! `ephpm php --config <cfg> -r "var_dump(extension_loaded(…))"`:
+//! [`cli_config_loads_php_extensions_by_path`] lists the catalog `.so` files by
+//! absolute path, and [`cli_config_loads_php_extensions_by_bare_name`] lists
+//! them by bare name with `ini_overrides = [["extension_dir", …]]` (the case
+//! that regressed: a bare name needs `extension_dir`, which the CLI gets only
+//! when the config path prepends it).
+//!
+//! **Manual-only, like the HTTP proof.** No CI lane sets the fixture env vars,
+//! and `crates/ephpm-e2e` is excluded from the workspace nextest the nightly
+//! linked-test job runs — so these self-skip (pass) everywhere automated and
+//! must be run by hand against a real glibc-dynamic binary plus the ABI-matched
+//! catalog:
+//!
+//! ```sh
+//! curl -fsSL -o ext.tgz \
+//!   https://github.com/ephpm/php-sdk/releases/download/ext-8.5.12/ephpm-ext-8.5.12-linux-x86_64-gnu.tar.gz
+//! mkdir ext && tar xzf ext.tgz -C ext
+//! EPHPM_EXT_BINARY=./target/release/ephpm EPHPM_EXT_DIR="$PWD/ext" \
+//!   cargo test -p ephpm-e2e --test extensions
+//! ```
+//!
+//! The harness supplies the binary via `EPHPM_EXT_BINARY` and the catalog
+//! directory via `EPHPM_EXT_DIR` (the same catalog the HTTP fixture mounts);
+//! each test self-skips when either is unset.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -125,43 +142,19 @@ fn cli_ext_fixture() -> Option<(PathBuf, PathBuf)> {
     Some((PathBuf::from(binary), PathBuf::from(dir)))
 }
 
-/// `ephpm php --config <cfg>` loads `[php] extensions` from the config — the
-/// CLI's extension set matches the server's.
-///
-/// Spawns the real binary once per catalog extension with
-/// `-r "var_dump(extension_loaded('<ext>'))"` against a generated config that
-/// lists the catalog `.so` files under `[php] extensions`, and asserts each
-/// prints `bool(true)`. Proves the `-d extension=` defines the CLI prepends
-/// reach PHP's module startup (and that multiple `extension=` directives
-/// accumulate — every listed extension loads, not just the last).
-#[test]
-fn cli_config_loads_php_extensions() {
-    let Some((binary, ext_dir)) = cli_ext_fixture() else {
-        eprintln!("EPHPM_EXT_BINARY / EPHPM_EXT_DIR unset — skipping CLI extension E2E");
-        return;
-    };
+/// Forward-slashed path string that is a clean TOML basic string on any host.
+fn toml_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
-    // A config whose only job is to list the catalog `.so` files under
-    // [php] extensions, each as an absolute path (no extension_dir search) and
-    // forward-slashed so the path is a clean TOML basic string on any host.
-    use std::fmt::Write as _;
-    let mut toml = String::from("[php]\nextensions = [\n");
+/// Spawn `ephpm php --config <cfg> -r "var_dump(extension_loaded('<ext>'))"`
+/// once per catalog extension and assert each prints `bool(true)`.
+fn assert_each_extension_loads(binary: &std::path::Path, cfg: &std::path::Path) {
     for (ext, _) in EXPECTED {
-        let so = ext_dir.join(format!("{ext}.so"));
-        assert!(so.is_file(), "catalog is missing {}: {}", ext, so.display());
-        let _ = writeln!(toml, "    \"{}\",", so.to_string_lossy().replace('\\', "/"));
-    }
-    toml.push_str("]\n");
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = tmp.path().join("ephpm.toml");
-    std::fs::write(&cfg, toml).expect("write config");
-
-    for (ext, _) in EXPECTED {
-        let out = Command::new(&binary)
+        let out = Command::new(binary)
             .arg("php")
             .arg("--config")
-            .arg(&cfg)
+            .arg(cfg)
             .arg("-r")
             .arg(format!("var_dump(extension_loaded('{ext}'));"))
             .output()
@@ -178,4 +171,65 @@ fn cli_config_loads_php_extensions() {
              reach the CLI\nstdout:\n{stdout}\nstderr:\n{stderr}",
         );
     }
+}
+
+/// `ephpm php --config <cfg>` loads `[php] extensions` listed by **absolute
+/// path**. Proves the `-d extension=` defines the CLI prepends reach PHP's
+/// module startup, and that multiple `extension=` directives accumulate (every
+/// listed extension loads, not just the last).
+#[test]
+fn cli_config_loads_php_extensions_by_path() {
+    let Some((binary, ext_dir)) = cli_ext_fixture() else {
+        eprintln!("EPHPM_EXT_BINARY / EPHPM_EXT_DIR unset — skipping CLI extension E2E (by path)");
+        return;
+    };
+
+    use std::fmt::Write as _;
+    let mut toml = String::from("[php]\nextensions = [\n");
+    for (ext, _) in EXPECTED {
+        let so = ext_dir.join(format!("{ext}.so"));
+        assert!(so.is_file(), "catalog is missing {}: {}", ext, so.display());
+        let _ = writeln!(toml, "    \"{}\",", toml_path(&so));
+    }
+    toml.push_str("]\n");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("ephpm.toml");
+    std::fs::write(&cfg, toml).expect("write config");
+    assert_each_extension_loads(&binary, &cfg);
+}
+
+/// `ephpm php --config <cfg>` loads `[php] extensions` listed by **bare name**,
+/// resolved against an `[php] ini_overrides` `extension_dir`. This is the case
+/// that regressed before the H1 fix: a bare name needs `extension_dir`, which
+/// the serve path writes into the generated ini but the CLI receives (on a
+/// no-`--site` run) only because `run_php` now prepends a `-d extension_dir=…`
+/// define ahead of the `-d extension=…` defines. Without that prefix PHP would
+/// warn "Unable to load dynamic library 'redis'", exit 0, and
+/// `extension_loaded` would be false.
+#[test]
+fn cli_config_loads_php_extensions_by_bare_name() {
+    let Some((binary, ext_dir)) = cli_ext_fixture() else {
+        eprintln!(
+            "EPHPM_EXT_BINARY / EPHPM_EXT_DIR unset — skipping CLI extension E2E (bare name)"
+        );
+        return;
+    };
+
+    use std::fmt::Write as _;
+    let mut toml = format!(
+        "[php]\nini_overrides = [[\"extension_dir\", \"{}\"]]\nextensions = [\n",
+        toml_path(&ext_dir),
+    );
+    for (ext, _) in EXPECTED {
+        let so = ext_dir.join(format!("{ext}.so"));
+        assert!(so.is_file(), "catalog is missing {}: {}", ext, so.display());
+        let _ = writeln!(toml, "    \"{ext}\",");
+    }
+    toml.push_str("]\n");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("ephpm.toml");
+    std::fs::write(&cfg, toml).expect("write config");
+    assert_each_extension_loads(&binary, &cfg);
 }

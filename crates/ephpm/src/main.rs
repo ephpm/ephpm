@@ -186,11 +186,13 @@ enum Commands {
     /// scripts that open their own connection work too (issue #689).
     #[command(disable_help_flag = true)]
     Php {
-        /// Path to the ephpm configuration file. Only read together with
-        /// `--site`; supplies `[server] sites_dir`, `[db.sqlite]`, and
-        /// `[kv] secret` so the CLI can locate and authenticate to the site's
-        /// database. `--long` only (never `-c`), to avoid colliding with
-        /// php-cli's own `-c <path>` ini flag in the passthrough args.
+        /// Path to the ephpm configuration file. Loads `[php] extensions` (the
+        /// same dynamically-linked extensions the server loads) with or without
+        /// `--site`; with `--site` it also supplies `[server] sites_dir`,
+        /// `[db.sqlite]`, and `[kv] secret` so the CLI can locate and
+        /// authenticate to the site's database. `--long` only (never `-c`), to
+        /// avoid colliding with php-cli's own `-c <path>` ini flag in the
+        /// passthrough args.
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -1516,11 +1518,10 @@ fn run_php(
             let cfg = ephpm_config::Config::load(&config_path)
                 .with_context(|| format!("loading configuration from {}", config_path.display()))?;
             // `[php] extensions` (global, not per-tenant): load the same
-            // dynamically-linked extensions the server does.
-            for line in extension_ini_lines(&cfg)? {
-                ext_args.push("-d".to_string());
-                ext_args.push(line);
-            }
+            // dynamically-linked extensions the server does. (On this path the
+            // sandbox below also replays the same extension_dir override, but
+            // last-define-wins makes that harmless.)
+            ext_args = extension_cli_defines(&cfg)?;
             // Apply the SAME per-tenant PHP sandbox a vhost HTTP request gets —
             // open_basedir + private temp/session dirs + disable_functions —
             // before running any tenant PHP (issue #698). Fails closed on an
@@ -1557,16 +1558,16 @@ fn run_php(
             // bare `wp`/`artisan`/cron run gets the server's extension set. It
             // does NOT locate a site database — that needs `--site`.
             if let Some(config_path) = &config {
+                // Match the --site branch so the "loading as a Zend extension"
+                // info log from extension resolution is actually emitted.
+                ensure_cli_tracing();
                 if !config_path.exists() {
                     anyhow::bail!("configuration file not found: {}", config_path.display());
                 }
                 let cfg = ephpm_config::Config::load(config_path).with_context(|| {
                     format!("loading configuration from {}", config_path.display())
                 })?;
-                for line in extension_ini_lines(&cfg)? {
-                    ext_args.push("-d".to_string());
-                    ext_args.push(line);
-                }
+                ext_args = extension_cli_defines(&cfg)?;
                 eprintln!(
                     "warning: `ephpm php --config` without `--site` loads `[php] extensions` but \
                      does not locate a site database; pass `--site <key>` for that"
@@ -2545,6 +2546,52 @@ fn extension_ini_lines(config: &ephpm_config::Config) -> anyhow::Result<Vec<Stri
         lines.push(ini_line);
     }
     Ok(lines)
+}
+
+/// The prepended `-d` argument pairs that make `ephpm php --config` load
+/// `[php] extensions`: an optional `extension_dir` override followed by one
+/// `-d extension=`/`-d zend_extension=` pair per entry.
+///
+/// Why the `extension_dir` prefix: a **bare-name** entry (`extensions =
+/// ["redis"]`) is resolved by PHP against `extension_dir` at load time. The
+/// serve path writes `[php] ini_overrides` (including any `extension_dir`) into
+/// the generated php.ini, but the CLI receives `ini_overrides` only on the
+/// `--site` path (replayed by [`site_sandbox_cli_defines`]). Without it, a
+/// bare-name extension would be looked up in the baked-in placeholder
+/// `extension_dir` and fail to load. So when `ini_overrides` sets an explicit
+/// `extension_dir`, it is prepended here for *both* paths — harmless on
+/// `--site`, which replays the same value (php-cli is last-define-wins, and
+/// extensions load against the final `extension_dir` regardless of order). An
+/// absolute-path entry does not need it.
+///
+/// # Errors
+///
+/// Propagates [`extension_ini_lines`] (the Windows static refusal, an
+/// unreadable current directory, or an entry that cannot be written as an ini
+/// line).
+fn extension_cli_defines(config: &ephpm_config::Config) -> anyhow::Result<Vec<String>> {
+    let lines = extension_ini_lines(config)?;
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(lines.len() * 2 + 2);
+    // Pass `None` for the compiled-in default so only an *explicit* operator
+    // `extension_dir` override is emitted — PHP already uses the compiled-in
+    // default on its own.
+    if let Some(dir) = ext_ini::effective_extension_dir(&config.php.ini_overrides, None) {
+        let value = dir.to_string_lossy();
+        // ini-quote so a path with spaces or (on Windows) backslashes survives
+        // the ini parser; fall back to the raw value if it cannot be quoted
+        // (a line break / NUL, which an extension_dir never has).
+        let quoted = ext_ini::ini_quote(&value).unwrap_or_else(|| value.clone().into_owned());
+        out.push("-d".to_string());
+        out.push(format!("extension_dir={quoted}"));
+    }
+    for line in lines {
+        out.push("-d".to_string());
+        out.push(line);
+    }
+    Ok(out)
 }
 
 /// Shared HTTP server startup path used by both `serve` (production) and
