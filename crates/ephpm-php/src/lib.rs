@@ -1876,6 +1876,29 @@ impl PhpRuntime {
             // uses zend_try/zend_catch internally for bailout protection.
             let ret = unsafe { ffi::ephpm_thread_init() };
             if ret != 0 {
+                // `ephpm_thread_init()` calls `ts_resource(0)` — which allocates
+                // this thread's TSRM entry — before `php_request_startup()`; a
+                // startup failure tears the request down but does NOT
+                // `ts_free_thread`, so the entry is abandoned exactly like a
+                // crash-contained one (`registered` stays false below, so the
+                // caller retires this thread without PHP teardown and
+                // `ThreadPhpGuard::drop` no-ops). Neutralise it so that when a
+                // later thread recycles this `pthread_t`, TSRM's stale-entry
+                // path runs no per-thread destructors over it. Mandatory on PHP
+                // 8.6+, where `AG()` (the ZMM heap) is a native `__thread`
+                // block and such a destructor would deref the recycling
+                // thread's not-yet-constructed heap and abort the process — the
+                // same failure `contain_on_this_thread` fixes on the
+                // stack-overflow path. A no-op on PHP < 8.6 (the recycle
+                // reclaims the entry safely) and on non-Linux/macOS.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    // SAFETY: only reads the TSRM cache pointer and zeroes the
+                    // abandoned entry's resource count — it touches no heap.
+                    // This thread runs no further PHP after a failed
+                    // registration, so nothing re-reads the entry on it.
+                    let _ = unsafe { ffi::ephpm_detach_contained_thread() };
+                }
                 return Err(PhpError::ThreadInitFailed);
             }
 
