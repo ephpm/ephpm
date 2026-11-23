@@ -144,6 +144,18 @@ fn session_lock_is_released_by_finish_request() {
     std::fs::create_dir_all(&save_path).expect("session dir");
     // No session_write_close(): the session module writes and unlocks in its
     // RSHUTDOWN, which is exactly the path that used to be deferred.
+    // `session.use_strict_mode = 0` is required to pin a fixed session id
+    // across requests. PHP 8.6 flips the default of `session.use_strict_mode`
+    // from 0 to 1 (the long-planned session-fixation-hardening default, which
+    // shipped in 8.6.0 alongside — but distinct from — the Nov-2026
+    // session-security fixes that were backported to 8.3/8.4/8.5; this test was
+    // still green on 8.5.13, which keeps the 0 default). Under strict mode a
+    // `session_id()` that names no existing session is rejected and the module
+    // invents a fresh random id, so the fixed id below would never persist —
+    // each request would start a brand-new session (counter stuck at 1) and
+    // this test would stop exercising the lock-release path it exists for.
+    // Through 8.5 the default was 0, so the opt-out was implicit. (ePHPm
+    // honours the supplied id either way; strict mode is purely a PHP default.)
     let script = write_script(
         "session_counter_autoclose.php",
         &format!(
@@ -151,6 +163,7 @@ fn session_lock_is_released_by_finish_request() {
 ini_set('session.save_handler', 'files');
 ini_set('session.save_path', {path:?});
 ini_set('session.use_cookies', '0');
+ini_set('session.use_strict_mode', '0');
 ini_set('session.cache_limiter', '');
 session_id('ephpmteardownsessiontest0001');
 session_start();
