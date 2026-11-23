@@ -178,7 +178,7 @@ int ephpm_execute_script(const char *filename) {
     counted against it.
   - Every request runs in one process, so the bound that matters to the host is
     `concurrency` × the per-request ceiling below, not one request's limit.
-- From PHP 8.3.36 / 8.4.27 / 8.5.12, `memory_limit` is a **soft** limit:
+- From PHP 8.3.36 / 8.4.27 / 8.5.12 / 8.6.0, `memory_limit` is a **soft** limit:
   exceeding it queues an out-of-memory error that PHP raises at the script's
   next VM instruction (the "interrupt"), so one internal call can allocate well
   past it first. The fatal error then unwinds through the wrapper's

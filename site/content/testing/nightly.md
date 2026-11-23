@@ -29,7 +29,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 
 ## 1. Full Release Build Matrix
 
-**What:** Build `cargo xtask release` for PHP 8.4 and 8.5 on Linux and macOS using pre-built `libphp.a` artifacts. Then run all `#[ignore]` integration tests against the built binary.
+**What:** Build `cargo xtask release` for PHP 8.3, 8.4, 8.5 and 8.6 on Linux and macOS using pre-built `libphp.a` artifacts. Then run all `#[ignore]` integration tests against the built binary.
 
 **Why nightly:** With pre-built `libphp.a` from the external PHP build project, this drops from ~20 min (compiling static-php-cli) to ~4 min (just Rust compilation + linking). Still too heavy for every PR push, and the stub-mode tests in PR CI already catch Rust compilation errors.
 
@@ -330,7 +330,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 
 ## 9. Windows Cross-Compilation
 
-**What:** Verify that `cargo xtask release --target windows` produces a valid Windows executable for PHP 8.4 and 8.5.
+**What:** Verify that `cargo xtask release --target windows` produces a valid Windows executable for PHP 8.3, 8.4, 8.5 and 8.6.
 
 **Why nightly:** Requires `cargo-xwin` + MSVC cross-toolchain. Slow to set up, and Windows-specific breakage is rare. The PR CI's stub-mode compile already catches most Rust issues.
 

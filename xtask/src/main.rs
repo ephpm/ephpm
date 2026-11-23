@@ -16,7 +16,7 @@ mod php_versions;
 /// Users may also pass a full version explicitly (e.g. "8.5.6") and the
 /// resolver will accept it as-is.
 const PHP_SDK_VERSIONS: &[(&str, &str)] =
-    &[("8.3", "8.3.37"), ("8.4", "8.4.28"), ("8.5", "8.5.13")];
+    &[("8.3", "8.3.37"), ("8.4", "8.4.28"), ("8.5", "8.5.13"), ("8.6", "8.6.0")];
 
 /// EXPERIMENTAL: PHP minors published only as an upstream pre-release (beta/RC).
 ///
@@ -36,26 +36,26 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] =
 ///     publishes them under a DISTINCT `v<ref>-php<beta>` pre-release tag that
 ///     never touches the stable release.
 ///
-/// `resolve_php_version` accepts these minors so `cargo xtask release 8.6` and
-/// `cargo xtask php-sdk 8.6` resolve to the pinned beta once its SDK is
-/// published at github.com/ephpm/php-sdk. Not GA — do not document 8.6 as
-/// supported.
+/// `resolve_php_version` accepts these minors so `cargo xtask release <minor>`
+/// and `cargo xtask php-sdk <minor>` resolve to the pinned beta once its SDK is
+/// published at github.com/ephpm/php-sdk. A minor listed here is NOT GA — do
+/// not document it as supported until it graduates into `PHP_SDK_VERSIONS`.
 ///
-/// EMPTY ON PURPOSE (v0.13.0). The only published pre-release SDK, php-sdk
-/// `v8.6.0beta1`, predates the php-src fix for CVE-2026-109618/109619
-/// (php-src 31c0ea7d7f — the `memory_hard_limit_percent` hard limit that
-/// ePHPm's per-request containment relies on); php-src `php-8.6.0beta1`
-/// through `beta3` lack it, and the first 8.6 tag that carries it is
-/// `php-8.6.0RC4`. With `("8.6", "8.6.0beta1")` here, `release-php-beta.yml`
-/// would publish a `v<tag>-php8.6.0beta1` pre-release built on vulnerable PHP
-/// after every stable release. With the table empty, both experimental
-/// matrices are `[]`, every beta build job self-skips, and the publish job is
-/// skipped too, so the lane is a no-op.
+/// EMPTY ON PURPOSE. 8.6 graduated to GA in `PHP_SDK_VERSIONS` (8.6.0 final),
+/// so it is no longer a beta-only minor and does not belong here; there is no
+/// newer PHP minor in pre-release to pin. With the table empty, both
+/// experimental matrices are `[]`, every beta build job self-skips, and the
+/// publish job is skipped too, so the lane is a no-op.
 ///
-/// To re-enable: publish a php-sdk pre-release built from a php-src tag that
-/// contains the fix (8.6.0RC4 or later; check that the SDK's headers declare
-/// `ZEND_HAS_OOM` and `zend_set_memory_hard_limit_percent`), then add it here,
-/// e.g. `&[("8.6", "8.6.0RC4")]`.
+/// Historical note: while 8.6 was pre-release this table was kept empty rather
+/// than pinning `8.6.0beta1`, which predated the php-src fix for
+/// CVE-2026-109618/109619 (the `memory_hard_limit_percent` hard limit ePHPm's
+/// per-request containment relies on; first carried by `php-8.6.0RC4`). The
+/// 8.6.0 GA pinned above carries it.
+///
+/// To pin a FUTURE beta: publish a php-sdk pre-release built from a php-src tag
+/// that contains the fixes the build relies on, then add it here, e.g.
+/// `&[("8.7", "8.7.0RC1")]`.
 const EXPERIMENTAL_PHP_VERSIONS: &[(&str, &str)] = &[];
 
 /// Default PHP minor when no version is specified on the command line.
@@ -68,13 +68,14 @@ const DEFAULT_PHP_MINOR: &str = "8.5";
 /// Single source of truth, read by both the matrix generators in `php_versions`
 /// and `validate_variant`:
 ///   * `tailcall_matrix` = `PHP_SDK_VERSIONS` ∩ this set — the GA TAILCALL legs
-///     of `release.yml`'s gating-adjacent `build-windows-tailcall` job (8.5).
+///     of `release.yml`'s gating-adjacent `build-windows-tailcall` job (8.5, 8.6).
 ///   * `experimental_tailcall_matrix` = `EXPERIMENTAL_PHP_VERSIONS` ∩ this set —
 ///     the non-gating beta TAILCALL leg of `release-php-beta.yml` (empty while
 ///     `EXPERIMENTAL_PHP_VERSIONS` is empty).
 ///
-/// 8.6 is never in `PHP_SDK_VERSIONS`, so listing it here does not add
-/// it to the gating `tailcall_matrix` (which filters `PHP_SDK_VERSIONS`).
+/// 8.6 is now GA in `PHP_SDK_VERSIONS`, so listing it here DOES add it to the
+/// gating `tailcall_matrix`: the clang/TAILCALL 8.6 Windows SDK builds green, so
+/// 8.6 joins 8.5 as a GA TAILCALL leg of `release.yml`'s `build-windows-tailcall`.
 const TAILCALL_MINORS: &[&str] = &["8.5", "8.6"];
 
 /// Cargo features every *shipped* `ephpm` binary is built with.
@@ -163,7 +164,7 @@ shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version
 Windows builds:
   --target windows    Build a native Windows .exe (must run on Windows; MSVC build tools required).
                       Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64.
-  --variant clang     (with --target windows, PHP 8.5 only) Use the clang-cl-built PHP SDK whose
+  --variant clang     (with --target windows, PHP 8.5/8.6) Use the clang-cl-built PHP SDK whose
                       interpreter is the TAILCALL VM — 1.6-1.7x faster on CPU-bound PHP than the
                       default MSVC build's CALL VM. Experimental. The SDK asset is
                       php-sdk-<ver>-windows-x86_64-clang.tar.gz, cached side-by-side with the
@@ -656,7 +657,7 @@ fn resolve_php_version(input: &str) -> Option<String> {
 /// `--target windows` overrides host detection so any host with curl + tar
 /// can prefetch the Windows SDK (the download itself is platform-neutral).
 /// `--variant clang` selects the clang-cl / TAILCALL Windows SDK
-/// (PHP 8.5 only), `--variant shared` the shared-engine Windows SDK
+/// (PHP 8.5/8.6), `--variant shared` the shared-engine Windows SDK
 /// (`php8ts.dll`) — see `validate_variant`.
 fn php_sdk(args: &[String]) -> ExitCode {
     let Some(version) = resolve_php_version(parse_release_php_version(args)) else {

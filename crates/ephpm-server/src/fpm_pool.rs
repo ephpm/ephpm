@@ -107,6 +107,22 @@
 //! count stayed flat throughout, so retired threads really do exit. The
 //! alternative is the whole server dying on crash number one.
 //!
+//! That plateau is **PHP ≤ 8.5 only**. Through 8.5 the abandoned thread's ZMM
+//! heap (`AG(mm_heap)`) lived in its TSRM entry's fast storage, so when a
+//! replacement pool thread recycled the dead thread's `pthread_t`, TSRM's
+//! stale-entry path ran `alloc_globals_dtor()` and reclaimed the heap — which
+//! is what bounds the leak. PHP 8.6 moved `AG()` to a native `__thread` block
+//! (`ts_allocate_tls_id`); the recycle then skips `alloc_globals_dtor` (a TLS
+//! dtor of a foreign thread) AND — far worse — the surviving non-TLS dtors
+//! would dereference the recycling thread's not-yet-constructed heap and abort
+//! the process, so `ephpm-php` detaches the abandoned entry outright
+//! (`ephpm_detach_contained_thread`). On 8.6+ each **stack-overflow** contained
+//! crash therefore leaks its poisoned ZMM heap for good — the heap is never
+//! reclaimed on recycle in any case there — so the leak grows with the crash
+//! count rather than plateauing. (The hard-memory-limit path is unaffected: it
+//! frees the consistent heap on the poison thread, every version.) Containing
+//! the crash still beats the whole server dying.
+//!
 //! Respawning after a poison is rate-limited ([`FpmPool::note_poisoned`]): a
 //! crash costs a thread teardown plus a fresh TSRM registration, far more than a
 //! normal request, so an attacker looping the crash script would otherwise get

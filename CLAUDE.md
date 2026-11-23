@@ -26,7 +26,7 @@ cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)
 # release --target windows` errors out on a non-Windows host.
 cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/release/ephpm.exe
 
-# Experimental TAILCALL Windows build (PHP 8.5 only): links the clang-cl-built
+# Experimental TAILCALL Windows build (PHP 8.5 and 8.6): links the clang-cl-built
 # SDK (php-sdk-<ver>-windows-x86_64-clang.tar.gz) whose interpreter is the
 # TAILCALL VM — 1.6-1.7x faster on CPU-bound PHP than the MSVC CALL VM.
 # xtask hard-gates on the SDK's VM kind (disassembles zend_vm_kind, requires

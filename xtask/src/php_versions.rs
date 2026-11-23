@@ -41,9 +41,8 @@ fn php_matrix_json() -> String {
 /// JSON array of the GA TAILCALL minors' `{minor, full}` pairs.
 ///
 /// The matrix for `release.yml`'s non-gating `build-windows-tailcall` job — the
-/// GA (`PHP_SDK_VERSIONS`) minors that are TAILCALL-capable. 8.5-only today: the
-/// TAILCALL VM does not exist in PHP 8.3/8.4, and 8.6 is a beta (it lives in
-/// `EXPERIMENTAL_PHP_VERSIONS`, surfaced by `experimental_tailcall_matrix`).
+/// GA (`PHP_SDK_VERSIONS`) minors that are TAILCALL-capable: 8.5 and 8.6. The
+/// TAILCALL VM does not exist in PHP 8.3/8.4, so they are excluded.
 fn tailcall_matrix_json() -> String {
     let items: Vec<String> = PHP_SDK_VERSIONS
         .iter()
@@ -164,8 +163,9 @@ mod tests {
     /// `tailcall_matrix` is exactly the TAILCALL subset of the GA table — same
     /// full versions the table pins, no more, no fewer. Its object count is the
     /// intersection of `PHP_SDK_VERSIONS` and `TAILCALL_MINORS` (not
-    /// `TAILCALL_MINORS.len()`: that set also carries beta-only minors like 8.6,
-    /// which live in `EXPERIMENTAL_PHP_VERSIONS` and must not appear here).
+    /// `TAILCALL_MINORS.len()`: that set may also carry a TAILCALL-capable minor
+    /// that is still beta-only in `EXPERIMENTAL_PHP_VERSIONS`, which must not
+    /// appear here).
     #[test]
     fn tailcall_matrix_is_the_tailcall_subset() {
         let json = tailcall_matrix_json();
