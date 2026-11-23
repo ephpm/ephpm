@@ -241,6 +241,18 @@ mod ffi {
         #[cfg(target_os = "linux")]
         pub fn ephpm_release_contained_heap() -> ::std::os::raw::c_int;
 
+        /// Neutralize the current thread's abandoned TSRM entry after a
+        /// contained **C-stack overflow**, so a later thread that recycles this
+        /// `pthread_t` runs no per-thread globals destructors over the poisoned
+        /// state. PHP 8.6+ only — there `AG()` (the ZMM heap) is native
+        /// `__thread` and a recycle-time destructor would dereference the
+        /// recycling thread's not-yet-constructed heap and abort the process;
+        /// on PHP < 8.6 the recycle reclaims the entry safely and this is a
+        /// no-op returning 0. Returns 1 if detached, 0 if nothing was done.
+        /// Linux/macOS only; the thread must make no further PHP call.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub fn ephpm_detach_contained_thread() -> ::std::os::raw::c_int;
+
         /// 1 if the linked engine has PHP's hard memory limit
         /// (`memory_hard_limit_percent`), 0 otherwise. A compile-time fact
         /// of the SDK headers; safe on any thread.
@@ -618,7 +630,10 @@ fn contain_on_this_thread(kind: crash_guard::Guarded) {
         // refuse a poisoned thread and its TLS retirement guard is disarmed).
         // The hard-limit exit happened before the allocator touched the heap,
         // so the heap's chunk and huge-block lists are consistent; see
-        // `ephpm_release_contained_heap` in ephpm_wrapper.c.
+        // `ephpm_release_contained_heap` in ephpm_wrapper.c. That call also
+        // detaches this thread's TSRM entry (count=0), so a recycled pthread_t
+        // runs no destructors over it — the same neutralisation the stack-
+        // overflow path does below.
         let released = unsafe { ffi::ephpm_release_contained_heap() };
         if released == 0 {
             // Only if TSRM's private entry layout ever stops matching the
@@ -629,6 +644,25 @@ fn contain_on_this_thread(kind: crash_guard::Guarded) {
                  leaked instead of freed"
             );
         }
+        return;
+    }
+
+    // A contained C-stack overflow: the heap is mid-mutation and must be leaked,
+    // but the abandoned TSRM entry still has to be neutralised so a later thread
+    // that recycles this `pthread_t` runs no per-thread destructors over the
+    // poisoned Zend state. Mandatory on PHP 8.6+, where `AG()` (the ZMM heap)
+    // moved to a native `__thread` block: a recycle-time destructor
+    // (`executor_globals_dtor`, ...) would resolve `AG(mm_heap)` through the
+    // recycling thread's not-yet-constructed heap (NULL) and abort the whole
+    // process — the failure this contains. A no-op on PHP < 8.6, where the
+    // recycle reclaims the entry safely; see `ephpm_detach_contained_thread`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: this thread was just poisoned (its TLS retirement guard is
+        // disarmed and nothing runs PHP on it again). The call only reads the
+        // TSRM cache pointer and zeroes the entry's resource count — it never
+        // touches the mid-mutation heap.
+        let _ = unsafe { ffi::ephpm_detach_contained_thread() };
     }
     #[cfg(not(target_os = "linux"))]
     let _ = kind;

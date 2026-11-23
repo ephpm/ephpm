@@ -1210,6 +1210,102 @@ int ephpm_engine_has_hard_memory_limit(void)
 #endif
 }
 
+/* ===================================================================
+ * Contained-crash TSRM entry detach (Linux + macOS)
+ *
+ * Both contained-crash paths abandon the poisoned thread WITHOUT calling
+ * ts_free_thread(), so its `tsrm_tls_entry` stays in TSRM's table with its
+ * resource count intact. glibc and macOS recycle an exited thread's stack and
+ * TCB, so a replacement pool thread routinely gets the dead thread's
+ * pthread_t. TSRM's ts_resource_ex() then finds that stale entry and
+ * "gracefully" runs every per-thread globals destructor over it
+ * (ts_free_resources) before reallocating — walking the poisoned per-thread
+ * Zend state of the abandoned request.
+ *
+ * ephpm_detach_thread_resources() sets the entry's resource count to 0 so the
+ * recycle path runs NO destructors and only frees the storage array. It is the
+ * neutralisation shared by the hard-memory-limit release
+ * (ephpm_release_contained_heap, Linux) and the stack-overflow poison path
+ * (ephpm_detach_contained_thread). It touches only the TSRM entry struct, never
+ * the poisoned heap, so it is safe even after a stack overflow left the heap's
+ * free lists mid-mutation.
+ * =================================================================== */
+
+#if defined(__linux__) || defined(__APPLE__)
+
+/* Mirror of TSRM's private `struct _tsrm_tls_entry` (TSRM/TSRM.c), verified
+ * byte-identical through PHP 8.3-8.6: the per-thread resource table that the
+ * TSRM cache pointer (`tsrm_get_ls_cache()`) points at. (8.5 -> 8.6 moved some
+ * globals to native __thread storage via ts_allocate_tls_id but left THIS
+ * struct's fields unchanged.) Never used without first checking that
+ * `thread_id` reads back as this thread, which a layout change would break. */
+typedef struct {
+    void **storage;
+    int count;
+    pthread_t thread_id;
+    void *next;
+} ephpm_tsrm_tls_entry_view;
+
+/* Set this thread's abandoned TSRM entry resource count to 0 so a later thread
+ * that recycles this pthread_t runs no per-thread globals destructors over it
+ * (ts_free_resources loops `count-1 .. 0`). Returns 1 if detached, 0 if the
+ * cache entry could not be matched to this thread (TSRM layout drift). */
+static int ephpm_detach_thread_resources(void)
+{
+    ephpm_tsrm_tls_entry_view *entry = (ephpm_tsrm_tls_entry_view *)tsrm_get_ls_cache();
+    if (entry == NULL || !pthread_equal(entry->thread_id, pthread_self())) {
+        return 0;
+    }
+    entry->count = 0;
+    return 1;
+}
+
+/*
+ * Neutralise THIS thread's abandoned TSRM entry after a contained C-STACK
+ * OVERFLOW, so that when a later thread recycles this pthread_t, TSRM's
+ * stale-entry path (ts_resource_ex -> ts_free_resources) runs NO per-thread
+ * globals destructors over the mid-mutation Zend state.
+ *
+ * Needed only on PHP 8.6+. Through 8.5 AG() (the ZMM heap) lived in the TSRM
+ * entry's own fast-offset storage (ts_allocate_fast_id), so on the recycle
+ * path AG(mm_heap) resolved through the dead thread's still-mapped entry: the
+ * surviving destructors' efree()s worked, and alloc_globals_dtor() even
+ * reclaimed the heap — the recycle both survived AND bounded the leak, so there
+ * we deliberately leave the entry intact (detaching would stop that
+ * reclamation). 8.6 moved AG() to a native __thread block (ts_allocate_tls_id,
+ * zend_alloc.c start_memory_manager): on the recycle path the surviving
+ * non-TLS destructors (executor_globals_dtor's zend_hash_destroy,
+ * compiler_globals_dtor's pefree, ...) resolve AG(mm_heap) through the
+ * RECYCLING thread's __thread block, whose ctor has NOT run yet (it runs later,
+ * in allocate_new_resource) — so AG(mm_heap) is NULL and efree() dereferences
+ * it, aborting the whole process. (8.6 also skips alloc_globals_dtor on the
+ * recycle — a TLS dtor of a foreign thread — so the poisoned heap is never
+ * reclaimed there regardless; detaching therefore costs no reclamation 8.6
+ * would otherwise do.)
+ *
+ * count=0 makes the recycle free only the storage array and the entry block.
+ * The poisoned ZMM heap is leaked: a stack overflow leaves its free lists
+ * mid-mutation, so it can never be freed here (unlike the hard-limit heap,
+ * which is consistent and is given back by ephpm_release_contained_heap).
+ *
+ * Returns 1 if the entry was detached, 0 if nothing was done (PHP < 8.6, or the
+ * entry could not be matched to this thread — TSRM layout drift).
+ */
+int ephpm_detach_contained_thread(void)
+{
+#if PHP_VERSION_ID >= 80600
+    return ephpm_detach_thread_resources();
+#else
+    /* < 8.6 reclaims the entry safely on recycle; keep it intact. Reference the
+     * helper so it is not flagged unused where ephpm_release_contained_heap
+     * (its only other caller) is not compiled — e.g. a non-Linux < 8.6 build. */
+    (void)ephpm_detach_thread_resources;
+    return 0;
+#endif
+}
+
+#endif /* __linux__ || __APPLE__ */
+
 #if defined(__linux__)
 #include "zend_extensions.h"
 
@@ -1245,42 +1341,14 @@ extern void zend_shared_alloc_safe_unlock(void) __attribute__((weak));
  * first.
  *
  * TSRM must also forget the thread's resources without running their
- * destructors. The thread exits without ts_free_thread() (that would run every
- * extension's globals destructor over the abandoned request), so its entry
- * stays in TSRM's table. When a later thread gets the same pthread_t — glibc
- * reuses cached thread stacks, so a replacement pool thread usually does —
- * ts_resource_ex() treats the entry as stale and "gracefully" runs all the
- * globals destructors on it: pcre's efree()s into this heap and
- * alloc_globals_dtor() shuts it down a second time. So the entry's resource
- * count is set to 0 first (ephpm_detach_thread_resources); the stale-entry
- * path then just frees the storage array. If the entry cannot be detached
- * safely, the heap is left alone (leaked, or freed by that stale-entry path)
- * rather than freed twice.
+ * destructors when a later thread recycles this pthread_t: the entry's
+ * resource count is set to 0 first (ephpm_detach_thread_resources, defined
+ * above), so the stale-entry path then just frees the storage array and runs
+ * no destructor over the abandoned request. If the entry cannot be detached
+ * safely, the heap is left alone (leaked) rather than freed twice.
  *
  * Returns 1 if the heap was freed, 0 if it was kept.
  */
-
-/* Mirror of TSRM's private `struct _tsrm_tls_entry` (TSRM/TSRM.c), unchanged
- * through PHP 8.3-8.5: the per-thread resource table that the TSRM cache
- * pointer (`tsrm_get_ls_cache()`) points at. Never used without first checking
- * that `thread_id` reads back as this thread, which a layout change would
- * break. */
-typedef struct {
-    void **storage;
-    int count;
-    pthread_t thread_id;
-    void *next;
-} ephpm_tsrm_tls_entry_view;
-
-static int ephpm_detach_thread_resources(void)
-{
-    ephpm_tsrm_tls_entry_view *entry = (ephpm_tsrm_tls_entry_view *)tsrm_get_ls_cache();
-    if (entry == NULL || !pthread_equal(entry->thread_id, pthread_self())) {
-        return 0;
-    }
-    entry->count = 0;
-    return 1;
-}
 
 int ephpm_release_contained_heap(void)
 {
