@@ -81,6 +81,8 @@ const NON_CONFIG_ENV_VARS: &[&str] = &[
     "WORKER_STREAM_URL",
     "PREVIEW_URL",
     "EXT_URL",
+    "EXT_BINARY",
+    "EXT_DIR",
     "HRANA_URL",
     "WP_URL",
     "WP_ADMIN_USER",

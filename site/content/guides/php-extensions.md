@@ -141,7 +141,9 @@ startup (MINIT) exactly as vanilla PHP would:
 
 Because the load lines precede `ini_file`/`ini_overrides` in the
 generated ini, you can configure an extension's own ini settings in the
-same config file.
+same config file. This applies on the server, and to `ephpm php --site`;
+a no-`--site` CLI run loads the extensions but **not** those `ini_overrides`/
+`ini_file` settings (see [`ephpm php`](/reference/cli/php/#php-extensions)).
 
 ### Zend extensions (Xdebug, PCOV, profilers)
 
@@ -167,6 +169,15 @@ The same ABI contract applies: the `.so` must be a ZTS build for the
 matching PHP minor. For one-off CLI use,
 `ephpm php -d zend_extension=/path/to/xdebug.so` works too (see
 [`ephpm php`](/reference/cli/php/)).
+
+`ephpm php --config <path>` also loads `[php] extensions` straight from the
+config, so `wp`, `artisan`, migrations and cron scripts load the **same**
+extension set the server has — no need to repeat each one as a `-d` flag. This
+works with or without `--site` (extensions are a global `[php]` property, not
+per-tenant), and a bare-name entry resolves against the `extension_dir` from
+`ini_overrides`, which the CLI prepends for you. Extension *settings* (other
+`ini_overrides` / an `ini_file`) only reach the CLI with `--site`. See
+[`ephpm php`](/reference/cli/php/#php-extensions).
 
 For step debugging — `ephpm dev --xdebug`, IDE setup, and how debugging
 works in worker mode — see [Debugging with Xdebug](/guides/xdebug/).

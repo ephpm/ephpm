@@ -105,7 +105,7 @@ With `--xdebug`, the dev server also sets `xdebug.mode=debug,develop` and `xdebu
 
 Run PHP CLI commands using the embedded PHP runtime. Apart from two ePHPm options, every argument after `php` goes straight to PHP's own argument parser, so all standard PHP CLI flags work. See the [full `php` reference](php/).
 
-The two ePHPm options are `--site <key>` and `--config <path>`. When they come **first**, before the PHP program and its arguments, ePHPm consumes them and binds the [`ephpm_db_*` bridge](/guides/db-from-php/) to that virtual host's database (`--config` is required with `--site`). They are `--long`-only, so they never collide with php-cli's own `-c`. Anywhere after the program they pass through to PHP untouched. `--config` without `--site` has no effect: it prints a warning and is ignored. See [Binding a virtual host's database](php/#binding-a-virtual-hosts-database---site).
+The two ePHPm options are `--site <key>` and `--config <path>`. When they come **first**, before the PHP program and its arguments, ePHPm consumes them and binds the [`ephpm_db_*` bridge](/guides/db-from-php/) to that virtual host's database (`--config` is required with `--site`). They are `--long`-only, so they never collide with php-cli's own `-c`. Anywhere after the program they pass through to PHP untouched. `--config` without `--site` still loads that config's `[php] extensions` — so the CLI's extension set matches the server's — but binds no database and applies no sandbox; a missing or invalid config file is a hard error. See [Binding a virtual host's database](php/#binding-a-virtual-hosts-database---site).
 
 ```bash
 ephpm php --site shop --config /etc/ephpm/ephpm.toml -- vendor/bin/wp option get siteurl
