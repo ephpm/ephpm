@@ -137,6 +137,13 @@ pub struct ResolvedJob {
     pub starting_deadline: Option<Duration>,
     /// Suspended jobs never evaluate.
     pub suspend: bool,
+    /// Resolved memory ceiling in bytes (`None` ⇒ no ceiling). Applied as an OS
+    /// `RLIMIT_AS` on a binary child and as the PHP `memory_limit` ceiling on a
+    /// PHP child (hardening F5).
+    pub memory_max_bytes: Option<u64>,
+    /// Resolved CPU ceiling in cores (`None` ⇒ no ceiling). Enforced as an
+    /// `RLIMIT_CPU` CPU-time ceiling of `ceil(cpu_cores × timeout)` seconds.
+    pub cpu_cores: Option<f64>,
 }
 
 impl ResolvedJob {
@@ -156,6 +163,21 @@ impl ResolvedJob {
             (Some(site), Some(dir)) => Some(dir.join(site)),
             _ => None,
         };
+        // An RLIMIT_CPU CPU-time ceiling in whole seconds: a job allowed
+        // `cpu_cores` cores for `timeout` wall-seconds may legitimately burn up
+        // to `cpu_cores × timeout` CPU-seconds. `ceil`, and at least 1, so a
+        // sub-core allowance is still a positive cap (which also throttles a
+        // single-threaded CPU peg before the wall-clock timeout). `None` ⇒ no
+        // CPU-time cap.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let cpu_secs = self.cpu_cores.map(|cores| {
+            let secs = (cores * self.timeout.as_secs_f64()).ceil();
+            (secs as u64).max(1)
+        });
         ExecRequest {
             job: self.name.clone(),
             site: self.site.clone(),
@@ -164,6 +186,8 @@ impl ResolvedJob {
             config_path,
             cwd,
             timeout: self.timeout,
+            memory_max_bytes: self.memory_max_bytes,
+            cpu_secs,
         }
     }
 }
@@ -247,6 +271,13 @@ pub struct CronScheduler {
     directory_timeout: Duration,
     max_jobs_per_site: usize,
     default_tz: Tz,
+    /// Section-resolved memory ceiling (`[cron] memory_max`, else the derived
+    /// ≈ 33 % default), in bytes; the directory tier and any operator job
+    /// without its own `memory_max` use this. `None` ⇒ no ceiling.
+    section_memory_bytes: Option<u64>,
+    /// Section-resolved CPU ceiling (`[cron] cpu_max`, else the derived default)
+    /// in cores; same fallthrough as `section_memory_bytes`.
+    section_cpu_cores: Option<f64>,
 
     clustered: bool,
     cluster: Option<Arc<ClusterHandle>>,
@@ -282,9 +313,33 @@ impl CronScheduler {
         let cron = &config.cron;
         let default_tz = ephpm_config::parse_timezone(&cron.timezone).unwrap_or(chrono_tz::UTC);
 
+        // Resolve the section-level resource ceilings once (hardening F5): the
+        // operator's `[cron] memory_max`/`cpu_max`, else the derived defaults
+        // (≈ 33 % of the detected memory budget; half the detected CPU). These
+        // are the directory tier's ceilings and the fallback for an operator
+        // job that sets neither. `Config::validate` already rejected a bad
+        // value, so a parse error here falls back to the derived default.
+        let derived_mem = ephpm_config::default_cron_memory_bytes();
+        let derived_cpu = ephpm_config::default_cron_cpu_cores();
+        let section_memory_bytes = ephpm_config::parse_cron_memory_limit(
+            "[cron] memory_max",
+            cron.memory_max.as_deref(),
+            derived_mem,
+        )
+        .unwrap_or(derived_mem);
+        let section_cpu_cores =
+            ephpm_config::parse_cron_cpu_limit("[cron] cpu_max", cron.cpu_max, derived_cpu)
+                .unwrap_or(derived_cpu);
+        tracing::info!(
+            memory_max_bytes = ?section_memory_bytes,
+            cpu_max_cores = ?section_cpu_cores,
+            "cron: per-job resource ceilings (section default; per-job overrides apply)"
+        );
+
         let mut operator_jobs = Vec::new();
         for job in &cron.jobs {
-            match resolve_operator_job(job, &cron.timezone) {
+            match resolve_operator_job(job, &cron.timezone, section_memory_bytes, section_cpu_cores)
+            {
                 Ok(resolved) => operator_jobs.push(resolved),
                 Err(e) => tracing::error!(job = job.name, error = %e, "cron: skipping invalid job"),
             }
@@ -318,6 +373,8 @@ impl CronScheduler {
             directory_timeout: Duration::from_secs(3600),
             max_jobs_per_site: cron.max_jobs_per_site.max(1) as usize,
             default_tz,
+            section_memory_bytes,
+            section_cpu_cores,
             clustered,
             cluster,
             self_id,
@@ -368,6 +425,10 @@ impl CronScheduler {
                     concurrency_policy: ConcurrencyPolicy::Forbid,
                     starting_deadline: None,
                     suspend: false,
+                    // The directory tier has no per-file config, so it uses the
+                    // section ceilings (hardening F5).
+                    memory_max_bytes: self.section_memory_bytes,
+                    cpu_cores: self.section_cpu_cores,
                 });
             }
         }
@@ -715,15 +776,32 @@ enum FireOutcome {
 }
 
 /// Resolve one operator `CronJob` into a `ResolvedJob`.
+///
+/// `section_memory_bytes` / `section_cpu_cores` are the already-resolved section
+/// ceilings used when this job sets neither `memory_max` nor `cpu_max`
+/// (hardening F5). A per-job value overrides the section one; an opt-out keyword
+/// (`memory_max = "0"` / `cpu_max = 0`) clears the ceiling for this job alone.
 fn resolve_operator_job(
     job: &ephpm_config::CronJob,
     default_tz: &str,
+    section_memory_bytes: Option<u64>,
+    section_cpu_cores: Option<f64>,
 ) -> Result<ResolvedJob, String> {
     let schedule = job.schedule_parsed().map_err(|e| e.to_string())?;
     let tz = job.timezone_resolved(default_tz).map_err(|e| e.to_string())?;
     let timeout = job.timeout_duration().map_err(|e| e.to_string())?;
     let starting_deadline = job.starting_deadline_duration().map_err(|e| e.to_string())?;
     let concurrency_policy = job.concurrency_policy_parsed().map_err(|e| e.to_string())?;
+    // Validation already proved these parse; fall back to the section value on
+    // the impossible error path rather than propagating.
+    let memory_max_bytes = ephpm_config::parse_cron_memory_limit(
+        "memory_max",
+        job.memory_max.as_deref(),
+        section_memory_bytes,
+    )
+    .unwrap_or(section_memory_bytes);
+    let cpu_cores = ephpm_config::parse_cron_cpu_limit("cpu_max", job.cpu_max, section_cpu_cores)
+        .unwrap_or(section_cpu_cores);
     Ok(ResolvedJob {
         name: job.name.clone(),
         site: job.site.clone(),
@@ -736,6 +814,8 @@ fn resolve_operator_job(
         concurrency_policy,
         starting_deadline,
         suspend: job.suspend,
+        memory_max_bytes,
+        cpu_cores,
     })
 }
 

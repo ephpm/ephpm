@@ -64,8 +64,11 @@ before PHP runs, so `wp`, `artisan`, migrations, and seeders built on the
 
 | Option | Meaning |
 |--------|---------|
-| `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database **and applies that tenant's PHP sandbox** (`open_basedir` + `disable_functions` + operator `ini_overrides` — see [The per-site PHP sandbox](#the-per-site-php-sandbox) below). Validated fail-closed (an unknown or malformed key is rejected). |
+| `--site <key>` | The vhost directory name under `[server] sites_dir`. Binds `ephpm_db_*` to that site's database, **applies that tenant's PHP sandbox** (`open_basedir` + `disable_functions` + operator `ini_overrides` — see [The per-site PHP sandbox](#the-per-site-php-sandbox) below), and **bounds PHP memory**: the `memory_limit` ceiling (`[php] memory_limit_max`, else the startup limit) is enforced so a tenant script's `ini_set('memory_limit', '-1')` is refused (hardening finding F5). Validated fail-closed. |
 | `--config <path>` | The ePHPm config file (`[server] sites_dir`, `[db.sqlite]`, `[kv] secret`). **Required** with `--site`. On its own (without `--site`) it still loads [`[php] extensions`](#php-extensions) from the config — so the CLI runs with the server's extension set — but does **not** locate a site database; it prints a warning on stderr saying so and runs PHP normally. |
+| `--confine` | *(requires `--site`)* Confine the run in the per-site OS sandbox before PHP starts — Landlock scoped to this one vhost, `PR_SET_NO_NEW_PRIVS`, `RLIMIT_CPU` (from `--cpu-secs`), and (as root) an irreversible uid/gid drop. Best-effort and Linux-only (a layer the kernel or privileges cannot provide is warned and skipped, never fatal). This is what the native cron scheduler passes for per-site PHP cron children. |
+| `--memory-max <qty>` | *(requires `--site`)* Override the `memory_limit` ceiling for this run (a byte count or a `K`/`M`/`G` quantity). The cron scheduler sets it from the job's resolved `memory_max`. |
+| `--cpu-secs <n>` | *(requires `--confine`)* `RLIMIT_CPU` CPU-time ceiling in seconds. The cron scheduler sets it to `ceil(cpu_max × timeout)`. |
 
 Both are ePHPm's own options and must appear **before** the PHP program and its
 arguments; they are `--long`-only (never `-c`, which stays php-cli's ini flag),
@@ -93,11 +96,14 @@ operators:
   widen the basedir with a trailing `-d open_basedir=…` **after** the PHP
   program: those options are last-define-wins and only the operator, never the
   tenant's script body, controls argv.
-- **This is the data-plane sandbox only.** It is `open_basedir` + a denylist, not
-  an OS-level sandbox: the `--site` child shares the server's uid and network
-  namespace, so it is **not** confined by the per-vhost egress (eBPF) layer, and
-  a custom `[php] ini_file` is **not** replayed to it (only `ini_overrides` are).
-  For untrusted tenant code that needs the full process sandbox, run it through
+- **This is the data-plane sandbox only — unless you add `--confine`.** By
+  default `--site` applies `open_basedir` + a denylist, not an OS-level sandbox:
+  the child shares the server's uid and network namespace, so it is **not**
+  confined by the per-vhost egress (eBPF) layer, and a custom `[php] ini_file` is
+  **not** replayed to it (only `ini_overrides` are). Add [`--confine`](#binding-a-virtual-hosts-database---site)
+  (as the native cron scheduler does) for the per-site OS sandbox — Landlock,
+  `no_new_privs`, `RLIMIT_CPU`, and a uid drop that also arms the egress layer —
+  layered on top. For untrusted tenant *binaries*, run them through
   [`ephpm exec --site`](../exec/) instead.
 
 On Windows the sandbox path values are emitted quoted (the `open_basedir`

@@ -323,6 +323,15 @@ mod ffi {
         /// `php_embed_init()`. The server never calls this and stays `"ephpm"`.
         pub fn ephpm_enable_cli_mode();
 
+        /// Mark the CLI process as running a specific tenant's code (`ephpm php
+        /// --site`, incl. per-site cron). Set IN ADDITION to
+        /// `ephpm_enable_cli_mode()`, BEFORE `php_embed_init()`. Re-enables the
+        /// `memory_hard_limit_percent` SYSTEM-lock and the `memory_limit`
+        /// ceiling that plain CLI mode skips, so tenant cron cannot raise
+        /// `memory_limit` to exhaust host memory (finding F5). Does not change
+        /// the SAPI identity.
+        pub fn ephpm_enable_tenant_mode();
+
         /// CLI `-n` — load no php.ini file at all. Must be called BEFORE
         /// `php_embed_init()` (the ini search happens during module startup).
         pub fn ephpm_cli_set_no_ini();
@@ -1310,6 +1319,39 @@ impl PhpRuntime {
         Ok(())
     }
 
+    /// Switch the SAPI identity to `"cli"` (the `ephpm php` process). Must be
+    /// called before [`PhpRuntime::init`] / [`PhpRuntime::cli_main`]. A no-op in
+    /// stub mode. Idempotent.
+    pub fn enable_cli_mode() {
+        #[cfg(php_linked)]
+        // SAFETY: sets a process global read during module startup; must run on
+        // the single-threaded startup path before php_embed_init(), which the
+        // caller guarantees.
+        unsafe {
+            ffi::ephpm_enable_cli_mode();
+        }
+    }
+
+    /// Mark the process as a **tenant** CLI run (`ephpm php --site`, including
+    /// every per-site cron child), in addition to [`PhpRuntime::enable_cli_mode`].
+    /// Must be called before [`PhpRuntime::init`] / [`PhpRuntime::cli_main`].
+    ///
+    /// This re-enables the `memory_hard_limit_percent` SYSTEM-lock and the
+    /// `memory_limit` ceiling that plain CLI mode skips, so a tenant cron script
+    /// cannot `ini_set('memory_limit', '-1')` and exhaust host memory (hardening
+    /// finding F5). Pair it with [`PhpRuntime::set_memory_limit_max`] to set an
+    /// explicit ceiling; otherwise the ceiling is the `memory_limit` PHP started
+    /// with. A no-op in stub mode. Idempotent.
+    pub fn enable_tenant_mode() {
+        #[cfg(php_linked)]
+        // SAFETY: sets a process global read during module startup; must run on
+        // the single-threaded startup path before php_embed_init(), which the
+        // caller guarantees.
+        unsafe {
+            ffi::ephpm_enable_tenant_mode();
+        }
+    }
+
     /// Whether the linked PHP engine has the hard memory limit
     /// (`memory_hard_limit_percent`, PHP 8.3.36 / 8.4.27 / 8.5.12+), whose
     /// `_exit(137)` ends the process unless
@@ -1333,8 +1375,10 @@ impl PhpRuntime {
     ///
     /// `None` makes the ceiling the `memory_limit` PHP starts with. Must be
     /// called before [`PhpRuntime::init`] / [`PhpRuntime::init_with_ini_file`]:
-    /// the hook that enforces it is installed during module startup. Not
-    /// applied in CLI mode. A no-op in stub mode.
+    /// the hook that enforces it is installed during module startup. Applied
+    /// for server requests and for a tenant CLI run (after
+    /// [`PhpRuntime::enable_tenant_mode`]); NOT applied for the plain operator
+    /// CLI (`ephpm php` without `--site`). A no-op in stub mode.
     ///
     /// # Errors
     ///
@@ -1427,8 +1471,9 @@ impl PhpRuntime {
     }
 
     /// The startup `memory_limit` and the enforced runtime ceiling, in bytes,
-    /// or `None` when no ceiling is enforced (`-1`, CLI mode, stub mode, or
-    /// before [`PhpRuntime::init`]). A startup `memory_limit` of `-1` reads as
+    /// or `None` when no ceiling is enforced (`-1`, the plain operator CLI
+    /// without [`PhpRuntime::enable_tenant_mode`], stub mode, or before
+    /// [`PhpRuntime::init`]). A startup `memory_limit` of `-1` reads as
     /// `u64::MAX`.
     #[must_use]
     pub fn memory_limit_bounds() -> Option<MemoryLimitBounds> {

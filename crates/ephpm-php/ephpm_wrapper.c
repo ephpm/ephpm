@@ -643,6 +643,14 @@ static ephpm_log_sink_fn g_log_sink = NULL;
  * Defined this early because ephpm_sapi_log_message reads it. */
 static int g_cli_mode = 0;
 
+/* Tenant-mode flag — set by ephpm_enable_tenant_mode() (documented below). A
+ * CLI invocation that runs a specific virtual host's code (`ephpm php --site`,
+ * including every per-site cron child) sets this in ADDITION to g_cli_mode, so
+ * the memory ceilings below are enforced for tenant CLI even though plain
+ * `ephpm php` (the trusted operator) stays unbounded. Defined this early so
+ * the ceiling installers can read it. */
+static int g_tenant_mode = 0;
+
 /*
  * Install the Rust-side sink that receives PHP's error-log lines (the
  * `log_errors=On` path when no `error_log` file is configured). Must be
@@ -1525,6 +1533,24 @@ void __wrap_zend_unset_timeout(void)
 void ephpm_enable_cli_mode(void)
 {
     g_cli_mode = 1;
+}
+
+/*
+ * Mark this CLI process as running a specific tenant's code (`ephpm php
+ * --site <key>`, including per-site cron children). MUST be called before
+ * php_embed_init() for the same reason as ephpm_enable_cli_mode(): the memory
+ * ceilings are installed during module startup and read this flag there.
+ *
+ * It does NOT change the SAPI identity (still "cli") — it only re-enables the
+ * memory_hard_limit_percent SYSTEM-lock and the memory_limit ceiling that
+ * g_cli_mode otherwise skips, so a tenant cron script cannot `ini_set(
+ * 'memory_limit', '-1')` and exhaust host memory (hardening finding F5). Plain
+ * `ephpm php` (no --site, the trusted operator) never sets this and stays
+ * unbounded, exactly as php-cli is.
+ */
+void ephpm_enable_tenant_mode(void)
+{
+    g_tenant_mode = 1;
 }
 
 /* SAPI name/pretty-name pair for the active mode. */
@@ -3849,11 +3875,14 @@ static const zend_function_entry ephpm_worker_envelope_methods[] = {
  * every ZTS thread copies its own directives from (zend_copy_ini_directives),
  * so one write covers every thread. main.c registers its entries before any
  * module starts, so the entry exists here on a patched SDK; on an older SDK it
- * is absent and this is a no-op. Not in `ephpm php` (g_cli_mode): the CLI runs
- * the operator's own script, as php-cli would. */
+ * is absent and this is a no-op. Skipped only for the plain operator CLI
+ * (`ephpm php`, g_cli_mode && !g_tenant_mode) — that runs the operator's own
+ * script, as php-cli would. A tenant CLI run (`ephpm php --site`, which sets
+ * g_tenant_mode, including every per-site cron child) is locked exactly like a
+ * server request so a tenant cannot raise the hard limit (finding F5). */
 static void ephpm_lock_hard_limit_ini(void)
 {
-    if (g_cli_mode) {
+    if (g_cli_mode && !g_tenant_mode) {
         return;
     }
     zend_ini_entry *entry = zend_hash_str_find_ptr(
@@ -3888,8 +3917,10 @@ static void ephpm_lock_hard_limit_ini(void)
  * The ceiling is the raw string handed over by ephpm_set_memory_limit_max()
  * before module startup, or — when none was — the memory_limit PHP started
  * with. A ceiling of -1 (or a startup memory_limit of -1 with no explicit
- * ceiling) disables the check. Not in `ephpm php` (g_cli_mode): the CLI runs
- * the operator's own script, as php-cli does, and composer needs -1.
+ * ceiling) disables the check. Skipped only for the plain operator CLI
+ * (`ephpm php`, g_cli_mode && !g_tenant_mode): that runs the operator's own
+ * script, as php-cli does, and composer needs -1. A tenant CLI run (`ephpm php
+ * --site`, g_tenant_mode — including per-site cron) is bounded like a request.
  *
  * Installed from this module's MINIT, like ephpm_lock_hard_limit_ini, so every
  * ZTS thread's copy of the entry (zend_copy_ini_directives) carries the
@@ -3955,7 +3986,11 @@ static ZEND_INI_MH(ephpm_on_modify_memory_limit)
 
 static void ephpm_bound_memory_limit_ini(void)
 {
-    if (g_cli_mode) {
+    /* Enforced for server requests and for tenant CLI (`ephpm php --site`,
+     * g_tenant_mode — including per-site cron children); skipped only for the
+     * plain operator CLI (`ephpm php`), where composer and friends need -1
+     * (finding F5). */
+    if (g_cli_mode && !g_tenant_mode) {
         return;
     }
     zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives), ZEND_STRL("memory_limit"));
