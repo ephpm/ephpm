@@ -1648,6 +1648,13 @@ path = "{DATA_DIR}/wordpress.db"
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:{MYSQL_PORT}"
 
+# The whole-database clustered wire listener authenticates by default
+# ([db.wire_auth], finding F4). The cluster_failover suite drives it with a
+# bare mysql_async client and an empty password, and this fixture is testing
+# CDC failover, not auth — so opt the listener back to open loopback access.
+[db.wire_auth]
+allow_insecure_no_auth = true
+
 [db.sqlite.replication]
 role = "auto"
 

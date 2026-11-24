@@ -54,6 +54,7 @@ pub mod turso_cdc_metrics;
 mod user_locks;
 pub mod wal_gate;
 pub mod websocket;
+pub mod wire_auth;
 pub mod worker_pool;
 pub mod xdebug_trigger;
 
@@ -572,6 +573,39 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         _ => None,
     };
 
+    // Baseline authentication for the SHARED SQL wire listeners ([db.mysql]
+    // proxy, single-node / whole-database clustered [db.sqlite]). Resolved ONCE
+    // here so the listener (its authenticator) and the router (the credential
+    // it injects into $_SERVER) agree — the per-process random fallback would
+    // otherwise differ between them. Per-site mode is NOT covered here: it has
+    // its own per-vhost credential (`per_site_wire_auth`). When no shared
+    // listener exists we stay `Disabled` (and silent) rather than mint and log
+    // a credential nothing uses. Finding F4 (multi-tenant breakout audit).
+    let shared_db_wire = if shared_db_wire_present(&config, cluster_handle.is_some()) {
+        wire_auth::SharedWireAuth::resolve(&config)?
+    } else {
+        wire_auth::SharedWireAuth::Disabled
+    };
+
+    // A shared SQL wire listener in a multi-tenant deployment gives every
+    // tenant the SAME database — the shared credential authenticates the
+    // *server*, not a tenant, so one tenant's PHP reads and writes every
+    // other's data. Per-site mode (one database per vhost, per-vhost
+    // credential) is the isolating configuration. Warn loudly; don't refuse,
+    // because a single trusted-app multi-site front end is a legitimate (if
+    // unusual) shape.
+    if config.server.sites_dir.is_some()
+        && shared_db_wire_present(&config, cluster_handle.is_some())
+    {
+        tracing::warn!(
+            "[server] sites_dir is set together with a SHARED SQL wire listener ([db.mysql] or \
+             single-node / whole-database clustered [db.sqlite]). Every virtual host shares ONE \
+             database with NO tenant isolation — any tenant's PHP can read and write every other \
+             tenant's data. For per-tenant isolation use per-site mode: [db.sqlite] with \
+             [db.sqlite] dir set (and, clustered, [db.sqlite.replication] per_site = true)."
+        );
+    }
+
     // Shared "am I the writable SQLite target?" view, exposed at
     // `/_ephpm/primary` for active-passive load-balancer routing. Starts `true`
     // (a standalone/non-clustered node is trivially writable); in
@@ -645,6 +679,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         db_backup.clone(),
         cron_scheduler,
         dev_mode,
+        &shared_db_wire,
     )
     .await?;
 
@@ -656,6 +691,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         &db_health,
         Arc::clone(&primary_view),
         per_site_cluster,
+        &shared_db_wire,
     )
     .await?;
     // Everything root is needed for is now done: privileged ports are bound,
@@ -1045,6 +1081,9 @@ async fn bind_listeners(
     // `ephpm dev`: lifts the multi-site credential requirement on the
     // internal endpoints (see `Router::with_dev_mode_access`).
     dev_mode: bool,
+    // Shared SQL wire-listener authentication (finding F4), resolved once in
+    // `serve()` so the router injects the SAME credential the listener verifies.
+    shared_db_wire: &wire_auth::SharedWireAuth,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -1301,6 +1340,17 @@ async fn bind_listeners(
 
         let router = match per_site_db_wire {
             Some((auth, listen)) => router.with_per_site_db_wire(auth, listen),
+            None => router,
+        };
+
+        // Inject the shared wire credential into PHP's $_SERVER DB_* for the
+        // shared-listener modes ([db.mysql] proxy, single-node / whole-database
+        // clustered [db.sqlite]) so stock pdo_mysql authenticates transparently.
+        // `None` leaves the router's config-derived injection untouched (opt-out,
+        // or a mode this does not cover — e.g. per-site or [db.postgres]).
+        let router = match build_shared_db_env_vars(config, shared_db_wire, config.cluster.enabled)
+        {
+            Some(env_vars) => router.with_shared_db_wire(env_vars),
             None => router,
         };
 
@@ -2544,23 +2594,40 @@ fn warn_internal_access_exposure(
 /// there is no credential an operator could configure to make the
 /// listener safe, and binding `0.0.0.0` inside a container that is
 /// firewalled by a network policy is a legitimate deployment.
-fn warn_on_exposed_db_listeners(config: &Config) {
+fn warn_on_exposed_db_listeners(config: &Config, shared_wire: &wire_auth::SharedWireAuth) {
+    // The shared listeners ([db.mysql] proxy, single-node / whole-database
+    // clustered [db.sqlite] mysql_listen) authenticate when `shared_wire` is
+    // required. The optional Hrana/PostgreSQL/TDS SQLite frontends, and the
+    // [db.postgres] proxy, are not covered by the shared credential.
+    let mysql_authed = shared_wire.is_required();
     // Defaults mirror the ones applied where each proxy is started below.
     if let Some(mysql) = &config.db.mysql {
         warn_if_db_listener_exposed(
             "[db.mysql] listen",
             mysql.listen.as_deref().unwrap_or("127.0.0.1:3306"),
+            mysql_authed,
         );
     }
     if let Some(pg) = &config.db.postgres {
         warn_if_db_listener_exposed(
             "[db.postgres] listen",
             pg.listen.as_deref().unwrap_or("127.0.0.1:5432"),
+            false,
         );
     }
     if let Some(sqlite) = &config.db.sqlite {
         let proxy = &sqlite.proxy;
-        warn_if_db_listener_exposed("[db.sqlite.proxy] mysql_listen", &proxy.mysql_listen);
+        // The MySQL frontend is authenticated in single-node / whole-database
+        // clustered mode; in per-site mode it is gated per vhost by
+        // `site_wire_auth` (also authenticated), so `mysql_authed` is only
+        // false under the explicit opt-out. The optional frontends are never
+        // authenticated (they refuse to start when auth is required).
+        let sqlite_mysql_authed = mysql_authed || config.server.sites_dir.is_some();
+        warn_if_db_listener_exposed(
+            "[db.sqlite.proxy] mysql_listen",
+            &proxy.mysql_listen,
+            sqlite_mysql_authed,
+        );
         let optional = [
             ("[db.sqlite.proxy] hrana_listen", proxy.hrana_listen.as_deref()),
             ("[db.sqlite.proxy] postgres_listen", proxy.postgres_listen.as_deref()),
@@ -2568,17 +2635,31 @@ fn warn_on_exposed_db_listeners(config: &Config) {
         ];
         for (key, addr) in optional {
             if let Some(addr) = addr {
-                warn_if_db_listener_exposed(key, addr);
+                warn_if_db_listener_exposed(key, addr, false);
             }
         }
     }
 }
 
 /// Emit the exposure warning for one listener, if it is in fact exposed.
-fn warn_if_db_listener_exposed(key: &str, addr: &str) {
-    if let Some(exposure) = db_listen_exposure(addr) {
+///
+/// `authenticated` tightens the message: an authenticated listener still
+/// warrants a firewall (whoever can read the credential has full access), but
+/// it is not the wide-open hole an unauthenticated one is.
+fn warn_if_db_listener_exposed(key: &str, addr: &str, authenticated: bool) {
+    let Some(exposure) = db_listen_exposure(addr) else {
+        return;
+    };
+    if authenticated {
         tracing::warn!(
-            "{key} = \"{addr}\" listens on {exposure}. The SQL wire frontends do NOT \
+            "{key} = \"{addr}\" listens on {exposure}. The listener requires the shared \
+             [db.wire_auth] credential, but anyone who can read it (or the config/[kv] secret it \
+             derives from) gets full read/write access. Bind a loopback address unless this port \
+             is firewalled from untrusted networks."
+        );
+    } else {
+        tracing::warn!(
+            "{key} = \"{addr}\" listens on {exposure}. This SQL wire frontend does NOT \
              authenticate clients — any host that can reach this port gets full read/write \
              access to the database. Bind a loopback address unless this port is firewalled \
              from untrusted networks."
@@ -2636,10 +2717,14 @@ async fn start_db_proxies(
     // registry so the resolver is registered before any request. `Some` only
     // in per-site clustered mode; consumed by the CDC path below.
     per_site_cluster: Option<PerSiteClusterWiring>,
+    // Baseline authentication for the SHARED SQL wire listeners ([db.mysql],
+    // single-node / whole-database clustered [db.sqlite]). Resolved once in
+    // `serve()` so the listener and the router's $_SERVER injection agree.
+    shared_wire: &wire_auth::SharedWireAuth,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
-    warn_on_exposed_db_listeners(config);
+    warn_on_exposed_db_listeners(config, shared_wire);
 
     // MySQL proxy
     if let Some(mysql_config) = &config.db.mysql {
@@ -2692,6 +2777,12 @@ async fn start_db_proxies(
                 // proxied and embedded queries land on one metrics surface.
                 query_stats.clone(),
                 health,
+                // Verify the client's handshake against the shared credential
+                // before forwarding, unless the operator opted out. `None`
+                // restores the old credential-free behavior.
+                shared_wire
+                    .injected_credential()
+                    .map(|(_, password)| ephpm_db::mysql::ClientAuth::from_password(password)),
             )
             .await
             .context("failed to start MySQL proxy")?,
@@ -2818,6 +2909,7 @@ async fn start_db_proxies(
                 config.db.analysis.log_failed_sql,
                 &mut handles,
                 primary_view,
+                shared_wire,
             )
             .await?;
         } else if is_per_site_sqlite(config, cluster.is_some()) {
@@ -2831,6 +2923,7 @@ async fn start_db_proxies(
                 query_stats,
                 config.db.analysis.log_failed_sql,
                 &mut handles,
+                shared_wire,
             )
             .await?;
         }
@@ -3200,6 +3293,78 @@ pub(crate) fn is_per_site_clustered(config: &Config, cluster_enabled: bool) -> b
             && is_clustered_sqlite(s, cluster_enabled)
             && s.replication.per_site
     })
+}
+
+/// Whether a **shared** SQL wire listener (one the `[db.wire_auth]` credential
+/// gates) exists: the `[db.mysql]` proxy, or single-node / whole-database
+/// clustered `[db.sqlite]`.
+///
+/// Per-site modes are excluded — they have their own per-vhost wire credential
+/// (`site_wire_auth`), so the shared credential neither gates nor is injected
+/// for them. When this is false the shared credential is left unresolved
+/// (`SharedWireAuth::Disabled`) so nothing is minted or logged for a listener
+/// that does not exist.
+pub(crate) fn shared_db_wire_present(config: &Config, cluster_enabled: bool) -> bool {
+    if config.db.mysql.is_some() {
+        return true;
+    }
+    config.db.sqlite.is_some()
+        && !is_per_site_sqlite(config, cluster_enabled)
+        && !is_per_site_clustered(config, cluster_enabled)
+}
+
+/// Build the `$_SERVER` `DB_*` injection for the shared-listener modes, with
+/// the shared wire credential, or `None` to leave the router's config-derived
+/// injection ([`build_db_env_vars`]) untouched.
+///
+/// Returns `None` when:
+/// * authentication is disabled (opt-out) — PHP keeps the old behavior; for
+///   `[db.mysql]` the backend credentials it already injected still reach a
+///   now-credential-free proxy, and single-node `[db.sqlite]` injected nothing;
+/// * `[db.postgres]` is the backend (not covered by the shared credential);
+/// * there is no shared listener at all (per-site, or no `[db.sqlite]`).
+///
+/// For `[db.mysql]` it overrides the injected `DB_USER`/`DB_PASSWORD` (and the
+/// `DATABASE_URL`) with the shared credential, because PHP now authenticates to
+/// the *proxy* with it, not with the backend account. The database name stays
+/// the one parsed from the backend URL so framework config reads sensibly. For
+/// single-node / whole-database clustered `[db.sqlite]` it synthesizes the full
+/// map pointing at `mysql_listen`.
+pub(crate) fn build_shared_db_env_vars(
+    config: &Config,
+    shared_wire: &wire_auth::SharedWireAuth,
+    cluster_enabled: bool,
+) -> Option<Vec<(String, String)>> {
+    let (username, password) = shared_wire.injected_credential()?; // None => disabled
+
+    // [db.mysql] proxy takes precedence (matches `build_db_env_vars`).
+    if let Some(mysql) = &config.db.mysql
+        && mysql.inject_env
+    {
+        let listen = mysql.listen.as_deref().unwrap_or("127.0.0.1:3306");
+        let db_name = router::db_name_from_url(&mysql.url);
+        return Some(router::wire_db_env_vars(listen, username, password, &db_name, "mysql"));
+    }
+
+    // [db.postgres] is not gated by the shared credential — leave it alone.
+    if config.db.postgres.is_some() {
+        return None;
+    }
+
+    // Single-node / whole-database clustered [db.sqlite]: inject a full map
+    // pointing at the authenticated MySQL listener. (Per-site modes are handled
+    // per request by `build_per_site_db_env_vars` and never reach here.)
+    if let Some(sqlite) = &config.db.sqlite
+        && !is_per_site_sqlite(config, cluster_enabled)
+        && !is_per_site_clustered(config, cluster_enabled)
+    {
+        let listen = &sqlite.proxy.mysql_listen;
+        // Cosmetic database name; litewire fixes the real database by the
+        // backend bound, and answers `USE <db>` without switching.
+        return Some(router::wire_db_env_vars(listen, username, password, "ephpm", "mysql"));
+    }
+
+    None
 }
 
 /// The embedded-SQLite mode a loaded [`Config`] selects, classified for the
@@ -3708,6 +3873,7 @@ async fn start_single_node_sqlite(
     // litewire wire frontend.
     log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    shared_wire: &wire_auth::SharedWireAuth,
 ) -> anyhow::Result<()> {
     probe_sqlite_listeners(&sqlite_frontend_addrs(&sqlite_config.proxy))
         .await
@@ -3737,7 +3903,8 @@ async fn start_single_node_sqlite(
         share_backend_with_php(scoped),
         log_failed_sql,
         handles,
-    );
+        shared_wire,
+    )?;
     Ok(())
 }
 
@@ -3789,6 +3956,14 @@ impl litewire::backend::Backend for PhpSharedBackend {
 }
 
 /// Wire the configured frontends onto a litewire builder and spawn it.
+///
+/// # Errors
+///
+/// Fails closed when authentication is required (`[db.wire_auth]`, the default)
+/// and a Hrana/PostgreSQL/TDS frontend is also configured: litewire can
+/// authenticate only its MySQL frontend, so there is no way to serve the
+/// others behind the shared credential. The operator removes those frontends
+/// or opts out with `allow_insecure_no_auth = true`.
 fn spawn_single_node_litewire(
     sqlite_config: &ephpm_config::SqliteConfig,
     backend: impl litewire::backend::Backend,
@@ -3796,36 +3971,72 @@ fn spawn_single_node_litewire(
     // logs the raw failing SQL (truncated) at WARN — see the config doc comment.
     log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) {
+    shared_wire: &wire_auth::SharedWireAuth,
+) -> anyhow::Result<()> {
+    let proxy = &sqlite_config.proxy;
+
+    // Authenticated: MySQL frontend only (litewire refuses the others under an
+    // authenticator). Build with_authenticator, binding this one backend to
+    // every connection that proves the shared credential.
+    if shared_wire.is_required() {
+        reject_unauthenticatable_sqlite_frontends(proxy, "single-node")?;
+        let shared = std::sync::Arc::new(backend) as litewire::backend::SharedBackend;
+        let authenticator =
+            shared_wire.authenticator(shared).expect("is_required() => authenticator() is Some");
+        let mut builder = litewire::LiteWire::with_authenticator(authenticator);
+        if log_failed_sql {
+            builder = builder.log_failed_sql(true);
+        }
+        builder = builder.mysql(&proxy.mysql_listen);
+        if proxy.max_connections > 0 {
+            builder = builder.max_connections(proxy.max_connections);
+        }
+        tracing::info!(
+            listen = %proxy.mysql_listen,
+            "SQLite MySQL wire protocol enabled (authenticated; clients present the shared \
+             [db.wire_auth] credential, injected into PHP's $_SERVER)"
+        );
+        handles.push(tokio::spawn(async move {
+            match builder.serve().await {
+                Ok(()) => tracing::info!("litewire stopped"),
+                Err(e) => tracing::error!("litewire error: {e:#}"),
+            }
+        }));
+        return Ok(());
+    }
+
+    // Opt-out (`allow_insecure_no_auth = true`): the historical shape — one
+    // fixed backend served to every client on every configured frontend, with
+    // no credential. The loud WARN was already emitted at resolution.
     let mut builder = litewire::LiteWire::new(backend);
     if log_failed_sql {
         builder = builder.log_failed_sql(true);
     }
-    builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
+    builder = builder.mysql(&proxy.mysql_listen);
     tracing::info!(
-        listen = %sqlite_config.proxy.mysql_listen,
-        "SQLite MySQL wire protocol enabled"
+        listen = %proxy.mysql_listen,
+        "SQLite MySQL wire protocol enabled (UNAUTHENTICATED — allow_insecure_no_auth)"
     );
 
-    if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
+    if let Some(ref hrana_addr) = proxy.hrana_listen {
         builder = builder.hrana(hrana_addr);
         tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled");
     }
 
-    if let Some(ref pg_addr) = sqlite_config.proxy.postgres_listen {
+    if let Some(ref pg_addr) = proxy.postgres_listen {
         builder = builder.postgres(pg_addr);
         tracing::info!(listen = %pg_addr, "SQLite PostgreSQL wire protocol enabled");
     }
 
-    if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
+    if let Some(ref tds_addr) = proxy.tds_listen {
         builder = builder.tds(tds_addr);
         tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled");
     }
 
-    if sqlite_config.proxy.max_connections > 0 {
-        builder = builder.max_connections(sqlite_config.proxy.max_connections);
+    if proxy.max_connections > 0 {
+        builder = builder.max_connections(proxy.max_connections);
         tracing::info!(
-            max_connections = sqlite_config.proxy.max_connections,
+            max_connections = proxy.max_connections,
             "SQLite wire frontends: connection cap enabled"
         );
     }
@@ -3836,6 +4047,39 @@ fn spawn_single_node_litewire(
             Err(e) => tracing::error!("litewire error: {e:#}"),
         }
     }));
+    Ok(())
+}
+
+/// Fail startup if an unauthenticatable wire frontend (Hrana / PostgreSQL /
+/// TDS) is configured while authentication is required.
+///
+/// litewire's per-connection authenticator binds only the MySQL frontend;
+/// starting it with any of the others configured is refused by litewire
+/// anyway, so this catches it early with an actionable message naming the
+/// opt-out. `mode` is a short label for the log ("single-node" / "clustered").
+pub(crate) fn reject_unauthenticatable_sqlite_frontends(
+    proxy: &ephpm_config::SqliteProxyConfig,
+    mode: &str,
+) -> anyhow::Result<()> {
+    let mut extra = Vec::new();
+    if proxy.hrana_listen.is_some() {
+        extra.push("hrana_listen");
+    }
+    if proxy.postgres_listen.is_some() {
+        extra.push("postgres_listen");
+    }
+    if proxy.tds_listen.is_some() {
+        extra.push("tds_listen");
+    }
+    anyhow::ensure!(
+        extra.is_empty(),
+        "[db.sqlite.proxy] {frontends} cannot be authenticated: litewire authenticates only the \
+         MySQL frontend, so the shared [db.wire_auth] credential cannot gate them ({mode} mode). \
+         Remove {frontends}, or set [db.wire_auth] allow_insecure_no_auth = true to serve every \
+         frontend WITHOUT authentication.",
+        frontends = extra.join(" / "),
+    );
+    Ok(())
 }
 
 /// Parse a memory size string (e.g. "256MB", "1GB") to bytes.
@@ -4210,6 +4454,78 @@ mod lib_tests {
             },
             backup: ephpm_config::DbBackupConfig::default(),
         }
+    }
+
+    /// Load a `Config` from inline TOML (for the wire-auth injection tests).
+    fn cfg_from(toml: &str) -> Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ephpm.toml");
+        std::fs::write(&path, toml).expect("write config");
+        Config::load(&path).expect("load config")
+    }
+
+    fn env_get<'a>(vars: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        vars.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str())
+    }
+
+    // ── finding F4: shared wire-listener authentication ──────────────────
+
+    #[test]
+    fn shared_wire_present_only_for_shared_listener_modes() {
+        // [db.mysql] proxy → shared listener.
+        assert!(shared_db_wire_present(
+            &cfg_from("[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\n"),
+            false
+        ));
+        // single-node [db.sqlite] → shared listener.
+        assert!(shared_db_wire_present(&cfg_from("[db.sqlite]\npath = \"app.db\"\n"), false));
+        // per-site [db.sqlite] (sites_dir + dir) → NOT shared (own per-vhost creds).
+        assert!(!shared_db_wire_present(
+            &cfg_from("[server]\nsites_dir = \"/srv/sites\"\n[db.sqlite]\ndir = \"/srv/dbs\"\n"),
+            false
+        ));
+        // No database → nothing to gate.
+        assert!(!shared_db_wire_present(&cfg_from(""), false));
+    }
+
+    #[test]
+    fn shared_db_env_injects_credential_for_single_node_sqlite() {
+        let config = cfg_from(
+            "[db.sqlite]\npath = \"app.db\"\n[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:3399\"\n",
+        );
+        let wire = wire_auth::SharedWireAuth::Required(std::sync::Arc::from("tok"));
+        let vars = build_shared_db_env_vars(&config, &wire, false)
+            .expect("single-node sqlite must inject DB_*");
+        assert_eq!(env_get(&vars, "DB_HOST"), Some("127.0.0.1"));
+        assert_eq!(env_get(&vars, "DB_PORT"), Some("3399"));
+        assert_eq!(env_get(&vars, "DB_USER"), Some(wire_auth::WIRE_USERNAME));
+        assert_eq!(env_get(&vars, "DB_PASSWORD"), Some("tok"));
+        assert_eq!(env_get(&vars, "DB_CONNECTION"), Some("mysql"));
+    }
+
+    #[test]
+    fn shared_db_env_overrides_mysql_proxy_password() {
+        // The injected credential for [db.mysql] is the wire credential, NOT
+        // the backend URL's password — PHP authenticates to the proxy now.
+        let config = cfg_from("[db.mysql]\nurl = \"mysql://root:backendpw@127.0.0.1:3306/shop\"\n");
+        let wire = wire_auth::SharedWireAuth::Required(std::sync::Arc::from("wiretok"));
+        let vars = build_shared_db_env_vars(&config, &wire, false).expect("mysql proxy injects");
+        assert_eq!(env_get(&vars, "DB_PASSWORD"), Some("wiretok"));
+        assert_eq!(env_get(&vars, "DB_NAME"), Some("shop"), "db name stays the backend's");
+        assert!(
+            !vars.iter().any(|(_, v)| v.contains("backendpw")),
+            "the backend password must not leak into the injected env"
+        );
+    }
+
+    #[test]
+    fn shared_db_env_is_none_when_auth_disabled() {
+        let config = cfg_from("[db.sqlite]\npath = \"app.db\"\n");
+        assert!(
+            build_shared_db_env_vars(&config, &wire_auth::SharedWireAuth::Disabled, false)
+                .is_none(),
+            "opt-out leaves the router's config-derived injection untouched"
+        );
     }
 
     #[test]
@@ -4815,9 +5131,15 @@ mod lib_tests {
         let stats = ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default());
         let mut handles = Vec::new();
 
-        let err = start_single_node_sqlite(&cfg, &stats, false, &mut handles)
-            .await
-            .expect_err("an occupied mysql_listen must fail startup");
+        let err = start_single_node_sqlite(
+            &cfg,
+            &stats,
+            false,
+            &mut handles,
+            &wire_auth::SharedWireAuth::Disabled,
+        )
+        .await
+        .expect_err("an occupied mysql_listen must fail startup");
         assert!(format!("{err:#}").contains(&addr), "got: {err:#}");
         assert!(handles.is_empty(), "no litewire task may be spawned");
         assert!(!db.exists(), "the database must not be opened before the listener check");

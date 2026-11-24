@@ -2427,6 +2427,21 @@ impl Router {
         self
     }
 
+    /// Replace the static `DB_*` injection with one carrying the shared wire
+    /// credential (finding F4).
+    ///
+    /// `serve()` calls this only for the shared-listener modes ([db.mysql]
+    /// proxy, single-node / whole-database clustered [db.sqlite]) when
+    /// authentication is required, with the credential the listener verifies
+    /// against — so stock `pdo_mysql` authenticates transparently. Left unset,
+    /// the router keeps whatever [`build_db_env_vars`] derived from config
+    /// (the opt-out / `[db.postgres]` / per-site paths).
+    #[must_use]
+    pub(crate) fn with_shared_db_wire(mut self, env_vars: Vec<(String, String)>) -> Self {
+        self.db_env_vars = env_vars;
+        self
+    }
+
     /// Resolve the site configuration from the `Host` header.
     ///
     /// Returns the document root, index files, and fallback chain for the
@@ -7161,14 +7176,40 @@ fn build_db_env_vars(config: &Config) -> Vec<(String, String)> {
 
 /// Parse a database URL and proxy listen address into env var pairs.
 fn db_env_from_url(listen: &str, backend_url: &str, driver: &str) -> Vec<(String, String)> {
-    let (host, port) = listen.rsplit_once(':').unwrap_or((listen, "3306"));
-
     // Parse: scheme://user:password@host:port/dbname
     let rest = backend_url.find("://").map_or(backend_url, |i| &backend_url[i + 3..]);
-    let (creds, host_db) = rest.split_once('@').unwrap_or(("", rest));
+    let (creds, _host_db) = rest.split_once('@').unwrap_or(("", rest));
     let (user, password) = creds.split_once(':').unwrap_or((creds, ""));
-    let db_name = host_db.split_once('/').map_or("", |(_, db)| db).split('?').next().unwrap_or("");
+    let db_name = db_name_from_url(backend_url);
+    wire_db_env_vars(listen, user, password, &db_name, driver)
+}
 
+/// Extract the database name from a backend URL (`scheme://…/dbname?params`).
+///
+/// Empty when the URL carries no path component.
+#[must_use]
+pub(crate) fn db_name_from_url(backend_url: &str) -> String {
+    let rest = backend_url.find("://").map_or(backend_url, |i| &backend_url[i + 3..]);
+    let host_db = rest.split_once('@').map_or(rest, |(_, hd)| hd);
+    host_db.split_once('/').map_or("", |(_, db)| db).split('?').next().unwrap_or("").to_string()
+}
+
+/// Build the `DB_*` env-var pairs PHP's frameworks auto-discover, for a given
+/// proxy `listen` address and explicit credentials.
+///
+/// Shared by the config-derived `[db.mysql]` / `[db.postgres]` injection
+/// ([`db_env_from_url`]) and the shared-wire-credential injection
+/// ([`crate::build_shared_db_env_vars`]), so the two cannot drift. `listen`'s
+/// host is passed through verbatim (a DNS name stays a DNS name).
+#[must_use]
+pub(crate) fn wire_db_env_vars(
+    listen: &str,
+    user: &str,
+    password: &str,
+    db_name: &str,
+    driver: &str,
+) -> Vec<(String, String)> {
+    let (host, port) = listen.rsplit_once(':').unwrap_or((listen, "3306"));
     vec![
         ("DB_HOST".into(), host.into()),
         ("DB_PORT".into(), port.into()),

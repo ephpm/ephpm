@@ -48,6 +48,35 @@ pub fn derive_site_password(secret: &str, hostname: &str) -> String {
     hex
 }
 
+/// Domain-separation label for the single shared SQL-wire-listener credential.
+///
+/// Distinct from any site key (which is `[a-z0-9._-]`), so a tenant can never
+/// name a site whose per-site password collides with the shared one.
+const SERVER_WIRE_LABEL: &str = "ephpm-db-wire";
+
+/// Derive the shared SQL-wire-listener password from a master secret.
+///
+/// `HMAC-SHA256(secret, "ephpm-db-wire")`, hex-encoded — the same construction
+/// [`derive_site_password`] uses, with a fixed label instead of a site key, so
+/// the shared credential is stable across restarts and derivable by any
+/// co-located process that can read the same `[kv] secret`.
+///
+/// Returns a lowercase hex string (64 characters).
+///
+/// # Examples
+///
+/// ```
+/// use ephpm_kv::auth::derive_wire_password;
+///
+/// let pw = derive_wire_password("my-secret");
+/// assert_eq!(pw.len(), 64);
+/// assert_eq!(pw, derive_wire_password("my-secret"));
+/// ```
+#[must_use]
+pub fn derive_wire_password(secret: &str) -> String {
+    derive_site_password(secret, SERVER_WIRE_LABEL)
+}
+
 /// Constant-time validation of a provided password against the derived value.
 ///
 /// Computes `HMAC-SHA256(secret, hostname)` and compares the hex-encoded

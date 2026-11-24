@@ -154,8 +154,9 @@ There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with
 | In-process PHP bridge (`ephpm_db_*`) | **Implemented** (v0.6.3; adapter introspection surface v0.7.4) | `ephpm-php` (`db_bridge`) |
 | Turso engine (`[db.sqlite]`, single-node) | **Implemented — Beta engine upstream** | `litewire-turso` |
 | Clustered Turso CDC replication (no sqld sidecar) | **Implemented — experimental** | `ephpm-server` (`turso_cdc`) |
-| PostgreSQL wire protocol frontend (`postgres_listen`) | **Implemented** — single-site mode only; unauthenticated; not started in multi-site mode | `litewire-postgres` (pgwire) |
-| TDS (SQL Server) wire protocol frontend (`tds_listen`) | **Implemented** — single-site mode only; unauthenticated; not started in multi-site mode | `litewire-tds` |
+| MySQL wire-listener auth (shared single-database modes) | **Implemented** — `[db.wire_auth]`, required by default; opt out with `allow_insecure_no_auth = true` | `ephpm-server` (`wire_auth`), `ephpm-db` (`mysql::ClientAuth`) |
+| PostgreSQL wire protocol frontend (`postgres_listen`) | **Implemented** — single-site mode only; **unauthenticated** (not covered by `[db.wire_auth]`); refused when MySQL auth is required; not started in multi-site mode | `litewire-postgres` (pgwire) |
+| TDS (SQL Server) wire protocol frontend (`tds_listen`) | **Implemented** — single-site mode only; **unauthenticated**; refused when MySQL auth is required; not started in multi-site mode | `litewire-tds` |
 | Per-site databases (`[server] sites_dir` + `[db.sqlite] dir`) | **Implemented** | `ephpm-server` (`site_backends`, `site_wire_auth`) |
 | Per-site clustered replication (`[db.sqlite.replication] per_site = true`) | **Implemented — experimental** | `ephpm-server` (`turso_cdc`, `sql_forward`) |
 

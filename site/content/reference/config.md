@@ -1163,6 +1163,40 @@ A snapshot runs in a bounded amount of resident memory that **is not proportiona
 
 **Modes.** All modes. In single-node and per-site-single mode the one holder backs each database up. In clustered mode the scheduler gates each database on this node's election/HRW ownership (whole-database: the elected primary or, with `source = "replica"`, a non-primary node; per-site: each site's HRW owner or a replica holder) so each database is snapshotted by **exactly one node** per interval — confirm the split with `ephpm_db_backup_skipped_total{site,reason}` on the non-responsible nodes. A clustered backup carries the CDC replication bookkeeping; `ephpm db restore` strips it so the restored file becomes clean origin data **on the node it is installed on**. Installing it does **not** by itself converge the cluster: a replica that still holds its old database treats the restored node's fresh log identity as an ordinary failover, **keeps its old rows**, and tails the restored log on top — a silently *mixed* database. A clustered restore therefore requires every node stopped (the CLI can only check the local node), and convergence needs one of two things. The two clustered topologies differ in maturity: **whole-database clustered backup is supported**, and `ephpm db restore --reseed` (whole-database only, every node on v0.16.2+) stamps a reseed generation into the restored image so every replica force-discards its own data and cold re-bootstraps from the restored node automatically — restore on the lowest-ordinal node, start it first, and the others converge on their own; **without** `--reseed` convergence is manual (stop every node and delete every *other* node's `.db`/`-wal`/`-shm` before restart). **Per-site clustered backup is EXPERIMENTAL and lab-pending** — it is reachable only through the experimental [`per_site = true`](#dbsqlitereplication-clustered-mode-only) opt-in, its restore convergence is not yet validated on a live cluster (it relies on `SiteVersion` epoch dominance across a whole-cluster restart, and a returning peer with a higher epoch could overwrite a restore silently; `--reseed` is whole-database only, so per-site convergence is still the manual wipe), and both startup and `ephpm db restore` warn loudly about it. Restoring is offline only in this release: see [`ephpm db restore`](/reference/cli/db/#ephpm-db-restore). The design, the exactly-once guarantees, and the multi-node lab validation still pending are in the [clustered-backup design note](/roadmap/clustered-db-backups/). Boot-time auto-hydrate (pulling the newest object when a site's local `.db` is absent at first open) is **planned — not yet implemented**. A task-oriented walkthrough (enable, credentials for S3/MinIO/R2, listing, retention, a worked restore) is the [Database backups guide](/guides/database-backups/).
 
+### `[db.wire_auth]`
+
+Baseline authentication for the **shared** SQL wire listeners — the `[db.mysql]`
+proxy and single-node / whole-database clustered `[db.sqlite]`. The per-site
+(multi-tenant) MySQL listener is not covered here; it already authenticates each
+virtual host with its own credential.
+
+**Authentication is required by default** (a behavior change — finding F4 of the
+multi-tenant breakout audit). These listeners previously authenticated nobody:
+any process that could reach the loopback port, a tenant's own PHP included,
+connected credential-free with full read/write access. PHP keeps working
+transparently because ePHPm injects the credential into each request's
+`$_SERVER` (`DB_USER` / `DB_PASSWORD` / `DATABASE_URL`) — never into the process
+environment (`getenv()` cannot read it) and never logged — exactly as per-site
+mode injects per-site credentials.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `allow_insecure_no_auth` | bool | `false` | Opt out of authentication, restoring the pre-hardening credential-free behavior. Logs a loud `WARN` at startup. Intended only for deployments where the ports are firewalled from untrusted networks. |
+| `password` | string | *(none)* | Explicit shared password. When unset, the credential is `HMAC-SHA256([kv] secret, "ephpm-db-wire")`; when `[kv] secret` is also unset, a per-process random value (stable only for the process lifetime). Never logged. |
+
+Notes:
+
+- With a configured `password` or a stable `[kv] secret`, the credential is
+  stable across restarts, so a co-located `ephpm php --site` / external client
+  can authenticate. **Anyone who can read the config file (or the `[kv] secret`)
+  can connect** — the same trust boundary `ephpm exec` documents.
+- The Hrana / PostgreSQL / TDS `[db.sqlite.proxy]` frontends **cannot** be
+  authenticated (litewire authenticates only its MySQL frontend). Configuring
+  one while authentication is required is a **startup error** that names the
+  opt-out. `[db.postgres]` proxy auth is not yet implemented.
+- `[server] sites_dir` with a shared listener gives every tenant the **same**
+  database (no isolation); startup warns and points you at per-site mode.
+
 ### `[db.read_write_split]`
 
 | Key | Type | Default | Description |
