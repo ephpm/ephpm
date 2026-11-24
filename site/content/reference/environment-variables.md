@@ -54,6 +54,18 @@ Not reported, because ePHPm or its tooling reads them directly rather than as co
 
 Any other `EPHPM_*` variable you set for some other purpose (for example one referenced as `env:NAME` from a per-site override file) is still reported. The warning is advisory: it changes nothing about how the variable is used. Two limits: the "did you mean" suggestion only fixes the separator after the section name (`EPHPM_DB_SQLITE_PATH` suggests `EPHPM_DB__SQLITE_PATH`, while the real key is `EPHPM_DB__SQLITE__PATH`), and a misspelling that collides with a harness variable (`EPHPM_SITES_DIR`, `EPHPM_DOCROOT`, `EPHPM_KV_HOST`, `EPHPM_KV_PORT`, `EPHPM_TEST_*`) is not reported.
 
+## What PHP can see: the environment scrub
+
+`ephpm serve` **scrubs the process environment before PHP starts** (`[php] scrub_environment`, default `true`; audit finding F1). A PHP request reads the process environment through `getenv()`, the `$_ENV` superglobal and `phpinfo()`, and in a multi-tenant deployment one process serves every tenant — so without the scrub any tenant's PHP could read the operator's `EPHPM_KV__SECRET` / `EPHPM_CLUSTER__SECRET`, `AWS_*` credentials and every other exported secret, and with `[kv] secret` mint every other tenant's database/KV password. The scrub clears every variable not kept, once, on the single-threaded startup path before `php_embed_init()`, so `getenv()` / `$_ENV` / `phpinfo()` are clean at the source.
+
+After the scrub, a tenant's PHP sees only:
+
+- the variables named in `[php] env_allowlist` (default `PATH`, `TZ`, `LANG`, `LC_*` — a `*` suffix is a prefix glob);
+- the small internal keep-set ePHPm needs to keep running, which includes the worker-mode bootstrap paths above (`EPHPM_APP_BASE`, `EPHPM_WORKER_BOOTSTRAP`, `EPHPM_WP_PATH`) so **worker mode keeps working with the scrub on** — they are paths, not secrets;
+- any variable a `[[middleware]]` mount references as `env:NAME` (kept so the middleware can resolve it; a secret passed this way stays readable by that node's PHP — prefer a `file:` indirection).
+
+Secrets ePHPm itself consumes are captured before the scrub (figment has already read the `EPHPM_*` config into memory; `AWS_*` are cached into a process-global just before the scrub), so the scrub never breaks the server. **The scrub cannot be disabled under `[server] sites_dir`** — `Config::validate` refuses to start, because disabling it reopens F1 for every tenant. In a single-site deployment it may be set to `false` for an app that reads its own secrets from `getenv()`, but prefer widening `[php] env_allowlist` to the exact variables that app needs. Note: the scrub clears the live `environ` (what `getenv()`/`$_ENV`/`phpinfo()` read); a reader of `/proc/self/environ` still sees the exec-time snapshot, so a multi-tenant deployment should also confine PHP from reading `/proc` (`open_basedir`, the F3 sandbox).
+
 ## `ephpm dev` differs
 
 The table above describes `ephpm serve`. Under `ephpm dev` (and a bare `ephpm`, which runs it):

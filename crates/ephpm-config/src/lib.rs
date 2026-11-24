@@ -129,7 +129,10 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &["PATH", "TZ", "LANG", "LC_*"];
 /// [`NON_CONFIG_ENV_VARS`] that `serve`/`dev` consult once the server is
 /// running — the PHP-pool spin tuning (`ephpm_php::handoff::SpinPolicy`), the
 /// middleware search path and the `github-auth` cdylib override, plus the
-/// Windows service-log route and the crash-handler hook. The unprefixed
+/// Windows service-log route and the crash-handler hook. The worker-mode
+/// bootstrap paths (`EPHPM_APP_BASE`, `EPHPM_WORKER_BOOTSTRAP`, `EPHPM_WP_PATH`)
+/// the org's PHP worker packages read with `getenv()` are kept too — they are
+/// paths, not secrets, and scrubbing them would break worker mode. The unprefixed
 /// entries are the Rust/tokio runtime and host-discovery variables the process
 /// (and its dependencies) read while standing up the tokio runtime and the
 /// cluster identity. The `OTEL_` prefix keeps OpenTelemetry export working.
@@ -153,6 +156,17 @@ pub const SCRUB_RESERVED_ENV_VARS: &[&str] = &[
     // Service / crash plumbing.
     "EPHPM_SERVICE_LOG_FILE",
     "EPHPM_FATAL_HANDLER",
+    // Worker-mode bootstrap paths the org's PHP worker packages read via
+    // getenv() (the docs tell operators to export these before `ephpm serve`):
+    // EPHPM_APP_BASE (ephpm/octane-driver), EPHPM_WORKER_BOOTSTRAP
+    // (ephpm/psr15-worker), EPHPM_WP_PATH (ephpm/wordpress-worker). They are
+    // filesystem paths, not secrets, and scrubbing them would silently break
+    // worker mode — so they survive the scrub regardless of the allowlist. The
+    // wordpress-sample EPHPM_SEED_TOKEN is deliberately absent (it is a token;
+    // an operator who needs it names it in [php] env_allowlist).
+    "EPHPM_APP_BASE",
+    "EPHPM_WORKER_BOOTSTRAP",
+    "EPHPM_WP_PATH",
     // Rust / tokio runtime, built after the scrub.
     "RUST_LOG",
     "RUST_BACKTRACE",
@@ -14205,6 +14219,18 @@ enabled = true
         assert!(env_scrub_reserved("OTEL_EXPORTER_OTLP_ENDPOINT"), "OTEL_ prefix kept");
         assert!(!env_scrub_reserved("EPHPM_KV__SECRET"), "config secrets are never reserved");
         assert!(!env_scrub_reserved("AWS_ACCESS_KEY_ID"), "cloud creds are cached, not reserved");
+    }
+
+    #[test]
+    fn env_scrub_reserved_keeps_worker_bootstrap_vars() {
+        // The org's PHP worker packages read these with getenv() after the
+        // scrub; dropping them would silently break worker mode (fold-in b).
+        assert!(env_scrub_reserved("EPHPM_APP_BASE"), "octane-driver app base kept");
+        assert!(env_scrub_reserved("EPHPM_WORKER_BOOTSTRAP"), "psr15-worker bootstrap kept");
+        assert!(env_scrub_reserved("EPHPM_WP_PATH"), "wordpress-worker path kept");
+        // The wordpress-sample seed token is a token, not a worker path, so it
+        // is not auto-kept — an operator names it in [php] env_allowlist.
+        assert!(!env_scrub_reserved("EPHPM_SEED_TOKEN"), "token is not auto-reserved");
     }
 
     #[test]
