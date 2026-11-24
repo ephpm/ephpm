@@ -915,6 +915,22 @@ mysql_common = { git = "https://github.com/ephpm/rust_mysql_common.git", rev = "
 # turso crate the lockfile pulls from crates.io is patched so no crates.io
 # 0.8.3 copy remains beside the fork. Remove this block (and the deny.toml
 # allow-git entry) once a Turso release carrying these fixes is pinned.
+#
+# turso 0.8.4 assessment (2026-11-24, issue #722 — pins LEFT UNCHANGED): the
+# crates.io `turso 0.8.4` release does NOT carry any of the three fixes above.
+# All three upstream PRs are still OPEN on tursodatabase/turso — #10117
+# (page-1 init_lock), #11503 (batched VACUUM INTO), #11808 (VACUUM INTO source
+# read transaction) — and the v0.8.3...v0.8.4 commit range touches none of
+# them (its changes are FK-DELETE rowid collection, UPDATE rowid savepoint, a
+# JS-binding lock fix, rustls 0.23.45, an autocommit-rollback fix, UPSERT
+# before-image read, and CI runner changes). Bumping to `=0.8.4` and dropping
+# this fork would therefore be a data-safety REGRESSION (re-exposes the page-1
+# allocation race and both VACUUM INTO backup hazards). The bump stays blocked
+# until BOTH happen, in order: (1) the ephpm/turso fork is rebased onto v0.8.4
+# carrying #10117/#11503/#11808 (cross-repo), and (2) litewire is moved to the
+# matching turso rev FIRST (litewire main still pins `turso = "=0.8.3"`, with no
+# bump PR or branch), then this repo's litewire rev + both turso pins move
+# together.
 turso = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
 turso_core = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
 turso_ext = { git = "https://github.com/ephpm/turso.git", rev = "af76b60dc486d6f73175465c962059643f2bfea4" }
