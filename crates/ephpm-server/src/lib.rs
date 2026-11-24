@@ -2903,17 +2903,21 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
 /// Returns `None` when both `ebpf_policy` and `unix_socket_policy` are off
 /// (zero cost: nothing loaded, no per-request tag). Otherwise the `vhostnet`
 /// object is loaded once; the TCP/loopback programs attach when `ebpf_policy`,
-/// and the AF_UNIX fence per `unix_socket_policy`:
+/// and the AF_UNIX fence per `unix_socket_policy`, which the secure default
+/// `"auto"` resolves here against this node (Linux + multi-tenant +
+/// per-request + non-dev ⇒ best-effort fence; otherwise off):
 ///
 /// * `"required"` — a fence failure is a startup error.
-/// * `"warn"` — a fence failure is logged at ERROR and startup continues with
-///   tenant unix connects **unfenced** (the TCP policy, if on, still applies).
+/// * `"warn"` / `"auto"` (where applicable) — a fence failure is logged at
+///   ERROR and startup continues with tenant unix connects **unfenced** (the
+///   TCP policy, if on, still applies).
 ///
 /// `per_site_db_wire_listen` is the stock-`pdo_mysql` listener address in
 /// per-site mode (an infra port every tagged vhost may reach).
 ///
-/// With the fence off on a multi-tenant (non-dev) node, logs one WARN naming
-/// the exposure (audit finding F2), so the default never passes silently.
+/// When an operator **explicitly** sets the fence `"off"` on a node where the
+/// secure default would otherwise fence, logs one WARN naming the exposure
+/// (audit finding F2), so the opt-out never passes silently.
 fn start_tenant_ebpf(
     config: &Config,
     per_site_db_wire_listen: Option<&str>,
@@ -2922,23 +2926,40 @@ fn start_tenant_ebpf(
     use ephpm_config::UnixSocketPolicy;
 
     let tn = &config.server.tenant_network;
-    let unix_policy = tn
+    let raw_policy = tn
         .parse_unix_socket_policy()
         .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+    // Resolve the secure default `auto` for this node. The fence can only run,
+    // and the secure default should only turn it on, where the per-thread
+    // tenant tag exists and the hooks are available: Linux, multi-tenant
+    // (`sites_dir`), per-request mode, and not `ephpm dev`. Elsewhere `auto`
+    // resolves to off so single-tenant / dev / non-Linux / worker nodes keep
+    // running unchanged. Explicit `required`/`warn`/`off` pass through.
+    let fenceable = cfg!(target_os = "linux")
+        && config.server.sites_dir.is_some()
+        && !dev_mode
+        && !config.php.is_worker_mode();
+    let unix_policy = raw_policy.resolve(fenceable);
     let opts = tenant_ebpf::LoadOptions {
         tcp_policy: tn.ebpf_policy,
         unix_fence: unix_policy.is_enabled(),
     };
 
     if !opts.tcp_policy && !opts.unix_fence {
-        if config.server.sites_dir.is_some() && !dev_mode {
+        // The fence is not active. Warn about the exposure only where the
+        // operator EXPLICITLY opted out (`"off"`) on a node where the secure
+        // default would otherwise have fenced — `fenceable` captures exactly
+        // that (Linux, multi-tenant, per-request, non-dev). `auto` resolving to
+        // off (non-Linux / worker) is the feature being inapplicable, not an
+        // opt-out, so it does not nag.
+        if raw_policy == UnixSocketPolicy::Off && fenceable {
             tracing::warn!(
                 "tenant_network: unix_socket_policy = \"off\" on a multi-tenant node — tenant PHP \
                  can connect() to EVERY unix socket this uid can reach (docker.sock, database auth \
                  sockets, D-Bus) via unix:// streams, PDO unix_socket= or curl's \
-                 CURLOPT_UNIX_SOCKET_PATH; open_basedir gates none of them. Set \
-                 [server.tenant_network] unix_socket_policy = \"required\" (Linux >= 6.7 with \
-                 BTF, CAP_BPF + CAP_NET_ADMIN) to deny them all except an explicit per-site \
+                 CURLOPT_UNIX_SOCKET_PATH; open_basedir gates none of them. Remove this line for \
+                 the secure default, or set unix_socket_policy = \"required\" (Linux >= 6.7 with \
+                 BTF, CAP_BPF + CAP_NET_ADMIN), to deny them all except an explicit per-site \
                  unix_socket_allow list."
             );
         }
@@ -2971,19 +2992,24 @@ fn start_tenant_ebpf(
         None
     };
 
-    // `"warn"` covers the WHOLE fence setup chain when the fence is the only
-    // reason the object is being loaded: a failure anywhere in it (cgroup,
-    // object, verifier, attach) is logged and the node runs unfenced. With
-    // `ebpf_policy = true` the base load stays fail-closed as it always was.
+    // The best-effort posture (an explicit `"warn"`, or the secure default
+    // `"auto"` resolved on a node where the fence applies) covers the WHOLE
+    // fence setup chain when the fence is the only reason the object is being
+    // loaded: a failure anywhere in it (cgroup, object, verifier, attach) is
+    // logged at ERROR and the node runs unfenced. With `ebpf_policy = true` the
+    // base load stays fail-closed as it always was. The log names the
+    // configured policy string (`auto`/`warn`) so it is never misleading.
     let warn_unfenced = |e: &anyhow::Error| {
         tracing::error!(
             error = %format!("{e:#}"),
-            "tenant_network: AF_UNIX connect fence could NOT be attached and unix_socket_policy = \
-             \"warn\" — starting UNFENCED: tenant PHP can connect() to every unix socket this uid \
-             can reach (audit finding F2). Needs Linux >= 6.7 with BTF and CAP_BPF + \
-             CAP_NET_ADMIN; set \"required\" to refuse startup instead."
+            policy = %tn.unix_socket_policy,
+            "tenant_network: AF_UNIX connect fence could NOT be attached — starting UNFENCED on a \
+             multi-tenant node: tenant PHP can connect() to every unix socket this uid can reach \
+             (audit finding F2). Needs Linux >= 6.7 with BTF and CAP_BPF + CAP_NET_ADMIN; set \
+             unix_socket_policy = \"required\" to refuse startup instead."
         );
     };
+    // `auto` resolved to `Warn` above, so this also covers the secure default.
     let fence_only_warn = !opts.tcp_policy && unix_policy == UnixSocketPolicy::Warn;
 
     let loaded = tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
@@ -3049,8 +3075,10 @@ fn start_tenant_ebpf(
                          the floor.",
                     ));
                 }
-                // `Off` is unreachable here (`opts.unix_fence` is false for it).
-                UnixSocketPolicy::Warn | UnixSocketPolicy::Off => {
+                // `unix_policy` is already resolved, so `Off`/`Auto` are
+                // unreachable here (`opts.unix_fence` is false for `Off`, and
+                // `resolve` never yields `Auto`); folded in for exhaustiveness.
+                UnixSocketPolicy::Warn | UnixSocketPolicy::Off | UnixSocketPolicy::Auto => {
                     warn_unfenced(&e);
                     if !opts.tcp_policy {
                         // Nothing left for the tag to serve: drop the object

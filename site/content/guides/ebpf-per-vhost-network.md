@@ -127,7 +127,8 @@ has no stale BPF state to reconcile.
 
 ## AF_UNIX connect fence (`unix_socket_policy`)
 
-**Status: Linux ≥ 6.7 only, off by default, independent of `ebpf_policy`.**
+**Status: Linux ≥ 6.7 only, on by default (`unix_socket_policy = "auto"`) on a
+multi-tenant node, independent of `ebpf_policy`.**
 
 The policy above governs TCP/UDP. It leaves one door open that `open_basedir`
 cannot close (multi-tenant breakout audit finding F2): ePHPm is one process and
@@ -155,7 +156,8 @@ an unconnected datagram socket, `sendto(2)`), which is where the fence sits:
 sites_dir = "/srv/ephpm/sites"
 
 [server.tenant_network]
-unix_socket_policy = "required"     # or "warn" (start unfenced on failure), "off"
+unix_socket_policy = "required"     # default is "auto" (on where it can run);
+                                    # "warn" (start unfenced on failure), "off" to opt out
 
 # Per-site allowlist. Absent site (or []) = no unix socket at all.
 [server.tenant_network.unix_socket_allow]
@@ -169,13 +171,19 @@ matched bytewise.
 
 ### Fail-closed behaviour
 
-`unix_socket_policy` has three values, and the choice is the failure policy:
+`unix_socket_policy` has four values. `"auto"` is the default and the choice of
+the others is the failure policy:
 
 | Value | Fence attaches | Fence cannot attach (kernel < 6.7, no BTF, missing capability) |
 |---|---|---|
-| `"required"` | tenant unix connects fenced | **startup refused** with the reason — the posture for a multi-tenant node |
+| `"auto"` (default) | tenant unix connects fenced on a node where the fence can run (Linux, multi-tenant, per-request, not `ephpm dev`); inert elsewhere | ERROR logged, node starts **unfenced** — same as `"warn"` |
+| `"required"` | tenant unix connects fenced | **startup refused** with the reason — the hard-guarantee posture for a multi-tenant node |
 | `"warn"` | tenant unix connects fenced | ERROR logged, node starts **unfenced** |
-| `"off"` | nothing loaded | multi-tenant startup logs one WARN naming the exposure |
+| `"off"` | nothing loaded (explicit opt-out) | a node where the fence would otherwise run logs one WARN naming the exposure |
+
+`"auto"` is the secure default: a multi-tenant Linux ≥ 6.7 node fences tenant
+unix connects without any configuration, and single-tenant, `ephpm dev`,
+non-Linux and worker nodes are left untouched.
 
 ePHPm probes the preconditions before touching the kernel and names the one
 that fails ("kernel 6.1.0 is older than 6.7", "kernel BTF has no kfunc
@@ -196,8 +204,9 @@ errors, never silent no-ops.
 - Multi-tenant mode (`[server] sites_dir`), per-request PHP mode.
 
 **Older kernels.** There is no fallback inside ePHPm: on a kernel before 6.7
-the hooks do not exist, so `"required"` refuses to start and `"warn"` runs
-unfenced. A kernel built with `CONFIG_BPF_LSM` (and `bpf` in the `lsm=` boot
+the hooks do not exist, so `"required"` refuses to start while `"auto"` (the
+default) and `"warn"` log an ERROR and run unfenced. A kernel built with
+`CONFIG_BPF_LSM` (and `bpf` in the `lsm=` boot
 list) could host an equivalent LSM-BPF policy on `unix_stream_connect` /
 `socket_connect`, which also sees the *resolved* socket and so is immune to the
 symlink caveat below — that is a possible future lane, not shipped. Without

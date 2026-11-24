@@ -1686,7 +1686,8 @@ pub struct TenantNetworkConfig {
     pub max_sidecar_ports_per_vhost: u32,
 
     /// AF_UNIX connect fence for tenant PHP (multi-tenant breakout audit
-    /// finding F2): `"off"` (default), `"required"`, or `"warn"`.
+    /// finding F2): `"auto"` (default, **on**), `"off"`, `"required"`, or
+    /// `"warn"`.
     ///
     /// ePHPm is one process and one uid, so tenant PHP can `connect()` to any
     /// unix socket the service uid can reach — `docker.sock`, a database's
@@ -1700,17 +1701,23 @@ pub struct TenantNetworkConfig {
     /// Complements the TCP/loopback policy of `ebpf_policy`; the two are
     /// independent switches over the same per-thread tag.
     ///
+    /// * `"auto"` (default) — **secure by default**: behaves as `"warn"` on a
+    ///   node where the fence can run (Linux, multi-tenant, per-request mode,
+    ///   not `ephpm dev`) and is otherwise inert, so single-tenant / dev /
+    ///   non-Linux / worker nodes are never broken by the default. Resolved by
+    ///   [`UnixSocketPolicy::resolve`] at startup.
     /// * `"required"` — the fence must load and attach; if it cannot (kernel
     ///   older than 6.7, no BTF, missing `CAP_BPF`/`CAP_NET_ADMIN`) startup is
-    ///   **refused**. The posture for a multi-tenant node.
+    ///   **refused**. The hard-guarantee posture for a multi-tenant node.
     /// * `"warn"` — try; on failure log an ERROR and start anyway, with tenant
     ///   unix connects unfenced. For hosts that cannot yet meet the kernel floor.
-    /// * `"off"` — nothing loaded. In multi-tenant mode startup logs a WARN
-    ///   naming the exposure.
+    /// * `"off"` — nothing loaded (the explicit opt-out). On a node where the
+    ///   fence would otherwise run, startup logs a WARN naming the exposure.
     ///
-    /// Linux-only and multi-tenant-only like `ebpf_policy`: any other value, or
-    /// a non-`off` value off Linux / without `[server] sites_dir`, is a hard
-    /// startup error.
+    /// `"auto"` is valid on every platform (it self-disables where the fence
+    /// cannot run). An explicit `"required"`/`"warn"` off Linux, without
+    /// `[server] sites_dir`, or in worker mode is a hard startup error, as is
+    /// any unrecognised value.
     #[serde(default = "default_unix_socket_policy")]
     pub unix_socket_policy: String,
 
@@ -1740,7 +1747,11 @@ fn default_max_sidecar_ports_per_vhost() -> u32 {
 }
 
 fn default_unix_socket_policy() -> String {
-    "off".to_string()
+    // Secure by default: `"auto"` fences tenant unix connects (deny-all) on a
+    // Linux ≥ 6.7 multi-tenant per-request node, and is inert on every other
+    // deployment. See `UnixSocketPolicy::resolve`. `"off"` is the explicit
+    // opt-out.
+    "auto".to_string()
 }
 
 impl Default for TenantNetworkConfig {
@@ -1759,7 +1770,14 @@ impl Default for TenantNetworkConfig {
 /// Parsed `[server.tenant_network] unix_socket_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnixSocketPolicy {
-    /// No fence loaded (the default).
+    /// The context-sensitive **secure default**: a deny-all fence (empty
+    /// allowlist) on a node where it can meaningfully run — Linux ≥ 6.7,
+    /// multi-tenant (`sites_dir` set), per-request mode, not `ephpm dev` — and
+    /// inert everywhere else, so single-tenant, dev, non-Linux and worker nodes
+    /// are never broken by the default. See [`Self::resolve`]; this value never
+    /// survives resolution.
+    Auto,
+    /// No fence loaded.
     Off,
     /// Load and attach the fence; refuse startup if that fails.
     Required,
@@ -1769,9 +1787,35 @@ pub enum UnixSocketPolicy {
 
 impl UnixSocketPolicy {
     /// `true` for every mode that loads the fence.
+    ///
+    /// Call this only on a value returned by [`resolve`](Self::resolve):
+    /// [`Auto`](Self::Auto) is context-sensitive and reports `true` here
+    /// (it intends to fence where applicable), but its real effect is only
+    /// known once resolved against the deployment.
     #[must_use]
     pub fn is_enabled(self) -> bool {
         self != Self::Off
+    }
+
+    /// Resolve the secure default [`Auto`](Self::Auto) into a concrete posture
+    /// for this deployment. Every explicit value passes through unchanged.
+    ///
+    /// `fenceable` must be `true` only where the fence can meaningfully run:
+    /// Linux, multi-tenant (`sites_dir` set), per-request PHP mode, and not
+    /// `ephpm dev`. In a fenceable context `Auto` becomes [`Warn`](Self::Warn)
+    /// — a deny-all fence that logs an ERROR and continues unfenced if the
+    /// kernel cannot host it (the same best-effort posture an operator gets
+    /// from an explicit `"warn"`, and the posture `[server] self_sandbox =
+    /// "auto"` takes for its Landlock sandbox). Elsewhere `Auto` becomes
+    /// [`Off`](Self::Off). An operator who needs a hard guarantee sets
+    /// `"required"` (fail-closed); one who wants to opt out sets `"off"`.
+    #[must_use]
+    pub fn resolve(self, fenceable: bool) -> Self {
+        match self {
+            Self::Auto if fenceable => Self::Warn,
+            Self::Auto => Self::Off,
+            other => other,
+        }
     }
 }
 
@@ -1868,11 +1912,13 @@ impl TenantNetworkConfig {
     /// anything but `"off"`, `"required"` or `"warn"`.
     pub fn parse_unix_socket_policy(&self) -> Result<UnixSocketPolicy, String> {
         match self.unix_socket_policy.as_str() {
+            "auto" => Ok(UnixSocketPolicy::Auto),
             "off" => Ok(UnixSocketPolicy::Off),
             "required" => Ok(UnixSocketPolicy::Required),
             "warn" => Ok(UnixSocketPolicy::Warn),
             other => Err(format!(
-                "unix_socket_policy must be \"off\", \"required\" or \"warn\", got {other:?}"
+                "unix_socket_policy must be \"auto\", \"off\", \"required\" or \"warn\", got \
+                 {other:?}"
             )),
         }
     }
@@ -5969,18 +6015,27 @@ impl Config {
         }
 
         // [server.tenant_network] unix_socket_policy — the AF_UNIX connect
-        // fence (audit finding F2). Same posture as ebpf_policy: a mode string
-        // is parsed fail-closed, the feature is Linux + multi-tenant +
-        // per-request only, and an allowlist with the fence off is an error
-        // rather than a knob that silently does nothing. Whether the running
-        // kernel can host the hooks (>= 6.7, BTF, CAP_BPF) is decided in
-        // serve() at load time, where `"required"` refuses startup.
+        // fence (audit finding F2). The mode string is parsed fail-closed and
+        // the allowlist entries are always validated. The default is the
+        // context-sensitive `"auto"` (secure by default), which self-disables
+        // on a node where the fence cannot run and so is valid on every
+        // platform; only an operator who EXPLICITLY asked for the fence
+        // (`"required"`/`"warn"`) hard-errors on an inapplicable deployment
+        // (off Linux, no `sites_dir`, worker mode) — otherwise the secure
+        // default would break single-tenant / dev / non-Linux / worker nodes.
+        // An allowlist with the fence explicitly `"off"` is an error rather
+        // than a knob that silently does nothing. Whether the running kernel
+        // can host the hooks (>= 6.7, BTF, CAP_BPF) is decided in serve() at
+        // load time, where `"required"` refuses startup and `"auto"`/`"warn"`
+        // continue unfenced with a loud log.
         {
             let tn = &self.server.tenant_network;
             let policy = tn
                 .parse_unix_socket_policy()
                 .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
-            if policy.is_enabled() {
+            let explicitly_required =
+                matches!(policy, UnixSocketPolicy::Required | UnixSocketPolicy::Warn);
+            if explicitly_required {
                 if !cfg!(target_os = "linux") {
                     return Err(ConfigError::Validation(format!(
                         "[server.tenant_network] unix_socket_policy = {:?} is Linux-only \
@@ -6005,11 +6060,12 @@ impl Config {
                         tn.unix_socket_policy
                     )));
                 }
-            } else if !tn.unix_socket_allow.is_empty() {
+            } else if policy == UnixSocketPolicy::Off && !tn.unix_socket_allow.is_empty() {
                 return Err(ConfigError::Validation(
                     "[server.tenant_network] unix_socket_allow is set but unix_socket_policy = \
                      \"off\": the allowlist would never be enforced. Set unix_socket_policy = \
-                     \"required\" (or \"warn\"), or remove the allowlist."
+                     \"required\" (or leave it unset for the secure default), or remove the \
+                     allowlist."
                         .to_string(),
                 ));
             }
@@ -14751,12 +14807,31 @@ log_failed_sql = true
     }
 
     #[test]
-    fn test_unix_socket_policy_defaults_off_with_empty_allowlist() {
+    fn test_unix_socket_policy_defaults_to_secure_auto_with_empty_allowlist() {
+        // Secure by default: the policy is `"auto"` (not `"off"`) and the empty
+        // allowlist means deny-all once the fence is active.
         let config = Config::default_config().unwrap();
         let tn = &config.server.tenant_network;
-        assert_eq!(tn.parse_unix_socket_policy().unwrap(), UnixSocketPolicy::Off);
-        assert!(!UnixSocketPolicy::Off.is_enabled());
+        assert_eq!(tn.unix_socket_policy, "auto", "default must be the secure `auto`, not `off`");
+        assert_eq!(tn.parse_unix_socket_policy().unwrap(), UnixSocketPolicy::Auto);
         assert!(tn.unix_socket_allow.is_empty(), "default allowlist is empty = deny all");
+    }
+
+    #[test]
+    fn test_unix_socket_policy_auto_resolution() {
+        use UnixSocketPolicy::{Auto, Off, Required, Warn};
+        // `auto` fences (best-effort) where the fence can run, and is inert
+        // (off) on single-tenant / dev / non-Linux / worker nodes — so the
+        // secure default never breaks them.
+        assert_eq!(Auto.resolve(true), Warn, "auto on a fenceable node loads the deny-all fence");
+        assert_eq!(Auto.resolve(false), Off, "auto is inert where the fence cannot run");
+        // Explicit values pass through unchanged regardless of context.
+        for p in [Off, Required, Warn] {
+            assert_eq!(p.resolve(true), p);
+            assert_eq!(p.resolve(false), p);
+        }
+        assert!(!Off.is_enabled());
+        assert!(Required.is_enabled() && Warn.is_enabled());
     }
 
     #[test]
@@ -14764,17 +14839,51 @@ log_failed_sql = true
         let err = validate_unix_toml(
             "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"on\"\n",
         )
-        .expect_err("typo'd mode must not fall through to off");
+        .expect_err("typo'd mode must not fall through to a silent posture");
         assert!(matches!(err, ConfigError::Validation(m) if m.contains("unix_socket_policy")));
     }
 
     #[test]
-    fn test_unix_socket_allow_without_policy_is_an_error() {
+    fn test_unix_socket_allow_with_explicit_off_is_an_error() {
+        // An allowlist alongside an EXPLICIT `off` is a contradiction (the
+        // allowlist would never be enforced) — still a hard error.
         let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"off\"\n\n[server.tenant_network.unix_socket_allow]\n\"a.test\" = [\"/run/a.sock\"]\n",
+        )
+        .expect_err("allowlist with the fence explicitly off is a silent no-op");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("unix_socket_allow")));
+    }
+
+    #[test]
+    fn test_unix_socket_allow_under_default_auto_is_accepted() {
+        // Under the secure default (`auto`, policy unset) an allowlist is NOT a
+        // contradiction — auto enables the fence where applicable — so it must
+        // validate rather than error as an explicit `off` does.
+        validate_unix_toml(
             "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network.unix_socket_allow]\n\"a.test\" = [\"/run/a.sock\"]\n",
         )
-        .expect_err("allowlist with the fence off is a silent no-op");
-        assert!(matches!(err, ConfigError::Validation(m) if m.contains("unix_socket_allow")));
+        .expect("allowlist under the default auto policy is valid");
+    }
+
+    #[test]
+    fn test_unix_socket_policy_auto_is_valid_on_single_site() {
+        // The secure default must never break a single-tenant node: `auto`
+        // (policy unset) validates with no `sites_dir`, where it resolves to
+        // off. An explicit `required` here is still a hard error (below).
+        validate_unix_toml("[server]\nlisten = \"127.0.0.1:8080\"\n")
+            .expect("default auto policy must validate on a single-site node");
+    }
+
+    #[test]
+    fn test_unix_socket_policy_auto_validates_everywhere() {
+        // `auto` is tolerant: it validates with `sites_dir` on every platform
+        // (self-disabling off Linux at resolve time), where an explicit
+        // `required`/`warn` would hard-error. Pins that the secure default
+        // never turns an inapplicable deployment into a startup failure.
+        validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"auto\"\n",
+        )
+        .expect("explicit auto must validate on any platform");
     }
 
     #[cfg(not(target_os = "linux"))]

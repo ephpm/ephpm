@@ -364,20 +364,30 @@ node's PHP. Prefer a `file:/abs/path` indirection for those secrets — the
 `preview-gate` and `github-auth` `session_secret` both accept it — so the
 literal never sits in the environment at all.
 
-### 11. AF_UNIX connect fence (Linux ≥ 6.7, opt-in)
+### 11. AF_UNIX connect fence (Linux ≥ 6.7, on by default)
 
 Everything above is about IP. **Unix sockets are a separate door**, and
 `open_basedir` does not gate it (multi-tenant breakout audit finding F2): one
 process, one uid, so tenant PHP can `connect()` to `/var/run/docker.sock`, a
 database's auth socket, D-Bus or journald through `unix://` streams,
 `socket_connect()`, PDO `unix_socket=` or curl `CURLOPT_UNIX_SOCKET_PATH`.
-`[server.tenant_network] unix_socket_policy = "required"` attaches
-`cgroup/connect_unix` + `cgroup/sendmsg_unix` programs that let a tenant thread
-reach **only the unix sockets allowlisted for its site** — the default
-allowlist is empty, so tenants reach none — and refuses to start if the fence
-cannot be attached. It rides on the same per-thread tag as §9 but is an
-independent switch. **Requires Linux 6.7 or newer** (the hooks do not exist
-before); see the [eBPF guide](/guides/ebpf-per-vhost-network/#af_unix-connect-fence-unix_socket_policy)
+ePHPm attaches `cgroup/connect_unix` + `cgroup/sendmsg_unix` programs that let a
+tenant thread reach **only the unix sockets allowlisted for its site** — the
+default allowlist is empty, so tenants reach none. It rides on the same
+per-thread tag as §9 but is an independent switch.
+
+**This is on by default.** `unix_socket_policy` defaults to `"auto"`, which
+fences a multi-tenant Linux ≥ 6.7 per-request node (and is inert on
+single-tenant, `ephpm dev`, non-Linux and worker nodes, so those are
+unaffected). A node that needs a socket an app legitimately uses must
+allowlist it — otherwise the app's unix connects fail with `EPERM`; that is the
+intended "secure by default, break-then-allowlist" posture. On a kernel older
+than 6.7 (or without BTF / `CAP_BPF`) `"auto"` logs a loud ERROR and runs
+unfenced — it never silently claims a protection it does not have. Set
+`unix_socket_policy = "required"` to turn that into a hard startup refusal, or
+`unix_socket_policy = "off"` to opt out. **Requires Linux 6.7 or newer** (the
+hooks do not exist before); see the
+[eBPF guide](/guides/ebpf-per-vhost-network/#af_unix-connect-fence-unix_socket_policy)
 for the kernel floor, the fail-closed modes, and the symlink caveat on
 allowlisted paths.
 
@@ -390,7 +400,7 @@ The layers divide into two groups, and it matters which is which:
 | §1–§6 — `open_basedir`, the function denylist, persistence off, per-vhost temp/session, per-site database + wire credential, per-site KV keyspace | ePHPm | **On by default** whenever `[server] sites_dir` is set |
 | §7–§8 — the two-uid split, the systemd sandbox extras (`PrivateTmp`, `IPAddressDeny`), the nftables egress table | **You**, on the host | Not shipped, not written by `ephpm install`, not on by default |
 | §9 — eBPF per-vhost network policy | ePHPm (Linux only) | Off by default, opt in with `ebpf_policy = true`, plus host prerequisites |
-| §11 — AF_UNIX connect fence | ePHPm (Linux ≥ 6.7 only) | Off by default, opt in with `unix_socket_policy = "required"`; multi-tenant startup WARNs while off |
+| §11 — AF_UNIX connect fence | ePHPm (Linux ≥ 6.7 only) | **On by default** (`unix_socket_policy = "auto"`) on a multi-tenant node; allowlist the sockets a site needs, set `"required"` to also fail closed, or `"off"` to opt out |
 
 A recommended production config makes the ePHPm-side intent explicit:
 
