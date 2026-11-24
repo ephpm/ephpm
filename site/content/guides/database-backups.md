@@ -364,11 +364,19 @@ starting them, so they cold-bootstrap from the restored node.
 Available only because you opted into the experimental
 [`[db.sqlite.replication] per_site = true`](/reference/config/#dbsqlitereplication-clustered-mode-only).
 Each site is snapshotted once by its HRW owner (`source = "replica"` is not yet
-supported here and falls back to the owner with a `WARN`). Restore is
-experimental with the **same manual wipe procedure** as whole-database, plus an
-extra hazard: a peer returning with a higher `SiteVersion` epoch for the site
-could overwrite the restore with **no error**. `ephpm db restore` prints the
-full procedure before it asks you to confirm.
+supported here and falls back to the owner with a `WARN`). **`ephpm db restore
+--reseed --site <key>` converges a per-site clustered deployment (v0.16.3+),**
+the same way the whole-database path does: it stamps a per-site reseed generation
+into the site's `.db`, the site's owner advertises it, and it **dominates the
+per-site `SiteVersion` order** — so a peer that still holds the site
+force-discards it and cold re-bootstraps from the owner, and the former hazard (a
+peer returning with a higher ownership epoch silently overwriting the restore)
+can no longer occur. Procedure: stop every node, `ephpm db restore --reseed
+--site <key>` on one node, start it **first**, then the others. Requires every
+node on **v0.16.3+** (an older peer ignores the signal and stays divergent —
+fail-safe, not corruption). *Without* `--reseed` the **manual wipe procedure**
+applies and the higher-epoch-overwrite hazard remains, so prefer `--reseed`.
+`ephpm db restore` prints the full procedure before it asks you to confirm.
 
 The CLI can only check the local node, so a clustered restore demands every node
 be stopped and asks you to confirm. See the
@@ -429,5 +437,8 @@ EPHPM_DOCROOT=./crates/ephpm-e2e/tests/docroot \
 
 Without the opt-in (or without a built binary) it prints a clear `SKIP` and
 passes, so a bare `cargo test` is unaffected. Clustered Turso is Linux/macOS +
-experimental, so the harness **skips on Windows**. A matching live `--reseed`
-convergence sub-test is planned for v0.16.3.
+experimental, so the harness **skips on Windows**. The same file also carries
+`reseed_converges_a_running_cluster` (#707): it writes rows, dumps them, writes
+*more* rows, then `ephpm db restore --reseed`s the earlier dump onto one node and
+restarts the cluster — asserting every node converges on **exactly** the reseeded
+rows (the later rows discarded). Same opt-in and `SKIP` behaviour.

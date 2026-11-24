@@ -2,7 +2,15 @@
 //!
 //! This is the live validation for ePHPm's v0.16.2 drain gate (#701) and
 //! `ephpm db restore --reseed` (#704): a graceful drain of the elected primary
-//! must promote a replica **without losing any already-written data**.
+//! must promote a replica **without losing any already-written data**. Two
+//! scenarios run here:
+//!
+//! - [`graceful_primary_drain_promotes_a_replica_without_data_loss`] — the drain
+//!   gate: a SIGTERM drain of the primary promotes a survivor with no loss.
+//! - [`reseed_converges_a_running_cluster`] — #707 (c): `ephpm db restore
+//!   --reseed` converges a running cluster onto the restored data, each replica
+//!   discarding its own copy. (Offline install correctness is unit-tested in the
+//!   `ephpm` crate; this proves the live end-to-end convergence.)
 //!
 //! # What this proves, and how it differs from `turso_cdc.rs`
 //!
@@ -230,11 +238,198 @@ async fn graceful_primary_drain_promotes_a_replica_without_data_loss() {
         }
     }
 
-    // TODO(v0.16.3): live `--reseed` convergence sub-test. Deferred here to keep
-    // the required drain-loss test a single, non-flaky scenario: the reseed path
-    // needs an offline `ephpm db restore --reseed` on a stopped node, a restart,
-    // and a convergence assertion — a second topology lifecycle whose timing
-    // variance is best isolated in its own test rather than bolted onto this one.
+    // Live `--reseed` convergence is validated by
+    // `reseed_converges_a_running_cluster` below — a separate scenario, so this
+    // required drain-loss test stays a single, non-flaky lifecycle.
+}
+
+/// The rows the reseed source carries (`reseed_converges_a_running_cluster`): the
+/// restore holds *only* these, and the cluster must converge on exactly them.
+const RESEED_ROWS: &[(i64, &str)] = &[(1, "alpha"), (2, "beta"), (3, "gamma")];
+
+/// The rows written *after* the reseed source is captured: present on every node
+/// at reseed time, they must be **discarded** when each node adopts the restore.
+const POST_SNAPSHOT_ROWS: &[(i64, &str)] = &[(4, "delta"), (5, "epsilon"), (6, "zeta")];
+
+/// **#707 (c): live whole-database `--reseed` convergence.**
+///
+/// Proves that `ephpm db restore --reseed` converges a *running* whole-database
+/// cluster onto the restored data — not just that the offline install works
+/// (that is unit-tested in `ephpm`). The scenario deliberately makes the restore
+/// data differ from what every node holds at reseed time, so a node that kept its
+/// own copy (the bug `--reseed` fixes) would be caught:
+///
+/// 1. Write `RESEED_ROWS` and let them replicate to every node.
+/// 2. Stop node 0 and `ephpm db dump` it → a snapshot holding **only** those rows.
+/// 3. With the survivors still up, write `POST_SNAPSHOT_ROWS`; every live node now
+///    holds `RESEED_ROWS + POST_SNAPSHOT_ROWS`.
+/// 4. Stop every node. `ephpm db restore --reseed` the dump onto node 0 (the
+///    lowest ordinal — the node that re-elects primary and advertises the reseed
+///    generation). Start node 0 first, then the others.
+/// 5. Assert every node converges on **exactly `RESEED_ROWS`** — each replica saw
+///    the newer reseed generation, force-discarded its `+POST_SNAPSHOT_ROWS` copy
+///    and cold re-bootstrapped from the restored primary.
+///
+/// Same gating and skips as the drain test; isolated as its own `#[test]` because
+/// it drives a second, slower topology lifecycle (stop-all → restore → start-all).
+#[tokio::test(flavor = "multi_thread")]
+async fn reseed_converges_a_running_cluster() {
+    if cfg!(windows) {
+        eprintln!(
+            "SKIP cluster_failover reseed: clustered Turso is Linux/macOS + experimental and not \
+             validated on Windows (CLAUDE.md)."
+        );
+        return;
+    }
+    let Some(binary) = ephpm_binary_env() else {
+        eprintln!("SKIP cluster_failover reseed: EPHPM_BINARY is unset.");
+        return;
+    };
+    if std::env::var_os("EPHPM_CLUSTER_FAILOVER").is_none() {
+        eprintln!(
+            "SKIP cluster_failover reseed: timing-sensitive test is opt-in — set \
+             EPHPM_CLUSTER_FAILOVER=1 to run."
+        );
+        return;
+    }
+
+    let docroot = resolve_docroot();
+    assert!(docroot.join("index.php").is_file(), "docroot {} has no index.php", docroot.display());
+
+    // ── 1. Spawn the cluster; write RESEED_ROWS on the primary ──────────────
+    let mut fixture = ClusterFixture::start(&binary, &docroot, CLUSTER_SIZE)
+        .await
+        .unwrap_or_else(|e| panic!("failed to start {CLUSTER_SIZE}-node cluster fixture: {e:#}"));
+    let base_urls: Vec<String> = fixture.base_urls().iter().map(|s| (*s).to_string()).collect();
+    let mysql_addrs: Vec<String> = fixture.mysql_addrs().iter().map(|s| (*s).to_string()).collect();
+    let all_nodes: Vec<usize> = (0..CLUSTER_SIZE).collect();
+
+    let primary = wait_for_sole_primary(&base_urls, &all_nodes, ELECTION_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("no sole primary elected: {e}\n{}", all_stderr(&fixture)));
+    mysql_exec(
+        &mysql_addrs[primary],
+        "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("CREATE TABLE failed: {e}\n{}", fixture.stderr_tail(primary, 40)));
+    for (id, v) in RESEED_ROWS {
+        mysql_exec(&mysql_addrs[primary], &format!("INSERT INTO t (id, v) VALUES ({id}, '{v}')"))
+            .await
+            .unwrap_or_else(|e| panic!("INSERT ({id},{v}) failed: {e}"));
+    }
+
+    // Wait for the reseed rows on EVERY node, so node 0's own file holds them
+    // before we dump it (node 0 may be the primary or a replica).
+    for &n in &all_nodes {
+        wait_for_row_count(&mysql_addrs[n], RESEED_ROWS.len() as i64, REPLICATION_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("node {n} never saw the reseed rows: {e}\n{}", fixture.stderr_tail(n, 40))
+            });
+    }
+    eprintln!("[reseed-e2e] every node has the {} reseed rows", RESEED_ROWS.len());
+
+    // ── 2. Stop node 0 and dump it (the snapshot holds only RESEED_ROWS) ─────
+    let reseed_node = 0;
+    fixture.stop_node(reseed_node);
+    let source = fixture.node_dir(reseed_node).expect("node 0 dir").join("reseed-source.db.gz");
+    let source_arg = source.to_string_lossy().into_owned();
+    let out = fixture
+        .run_cli(reseed_node, &["db", "dump", "--site", "default", "--out", &source_arg])
+        .expect("spawn ephpm db dump");
+    assert!(out.status.success(), "ephpm db dump failed: {}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("[reseed-e2e] dumped node 0 → {}", source.display());
+
+    // ── 3. Write POST_SNAPSHOT_ROWS on a survivor so every live node diverges ─
+    let survivors: Vec<usize> = (1..CLUSTER_SIZE).collect();
+    let survivor_primary = wait_for_sole_primary(&base_urls, &survivors, REELECTION_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("no survivor primary after stopping node 0: {e}"));
+    for (id, v) in POST_SNAPSHOT_ROWS {
+        mysql_exec(
+            &mysql_addrs[survivor_primary],
+            &format!("INSERT INTO t (id, v) VALUES ({id}, '{v}')"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("INSERT post-snapshot ({id},{v}) failed: {e}"));
+    }
+    let total = (RESEED_ROWS.len() + POST_SNAPSHOT_ROWS.len()) as i64;
+    for &n in &survivors {
+        wait_for_row_count(&mysql_addrs[n], total, REPLICATION_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("survivor {n} never saw the post-snapshot rows: {e}"));
+    }
+    eprintln!("[reseed-e2e] survivors now hold all {total} rows (reseed + post-snapshot)");
+
+    // ── 4. Stop every node; reseed node 0 from the dump; restart all ────────
+    for &n in &survivors {
+        fixture.stop_node(n);
+    }
+    let out = fixture
+        .run_cli(
+            reseed_node,
+            &["db", "restore", "--site", "default", "--from", &source_arg, "--reseed", "--yes"],
+        )
+        .expect("spawn ephpm db restore --reseed");
+    assert!(
+        out.status.success(),
+        "ephpm db restore --reseed failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("[reseed-e2e] restored --reseed onto node 0; restarting the cluster (node 0 first)");
+
+    // Node 0 first so it re-elects primary and advertises the reseed generation.
+    fixture
+        .restart_node(reseed_node)
+        .await
+        .unwrap_or_else(|e| panic!("restart node 0 failed: {e:#}\n{}", fixture.stderr_tail(0, 40)));
+    for &n in &survivors {
+        fixture.restart_node(n).await.unwrap_or_else(|e| {
+            panic!("restart node {n} failed: {e:#}\n{}", fixture.stderr_tail(n, 40))
+        });
+    }
+
+    let new_primary =
+        wait_for_sole_primary(&base_urls, &all_nodes, REELECTION_TIMEOUT).await.unwrap_or_else(
+            |e| panic!("no sole primary after the reseed restart: {e}\n{}", all_stderr(&fixture)),
+        );
+    eprintln!(
+        "[reseed-e2e] cluster re-elected a primary (node {new_primary}); awaiting convergence"
+    );
+
+    // ── 5. CORE ASSERTION: every node converges on EXACTLY the reseed rows ──
+    // The reseed rows are 3; the pre-reseed copies held 6. Converging back to a
+    // count of 3 is the discard — the restore replaced each node's `+post` copy.
+    let want: Vec<String> = RESEED_ROWS.iter().map(|(_, v)| (*v).to_string()).collect();
+    for &n in &all_nodes {
+        wait_for_row_count(&mysql_addrs[n], RESEED_ROWS.len() as i64, REELECTION_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "node {n} never converged on the {} reseeded rows (still holds its pre-reseed \
+                     copy?): {e}\n{}",
+                    RESEED_ROWS.len(),
+                    fixture.stderr_tail(n, 60)
+                )
+            });
+        let got = mysql_query_strings(&mysql_addrs[n], "SELECT v FROM t ORDER BY id")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("SELECT on node {n} failed: {e}\n{}", fixture.stderr_tail(n, 40))
+            });
+        assert_eq!(
+            got, want,
+            "reseed did not converge: node {n} has {got:?}, expected exactly the reseeded {want:?} \
+             (the post-snapshot rows must have been discarded)"
+        );
+    }
+    eprintln!(
+        "[reseed-e2e] CONVERGED: every node holds exactly the {} reseeded rows; the \
+         post-snapshot rows were discarded",
+        RESEED_ROWS.len()
+    );
 }
 
 /// Abrupt-kill (SIGKILL) failover — the promotion-side crash-safety gate (#706).

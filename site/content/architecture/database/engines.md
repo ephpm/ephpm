@@ -510,11 +510,14 @@ What it is and is not:
   valid standalone artifact); **per-site clustered backup is experimental**
   (reachable only through the experimental `per_site = true`; `source = "replica"`
   there falls back to the owner with a `WARN`). **Restoring *into* a cluster is
-  experimental and manual for both topologies**: replicas do not auto-converge
-  onto a restored node (one still holding old data tails the restore on top of
-  it), so every node must be stopped and every other node's `.db` wiped so they
-  cold-bootstrap — the command prints the procedure, and the automatic `--reseed`
-  is not yet built. See the
+  experimental for both topologies**: a *plain* restore does not auto-converge a
+  running cluster (a replica still holding old data tails the restore on top of
+  it). `ephpm db restore --reseed` automates convergence — whole-database since
+  v0.16.2, per-site since v0.16.3 (#707): it stamps a reseed generation so every
+  peer force-discards and cold re-bootstraps from the restored node (for per-site
+  the generation dominates the `SiteVersion` order, so a higher-epoch peer cannot
+  overwrite the restore). Every node must still be stopped and the restored node
+  started first; the command prints the procedure. See the
   [clustered-backup design note](/roadmap/clustered-db-backups/) for the
   exactly-once guarantees and the multi-node lab validation each topology needs.
 

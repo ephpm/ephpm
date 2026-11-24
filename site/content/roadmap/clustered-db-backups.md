@@ -31,8 +31,9 @@ a replica does **not** auto-converge onto a restored node.
 > replica; a non-owner per-site replica returns `TailOnly` while a lineage is
 > recorded), so it keeps its old rows and tails the restored log on top of them.
 > Convergence therefore requires **manually wiping every other node's `.db`**
-> before restart — or, since **v0.16.2**, the `--reseed` flag, which automates
-> exactly that for whole-database clustered restores (see below). The passages
+> before restart — or the `--reseed` flag, which automates exactly that: for
+> whole-database clustered restores since **v0.16.2**, and for per-site clustered
+> restores since **v0.16.3** (#707; see below). The passages
 > below that describe "log-id change → proven divergence → re-bootstrap" are
 > retained as the *original design intent*; the implemented behaviour is the
 > correction here.
@@ -50,12 +51,23 @@ a replica does **not** auto-converge onto a restored node.
   stays divergent (fail-safe, not corruption). Without `--reseed` the original
   manual procedure still applies: wipe every other node's `.db`/`-wal`/`-shm`
   before restart.
-- **Per-site clustered backup — EXPERIMENTAL.** The backup half snapshots each
-  site once by its HRW owner (`source = "replica"` is not yet supported here and
-  falls back to the owner with a `WARN`). Restore uses the same manual wipe
-  procedure, plus a `SiteVersion` epoch-dominance hazard (below). Reachable only
-  through the experimental `[db.sqlite.replication] per_site = true` opt-in; both
-  **startup** and **`ephpm db restore`** warn loudly.
+- **Per-site clustered backup — EXPERIMENTAL; restore converges with `--reseed`
+  since v0.16.3 (#707).** The backup half snapshots each site once by its HRW
+  owner (`source = "replica"` is not yet supported here and falls back to the
+  owner with a `WARN`). **`ephpm db restore --reseed --site <key>` now converges
+  a per-site clustered deployment automatically**, the same way the whole-database
+  path does: the restore stamps a per-site reseed generation into the site's
+  `.db`, the site's owner advertises it, and it **dominates the per-site
+  `SiteVersion` order** — so a peer that still holds the site force-discards it
+  and cold re-bootstraps from the owner, and the former `SiteVersion`
+  epoch-dominance hazard (a stale higher-epoch peer silently overwriting the
+  restore) can no longer occur. The procedure mirrors whole-database: stop every
+  node, `ephpm db restore --reseed --site <key>` on one node, start it **first**,
+  then the others. Requires **every node on v0.16.3+** (an older peer ignores the
+  signal and stays divergent — fail-safe, not corruption). Without `--reseed` the
+  manual wipe procedure still applies. Reachable only through the experimental
+  `[db.sqlite.replication] per_site = true` opt-in; both **startup** and **`ephpm
+  db restore`** still warn that per-site clustering is experimental.
 
 ## Where we are
 
@@ -302,26 +314,30 @@ the replicas** so they come up cold:
   up *cold* and `maybe_bootstrap_cold_replica` fetches the restored primary's
   snapshot — skipping that wipe leaves a replica tailing the restore on top of
   its old rows (a mix), which a later failover then loses.
-- **Per-site clustered — EXPERIMENTAL, gated and lab-pending.** The site's owner
-  after restart is `hrw_owner`, which depends on which nodes are alive first —
-  not predictable offline. Convergence relies on the restored node **settling
-  first** and publishing a dominating `SiteVersion` (`next_owner_epoch` bumps the
-  epoch above every peer's). When a peer later becomes HRW owner of the site,
-  `decide_warm_settle` sees the restored node's higher `SiteVersion` in gossip
-  and catches up from it before serving, so the restored data wins. This is
-  correct *only if* the restored node's epoch dominates the epochs returning
-  peers bring — which is the one cluster-durability property unit tests cannot
-  prove and the lab must (see below). **Because that gap is reachable, per-site
-  clustered backup must never present as production-ready.** It is reachable only
-  through the experimental `[db.sqlite.replication] per_site = true` opt-in, and
-  on top of that: startup logs a dedicated `WARN` naming the restore caveat, and
-  `ephpm db restore` prints a loud warning before the confirmation (the hazard,
-  the "bring this node up first" workaround, and the planned `--reseed`). The
-  belt-and-suspenders mitigation, should the lab show epoch dominance is not
-  reliable across a whole-cluster restart, is a `--reseed` that removes the
-  site's `.db` on every other node so they come up cold and bootstrap from the
-  restored owner — **documented as planned, not built**; lab item 4 decides
-  whether it is needed.
+- **Per-site clustered — EXPERIMENTAL; `--reseed` converges since v0.16.3
+  (#707).** The site's owner after restart is `hrw_owner`, which depends on which
+  nodes are alive first — not predictable offline. `ephpm db restore --reseed
+  --site <key>` removes the fragility that made this lab-pending: it stamps a
+  per-site **reseed generation** into the site's `.db`, and that generation is now
+  the **most-significant component of `SiteVersion`** (above `epoch` and `head`).
+  So convergence no longer *relies* on the restored node's epoch happening to
+  dominate a returning peer's: the reseed generation dominates unconditionally.
+  The site's owner advertises it (gossip `sqlite:ver:<site>` and the CDC
+  `Hello`/snapshot header); a replica that sees a newer generation force-discards
+  and cold re-bootstraps from the owner (`run_site_replication` →
+  `ReseedRequired` → `force_reset`), and a peer that returns with a higher
+  *ownership epoch* can no longer out-rank the restore in `decide_warm_settle`.
+  The procedure mirrors whole-database: stop every node, `ephpm db restore
+  --reseed --site <key>` on one node, start it **first**, then the others; verify
+  each converged (`ephpm_cdc_bootstrap_total{outcome="handoff_ok"}`). Requires
+  **every node on v0.16.3+** (an older peer ignores the signal and stays
+  divergent — fail-safe, not corruption). Still reachable only through the
+  experimental `[db.sqlite.replication] per_site = true` opt-in, and startup plus
+  `ephpm db restore` still warn that per-site clustering is experimental;
+  multi-node ownership churn under reseed is unit-tested and validated by the
+  `reseed_converges_a_running_cluster` e2e harness, not yet long-run in the lab.
+  *Without* `--reseed` the manual wipe procedure still applies, and the
+  `SiteVersion` epoch-dominance hazard it carried remains — use `--reseed`.
 
 ### Restore stays offline, and says what it does
 
@@ -412,8 +428,11 @@ unit-validated + lab-pending, never cluster-validated):**
    **every node** serves the restored data (each peer cold-bootstrapped; no node
    silently kept the newer copy or tailed on top of it). This is the test that
    proves the reconciliation, and it is also what `--reseed` (shipped for
-   whole-database clustered in v0.16.2) automates; the negative case (skip the
-   wipe → a peer serves the old+new mix) is the regression guard.
+   whole-database clustered in v0.16.2, and for per-site clustered in v0.16.3)
+   automates; the negative case (skip the wipe → a peer serves the old+new mix)
+   is the regression guard. The whole-database half of this round trip is now
+   covered live by the `reseed_converges_a_running_cluster` e2e harness
+   (`crates/ephpm-e2e/tests/cluster_failover.rs`).
 5. **WAL behavior on a write-hot primary during backup** — a `VACUUM INTO` on a
    write-hot whole-DB primary / per-site owner does not unbound the `-wal`, and
    `source = "replica"` moves the WAL pin off the write node (measure
@@ -423,21 +442,21 @@ unit-validated + lab-pending, never cluster-validated):**
 
 ## Open design question to resolve before GA
 
-**Per-site clustered restore convergence depends on `SiteVersion` epoch
-dominance surviving a whole-cluster restart** (open question, flagged rather than
-guessed): the restored node must settle and publish an epoch that dominates the
-epochs returning peers bring. If gossip has dropped the site's
-`kv:sqlite:ver:<site>` before the restored node settles, it could compute a
-*lower* epoch than a returning peer and lose. Until the lab round-trip (item 4)
-settles this, per-site clustered backup ships **experimental-only** — reachable
-only through the experimental `per_site = true` opt-in, with a loud `WARN` at
-startup and at restore (implemented). The fallback, **if** the lab shows epoch
-dominance is not reliable, is a per-site `--reseed` that invalidates peer copies
-(removes their `<site>.db`) so the question does not arise — **planned, not
-built** (per-site only; the whole-database `--reseed` below has shipped).
-Whole-DB clustered restore does not have this `SiteVersion`-epoch dependency: a
-*plain* restore still does **not** converge a warm replica on its own (the
-replica keeps its old rows and tails the restored log on top), but `ephpm db
-restore --reseed` (shipped v0.16.2, whole-database only) stamps a reseed
-generation that makes every replica force-discard and cold re-bootstrap from the
-restored node — so whole-DB is the supported path and ships now.
+**Resolved in v0.16.3 (#707): per-site clustered restore no longer depends on
+`SiteVersion` epoch dominance.** The original concern was that a *plain* per-site
+restore relied on the restored node settling first and publishing an ownership
+**epoch** that dominates the epochs returning peers bring — and if gossip had
+dropped the site's `kv:sqlite:ver:<site>` before the restored node settled, a
+returning peer could carry a *higher* epoch and silently overwrite the restore.
+`ephpm db restore --reseed --site <key>` removes that dependency: the reseed
+generation it stamps is the **most-significant component of `SiteVersion`**
+(above `epoch` and `head`), so a reseeded copy out-ranks any pre-restore copy
+unconditionally, whatever epoch a returning peer brings. The restored owner
+advertises the generation, replicas force-discard and re-bootstrap from it, and
+`decide_warm_settle` can never prefer a stale higher-epoch peer over the reseed.
+`--reseed` requires every node on **v0.16.3+**. A *plain* per-site restore still
+carries the old epoch-dominance hazard and is not recommended — use `--reseed`.
+Whole-DB clustered restore converges the same way via `ephpm db restore --reseed`
+(shipped v0.16.2). Per-site clustered remains **experimental** (the `per_site =
+true` opt-in warns at startup and at restore), but its restore path is now
+convergent and documented as supported with `--reseed`.

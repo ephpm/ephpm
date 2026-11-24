@@ -725,13 +725,14 @@ enum DbCommand {
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// **Whole-database clustered only.** Also converge the cluster: stamp
-        /// a reseed generation into the restored image so every replica
-        /// force-discards its old data and cold re-bootstraps from this node on
-        /// restart — the automatic replacement for the manual "wipe every other
-        /// node's `.db`" step. Requires every node on v0.16.2+ (an older replica
-        /// ignores the signal and stays divergent — fail-safe, not corruption).
-        /// Rejected in single-node and per-site modes.
+        /// **Clustered only.** Also converge the cluster: stamp a reseed
+        /// generation into the restored image so every replica force-discards its
+        /// old data and cold re-bootstraps from this node on restart — the
+        /// automatic replacement for the manual "wipe every other node's `.db`"
+        /// step. Works for whole-database (requires every node on v0.16.2+) and
+        /// per-site clustered (requires every node on v0.16.3+); an older peer
+        /// ignores the signal and stays divergent — fail-safe, not corruption.
+        /// Rejected in single-node mode (no replicas to reseed).
         #[arg(long)]
         reseed: bool,
     },

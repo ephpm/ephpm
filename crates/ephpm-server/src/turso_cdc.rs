@@ -1850,23 +1850,26 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
-    // `whole_db = true`: the reseed force-discard signal is honored ONLY on the
-    // whole-database path (the only one `--reseed` can stamp). See F4.
+    // `honor_reseed = true`: the whole-database replica honors the reseed
+    // force-discard signal (`ephpm db restore --reseed`).
     subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE, true).await
 }
 
 /// [`subscribe_and_consume`] for one named site: the applied-watermark gauge
-/// is recorded under `site`. `whole_db` is whether this is the whole-database
-/// replica path (vs a per-site one): the reseed force-discard predicate is
-/// evaluated only when true, so a per-site replica can never be forced to
-/// discard — even if a vhost is named `default` or a reseed-stamped file is
-/// mis-placed into a per-site directory (F4).
+/// is recorded under `site`. `honor_reseed` is whether this replica path honors
+/// the reseed force-discard signal (`ephpm db restore --reseed`): the predicate
+/// is evaluated only when true. Both clustered modes set it now — whole-database
+/// since v0.16.2 and per-site since v0.16.3 (#707) — and the per-site owner only
+/// ever advertises a non-zero generation on a file an operator actually reseeded
+/// (`stamp_reseed_generation` writes the per-site `.db`), so honoring it on both
+/// paths is safe; a site that has never been reseeded advertises `0`, which
+/// loses every [`reseed_decision`] and discards nothing.
 async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
-    whole_db: bool,
+    honor_reseed: bool,
 ) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
         anyhow::anyhow!(
@@ -1888,21 +1891,20 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // owner's short-lived gossip advertisement is still live at that time.
     adopt_site_epoch(factory, source_epoch).await;
 
-    // Whole-database automatic reseed convergence (v0.16.2). Before resolving a
-    // watermark or subscribing, check whether the owner advertised a reseed
-    // generation **strictly greater** than this node has adopted — the signal
-    // that `ephpm db restore --reseed` installed fresh origin data on the owner
-    // and this replica must force-discard its old copy and cold re-bootstrap.
-    // The forced discard itself is driven by `run_replica` (reusing the existing
-    // fetch → vet → discard → apply snapshot primitives), so we return a typed,
-    // downcastable error here — the same pattern as `WatermarkResolution` — and
-    // never send `Subscribe`. A table-absent / zero generation reads `0`, so an
-    // ordinary promotion or failover (which re-advertises the adopted max) has
+    // Automatic reseed convergence (`ephpm db restore --reseed`; whole-database
+    // v0.16.2, per-site v0.16.3 / #707). Before resolving a watermark or
+    // subscribing, check whether the owner advertised a reseed generation
+    // **strictly greater** than this node has adopted — the signal that the
+    // operator installed fresh origin data on the owner and this replica must
+    // force-discard its old copy and cold re-bootstrap. The forced discard
+    // itself is driven by the caller (`run_replica` for whole-database,
+    // `run_site_replication` for per-site), reusing the existing fetch → vet →
+    // discard → apply snapshot primitives, so we return a typed, downcastable
+    // error here — the same pattern as `WatermarkResolution` — and never send
+    // `Subscribe`. A table-absent / zero generation reads `0`, so an ordinary
+    // promotion or failover (which re-advertises the adopted max) has
     // `incoming == adopted` and never triggers a discard.
-    // Whole-database path only (F4): `--reseed` can never stamp a per-site file,
-    // so a per-site replica must never be forced to discard — skip the read and
-    // the predicate entirely there rather than relying on the generation being 0.
-    if whole_db {
+    if honor_reseed {
         let adopted_reseed_gen = {
             let _permit = factory.wal_gate_permit().await;
             off_runtime(read_local_reseed_gen(apply_conn))
@@ -2247,12 +2249,19 @@ async fn write_site_epoch(conn: &turso::Connection, epoch: u64) -> anyhow::Resul
     Ok(())
 }
 
-/// This copy's full [`SiteVersion`](crate::site_version::SiteVersion): its
-/// persisted ownership epoch and the head of the current stint's CDC log.
+/// This copy's full [`SiteVersion`](crate::site_version::SiteVersion): the
+/// per-site reseed generation (`ephpm db restore --reseed`), the persisted
+/// ownership epoch, and the head of the current stint's CDC log.
+///
+/// The reseed generation dominates the version order, so a copy an operator has
+/// reseeded out-ranks a pre-restore copy on any node regardless of epoch — the
+/// property that keeps a stale higher-epoch peer from silently overwriting a
+/// per-site restore (#707).
 async fn read_site_version(
     conn: &turso::Connection,
 ) -> anyhow::Result<crate::site_version::SiteVersion> {
     Ok(crate::site_version::SiteVersion {
+        reseed_gen: read_local_reseed_gen(conn).await?,
         epoch: read_site_epoch(conn).await?,
         head: current_max_change_id(conn).await?,
     })
@@ -4699,6 +4708,37 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                                 backoff.reset();
                                 false
                             }
+                            Err(e) if e.downcast_ref::<ReseedRequired>().is_some() => {
+                                // The owner advertised a reseed generation newer
+                                // than this replica has adopted (`ephpm db restore
+                                // --reseed` on this site, #707). Force a clean
+                                // re-bootstrap from the owner on the next attempt:
+                                // `plan_replica_attempt` then discards local
+                                // tables (fetch → vet → discard → apply), and
+                                // `install_snapshot` adopts the owner's generation
+                                // from the snapshot header, so the next subscribe
+                                // no longer signals a reseed. The local copy is
+                                // only discarded inside `install_snapshot`, after
+                                // the replacement snapshot is fetched and vetted —
+                                // and never to an empty snapshot
+                                // (`snapshot_may_replace_local_data`), so a node
+                                // whose own data is the restore origin (its
+                                // generation is already the max) never reaches
+                                // here.
+                                let generation =
+                                    e.downcast_ref::<ReseedRequired>().map_or(0, |r| r.generation);
+                                cdc_metrics::record_connect_outcome("reseed");
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    generation,
+                                    "per-site replica: owner advertised a newer reseed generation; \
+                                     force-discarding local data and cold re-bootstrapping from the \
+                                     owner (ephpm db restore --reseed)"
+                                );
+                                force_reset = true;
+                                true
+                            }
                             Err(e) if is_schema_collision_error(&e) => {
                                 // Divergence: the replica holds a local-origin
                                 // object the owner's CDC batch collides with.
@@ -5077,9 +5117,10 @@ where
 /// [`SITE_VERSION_TTL`] (10 s) — this reads the peer's **durable** epoch over
 /// the reliable cluster channel. It is what lets a returning owner learn an
 /// interim owner's higher epoch *after* that owner has released ownership and
-/// its advert has lapsed (the #654 crash-restart hole). The header carries both
-/// the persisted `epoch` and the stint `watermark` (head), so the full
-/// [`SiteVersion`] is available without transferring the dump.
+/// its advert has lapsed (the #654 crash-restart hole). The header carries the
+/// persisted `epoch`, the stint `watermark` (head) and the reseed generation
+/// (#707), so the full [`SiteVersion`] is available without transferring the
+/// dump.
 ///
 /// `None` when the peer holds no copy (`no_copy`), is unreachable, or does not
 /// answer within [`HANDOFF_PROBE_TIMEOUT`] — every one of which only ever
@@ -5103,7 +5144,11 @@ async fn probe_peer_version(
     if header.no_copy {
         return None;
     }
-    Some(crate::site_version::SiteVersion { epoch: header.epoch, head: header.watermark })
+    Some(crate::site_version::SiteVersion {
+        reseed_gen: header.reseed_gen,
+        epoch: header.epoch,
+        head: header.watermark,
+    })
 }
 
 /// The freshest site version known from a **durable** source: the gossip advert
@@ -5647,16 +5692,22 @@ async fn settle_owner_version(
                 crate::site_version::next_owner_epoch(current.max(own_epoch), best_peer_epoch);
             write_site_epoch(conn, target).await?;
             let head = current_max_change_id(conn).await?;
-            anyhow::Ok((target, head))
+            // Carry this copy's reseed generation (`ephpm db restore --reseed`)
+            // into the advertised version: it dominates the order, so a peer that
+            // later takes the site reads it and never serves a pre-restore copy
+            // over the reseed (#707). A handoff install just above may have
+            // adopted it, so read it here, after that install committed.
+            let reseed_gen = read_local_reseed_gen(conn).await?;
+            anyhow::Ok((target, head, reseed_gen))
         })
         .await
     };
     match persisted {
-        Ok((target, head)) => {
+        Ok((target, head, reseed_gen)) => {
             advertise_site_version(
                 cluster,
                 site,
-                crate::site_version::SiteVersion { epoch: target, head },
+                crate::site_version::SiteVersion { reseed_gen, epoch: target, head },
             );
         }
         Err(e) => tracing::warn!(
@@ -5819,8 +5870,12 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    // `whole_db = false`: per-site replicas never honor the reseed signal (F4).
-    subscribe_and_consume_site(&mut stream, factory, &conn, site, false).await
+    // `honor_reseed = true`: a per-site replica honors the owner's reseed signal
+    // (`ephpm db restore --reseed` on this site's `.db`, #707) and force-discards
+    // via a `ReseedRequired` error, which `run_site_replication` turns into a
+    // clean re-bootstrap (`force_reset`). The owner advertises a non-zero
+    // generation only on a file an operator actually reseeded.
+    subscribe_and_consume_site(&mut stream, factory, &conn, site, true).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
@@ -7267,6 +7322,45 @@ mod tests {
         );
     }
 
+    /// `read_site_version` carries the reseed generation (#707), and it dominates
+    /// the resulting `SiteVersion` order, so a per-site owner advertises a
+    /// restored copy as unconditionally fresher than any pre-restore peer — and
+    /// the advert encodes/decodes it without loss. This is the read half of the
+    /// per-site reseed wiring (the settle/sampler paths both read through here).
+    #[tokio::test]
+    async fn read_site_version_includes_the_reseed_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // A pre-reseed copy: some ownership epoch, no reseed generation.
+        write_site_epoch(&conn, 9).await.unwrap();
+        let before = read_site_version(&conn).await.unwrap();
+        assert_eq!(before.reseed_gen, 0, "no reseed stamped yet");
+        assert_eq!(before.epoch, 9);
+
+        // Stamp a reseed generation (what `ephpm db restore --reseed` writes).
+        write_local_reseed_gen(&conn, 1_700_000_000_500).await.unwrap();
+        let after = read_site_version(&conn).await.unwrap();
+        assert_eq!(after.reseed_gen, 1_700_000_000_500, "read_site_version surfaces it");
+        assert_eq!(after.epoch, 9, "the epoch is unchanged by the stamp");
+
+        // It dominates the order: the reseeded copy out-ranks the pre-reseed one
+        // even though they share an epoch, and a far-higher-epoch peer still loses.
+        assert!(after > before);
+        let stale_higher_epoch =
+            crate::site_version::SiteVersion { reseed_gen: 0, epoch: u64::MAX, head: i64::MAX };
+        assert!(after > stale_higher_epoch, "reseed dominance survives any peer epoch");
+
+        // And the gossip advert round-trips the generation.
+        assert_eq!(
+            crate::site_version::decode(&crate::site_version::encode(after)),
+            Some(after),
+            "the advertised site version carries the reseed generation"
+        );
+    }
+
     /// **The reseed discard never wipes to nothing.** `reseed_bootstrap` uses
     /// `install_snapshot(.., discard_local = true)` verbatim, which runs
     /// `snapshot_may_replace_local_data` before dropping anything — so an empty
@@ -7469,7 +7563,7 @@ mod tests {
         // local `change_id` head (a founder accumulates bookkeeping change_ids a
         // replica's rebuilt log does not), deliberately ABOVE the interim
         // owner's watermark to prove the head tie-break is what used to go wrong.
-        let a_stale = SiteVersion { epoch: 1, head: 120 };
+        let a_stale = SiteVersion { reseed_gen: 0, epoch: 1, head: 120 };
 
         // A is SIGKILLed. B (a warm replica that adopted A's epoch 1) is
         // promoted. The re-settle this fix adds runs `settle_round`'s owner
@@ -7478,7 +7572,7 @@ mod tests {
         // writes; its stint head is small (a rebuilt log), below A's stale head.
         let b_epoch = next_owner_epoch(1, 1);
         assert_eq!(b_epoch, 2);
-        let b_interim = SiteVersion { epoch: b_epoch, head: 40 };
+        let b_interim = SiteVersion { reseed_gen: 0, epoch: b_epoch, head: 40 };
 
         // A returns warm (epoch 1) and HRW re-homes the site to it. Its durable
         // probe reads B's persisted epoch 2 regardless of advert timing, so the
@@ -7492,7 +7586,7 @@ mod tests {
         // Regression guard for the exact bug: WITHOUT the promotion re-settle,
         // B keeps the dead owner's epoch 1, the epochs tie, and the head
         // tie-break (A's 120 > B's 40) lets the returning owner serve stale.
-        let b_never_bumped = SiteVersion { epoch: 1, head: 40 };
+        let b_never_bumped = SiteVersion { reseed_gen: 0, epoch: 1, head: 40 };
         assert_eq!(
             decide_warm_settle(true, true, a_stale, Some(b_never_bumped)),
             crate::site_version::WarmSettle::Settled,
