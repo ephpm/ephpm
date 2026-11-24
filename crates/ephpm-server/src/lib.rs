@@ -237,6 +237,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // loop below.
     let mut kv_gossip_pull: Option<Arc<ephpm_cluster::GossipBulkTransfer>> = None;
 
+    // Large-tier anti-entropy (`[cluster.kv] anti_entropy_interval_secs`):
+    // built inside the cluster block, spawned alongside the accept loop and
+    // aborted at drain. Reconciles this node's large KV copies against the
+    // current replica set so origin/ex-replica copies converge without waiting
+    // for a gossip marker (#632).
+    let mut kv_anti_entropy: Option<Arc<ephpm_cluster::AntiEntropy>> = None;
+
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
         // Fail closed on an unauthenticated cluster: an empty secret means
@@ -332,6 +339,18 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         // a pulled small-tier entry lands exactly as a gossip-applied write.
         kv_gossip_pull = Some(ephpm_cluster::GossipBulkTransfer::new(
             Arc::clone(&cluster_handle),
+            data_plane_cipher.clone(),
+            data_plane_router.clone(),
+            &config.cluster.kv,
+        ));
+
+        // Large-tier anti-entropy reconciler. It shares the data-plane router
+        // (same stores + applied map), so a dropped copy and an adopted value
+        // land exactly as the live read/write paths would. Independent of
+        // `peer_handoff` — it is a steady-state safety net, not a restart one.
+        // Built even when disabled (zero interval); `run()` returns at once.
+        kv_anti_entropy = Some(ephpm_cluster::AntiEntropy::new(
+            &cluster_handle,
             data_plane_cipher.clone(),
             data_plane_router.clone(),
             &config.cluster.kv,
@@ -737,7 +756,22 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         })
     });
 
+    // Large-tier anti-entropy: reconcile this node's large KV copies against
+    // the current replica set on a timer, concurrently with the accept loop.
+    // A disabled (zero-interval) reconciler returns immediately. Aborted at
+    // drain below.
+    let anti_entropy = kv_anti_entropy.as_ref().filter(|ae| ae.enabled()).map(|ae| {
+        let ae = Arc::clone(ae);
+        tokio::spawn(ae.run())
+    });
+
     let served = accept_loop(listeners).await;
+
+    // Stop the anti-entropy timer before draining — its passes are pure
+    // reconciliation and have no shutdown work to finish.
+    if let Some(anti_entropy) = anti_entropy {
+        anti_entropy.abort();
+    }
 
     // A drain that begins before the warm-up finished: abandon the pull
     // rather than push while still pulling (both walk the same stores and

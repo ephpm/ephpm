@@ -7887,6 +7887,31 @@ pub struct ClusterKvConfig {
     /// Default: `7947`.
     #[serde(default = "default_kv_data_port")]
     pub data_port: u16,
+
+    /// How often (seconds) a node reconciles its large (data-plane) tier
+    /// copies against the current replica set — the large-tier anti-entropy
+    /// pass (#632). `0` disables it.
+    ///
+    /// Large values are replicated to their replica set at write time only,
+    /// and nothing rebalances them afterwards. Two kinds of local copy drift
+    /// stale as a result: an **origin** copy (the writing node keeps its own
+    /// copy whether or not it is a replica) and an **ex-replica** copy (a
+    /// node that was a replica under an older membership). Both keep serving
+    /// a superseded value until a gossip delete marker arrives — seconds on a
+    /// long-running node, minutes on a freshly restarted one.
+    ///
+    /// Each pass walks this node's local large values and, for every one:
+    /// drops a copy this node no longer owns once the authoritative replica
+    /// set confirms an equal-or-newer copy (readers then fetch through), and
+    /// refreshes a copy this node *does* own from a co-replica that holds a
+    /// strictly newer stamp (newest-stamp-wins). It never deletes an owned
+    /// copy and never pushes a value outward, so it can neither resurrect a
+    /// deleted key nor publish a winning stamp over newer data. Small
+    /// (gossip-tier) values are unaffected — chitchat already converges them.
+    ///
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_anti_entropy_interval_secs")]
+    pub anti_entropy_interval_secs: u64,
 }
 
 impl Default for ClusterKvConfig {
@@ -7901,6 +7926,7 @@ impl Default for ClusterKvConfig {
             hot_key_local_ttl_secs: default_hot_key_local_ttl_secs(),
             hot_key_max_memory: default_hot_key_max_memory(),
             data_port: default_kv_data_port(),
+            anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
         }
     }
 }
@@ -8504,6 +8530,10 @@ fn default_hot_key_max_memory() -> String {
 
 fn default_kv_data_port() -> u16 {
     7947
+}
+
+fn default_anti_entropy_interval_secs() -> u64 {
+    300
 }
 
 fn default_listen() -> String {

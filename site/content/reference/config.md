@@ -1307,6 +1307,7 @@ and the membership check is per-host and trusts the TCP source address.
 | `hot_key_local_ttl_secs` | u64 | `30` | Max age of cached hot-key values. |
 | `hot_key_max_memory` | string | `"64MB"` | Memory budget for hot-key cache. |
 | `data_port` | u16 | `7947` | TCP listener for the KV data plane. Binds the **IP of `[cluster] bind`** on this port (so `bind = "0.0.0.0:7946"` still exposes it on every interface — firewall it on multi-homed hosts, or bind a specific IP). Each node advertises its own `data_port` over gossip and peers dial it at `<gossip IP>:<advertised port>`, so nodes may use different ports. A peer running a build older than this advertisement is dialled on this node's own `data_port`. Every connection to a peer is bounded: 2 s to connect, 10 s per request, and a peer that refuses a connection is not redialled for 2 s. |
+| `anti_entropy_interval_secs` | u64 | `300` | How often (seconds) a node reconciles its large-tier copies against the current replica set; `0` disables it. Each pass drops a copy this node no longer owns once the replica set confirms an equal-or-newer copy (readers then fetch through), and refreshes an owned copy from a co-replica holding a strictly newer stamp (newest-stamp-wins). It never deletes an owned copy and never pushes a value outward, so it cannot resurrect a deleted key or publish a winning stamp over newer data. Small (gossip-tier) values are unaffected. |
 
 ## `[[middleware]]`
 
