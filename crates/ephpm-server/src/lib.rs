@@ -36,6 +36,7 @@ pub mod rate_limit;
 pub mod router;
 pub mod s3;
 pub mod screened_backend;
+pub mod server_sandbox;
 pub mod sigv4;
 pub mod site_backends;
 mod site_overrides;
@@ -145,6 +146,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // deliberately and once, is what keeps every TLS config in the process on
     // the same provider. Idempotent — see `tls::install_default_crypto_provider`.
     tls::install_default_crypto_provider();
+
+    // Multi-tenant breakout audit finding F3, part 1: fail closed on a dangerous
+    // privilege posture (root with no `run_as_user`). Done first, before any port
+    // is bound, so a misconfigured production deployment stops immediately rather
+    // than binding privileged ports and serving tenant PHP as host root. `dev`
+    // downgrades the failure to a warning.
+    privdrop::enforce_posture(&config, dev_mode).context("privilege posture check failed")?;
 
     // Install Prometheus recorder if metrics are enabled.
     let metrics_handle = if config.server.metrics.enabled {
@@ -629,6 +637,14 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Some((scheduler, handle)) => (Some(scheduler), Some(handle)),
         None => (None, None),
     };
+
+    // Multi-tenant breakout audit finding F3, part 2: decide and preflight the
+    // self-applied Landlock sandbox for the PHP execution engine BEFORE
+    // `bind_listeners` spawns the PHP pools. Each PHP thread arms the sandbox on
+    // itself at startup (see `fpm_pool`/`worker_pool`/`debug_lane`), so the
+    // decision and path set must be stored before any of those threads exist. In
+    // `Enforce` mode this fails startup if the kernel does not support Landlock.
+    server_sandbox::init(&config, dev_mode).context("failed to initialise the engine sandbox")?;
 
     let listeners = bind_listeners(
         &config,

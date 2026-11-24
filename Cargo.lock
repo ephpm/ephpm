@@ -1792,6 +1792,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "ipnet",
+ "landlock",
  "libc 0.2.189",
  "libloading",
  "litewire",

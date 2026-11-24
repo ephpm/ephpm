@@ -741,6 +741,21 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize) {
     // only while the thread waits in `recv` below.
     let mailbox = pool.dispatcher.register_worker();
 
+    // Arm the self-applied Landlock sandbox on this thread BEFORE any PHP runs
+    // (finding F3). A no-op unless `[server] self_sandbox` enabled it; when it
+    // did and arming fails, refuse to serve tenant PHP on an unsandboxed thread
+    // — fail closed, same bookkeeping as a TSRM-init failure below (no TSRM slot
+    // taken yet, so nothing to release).
+    if let Err(e) = crate::server_sandbox::restrict_current_php_thread() {
+        drop(mailbox);
+        tracing::error!(thread_id, ?e, "fpm pool thread could not arm the engine sandbox");
+        pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
+        counter!("ephpm_fpm_pool_boot_failures_total").increment(1);
+        pool.state.live.fetch_sub(1, Ordering::AcqRel);
+        respawn_if_running(pool);
+        return;
+    }
+
     // Register this thread with TSRM once (the per-thread registration guard
     // ensures a thread never double-registers). Unlike worker mode this does
     // NOT boot a framework — each request runs its own per-request cycle.

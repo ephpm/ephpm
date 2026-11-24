@@ -448,6 +448,23 @@ fn worker_main(
         ephpm_php::worker_bridge::set_retire_check(Box::new(move || pool.claim_surplus()));
     }
 
+    // Arm the self-applied Landlock sandbox on this worker BEFORE the framework
+    // boots (finding F3) — worker-mode boot executes application PHP (autoload,
+    // framework bootstrap) immediately in worker_thread_init below, so the
+    // sandbox must be in place first. A no-op unless `[server] self_sandbox`
+    // enabled it; when it did and arming fails, refuse to serve on an
+    // unsandboxed worker (fail closed), with the same cleanup a TSRM-init
+    // failure performs.
+    if let Err(e) = crate::server_sandbox::restrict_current_php_thread() {
+        ephpm_php::worker_bridge::clear_dispatch_source();
+        tracing::error!(worker_id, ?e, "worker could not arm the engine sandbox");
+        pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
+        counter!("ephpm_worker_boot_failures_total").increment(1);
+        pool.state.live.fetch_sub(1, Ordering::AcqRel);
+        respawn_if_running(pool);
+        return;
+    }
+
     // TSRM register + start the one long-lived request the whole loop runs in.
     if let Err(e) = PhpRuntime::worker_thread_init() {
         ephpm_php::worker_bridge::clear_dispatch_source();
