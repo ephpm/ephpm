@@ -45,6 +45,7 @@ pub mod sql_forward;
 pub mod static_files;
 pub mod stream_compress;
 pub mod tenant_ebpf;
+pub mod tenant_unix_fence;
 mod timeline;
 pub mod tls;
 pub mod tracked_backend;
@@ -1250,63 +1251,19 @@ async fn bind_listeners(
         ephpm_php::PhpRuntime::set_ws_registry(Arc::clone(&runtime.registry));
     }
 
-    // Per-vhost eBPF network policy ([server.tenant_network] ebpf_policy).
-    // Load + attach BEFORE the router is built, then hand the Arc to it. Fail
-    // closed: with ebpf_policy = true a load/attach, range, or overlap failure
-    // aborts startup — ePHPm must never come up with the policy the operator
-    // asked for silently absent (docs-must-match-code).
-    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> =
-        if config.server.tenant_network.ebpf_policy {
-            let port_of = |addr: &str| -> Option<u16> {
-                addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
-            };
-            let range = config
-                .server
-                .tenant_network
-                .parse_range()
-                .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
-            // The sidecar range must not overlap the kernel ephemeral range, or an
-            // outbound source port could collide with a handed-out real port.
-            tenant_ebpf::TenantEbpf::assert_no_ephemeral_overlap(range)?;
-            // ePHPm's own loopback infra ports every tagged vhost may reach: the
-            // stock pdo_mysql wire listener and the KV RESP listener.
-            let mut infra_ports: Vec<u16> = Vec::new();
-            if let Some((_, listen)) = per_site_db_wire.as_ref()
-                && let Some(p) = port_of(listen)
-            {
-                infra_ports.push(p);
-            }
-            if config.kv.redis_compat.enabled
-                && let Some(p) = port_of(&config.kv.redis_compat.listen)
-            {
-                infra_ports.push(p);
-            }
-            let handle = tenant_ebpf::TenantEbpf::load_and_attach(
-                config.server.tenant_network.cgroup_path.as_deref(),
-                &infra_ports,
-            )
-            .context(
-                "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy = \
-             true). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
-             CAP_NET_ADMIN. It also needs a raised RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the \
-             systemd unit): BPF maps are charged against memlock and the loader cannot raise the \
-             limit itself under NoNewPrivileges (no CAP_SYS_RESOURCE), so its absence surfaces as \
-             'failed to create map ... Operation not permitted' even when the capabilities are \
-             correct. Also confirm any external nft egress floor drops its blanket loopback-DROP \
-             for the ePHPm cgroup, or every sidecar connect will fail.",
-            )?;
-            handle.fill_pool(range, config.server.tenant_network.max_sidecar_ports_per_vhost)?;
-            tracing::info!(
-                cgroup = ?config.server.tenant_network.cgroup_path,
-                sidecar_port_range = %config.server.tenant_network.sidecar_port_range,
-                max_per_vhost = config.server.tenant_network.max_sidecar_ports_per_vhost,
-                ?infra_ports,
-                "tenant_network: eBPF per-vhost policy loaded and attached"
-            );
-            Some(handle)
-        } else {
-            None
-        };
+    // Per-vhost eBPF network policies ([server.tenant_network] ebpf_policy for
+    // TCP/loopback, unix_socket_policy for the AF_UNIX fence). Load + attach
+    // BEFORE the router is built, then hand the Arc to it — the router tags
+    // request threads whenever the handle exists, and both policies key on
+    // that tag. Fail closed: with ebpf_policy = true a load/attach, range, or
+    // overlap failure aborts startup; with unix_socket_policy = "required" a
+    // fence failure does too — ePHPm must never come up with a policy the
+    // operator asked for silently absent (docs-must-match-code).
+    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> = start_tenant_ebpf(
+        config,
+        per_site_db_wire.as_ref().map(|(_, listen)| listen.as_str()),
+        dev_mode,
+    )?;
 
     // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
     // request that created it and keeps dispatching PHP events through this
@@ -2939,6 +2896,173 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
              This knob is ignored; delete it."
         );
     }
+}
+
+/// Load and attach the `[server.tenant_network]` eBPF policies, if any is on.
+///
+/// Returns `None` when both `ebpf_policy` and `unix_socket_policy` are off
+/// (zero cost: nothing loaded, no per-request tag). Otherwise the `vhostnet`
+/// object is loaded once; the TCP/loopback programs attach when `ebpf_policy`,
+/// and the AF_UNIX fence per `unix_socket_policy`:
+///
+/// * `"required"` — a fence failure is a startup error.
+/// * `"warn"` — a fence failure is logged at ERROR and startup continues with
+///   tenant unix connects **unfenced** (the TCP policy, if on, still applies).
+///
+/// `per_site_db_wire_listen` is the stock-`pdo_mysql` listener address in
+/// per-site mode (an infra port every tagged vhost may reach).
+///
+/// With the fence off on a multi-tenant (non-dev) node, logs one WARN naming
+/// the exposure (audit finding F2), so the default never passes silently.
+fn start_tenant_ebpf(
+    config: &Config,
+    per_site_db_wire_listen: Option<&str>,
+    dev_mode: bool,
+) -> anyhow::Result<Option<Arc<tenant_ebpf::TenantEbpf>>> {
+    use ephpm_config::UnixSocketPolicy;
+
+    let tn = &config.server.tenant_network;
+    let unix_policy = tn
+        .parse_unix_socket_policy()
+        .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+    let opts = tenant_ebpf::LoadOptions {
+        tcp_policy: tn.ebpf_policy,
+        unix_fence: unix_policy.is_enabled(),
+    };
+
+    if !opts.tcp_policy && !opts.unix_fence {
+        if config.server.sites_dir.is_some() && !dev_mode {
+            tracing::warn!(
+                "tenant_network: unix_socket_policy = \"off\" on a multi-tenant node — tenant PHP \
+                 can connect() to EVERY unix socket this uid can reach (docker.sock, database auth \
+                 sockets, D-Bus) via unix:// streams, PDO unix_socket= or curl's \
+                 CURLOPT_UNIX_SOCKET_PATH; open_basedir gates none of them. Set \
+                 [server.tenant_network] unix_socket_policy = \"required\" (Linux >= 6.7 with \
+                 BTF, CAP_BPF + CAP_NET_ADMIN) to deny them all except an explicit per-site \
+                 unix_socket_allow list."
+            );
+        }
+        return Ok(None);
+    }
+
+    let port_of = |addr: &str| -> Option<u16> {
+        addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
+    };
+    // ePHPm's own loopback infra ports every tagged vhost may reach: the stock
+    // pdo_mysql wire listener and the KV RESP listener. Consulted by the TCP
+    // policy only, but harmless to populate regardless.
+    let mut infra_ports: Vec<u16> = Vec::new();
+    if let Some(p) = per_site_db_wire_listen.and_then(port_of) {
+        infra_ports.push(p);
+    }
+    if config.kv.redis_compat.enabled
+        && let Some(p) = port_of(&config.kv.redis_compat.listen)
+    {
+        infra_ports.push(p);
+    }
+
+    let range = if opts.tcp_policy {
+        let range = tn.parse_range().map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+        // The sidecar range must not overlap the kernel ephemeral range, or an
+        // outbound source port could collide with a handed-out real port.
+        tenant_ebpf::TenantEbpf::assert_no_ephemeral_overlap(range)?;
+        Some(range)
+    } else {
+        None
+    };
+
+    // `"warn"` covers the WHOLE fence setup chain when the fence is the only
+    // reason the object is being loaded: a failure anywhere in it (cgroup,
+    // object, verifier, attach) is logged and the node runs unfenced. With
+    // `ebpf_policy = true` the base load stays fail-closed as it always was.
+    let warn_unfenced = |e: &anyhow::Error| {
+        tracing::error!(
+            error = %format!("{e:#}"),
+            "tenant_network: AF_UNIX connect fence could NOT be attached and unix_socket_policy = \
+             \"warn\" — starting UNFENCED: tenant PHP can connect() to every unix socket this uid \
+             can reach (audit finding F2). Needs Linux >= 6.7 with BTF and CAP_BPF + \
+             CAP_NET_ADMIN; set \"required\" to refuse startup instead."
+        );
+    };
+    let fence_only_warn = !opts.tcp_policy && unix_policy == UnixSocketPolicy::Warn;
+
+    let loaded = tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
+        .context(
+            "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
+             unix_socket_policy). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
+             CAP_NET_ADMIN. It also needs a raised RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the \
+             systemd unit): BPF maps are charged against memlock and the loader cannot raise the \
+             limit itself under NoNewPrivileges (no CAP_SYS_RESOURCE), so its absence surfaces as \
+             'failed to create map ... Operation not permitted' even when the capabilities are \
+             correct. Also confirm any external nft egress floor drops its blanket loopback-DROP \
+             for the ePHPm cgroup, or every sidecar connect will fail.",
+        );
+    let handle = match loaded {
+        Ok(handle) => handle,
+        Err(e) if fence_only_warn => {
+            warn_unfenced(&e);
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+
+    if let Some(range) = range {
+        handle.fill_pool(range, tn.max_sidecar_ports_per_vhost)?;
+        tracing::info!(
+            cgroup = ?tn.cgroup_path,
+            sidecar_port_range = %tn.sidecar_port_range,
+            max_per_vhost = tn.max_sidecar_ports_per_vhost,
+            ?infra_ports,
+            "tenant_network: eBPF per-vhost policy loaded and attached"
+        );
+    }
+
+    if opts.unix_fence {
+        // Allowlist first, fence second: once the fence is attached, a tagged
+        // thread is denied anything not yet in the map, and the first request
+        // must never race the operator's own allowlist.
+        let allow = tn
+            .parse_unix_socket_allow()
+            .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+        let mut entries = 0usize;
+        for (site, targets) in &allow {
+            handle.set_unix_allow(site, targets)?;
+            entries += targets.len();
+        }
+        match handle.attach_unix_fence() {
+            Ok(()) => tracing::info!(
+                policy = %tn.unix_socket_policy,
+                sites_allowlisted = allow.len(),
+                allow_entries = entries,
+                "tenant_network: AF_UNIX connect fence attached (cgroup/connect_unix + \
+                 sendmsg_unix) — tenant PHP may reach ONLY the allowlisted unix sockets; every \
+                 other unix connect from a tenant thread is denied (EPERM)"
+            ),
+            Err(e) => match unix_policy {
+                UnixSocketPolicy::Required => {
+                    return Err(e.context(
+                        "attaching the AF_UNIX connect fence ([server.tenant_network] \
+                         unix_socket_policy = \"required\"). Requires Linux >= 6.7 with BTF \
+                         (CONFIG_DEBUG_INFO_BTF), the bpf JIT enabled, and CAP_BPF + CAP_NET_ADMIN. \
+                         Refusing to start multi-tenant with tenant unix connects unfenced; set \
+                         unix_socket_policy = \"warn\" to start anyway on a host that cannot meet \
+                         the floor.",
+                    ));
+                }
+                // `Off` is unreachable here (`opts.unix_fence` is false for it).
+                UnixSocketPolicy::Warn | UnixSocketPolicy::Off => {
+                    warn_unfenced(&e);
+                    if !opts.tcp_policy {
+                        // Nothing left for the tag to serve: drop the object
+                        // rather than pay a per-request map write for no policy.
+                        return Ok(None);
+                    }
+                }
+            },
+        }
+    }
+
+    Ok(Some(handle))
 }
 
 /// The resolved embedded-SQLite mode, as a stable label for the startup log.

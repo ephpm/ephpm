@@ -1,10 +1,19 @@
-//! Per-vhost kernel network policy (`[server.tenant_network] ebpf_policy`).
+//! Per-vhost kernel network policy (`[server.tenant_network] ebpf_policy` and
+//! `unix_socket_policy`).
 //!
 //! Loads the BPF programs (compiled by `build.rs`, embedded via `include_bytes!`)
 //! with **aya** — pure Rust, no libbpf, no C runtime dependency — and attaches
 //! `bind4/6` and `connect4/6` to ePHPm's own cgroup. Holds the maps so the
 //! request path can tag threads and so the real-port pool can be provisioned.
 //! See `crates/ephpm-server/bpf/vhostnet.bpf.c` for the kernel side.
+//!
+//! The AF_UNIX connect fence (`unix_socket_policy`, audit finding F2) rides on
+//! the same per-thread tag: [`TenantEbpf`] owns its `unix_allow` map and hands
+//! the fds of the shared `tag`/`nscfg`/`unix_allow` maps to
+//! [`crate::tenant_unix_fence`], whose raw loader attaches the
+//! `cgroup/connect_unix` + `sendmsg_unix` programs. The two policies are
+//! independent switches ([`LoadOptions`]): either one being on is what makes
+//! `serve()` construct this type and the router tag request threads.
 //!
 //! Close-time port reclamation (a `sock_release` program returning ports to the
 //! pool) is **not implemented** and has no target release: reading a socket's
@@ -57,6 +66,21 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use ephpm_config::UnixSocketTarget;
+
+/// Which policies [`TenantEbpf::load_and_attach`] attaches. The `vhostnet`
+/// object (and its maps, including the per-thread `tag`) is loaded whenever
+/// either is on; the programs are attached per switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// `[server.tenant_network] ebpf_policy`: `cgroup/bind4+6` + `connect4+6`
+    /// (loopback authorization, sidecar port-rewrite, per-vhost quota).
+    pub tcp_policy: bool,
+    /// `[server.tenant_network] unix_socket_policy != "off"`: reserve the
+    /// shared-map fds the AF_UNIX fence needs so
+    /// [`TenantEbpf::attach_unix_fence`] can be called afterwards.
+    pub unix_fence: bool,
+}
 
 /// One numeric id per canonical site key. The kernel `tag`/`assigned`/
 /// `port_owner` maps key on `u32` vhost ids, not strings; this assigns a stable
@@ -90,14 +114,18 @@ mod imp {
     // Every unsafe block below carries a SAFETY note.
     #![allow(unsafe_code)]
 
+    use std::fs::File;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::os::linux::fs::MetadataExt;
     use std::sync::Mutex;
 
     use anyhow::{Context, anyhow};
     use aya::maps::{Array, HashMap as AyaHashMap, MapData, Queue};
     use aya::programs::{CgroupAttachMode, CgroupSockAddr};
+    use ephpm_config::UNIX_PATH_MAX;
 
-    use super::{Arc, Result, SiteIdRegistry};
+    use super::{Arc, LoadOptions, Result, SiteIdRegistry, UnixSocketTarget};
+    use crate::tenant_unix_fence::{MapFds, UnixFence};
 
     /// Compiled BPF object, produced by `build.rs` (`clang -target bpf`) and
     /// embedded. The bytes ship in the binary — no runtime file, no libbpf.
@@ -124,6 +152,22 @@ mod imp {
     // exactly — the invariants `aya::Pod` requires for a map value.
     unsafe impl aya::Pod for NsCfg {}
 
+    /// Key of the kernel `unix_allow` map: `struct unix_allow_key_t` in
+    /// `bpf/vhostnet_common.h`. `vhost` is the site's id, `path`/`len` the
+    /// destination exactly as the fence normalises it
+    /// ([`UnixSocketTarget::sun_path`]). `#[repr(C)]`, no padding: 4 + 4 + 108.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct UnixAllowKey {
+        vhost: u32,
+        len: u32,
+        path: [u8; UNIX_PATH_MAX],
+    }
+    // SAFETY: `UnixAllowKey` is `#[repr(C)]` and made only of `u32`s and a byte
+    // array — no padding (4 + 4 + 108 = 116 bytes, 4-aligned), no pointers,
+    // valid for any bit pattern — matching `struct unix_allow_key_t` exactly.
+    unsafe impl aya::Pod for UnixAllowKey {}
+
     /// Live handle: owns the loaded programs + their fd-links (via the retained
     /// [`aya::Ebpf`]) and the maps the request path and provisioning write.
     pub struct TenantEbpf {
@@ -139,18 +183,33 @@ mod imp {
         port_pool: Mutex<Queue<MapData, u32>>,
         /// `[0]` = `max_sidecar_ports_per_vhost`; set once by [`Self::fill_pool`].
         quota: Mutex<Array<MapData, u32>>,
+        /// Per-site AF_UNIX destination allowlist, written at startup by
+        /// [`Self::set_unix_allow`]. Read by the fence programs only.
+        unix_allow: Mutex<AyaHashMap<MapData, UnixAllowKey, u8>>,
+        /// The cgroup every program attaches to, kept so the fence can be
+        /// attached after the base load (its failure policy is the caller's).
+        cgroup: File,
+        /// Fds of the maps the fence shares with this object. Valid for as long
+        /// as `self` (the owning `MapData`s live in the fields above / `_bpf`).
+        shared_fds: MapFds,
+        /// The attached AF_UNIX fence, once [`Self::attach_unix_fence`] succeeds.
+        unix_fence: Mutex<Option<UnixFence>>,
         site_ids: SiteIdRegistry,
     }
 
     impl TenantEbpf {
-        /// Load, populate `nscfg` + `infra_ports`, and attach the four
-        /// `bind4/6` + `connect4/6` programs to `cgroup_path` (defaults to
-        /// ePHPm's own cgroup). Fails closed: any error here is fatal to startup
-        /// when `ebpf_policy = true`.
+        /// Load the `vhostnet` object, populate `nscfg` + `infra_ports`, and —
+        /// when `opts.tcp_policy` — attach the four `bind4/6` + `connect4/6`
+        /// programs to `cgroup_path` (defaults to ePHPm's own cgroup). Fails
+        /// closed: any error here is fatal to startup.
         ///
         /// `infra_ports` are ePHPm's own loopback service ports (the stock
         /// `pdo_mysql` wire listener, the KV RESP listener) that every tagged
         /// vhost is allowed to reach.
+        ///
+        /// The AF_UNIX fence is **not** attached here — call
+        /// [`Self::attach_unix_fence`] next, so `serve()` can apply the
+        /// `unix_socket_policy` failure mode to that step alone.
         ///
         /// # Errors
         ///
@@ -162,6 +221,7 @@ mod imp {
         pub fn load_and_attach(
             cgroup_path: Option<&str>,
             infra_ports: &[u16],
+            opts: &LoadOptions,
         ) -> Result<Arc<Self>> {
             bump_memlock_rlimit();
 
@@ -169,8 +229,9 @@ mod imp {
                 .load(BPF_OBJECT)
                 .context("loading the embedded vhostnet.bpf.o")?;
 
-            // Open the cgroup ePHPm lives in (v2 unified hierarchy). All five
-            // programs attach here.
+            // Open the cgroup ePHPm lives in (v2 unified hierarchy). Every
+            // program — the four sockaddr ones here, the two unix ones in
+            // `attach_unix_fence` — attaches here.
             let cg_path = match cgroup_path {
                 Some(p) => p.to_string(),
                 None => self_cgroup_path().context("resolving ePHPm's own cgroup path")?,
@@ -179,15 +240,19 @@ mod imp {
                 .with_context(|| format!("opening cgroup {cg_path} for BPF attach"))?;
 
             // sockaddr programs (bind/connect rewrite + authorize).
-            for name in ["vhost_bind4", "vhost_bind6", "vhost_connect4", "vhost_connect6"] {
-                let prog: &mut CgroupSockAddr = bpf
-                    .program_mut(name)
-                    .ok_or_else(|| anyhow!("BPF program {name} missing from object"))?
-                    .try_into()
-                    .with_context(|| format!("program {name} is not a cgroup/sockaddr program"))?;
-                prog.load().with_context(|| format!("verifier rejected {name}"))?;
-                prog.attach(&cgroup, CgroupAttachMode::Single)
-                    .with_context(|| format!("attaching {name} to {cg_path}"))?;
+            if opts.tcp_policy {
+                for name in ["vhost_bind4", "vhost_bind6", "vhost_connect4", "vhost_connect6"] {
+                    let prog: &mut CgroupSockAddr = bpf
+                        .program_mut(name)
+                        .ok_or_else(|| anyhow!("BPF program {name} missing from object"))?
+                        .try_into()
+                        .with_context(|| {
+                            format!("program {name} is not a cgroup/sockaddr program")
+                        })?;
+                    prog.load().with_context(|| format!("verifier rejected {name}"))?;
+                    prog.attach(&cgroup, CgroupAttachMode::Single)
+                        .with_context(|| format!("attaching {name} to {cg_path}"))?;
+                }
             }
 
             // Write nscfg[0] = {dev, ino} of /proc/self/ns/pid so the kernel can
@@ -217,10 +282,31 @@ mod imp {
                 }
             }
 
+            // Raw fds of the maps the AF_UNIX fence object shares with this one.
+            // Captured before `take_map`: moving a map's userspace handle out of
+            // `bpf` moves its `OwnedFd` without duplicating it, so the numbers
+            // stay valid for as long as the handles below (and `_bpf`) live.
+            let raw_fd = |bpf: &aya::Ebpf, name: &str| -> Result<std::os::fd::RawFd> {
+                // `aya::maps::Map` is an enum over `MapData`; only the two kinds
+                // vhostnet_common.h declares for the shared maps can appear.
+                match bpf.map(name).ok_or_else(|| anyhow!("{name} map missing"))? {
+                    aya::maps::Map::HashMap(data) | aya::maps::Map::Array(data) => {
+                        Ok(data.fd().as_fd().as_raw_fd())
+                    }
+                    other => Err(anyhow!("{name} map has an unexpected type: {other:?}")),
+                }
+            };
+            let shared_fds = MapFds {
+                tag: raw_fd(&bpf, "tag")?,
+                nscfg: raw_fd(&bpf, "nscfg")?,
+                unix_allow: raw_fd(&bpf, "unix_allow")?,
+            };
+
             // Take long-lived owned handles for the maps written after startup
-            // (tag: per request; port_pool/quota: fill_pool). The programs
-            // already hold kernel references to these maps, so moving the
-            // userspace handle out of `bpf` does not unload them.
+            // (tag: per request; port_pool/quota: fill_pool; unix_allow:
+            // set_unix_allow). The programs already hold kernel references to
+            // these maps, so moving the userspace handle out of `bpf` does not
+            // unload them.
             let tag: AyaHashMap<_, u32, u32> = bpf
                 .take_map("tag")
                 .ok_or_else(|| anyhow!("tag map missing"))?
@@ -236,14 +322,88 @@ mod imp {
                 .ok_or_else(|| anyhow!("quota map missing"))?
                 .try_into()
                 .context("quota map is not an ARRAY")?;
+            let unix_allow: AyaHashMap<_, UnixAllowKey, u8> = bpf
+                .take_map("unix_allow")
+                .ok_or_else(|| anyhow!("unix_allow map missing"))?
+                .try_into()
+                .context("unix_allow map is not a HASH")?;
 
             Ok(Arc::new(Self {
                 _bpf: bpf,
                 tag: Mutex::new(tag),
                 port_pool: Mutex::new(port_pool),
                 quota: Mutex::new(quota),
+                unix_allow: Mutex::new(unix_allow),
+                cgroup,
+                shared_fds,
+                unix_fence: Mutex::new(None),
                 site_ids: SiteIdRegistry::default(),
             }))
+        }
+
+        /// Load and attach the AF_UNIX fence (`cgroup/connect_unix` +
+        /// `sendmsg_unix`) to the same cgroup. Idempotent: a second call while
+        /// attached is a no-op. Until this succeeds a tagged thread's unix
+        /// connects are **unfenced**, which is why `serve()` treats a failure
+        /// here per `unix_socket_policy` (`"required"` ⇒ refuse startup).
+        ///
+        /// # Errors
+        ///
+        /// Returns the loader's error: kernel older than 6.7, no BTF, kfuncs
+        /// missing, verifier rejection (log attached), or `EPERM` on load /
+        /// link (missing `CAP_BPF` + `CAP_NET_ADMIN`).
+        ///
+        /// # Panics
+        ///
+        /// Panics if the internal fence mutex is poisoned, which cannot happen:
+        /// it is only ever held across infallible assignments.
+        pub fn attach_unix_fence(&self) -> Result<()> {
+            let mut slot = self.unix_fence.lock().expect("unix_fence mutex poisoned");
+            if slot.is_some() {
+                return Ok(());
+            }
+            let fence = UnixFence::load_and_attach(&self.cgroup, &self.shared_fds)?;
+            *slot = Some(fence);
+            Ok(())
+        }
+
+        /// Whether the AF_UNIX fence is attached (so tagged threads are fenced).
+        ///
+        /// # Panics
+        ///
+        /// Panics if the internal fence mutex is poisoned (see
+        /// [`Self::attach_unix_fence`]).
+        #[must_use]
+        pub fn unix_fence_active(&self) -> bool {
+            self.unix_fence.lock().expect("unix_fence mutex poisoned").is_some()
+        }
+
+        /// Allow `site_key` to reach every destination in `targets`, writing
+        /// one `unix_allow` entry per target under the site's vhost id (allocated
+        /// now, so the id the fence sees at request time is the same one). A
+        /// site never named here can reach no unix socket.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if a map write (`bpf_map_update_elem`) fails — e.g.
+        /// the map is full (4096 entries).
+        ///
+        /// # Panics
+        ///
+        /// Panics if the internal `unix_allow` mutex is poisoned, which can
+        /// only follow a panic in a prior map write; in practice this runs once
+        /// at startup before any concurrent access.
+        pub fn set_unix_allow(&self, site_key: &str, targets: &[UnixSocketTarget]) -> Result<()> {
+            let vhost = self.site_ids.id_for(site_key);
+            let mut map = self.unix_allow.lock().expect("unix_allow mutex poisoned");
+            for target in targets {
+                let (path, len) = target.sun_path();
+                let key = UnixAllowKey { vhost, len, path };
+                map.insert(key, 1u8, 0).with_context(|| {
+                    format!("writing unix_allow entry {target:?} for site {site_key:?}")
+                })?;
+            }
+            Ok(())
         }
 
         /// Fill `port_pool` with every port in the (validated) `range` and set
@@ -400,7 +560,7 @@ mod imp {
 // ===========================================================================
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use super::{Arc, Result, SiteIdRegistry};
+    use super::{Arc, LoadOptions, Result, SiteIdRegistry, UnixSocketTarget};
 
     /// Inert non-Linux placeholder with the same public surface as the Linux
     /// [`TenantEbpf`](super::TenantEbpf).
@@ -414,12 +574,38 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Always returns an error — the eBPF policy is Linux-only.
+        /// Always returns an error — the eBPF policies are Linux-only.
         pub fn load_and_attach(
             _cgroup_path: Option<&str>,
             _infra_ports: &[u16],
+            _opts: &LoadOptions,
         ) -> Result<Arc<Self>> {
-            anyhow::bail!("[server.tenant_network] ebpf_policy is Linux-only")
+            anyhow::bail!("[server.tenant_network] eBPF policies are Linux-only")
+        }
+
+        /// Always fails on non-Linux (never reached: `validate()` rejects the
+        /// knob first).
+        ///
+        /// # Errors
+        ///
+        /// Always returns an error — the AF_UNIX fence is Linux-only.
+        pub fn attach_unix_fence(&self) -> Result<()> {
+            anyhow::bail!("[server.tenant_network] unix_socket_policy is Linux-only")
+        }
+
+        /// Always `false` on non-Linux.
+        #[must_use]
+        pub fn unix_fence_active(&self) -> bool {
+            false
+        }
+
+        /// No-op on non-Linux.
+        ///
+        /// # Errors
+        ///
+        /// Never returns an error on non-Linux.
+        pub fn set_unix_allow(&self, _site_key: &str, _targets: &[UnixSocketTarget]) -> Result<()> {
+            Ok(())
         }
 
         /// No-op on non-Linux.

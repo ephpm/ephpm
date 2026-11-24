@@ -629,6 +629,128 @@ impl Drop for DbImportFixture {
     }
 }
 
+/// A self-managed **multi-tenant** node serving several virtual hosts from one
+/// scratch `sites_dir`, with a suite-supplied `[server.tenant_network]` (or any
+/// other) section appended to its config.
+///
+/// Built for the `tenant_unix_socket` suite, which needs two real vhosts on one
+/// server (to prove the AF_UNIX allowlist is per-site) and a config no shared
+/// node may carry (#288/#295: a kernel fence that denies unix connects would
+/// perturb every sibling suite). Like [`DbImportFixture`] it is two-phase so a
+/// suite can assert on a node that is *supposed* to refuse to start:
+/// [`prepare`](Self::prepare) lays the tree down, [`serve`](Self::serve)
+/// starts it, and [`logs`](Self::logs) reads the node's log either way.
+pub struct MultiSiteFixture {
+    child: Option<Child>,
+    base_url: String,
+    http_port: u16,
+    binary: PathBuf,
+    config_path: PathBuf,
+    lease: Option<PortLease>,
+    _tempdir: TempDir,
+}
+
+impl MultiSiteFixture {
+    /// Lay down `sites` (each `(site_key, index.php source)`) under a scratch
+    /// `sites_dir`, write the config with `extra_toml` appended, and reserve
+    /// the ports — but start nothing. `extra_toml` may use `{SCRATCH_DIR}`
+    /// (the fixture's scratch directory, TOML-escaped).
+    ///
+    /// # Errors
+    ///
+    /// Fails if ports cannot be reserved or the scratch files cannot be
+    /// written.
+    pub fn prepare(ephpm_binary: &Path, sites: &[(&str, &str)], extra_toml: &str) -> Result<Self> {
+        let mut reserver = PortReserver::new();
+        let lease = reserver.lease(&[PortKind::Tcp, PortKind::Tcp])?;
+        let (http_port, mysql_port) = (lease.port(0), lease.port(1));
+
+        let tmp = tempfile::Builder::new()
+            .prefix("ephpm-e2e-multisite-")
+            .tempdir()
+            .context("create tempdir")?;
+        let sites_dir = tmp.path().join("sites");
+        for (site, index_php) in sites {
+            let vhost = sites_dir.join(site);
+            fs::create_dir_all(&vhost).context("create vhost dir")?;
+            fs::write(vhost.join("index.php"), index_php).context("write vhost index.php")?;
+        }
+        let db_dir = tmp.path().join("db");
+        fs::create_dir_all(&db_dir).context("create db dir")?;
+
+        let trusted: Vec<String> = sites.iter().map(|(s, _)| format!("\"{s}\"")).collect();
+        let config = format!("{MULTI_SITE_TEMPLATE}\n{extra_toml}\n")
+            .replace("{HTTP_PORT}", &http_port.to_string())
+            .replace("{MYSQL_PORT}", &mysql_port.to_string())
+            .replace("{SITES_DIR}", &escape_toml(&sites_dir))
+            .replace("{DB_DIR}", &escape_toml(&db_dir))
+            .replace("{SCRATCH_DIR}", &escape_toml(tmp.path()))
+            .replace("{TRUSTED_SITES}", &trusted.join(", "))
+            .replace("{METRICS_TOKEN}", E2E_METRICS_TOKEN);
+        let config_path = tmp.path().join("ephpm.toml");
+        fs::write(&config_path, config).context("write config")?;
+
+        Ok(Self {
+            child: None,
+            base_url: String::new(),
+            http_port,
+            binary: ephpm_binary.to_path_buf(),
+            config_path,
+            lease: Some(lease),
+            _tempdir: tmp,
+        })
+    }
+
+    /// Start the node and wait for health. On `Err` the node either exited
+    /// (a startup refusal — read [`logs`](Self::logs) for why) or never
+    /// became healthy.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the child cannot be spawned or never reports healthy.
+    pub async fn serve(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        let child =
+            spawn_serve(&self.binary, &self.config_path, self._tempdir.path(), self.http_port, &[])
+                .await?;
+        self.child = Some(child);
+        self.base_url = format!("http://127.0.0.1:{}", self.http_port);
+        Ok(())
+    }
+
+    /// Everything the node has written so far — stdout (where the tracing
+    /// subscriber logs) followed by stderr (startup refusals) — empty if
+    /// nothing yet.
+    #[must_use]
+    pub fn logs(&self) -> String {
+        let read =
+            |name: &str| fs::read_to_string(self._tempdir.path().join(name)).unwrap_or_default();
+        format!("{}\n{}", read("stdout.log"), read("stderr.log"))
+    }
+
+    /// Base URL (`http://127.0.0.1:<port>`); empty until [`serve`](Self::serve).
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The fixture's scratch directory (config, logs, `sites/`, `db/`).
+    #[must_use]
+    pub fn scratch_dir(&self) -> &Path {
+        self._tempdir.path()
+    }
+}
+
+impl Drop for MultiSiteFixture {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            terminate(child);
+        }
+    }
+}
+
 /// A single ephpm process whose database is a **`[db.mysql]` proxy** pointed at
 /// a real MySQL/MariaDB backend.
 ///
@@ -1264,7 +1386,8 @@ async fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Res
 }
 
 fn tcp_get(port: u16, path: &str) -> Result<u16, String> {
-    let addr = format!("127.0.0.1:{port}").parse().map_err(|e: std::net::AddrParseError| e.to_string())?;
+    let addr =
+        format!("127.0.0.1:{port}").parse().map_err(|e: std::net::AddrParseError| e.to_string())?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
         .map_err(|e| format!("connect: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -1456,6 +1579,44 @@ secret = "e2e-db-import-secret-not-for-prod"
 [kv.redis_compat]
 enabled = true
 listen = "127.0.0.1:{KV_PORT}"
+
+[db.sqlite]
+dir = "{DB_DIR}"
+
+[db.sqlite.proxy]
+mysql_listen = "127.0.0.1:{MYSQL_PORT}"
+"#;
+
+/// Config for [`MultiSiteFixture`] — a per-site (`sites_dir` + `[db.sqlite]
+/// dir`) node with several vhosts. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
+/// `{SITES_DIR}`, `{DB_DIR}`, `{TRUSTED_SITES}` (the quoted, comma-joined site
+/// keys), `{METRICS_TOKEN}`, and `{SCRATCH_DIR}` for a caller's `extra_toml`.
+/// `[kv] secret` is fixed because a multi-tenant node refuses to start without
+/// one. No RESP listener: the fixture's suites do not need it and a listener
+/// is one more port to reserve.
+const MULTI_SITE_TEMPLATE: &str = r#"# Auto-generated by ephpm-e2e MultiSiteFixture — do not edit.
+[server]
+listen = "127.0.0.1:{HTTP_PORT}"
+document_root = "{SITES_DIR}"
+sites_dir = "{SITES_DIR}"
+index_files = ["index.php", "index.html"]
+
+[server.request]
+trusted_hosts = ["localhost", "127.0.0.1", "127.0.0.1:{HTTP_PORT}", {TRUSTED_SITES}]
+
+[server.metrics]
+enabled = true
+token = "{METRICS_TOKEN}"
+
+[server.diagnostics]
+token = "{METRICS_TOKEN}"
+
+[php]
+max_execution_time = 30
+memory_limit = "128M"
+
+[kv]
+secret = "e2e-multisite-secret-not-for-prod"
 
 [db.sqlite]
 dir = "{DB_DIR}"

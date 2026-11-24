@@ -352,6 +352,19 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// invocation — and asserts the script actually runs (a leading `--` would make
 /// php read an empty program from the closed stdin and silently no-op).
 ///
+/// `tenant_unix_socket` is here because its node carries a kernel policy no
+/// shared node may: `[server.tenant_network] unix_socket_policy = "required"`
+/// attaches `cgroup/connect_unix` + `sendmsg_unix` BPF programs to the node's
+/// cgroup — which, under this harness, is the harness's own cgroup — and
+/// denies every unix connect from a tenant thread that is not allowlisted. It
+/// also needs two real vhosts (per-site allowlist) and a node that is
+/// *expected to refuse to start* (the fail-closed case), both of which only a
+/// `MultiSiteFixture` the suite owns can provide. It self-skips (loudly, exit
+/// 0) where the fence cannot run — kernel older than 6.7, no BTF, no
+/// `CAP_BPF`/`CAP_NET_ADMIN`, which is the ordinary unprivileged E2E leg —
+/// and `EPHPM_REQUIRE_UNIX_FENCE_TESTS=1` turns that skip into a failure on a
+/// privileged lane.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
 /// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
 /// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
@@ -366,6 +379,7 @@ const SELF_MANAGED_SUITES: &[&str] = &[
     "db_backup",
     "php_site_env",
     "cron",
+    "tenant_unix_socket",
 ];
 
 /// Test suites that must be excluded from bare-process runs entirely.

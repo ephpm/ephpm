@@ -31,6 +31,10 @@ programs to ePHPm's cgroup. From that one per-thread tag it delivers:
 Untagged traffic (anything that is not a per-vhost request) passes through
 untouched.
 
+A separate switch in the same section, `unix_socket_policy`, fences tenant
+**AF_UNIX** connects behind a per-site allowlist (empty = deny all). It needs
+Linux ≥ 6.7 and is described in its own section below.
+
 ## Requirements
 
 - **Linux ≥ 5.10** with `CONFIG_CGROUP_BPF` and BTF (`/sys/kernel/btf/vmlinux`).
@@ -120,6 +124,115 @@ nothing to bpffs**. On graceful shutdown the links/maps drop (RAII → kernel
 detaches); on a hard `kill -9` the process fds close and the kernel refcounts
 every program/map/attachment to zero and auto-reaps. A cold restart therefore
 has no stale BPF state to reconcile.
+
+## AF_UNIX connect fence (`unix_socket_policy`)
+
+**Status: Linux ≥ 6.7 only, off by default, independent of `ebpf_policy`.**
+
+The policy above governs TCP/UDP. It leaves one door open that `open_basedir`
+cannot close (multi-tenant breakout audit finding F2): ePHPm is one process and
+one uid, so tenant PHP can `connect()` to **any unix socket the service uid can
+reach** — `/var/run/docker.sock`, a database server's auth socket, the system
+D-Bus, journald — through `stream_socket_client('unix://…')`,
+`socket_connect()`, PDO `mysql:unix_socket=…`, or curl's
+`CURLOPT_UNIX_SOCKET_PATH`. All of those end in the same `connect(2)` (or, for
+an unconnected datagram socket, `sendto(2)`), which is where the fence sits:
+
+- ePHPm attaches `cgroup/connect_unix` and `cgroup/sendmsg_unix` programs to
+  its cgroup. Both hooks exist **only on Linux 6.7 and later**.
+- A thread carrying a tenant tag (the same per-request tag `ebpf_policy` uses)
+  may reach a unix socket only if that socket is listed for **its** site in
+  `unix_socket_allow`. **The default allowlist is empty, which denies every
+  unix socket to every tenant.** Denied connects fail with `EPERM` at the
+  syscall — PHP sees "Permission denied" / "Operation not permitted" instantly,
+  never a hang.
+- ePHPm's own threads (and a request that matched no vhost) carry no tag and
+  are never fenced, so the KV unix listener, DNS, the service manager and so on
+  keep working.
+
+```toml
+[server]
+sites_dir = "/srv/ephpm/sites"
+
+[server.tenant_network]
+unix_socket_policy = "required"     # or "warn" (start unfenced on failure), "off"
+
+# Per-site allowlist. Absent site (or []) = no unix socket at all.
+[server.tenant_network.unix_socket_allow]
+"shop.example" = ["/run/ephpm/shop/php-worker.sock", "@shop-bus"]
+```
+
+Entries are absolute pathname sockets or abstract-namespace sockets written
+`@name`. A pathname matches whether the client passes the terminating NUL in
+`addr_len` or not, exactly as the kernel interprets it; an abstract name is
+matched bytewise.
+
+### Fail-closed behaviour
+
+`unix_socket_policy` has three values, and the choice is the failure policy:
+
+| Value | Fence attaches | Fence cannot attach (kernel < 6.7, no BTF, missing capability) |
+|---|---|---|
+| `"required"` | tenant unix connects fenced | **startup refused** with the reason — the posture for a multi-tenant node |
+| `"warn"` | tenant unix connects fenced | ERROR logged, node starts **unfenced** |
+| `"off"` | nothing loaded | multi-tenant startup logs one WARN naming the exposure |
+
+ePHPm probes the preconditions before touching the kernel and names the one
+that fails ("kernel 6.1.0 is older than 6.7", "kernel BTF has no kfunc
+`bpf_cast_to_kern_ctx`", `EPERM` on attach). A typo'd value, an allowlist with
+the policy off, a relative path or a path over 108 bytes are all startup
+errors, never silent no-ops.
+
+### Requirements (in addition to the list above)
+
+- **Linux ≥ 6.7** with `CONFIG_DEBUG_INFO_BTF` and the BPF JIT enabled
+  (`net.core.bpf_jit_enable = 1`, the default everywhere). The fence reads the
+  destination through the `bpf_cast_to_kern_ctx` / `bpf_rdonly_cast` kfuncs
+  against `struct bpf_sock_addr_kern.uaddrlen`, which landed with the hooks in
+  6.7.
+- The same `CAP_BPF` + `CAP_NET_ADMIN` and `LimitMEMLOCK=infinity` as
+  `ebpf_policy`. The fence can run **without** `ebpf_policy = true` (and so
+  without the nftables loopback handoff or the sidecar port range).
+- Multi-tenant mode (`[server] sites_dir`), per-request PHP mode.
+
+**Older kernels.** There is no fallback inside ePHPm: on a kernel before 6.7
+the hooks do not exist, so `"required"` refuses to start and `"warn"` runs
+unfenced. A kernel built with `CONFIG_BPF_LSM` (and `bpf` in the `lsm=` boot
+list) could host an equivalent LSM-BPF policy on `unix_stream_connect` /
+`socket_connect`, which also sees the *resolved* socket and so is immune to the
+symlink caveat below — that is a possible future lane, not shipped. Without
+either, the only mitigations are the per-uid ones: run the data plane as its
+own uid and keep that uid out of every socket's group/ACL (`docker` group,
+database admin sockets).
+
+### Caveats
+
+- **Literal match before path resolution.** The allowlist compares the string
+  the client passed, before the kernel follows symlinks. A tenant that can
+  write the directory holding an allowlisted path can replace the socket with a
+  symlink to `docker.sock` and connect "to" the allowlisted name. Allowlist only
+  paths in directories the tenant cannot write (root-owned `/run/ephpm/<site>/`
+  provisioned by you, never under the site's document root), or use abstract
+  sockets, which have no filesystem path. Abstract names are global to the
+  network namespace: a neighbouring tenant can still *bind* the name first.
+- **What breaks under deny-all.** Anything in tenant PHP that spoke to a unix
+  socket now fails with `EPERM`: `syslog()` and `error_log()` to the system log
+  (`/dev/log`), nss-resolve name resolution through
+  `/run/systemd/resolve/io.systemd.Resolve` (glibc then falls through to the
+  `dns` module in `nsswitch.conf`, so lookups still work where a DNS resolver
+  is reachable), MySQL/PostgreSQL clients configured with a socket instead of a
+  TCP address. Each is a deliberate allowlist decision; `/dev/log` is one shared
+  socket for every tenant, so allowlisting it hands every tenant the same
+  channel.
+- **Scope is the server's request path.** `ephpm php --site` and the
+  distributed cron run tenant code in a separate process ePHPm does not tag,
+  and worker mode is not supported. `bind()` of unix sockets by tenants is not
+  restricted.
+- **Verifying it is on.** The startup log carries
+  `tenant_network: AF_UNIX connect fence attached (cgroup/connect_unix +
+  sendmsg_unix)`; `bpftool cgroup show /sys/fs/cgroup/<ephpm cgroup>` lists two
+  `ephpm_connect_unix` / `ephpm_sendmsg_unix` programs. Nothing is pinned to
+  bpffs; the programs vanish with the process.
 
 ## Known limitation
 

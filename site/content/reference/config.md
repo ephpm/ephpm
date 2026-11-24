@@ -224,8 +224,20 @@ Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, exper
 | `cgroup_path` | string | (none) | Cgroup the programs attach to. Unset means the process's own cgroup, read from `/proc/self/cgroup`, which covers exactly ePHPm's threads and any sidecars it spawns. Override only for unusual systemd slice layouts. |
 | `sidecar_port_range` | string | `"20000-32767"` | Inclusive `"low-high"` range of **real** sidecar ports ePHPm hands out; `bind4` pops a free port from it and range size is the box-wide sidecar concurrency cap. **Must not overlap the kernel ephemeral range** (`net.ipv4.ip_local_port_range`, default `32768-60999`) or a tenant's outbound connect could be assigned a source port ePHPm also wants to hand out — ePHPm reads `ip_local_port_range` at load time and refuses to start on overlap. |
 | `max_sidecar_ports_per_vhost` | u32 | `8` | Maximum concurrent sidecar real ports one vhost may hold. Enforced **in-kernel** at `bind4` against the un-forgeable ePHPm-set vhost tag, so a tenant cannot bypass it and cannot starve siblings out of the shared pool. |
+| `unix_socket_policy` | string | `"off"` | AF_UNIX connect fence for tenant PHP (multi-tenant breakout audit finding F2). `"required"`: attach `cgroup/connect_unix` + `cgroup/sendmsg_unix` programs so a tenant thread can `connect()`/`sendto()` only the unix sockets listed for its site in `unix_socket_allow` — **a site with no entry can reach no unix socket at all** — and **refuse to start** if the fence cannot be attached. `"warn"`: same fence, but on failure log an ERROR and start **unfenced**. `"off"`: nothing loaded; a multi-tenant node logs one WARN naming the exposure. **Requires Linux ≥ 6.7** with BTF and `CAP_BPF` + `CAP_NET_ADMIN`; Linux-only, multi-tenant-only, per-request mode only, independent of `ebpf_policy` (either switch alone loads the per-thread tag). Any other value is a hard startup error. ePHPm's own threads are never fenced. |
+| `unix_socket_allow` | table | `{}` | Per-site allowlist for `unix_socket_policy`, keyed by **canonical site key** (vhost directory name): `"a.example" = ["/run/a/app.sock", "@a-bus"]`. Entries are absolute pathname sockets or abstract-namespace sockets written `@name`; a relative path, an embedded NUL, or a path over 108 bytes is a startup error, as is setting this while `unix_socket_policy = "off"`. Matched on the literal destination *before* the kernel resolves it, so list only paths in directories the tenant cannot write (a tenant-writable path can be swapped for a symlink to any other socket). |
 
 > **Known limitation.** Closed sidecar ports return to the pool only on ePHPm restart — the close-time reclaim path is not implemented (see the guide). A vhost re-binding the *same* virtual port reuses its existing real port, so a restarting sidecar does not consume a second slot; an app that opens many *different* sidecar ports over one process lifetime can reach `max_sidecar_ports_per_vhost` until restart.
+
+```toml
+# AF_UNIX fence: deny every unix socket to tenant PHP except these.
+[server.tenant_network]
+unix_socket_policy = "required"          # Linux >= 6.7 + BTF, CAP_BPF + CAP_NET_ADMIN
+
+[server.tenant_network.unix_socket_allow]
+"shop.example"  = ["/run/ephpm/shop/php-worker.sock"]
+"blog.example"  = []                     # same as absent: no unix socket at all
+```
 
 ### `[server.logging]`
 

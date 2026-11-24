@@ -99,6 +99,7 @@ const NON_CONFIG_ENV_VARS: &[&str] = &[
     "KV_HOST",
     "KV_PORT",
     "REQUIRE_DB_TESTS",
+    "REQUIRE_UNIX_FENCE_TESTS",
     "MYSQL_PROXY_TEST_URL",
     "GITHUB_AUTH_CDYLIB",
 ];
@@ -1683,6 +1684,50 @@ pub struct TenantNetworkConfig {
     /// tenant cannot starve siblings out of the shared pool. Small default (`8`).
     #[serde(default = "default_max_sidecar_ports_per_vhost")]
     pub max_sidecar_ports_per_vhost: u32,
+
+    /// AF_UNIX connect fence for tenant PHP (multi-tenant breakout audit
+    /// finding F2): `"off"` (default), `"required"`, or `"warn"`.
+    ///
+    /// ePHPm is one process and one uid, so tenant PHP can `connect()` to any
+    /// unix socket the service uid can reach — `docker.sock`, a database's
+    /// auth socket, D-Bus — and `open_basedir` gates none of the ways to do it
+    /// (`unix://` streams, PDO `unix_socket=`, curl `CURLOPT_UNIX_SOCKET_PATH`).
+    /// When on, ePHPm attaches `cgroup/connect_unix` + `cgroup/sendmsg_unix`
+    /// programs (**Linux ≥ 6.7** with BTF) to its cgroup; a tagged tenant
+    /// thread may then reach only the destinations listed for its site in
+    /// [`unix_socket_allow`](Self::unix_socket_allow) — **an unlisted site may
+    /// reach no unix socket at all**. ePHPm's own threads are never fenced.
+    /// Complements the TCP/loopback policy of `ebpf_policy`; the two are
+    /// independent switches over the same per-thread tag.
+    ///
+    /// * `"required"` — the fence must load and attach; if it cannot (kernel
+    ///   older than 6.7, no BTF, missing `CAP_BPF`/`CAP_NET_ADMIN`) startup is
+    ///   **refused**. The posture for a multi-tenant node.
+    /// * `"warn"` — try; on failure log an ERROR and start anyway, with tenant
+    ///   unix connects unfenced. For hosts that cannot yet meet the kernel floor.
+    /// * `"off"` — nothing loaded. In multi-tenant mode startup logs a WARN
+    ///   naming the exposure.
+    ///
+    /// Linux-only and multi-tenant-only like `ebpf_policy`: any other value, or
+    /// a non-`off` value off Linux / without `[server] sites_dir`, is a hard
+    /// startup error.
+    #[serde(default = "default_unix_socket_policy")]
+    pub unix_socket_policy: String,
+
+    /// Per-site allowlist of unix-socket destinations tenant PHP may connect
+    /// to while [`unix_socket_policy`](Self::unix_socket_policy) is on, keyed
+    /// by **canonical site key** (the vhost directory name). Each entry is an
+    /// absolute pathname socket (`"/run/foo/app.sock"`) or an abstract-namespace
+    /// socket written `"@name"`. A site that is absent (or lists nothing) may
+    /// connect to **no** unix socket — the default is deny-all.
+    ///
+    /// The match is on the literal destination the client passes, before the
+    /// kernel resolves it: allowlist only paths in directories the tenant
+    /// cannot write, or a tenant can swap the socket for a symlink to
+    /// something else. Setting this while `unix_socket_policy = "off"` is a
+    /// hard startup error (never a silent no-op).
+    #[serde(default)]
+    pub unix_socket_allow: BTreeMap<String, Vec<String>>,
 }
 
 fn default_sidecar_port_range() -> String {
@@ -1694,6 +1739,10 @@ fn default_max_sidecar_ports_per_vhost() -> u32 {
     8
 }
 
+fn default_unix_socket_policy() -> String {
+    "off".to_string()
+}
+
 impl Default for TenantNetworkConfig {
     fn default() -> Self {
         Self {
@@ -1701,11 +1750,157 @@ impl Default for TenantNetworkConfig {
             cgroup_path: None,
             sidecar_port_range: default_sidecar_port_range(),
             max_sidecar_ports_per_vhost: default_max_sidecar_ports_per_vhost(),
+            unix_socket_policy: default_unix_socket_policy(),
+            unix_socket_allow: BTreeMap::new(),
         }
     }
 }
 
+/// Parsed `[server.tenant_network] unix_socket_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixSocketPolicy {
+    /// No fence loaded (the default).
+    Off,
+    /// Load and attach the fence; refuse startup if that fails.
+    Required,
+    /// Load and attach the fence; log an ERROR and run unfenced if that fails.
+    Warn,
+}
+
+impl UnixSocketPolicy {
+    /// `true` for every mode that loads the fence.
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// `sizeof(sockaddr_un.sun_path)` — the kernel's `UNIX_PATH_MAX`.
+pub const UNIX_PATH_MAX: usize = 108;
+
+/// One validated `unix_socket_allow` destination.
+///
+/// [`sun_path`](Self::sun_path) renders it exactly the way the kernel-side
+/// fence normalises a connect destination (`crates/ephpm-server/bpf/
+/// unixsock.bpf.c`): a pathname is its bytes without a terminating NUL, an
+/// abstract name is a leading NUL followed by the name, and `len` counts the
+/// significant bytes. Both sides must agree byte for byte or nothing matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnixSocketTarget {
+    /// A filesystem socket, by absolute path.
+    Pathname(String),
+    /// An abstract-namespace socket (`"@name"` in config), by name.
+    Abstract(String),
+}
+
+impl UnixSocketTarget {
+    /// Parse one allowlist entry: an absolute path, or `@name` for an abstract
+    /// socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message for an empty entry, a relative path, a
+    /// path or name longer than the kernel accepts, or an embedded NUL.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        if spec.is_empty() {
+            return Err("empty entry".to_string());
+        }
+        if spec.contains('\0') {
+            return Err(format!("{spec:?}: embedded NUL byte"));
+        }
+        if let Some(name) = spec.strip_prefix('@') {
+            if name.is_empty() {
+                return Err("\"@\": abstract socket name is empty".to_string());
+            }
+            // The leading NUL occupies one of the 108 bytes.
+            if name.len() > UNIX_PATH_MAX - 1 {
+                return Err(format!(
+                    "{spec:?}: abstract socket name is {} bytes; the kernel allows at most {}",
+                    name.len(),
+                    UNIX_PATH_MAX - 1
+                ));
+            }
+            return Ok(Self::Abstract(name.to_string()));
+        }
+        if !spec.starts_with('/') {
+            return Err(format!(
+                "{spec:?}: must be an absolute path (\"/run/app.sock\") or an abstract socket \
+                 (\"@name\") — the kernel resolves a relative path against the server's working \
+                 directory, which is not a stable identity"
+            ));
+        }
+        if spec.len() > UNIX_PATH_MAX {
+            return Err(format!(
+                "{spec:?}: path is {} bytes; a unix socket path is at most {UNIX_PATH_MAX}",
+                spec.len()
+            ));
+        }
+        Ok(Self::Pathname(spec.to_string()))
+    }
+
+    /// The normalised `sun_path` bytes and their significant length — the
+    /// kernel-map key the fence compares against. See the type docs.
+    #[must_use]
+    pub fn sun_path(&self) -> ([u8; UNIX_PATH_MAX], u32) {
+        let mut path = [0u8; UNIX_PATH_MAX];
+        let len = match self {
+            Self::Pathname(p) => {
+                let b = p.as_bytes();
+                path[..b.len()].copy_from_slice(b);
+                b.len()
+            }
+            Self::Abstract(name) => {
+                let b = name.as_bytes();
+                path[1..=b.len()].copy_from_slice(b);
+                1 + b.len()
+            }
+        };
+        // `len <= 108` by construction in `parse`, so this never truncates.
+        (path, u32::try_from(len).unwrap_or(u32::MAX))
+    }
+}
+
 impl TenantNetworkConfig {
+    /// Parse `unix_socket_policy`.
+    ///
+    /// # Errors
+    /// Returns a human-readable message naming the accepted values for
+    /// anything but `"off"`, `"required"` or `"warn"`.
+    pub fn parse_unix_socket_policy(&self) -> Result<UnixSocketPolicy, String> {
+        match self.unix_socket_policy.as_str() {
+            "off" => Ok(UnixSocketPolicy::Off),
+            "required" => Ok(UnixSocketPolicy::Required),
+            "warn" => Ok(UnixSocketPolicy::Warn),
+            other => Err(format!(
+                "unix_socket_policy must be \"off\", \"required\" or \"warn\", got {other:?}"
+            )),
+        }
+    }
+
+    /// Parse and validate every `unix_socket_allow` entry, keyed by site.
+    ///
+    /// # Errors
+    /// Returns a message naming the site and the offending entry for an empty
+    /// site key or any entry [`UnixSocketTarget::parse`] rejects.
+    pub fn parse_unix_socket_allow(
+        &self,
+    ) -> Result<BTreeMap<String, Vec<UnixSocketTarget>>, String> {
+        let mut out = BTreeMap::new();
+        for (site, entries) in &self.unix_socket_allow {
+            if site.trim().is_empty() {
+                return Err("unix_socket_allow: empty site key".to_string());
+            }
+            let mut targets = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let target = UnixSocketTarget::parse(entry)
+                    .map_err(|e| format!("unix_socket_allow.{site:?}: {e}"))?;
+                targets.push(target);
+            }
+            out.insert(site.clone(), targets);
+        }
+        Ok(out)
+    }
+
     /// Parse `sidecar_port_range` into an inclusive `(low, high)`.
     ///
     /// # Errors
@@ -5770,6 +5965,55 @@ impl Config {
             self.server
                 .tenant_network
                 .parse_range()
+                .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
+        }
+
+        // [server.tenant_network] unix_socket_policy — the AF_UNIX connect
+        // fence (audit finding F2). Same posture as ebpf_policy: a mode string
+        // is parsed fail-closed, the feature is Linux + multi-tenant +
+        // per-request only, and an allowlist with the fence off is an error
+        // rather than a knob that silently does nothing. Whether the running
+        // kernel can host the hooks (>= 6.7, BTF, CAP_BPF) is decided in
+        // serve() at load time, where `"required"` refuses startup.
+        {
+            let tn = &self.server.tenant_network;
+            let policy = tn
+                .parse_unix_socket_policy()
+                .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
+            if policy.is_enabled() {
+                if !cfg!(target_os = "linux") {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] unix_socket_policy = {:?} is Linux-only \
+                         (cgroup/connect_unix + sendmsg_unix BPF hooks, Linux >= 6.7). Remove \
+                         it on this platform.",
+                        tn.unix_socket_policy
+                    )));
+                }
+                if self.server.sites_dir.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] unix_socket_policy = {:?} requires [server] \
+                         sites_dir (multi-tenant mode) — there are no tenant threads to fence \
+                         in single-site mode.",
+                        tn.unix_socket_policy
+                    )));
+                }
+                if self.php.is_worker_mode() {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] unix_socket_policy = {:?} is not supported \
+                         with [php] mode = \"worker\" (per-request mode only: the per-thread \
+                         tenant tag is written on the per-request path).",
+                        tn.unix_socket_policy
+                    )));
+                }
+            } else if !tn.unix_socket_allow.is_empty() {
+                return Err(ConfigError::Validation(
+                    "[server.tenant_network] unix_socket_allow is set but unix_socket_policy = \
+                     \"off\": the allowlist would never be enforced. Set unix_socket_policy = \
+                     \"required\" (or \"warn\"), or remove the allowlist."
+                        .to_string(),
+                ));
+            }
+            tn.parse_unix_socket_allow()
                 .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
         }
 
@@ -14495,5 +14739,110 @@ log_failed_sql = true
         .unwrap();
         let err = Config::load(&file).unwrap().validate().expect_err("malformed range");
         assert!(matches!(err, ConfigError::Validation(m) if m.contains("sidecar_port_range")));
+    }
+
+    // ── [server.tenant_network] unix_socket_policy (AF_UNIX fence, F2) ──
+
+    fn validate_unix_toml(toml: &str) -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, toml).unwrap();
+        Config::load(&file).unwrap().validate()
+    }
+
+    #[test]
+    fn test_unix_socket_policy_defaults_off_with_empty_allowlist() {
+        let config = Config::default_config().unwrap();
+        let tn = &config.server.tenant_network;
+        assert_eq!(tn.parse_unix_socket_policy().unwrap(), UnixSocketPolicy::Off);
+        assert!(!UnixSocketPolicy::Off.is_enabled());
+        assert!(tn.unix_socket_allow.is_empty(), "default allowlist is empty = deny all");
+    }
+
+    #[test]
+    fn test_unix_socket_policy_rejects_unknown_mode() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"on\"\n",
+        )
+        .expect_err("typo'd mode must not fall through to off");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("unix_socket_policy")));
+    }
+
+    #[test]
+    fn test_unix_socket_allow_without_policy_is_an_error() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network.unix_socket_allow]\n\"a.test\" = [\"/run/a.sock\"]\n",
+        )
+        .expect_err("allowlist with the fence off is a silent no-op");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("unix_socket_allow")));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_unix_socket_policy_rejected_off_linux() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"required\"\n",
+        )
+        .expect_err("fence is Linux-only");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("Linux-only")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unix_socket_policy_requires_sites_dir() {
+        let err = validate_unix_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[server.tenant_network]\nunix_socket_policy = \"required\"\n",
+        )
+        .expect_err("fence needs tenants");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("sites_dir")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unix_socket_policy_accepts_valid_allowlist() {
+        validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"warn\"\n\n[server.tenant_network.unix_socket_allow]\n\"a.test\" = [\"/run/a/app.sock\", \"@a-bus\"]\n\"b.test\" = []\n",
+        )
+        .expect("valid config");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_unix_socket_allow_rejects_relative_path() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nunix_socket_policy = \"required\"\n\n[server.tenant_network.unix_socket_allow]\n\"a.test\" = [\"run/a.sock\"]\n",
+        )
+        .expect_err("relative path");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("absolute path")));
+    }
+
+    #[test]
+    fn test_unix_socket_target_parse_and_key_encoding() {
+        // Pathname: bytes verbatim, no NUL, len = strlen.
+        let t = UnixSocketTarget::parse("/run/a.sock").unwrap();
+        assert_eq!(t, UnixSocketTarget::Pathname("/run/a.sock".into()));
+        let (path, len) = t.sun_path();
+        assert_eq!(len, 11);
+        assert_eq!(&path[..11], b"/run/a.sock");
+        assert!(path[11..].iter().all(|&b| b == 0));
+
+        // Abstract: leading NUL, then the name; len counts the NUL.
+        let t = UnixSocketTarget::parse("@bus").unwrap();
+        assert_eq!(t, UnixSocketTarget::Abstract("bus".into()));
+        let (path, len) = t.sun_path();
+        assert_eq!(len, 4);
+        assert_eq!(&path[..4], b"\0bus");
+
+        // Limits mirror the kernel's: 108 bytes of sun_path, the abstract
+        // name's leading NUL counts.
+        assert!(UnixSocketTarget::parse(&format!("/{}", "x".repeat(107))).is_ok());
+        assert!(UnixSocketTarget::parse(&format!("/{}", "x".repeat(108))).is_err());
+        assert!(UnixSocketTarget::parse(&format!("@{}", "x".repeat(107))).is_ok());
+        assert!(UnixSocketTarget::parse(&format!("@{}", "x".repeat(108))).is_err());
+
+        assert!(UnixSocketTarget::parse("").is_err());
+        assert!(UnixSocketTarget::parse("@").is_err());
+        assert!(UnixSocketTarget::parse("relative.sock").is_err());
+        assert!(UnixSocketTarget::parse("/has\0nul").is_err());
     }
 }
