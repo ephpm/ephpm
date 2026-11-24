@@ -41,13 +41,23 @@ pub struct ServerConfig {
     /// Idle read timeout in seconds. Connections that send nothing for
     /// this long are closed, freeing their buffers. `0` = no timeout.
     pub idle_timeout_secs: u64,
-    /// Optional password for RESP AUTH. When set, clients must authenticate
-    /// before any commands are accepted.
+    /// Optional password for RESP AUTH.
+    ///
+    /// * **Single-site** (no `MultiTenantStore`): the classic
+    ///   `requirepass`-style credential — clients must `AUTH <password>` before
+    ///   any command.
+    /// * **Multi-tenant** (`secret` + `MultiTenantStore` set): the **operator**
+    ///   credential (#384). A one-argument `AUTH <password>` that matches it
+    ///   binds the connection to the process-global store, the keyspace native
+    ///   middleware reads. A tenant never holds this password (it holds only its
+    ///   per-site HMAC), so the global store stays unreachable with any tenant
+    ///   credential. Leave unset to offer no global path at all.
     pub password: Option<String>,
     /// Master secret for HMAC-derived per-site authentication. When set
     /// alongside a `MultiTenantStore`, clients must `AUTH <hostname>
     /// <derived_password>` and their connection is scoped to that site's
-    /// store.
+    /// store. A one-argument `AUTH <password>` is instead the operator/global
+    /// path when `password` is also set (see that field).
     ///
     /// Without a `MultiTenantStore` the secret cannot authenticate anyone:
     /// AUTH is still demanded, and only `password` (when set) is accepted.
@@ -118,9 +128,11 @@ pub async fn run(
 /// for use in tests and embedding contexts where the caller manages the
 /// listener socket.
 ///
-/// When `secret` is `Some` and `multi_tenant` is `Some`, the server
-/// requires HMAC-derived per-site authentication. The `password` field
-/// is ignored in this mode.
+/// When `secret` is `Some` and `multi_tenant` is `Some`, the server requires
+/// HMAC-derived per-site authentication (`AUTH <hostname> <derived>`). In this
+/// mode the `password` field, when set, is the **operator** credential: a
+/// one-argument `AUTH <password>` binds the connection to the process-global
+/// store (#384). Unset `password` means no global path.
 ///
 /// # Errors
 ///
@@ -271,10 +283,38 @@ fn handle_auth(
 ) -> (Frame, bool, Option<HmacAuthResult>) {
     let (first_arg, second_arg) = extract_auth_args(frame);
 
-    // HMAC multi-tenant mode: AUTH <hostname> <derived_password>
+    // HMAC multi-tenant mode. Two credential shapes, split by argument count:
+    //
+    // * `AUTH <hostname> <derived>` — per-**tenant**. The connection is scoped
+    //   to that vhost's isolated store. The password is
+    //   `HMAC-SHA256(secret, hostname)`, which is the only credential a tenant
+    //   is ever handed (`$_SERVER[EPHPM_REDIS_PASSWORD]`).
+    //
+    // * `AUTH <operator_password>` — **operator / process-global** (#384). When
+    //   an operator password is configured (`[kv.redis_compat] password`), a
+    //   one-argument AUTH that matches it binds the connection to the
+    //   process-global store — the keyspace native middleware reads through
+    //   (`ephpm_middleware::host::KV_STORE`), unreachable over RESP in
+    //   multi-tenant mode before this. The split is deliberate and fail-closed:
+    //   a tenant knows only its own per-site HMAC, never the operator password,
+    //   so no tenant credential can reach the global store, and knowing the
+    //   operator password is already an operator-level capability (it sits in
+    //   the same config file as `[kv] secret`). With no operator password
+    //   configured there is simply no global path.
     if let (Some(secret_val), Some(mt)) = (secret, multi_tenant) {
         match (first_arg, second_arg) {
             (Some(hostname), Some(password)) => {
+                // An empty hostname resolves to the process-global default store
+                // (`get_site_store("") == default_store`). That store is the
+                // operator/global keyspace and is reachable only through the
+                // explicit one-argument operator AUTH below — never a two-arg
+                // site AUTH. Refuse it so a two-arg path can never escape its
+                // tenant scope. (A tenant cannot forge `HMAC(secret, "")`
+                // either, as it has no access to the secret — this is
+                // defence-in-depth that also keeps the privilege split crisp.)
+                if hostname.is_empty() {
+                    return (Frame::error("ERR invalid password"), false, None);
+                }
                 if auth::validate_site_password(secret_val, &hostname, &password) {
                     let store = mt.get_site_store(&hostname);
                     (Frame::ok(), true, Some(HmacAuthResult { store }))
@@ -282,8 +322,32 @@ fn handle_auth(
                     (Frame::error("ERR invalid password"), false, None)
                 }
             }
-            // Missing hostname or password argument.
-            (Some(_), None) | (None, _) => {
+            // One-argument AUTH: the operator/global path, gated on the operator
+            // password. Constant-time compared, same primitive as every other
+            // credential check here.
+            (Some(provided), None) => match required_password {
+                Some(expected)
+                    if !expected.is_empty()
+                        && auth::constant_time_eq(expected.as_bytes(), provided.as_bytes()) =>
+                {
+                    // Authenticate with NO store override: the connection keeps
+                    // its process-global default store (see `handle_connection`,
+                    // where `active_store` starts as the global store).
+                    (Frame::ok(), true, None)
+                }
+                // Operator password configured but the argument did not match.
+                Some(expected) if !expected.is_empty() => {
+                    (Frame::error("ERR invalid password"), false, None)
+                }
+                // No operator password configured: there is no global path, and
+                // a one-arg AUTH is just a malformed per-site AUTH. Preserve the
+                // historical message pointing at the missing hostname argument.
+                _ => {
+                    (Frame::error("ERR wrong number of arguments for 'auth' command"), false, None)
+                }
+            },
+            // No arguments at all.
+            (None, _) => {
                 (Frame::error("ERR wrong number of arguments for 'auth' command"), false, None)
             }
         }
@@ -518,5 +582,109 @@ mod tests {
         let expected: Arc<str> = Arc::from("s3cret");
         let (_frame, ok, _hmac) = handle_auth(&auth_frame("s3c"), Some(&expected), None, None);
         assert!(!ok, "a prefix of the password must not authenticate");
+    }
+
+    // ── Operator / process-global AUTH in multi-tenant mode (#384) ────────────
+
+    use crate::auth::derive_site_password;
+    use crate::multi_tenant::MultiTenantStore;
+    use crate::store::{Store, StoreConfig};
+
+    /// Build a RESP `AUTH <first> <second>` frame.
+    fn auth_frame2(first: &str, second: &str) -> Frame {
+        Frame::Array(vec![
+            Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+            Frame::Bulk(bytes::Bytes::copy_from_slice(first.as_bytes())),
+            Frame::Bulk(bytes::Bytes::copy_from_slice(second.as_bytes())),
+        ])
+    }
+
+    /// A multi-tenant registry wrapped the way `handle_connection` passes it.
+    fn multi_tenant() -> Arc<MultiTenantStore> {
+        let default = Store::new(StoreConfig::default());
+        Arc::new(MultiTenantStore::new(default, StoreConfig::default()))
+    }
+
+    #[test]
+    fn operator_one_arg_auth_reaches_the_global_store() {
+        let secret: Arc<str> = Arc::from("master-secret");
+        let operator: Arc<str> = Arc::from("op-pw");
+        let mt = multi_tenant();
+        let (_f, ok, hmac) =
+            handle_auth(&auth_frame("op-pw"), Some(&operator), Some(&secret), Some(&mt));
+        assert!(ok, "the operator password must authenticate a one-arg AUTH");
+        assert!(
+            hmac.is_none(),
+            "operator AUTH installs NO site-store override — the connection keeps the \
+             process-global default store"
+        );
+    }
+
+    #[test]
+    fn operator_one_arg_auth_rejects_wrong_password() {
+        let secret: Arc<str> = Arc::from("master-secret");
+        let operator: Arc<str> = Arc::from("op-pw");
+        let mt = multi_tenant();
+        let (_f, ok, _h) =
+            handle_auth(&auth_frame("not-op-pw"), Some(&operator), Some(&secret), Some(&mt));
+        assert!(!ok, "a wrong one-arg password must not reach the global store");
+    }
+
+    #[test]
+    fn tenant_derived_password_cannot_be_used_as_operator_one_arg() {
+        // The crux of #384's security requirement: the credential a tenant is
+        // handed (its per-site HMAC) must NOT open the operator/global path.
+        let secret: Arc<str> = Arc::from("master-secret");
+        let operator: Arc<str> = Arc::from("op-pw");
+        let mt = multi_tenant();
+        let tenant_pw = derive_site_password(&secret, "shop.example");
+        let (_f, ok, _h) =
+            handle_auth(&auth_frame(&tenant_pw), Some(&operator), Some(&secret), Some(&mt));
+        assert!(!ok, "a tenant's per-site HMAC must never authenticate as the operator");
+    }
+
+    #[test]
+    fn one_arg_auth_without_operator_password_is_rejected() {
+        // No operator password configured ⇒ no global path. A one-arg AUTH is
+        // then just a malformed per-site AUTH.
+        let secret: Arc<str> = Arc::from("master-secret");
+        let mt = multi_tenant();
+        let (_f, ok, _h) = handle_auth(&auth_frame("anything"), None, Some(&secret), Some(&mt));
+        assert!(!ok, "with no operator password, a one-arg AUTH must fail closed");
+    }
+
+    #[test]
+    fn two_arg_auth_with_empty_hostname_is_rejected() {
+        // The empty hostname would resolve to the global default store; only the
+        // explicit one-arg operator path may reach it.
+        let secret: Arc<str> = Arc::from("master-secret");
+        let operator: Arc<str> = Arc::from("op-pw");
+        let mt = multi_tenant();
+        let forged = derive_site_password(&secret, "");
+        let (_f, ok, _h) =
+            handle_auth(&auth_frame2("", &forged), Some(&operator), Some(&secret), Some(&mt));
+        assert!(!ok, "a two-arg AUTH with an empty hostname must not reach the global store");
+    }
+
+    #[test]
+    fn two_arg_site_auth_still_scopes_to_the_site_store() {
+        // The per-tenant path is unchanged: a correct host + derived password
+        // authenticates and installs that site's store override.
+        let secret: Arc<str> = Arc::from("master-secret");
+        let operator: Arc<str> = Arc::from("op-pw");
+        let mt = multi_tenant();
+        let pw = derive_site_password(&secret, "shop.example");
+        let (_f, ok, hmac) = handle_auth(
+            &auth_frame2("shop.example", &pw),
+            Some(&operator),
+            Some(&secret),
+            Some(&mt),
+        );
+        assert!(ok, "a correct per-site credential must authenticate");
+        let site_store = hmac.expect("per-site AUTH installs a site-store override").store;
+        assert!(
+            !Arc::ptr_eq(&site_store, mt.default_store()),
+            "a tenant connection must be scoped to its own store, never the global default"
+        );
     }
 }

@@ -119,7 +119,7 @@ In vhost mode (`[server] sites_dir = ...`), the RESP listener requires `[kv] sec
 password = HMAC-SHA256(secret, site_key)
 ```
 
-The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. `[kv.redis_compat] password` is ignored in this mode. The same secret also derives each site's MySQL wire password, so anyone who can read the config can impersonate any tenant — see [`[kv] secret`](/reference/config/#kv).
+The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. In this mode `[kv.redis_compat] password`, when set, is the **operator** credential: a one-argument `AUTH <password>` reaches the process-global store (what native middleware reads), unreachable with any per-site credential — see [KV RESP → Reaching the process-global store](/reference/kv-resp/#reaching-the-process-global-store-multi-tenant). The same secret also derives each site's MySQL wire password, so anyone who can read the config can impersonate any tenant — see [`[kv] secret`](/reference/config/#kv).
 
 **Single-site mode** (no `sites_dir`) has one shared store. There, only `[kv.redis_compat] password` authenticates the listener. `[kv] secret` cannot (there is no per-site derivation without `sites_dir`), so the RESP listener on with `[kv] secret` set and no `password` is a **startup error**. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 

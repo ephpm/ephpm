@@ -4128,7 +4128,11 @@ pub struct KvConfig {
     /// (`sites_dir`) mode: with `[kv.redis_compat] enabled = true` and
     /// `sites_dir` set but no secret, per-site AUTH cannot be derived and the
     /// listener would serve one shared global store to every tenant — so
-    /// [`Config::validate`] **refuses to start** (fail closed). In single-site
+    /// [`Config::validate`] **refuses to start** (fail closed). In this mode the
+    /// per-site `AUTH` scopes every connection to one vhost; the process-global
+    /// store (what native middleware reads) is reachable over RESP only via the
+    /// operator path — a one-argument `AUTH <password>` matching
+    /// `[kv.redis_compat] password` (#384). In single-site
     /// (no `sites_dir`) mode the shared store is the intended behavior and a
     /// secret is not required. Note that in single-site mode a set secret
     /// does **not** protect the RESP listener: it makes the listener demand
@@ -4491,7 +4495,12 @@ impl KvConfig {
 ///   `AUTH <hostname> <HMAC-SHA256(secret, hostname)>`, and the connection is
 ///   then bound to that hostname's own `Store` for its lifetime. That is real
 ///   per-tenant isolation — separate stores, not a key-prefix convention — and
-///   it is the same store the site's `ephpm_kv_*` SAPI calls use.
+///   it is the same store the site's `ephpm_kv_*` SAPI calls use. The
+///   **process-global** store (what native middleware reads) is reachable only
+///   through the operator path: a one-argument `AUTH <password>` matching
+///   `[kv.redis_compat] password` (#384). A tenant never holds that password, so
+///   no per-site credential can reach the global store; with no `password` set
+///   there is no RESP path to it at all.
 /// - **`secret` unset:** there is no per-tenant scoping. Every connection
 ///   dispatches against the process-wide default store, so any client that can
 ///   reach the listener sees every key, including other tenants'. The optional
@@ -4521,11 +4530,25 @@ pub struct KvRedisCompatConfig {
     #[serde(default)]
     pub socket: Option<String>,
 
-    /// Optional password required for RESP AUTH. When set, clients must send
-    /// `AUTH <password>` before any commands are accepted. Equivalent to
-    /// Redis `requirepass`.
+    /// Optional password for RESP AUTH. Its meaning depends on the deployment:
     ///
-    /// Default: `None` (no authentication required).
+    /// - **Single-site** (no `[server] sites_dir`): the classic Redis
+    ///   `requirepass` — clients must send `AUTH <password>` before any command.
+    /// - **Multi-tenant** (`[server] sites_dir` + `[kv] secret`): the
+    ///   **operator** credential (#384). Per-site clients authenticate with
+    ///   `AUTH <hostname> <HMAC-SHA256(secret, hostname)>` and are scoped to that
+    ///   vhost's store; a **one-argument** `AUTH <password>` that matches *this*
+    ///   value instead binds the connection to the **process-global** KV store —
+    ///   the keyspace native middleware reads and writes
+    ///   (`ephpm_middleware::host`), which per-site AUTH cannot reach. This is
+    ///   the only RESP path to the global store in multi-tenant mode; leave it
+    ///   unset to offer no global path at all. A tenant never holds this password
+    ///   (it is injected with only its own per-site HMAC), so no tenant
+    ///   credential can reach the global store. **Security:** knowing this
+    ///   password is an operator-level capability on par with `[kv] secret` —
+    ///   anyone who can read the config can use it.
+    ///
+    /// Default: `None` (no authentication; in multi-tenant mode, no global path).
     #[serde(default)]
     pub password: Option<String>,
 

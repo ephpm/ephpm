@@ -1090,6 +1090,180 @@ async fn hmac_auth_missing_password_arg_rejected() {
     );
 }
 
+// ── Operator / process-global AUTH in multi-tenant mode (#384) ──────────────
+//
+// In multi-tenant mode the per-site HMAC `AUTH` scopes every connection to one
+// vhost's store, leaving the process-global store (what native middleware
+// reads) unreachable over RESP. A one-argument `AUTH <operator_password>`, when
+// `[kv.redis_compat] password` is set, is the explicit operator path to it. The
+// tenant's per-site HMAC must never open that path.
+
+/// A multi-tenant server that also configures an operator password, keeping a
+/// handle on the process-global store so a test can observe where writes land.
+struct OperatorTestServer {
+    addr: String,
+    handle: tokio::task::JoinHandle<()>,
+    secret: String,
+    operator_password: String,
+    global: std::sync::Arc<Store>,
+}
+
+impl OperatorTestServer {
+    async fn start(secret: &str, operator_password: &str) -> Self {
+        use ephpm_kv::multi_tenant::MultiTenantStore;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+
+        // The process-global store is both `serve_on`'s `store` argument and the
+        // `MultiTenantStore`'s default — exactly the wiring `ephpm-server` uses,
+        // where it is also the store handed to native middleware.
+        let global = Store::new(StoreConfig::default());
+        let mt = MultiTenantStore::new(std::sync::Arc::clone(&global), StoreConfig::default());
+        let sec = Some(secret.to_string());
+        let op = Some(operator_password.to_string());
+        let store_for_serve = std::sync::Arc::clone(&global);
+        let handle = tokio::spawn(async move {
+            server::serve_on(
+                store_for_serve,
+                listener,
+                server::ServerConfig {
+                    max_input_buffer: 64 * 1024 * 1024,
+                    secret: sec,
+                    password: op,
+                    ..Default::default()
+                },
+                Some(mt),
+            )
+            .await
+            .ok();
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        Self {
+            addr,
+            handle,
+            secret: secret.to_string(),
+            operator_password: operator_password.to_string(),
+            global,
+        }
+    }
+
+    async fn con(&self) -> redis::aio::MultiplexedConnection {
+        redis::Client::open(format!("redis://{}/", self.addr))
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap()
+    }
+}
+
+impl Drop for OperatorTestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn operator_one_arg_auth_writes_to_the_process_global_store() {
+    let srv = OperatorTestServer::start("master-secret", "op-pw").await;
+    let mut con = srv.con().await;
+
+    // One-argument AUTH with the operator password.
+    let resp: String =
+        redis::cmd("AUTH").arg(&srv.operator_password).query_async(&mut con).await.unwrap();
+    assert_eq!(resp, "OK");
+
+    // A write now lands in the process-global store — the one middleware reads.
+    let _: () = redis::cmd("SET")
+        .arg("basicauth:shop.example")
+        .arg("secret-value")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.global.get("basicauth:shop.example").as_deref(),
+        Some(&b"secret-value"[..]),
+        "operator write must land in the process-global store"
+    );
+}
+
+#[tokio::test]
+async fn tenant_credential_cannot_reach_the_global_store() {
+    use ephpm_kv::auth::derive_site_password;
+
+    let srv = OperatorTestServer::start("master-secret", "op-pw").await;
+
+    // The operator seeds a key in the global store.
+    let mut op = srv.con().await;
+    let _: String =
+        redis::cmd("AUTH").arg(&srv.operator_password).query_async(&mut op).await.unwrap();
+    let _: () = redis::cmd("SET").arg("gkey").arg("gval").query_async(&mut op).await.unwrap();
+
+    // A tenant authenticates per-site and must NOT see the global key.
+    let tenant_pw = derive_site_password(&srv.secret, "shop.example");
+    let mut tenant = srv.con().await;
+    let _: String = redis::cmd("AUTH")
+        .arg("shop.example")
+        .arg(&tenant_pw)
+        .query_async(&mut tenant)
+        .await
+        .unwrap();
+    let seen: Option<String> =
+        redis::cmd("GET").arg("gkey").query_async(&mut tenant).await.unwrap();
+    assert!(seen.is_none(), "a per-site connection must not read the global store, got {seen:?}");
+
+    // And the tenant's own derived password must NOT work as the one-argument
+    // operator AUTH — the credential a tenant holds can never open the global
+    // path.
+    let mut escalate = srv.con().await;
+    let err = redis::cmd("AUTH").arg(&tenant_pw).query_async::<String>(&mut escalate).await;
+    assert!(
+        err.is_err(),
+        "a tenant's per-site HMAC must be rejected as a one-arg operator AUTH, got {err:?}"
+    );
+    // The connection stays unauthenticated after the rejected AUTH.
+    let blocked = redis::cmd("GET").arg("gkey").query_async::<Option<String>>(&mut escalate).await;
+    let msg = blocked.expect_err("commands must stay blocked after a failed AUTH").to_string();
+    assert!(msg.contains("NOAUTH"), "expected NOAUTH after a rejected operator AUTH, got: {msg}");
+
+    // A tenant also cannot reach the global store by forging an empty hostname.
+    let forged = derive_site_password(&srv.secret, "");
+    let mut empty = srv.con().await;
+    let err = redis::cmd("AUTH").arg("").arg(&forged).query_async::<String>(&mut empty).await;
+    assert!(err.is_err(), "a two-arg AUTH with an empty hostname must be refused, got {err:?}");
+}
+
+#[tokio::test]
+async fn operator_write_is_invisible_to_tenants_and_vice_versa() {
+    use ephpm_kv::auth::derive_site_password;
+
+    let srv = OperatorTestServer::start("master-secret", "op-pw").await;
+
+    // Operator writes a global key; tenant writes the same key name in its own
+    // store. Neither must see the other's value.
+    let mut op = srv.con().await;
+    let _: String =
+        redis::cmd("AUTH").arg(&srv.operator_password).query_async(&mut op).await.unwrap();
+    let _: () = redis::cmd("SET").arg("flag").arg("global").query_async(&mut op).await.unwrap();
+
+    let tenant_pw = derive_site_password(&srv.secret, "shop.example");
+    let mut tenant = srv.con().await;
+    let _: String = redis::cmd("AUTH")
+        .arg("shop.example")
+        .arg(&tenant_pw)
+        .query_async(&mut tenant)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET").arg("flag").arg("tenant").query_async(&mut tenant).await.unwrap();
+
+    let op_val: String = redis::cmd("GET").arg("flag").query_async(&mut op).await.unwrap();
+    let tenant_val: String = redis::cmd("GET").arg("flag").query_async(&mut tenant).await.unwrap();
+    assert_eq!(op_val, "global", "operator must still see the global value");
+    assert_eq!(tenant_val, "tenant", "tenant must see only its own value");
+    assert_eq!(srv.global.get("flag").as_deref(), Some(&b"global"[..]));
+}
+
 // ── v0.13 additions through a real client ────────────────────────────────────
 
 #[tokio::test]

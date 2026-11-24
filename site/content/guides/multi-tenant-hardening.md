@@ -236,10 +236,13 @@ never opens the target's file.
 
 The embedded KV store is namespaced per site key, so `ephpm_kv_*` from one tenant
 cannot read or overwrite another tenant's keys. The RESP listener (if enabled)
-authenticates with the same per-site derived password as `pdo_mysql`, and in
-this mode `[kv.redis_compat] password` is ignored. Multi-tenant mode with the
-RESP listener on and no `[kv] secret` is a startup error. See
-[KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
+authenticates with the same per-site derived password as `pdo_mysql`. A tenant's
+credential only ever reaches its own store; the **process-global** store (what
+native middleware reads) is reachable only through the operator path — a
+one-argument `AUTH` matching `[kv.redis_compat] password`, which no tenant holds
+(see [Reaching the process-global store](/reference/kv-resp/#reaching-the-process-global-store-multi-tenant)).
+Multi-tenant mode with the RESP listener on and no `[kv] secret` is a startup
+error. See [KV RESP Protocol → Authentication](/reference/kv-resp/#authentication).
 
 ### 7. Two-uid process model + systemd sandbox
 

@@ -2377,6 +2377,30 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
     // case never reaches here (rejected just above).
     let resp_multi_tenant = if config.kv.secret_is_set() { multi_tenant.clone() } else { None };
 
+    // Make the operator/process-global RESP path visible at startup (#384). In
+    // multi-tenant mode a one-argument `AUTH <password>` reaches the
+    // process-global store (the keyspace native middleware reads), gated on the
+    // operator password. Log whether that path is open so an operator can see at
+    // a glance whether they can seed operator-scoped middleware state over RESP.
+    if resp_multi_tenant.is_some() {
+        let operator_password_set =
+            config.kv.redis_compat.password.as_deref().is_some_and(|p| !p.is_empty());
+        if operator_password_set {
+            tracing::info!(
+                "KV RESP operator path enabled: a one-argument AUTH with [kv.redis_compat] \
+                 password reaches the process-global KV store (per-site AUTH <host> <derived> \
+                 stays tenant-scoped). Knowing the operator password is an operator-level \
+                 capability — treat it like [kv] secret."
+            );
+        } else {
+            tracing::debug!(
+                "KV RESP has no operator path: [kv.redis_compat] password is unset, so the \
+                 process-global KV store is not reachable over RESP (set it to enable \
+                 operator-scoped seeding)."
+            );
+        }
+    }
+
     let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
         match ephpm_kv::server::run(store_for_resp, server_config, resp_multi_tenant).await {
