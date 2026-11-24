@@ -4717,6 +4717,22 @@ const HANDOFF_OWNERSHIP_RECHECK: Duration = Duration::from_secs(2);
 /// unchanged reason (every change of reason is logged at once).
 const HANDOFF_BLOCKED_WARN_EVERY: u32 = 10;
 
+/// Nominal fast-retry delay after a snapshot install loses a race for *this
+/// node's own* write lock (`database is locked` / `table is locked`).
+///
+/// The peer's dump was already fetched and vetted — only the local
+/// `BEGIN IMMEDIATE` was momentarily blocked by a background writer on the same
+/// file (the owner head sampler, a replica tail `apply_batch`, or a first-open
+/// race), and on Turso 0.8.3 a raw connection has no busy timeout, so that
+/// contention fails *instantly* rather than waiting. Pacing it with the
+/// peer-unreachable [`ephpm_cluster::ReconnectBackoff`] (2 s → 20 s) is far too
+/// pessimistic: on a load-starved CI host it stretched a cold handoff past the
+/// de-flake windows (#709). A sub-second jittered retry converges well inside
+/// them — and cuts real handoff latency under contention — while the genuine
+/// peer-unreachable path keeps the reconnect backoff that exists to stop a
+/// lockstep re-dial cohort from self-sustaining an owner stall (stress F1).
+const HANDOFF_CONTENDED_RETRY: Duration = Duration::from_millis(150);
+
 /// The alive peers that could hold a copy of `site`, in the order a cold new
 /// owner should ask them: HRW rank over the alive members **excluding self**.
 ///
@@ -5000,8 +5016,16 @@ enum SettleRound {
     NotOwner,
     /// Too soon after startup to conclude "new site"; ask again after the wait.
     AwaitMembership(Duration),
-    /// Cannot settle now; the reason is what a refused request is told.
+    /// Cannot settle now; the reason is what a refused request is told. Paced
+    /// with the peer-unreachable reconnect backoff (2 s → 20 s).
     Blocked(String),
+    /// The peer's copy was fetched and vetted, but installing it lost a race
+    /// for *this node's own* write lock (`database is locked`). The site is
+    /// still refused (fail-closed, cold), but this is transient local
+    /// contention — not a peer stall — so it fast-retries
+    /// ([`HANDOFF_CONTENDED_RETRY`]) and does not advance the reconnect
+    /// backoff (#709).
+    Contended(String),
 }
 
 /// Settle `site`'s serving-gate state, then return. Runs alongside the site's
@@ -5024,8 +5048,16 @@ enum SettleRound {
 /// If some peer could not answer, the site stays unserved
 /// ([`SiteServeState::Blocked`] — requests refused with the reason, `WARN`
 /// logged, `ephpm_cdc_bootstrap_total{outcome="handoff_blocked"}` counted)
-/// and the round is retried with backoff. See [`handoff_verdict`] for why
-/// refusing beats serving empty.
+/// and the round is retried with the peer-unreachable reconnect backoff
+/// (2 s → 20 s). See [`handoff_verdict`] for why refusing beats serving empty.
+///
+/// A peer *did* answer but the local install lost a race for this node's own
+/// write lock ([`classify_install_failure`], `database is locked`) is a
+/// different case: the site is still refused (fail-closed, cold), but it is
+/// transient local contention, so it fast-retries ([`HANDOFF_CONTENDED_RETRY`],
+/// `outcome="handoff_contended"`) without advancing the reconnect backoff —
+/// pacing that momentary contention like an owner stall is what stretched a
+/// cold handoff past the de-flake windows (#709).
 ///
 /// # Safety of the pull
 ///
@@ -5049,6 +5081,7 @@ async fn settle_site_serving(
     let mut conn: Option<turso::Connection> = None;
     let mut backoff = ephpm_cluster::ReconnectBackoff::replica_stream();
     let mut blocked_rounds: u32 = 0;
+    let mut contended_rounds: u32 = 0;
     let mut last_reason: Option<String> = None;
     loop {
         if drivers_shutdown().is_cancelled() {
@@ -5093,6 +5126,7 @@ async fn settle_site_serving(
                 gate.set(&site, SiteServeState::Pending);
                 backoff.reset();
                 blocked_rounds = 0;
+                contended_rounds = 0;
                 last_reason = None;
                 HANDOFF_OWNERSHIP_RECHECK
             }
@@ -5121,11 +5155,65 @@ async fn settle_site_serving(
                 backoff.record_attempt(round_started.elapsed());
                 backoff.next_delay()
             }
+            SettleRound::Contended(reason) => {
+                contended_rounds = contended_rounds.saturating_add(1);
+                cdc_metrics::record_bootstrap("handoff_contended");
+                if contended_rounds.is_multiple_of(HANDOFF_BLOCKED_WARN_EVERY) {
+                    tracing::warn!(
+                        site = %site,
+                        retries = contended_rounds,
+                        "ownership handoff: the snapshot install keeps losing a race for the local \
+                         write lock; still fast-retrying (local contention, not an owner stall): \
+                         {reason}"
+                    );
+                } else {
+                    tracing::debug!(
+                        site = %site,
+                        retries = contended_rounds,
+                        "ownership handoff install hit transient local write-lock contention; \
+                         fast-retrying: {reason}"
+                    );
+                }
+                // The copy is still cold, so keep refusing to serve it
+                // (fail-closed). But pace this as the momentary local
+                // contention it is (sub-second), not as a peer stall
+                // (2 s → 20 s): the reconnect backoff run is left untouched for
+                // a genuine peer-unreachable block (#709).
+                gate.set(&site, SiteServeState::Blocked(reason));
+                ephpm_cluster::reconnect::jittered(HANDOFF_CONTENDED_RETRY)
+            }
         };
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             () = drivers_shutdown().cancelled() => return,
         }
+    }
+}
+
+/// Map a failed snapshot install during ownership handoff to the settle
+/// outcome that decides its retry pacing.
+///
+/// A transient local write-lock ([`is_locked_error`] — `database is locked` /
+/// `table is locked`) is benign contention on this node's *own* file: the
+/// peer's dump was already fetched and vetted, and only the local
+/// `BEGIN IMMEDIATE` lost a race with a background writer on the same file. It
+/// is a [`SettleRound::Contended`], fast-retried ([`HANDOFF_CONTENDED_RETRY`]),
+/// never the peer-unreachable reconnect backoff whose 2 s → 20 s pacing
+/// stretched a cold handoff under contention past the de-flake window (#709).
+/// Any other install error (a rejected or malformed dump, a commit failure) is
+/// a genuine [`SettleRound::Blocked`].
+///
+/// This changes only *pacing*. Either way the site stays refused (fail-closed),
+/// and the next round re-runs the whole fetch → vet → discard → apply sequence
+/// from scratch, re-checking coldness inside [`install_snapshot`]'s scope — so
+/// nothing about the install's correctness or its invariants is weakened.
+fn classify_install_failure(err: &anyhow::Error, peer_id: &str) -> SettleRound {
+    if is_locked_error(err) {
+        SettleRound::Contended(format!(
+            "installing the copy from {peer_id} lost a race for the local write lock: {err:#}"
+        ))
+    } else {
+        SettleRound::Blocked(format!("installing the copy from {peer_id} failed: {err:#}"))
     }
 }
 
@@ -5260,9 +5348,7 @@ async fn settle_round(
                 SettleRound::Settled
             }
             Ok(false) => SettleRound::Settled,
-            Err(e) => {
-                SettleRound::Blocked(format!("installing the copy from {} failed: {e:#}", peer.id))
-            }
+            Err(e) => classify_install_failure(&e, &peer.id),
         };
     }
 
@@ -6486,6 +6572,41 @@ mod tests {
         let unrelated = anyhow::anyhow!("connection refused");
         assert!(!is_locked_error(&unrelated));
         assert!(!is_schema_collision_error(&unrelated));
+    }
+
+    /// #709: a handoff install that lost a race for the local write lock
+    /// (`database is locked`) must be classified as a fast-retry
+    /// (`Contended`), *not* the peer-unreachable `Blocked` that feeds the
+    /// 2 s → 20 s reconnect backoff. Any other install failure stays `Blocked`.
+    #[test]
+    fn a_locked_install_fast_retries_instead_of_the_reconnect_backoff() {
+        // The exact chain a transient install race produces: Turso's
+        // `BEGIN IMMEDIATE` fails instantly (no busy timeout) under the
+        // `install_snapshot` context.
+        let locked =
+            anyhow::anyhow!("database is locked").context("snapshot: begin install transaction");
+        match classify_install_failure(&locked, "node-2") {
+            SettleRound::Contended(reason) => {
+                assert!(reason.contains("node-2"), "reason names the source peer: {reason}");
+            }
+            _ => panic!("a locked install must fast-retry (Contended), not Blocked"),
+        }
+
+        // A genuine, non-transient install failure (a rejected dump) keeps the
+        // peer-unreachable backoff pacing.
+        let rejected = anyhow::anyhow!("snapshot: dump rejected by the statement allowlist");
+        assert!(
+            matches!(classify_install_failure(&rejected, "node-2"), SettleRound::Blocked(_)),
+            "a non-transient install failure must stay Blocked (reconnect backoff)"
+        );
+
+        // The fast-retry delay is an order of magnitude below the reconnect
+        // base, so even at maximum jitter (1.5x) it cannot stretch a cold
+        // handoff the way the 2 s → 20 s backoff did on a load-starved host.
+        assert!(
+            HANDOFF_CONTENDED_RETRY.mul_f64(1.5) < ephpm_cluster::ReconnectBackoff::REPLICA_BASE,
+            "the contended fast-retry must stay well under the reconnect base delay"
+        );
     }
 
     /// The Bug 2 fix core: discarding a diverged replica's local state drops
