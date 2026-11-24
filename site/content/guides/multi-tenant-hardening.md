@@ -453,7 +453,7 @@ root** — to exactly:
 | Access | Paths |
 |---|---|
 | read + write | the site trees (`sites_dir`, `document_root`), the per-vhost temp/session root, the embedded-database dir (`[db.sqlite] dir`), and `/dev/{null,zero,full}` |
-| read only | the operator-owned per-site overrides, the public CA trust store (so a tenant's HTTPS client can verify certificates), a minimal non-secret slice of `/etc` (name resolution, the loader cache, timezone), `/dev/{u,}random`, and `/proc/self` |
+| read only | the operator-owned per-site overrides, the public CA trust store (so a tenant's HTTPS client can verify certificates), a minimal non-secret slice of `/etc` (name resolution, the loader cache, timezone), `/dev/{u,}random`, and a **curated set of `/proc/self` leaves** for self-inspection (`stat`, `status`, `maps`, `fd`, … — **never** the `/proc/self` directory, so `/proc/self/environ` (the service env, incl. `AWS_*`) and `/proc/self/mem` stay unreachable) |
 | read + execute | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/opt` (loader + shared libraries) |
 
 Everything else becomes unreachable, including the files a tenant breakout
@@ -466,11 +466,25 @@ restrict the network, and already-open descriptors (listeners, the loaded
 config, the generated `php.ini`, TLS keys) keep working, which is why the TLS
 private key is **never** granted to the sandboxed engine.
 
+**This is not the cross-tenant boundary.** A PHP pool thread serves many
+tenants over its lifetime and a Landlock domain can only be set once per thread
+and only narrowed, so the ruleset necessarily grants the *whole* `sites_dir`,
+embedded-DB dir and per-vhost state root — one tenant's PHP can reach another's
+files, database and sessions *through the filesystem* under Landlock alone.
+Keeping tenants out of each other's trees is the job of §1–§6
+(`open_basedir` + `disable_functions` + the per-site database/wire credential),
+not this sandbox. What Landlock adds is the kernel backstop against reaching
+**host** secrets and escaping the ePHPm tree entirely, even if `open_basedir`
+is bypassed.
+
 Controlled by [`self_sandbox`](/reference/config/#server):
 
-- `"auto"` (default) — armed in multi-tenant mode when the kernel enforces
-  Landlock (Linux ≥ 5.13, ABI 1); if the kernel lacks it, ePHPm logs a WARN and
-  serves unsandboxed. Off in single-tenant mode.
+- `"auto"` (default) — **secure by default**: armed in multi-tenant mode when
+  the kernel enforces Landlock (Linux ≥ 5.13, ABI 1), and **fails startup
+  closed** if the kernel lacks it (the same posture `require_privilege_drop`
+  takes — a node that isolates tenants must not run the shared-uid engine
+  unsandboxed). There is no "warn and serve unsandboxed" tier; use `"off"` to
+  accept that explicitly. Off in single-tenant mode.
 - `"enforce"` — require it: startup fails closed without kernel support, and a
   PHP thread that cannot arm the sandbox refuses to serve.
 - `"off"` — disabled.

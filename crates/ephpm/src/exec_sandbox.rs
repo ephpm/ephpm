@@ -817,17 +817,20 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
     ]);
 
     // Read-only: the minimum non-secret /etc a program needs (name resolution,
-    // the loader cache, timezone) plus entropy and /proc/self for self-inspection.
-    // Deliberately NOT /etc wholesale — that would expose /etc/ephpm and
-    // /etc/shadow. Each is an individual path, so only these leaves are granted.
+    // the loader cache, timezone) plus entropy. Deliberately NOT /etc wholesale —
+    // that would expose /etc/ephpm and /etc/shadow. Each is an individual path,
+    // so only these leaves are granted.
     //
-    // Deliberately `/proc/self`, NOT `/proc` wholesale: the exec'd command shares
-    // the `ephpm-web` uid with the *running server*, so a broad `/proc` grant
-    // would let it read the server's `/proc/<server-pid>/environ` and `maps`
-    // (same-uid `0400`) and exfiltrate the server's environment (any `EPHPM_*`
-    // secrets) and address layout. An interpreter/shell needs only its own
-    // `/proc/self/*`; per-pid entries for *other* pids stay unreachable.
-    let ro: Vec<PathBuf> = existing(&[
+    // Deliberately NOT `/proc` wholesale: the exec'd command shares the
+    // `ephpm-web` uid with the *running server*, so a broad `/proc` grant would
+    // let it read the server's `/proc/<server-pid>/environ` and `maps` (same-uid
+    // `0400`) and exfiltrate the server's environment (any `EPHPM_*` secrets) and
+    // address layout. It is **also** not the `/proc/self` directory: that would
+    // re-expose `/proc/self/environ` (the exec'd command's own environment, which
+    // carries whatever the server passed it) and `/proc/self/mem`. Only the
+    // curated self-inspection leaves are granted (see `proc_self_paths`);
+    // per-pid entries for *other* pids stay unreachable.
+    let mut ro: Vec<PathBuf> = existing(&[
         Path::new("/etc/passwd"),
         Path::new("/etc/group"),
         Path::new("/etc/nsswitch.conf"),
@@ -838,8 +841,8 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
         Path::new("/etc/hosts"),
         Path::new("/dev/urandom"),
         Path::new("/dev/random"),
-        Path::new("/proc/self"),
     ]);
+    ro.extend(existing(&proc_self_paths()));
 
     // Read-only: the system CA trust store, so an HTTPS client inside the sandbox
     // can verify server certificates (issue #485). Without this every outbound TLS
@@ -913,6 +916,36 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+/// The curated `/proc/self` entries a program needs for self-inspection, each
+/// granted read-only **individually**. Landlock is allow-list only, so the
+/// `/proc/self` directory is never granted — that keeps `/proc/self/environ`
+/// (the command's own environment) and `/proc/self/mem` (process memory)
+/// unreachable. Mirrors `ephpm-server`'s engine-sandbox set. `existing` drops
+/// any entry a given `/proc` layout lacks.
+#[cfg(target_os = "linux")]
+fn proc_self_paths() -> [&'static std::path::Path; 17] {
+    use std::path::Path;
+    [
+        Path::new("/proc/self/stat"),
+        Path::new("/proc/self/statm"),
+        Path::new("/proc/self/status"),
+        Path::new("/proc/self/limits"),
+        Path::new("/proc/self/cmdline"),
+        Path::new("/proc/self/maps"),
+        Path::new("/proc/self/smaps"),
+        Path::new("/proc/self/auxv"),
+        Path::new("/proc/self/fd"),
+        Path::new("/proc/self/fdinfo"),
+        Path::new("/proc/self/task"),
+        Path::new("/proc/self/exe"),
+        Path::new("/proc/self/cgroup"),
+        Path::new("/proc/self/mounts"),
+        Path::new("/proc/self/mountinfo"),
+        Path::new("/proc/self/ns"),
+        Path::new("/proc/self/io"),
+    ]
 }
 
 /// Filter a list of candidate paths down to those that currently exist, as

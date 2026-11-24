@@ -52,7 +52,10 @@
 //! * **read-only**: the operator-owned per-site overrides, the public CA trust
 //!   store (so an app's HTTPS client can verify certificates), a minimal
 //!   non-secret slice of `/etc` (name resolution + the loader cache + timezone),
-//!   `/dev/{u,}random`, and `/proc/self`;
+//!   `/dev/{u,}random`, and a **curated set of `/proc/self` leaves** for
+//!   self-inspection — never the `/proc/self` directory, so `/proc/self/environ`
+//!   (the process's own env: `AWS_*` and other service secrets) and
+//!   `/proc/self/mem` stay unreachable;
 //! * **read + execute**: `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/opt` —
 //!   where the loader and shared libraries live.
 //!
@@ -63,16 +66,25 @@
 //!
 //! Controlled by `[server] self_sandbox` ([`SelfSandboxMode`]):
 //!
-//! * `Auto` (default) — on in multi-tenant mode when the kernel enforces
-//!   Landlock (≥ 5.13, ABI 1); if the kernel lacks it, `WARN` and serve
-//!   unsandboxed. Off in single-tenant mode.
-//! * `Enforce` — require it: [`init`] **fails startup** if the kernel does not
-//!   enforce Landlock, and [`restrict_current_php_thread`] returns an error (so
-//!   the pool retires the thread) if a thread cannot arm it.
-//! * `Off` — disabled.
+//! * `Auto` (default) — **secure by default in multi-tenant mode**: on when the
+//!   kernel enforces Landlock (≥ 5.13, ABI 1), and [`init`] **fails startup** if
+//!   the kernel does not (fail closed — a node that isolates tenants must not run
+//!   the shared-uid engine without the kernel backstop; the same posture
+//!   [`crate::privdrop`]/`require_privilege_drop` takes). Off in single-tenant
+//!   mode (opt in with `Enforce`).
+//! * `Enforce` — require it regardless of tenancy: [`init`] **fails startup** if
+//!   the kernel does not enforce Landlock, and [`restrict_current_php_thread`]
+//!   returns an error (so the pool retires the thread) if a thread cannot arm it.
+//! * `Off` — disabled. The explicit escape hatch; [`init`] logs a loud `WARN` in
+//!   multi-tenant mode so an operator opting out of the secure default is never
+//!   silent about it.
 //!
-//! Ignored on non-Linux (Windows/macOS compile the inert stub) and in
-//! `ephpm dev` (a developer iterating locally is never sandboxed).
+//! There is deliberately **no** "enabled but warn-and-serve-unsandboxed" tier: a
+//! node that asked to sandbox either sandboxes or fails closed. Ignored on
+//! non-Linux (Windows/macOS compile the inert stub — an enabled decision there
+//! logs a `WARN` and serves unsandboxed, never fails startup, since Landlock is
+//! Linux-only) and in `ephpm dev` (a developer iterating locally is never
+//! sandboxed).
 
 // The Linux impl calls `prctl(PR_SET_NO_NEW_PRIVS)` and the Landlock FFI; the
 // one unsafe block carries a SAFETY note explaining the invariant it upholds.
@@ -109,6 +121,8 @@ pub fn init(config: &Config, dev_mode: bool) -> anyhow::Result<()> {
     let mode = config.server.self_sandbox_mode();
     let multi_tenant = config.server.sites_dir.is_some();
 
+    // Loud, honest notices for the cases where the engine ends up *not*
+    // sandboxed but an operator might assume otherwise.
     if dev_mode {
         if mode != SelfSandboxMode::Off {
             tracing::info!(
@@ -116,44 +130,123 @@ pub fn init(config: &Config, dev_mode: bool) -> anyhow::Result<()> {
                  Landlock-sandboxed while iterating locally"
             );
         }
-        mark_disabled();
-        return Ok(());
+    } else if mode == SelfSandboxMode::Off && multi_tenant {
+        // The explicit escape hatch, flagged in the posture where it matters.
+        tracing::warn!(
+            "[server] self_sandbox = \"off\": the multi-tenant PHP engine is NOT \
+             Landlock-sandboxed. A tenant that breaks out of PHP can read every host file \
+             the service uid can reach — the cluster secret, TLS private keys, other \
+             tenants' databases. This is an explicit opt-out of the secure default; set \
+             self_sandbox = \"auto\" or \"enforce\" to restore it."
+        );
     }
 
-    let enabled = match mode {
-        SelfSandboxMode::Off => false,
-        SelfSandboxMode::Auto => multi_tenant,
-        SelfSandboxMode::Enforce => true,
-    };
-    if !enabled {
-        if mode == SelfSandboxMode::Auto && !multi_tenant {
-            tracing::debug!(
-                "[server] self_sandbox = auto: single-tenant, engine Landlock sandbox off \
-                 (set self_sandbox = \"enforce\" to opt in)"
-            );
+    match decide(mode, multi_tenant, dev_mode) {
+        Decision::Disabled => {
+            if mode == SelfSandboxMode::Auto && !multi_tenant && !dev_mode {
+                tracing::debug!(
+                    "[server] self_sandbox = auto: single-tenant, engine Landlock sandbox off \
+                     (set self_sandbox = \"enforce\" to opt in)"
+                );
+            }
+            mark_disabled();
+            Ok(())
         }
-        mark_disabled();
-        return Ok(());
+        Decision::Enabled => {
+            #[cfg(target_os = "linux")]
+            {
+                init_enabled(config, mode)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Landlock is Linux-only; never break Windows/macOS by failing
+                // startup for a feature the platform cannot provide. But an
+                // enabled decision here means a multi-tenant (or `enforce`) node
+                // is running its engine unsandboxed, so say so loudly rather than
+                // silently — the "degrade loudly, never silently" posture.
+                tracing::warn!(
+                    mode = ?mode,
+                    "[server] self_sandbox: the Landlock engine sandbox is Linux-only — the \
+                     PHP engine is NOT filesystem-sandboxed on this platform. Cross-tenant and \
+                     host isolation rest on open_basedir + disable_functions alone."
+                );
+                mark_disabled();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Whether the engine should be sandboxed — the pure **secure-by-default**
+/// policy, factored out from kernel probing so it is unit-testable on any
+/// platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Do not sandbox (store `None`): `off`, `ephpm dev`, or single-tenant `auto`.
+    Disabled,
+    /// Sandbox the engine. A kernel without Landlock is **fatal** (fail closed) —
+    /// there is deliberately no "warn and serve unsandboxed" tier for a node that
+    /// asked to sandbox. The only opt-out is an explicit `self_sandbox = "off"`.
+    Enabled,
+}
+
+/// The secure-by-default decision. `auto` (the default) sandboxes a multi-tenant
+/// node and leaves a single-tenant node unsandboxed; `enforce` always sandboxes;
+/// `off` never does; `ephpm dev` is never sandboxed.
+///
+/// The change from the original F3 proposal: `auto` in multi-tenant mode no
+/// longer degrades to "WARN and serve unsandboxed" when the kernel lacks
+/// Landlock — it fails closed, exactly as `require_privilege_drop` does in
+/// multi-tenant mode. A node that asked to isolate tenants must not silently run
+/// the shared-uid engine without the kernel backstop.
+fn decide(mode: SelfSandboxMode, multi_tenant: bool, dev_mode: bool) -> Decision {
+    if dev_mode {
+        return Decision::Disabled;
+    }
+    match mode {
+        SelfSandboxMode::Auto if multi_tenant => Decision::Enabled,
+        // Single-tenant `auto` and `off` both leave the engine unsandboxed.
+        SelfSandboxMode::Off | SelfSandboxMode::Auto => Decision::Disabled,
+        SelfSandboxMode::Enforce => Decision::Enabled,
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use ephpm_config::SelfSandboxMode::{Auto, Enforce, Off};
+
+    use super::{Decision, decide};
+
+    /// The secure-by-default matrix: `auto` sandboxes a multi-tenant node (the
+    /// headline change — no silent unsandboxed multi-tenant engine), leaves a
+    /// single-tenant node alone, `enforce` always sandboxes, `off` never does,
+    /// and `ephpm dev` is never sandboxed.
+    #[test]
+    fn decide_is_secure_by_default() {
+        // auto: on for multi-tenant, off for single-tenant.
+        assert_eq!(decide(Auto, true, false), Decision::Enabled);
+        assert_eq!(decide(Auto, false, false), Decision::Disabled);
+        // enforce: always on, regardless of tenancy.
+        assert_eq!(decide(Enforce, true, false), Decision::Enabled);
+        assert_eq!(decide(Enforce, false, false), Decision::Enabled);
+        // off: never on — the explicit escape hatch.
+        assert_eq!(decide(Off, true, false), Decision::Disabled);
+        assert_eq!(decide(Off, false, false), Decision::Disabled);
+        // dev mode: never sandboxed, whatever the mode or tenancy.
+        for mode in [Auto, Enforce, Off] {
+            for mt in [true, false] {
+                assert_eq!(decide(mode, mt, true), Decision::Disabled);
+            }
+        }
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        init_enabled(config, mode)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Landlock is Linux-only; never break Windows/macOS. `enforce` cannot be
-        // honoured here, so say so loudly (an operator asking for a hard sandbox
-        // on a platform that cannot provide one deserves to know), but do not
-        // fail startup — the platform simply has no self-sandbox.
-        if mode == SelfSandboxMode::Enforce {
-            tracing::warn!(
-                "[server] self_sandbox = \"enforce\" is ignored on this platform — the \
-                 Landlock engine sandbox is Linux-only"
-            );
-        }
-        mark_disabled();
-        Ok(())
+    /// A multi-tenant node's default (`auto`) is an *enabled* decision — so a
+    /// kernel without Landlock fails closed (`init_enabled` bails on
+    /// `Enforcement::None`) rather than serving unsandboxed. This is the property
+    /// the owner directive ("secure-first, turn these on") requires.
+    #[test]
+    fn multi_tenant_default_fails_closed_without_landlock() {
+        assert_eq!(decide(Auto, true, false), Decision::Enabled);
     }
 }
 
@@ -221,22 +314,18 @@ fn init_enabled(config: &Config, mode: SelfSandboxMode) -> anyhow::Result<()> {
             Ok(())
         }
         imp::Enforcement::None => {
-            if mode == SelfSandboxMode::Enforce {
-                anyhow::bail!(
-                    "[server] self_sandbox = \"enforce\" but this kernel does not enforce \
-                     Landlock (needs Linux >= 5.13). Upgrade the kernel, or set self_sandbox \
-                     = \"auto\" (warn and continue) or \"off\" to run without the engine \
-                     filesystem sandbox."
-                );
-            }
-            tracing::warn!(
-                "self-sandbox: this kernel does not enforce Landlock (needs Linux >= 5.13) — \
-                 the PHP engine is NOT filesystem-sandboxed. Cross-tenant and host isolation \
-                 rest on open_basedir + disable_functions alone. Set self_sandbox = \
-                 \"enforce\" to make this fatal."
+            // `init_enabled` is only reached for an *enabled* decision (`enforce`,
+            // or `auto` in multi-tenant mode). Both fail closed rather than serve
+            // the engine unsandboxed — the secure-by-default posture. The only
+            // opt-out is an explicit `self_sandbox = "off"`.
+            anyhow::bail!(
+                "[server] self_sandbox = {:?}: this kernel does not enforce Landlock (needs \
+                 Linux >= 5.13 with Landlock enabled in the kernel), so the PHP engine cannot \
+                 be filesystem-sandboxed. Refusing to serve an unsandboxed engine. Enable \
+                 Landlock in the kernel, or set [server] self_sandbox = \"off\" to explicitly \
+                 accept an unsandboxed engine (not recommended in multi-tenant mode).",
+                mode
             );
-            let _ = SANDBOX.set(None);
-            Ok(())
         }
     }
 }
@@ -255,6 +344,11 @@ mod imp {
     /// The paths the PHP engine is allowed to reach, by access class. Built once
     /// from config in [`SandboxSpec::from_config`]; the same instance both
     /// preflights the kernel and arms every PHP thread.
+    // The three fields intentionally share the `read_` prefix: they name the
+    // three Landlock access classes (read+write, read+execute, read-only), so
+    // the prefix *is* the meaning. `clippy::struct_field_names` (newer
+    // toolchains) is a false positive here.
+    #[allow(clippy::struct_field_names)]
     #[derive(Debug, Clone)]
     pub(super) struct SandboxSpec {
         /// Read + write + the directory-content rights (site trees, state root,
@@ -335,10 +429,10 @@ mod imp {
                 Path::new("/opt"),
             ]);
 
-            // Minimal non-secret /etc (name resolution, loader cache, timezone),
-            // entropy, /proc/self — deliberately NOT /etc, /proc, or /dev
-            // wholesale, which would re-expose /etc/ephpm, /etc/shadow, and other
-            // pids' /proc/<pid>/environ.
+            // Minimal non-secret /etc (name resolution, loader cache, timezone)
+            // and entropy — deliberately NOT /etc, /proc, or /dev wholesale,
+            // which would re-expose /etc/ephpm, /etc/shadow, and other pids'
+            // /proc/<pid>/environ.
             let mut ro: Vec<PathBuf> = existing(&[
                 Path::new("/etc/passwd"),
                 Path::new("/etc/group"),
@@ -351,8 +445,17 @@ mod imp {
                 Path::new("/etc/hosts"),
                 Path::new("/dev/urandom"),
                 Path::new("/dev/random"),
-                Path::new("/proc/self"),
             ]);
+            // Self-inspection via /proc/self, granted as individual leaves so the
+            // sensitive siblings stay unreachable — deliberately NOT the
+            // /proc/self directory, which would re-expose /proc/self/environ (the
+            // process's OWN environment: `AWS_*` S3 credentials and any other
+            // secret in the service env — a host-secret leak that bypasses even
+            // the F1 env scrub, since /proc/self/environ is the raw process env,
+            // not PHP's `$_ENV`) and /proc/self/mem. Landlock is allow-list only
+            // and cannot subtract a child from a granted directory, so the
+            // directory itself is never granted. See `proc_self_paths`.
+            ro.extend(existing(&proc_self_paths()));
             // Operator-owned per-site overrides (read per request). Lives outside
             // `sites_dir` by a startup invariant, so granting read here never
             // widens a tenant's reach into another's container.
@@ -475,6 +578,43 @@ mod imp {
         ]
     }
 
+    /// The specific `/proc/self` entries a program legitimately needs for
+    /// self-inspection, each granted read-only **individually**.
+    ///
+    /// Landlock is allow-list only — it cannot grant `/proc/self` and then
+    /// subtract a child — so to keep the sensitive siblings unreachable the
+    /// `/proc/self` directory is never granted; only these leaves/subtrees are.
+    /// Deliberately **excluded**: `environ` (the process's own environment, with
+    /// `AWS_*` S3 credentials and any other secret in the service env),
+    /// `mem`/`pagemap`/`clear_refs` (process memory), and `root`/`cwd` (magic
+    /// symlinks to `/` and the cwd whose targets are escape-shaped). Verified on
+    /// a live kernel (Landlock ABI 7): PHP 8.5 self-inspection (`memory_get_usage`,
+    /// `/proc/self/status`, `cmdline`, `maps`, `fd`) works with this set while
+    /// `/proc/self/environ` and `/proc/self/mem` are denied `EACCES`. `existing`
+    /// drops any entry a given `/proc` layout lacks; each is independently
+    /// non-critical (PHP boots even with none granted).
+    fn proc_self_paths() -> [&'static Path; 17] {
+        [
+            Path::new("/proc/self/stat"),
+            Path::new("/proc/self/statm"),
+            Path::new("/proc/self/status"),
+            Path::new("/proc/self/limits"),
+            Path::new("/proc/self/cmdline"),
+            Path::new("/proc/self/maps"),
+            Path::new("/proc/self/smaps"),
+            Path::new("/proc/self/auxv"),
+            Path::new("/proc/self/fd"),
+            Path::new("/proc/self/fdinfo"),
+            Path::new("/proc/self/task"),
+            Path::new("/proc/self/exe"),
+            Path::new("/proc/self/cgroup"),
+            Path::new("/proc/self/mounts"),
+            Path::new("/proc/self/mountinfo"),
+            Path::new("/proc/self/ns"),
+            Path::new("/proc/self/io"),
+        ]
+    }
+
     /// Keep only the paths that currently exist, as owned `PathBuf`s.
     fn existing(paths: &[&Path]) -> Vec<PathBuf> {
         paths.iter().filter(|p| p.exists()).map(|p| p.to_path_buf()).collect()
@@ -540,6 +680,35 @@ mod imp {
             let _ = std::fs::remove_dir_all(&tmp);
         }
 
+        /// The `/proc/self` grant is curated leaves, never the directory — so
+        /// the process's own environment (`/proc/self/environ`: `AWS_*` and any
+        /// service secret) and memory (`/proc/self/mem`) stay unreachable, while
+        /// the self-inspection files PHP/glibc use are granted. Regression guard
+        /// for the F3 host-secret leak found on a live kernel (Landlock ABI 7).
+        #[test]
+        fn proc_self_grant_excludes_environ_and_mem() {
+            let tmp = std::env::temp_dir().join(format!("ephpm-sbx-proc-{}", std::process::id()));
+            let sites = tmp.join("sites");
+            let sqlite = tmp.join("db");
+            std::fs::create_dir_all(&sites).unwrap();
+            std::fs::create_dir_all(&sqlite).unwrap();
+            let config = multi_tenant_config(&sites, &sqlite);
+            let spec = SandboxSpec::from_config(&config);
+
+            let ro: Vec<String> =
+                spec.read_only.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            // Never the directory itself, nor the sensitive leaves.
+            for bad in ["/proc/self", "/proc/self/environ", "/proc/self/mem"] {
+                assert!(!ro.iter().any(|p| p == bad), "must not grant {bad}: {ro:?}");
+            }
+            // The self-inspection leaves PHP/glibc use are granted (they exist on
+            // any Linux test host).
+            for good in ["/proc/self/status", "/proc/self/stat", "/proc/self/maps"] {
+                assert!(ro.iter().any(|p| p == good), "must grant {good}: {ro:?}");
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
         #[test]
         fn ca_trust_dirs_are_public_cert_dirs_only() {
             for p in ca_trust_dirs() {
@@ -587,6 +756,47 @@ mod imp {
                 // The path outside the ruleset is denied by the kernel.
                 let denied = std::fs::read(&outside2);
                 assert!(denied.is_err(), "read outside the ruleset must be denied after lockdown");
+            });
+            handle.join().expect("probe thread");
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        /// The curated `/proc/self` grant, proven on the live kernel through
+        /// ePHPm's **own** apply path: after arming the real ruleset on a thread,
+        /// `/proc/self/environ` (the service env — `AWS_*` and other secrets) and
+        /// `/proc/self/mem` are denied, while `/proc/self/status` stays readable
+        /// for self-inspection. Regression guard for the F3 host-secret leak.
+        /// No-op on kernels without Landlock (preflight gate), so it never false-
+        /// fails on a CI kernel lacking it.
+        #[test]
+        fn lockdown_denies_proc_self_environ() {
+            let tmp = std::env::temp_dir().join(format!("ephpm-sbx-env-{}", std::process::id()));
+            let sites = tmp.join("sites");
+            let sqlite = tmp.join("db");
+            std::fs::create_dir_all(&sites).unwrap();
+            std::fs::create_dir_all(&sqlite).unwrap();
+            let config = multi_tenant_config(&sites, &sqlite);
+            let spec = SandboxSpec::from_config(&config);
+
+            if preflight(&spec) != Enforcement::Full {
+                eprintln!("kernel does not fully enforce Landlock; skipping environ assertion");
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+
+            let handle = std::thread::spawn(move || {
+                restrict_current_thread(&spec).expect("arm sandbox on probe thread");
+                // The host-secret leak F3 must close: the process's own env.
+                assert!(
+                    std::fs::read("/proc/self/environ").is_err(),
+                    "/proc/self/environ must be denied — it leaks the service env (AWS_* etc.)"
+                );
+                assert!(std::fs::read("/proc/self/mem").is_err(), "/proc/self/mem must be denied");
+                // Self-inspection stays available.
+                assert!(
+                    std::fs::read("/proc/self/status").is_ok(),
+                    "/proc/self/status must stay readable under the curated grant"
+                );
             });
             handle.join().expect("probe thread");
             let _ = std::fs::remove_dir_all(&tmp);

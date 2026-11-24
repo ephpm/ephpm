@@ -736,14 +736,20 @@ pub struct ServerConfig {
     /// Accepted values (fail closed on a typo — a silently-ignored security
     /// knob is worse than none):
     ///
-    /// * `"auto"` (default) — enable when multi-tenant (`sites_dir` set) and the
-    ///   kernel enforces Landlock (≥ 5.13, ABI 1); `WARN` and continue
-    ///   unsandboxed if the kernel lacks it. Single-tenant: left off (opt in
-    ///   with `"enforce"`).
-    /// * `"enforce"` — require it: startup **fails closed** if the kernel does
-    ///   not enforce Landlock, and a thread that cannot arm the sandbox refuses
-    ///   to serve. Use this where the sandbox is a hard requirement.
-    /// * `"off"` — disabled.
+    /// * `"auto"` (default) — **secure by default in multi-tenant mode**: enable
+    ///   when multi-tenant (`sites_dir` set) and the kernel enforces Landlock
+    ///   (≥ 5.13, ABI 1), and **fail startup closed** if the kernel does not —
+    ///   the same posture [`require_privilege_drop`](Self::require_privilege_drop)
+    ///   takes, because a node that isolates tenants must not run the shared-uid
+    ///   PHP engine without the kernel backstop. Single-tenant: left off (opt in
+    ///   with `"enforce"`). There is deliberately no "warn and serve unsandboxed"
+    ///   tier — use `"off"` to accept that explicitly.
+    /// * `"enforce"` — require it regardless of tenancy: startup **fails closed**
+    ///   if the kernel does not enforce Landlock, and a thread that cannot arm
+    ///   the sandbox refuses to serve. Use this to sandbox a single-tenant node.
+    /// * `"off"` — disabled. The explicit escape hatch; startup logs a loud
+    ///   `WARN` in multi-tenant mode so opting out of the secure default is never
+    ///   silent.
     ///
     /// Landlock governs filesystem access only; it does not restrict the
     /// network, and already-open file descriptors (listeners, the loaded config,
@@ -7172,8 +7178,9 @@ pub const SELF_SANDBOX_MODES: &[&str] = &["auto", "enforce", "off"];
 /// [`ServerConfig::self_sandbox_mode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelfSandboxMode {
-    /// Enable in multi-tenant mode when the kernel enforces Landlock; WARN and
-    /// continue unsandboxed otherwise. Off in single-tenant mode.
+    /// Secure by default: enable in multi-tenant mode and **fail startup closed**
+    /// if the kernel does not enforce Landlock (no "warn and serve unsandboxed"
+    /// tier). Off in single-tenant mode (opt in with [`Enforce`](Self::Enforce)).
     Auto,
     /// Require the sandbox: fail startup if the kernel does not enforce
     /// Landlock, and a thread that cannot arm it refuses to serve.
