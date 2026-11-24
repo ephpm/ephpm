@@ -866,8 +866,24 @@ opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "146
 # mysql_common: Decoder::with_buffer + stream::copy_decode) whose signatures
 # are unchanged in 0.14. With these plus the workspace `zstd = "0.14"` bump
 # (ephpm-kv), the tree resolves to zstd 0.14.3 / zstd-safe 8.2.0 (zstd-sys
-# stays 2.1.2). Remove both when upstream chitchat and mysql_common release on
-# zstd 0.14. See ephpm/ephpm#648.
+# stays 2.1.2).
+#
+# The chitchat fork CANNOT yet be retired despite upstream chitchat 0.14.0
+# (released 2026-11-05, requires `zstd ^0.14`, MSRV 1.87) clearing the zstd
+# advisory on its own (investigated for #708). Our fork is chitchat 0.10 with
+# only the zstd bump, and 0.10 exposes a PUBLIC `impl Serializable /
+# Deserializable for ChitchatMessage`. `ephpm-cluster`'s `EncryptedUdpTransport`
+# (`[cluster] secret` — authenticated/encrypted gossip) relies on that public
+# surface to serialize a message, seal it, and send it (and to open+deserialize
+# on recv). Upstream 0.14 moved wire (de)serialization onto `ChitchatEnvelope`
+# as `pub(crate)` inherent methods and dropped the public `Serializable`/
+# `Deserializable` impls, so an out-of-crate custom `Socket` has NO public way
+# to encode/decode an envelope (the message variants also carry unexported
+# `Digest`/`Delta` types). Retiring the fork to upstream 0.14 therefore breaks
+# encrypted gossip. Retire only once upstream chitchat re-exposes a public
+# envelope/message (de)serialization API (or ephpm-cluster's gossip encryption
+# is redesigned to not need one). mysql_common still needs the fork because
+# upstream has not released on zstd 0.14 at all. See ephpm/ephpm#648 / #708.
 chitchat = { git = "https://github.com/ephpm/chitchat.git", rev = "52188450c14cc899846bc66baccc39c56297cc9d" }
 mysql_common = { git = "https://github.com/ephpm/rust_mysql_common.git", rev = "44aee03c86b7c939ea484edb98f71dfc4b921fc3" }
 # CORRECTNESS: Turso 0.8.3's page-1 allocation race. When several connections

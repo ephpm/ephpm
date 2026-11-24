@@ -155,7 +155,13 @@ allow-git = [
     # ePHPm forks of chitchat and rust_mysql_common with only their `zstd`
     # dependency bumped 0.13 -> 0.14 so the whole graph can reach the
     # RUSTSEC-2026-0391/0398/0403 fix (zstd 0.14.3 / zstd-safe 8.2.0); see
-    # [patch.crates-io] in Cargo.toml. Remove when both release on zstd 0.14.
+    # [patch.crates-io] in Cargo.toml. rust_mysql_common: remove when upstream
+    # releases on zstd 0.14. chitchat: NOT removable by a zstd release alone —
+    # upstream chitchat 0.14 already requires zstd ^0.14 but dropped the public
+    # message (de)serialization API that ephpm-cluster's EncryptedUdpTransport
+    # needs (investigated for #708; see the long note in Cargo.toml). Retire
+    # only once that public API returns upstream (or gossip encryption is
+    # redesigned). See ephpm/ephpm#648 / #708.
     "https://github.com/ephpm/chitchat.git",
     "https://github.com/ephpm/rust_mysql_common.git",
     # ePHPm fork of opensrv-mysql 0.7.0 (RUSTSEC-2026-0285 fix; see
