@@ -1,0 +1,116 @@
+# ===========================================================================
+# ePHPm — KV warm-restart snapshots ([kv.snapshot])
+# ===========================================================================
+#
+# A snapshot is an ENCRYPTED copy of every live KV entry (the default store and
+# every per-site store) written at graceful shutdown and loaded before the
+# listeners open, so a restarted node serves WARM instead of cold.
+#
+# It is a cache WARM-UP, not durability: nothing is written between snapshots,
+# and a snapshot that cannot be verified is ignored (the node starts cold).
+# Use a periodic `interval` if you want something to survive a crash/SIGKILL.
+#
+# Always encrypted — there is no plaintext mode. `mode != "off"` REQUIRES a
+# [kv] secret (the per-file key is HKDF-SHA256 from it; the secret is never
+# written). Config::validate fails closed otherwise.
+#
+# Guide:        site/content/guides/kv-warm-restart.md
+# Architecture: site/content/architecture/kv-snapshots.md
+#
+# Every key is real (crates/ephpm-config/src/lib.rs); defaults are noted. Pick
+# ONE of the two [kv.snapshot] blocks below (local file OR object storage).
+# ===========================================================================
+
+[server]
+listen = "0.0.0.0:8080"
+
+[kv]
+# Required for any snapshot mode. Load from a file/secret store in production.
+secret = "change-me-load-from-a-secret-store"
+
+# ---------------------------------------------------------------------------
+# Option A — LOCAL FILE (mode = "local")
+# ---------------------------------------------------------------------------
+# The snapshot is one file at <path>/<identity>.kvsnap, written to a temp file
+# and renamed into place (a reader only ever sees a complete snapshot).
+[kv.snapshot]
+mode = "local"                       # "off" (default) | "local" | "object"
+
+# Directory the file lives in. REQUIRED for mode = "local"; created at startup.
+path = "/var/lib/ephpm/kv-snapshots"
+
+# File stem. Defaults to [cluster] node_id if set, else the host name — stable
+# for a VM, systemd unit, or StatefulSet pod. A Deployment pod has a random
+# host name, so set this explicitly there (replicas sharing one identity race;
+# last writer wins). Default: unset (node_id / host name).
+# identity = "web-1"
+
+# When to write / load. Both default to true.
+on_shutdown   = true                 # write during graceful shutdown (after drain)
+load_on_start = true                 # load before the listeners open
+
+# Also write periodically while running, e.g. "15m". This is what survives a
+# crash or SIGKILL, at the cost of a CPU+disk burst each time. "0" (default)
+# disables periodic snapshots. Integer + ms/s/m/h/d.
+interval = "0"
+
+# Give up loading after this long and start with whatever was restored. Load
+# never fails startup. Default: "30s".
+load_timeout = "30s"
+
+# Largest snapshot to write or load; a write that would exceed it is abandoned
+# (previous kept), a file over it is not loaded. Bytes or KB/MB/GB (1024).
+# Default: "1GB".
+max_size = "1GB"
+
+# Clustered nodes only: warm this node's large-value share from peers on start
+# and push to takeover nodes on drain. No effect on a non-clustered node.
+# Default: true. (Independent of mode — a cluster node can warm from peers with
+# no file at all.)
+peer_handoff = true
+
+# ---------------------------------------------------------------------------
+# Option B — OBJECT STORAGE (mode = "object") — delete Option A and use this
+# ---------------------------------------------------------------------------
+# The object lives at s3://bucket[/prefix]; the key is <prefix>/<identity>.kvsnap.
+# Credentials come ONLY from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ optional
+# AWS_SESSION_TOKEN) in the environment — never this file; startup fails if unset.
+#
+# [kv.snapshot]
+# mode     = "object"
+# url      = "s3://ephpm-kv-snapshots/prod"   # REQUIRED in object mode
+# identity = "web-1"                          # object key stem (set it on random-hostname pods)
+# interval = "15m"
+#
+# --- MinIO ---
+# endpoint   = "http://minio:9000"
+# region     = "us-east-1"                    # MinIO accepts anything
+# path_style = true                           # default true when endpoint is set
+#
+# --- Cloudflare R2 ---
+# endpoint   = "https://<account-id>.r2.cloudflarestorage.com"
+# region     = "auto"
+#
+# --- AWS S3 --- (omit endpoint/path_style; just set the region)
+# region = "us-west-2"
+#
+# on_shutdown/load_on_start/load_timeout/max_size/peer_handoff behave as above.
+
+# ---------------------------------------------------------------------------
+# Operating the snapshots
+# ---------------------------------------------------------------------------
+# Runtime controls (POST /_ephpm/kv/snapshot save, POST /_ephpm/kv/snapshot/load)
+# change state, so they need [server.diagnostics] token (or an mTLS metrics
+# listener) on EVERY node, single-site included — fail closed. The read-only
+# GET status keeps the lighter gate. All three move to [server.metrics] listen
+# when that is set.
+#
+# [server.diagnostics]
+# token = "change-me-diagnostics-bearer"
+#
+# CLI (reads/writes the files directly; no running server needed for inspect):
+#   ephpm kv snapshot inspect <file>     # header + per-site counts
+#   ephpm kv snapshot verify  <file>     # decrypt + integrity check (needs [kv] secret)
+#   ephpm kv snapshot save -c ephpm.toml # ask the running server to write one now
+#   ephpm kv snapshot load -c ephpm.toml # roll live keys back to the snapshot
+#   ephpm kv snapshot status -c ephpm.toml
