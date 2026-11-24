@@ -1167,6 +1167,13 @@ disable_shell_exec = true
 [php]
 max_execution_time = 30
 memory_limit = "128M"
+# The single-site docroot scripts (sqlite_test.php, rw_split_test.php, ...)
+# read the embedded wire listener via getenv('DB_HOST')/getenv('DB_PORT'),
+# which the fixture exports into this node's process environment (single-site
+# [db.sqlite] injects nothing itself). Since the environment scrub (finding F1)
+# defaults on and its default allowlist is PATH/TZ/LANG/LC_*, those two keys
+# must be allowlisted here or the scripts fall back to the stock host/port.
+env_allowlist = ["PATH", "TZ", "LANG", "LC_*", "DB_HOST", "DB_PORT"]
 ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],{INI_OVERRIDES_EXTRA}

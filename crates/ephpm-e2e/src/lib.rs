@@ -1339,6 +1339,9 @@ enabled = true
 [php]
 max_execution_time = 30
 memory_limit = "128M"
+# Keep the DB wire coordinates visible to the docroot scripts' getenv()
+# after the environment scrub (finding F1; default allowlist is PATH/TZ/LANG/LC_*).
+env_allowlist = ["PATH", "TZ", "LANG", "LC_*", "DB_HOST", "DB_PORT"]
 
 [db.sqlite]
 path = "{DATA_DIR}/ephpm-fixture.db"
