@@ -8,17 +8,29 @@
 //!
 //! The sibling [`turso_cdc`](super) suite already covers a **hard-kill** failover
 //! (SIGKILL the primary) observed over litewire's **Hrana** HTTP API, keyed on
-//! the `ephpm_cdc_subscribers` metric. This suite is deliberately a different
-//! axis:
+//! the `ephpm_cdc_subscribers` metric. This suite holds two MySQL-wire scenarios
+//! on a different axis:
 //!
-//! - **Graceful drain, not a crash.** The primary is stopped with SIGTERM
-//!   ([`ClusterFixture::stop_node`] → `terminate`), which runs ephpm's graceful
-//!   shutdown — and on a whole-database clustered primary that runs the CDC
-//!   drain gate (`drain_whole_db_primary` in `ephpm-server/src/turso_cdc.rs`),
-//!   which waits for every attached replica to apply the CDC head before the
-//!   cluster channel closes. That gate is the thing under test: without it, a
-//!   replica promoted after the primary drained would lose the shipped-but-not-
-//!   yet-applied tail.
+//! - **Graceful drain, not a crash**
+//!   ([`graceful_primary_drain_promotes_a_replica_without_data_loss`]). The
+//!   primary is stopped with SIGTERM ([`ClusterFixture::stop_node`] →
+//!   `terminate`), which runs ephpm's graceful shutdown — and on a
+//!   whole-database clustered primary that runs the CDC drain gate
+//!   (`drain_whole_db_primary` in `ephpm-server/src/turso_cdc.rs`), which waits
+//!   for every attached replica to apply the CDC head before the cluster channel
+//!   closes. That gate is the thing under test: without it, a replica promoted
+//!   after the primary drained would lose the shipped-but-not-yet-applied tail.
+//! - **Abrupt kill, not a drain**
+//!   ([`hard_kill_primary_promotes_a_replica_without_corrupting_replicated_data`]).
+//!   The primary is SIGKILLed ([`ClusterFixture::kill_node`]) with **no**
+//!   graceful shutdown, so the drain gate never runs. This is the case the
+//!   promotion-side crash-safety gate (`turso_cdc::await_promotion_settle`, #706)
+//!   covers: the newly-elected primary must not advertise itself writable until
+//!   its own apply pipeline has quiesced, so the data that *had* already
+//!   replicated is intact and a fresh write lands cleanly on top of a settled
+//!   state. (A tail that only the dead primary held is lost — that is the
+//!   by-design cost of an abrupt kill, which this test does not contradict: it
+//!   writes, then waits for replication to **every** survivor before the kill.)
 //! - **The MySQL wire path, not Hrana.** Data is written and read through each
 //!   node's `[db.sqlite.proxy] mysql_listen` listener with a real MySQL client
 //!   (`mysql_async`) — the same surface production PHP's `pdo_mysql` uses. In
@@ -223,6 +235,149 @@ async fn graceful_primary_drain_promotes_a_replica_without_data_loss() {
     // needs an offline `ephpm db restore --reseed` on a stopped node, a restart,
     // and a convergence assertion — a second topology lifecycle whose timing
     // variance is best isolated in its own test rather than bolted onto this one.
+}
+
+/// Abrupt-kill (SIGKILL) failover — the promotion-side crash-safety gate (#706).
+///
+/// The drain gate cannot cover a crash: SIGKILL runs none of ephpm's shutdown.
+/// What this proves is the *promotion* side. We write, then wait for the rows to
+/// replicate to **every** survivor, then SIGKILL the primary. A survivor is
+/// auto-promoted; the promotion gate holds it non-writable (`/_ephpm/primary`
+/// non-200) until its apply pipeline has quiesced. Once promoted we assert:
+///
+/// 1. every already-replicated row is intact on every survivor (the crash did
+///    not corrupt or lose data that had replicated), and
+/// 2. a fresh write to the new primary commits and replicates to the other
+///    survivor — i.e. the promoted node accepts writes cleanly on top of a
+///    settled state, rather than on a tail it was still applying.
+///
+/// This deliberately does **not** assert recovery of a tail that only the dead
+/// primary held: that loss is the documented cost of an abrupt kill.
+#[tokio::test(flavor = "multi_thread")]
+async fn hard_kill_primary_promotes_a_replica_without_corrupting_replicated_data() {
+    if cfg!(windows) {
+        eprintln!(
+            "SKIP cluster_failover (hard kill): clustered Turso is Linux/macOS + experimental \
+             and not validated on Windows (CLAUDE.md). Run this on Linux/macOS in the lab."
+        );
+        return;
+    }
+    let Some(binary) = ephpm_binary_env() else {
+        eprintln!(
+            "SKIP cluster_failover (hard kill): EPHPM_BINARY is unset. Set \
+             EPHPM_CLUSTER_FAILOVER=1 and EPHPM_BINARY=… to run."
+        );
+        return;
+    };
+    if std::env::var_os("EPHPM_CLUSTER_FAILOVER").is_none() {
+        eprintln!(
+            "SKIP cluster_failover (hard kill): timing-sensitive failover test is opt-in — set \
+             EPHPM_CLUSTER_FAILOVER=1 to run (the gating E2E leg deliberately does not)."
+        );
+        return;
+    }
+
+    let docroot = resolve_docroot();
+    assert!(
+        docroot.join("index.php").is_file(),
+        "docroot {} has no index.php — set EPHPM_DOCROOT to a docroot that serves PHP",
+        docroot.display()
+    );
+
+    // ── 1. Spawn a 3-node whole-database clustered cluster ──────────────────
+    let mut fixture = ClusterFixture::start(&binary, &docroot, CLUSTER_SIZE)
+        .await
+        .unwrap_or_else(|e| panic!("failed to start {CLUSTER_SIZE}-node cluster fixture: {e:#}"));
+    let base_urls: Vec<String> = fixture.base_urls().iter().map(|s| (*s).to_string()).collect();
+    let mysql_addrs: Vec<String> = fixture.mysql_addrs().iter().map(|s| (*s).to_string()).collect();
+
+    // ── 2. Find the elected primary ─────────────────────────────────────────
+    let all_nodes: Vec<usize> = (0..CLUSTER_SIZE).collect();
+    let primary = wait_for_sole_primary(&base_urls, &all_nodes, ELECTION_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("no sole primary elected: {e}\n{}", all_stderr(&fixture)));
+    eprintln!("[hardkill-e2e] elected primary: node {primary} ({})", base_urls[primary]);
+
+    // ── 3. Write data on the primary ────────────────────────────────────────
+    let primary_addr = mysql_addrs[primary].clone();
+    mysql_exec(&primary_addr, "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap_or_else(|e| {
+            panic!("CREATE TABLE on primary node {primary} failed: {e}\n{}", fixture.stderr_tail(primary, 40))
+        });
+    for (id, v) in ROWS {
+        mysql_exec(&primary_addr, &format!("INSERT INTO t (id, v) VALUES ({id}, '{v}')"))
+            .await
+            .unwrap_or_else(|e| panic!("INSERT ({id},{v}) on primary node {primary} failed: {e}"));
+    }
+    eprintln!("[hardkill-e2e] wrote {} rows on the primary", ROWS.len());
+
+    // ── 4. Wait for the rows to replicate to EVERY survivor ─────────────────
+    // Crucial: the data must be on both replicas BEFORE the kill, so the test
+    // asserts "no corruption of replicated data", never "recovery of a tail only
+    // the dead node held" (which an abrupt kill legitimately loses).
+    let survivors: Vec<usize> = (0..CLUSTER_SIZE).filter(|&i| i != primary).collect();
+    for &s in &survivors {
+        wait_for_row_count(&mysql_addrs[s], ROWS.len() as i64, REPLICATION_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "replica node {s} never saw {} replicated rows before the kill: {e}\n{}",
+                    ROWS.len(),
+                    fixture.stderr_tail(s, 40)
+                )
+            });
+    }
+    eprintln!("[hardkill-e2e] all {} rows replicated to every survivor", ROWS.len());
+
+    // ── 5. SIGKILL the primary (no graceful shutdown; the drain gate is skipped)
+    eprintln!("[hardkill-e2e] SIGKILLing primary node {primary}");
+    fixture.kill_node(primary);
+
+    // ── 6. A survivor is promoted ────────────────────────────────────────────
+    let new_primary =
+        wait_for_sole_primary(&base_urls, &survivors, REELECTION_TIMEOUT).await.unwrap_or_else(
+            |e| panic!("no survivor was promoted after the kill: {e}\n{}", all_stderr(&fixture)),
+        );
+    assert_ne!(new_primary, primary, "the killed primary cannot be re-elected");
+    eprintln!("[hardkill-e2e] promoted new primary: node {new_primary} ({})", base_urls[new_primary]);
+
+    // ── 7. Replicated data is intact on every survivor ──────────────────────
+    let want: Vec<String> = ROWS.iter().map(|(_, v)| (*v).to_string()).collect();
+    for &s in &survivors {
+        let got = mysql_query_strings(&mysql_addrs[s], "SELECT v FROM t ORDER BY id")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("SELECT on survivor node {s} failed: {e}\n{}", fixture.stderr_tail(s, 40))
+            });
+        assert_eq!(
+            got, want,
+            "replicated data corrupted/lost after hard kill → promote: survivor node {s} has \
+             {got:?}, expected {want:?}"
+        );
+    }
+
+    // ── 8. The promoted primary accepts a fresh write that replicates ────────
+    // The crux of the promotion gate: once the new primary advertises writable,
+    // a write must land on a settled state and ship to the other survivor.
+    mysql_exec(&mysql_addrs[new_primary], "INSERT INTO t (id, v) VALUES (4, 'delta')")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "post-promotion INSERT on new primary node {new_primary} failed: {e}\n{}",
+                fixture.stderr_tail(new_primary, 40)
+            )
+        });
+    let other = survivors.iter().copied().find(|&s| s != new_primary).expect("a second survivor");
+    wait_for_row_count(&mysql_addrs[other], (ROWS.len() + 1) as i64, REPLICATION_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "post-promotion write never replicated to survivor node {other}: {e}\n{}",
+                fixture.stderr_tail(other, 40)
+            )
+        });
+    eprintln!("[hardkill-e2e] post-promotion write replicated to node {other}; promotion is clean");
 }
 
 // ── docroot ─────────────────────────────────────────────────────────────────
