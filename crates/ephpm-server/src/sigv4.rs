@@ -41,12 +41,49 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// Process-global cache for [`Credentials::from_env`], populated once at
+/// server startup by [`cache_credentials_from_env`].
+///
+/// It exists because the environment scrub (multi-tenant breakout audit
+/// finding **F1**) removes `AWS_*` from the live environment before PHP starts,
+/// and the S3 KV-snapshot store / DB-backup store read their credentials
+/// *lazily* — long after the scrub — the first time an upload runs. Caching the
+/// read at startup (before the scrub) lets the scrub drop `AWS_*` from PHP's
+/// view without breaking S3. The cache is only populated on the real server
+/// startup path; code paths (and tests) that never call
+/// [`cache_credentials_from_env`] keep reading the live environment.
+static CACHED_CREDENTIALS: std::sync::OnceLock<Option<Credentials>> = std::sync::OnceLock::new();
+
+/// Read `AWS_*` from the environment once and cache the result, so later
+/// [`Credentials::from_env`] calls survive the environment scrub (finding F1).
+///
+/// Idempotent: the first call wins and a second is a no-op (the scrub only
+/// runs once at startup). Call on the single-threaded startup path, **before**
+/// the environment is scrubbed and before any worker thread exists.
+pub fn cache_credentials_from_env() {
+    let _ = CACHED_CREDENTIALS.set(Credentials::read_env());
+}
+
 impl Credentials {
-    /// Read the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
-    /// `AWS_SESSION_TOKEN` variables. `None` when either key is unset or
-    /// empty.
+    /// The static credentials for signing, from the startup cache when it was
+    /// populated ([`cache_credentials_from_env`]) and otherwise from the live
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+    /// variables. `None` when either key is unset or empty.
+    ///
+    /// Reading the cache is what lets the server drop `AWS_*` from the
+    /// environment PHP can see (finding F1) without breaking a later S3 upload.
     #[must_use]
     pub fn from_env() -> Option<Self> {
+        if let Some(cached) = CACHED_CREDENTIALS.get() {
+            return cached.clone();
+        }
+        Self::read_env()
+    }
+
+    /// Read the standard `AWS_*` variables directly from the live environment,
+    /// bypassing the startup cache. `None` when either key is unset or empty.
+    #[must_use]
+    fn read_env() -> Option<Self> {
         let access_key_id =
             std::env::var("AWS_ACCESS_KEY_ID").ok().filter(|s| !s.trim().is_empty())?;
         let secret_access_key =

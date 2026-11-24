@@ -63,7 +63,7 @@ site_overrides_dir = "/var/lib/ephpm/site-overrides"   # NOT inside sites_dir
 document_root = "public"    # relative to the site container
 ```
 
-The file understands `document_root` here, [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below, and the [`[preview_auth]`](#preview_auth-the-access-gate) section that turns the preview access gate on for one vhost. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
+The file understands `document_root` here, [`auto_prepend_file`](#per-site-auto_prepend_file-bootstrap-one-site-before-every-request) below, the [`[env]`](#env-per-site-environment-the-container-model) table of per-site environment variables, and the [`[preview_auth]`](#preview_auth-the-access-gate) section that turns the preview access gate on for one vhost. A key ePHPm does not know is ignored with a warning; a key it knows with a value it cannot honour takes that site out of service. See [Failure modes](#failure-modes-a-broken-override-takes-the-site-out-of-service).
 
 ```
 /var/www/sites/alice-blog.com/     ← the site CONTAINER
@@ -126,6 +126,7 @@ That is the opposite of what earlier versions did, and the reason is worth stati
 | `document_root` is a symlink resolving outside the container | **503** |
 | `auto_prepend_file` names a path outside the container, a directory, or a missing file | **503** |
 | `auto_prepend_file` set while `[php] mode = "worker"` | Key ignored with a `WARN`; the site still serves (see below) |
+| `[env]` has a non-string value, an empty name, or a name ePHPm injects (`DB_*`, `WS_*`, `EPHPM_*`, `DATABASE_URL`) | **503** |
 | Override contains keys this ePHPm version doesn't know | Ignored — with a `WARN` naming the file, the site, every unrecognised key, and a "did you mean" hint. Recognised keys still apply |
 
 Row two remains the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing entirely**, which ePHPm cannot distinguish from a site that has none. Only a file that *exists* and is broken produces a 503. Startup names both cases: `grep` the boot log for `per-site document root overrides applied` and for `per-site overrides that cannot be honoured`.
@@ -219,6 +220,24 @@ repo           = "acme/web"                           # per-preview authz target
 - **Fail-closed.** A missing/short/unresolvable `session_secret`, or a missing `login_url`, takes the one preview **out of service (503)** rather than serving it ungated — the same narrowing rule `document_root` follows. Unknown keys inside the section are tolerated (reported), so a newer provisioning daemon can add one without a fleet outage.
 - **Reachability.** The router routes the `/_ephpm/auth/` sub-namespace to the middleware chain, so `github-auth`'s default endpoints work: login at `/_ephpm/auth/github/login`, callback at `/_ephpm/auth/github/callback` (the URL to register in the GitHub OAuth App). The gate never runs on `/_ephpm/auth/`, so no `exempt_paths` entry is needed for the defaults.
 - **Share links.** A `via:"share"` capability token (short `exp`, per-`jti` KV revocation, per-site epoch) admits a stakeholder who lacks repo access, as the cookie or `?ephpm_share=<token>`. It is a **bearer capability** — see the [roadmap page](/roadmap/preview-access-gate/) for the threat model, revocation, and the switchboard contract.
+
+### `[env]`: per-site environment (the container model)
+
+Because the process environment is [scrubbed before PHP starts](/guides/multi-tenant-hardening/#environment-scrubbing-finding-f1), a tenant sees none of the operator's environment. The `[env]` table is how you give one vhost back the variables *its* app needs — the per-site half of a container's environment model: the host environment is hidden, and each tenant gets only what its operator declared.
+
+```toml
+# <site_overrides_dir>/<site-key>.toml   (operator-owned)
+document_root = "public"
+
+[env]
+APP_ENV   = "production"
+APP_DEBUG = "false"
+FEATURE_X = "1"
+```
+
+- **Injected per request, into that vhost's `$_SERVER` only** — thread-local, exactly like the `DB_*` credentials ePHPm already injects. It is **never** written into the process `environ`, so one tenant's declared env is invisible to another tenant's PHP (and to `getenv()` process-wide). Read it as `$_SERVER['APP_ENV']`; the same `$_SERVER`-first pattern the `DB_*` variables use (see [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
+- **Values must be strings.** A non-string value, an empty name, or a name ePHPm injects itself (`DB_*`, `WS_*`, `EPHPM_*`, `DATABASE_URL`) takes the one site out of service (503) — a key ePHPm understood and could not honour, the same fail-closed rule `document_root` follows.
+- **Operator-owned, not tenant-owned.** Like the rest of this file it lives outside `sites_dir`; a tenant cannot write it. It is still the right place for a secret an app reads from `$_SERVER` — unlike the (scrubbed) process environment, it never leaks to another tenant.
 
 ### Other per-site configuration
 

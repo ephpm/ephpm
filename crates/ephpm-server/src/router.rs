@@ -323,6 +323,13 @@ pub(crate) struct SiteRoots {
     /// per request — the compiled regexes sit behind the `RewriteSet`'s `Vec`,
     /// and an empty set clones nothing.
     pub(crate) rewrites: ephpm_config::RewriteSet,
+    /// This vhost's declared environment (`[env]` in its override file), as
+    /// `(name, value)` pairs, from [`crate::site_overrides::SiteOverride::env`].
+    /// Injected into this vhost's `$_SERVER` per request, thread-local — never
+    /// into the process `environ` (multi-tenant breakout audit finding **F1**,
+    /// half b). Empty for the overwhelming majority of sites, so the per-request
+    /// clone allocates nothing new.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl SiteRoots {
@@ -339,6 +346,7 @@ impl SiteRoots {
             preview_gate_repo: None,
             unknown_keys: Vec::new(),
             rewrites: ephpm_config::RewriteSet::default(),
+            env: Vec::new(),
         }
     }
 
@@ -1160,6 +1168,7 @@ fn resolve_site_roots(
         preview_gate_repo: over.preview_gate_repo,
         unknown_keys: over.unknown_keys,
         rewrites,
+        env: over.env,
     }
 }
 
@@ -4105,6 +4114,9 @@ impl Router {
             // resolution, not here — by the time a request reaches `handle_php`
             // the path/query already reflect any match (see the `rewrite` arg).
             rewrites: _,
+            // This vhost's operator-declared environment, injected into its
+            // own request's `$_SERVER` below (finding F1, half b).
+            env: site_env,
         } = roots;
         // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
         // default under `[server] preview`). Enforced HERE — the single point
@@ -4553,9 +4565,18 @@ impl Router {
         // functions from the function table; runtime ini changes don't
         // re-disable them). Wiring lives in `crates/ephpm/src/main.rs`.
 
+        // Per-site declared environment (finding F1, half b). Injected FIRST so
+        // that if a declaration ever named a key ePHPm also injects, ePHPm's own
+        // value (pushed below) wins under `php_register_variable`'s last-wins
+        // rule — belt-and-braces, since `site_overrides::resolve_env` already
+        // rejects the reserved DB_*/WS_*/EPHPM_*/DATABASE_URL names. These reach
+        // the tenant's `$_SERVER` per request and thread-local, never the
+        // process `environ`, so one tenant's declared env is invisible to
+        // another's PHP.
+        let mut env_vars: Vec<(String, String)> = site_env;
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.
-        let mut env_vars = self.build_kv_env_vars(kv_site_key.as_deref());
+        env_vars.extend(self.build_kv_env_vars(kv_site_key.as_deref()));
         env_vars.extend_from_slice(&self.db_env_vars);
         // Per-site DB credentials, when the multi-tenant wire listener is up.
         // Reuses the site key already derived for the bridge, so `pdo_mysql`
@@ -14728,6 +14749,34 @@ echo "post response";
             "the container must stay the vhost directory — it is the open_basedir boundary"
         );
         assert_eq!(resolved.key.as_deref(), Some("laravel.test"));
+    }
+
+    /// Per-site `[env]` (finding F1, half b): each vhost's declared environment
+    /// is carried onto its own `SiteRoots`, and one site never sees another's.
+    /// This is the resolution half of the guarantee; `handle_php` then injects
+    /// `roots.env` into that request's `$_SERVER` (and nothing else sees it).
+    #[test]
+    fn site_override_env_is_per_site_and_isolated() {
+        let f = fleet();
+        f.site("a.test", &["web"]);
+        f.site("b.test", &["web"]);
+        f.override_for("a.test", "[env]\nAPP_ENV = \"site-a\"\nA_ONLY = \"1\"\n");
+        f.override_for("b.test", "[env]\nAPP_ENV = \"site-b\"\n");
+
+        let router = f.router();
+        let a = router.resolve_site("a.test").roots.env;
+        let b = router.resolve_site("b.test").roots.env;
+
+        // Sorted by name: `APP_ENV` < `A_ONLY` ('P' < '_').
+        assert_eq!(
+            a,
+            [("APP_ENV", "site-a"), ("A_ONLY", "1")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .to_vec()
+        );
+        // Site B sees only its own value, never site A's `A_ONLY`.
+        assert_eq!(b, [("APP_ENV".to_string(), "site-b".to_string())].to_vec());
+        assert!(!b.iter().any(|(k, _)| k == "A_ONLY"), "site B must not see site A's env");
     }
 
     /// THE invariant: `open_basedir` follows the container, so PHP served from

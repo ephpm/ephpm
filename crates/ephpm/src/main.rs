@@ -45,6 +45,7 @@ mod db_query;
 mod db_restore;
 mod db_shell;
 mod dev_xdebug;
+mod env_scrub;
 mod exec_sandbox;
 mod ext_ini;
 mod fatal_signal;
@@ -2791,6 +2792,37 @@ fn run_with_config(
                 var.name
             ),
         }
+    }
+
+    // Scrub the process environment before PHP can read it (multi-tenant
+    // breakout audit finding F1). Runs here — on the single-threaded startup
+    // path, after figment has read the `EPHPM_*` config and the unmapped-var
+    // warning has inspected the original environment, and BEFORE
+    // `php_embed_init()` and any PHP pool thread exists, so mutating `environ`
+    // is race-free and PHP's `getenv()` / `$_ENV` / `phpinfo()` are clean at
+    // the source. `AWS_*` are cached just before, so a later S3 upload still
+    // finds them. See `env_scrub`.
+    if config.php.scrub_environment {
+        ephpm_server::cache_aws_credentials();
+        // Keep both kinds of `env:NAME` reference the config consumes lazily,
+        // after the scrub: middleware-mount references (`env_refs`) and the
+        // per-site override files' `[preview_auth] session_secret` (resolved at
+        // request time) — scrubbing either would break middleware / previews.
+        let mut keep_env_refs = env_refs.clone();
+        if let Some(dir) = config.server.effective_site_overrides_dir() {
+            keep_env_refs.extend(ephpm_server::scan_site_env_references(dir));
+        }
+        let report =
+            env_scrub::scrub_process_environment(&config.php.env_allowlist, &keep_env_refs);
+        report.log();
+    } else {
+        // Only reachable in single-site mode: `Config::validate` refuses
+        // `scrub_environment = false` under `[server] sites_dir`.
+        tracing::warn!(
+            "[php] scrub_environment = false — the full process environment is visible to PHP \
+             via getenv()/$_ENV/phpinfo(). Safe only in a single-tenant deployment you trust; \
+             prefer leaving the scrub on and naming what the app needs in [php] env_allowlist."
+        );
     }
 
     // Build the effective PHP ini file. If the user specified ini_overrides

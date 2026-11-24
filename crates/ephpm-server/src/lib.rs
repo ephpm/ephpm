@@ -100,6 +100,19 @@ const CLUSTER_RATELIMIT_WARNING: &str = "[middleware] ratelimit mounted with [cl
      spread across N nodes. See \
      https://ephpm.dev/reference/middleware/ratelimit/#in-a-cluster for details.";
 
+/// Cache the process's `AWS_*` credentials before the environment scrub
+/// removes them (multi-tenant breakout audit finding **F1**).
+///
+/// The S3 KV-snapshot store and the S3 DB-backup store read their credentials
+/// lazily, long after the CLI scrubs the environment ahead of `php_embed_init()`.
+/// This hoists that read to startup so the scrub can drop `AWS_*` from the
+/// environment PHP sees without breaking a later upload. Idempotent; call once,
+/// on the single-threaded startup path, immediately before the scrub. A no-op
+/// when the server never uses S3 (no credentials to cache).
+pub fn cache_aws_credentials() {
+    sigv4::cache_credentials_from_env();
+}
+
 /// Start the HTTP server with the given configuration.
 ///
 /// `dev_mode` is `true` under `ephpm dev` / bare `ephpm` and `false` under
@@ -2990,6 +3003,20 @@ pub fn scan_site_capabilities(
     overrides_dir: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
     site_overrides::scan_capabilities(overrides_dir)
+}
+
+/// Collect the `env:NAME` environment-variable references across every per-site
+/// override file in `overrides_dir`, so the startup environment scrub (finding
+/// F1) keeps those names available for the fields that resolve them lazily at
+/// request time (today only `[preview_auth] session_secret`).
+///
+/// Best-effort and never fatal — see
+/// [`site_overrides::scan_env_references`]. Returns the bare names (`env:`
+/// stripped), sorted and de-duplicated; empty when the directory is absent or
+/// nothing uses an `env:` reference.
+#[must_use]
+pub fn scan_site_env_references(overrides_dir: &std::path::Path) -> Vec<String> {
+    site_overrides::scan_env_references(overrides_dir)
 }
 
 /// Build the per-site database registry and register it with the PHP bridge,

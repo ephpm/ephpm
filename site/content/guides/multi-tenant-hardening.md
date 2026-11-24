@@ -310,6 +310,57 @@ This is **experimental and Linux-only**, off by default. See
 deployment requirements (kernel ≥ 5.10 + BTF, `CAP_BPF`/`CAP_NET_ADMIN`,
 `LimitMEMLOCK=infinity`, and the nftables loopback handoff).
 
+### 10. Environment scrubbing (finding F1)
+
+A PHP request reads the **process environment** through `getenv()` (including
+the no-argument form that dumps everything), the `$_ENV` superglobal and
+`phpinfo()` — all three read libc's `environ` directly. In a multi-tenant
+process that environment is a shared surface: it holds `[kv] secret` and
+`[cluster] secret` (passed as `EPHPM_KV__SECRET` / `EPHPM_CLUSTER__SECRET`),
+`AWS_*` credentials, and any other secret the operator exported. Left intact,
+any tenant's PHP could read them — and because every tenant's database and KV
+password is `HMAC(secret, site_key)`, reading `[kv] secret` lets one tenant mint
+**every** other tenant's credential. That is a full cross-tenant breakout, and
+it is what this layer closes.
+
+ePHPm scrubs the environment once, on the single-threaded startup path, **before
+`php_embed_init()` and before any PHP pool thread exists**, so every variable
+not on the allowlist is gone before any tenant code — or `phpinfo()` — can read
+it. It is on by default (`[php] scrub_environment = true`) and **cannot be
+disabled under `[server] sites_dir`**: `false` there is a startup error.
+
+```toml
+[php]
+# on by default; mandatory in multi-tenant mode
+scrub_environment = true
+# the four safe families kept by default; widen to the exact non-secret
+# variables an app legitimately reads, never a secret
+env_allowlist = ["PATH", "TZ", "LANG", "LC_*"]
+```
+
+What survives the scrub: the `env_allowlist` names (default `PATH`, `TZ`,
+`LANG`, `LC_*`), ePHPm's own operational variables (the PHP-pool dispatch
+tuning, `EPHPM_MIDDLEWARE_DIR`, `OTEL_*`, the Rust/tokio runtime vars), and any
+middleware `env:NAME` reference the config consumes. Secrets ePHPm itself needs
+are captured *before* the scrub — figment has already read the `EPHPM_*` config
+into memory, and `AWS_*` are cached into a process-global — so the scrub never
+breaks the server.
+
+This mirrors what `ephpm exec` already does for the children it spawns
+(`env_clear` + a fixed allowlist), applied here to the server's own process.
+The net model is a container's: **the host environment is hidden, and each
+tenant gets only what its operator declared** — which it declares per-vhost via
+the [`[env]`](/guides/virtual-hosts/#env-per-site-environment-the-container-model)
+table in the site's override file, injected into that tenant's `$_SERVER`
+per request (never into the process `environ`).
+
+**Residual:** a secret an operator *chooses* to pass to a `[[middleware]]` mount
+via an `env:NAME` reference stays in the environment (ePHPm resolves it lazily,
+after the scrub, when the module is built), so it remains readable by that
+node's PHP. Prefer a `file:/abs/path` indirection for those secrets — the
+`preview-gate` and `github-auth` `session_secret` both accept it — so the
+literal never sits in the environment at all.
+
 ## Turning it on
 
 The layers divide into two groups, and it matters which is which:

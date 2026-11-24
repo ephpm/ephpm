@@ -103,7 +103,7 @@ use std::path::{Component, Path, PathBuf};
 /// step with [`RawOverride`]'s fields — pinned by
 /// [`tests::known_keys_matches_the_parsed_schema`].
 const KNOWN_KEYS: &[&str] =
-    &["document_root", "auto_prepend_file", "preview_auth", "security", "rewrite"];
+    &["document_root", "auto_prepend_file", "preview_auth", "security", "rewrite", "env"];
 
 /// Shortest accepted preview-gate `session_secret`, in bytes.
 ///
@@ -223,6 +223,19 @@ pub(crate) struct SiteOverride {
     /// [`crate::router::resolve_site_roots`] compiles them, failing the one
     /// site closed (503) on a bad regex or an escaping `to`.
     pub(crate) rewrites: Vec<ephpm_config::RewriteRule>,
+    /// This site's declared environment (`[env]` in the override file), as
+    /// `(name, value)` pairs sorted by name. Injected into **this** vhost's
+    /// `$_SERVER` per request, thread-local — never into the process `environ`
+    /// (multi-tenant breakout audit finding **F1**, half b).
+    ///
+    /// This is the tenant's slice of a container-style environment: once the
+    /// process environment is scrubbed, a tenant sees only the variables its
+    /// operator declared here, and only in its own requests. Empty for a site
+    /// that declares no `[env]` table (the overwhelming majority), so the
+    /// per-request clone allocates nothing new. Sorted so an unchanged file
+    /// compares equal across a `SITE_CONFIG_TTL` re-read (this struct is
+    /// `PartialEq`).
+    pub(crate) env: Vec<(String, String)>,
 }
 
 /// The override file's schema.
@@ -245,6 +258,12 @@ struct RawOverride {
     /// parse error that fails the file closed, like every other understood key.
     #[serde(default)]
     rewrite: Vec<ephpm_config::RewriteRule>,
+    /// Per-site declared environment. A TOML table of string → string that
+    /// ePHPm injects into this vhost's `$_SERVER` per request (never into the
+    /// process `environ`). Values must be strings; a non-string value is a TOML
+    /// type error that fails the file closed like any other understood key.
+    #[serde(default)]
+    env: Option<std::collections::BTreeMap<String, toml::Value>>,
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -552,6 +571,20 @@ pub(crate) fn load(
         None => (None, None),
     };
 
+    // Per-site declared environment (half b of finding F1). A key this binary
+    // understands whose value it cannot honour — a non-string value, an empty
+    // name, or a name ePHPm reserves for its own injected `$_SERVER` keys —
+    // fails the one site closed, exactly like a broken `document_root`. An
+    // operator who wrote `[env]` expects those variables injected; serving the
+    // tenant without them is the silent-wrong-answer failure (#463).
+    let env = match &raw.env {
+        Some(map) => match resolve_env(map) {
+            Ok(pairs) => pairs,
+            Err(reason) => return unusable(reason, &"[env]"),
+        },
+        None => Vec::new(),
+    };
+
     SiteOverride {
         document_root,
         auto_prepend_file,
@@ -563,7 +596,59 @@ pub(crate) fn load(
         // `resolve_site_roots`. A typo'd key inside a `[[rewrite]]` was already
         // a TOML parse error above (the rule struct is strict).
         rewrites: raw.rewrite,
+        env,
     }
+}
+
+/// Names ePHPm injects into a tenant's `$_SERVER` itself (per-site DB
+/// credentials, KV/RESP auth, node identity, WebSocket lifecycle). A per-site
+/// `[env]` declaration may not shadow these — the operator's `[env]` is for the
+/// tenant's *own* variables, and letting it collide with ePHPm's injected
+/// credentials would be confusing at best (ePHPm injects these later, so they
+/// already win) and a footgun at worst. Rejected by name or by `DB_`/`WS_`
+/// prefix; reusing the same reserved list keeps the rule stable as the injected
+/// set grows.
+fn env_name_is_reserved(name: &str) -> bool {
+    name.starts_with("DB_")
+        || name.starts_with("WS_")
+        || name.starts_with("EPHPM_")
+        || name == "DATABASE_URL"
+}
+
+/// Validate and normalise a per-site `[env]` table into sorted `(name, value)`
+/// pairs. Every value must be a string; the name must be non-empty, free of
+/// `=` and NUL (so it is a legal environment-variable name and a legal
+/// `$_SERVER` key), and must not collide with a name ePHPm injects itself (see
+/// [`env_name_is_reserved`]). Any violation is a fail-closed `&'static str`
+/// reason for [`SiteOverride::unusable`].
+fn resolve_env(
+    map: &std::collections::BTreeMap<String, toml::Value>,
+) -> Result<Vec<(String, String)>, &'static str> {
+    let mut pairs = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        if name.is_empty() {
+            return Err("[env] contains an empty variable name");
+        }
+        if name.contains('=') || name.contains('\0') {
+            return Err("[env] variable name contains `=` or a NUL byte");
+        }
+        if env_name_is_reserved(name) {
+            return Err(
+                "[env] may not set a name ePHPm injects itself (DB_*, WS_*, EPHPM_*, DATABASE_URL)",
+            );
+        }
+        let toml::Value::String(s) = value else {
+            return Err("[env] values must be strings");
+        };
+        if s.contains('\0') {
+            return Err("[env] value contains a NUL byte");
+        }
+        pairs.push((name.clone(), s.clone()));
+    }
+    // BTreeMap already iterates sorted by key, so `pairs` is sorted; keep the
+    // sort explicit so the invariant survives a future map-type change.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pairs)
 }
 
 /// Turn a `[preview_auth]` section into the JSON config the
@@ -758,6 +843,57 @@ pub(crate) fn scan_capabilities(
     }
 
     Ok(map)
+}
+
+/// Collect the `env:NAME` environment-variable references across every override
+/// file in `overrides_dir`, so the startup environment scrub (finding F1) keeps
+/// those names available for the fields that resolve them lazily, after the
+/// scrub, at request time.
+///
+/// The only override field that follows an `env:` indirection is
+/// `[preview_auth] session_secret` (resolved by [`resolve_secret`] on each
+/// `SITE_CONFIG_TTL` re-read via `std::env::var`). Scrubbing that variable would
+/// take every gated preview out of service (503), so its name must survive —
+/// exactly as the middleware `env:` references from [`ephpm_config::Config::env_references`]
+/// do for globally-mounted modules.
+///
+/// Best-effort and never fatal: an unreadable file, invalid TOML, or a stem
+/// that is not a valid site key contributes nothing (that file already fails
+/// its own site closed at request time). Returns the bare variable names
+/// (`env:` prefix stripped), de-duplicated and sorted. An empty vec when the
+/// directory is absent or no file uses an `env:` reference.
+#[must_use]
+pub(crate) fn scan_env_references(overrides_dir: &Path) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(overrides_dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !crate::router::is_valid_site_key(stem) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(raw) = toml::from_str::<RawOverride>(&text) else {
+            continue;
+        };
+        if let Some(pa) = &raw.preview_auth
+            && let Some(secret) = pa.session_secret.as_deref().map(str::trim)
+            && let Some(var) = secret.strip_prefix("env:")
+            && !var.is_empty()
+        {
+            names.insert(var.to_string());
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Validate a `[preview_auth] repo` value as `owner/name`.
@@ -1684,6 +1820,8 @@ mod tests {
                 "security" => format!("[{key}]\ncapabilities = []\n"),
                 // An array-of-tables, with both of the rule's required keys.
                 "rewrite" => format!("[[{key}]]\nregex = \"^/x$\"\nto = \"/x.php\"\n"),
+                // A TOML table of string values, so nothing lands in `unknown`.
+                "env" => format!("[{key}]\nAPP_ENV = \"production\"\n"),
                 _ => format!("{key} = \"x\"\n"),
             };
             let raw: RawOverride = toml::from_str(&toml).unwrap();
@@ -1695,6 +1833,84 @@ mod tests {
         // And nothing outside the list parses as typed.
         let raw: RawOverride = toml::from_str("some_future_key = \"x\"\n").unwrap();
         assert_eq!(raw.unknown.len(), 1);
+    }
+
+    // ── [env] — per-site declared environment (finding F1, half b) ────────
+
+    /// A valid `[env]` table resolves to sorted `(name, value)` pairs and does
+    /// not make the site unusable.
+    #[test]
+    fn per_site_env_resolves_sorted_pairs() {
+        let f = fixture();
+        f.write("[env]\nZEBRA = \"z\"\nAPP_ENV = \"production\"\nFEATURE_X = \"1\"\n");
+        let over = f.load();
+        assert_eq!(over.unusable, None);
+        assert_eq!(
+            over.env,
+            vec![
+                ("APP_ENV".to_string(), "production".to_string()),
+                ("FEATURE_X".to_string(), "1".to_string()),
+                ("ZEBRA".to_string(), "z".to_string()),
+            ]
+        );
+    }
+
+    /// No `[env]` table means no declared environment (the common case).
+    #[test]
+    fn absent_env_is_empty() {
+        let f = fixture();
+        f.write("document_root = \"web\"\n");
+        assert_eq!(f.load().env, Vec::<(String, String)>::new());
+    }
+
+    /// A non-string value is a key this binary understood but could not honour,
+    /// so the site fails closed rather than serving without the env.
+    #[test]
+    fn per_site_env_non_string_value_is_unusable() {
+        let f = fixture();
+        f.write("[env]\nAPP_DEBUG = true\n");
+        assert_eq!(f.load().unusable, Some("[env] values must be strings"));
+    }
+
+    /// `[env]` may not shadow a name ePHPm injects itself — fail closed.
+    #[test]
+    fn per_site_env_reserved_name_is_unusable() {
+        for name in ["DB_PASSWORD", "WS_EVENT", "EPHPM_NODE_ID", "DATABASE_URL"] {
+            let f = fixture();
+            f.write(&format!("[env]\n{name} = \"x\"\n"));
+            assert!(
+                f.load().unusable.is_some(),
+                "{name} collides with an ePHPm-injected variable and must fail closed"
+            );
+        }
+    }
+
+    /// An empty variable name is rejected (fail closed).
+    #[test]
+    fn per_site_env_empty_name_is_unusable() {
+        let f = fixture();
+        f.write("[env]\n\"\" = \"x\"\n");
+        assert_eq!(f.load().unusable, Some("[env] contains an empty variable name"));
+    }
+
+    /// The environment scrub (finding F1) must keep a `[preview_auth]`
+    /// `session_secret = "env:NAME"` variable alive — `scan_env_references`
+    /// surfaces that name so the scrubber does not drop it (which would 503
+    /// every gated preview).
+    #[test]
+    fn scan_env_references_finds_preview_session_secret() {
+        let f = fixture();
+        f.write(
+            "[preview_auth]\nlogin_url = \"/_ephpm/auth/github/login\"\n\
+             session_secret = \"env:PREVIEW_SESSION_SECRET\"\n",
+        );
+        // A literal secret (no `env:`) and a file: reference contribute nothing.
+        std::fs::write(
+            f.overrides.join("other.test.toml"),
+            "[preview_auth]\nlogin_url = \"/x\"\nsession_secret = \"file:/etc/secret\"\n",
+        )
+        .unwrap();
+        assert_eq!(scan_env_references(&f.overrides), vec!["PREVIEW_SESSION_SECRET".to_string()]);
     }
 
     // ── [[rewrite]] — per-site rewrite rules (v0.13.4) ────────────────────
