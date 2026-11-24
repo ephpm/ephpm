@@ -272,6 +272,7 @@
 //! and (C-side only) `EPHPM_DB_ERR_BAD_PARAM`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -527,6 +528,12 @@ thread_local! {
     /// under the same rule as [`DB_LAST`], which is what lets
     /// `ephpm_db_errno()` report on a statement whose exception was caught.
     static DB_ERROR: RefCell<Option<BridgeError>> = const { RefCell::new(None) };
+    /// Open streaming cursors on this thread (issue #264). Pure buffered data —
+    /// no session, no backend `Arc`, no engine handle — so unlike [`DB_HELD`]
+    /// it needs no teardown parking and can be cleared from anywhere. Closed
+    /// for the thread by [`close_all_cursors`] at [`on_request_end`] so a
+    /// handle never leaks into the next request on a persistent worker thread.
+    static DB_CURSORS: RefCell<CursorTable> = const { RefCell::new(CursorTable::new()) };
 }
 
 /// What is remembered about the last statement executed on this thread once
@@ -1007,11 +1014,10 @@ fn backend_for(source: &BackendSource, site: &str) -> Result<SharedBackend, Brid
 /// can drive a locally-constructed [`DbBridge`] (with a mock backend)
 /// without going through the process-wide, set-once [`DB_BRIDGE`].
 fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
-    // `try_with` throughout (issue #269): a `register_shutdown_function`
-    // callback running inside `php_request_shutdown()` on an exiting thread
-    // lands here with these cells already destroyed.
-    let Ok(params) = DB_PARAMS.try_with(|p| std::mem::take::<Vec<Value>>(&mut p.borrow_mut()))
-    else {
+    // `try_with` (issue #269): a `register_shutdown_function` callback running
+    // inside `php_request_shutdown()` on an exiting thread lands here with the
+    // parameter cell already destroyed.
+    let Ok(params) = take_params() else {
         return RunStatus::Gone;
     };
     reset_staged();
@@ -1031,27 +1037,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         return if staged == RunStatus::Gone { RunStatus::Gone } else { RunStatus::Unavailable };
     };
 
-    let Ok(sql) = std::str::from_utf8(sql) else {
-        return stage_error(BridgeError {
-            code: ER_PARSE_ERROR,
-            sqlstate: *b"42000",
-            message: "SQL must be valid UTF-8".to_string(),
-        });
+    let sql = match validate_sql(sql) {
+        Ok(sql) => sql,
+        Err(status) => return status,
     };
-
-    // Defense-in-depth: reject cross-database / path primitives on the tenant
-    // query path regardless of what the backend would do on its own. The
-    // bridge's input is MySQL-dialect text (translated by litewire below), so
-    // it is screened by the MySQL lexing rule — see `screen_sql`'s docs.
-    if let Err(offending) = screen_sql_mysql(sql) {
-        return stage_error(BridgeError {
-            code: ER_UNKNOWN_ERROR,
-            sqlstate: *b"HY000",
-            message: format!(
-                "statement type `{offending}` is not permitted on the tenant database path"
-            ),
-        });
-    }
 
     // The gate (issue #269). Every cell the execution path still needs is
     // checked HERE, before anything runs — which is what makes "`Gone` means
@@ -1062,48 +1051,108 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     //
     // BOTH result cells are probed, not just one: a successful run stages rows
     // into `DB_ROWS` and metadata into `DB_LAST`, and half a staged result is
-    // worse than none.
-    //
-    // `DB_HELD` is the last cell a query touches and therefore the FIRST of
-    // this module's cells to be destroyed, so on a retiring thread this is
-    // where a shutdown-function call actually stops.
+    // worse than none. [`produce_result`] additionally gates on `DB_HELD` (the
+    // last cell a query touches, and therefore the FIRST destroyed), so a
+    // statement never runs on a half-destroyed thread.
     if !is_live(&DB_ROWS) || !is_live(&DB_LAST) {
         return RunStatus::Gone;
     }
 
-    // Remote wire path (issue #471, `ephpm php --site` against a running
-    // server): forward the RAW MySQL SQL to the server's listener and let its
-    // frontend `Session` do the single, authoritative translation. No local
-    // `Session` (that would translate twice) and no per-thread [`HeldSession`]
-    // (the remote connection is authenticated as the site, so there is no
-    // site swap to perform). The defensive `screen_sql` above already ran; the
-    // server screens again. Staging is safe — the gate just proved both result
-    // cells are live on this (live) thread.
+    match produce_result(bridge, sql, &params) {
+        Ok(result) => stage_result(result),
+        Err(RunFailure::Error(e)) => stage_error(e),
+        Err(RunFailure::Gone) => RunStatus::Gone,
+    }
+}
+
+/// Take and clear this thread's staged parameter list.
+///
+/// `Err(())` means the parameter cell has already been destroyed (a retiring
+/// thread, issue #269); the caller reports `Gone` and runs nothing, so a
+/// parameter lost here can never produce a silently wrong query.
+fn take_params() -> Result<Vec<Value>, ()> {
+    DB_PARAMS.try_with(|p| std::mem::take::<Vec<Value>>(&mut p.borrow_mut())).map_err(|_| ())
+}
+
+/// Validate and screen raw PHP SQL bytes for the per-thread session path,
+/// shared by [`run_on`] and [`cursor_open_on`].
+///
+/// On success returns the statement as `&str`. On failure it has already
+/// *staged* the error (so `ephpm_db_errno()` can read it) and returns the
+/// [`RunStatus`] the caller should surface — `Err` normally, or `Gone` if the
+/// error cell was itself destroyed (issue #269).
+fn validate_sql(sql: &[u8]) -> Result<&str, RunStatus> {
+    let Ok(sql) = std::str::from_utf8(sql) else {
+        return Err(stage_error(BridgeError {
+            code: ER_PARSE_ERROR,
+            sqlstate: *b"42000",
+            message: "SQL must be valid UTF-8".to_string(),
+        }));
+    };
+
+    // Defense-in-depth: reject cross-database / path primitives on the tenant
+    // query path regardless of what the backend would do on its own. The
+    // bridge's input is MySQL-dialect text (translated by litewire below), so
+    // it is screened by the MySQL lexing rule — see `screen_sql`'s docs.
+    if let Err(offending) = screen_sql_mysql(sql) {
+        return Err(stage_error(BridgeError {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: format!(
+                "statement type `{offending}` is not permitted on the tenant database path"
+            ),
+        }));
+    }
+    Ok(sql)
+}
+
+/// Execute an already-validated statement and return its [`SessionResult`]
+/// **without staging anything**.
+///
+/// This is the shared execution core of [`run_on`] (which stages the result
+/// into [`DB_ROWS`]/[`DB_LAST`]) and [`cursor_open_on`] (which buffers it into
+/// a [`Cursor`]). It carries the two execution paths and all their safety
+/// properties unchanged:
+///
+/// * **Remote wire path** (issue #471, `ephpm php --site`): the raw MySQL SQL
+///   is forwarded verbatim to a running server's listener, whose frontend
+///   `Session` does the single authoritative translation. No local `Session`
+///   (that would translate twice) and no [`HeldSession`] (the remote
+///   connection is already authenticated as the site, so there is no swap).
+/// * **Per-thread session path**: `DB_HELD` is reached with `try_with` and a
+///   destroyed cell returns [`RunFailure::Gone`] — a statement never runs on a
+///   half-destroyed thread (issue #269). An engine panic is contained and the
+///   session discarded, never reused (see `catch_engine_panic`).
+///
+/// Both paths run under an `extern "C"` PHP native, where an unwinding panic
+/// aborts the process, so both are wrapped in [`catch_engine_panic`].
+fn produce_result(
+    bridge: &DbBridge,
+    sql: &str,
+    params: &[Value],
+) -> Result<SessionResult, RunFailure> {
     if let BackendSource::Remote(remote) = &bridge.source {
-        // Panic-guarded like the session path below: this runs under an
-        // `extern "C"` PHP native, where an unwinding panic aborts the process.
-        let outcome = catch_engine_panic(|| bridge.handle.block_on(remote.run(sql, &params)));
-        return match outcome {
-            Ok(Ok(result)) => stage_result(result),
-            Ok(Err(e)) => stage_error(BridgeError::from(e)),
+        return match catch_engine_panic(|| bridge.handle.block_on(remote.run(sql, params))) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(RunFailure::Error(BridgeError::from(e))),
             Err(panic) => {
                 tracing::error!(
                     panic = %panic,
                     "remote database backend panicked while executing a statement"
                 );
-                stage_error(engine_panic_error())
+                Err(RunFailure::Error(engine_panic_error()))
             }
         };
     }
 
-    let Ok(outcome) = DB_HELD.try_with(|cell| {
+    match DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
         // Engine panics stop HERE (see `catch_engine_panic`). The session that
         // was executing is in an unknown state — the engine may have been
         // mid-write, holding locks, or with a half-applied transaction — so it
         // is discarded, never reused: the next statement on this thread opens a
         // fresh connection. Whatever transaction it held is abandoned with it.
-        match catch_engine_panic(|| run_held(bridge, &mut slot, sql, &params)) {
+        match catch_engine_panic(|| run_held(bridge, &mut slot, sql, params)) {
             Ok(outcome) => outcome,
             Err(panic) => {
                 tracing::error!(
@@ -1115,14 +1164,9 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
                 Err(RunFailure::Error(engine_panic_error()))
             }
         }
-    }) else {
-        return RunStatus::Gone;
-    };
-
-    match outcome {
-        Ok(result) => stage_result(result),
-        Err(RunFailure::Error(e)) => stage_error(e),
-        Err(RunFailure::Gone) => RunStatus::Gone,
+    }) {
+        Ok(outcome) => outcome,
+        Err(_) => Err(RunFailure::Gone),
     }
 }
 
@@ -1718,6 +1762,294 @@ fn strip_leading_noise(stmt: &str, mysql: bool) -> &str {
     }
 }
 
+// ── Streaming result cursors (issue #264) ───────────────────────────────
+//
+// `ephpm_db_query` materializes a whole result set into one PHP array: a
+// million-row SELECT is a million zvals alive at once, which can OOM a worker
+// thread. A cursor bounds the PHP-side (zval) memory to one chunk at a time.
+//
+// The result is materialized ONCE, at open, through the SAME execution path as
+// `run_on` ([`produce_result`] — Remote branch, per-thread session swap, panic
+// containment and connection recycling all shared), then buffered in this
+// thread's cursor table and handed to PHP in chunks by [`cursor_fetch`]. Rows
+// are drained from the FRONT of a `VecDeque`, so the heavy `Value` payload of
+// already-yielded rows is freed as iteration proceeds — the Rust-side buffer
+// shrinks toward empty rather than being held whole until close.
+//
+// This is deliberately NOT engine-level streaming: litewire's `Session` /
+// `BackendConn` only expose a fully-materialized `ResultSet`, so a true
+// constant-memory cursor would need a new litewire primitive (a follow-up).
+// The win delivered here is real but bounded: PHP holds one chunk and the Rust
+// buffer frees progressively, but the full result set is still buffered in the
+// bridge at open. The guide documents this honestly.
+//
+// Because a cursor holds only owned data (columns + `Value` rows) and NO
+// engine / session / backend handle, dropping it is plain heap frees — it
+// needs none of the thread-teardown parking that [`HeldSession`] does (issues
+// #300 / #269), and the table can be cleared from anywhere, including a
+// retiring thread. Every PHP-reachable accessor still uses `try_with` so a
+// shutdown-function call after teardown degrades instead of panicking.
+//
+// Cursors are thread-local, keyed by a handle unique within the thread. Within
+// one request PHP runs on a single thread, so a cursor opened and consumed in a
+// request stays on its thread; [`on_request_end`] closes any a script left
+// open, so a handle never leaks into the next request on a worker thread.
+
+/// A materialized result set being handed to PHP in forward-only chunks.
+struct Cursor {
+    /// Column metadata, re-staged into [`DB_LAST`] on every fetch so
+    /// `ephpm_db_columns()` describes the cursor's rows throughout iteration.
+    columns: Vec<Column>,
+    /// Remaining rows, drained from the front so yielded rows free as we go.
+    rows: VecDeque<Vec<Value>>,
+    /// Whether the opened statement produced a result set (vs. an OK).
+    had_rowset: bool,
+    /// `affected_rows` of an OK statement (0 for a result set).
+    affected_rows: u64,
+    /// `last_insert_id` of an OK statement (0 for a result set).
+    last_insert_id: u64,
+}
+
+/// This thread's open cursors. A `Vec` rather than a `HashMap` because a
+/// request holds a small handful of cursors (usually one), the lookup is a
+/// short linear scan, and `Vec::new` is `const` so the thread-local initializes
+/// without a lazy allocation — matching the other bridge cells.
+struct CursorTable {
+    /// Next handle to hand out. Starts at 1 so 0 is never valid and the C side
+    /// can treat it as "none".
+    next: u64,
+    /// `(handle, cursor)` pairs.
+    cursors: Vec<(u64, Cursor)>,
+}
+
+impl CursorTable {
+    const fn new() -> Self {
+        Self { next: 1, cursors: Vec::new() }
+    }
+
+    /// Store `cursor` and return its freshly allocated handle.
+    fn insert(&mut self, cursor: Cursor) -> u64 {
+        let handle = self.next;
+        // Never hand out 0 (the C side's "none"). u64 cannot realistically wrap
+        // within a request, but roll over defensively rather than panic.
+        self.next = self.next.wrapping_add(1);
+        if self.next == 0 {
+            self.next = 1;
+        }
+        self.cursors.push((handle, cursor));
+        handle
+    }
+
+    fn get_mut(&mut self, handle: u64) -> Option<&mut Cursor> {
+        self.cursors.iter_mut().find(|(h, _)| *h == handle).map(|(_, c)| c)
+    }
+
+    /// Remove `handle`, returning whether it existed.
+    fn remove(&mut self, handle: u64) -> bool {
+        if let Some(pos) = self.cursors.iter().position(|(h, _)| *h == handle) {
+            // Order does not matter — handles are looked up by value.
+            self.cursors.swap_remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Outcome of [`cursor_open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOpen {
+    /// A result-set cursor is open; the handle is valid and column metadata is
+    /// staged for the introspection accessors.
+    Rows(u64),
+    /// The statement produced no result set (an OK). A cursor is still opened
+    /// (it yields zero rows) so the caller gets a uniform handle; [`ok_info`]
+    /// reflects the statement.
+    Ok(u64),
+    /// An error was staged (read via the error accessor).
+    Err,
+    /// No backend is registered — `[db.sqlite]` is not active.
+    Unavailable,
+    /// This thread's bridge state is already destroyed (issue #269); nothing
+    /// ran and no cursor was opened.
+    Gone,
+}
+
+/// Outcome of [`cursor_fetch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorFetch {
+    /// `n` rows were drained from the cursor and staged into [`DB_ROWS`] (read
+    /// via the row/cell accessors, released by [`finish`]). `0` means the
+    /// cursor is exhausted.
+    Fetched(usize),
+    /// No cursor with that handle is open on this thread (closed, never
+    /// opened, or opened on another thread).
+    NoSuchHandle,
+    /// This thread's bridge state is already destroyed (issue #269).
+    Gone,
+}
+
+/// Open a streaming cursor over `sql`'s result set (raw PHP string bytes),
+/// buffering the result in this thread's cursor table and returning a handle.
+///
+/// Executes the statement exactly once, through the same path as
+/// [`run_sql_bytes`] (translation, screening, per-site swap, Remote forwarding,
+/// panic containment). The staged parameter list is consumed.
+#[must_use]
+pub fn cursor_open(sql: &[u8]) -> CursorOpen {
+    cursor_open_on(DB_BRIDGE.get(), sql)
+}
+
+/// [`cursor_open`] against an explicit bridge. Split out for the same reason as
+/// [`run_on`]: unit tests drive a locally-constructed [`DbBridge`].
+fn cursor_open_on(bridge: Option<&DbBridge>, sql: &[u8]) -> CursorOpen {
+    let Ok(params) = take_params() else {
+        return CursorOpen::Gone;
+    };
+    // Clear the last-statement record/error, exactly as a plain `run` does, so
+    // `ephpm_db_errno()` after a failed open reflects the open.
+    reset_staged();
+
+    let Some(bridge) = bridge else {
+        let staged = stage_error(infra_error(
+            ERR_UNAVAILABLE,
+            "no embedded database is active (requires [db.sqlite])".to_string(),
+        ));
+        return if staged == RunStatus::Gone { CursorOpen::Gone } else { CursorOpen::Unavailable };
+    };
+
+    let sql = match validate_sql(sql) {
+        Ok(sql) => sql,
+        Err(RunStatus::Gone) => return CursorOpen::Gone,
+        Err(_) => return CursorOpen::Err,
+    };
+
+    // The gate (issue #269), mirroring `run_on`: the cells this path writes are
+    // the cursor table and the metadata record. Probe them before executing so
+    // a retiring thread refuses rather than running a statement whose result it
+    // could not record. `produce_result` additionally gates on `DB_HELD`.
+    if !is_live(&DB_CURSORS) || !is_live(&DB_LAST) {
+        return CursorOpen::Gone;
+    }
+
+    match produce_result(bridge, sql, &params) {
+        Ok(result) => stage_cursor(result),
+        Err(RunFailure::Error(e)) => {
+            if stage_error(e) == RunStatus::Gone {
+                CursorOpen::Gone
+            } else {
+                CursorOpen::Err
+            }
+        }
+        Err(RunFailure::Gone) => CursorOpen::Gone,
+    }
+}
+
+/// Buffer a materialized result as a new cursor and stage its metadata into
+/// [`DB_LAST`] so the introspection accessors describe it before the first
+/// fetch. Plain `with`: [`cursor_open_on`]'s gate just proved both cells live.
+fn stage_cursor(result: SessionResult) -> CursorOpen {
+    let (cursor, rowset) = match result {
+        SessionResult::Rows(rs) => (
+            Cursor {
+                columns: rs.columns,
+                // `VecDeque::from(Vec)` reuses the buffer (no row copy).
+                rows: VecDeque::from(rs.rows),
+                had_rowset: true,
+                affected_rows: 0,
+                last_insert_id: 0,
+            },
+            true,
+        ),
+        SessionResult::Ok(ok) => (
+            Cursor {
+                columns: Vec::new(),
+                rows: VecDeque::new(),
+                had_rowset: false,
+                affected_rows: ok.affected_rows,
+                last_insert_id: ok.last_insert_id,
+            },
+            false,
+        ),
+    };
+    DB_LAST.with(|l| {
+        *l.borrow_mut() = LastCall {
+            had_rowset: cursor.had_rowset,
+            columns: cursor.columns.clone(),
+            affected_rows: cursor.affected_rows,
+            last_insert_id: cursor.last_insert_id,
+        };
+    });
+    let handle = DB_CURSORS.with(|c| c.borrow_mut().insert(cursor));
+    if rowset { CursorOpen::Rows(handle) } else { CursorOpen::Ok(handle) }
+}
+
+/// Drain up to `max` more rows from the cursor into [`DB_ROWS`] (read via the
+/// row/cell accessors, released by [`finish`]) and re-stage its column metadata
+/// into [`DB_LAST`], returning how many rows were staged.
+///
+/// Forward-only: each fetch removes the rows it returns from the front of the
+/// cursor's buffer, freeing their payload. A `max` of 0 stages nothing; `0`
+/// rows returned means the cursor is exhausted.
+#[must_use]
+pub fn cursor_fetch(handle: u64, max: usize) -> CursorFetch {
+    // The gate (issue #269): a fetch writes `DB_ROWS` and `DB_LAST` and reads
+    // `DB_CURSORS`. If any is gone the thread is retiring — report `Gone`.
+    if !is_live(&DB_ROWS) || !is_live(&DB_LAST) || !is_live(&DB_CURSORS) {
+        return CursorFetch::Gone;
+    }
+    let chunk = DB_CURSORS.with(|c| {
+        let mut table = c.borrow_mut();
+        table.get_mut(handle).map(|cursor| {
+            let take = max.min(cursor.rows.len());
+            let rows: Vec<Vec<Value>> = cursor.rows.drain(..take).collect();
+            let meta = LastCall {
+                had_rowset: cursor.had_rowset,
+                columns: cursor.columns.clone(),
+                affected_rows: cursor.affected_rows,
+                last_insert_id: cursor.last_insert_id,
+            };
+            (rows, meta)
+        })
+    });
+    let Some((rows, meta)) = chunk else {
+        return CursorFetch::NoSuchHandle;
+    };
+    let n = rows.len();
+    DB_LAST.with(|l| *l.borrow_mut() = meta);
+    DB_ROWS.with(|r| *r.borrow_mut() = rows);
+    CursorFetch::Fetched(n)
+}
+
+/// Close a cursor, freeing its buffered rows. Returns whether a cursor with
+/// that handle was open on this thread. Idempotent and safe on a retiring
+/// thread (issue #269): a destroyed cell reports `false`.
+#[must_use]
+pub fn cursor_close(handle: u64) -> bool {
+    DB_CURSORS.try_with(|c| c.borrow_mut().remove(handle)).unwrap_or(false)
+}
+
+/// Close every cursor this thread left open and reset the handle counter.
+///
+/// Called from [`on_request_end`] so a request's cursors never leak into the
+/// next request on a persistent worker thread. Pure heap frees (no session, no
+/// engine), so it is safe anywhere, including a retiring thread — `try_with`
+/// makes it a no-op there (the thread-local's own destructor frees the rows).
+fn close_all_cursors() {
+    let _ = DB_CURSORS.try_with(|c| {
+        let mut table = c.borrow_mut();
+        if !table.cursors.is_empty() {
+            tracing::warn!(
+                count = table.cursors.len(),
+                "PHP request left streaming database cursors open at request end — closing them \
+                 (scripts should ephpm_db_cursor_close() when done)"
+            );
+            table.cursors.clear();
+        }
+        table.next = 1;
+    });
+}
+
 /// Per-request teardown for this thread's bridge state.
 ///
 /// Must run at the end of **every** PHP request, on the thread that ran
@@ -1767,6 +2099,11 @@ pub fn on_request_end() {
     // another request's `ephpm_db_errno()`. Inert on a retiring thread
     // (issue #269): every cell it touches is reached with `try_with`.
     reset_staged();
+    // Close any streaming cursors the script left open (issue #264), so a
+    // handle never leaks into the next request on a worker thread. Pure heap
+    // frees (no session / engine), so unlike the graveyard drain below it is
+    // safe even on a retiring thread and runs before the `DB_HELD` gate.
+    close_all_cursors();
     // Everything below needs a LIVE thread. [`DB_HELD`] being unreachable is
     // the precise signal that this thread is inside its TLS-destructor phase —
     // where `HeldCell::drop` has already parked this thread's session, and
@@ -2156,6 +2493,26 @@ pub struct EphpmDbOps {
     /// Whether a statement issued now would reach a database (1) or fail for
     /// an infrastructure reason (0).
     pub available: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
+    /// Open a streaming cursor over `sql`'s result (issue #264), buffering the
+    /// result in the bridge and writing the handle to `*out_handle`. Returns
+    /// 1 = result-set cursor opened, 2 = OK/no-rowset cursor opened,
+    /// -1 = error staged, -2 = no backend registered, -3 = bridge gone
+    /// (issue #269; nothing ran).
+    pub cursor_open: Option<
+        unsafe extern "C" fn(
+            sql: *const std::os::raw::c_char,
+            sql_len: usize,
+            out_handle: *mut u64,
+        ) -> std::os::raw::c_int,
+    >,
+    /// Fetch up to `max` more rows from the cursor into the staged row buffer
+    /// (read via `row_count`/`col_*`/`cell`, released by `finish`). Returns the
+    /// number of rows staged (0 = cursor exhausted), -1 = no such handle on
+    /// this thread, -3 = bridge gone.
+    pub cursor_fetch:
+        Option<unsafe extern "C" fn(handle: u64, max: usize) -> std::os::raw::c_longlong>,
+    /// Close a cursor and free its buffer. Returns 1 if it existed, else 0.
+    pub cursor_close: Option<unsafe extern "C" fn(handle: u64) -> std::os::raw::c_int>,
 }
 
 // ── C shims (php_linked only) ───────────────────────────────────────────
@@ -2366,6 +2723,56 @@ unsafe extern "C" fn db_available() -> std::os::raw::c_int {
     std::os::raw::c_int::from(is_available())
 }
 
+#[cfg(php_linked)]
+unsafe extern "C" fn db_cursor_open(
+    sql: *const std::os::raw::c_char,
+    sql_len: usize,
+    out_handle: *mut u64,
+) -> std::os::raw::c_int {
+    // SAFETY: `sql` points to `sql_len` bytes of a PHP string obtained via
+    // zend_parse_parameters, valid for the duration of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(sql.cast::<u8>(), sql_len) };
+    // `cursor_open` contains engine panics via `produce_result`; this is the
+    // backstop for any other panic (a panic must never unwind out of this
+    // `extern "C"` fn — that aborts the process).
+    let outcome = catch_engine_panic(|| cursor_open(bytes)).unwrap_or_else(|panic| {
+        tracing::error!(panic = %panic, "ephpm_db_cursor_open panicked");
+        let staged =
+            catch_engine_panic(|| stage_error(engine_panic_error())).unwrap_or(RunStatus::Gone);
+        if staged == RunStatus::Gone { CursorOpen::Gone } else { CursorOpen::Err }
+    });
+    let (code, handle) = match outcome {
+        CursorOpen::Rows(h) => (1, h),
+        CursorOpen::Ok(h) => (2, h),
+        CursorOpen::Err => (-1, 0),
+        CursorOpen::Unavailable => (-2, 0),
+        CursorOpen::Gone => (-3, 0),
+    };
+    // SAFETY: `out_handle` is a valid pointer to a u64 local in our C wrapper
+    // (`PHP_FUNCTION(ephpm_db_cursor_open)`).
+    unsafe {
+        *out_handle = handle;
+    }
+    code
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn db_cursor_fetch(handle: u64, max: usize) -> std::os::raw::c_longlong {
+    let outcome = catch_engine_panic(|| cursor_fetch(handle, max)).unwrap_or(CursorFetch::Gone);
+    match outcome {
+        CursorFetch::Fetched(n) => {
+            std::os::raw::c_longlong::try_from(n).unwrap_or(std::os::raw::c_longlong::MAX)
+        }
+        CursorFetch::NoSuchHandle => -1,
+        CursorFetch::Gone => -3,
+    }
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn db_cursor_close(handle: u64) -> std::os::raw::c_int {
+    std::os::raw::c_int::from(catch_engine_panic(|| cursor_close(handle)).unwrap_or(false))
+}
+
 // ── Static ops table ────────────────────────────────────────────────────
 
 /// The C-compatible function pointer table, ready to pass to
@@ -2389,6 +2796,9 @@ pub static DB_OPS: EphpmDbOps = EphpmDbOps {
     col_decltype: Some(db_col_decltype),
     in_transaction: Some(db_in_transaction),
     available: Some(db_available),
+    cursor_open: Some(db_cursor_open),
+    cursor_fetch: Some(db_cursor_fetch),
+    cursor_close: Some(db_cursor_close),
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -2575,6 +2985,181 @@ mod tests {
         assert_eq!(run("SELECT COUNT(*) FROM bridge_jm"), RunStatus::Rows);
         with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
         finish();
+    }
+
+    // ── Streaming cursors (issue #264) ──────────────────────────────────
+
+    fn open_handle(sql: &str) -> u64 {
+        match cursor_open(sql.as_bytes()) {
+            CursorOpen::Rows(h) | CursorOpen::Ok(h) => h,
+            other => panic!("cursor_open({sql}) failed: {other:?}"),
+        }
+    }
+
+    fn fetch(handle: u64, n: usize) -> usize {
+        match cursor_fetch(handle, n) {
+            CursorFetch::Fetched(k) => k,
+            other => panic!("cursor_fetch failed: {other:?}"),
+        }
+    }
+
+    /// Rows left buffered in the cursor (test-only introspection of the
+    /// thread-local table).
+    fn cursor_remaining(handle: u64) -> usize {
+        DB_CURSORS.with(|c| {
+            c.borrow()
+                .cursors
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .map_or(0, |(_, cur)| cur.rows.len())
+        })
+    }
+
+    fn open_cursor_count() -> usize {
+        DB_CURSORS.with(|c| c.borrow().cursors.len())
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_streams_rows_in_chunks_and_frees_as_it_drains() {
+        init_bridge();
+        assert_eq!(
+            run("CREATE TABLE bridge_cur (id INTEGER PRIMARY KEY, name TEXT)"),
+            RunStatus::Ok
+        );
+        for i in 1..=5 {
+            params_reset();
+            param_push(Value::Integer(i));
+            param_push(Value::Text(format!("row{i}")));
+            assert_eq!(run("INSERT INTO bridge_cur (id, name) VALUES (?, ?)"), RunStatus::Ok);
+        }
+
+        let h = open_handle("SELECT id, name FROM bridge_cur ORDER BY id");
+        // Metadata is available before the first fetch.
+        assert!(had_rowset());
+        assert_eq!(col_count(), 2);
+        assert_eq!(cursor_remaining(h), 5);
+
+        // Chunk 1: rows 1,2 staged into the shared row buffer.
+        assert_eq!(fetch(h, 2), 2);
+        assert_eq!(row_count(), 2);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
+        assert_eq!(cell_text(1, 1).as_deref(), Some("row2"));
+        with_col_name(1, |n| assert_eq!(n, Some("name")));
+        // Yielded rows were drained from the buffer, not just indexed past.
+        assert_eq!(cursor_remaining(h), 3);
+
+        // Chunk 2: rows 3,4.
+        assert_eq!(fetch(h, 2), 2);
+        assert_eq!(cell_text(0, 1).as_deref(), Some("row3"));
+        assert_eq!(cursor_remaining(h), 1);
+
+        // Chunk 3: the final row, then exhaustion.
+        assert_eq!(fetch(h, 2), 1);
+        assert_eq!(cell_text(0, 1).as_deref(), Some("row5"));
+        assert_eq!(fetch(h, 2), 0, "an exhausted cursor fetches nothing");
+        assert_eq!(cursor_remaining(h), 0);
+
+        // Close is reported, and a second close is a no-op false.
+        assert!(cursor_close(h));
+        assert!(!cursor_close(h));
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_survives_an_interleaved_query() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_cur_i (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        for i in 1..=4 {
+            params_reset();
+            param_push(Value::Integer(i));
+            assert_eq!(run("INSERT INTO bridge_cur_i (id) VALUES (?)"), RunStatus::Ok);
+        }
+
+        let h = open_handle("SELECT id FROM bridge_cur_i ORDER BY id");
+        assert_eq!(fetch(h, 2), 2);
+
+        // A plain query between fetches resets the shared staged buffers but
+        // must not disturb the cursor's own buffer.
+        assert_eq!(run("SELECT COUNT(*) FROM bridge_cur_i"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(4))));
+
+        assert_eq!(fetch(h, 2), 2, "the cursor still yields its remaining rows");
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(3))));
+        assert!(cursor_close(h));
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_on_zero_row_select_reports_columns() {
+        init_bridge();
+        assert_eq!(
+            run("CREATE TABLE bridge_cur_z (id INTEGER PRIMARY KEY, label TEXT)"),
+            RunStatus::Ok
+        );
+        params_reset();
+        param_push(Value::Integer(-1));
+        let open = cursor_open(b"SELECT id, label FROM bridge_cur_z WHERE id = ?");
+        let CursorOpen::Rows(h) = open else {
+            panic!("a SELECT must open a rows cursor: {open:?}")
+        };
+        // #262 parity: a zero-row result still describes its columns.
+        assert!(had_rowset());
+        assert_eq!(col_count(), 2);
+        assert_eq!(fetch(h, 10), 0);
+        assert!(cursor_close(h));
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_on_non_select_opens_an_ok_cursor() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_cur_ok (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        let open = cursor_open(b"INSERT INTO bridge_cur_ok (id) VALUES (7)");
+        let CursorOpen::Ok(h) = open else { panic!("a write must open an OK cursor: {open:?}") };
+        assert!(!had_rowset());
+        assert_eq!(ok_info().0, 1, "affected_rows is reported for the OK cursor");
+        assert_eq!(fetch(h, 10), 0, "an OK cursor yields no rows");
+        assert!(cursor_close(h));
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_fetch_on_unknown_handle_reports_no_such_handle() {
+        init_bridge();
+        assert_eq!(cursor_fetch(999_999, 1), CursorFetch::NoSuchHandle);
+        assert!(!cursor_close(999_999));
+    }
+
+    #[test]
+    #[serial]
+    fn cursor_screen_rejects_forbidden_statements() {
+        init_bridge();
+        assert_eq!(cursor_open(b"ATTACH DATABASE 'x' AS y"), CursorOpen::Err);
+        with_error(|e| {
+            let (code, _, msg) = e.expect("screen must stage an error");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert!(msg.contains("ATTACH"), "got: {msg}");
+        });
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn request_end_closes_open_cursors() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_cur_re (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_cur_re (id) VALUES (1)"), RunStatus::Ok);
+        let h = open_handle("SELECT id FROM bridge_cur_re");
+        assert_eq!(cursor_remaining(h), 1);
+        // A script that forgets to close its cursor must not leak it.
+        on_request_end();
+        assert_eq!(open_cursor_count(), 0, "request end must close leaked cursors");
+        assert_eq!(cursor_fetch(h, 1), CursorFetch::NoSuchHandle);
     }
 
     #[test]

@@ -25,8 +25,10 @@ bridge is handed the same stats-wrapping backend the wire frontends serve.
 > **Requires ePHPm v0.6.3 or newer.** The `ephpm_db_*` functions first
 > shipped in v0.6.3. `ephpm_db_run()`, `ephpm_db_columns()`,
 > `ephpm_db_in_transaction()`, `ephpm_db_available()`, `ephpm_db_errno()`
-> and `ephpm_db_error()` were added in **v0.7.4**; use
-> `function_exists()` to feature-detect them if you support older servers.
+> and `ephpm_db_error()` were added in **v0.7.4**; the streaming cursor
+> functions `ephpm_db_cursor_open()`, `ephpm_db_cursor_fetch()` and
+> `ephpm_db_cursor_close()` in **v0.20.0**. Use `function_exists()` to
+> feature-detect any of them if you support older servers.
 
 ## The function surface
 
@@ -40,11 +42,17 @@ bridge is handed the same stats-wrapping backend the wire frontends serve.
 | `ephpm_db_available()` | `bool` | no |
 | `ephpm_db_errno()` | `int` (0 = last statement succeeded) | no |
 | `ephpm_db_error()` | `?array{code, sqlstate, message}` | no |
+| `ephpm_db_cursor_open(string $sql, array $params = [])` | `int` (a cursor handle) | yes |
+| `ephpm_db_cursor_fetch(int $handle, int $size = 1)` | list of assoc rows (a chunk) | no |
+| `ephpm_db_cursor_close(int $handle)` | `bool` | no |
 
 The five introspection functions never throw, never run SQL, and never
 disturb what the executing functions left behind. They describe the last
 statement **on the current worker thread**, and are reset at the end of every
 request.
+
+The `ephpm_db_cursor_*` functions stream a large result set in chunks — see
+[Streaming large results with a cursor](#streaming-large-results-with-a-cursor).
 
 ## When the functions exist
 
@@ -593,14 +601,77 @@ mid-transaction, so a misclassified error can never silently throw away a
 transaction you still own — an open transaction on a dead connection is
 cleaned up by the request-end rollback above instead.
 
+## Streaming large results with a cursor
+
+`ephpm_db_query()` materializes the **whole** result set into one PHP array.
+For a result with a million rows that is a million PHP arrays alive at once,
+which can exhaust a worker thread's memory. When you need to walk a large
+result without holding all of it, use a cursor:
+
+```php
+$cursor = ephpm_db_cursor_open(
+    'SELECT id, email FROM users WHERE active = ? ORDER BY id',
+    [1]
+);
+try {
+    while (($chunk = ephpm_db_cursor_fetch($cursor, 500)) !== []) {
+        foreach ($chunk as $row) {
+            // process $row; only 500 rows' worth of PHP arrays live at a time
+        }
+    }
+} finally {
+    ephpm_db_cursor_close($cursor);
+}
+```
+
+- **`ephpm_db_cursor_open($sql, $params)`** runs the statement once and returns
+  an integer **handle**. Rows come back from `ephpm_db_cursor_fetch()` in the
+  same shape `ephpm_db_query()` returns them (assoc arrays keyed by column
+  name, native types). It throws on a SQL or infrastructure error exactly as
+  `ephpm_db_query()` does.
+- **`ephpm_db_cursor_fetch($handle, $size)`** returns up to `$size` rows
+  (default 1). It returns fewer than `$size` — and finally `[]` — as the
+  result runs out; an empty array means the cursor is exhausted. `$size` must
+  be at least 1. An unknown handle throws.
+- **`ephpm_db_cursor_close($handle)`** frees the cursor's buffer and returns
+  whether the handle was open. It never throws, so it is safe in a `finally`.
+  `ephpm_db_columns()` describes the cursor's columns between fetches.
+
+What the cursor bounds, and what it does not. The win is on the **PHP side**:
+only one chunk of rows exists as PHP arrays at a time, instead of the entire
+result. The result set is still **buffered once in the server** when the
+cursor is opened — the bridge frees each chunk's rows as you fetch past them,
+so that buffer shrinks as you iterate, but ePHPm does not yet stream rows out
+of the engine one page at a time (that needs a litewire primitive and is a
+follow-up to [#264](https://github.com/ephpm/ephpm/issues/264)). So a cursor
+keeps PHP memory flat across a large result, but is **not** a zero-buffer
+constant-memory stream end to end. It is the right tool for an export or a
+batch job; it is not a reason to `SELECT *` a table you only need part of.
+
+A handle is valid **only on the worker thread that opened it** and **only
+until the request ends**. The server closes any cursor a script leaves open at
+request end (with a warning), so a handle never leaks into the next request —
+but close your own cursors as soon as you are done. Opening a cursor over a
+statement with no result set (an `INSERT`, `SET NAMES`) succeeds and yields a
+cursor that fetches zero rows; use `ephpm_db_execute()` for those instead.
+
+This is what a framework's lazy iterator (Laravel's `cursor()`/`lazy()`, a
+Doctrine streaming result) can be built on. Until an adapter routes through it,
+`cursor()`/`lazy()` over the plain bridge is still buffered underneath — see
+the next section.
+
 ## What the bridge does not do
 
 These are real, current limitations.
 
-- **No streaming cursor.** `ephpm_db_query()` buffers the entire result set
-  before returning it. Correct, but not constant-memory — a Laravel
-  `cursor()`/`lazy()` call over the bridge is buffered underneath. Do not
-  stream a million rows through it.
+- **No end-to-end engine streaming.** `ephpm_db_query()` buffers the entire
+  result set before returning it, and even
+  [a cursor](#streaming-large-results-with-a-cursor) buffers the whole result
+  in the server once at open — it bounds PHP-side memory to one chunk but does
+  not stream rows out of the engine a page at a time. A Laravel
+  `cursor()`/`lazy()` call over the plain bridge (not yet routed through
+  `ephpm_db_cursor_*`) is fully buffered underneath. True constant-memory
+  streaming needs a litewire primitive.
   ([#264](https://github.com/ephpm/ephpm/issues/264))
 - **`WITH … SELECT` and `INSERT … RETURNING` do not work.** Not a bridge
   limitation — litewire routes a statement to the engine's query or execute

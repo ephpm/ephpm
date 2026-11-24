@@ -32,6 +32,11 @@
  *   - errno:         ephpm_db_errno()/ephpm_db_error() after a caught
  *                    exception, and their reset by the next statement
  *   - available:     ephpm_db_available()
+ *
+ * Streaming cursors (issue #264):
+ *   - cursor:        ephpm_db_cursor_open()/fetch()/close() over a seeded
+ *                    result — chunk sizes, row order, close semantics, and
+ *                    the unknown-handle throw
  */
 
 header('Content-Type: application/json');
@@ -45,6 +50,8 @@ $required = [
     // v0.7.4 adapter surface.
     'ephpm_db_run', 'ephpm_db_columns', 'ephpm_db_in_transaction',
     'ephpm_db_available', 'ephpm_db_errno', 'ephpm_db_error',
+    // v0.20.0 streaming cursor surface (#264).
+    'ephpm_db_cursor_open', 'ephpm_db_cursor_fetch', 'ephpm_db_cursor_close',
 ];
 $missing = array_values(array_filter($required, static fn (string $f) => !function_exists($f)));
 if ($missing !== []) {
@@ -271,6 +278,45 @@ try {
                 'available' => ephpm_db_available(),
                 // Distinct question from "am I on ePHPm".
                 'declared'  => function_exists('ephpm_db_available'),
+            ]]);
+            break;
+
+        case 'cursor':
+            // #264: stream a seeded result in chunks. Only one chunk's worth
+            // of PHP arrays exists at a time; the whole result never does.
+            for ($i = 1; $i <= 5; $i++) {
+                ephpm_db_execute(
+                    'INSERT INTO bridge_e2e (name, value) VALUES (?, ?)',
+                    ["c{$i}", (string) $i]
+                );
+            }
+            $handle = ephpm_db_cursor_open(
+                'SELECT name FROM bridge_e2e WHERE name LIKE ? ORDER BY id',
+                ['c%']
+            );
+            $chunk_sizes = [];
+            $names = [];
+            while (($chunk = ephpm_db_cursor_fetch($handle, 2)) !== []) {
+                $chunk_sizes[] = count($chunk);
+                foreach ($chunk as $row) {
+                    $names[] = $row['name'];
+                }
+            }
+            $closed = ephpm_db_cursor_close($handle);
+            $closed_again = ephpm_db_cursor_close($handle);
+            // An unknown handle must throw, not return [].
+            $threw_unknown = false;
+            try {
+                ephpm_db_cursor_fetch(987654321, 1);
+            } catch (Exception $e) {
+                $threw_unknown = true;
+            }
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'chunk_sizes'   => $chunk_sizes,
+                'names'         => $names,
+                'closed'        => $closed,
+                'closed_again'  => $closed_again,
+                'threw_unknown' => $threw_unknown,
             ]]);
             break;
 
