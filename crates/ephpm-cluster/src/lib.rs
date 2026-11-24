@@ -33,7 +33,7 @@ pub use cluster_channel::{
 pub use clustered_store::{ClusteredStore, KvReplicator, SiteKvReplicator};
 pub use gossip_kv::{Stamp, StampClock, node_tag};
 pub use kv_data_plane as data_plane;
-pub use kv_handoff::{HandoffReport, HandoffSource, PeerHandoff};
+pub use kv_handoff::{GossipBulkTransfer, HandoffReport, HandoffSource, PeerHandoff};
 pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
 pub use reconnect::ReconnectBackoff;
 pub use secure_transport::{ClusterCipher, EncryptedUdpTransport};

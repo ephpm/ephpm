@@ -218,6 +218,11 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // inside the cluster block, used before the accept loop (pull) and after
     // it (push).
     let mut kv_handoff: Option<Arc<ephpm_cluster::PeerHandoff>> = None;
+    // Gossip-tier bulk transfer (#631): built for EVERY clustered node (not
+    // gated on peer_handoff — it fixes the small tier's slow per-MTU catch-up,
+    // which affects every node on rejoin), pulled concurrently with the accept
+    // loop below.
+    let mut kv_gossip_pull: Option<Arc<ephpm_cluster::GossipBulkTransfer>> = None;
 
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
@@ -291,7 +296,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             }
             None => ephpm_cluster::data_plane::KvRouter::global(data_plane_store),
         }
-        .with_applied(Arc::clone(&applied));
+        .with_applied(Arc::clone(&applied))
+        // Answer gossip-tier bulk pulls (#631) with this node's small tier.
+        // Always on for a clustered node: the slow per-MTU gossip catch-up it
+        // works around affects every node on rejoin, not just large-value
+        // replicas.
+        .with_gossip_share(config.cluster.kv.small_key_threshold, cluster_handle.self_node().id);
         let data_plane_router = match &handoff_source {
             Some(source) => data_plane_router.with_handoff(Arc::clone(source)),
             None => data_plane_router,
@@ -305,6 +315,14 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
                 &config.cluster.kv,
             ));
         }
+        // The gossip bulk transfer shares the same router (its applied map), so
+        // a pulled small-tier entry lands exactly as a gossip-applied write.
+        kv_gossip_pull = Some(ephpm_cluster::GossipBulkTransfer::new(
+            Arc::clone(&cluster_handle),
+            data_plane_cipher.clone(),
+            data_plane_router.clone(),
+            &config.cluster.kv,
+        ));
         tokio::spawn(async move {
             if let Err(e) = ephpm_cluster::data_plane::serve_router(
                 data_plane_router,
@@ -686,6 +704,26 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         })
     });
 
+    // Gossip-tier bulk fill (#631): pull the whole small tier from every alive
+    // peer over the data plane so a (re)joining node's local store is complete
+    // in seconds, instead of the seconds-to-minutes the per-MTU, version-order
+    // chitchat catch-up takes (and which a tombstone-grace reset storm can keep
+    // from ever finishing). Runs concurrently with the accept loop for the same
+    // reason as the large-value warm-up above, and is safe during serving for
+    // the same reason: every entry lands through the stamped-write path, so a
+    // read racing it sees a miss, never an older value. It does NOT open the
+    // catch-up gate early — live-write freshness during the remaining gossip
+    // convergence stays the gate's job.
+    let gossip_warm_up = kv_gossip_pull.as_ref().map(|pull| {
+        let pull = Arc::clone(pull);
+        let deadline = tokio::time::Instant::now() + kv_snapshot::load_timeout_from(&config);
+        let expect_peers = !config.cluster.join.is_empty();
+        tokio::spawn(async move {
+            let report = pull.pull(deadline, expect_peers).await;
+            kv_snapshot::record_handoff("gossip-in", &report);
+        })
+    });
+
     let served = accept_loop(listeners).await;
 
     // A drain that begins before the warm-up finished: abandon the pull
@@ -696,6 +734,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     {
         warm_up.abort();
         tracing::info!("shutdown began before the KV warm-up pull finished; pull abandoned");
+    }
+    if let Some(gossip_warm_up) = gossip_warm_up
+        && !gossip_warm_up.is_finished()
+    {
+        gossip_warm_up.abort();
+        tracing::info!("shutdown began before the KV gossip bulk pull finished; pull abandoned");
     }
 
     // Requests are drained. In per-site clustered mode, announce the leave now,

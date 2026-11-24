@@ -241,6 +241,44 @@ async fn alive_sorted(cluster: &ClusterHandle) -> Vec<NodeInfo> {
     alive
 }
 
+/// Alive peers other than this node, each with its data-plane address (peers
+/// whose data port has not yet arrived in gossip are skipped). Shared by the
+/// large-value handoff and the gossip bulk transfer.
+async fn alive_peers_with_addr(
+    cluster: &ClusterHandle,
+    data_port: u16,
+) -> Vec<(NodeInfo, SocketAddr)> {
+    let self_id = cluster.self_node().id;
+    alive_sorted(cluster)
+        .await
+        .into_iter()
+        .filter(|n| n.id != self_id)
+        .filter_map(|n| node_data_addr(&n, data_port).map(|addr| (n, addr)))
+        .collect()
+}
+
+/// Wait up to [`PEER_DISCOVERY_WAIT`] for gossip to list at least one alive
+/// peer when the node was configured to join others (`expect_peers`). Returns
+/// the peers found; an empty result after the wait means "alone", not "ran out
+/// of time". Factored out of the two pull paths (large handoff, gossip bulk)
+/// so both wait identically.
+async fn discover_peers(
+    cluster: &ClusterHandle,
+    data_port: u16,
+    expect_peers: bool,
+    started: Instant,
+) -> Vec<(NodeInfo, SocketAddr)> {
+    let mut peers = alive_peers_with_addr(cluster, data_port).await;
+    if expect_peers && peers.is_empty() {
+        let give_up = started + PEER_DISCOVERY_WAIT;
+        while peers.is_empty() && Instant::now() < give_up {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            peers = alive_peers_with_addr(cluster, data_port).await;
+        }
+    }
+    peers
+}
+
 /// The push and pull operations for one node.
 pub struct PeerHandoff {
     cluster: Arc<ClusterHandle>,
@@ -279,13 +317,7 @@ impl PeerHandoff {
 
     /// Alive peers other than this node, with their data-plane addresses.
     async fn peers(&self) -> Vec<(NodeInfo, SocketAddr)> {
-        let self_id = self.cluster.self_node().id;
-        alive_sorted(&self.cluster)
-            .await
-            .into_iter()
-            .filter(|n| n.id != self_id)
-            .filter_map(|n| node_data_addr(&n, self.data_port).map(|addr| (n, addr)))
-            .collect()
+        alive_peers_with_addr(&self.cluster, self.data_port).await
     }
 
     /// Pull this node's share of large values from every alive peer, applying
@@ -497,6 +529,141 @@ impl PeerHandoff {
         report.bytes = sent_bytes.load(Ordering::Relaxed);
         report.failed_writes = failed.load(Ordering::Relaxed);
         report.timed_out = timed_out;
+        report.elapsed = started.elapsed();
+        report
+    }
+}
+
+/// Bulk transfer of the **gossip (small) tier** on (re)join: the root-cause
+/// fix for #631.
+///
+/// A node that (re)joins with a fresh chitchat generation receives each peer's
+/// gossip state per peer, in version order, one MTU per exchange — so catching
+/// up on a large small-tier state takes seconds to minutes, and under
+/// continuous writes chitchat's tombstone-grace resets can keep it from ever
+/// converging. [`crate::ClusteredStore`]'s catch-up gate (#633) keeps reads
+/// correct meanwhile by serving them through peers, but the *local* store
+/// stays incomplete the whole time.
+///
+/// This closes that: right after the listeners bind, the node pulls the whole
+/// small tier from **every** alive peer over the data plane ([`OP_SHARE_GOSSIP`]),
+/// in batched frames, concurrently, and lands each entry through
+/// [`KvRouter::apply_stamped`]. Because every node holds the whole small tier,
+/// pulling from all peers and keeping the newest stamp makes the local store
+/// as fresh as the best-informed peer in seconds — independent of, and robust
+/// to, the gossip view never converging. The redundant wire transfer (the same
+/// tier from each peer) is a bounded one-time startup cost; the receiver
+/// deduplicates by stamp, so no stale copy is ever kept.
+///
+/// Correctness, stated exactly: every entry lands through the same
+/// applied-stamp map (`apply_if_newer`) that the replication hooks, the gossip
+/// applier and the large-value handoff use, so a bulk copy only ever fills a
+/// slot this node has no newer record for. A live write that reaches the node
+/// before, during or after the pull — from a client, gossip, a replica push —
+/// is never regressed by an older bulk copy. The pull runs **concurrently with
+/// the accept loop** and does not open the catch-up gate early: live-write
+/// freshness during the remaining gossip convergence stays the gate's job, so
+/// a write made on a peer after the pull is still served through peers until
+/// gossip delivers it. This path fixes the *initial fill*, not live-write
+/// convergence (see #631's separate candidates for the latter).
+///
+/// [`OP_SHARE_GOSSIP`]: crate::kv_data_plane
+/// [`KvRouter::apply_stamped`]: crate::kv_data_plane::KvRouter::apply_stamped
+pub struct GossipBulkTransfer {
+    cluster: Arc<ClusterHandle>,
+    client: Arc<DataPlaneClient>,
+    router: KvRouter,
+    data_port: u16,
+}
+
+impl std::fmt::Debug for GossipBulkTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GossipBulkTransfer")
+            .field("data_port", &self.data_port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GossipBulkTransfer {
+    /// Build for this node. `router` must be the same router the data-plane
+    /// listener serves (its applied map installed), so a pulled entry lands
+    /// exactly as a gossip-applied or replica write would. `cipher` must match
+    /// the peers' listeners.
+    #[must_use]
+    pub fn new(
+        cluster: Arc<ClusterHandle>,
+        cipher: Option<Arc<ClusterCipher>>,
+        router: KvRouter,
+        kv: &ClusterKvConfig,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cluster,
+            client: Arc::new(DataPlaneClient::new(cipher)),
+            router,
+            data_port: kv.data_port,
+        })
+    }
+
+    /// Pull the whole small tier from every alive peer, applying each entry as
+    /// a stamped write. Stops at `deadline` with what was received kept.
+    ///
+    /// `expect_peers` says the node has join seeds: the pull then first waits
+    /// up to [`PEER_DISCOVERY_WAIT`] for gossip to list an alive peer (the same
+    /// join wait the large-value handoff uses), so a node that starts before a
+    /// gossip round completes still asks someone. The wait is **not** shortened
+    /// by `deadline`.
+    pub async fn pull(&self, deadline: Instant, expect_peers: bool) -> HandoffReport {
+        let started = Instant::now();
+        let peers = discover_peers(&self.cluster, self.data_port, expect_peers, started).await;
+        if peers.is_empty() {
+            tracing::debug!("KV gossip bulk pull: no alive peer; nothing to fill from");
+        }
+        let mut report = HandoffReport { peers: peers.len(), ..HandoffReport::default() };
+        // Every peer at once: each holds the whole tier, so the pull is bounded
+        // by the slowest peer, and `apply_stamped` keeps the newest across them.
+        let mut tasks = JoinSet::new();
+        for (peer, addr) in peers {
+            let client = Arc::clone(&self.client);
+            let router = self.router.clone();
+            tasks.spawn(async move {
+                let result = client
+                    .share_gossip_from(addr, deadline, |entry: ShareEntry| {
+                        if router
+                            .apply_stamped(
+                                &entry.transport_key,
+                                entry.value,
+                                entry.ttl_ms,
+                                entry.stamp,
+                            )
+                            .is_none()
+                        {
+                            tracing::debug!(key = %entry.transport_key, "pulled key is not routable here");
+                        }
+                    })
+                    .await;
+                (peer, addr, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((peer, addr, result)) = joined else {
+                report.failed_peers += 1;
+                continue;
+            };
+            match result {
+                Ok((keys, bytes)) => {
+                    report.keys += keys;
+                    report.bytes += bytes;
+                    tracing::debug!(peer = %peer.id, keys, bytes, "KV gossip bulk pull from peer done");
+                }
+                Err(e) => {
+                    report.failed_peers += 1;
+                    if Instant::now() >= deadline {
+                        report.timed_out = true;
+                    }
+                    tracing::warn!(peer = %peer.id, %addr, "KV gossip bulk pull from peer failed: {e:#}");
+                }
+            }
+        }
         report.elapsed = started.elapsed();
         report
     }
