@@ -10292,8 +10292,14 @@ mod tests {
                     assert_eq!(doc["status"], "ok", "{path}: {body}");
                     // The AF_UNIX tenant-fence state is always present so a
                     // fleet can assert the on-by-default fence took.
-                    assert!(doc.get("unix_fence_active").is_some_and(serde_json::Value::is_boolean), "{path}: {body}");
-                    assert!(doc.get("unix_fence_policy").is_some_and(serde_json::Value::is_string), "{path}: {body}");
+                    assert!(
+                        doc.get("unix_fence_active").is_some_and(serde_json::Value::is_boolean),
+                        "{path}: {body}"
+                    );
+                    assert!(
+                        doc.get("unix_fence_policy").is_some_and(serde_json::Value::is_string),
+                        "{path}: {body}"
+                    );
                 }
                 // 200 or 503 depending on whether a sibling test already
                 // initialized the process-global stub runtime, and on whether
