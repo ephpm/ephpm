@@ -187,6 +187,7 @@ struct Opts {
     sites_dir: Option<PathBuf>,
     directory_sites: Option<Vec<String>>,
     max_jobs_per_site: usize,
+    siteless_db_env: Vec<(String, String)>,
 }
 
 fn build(o: Opts) -> CronScheduler {
@@ -207,6 +208,7 @@ fn build(o: Opts) -> CronScheduler {
         lease: o.lease,
         cursor: o.cursor,
         executor: o.executor,
+        siteless_db_env: o.siteless_db_env,
         running: RunningState::new(o.max_concurrent),
         status: Arc::new(std::sync::Mutex::new(HashMap::new())),
     }
@@ -233,7 +235,27 @@ fn scheduler(
         sites_dir: None,
         directory_sites: Some(Vec::new()),
         max_jobs_per_site: 20,
+        siteless_db_env: Vec::new(),
     })
+}
+
+/// M3: a siteless (operator) job receives the shared wire `DB_*` in its child
+/// env; a per-site (tenant) job receives nothing — it uses its own per-site
+/// credential, never the shared one.
+#[test]
+fn siteless_job_gets_shared_db_env_but_per_site_does_not() {
+    let db_env = vec![
+        ("DB_USER".to_string(), "ephpm".to_string()),
+        ("DB_PASSWORD".to_string(), "shared-secret".to_string()),
+    ];
+
+    let siteless = every_minute_job("ops", None);
+    let req = siteless.exec_request(None, None, &db_env);
+    assert_eq!(req.extra_env, db_env, "a siteless job must receive the shared DB_*");
+
+    let tenant = every_minute_job("shop-job", Some("shop"));
+    let req = tenant.exec_request(None, None, &db_env);
+    assert!(req.extra_env.is_empty(), "a per-site job must NOT receive the shared credential");
 }
 
 async fn fire_count(s: &CronScheduler, job: &str) -> u64 {
@@ -1284,6 +1306,7 @@ fn dir_scheduler(
         sites_dir: Some(sites_dir.to_path_buf()),
         directory_sites,
         max_jobs_per_site,
+        siteless_db_env: Vec::new(),
     })
 }
 

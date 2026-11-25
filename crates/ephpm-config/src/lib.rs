@@ -3132,6 +3132,89 @@ pub struct DbConfig {
     /// Query analysis and optimization settings.
     #[serde(default)]
     pub analysis: DbAnalysisConfig,
+
+    /// Baseline authentication for the **shared** SQL wire listeners
+    /// (`[db.mysql]` proxy, and single-node / whole-database clustered
+    /// `[db.sqlite]`).
+    #[serde(default)]
+    pub wire_auth: WireAuthConfig,
+}
+
+/// Baseline authentication for the shared SQL wire listeners
+/// (`[db.wire_auth]`).
+///
+/// # What this gates
+///
+/// Three listeners historically authenticated **nobody** — anything that could
+/// reach the loopback port (including a tenant's own PHP) connected
+/// credential-free and got full read/write access to the database:
+///
+/// * the `[db.mysql]` / (unaffected: `[db.postgres]`) forwarding proxy, which
+///   read and discarded the client handshake;
+/// * single-node `[db.sqlite]` (one litewire `MySQL` frontend over the embedded
+///   Turso engine);
+/// * whole-database clustered `[db.sqlite]` (the same frontend, CDC-replicated).
+///
+/// The per-site (multi-tenant) MySQL listener is **not** gated here: it already
+/// authenticates each virtual host with its own `HMAC-SHA256(secret, site_key)`
+/// credential (see `site_wire_auth`), and this section does not change it.
+///
+/// # The default is secure (a behavior change)
+///
+/// Authentication is **required by default** ([`allow_insecure_no_auth`] is
+/// `false`). PHP keeps working transparently: the server injects the shared
+/// credential into each request's `$_SERVER` (`DB_USER` / `DB_PASSWORD` / …) the
+/// same way per-site mode injects per-site credentials, so stock `pdo_mysql`
+/// auto-discovers it. An external client with no credential — anything that is
+/// not this process's own PHP — is now refused at the handshake.
+///
+/// [`allow_insecure_no_auth`]: Self::allow_insecure_no_auth
+///
+/// # Where the credential comes from
+///
+/// In order of precedence:
+///
+/// 1. [`password`](Self::password) when set — an explicit shared password;
+/// 2. otherwise `HMAC-SHA256([kv] secret, "EPHPM:db-wire")`, hex-encoded — the
+///    same style `site_wire_auth` derives per-site passwords with, stable across
+///    restarts, which is what lets a co-located CLI authenticate;
+/// 3. otherwise a fresh per-process random credential — the listener is still
+///    authenticated and the in-process PHP still connects (the credential is
+///    injected into `$_SERVER`), but external clients and the CLI wire path
+///    cannot authenticate across restarts (the credential rotates on restart).
+///
+/// The credential is never written to the process environment (so `getenv()`
+/// cannot read it) and never logged; only per-request `$_SERVER` derivations
+/// reach PHP.
+///
+/// # Security note (config-read ⇒ impersonation)
+///
+/// With a configured `password` or a stable `[kv] secret`, anyone who can read
+/// the config file can connect to the shared listener. That is the same trust
+/// boundary `ephpm exec` and the per-site wire credential already document.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WireAuthConfig {
+    /// Opt out of authentication, restoring the pre-hardening credential-free
+    /// behavior on the shared SQL wire listeners.
+    ///
+    /// Default: `false` (authentication required). Setting `true` makes the
+    /// listeners accept any client with no credential again — intended only for
+    /// deployments where the ports are firewalled from untrusted networks and
+    /// the operator explicitly wants open loopback access (for example an
+    /// external tool that cannot carry the injected credential). Startup logs a
+    /// loud `WARN` when it is enabled.
+    #[serde(default)]
+    pub allow_insecure_no_auth: bool,
+
+    /// Explicit shared password for the wire listeners.
+    ///
+    /// When set, it is the credential PHP and external clients must present
+    /// (and the one injected into `$_SERVER`). When unset, the credential is
+    /// derived from `[kv] secret`, or — if that is also unset — generated
+    /// per-process. Never logged. Default: `None`.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Embedded `SQLite` database configuration (`[db.sqlite]`).
@@ -6919,6 +7002,57 @@ impl Config {
         // not the scheduler is enabled, so a typo in a job that is currently
         // suspended still fails startup rather than silently never firing.
         self.cron.validate(&self.server)?;
+
+        self.validate_wire_auth()?;
+
+        Ok(())
+    }
+
+    /// Validate `[db.wire_auth]` against the shared-listener configuration
+    /// (findings M2 and L2 of the F4 review).
+    ///
+    /// * **L2** — an *empty* `password` is a hard error. An operator who writes
+    ///   `password = ""` meant something; silently falling through to the
+    ///   `[kv] secret` / random credential is a no-op knob, which the repo's
+    ///   fail-closed rule forbids.
+    /// * **M2** — a `[db.mysql]` proxy with `inject_env = false` does **not**
+    ///   inject the shared `DB_*` into PHP, so the only way anything can reach the
+    ///   authenticated proxy is a credential the operator can read. With no
+    ///   explicit `password` and no `[kv] secret`, the credential is a per-process
+    ///   random value that exists nowhere an operator can read — the proxy is
+    ///   unreachable with no error. Refuse rather than come up silently broken.
+    fn validate_wire_auth(&self) -> Result<(), ConfigError> {
+        let wa = &self.db.wire_auth;
+
+        // L2: `password = ""` is never a valid credential.
+        if wa.password.as_deref().is_some_and(str::is_empty) {
+            return Err(ConfigError::Validation(
+                "[db.wire_auth] password is set to an empty string, which is not a usable \
+                 credential. Remove the key to accept the [kv] secret-derived (or per-process \
+                 random) credential, or set it to a real password."
+                    .to_string(),
+            ));
+        }
+
+        // M2: a [db.mysql] proxy with inject_env = false and an unreadable
+        // (random-fallback) credential is unreachable. `inject_env` only exists
+        // for the [db.mysql] proxy; the [db.sqlite] shared paths always inject.
+        if let Some(mysql) = self.db.mysql.as_ref()
+            && !mysql.inject_env
+            && !wa.allow_insecure_no_auth
+            && wa.password.is_none()
+            && self.kv.secret.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ConfigError::Validation(
+                "[db.mysql] inject_env = false requires an operator-readable wire credential: the \
+                 shared DB_* are not injected into PHP, and with no [db.wire_auth] password and no \
+                 [kv] secret the listener's credential is a per-process random value that exists \
+                 nowhere you can read — the proxy would be unreachable. Set [db.wire_auth] password \
+                 (or [kv] secret) so clients can authenticate, or [db.wire_auth] \
+                 allow_insecure_no_auth = true to run the proxy credential-free."
+                    .to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -10901,6 +11035,13 @@ listen = "0.0.0.0:8080"
             ),
             ("[db.read_write_split]", "[db.read_write_split]\nbogus_key = 1\n", "bogus_key"),
             ("[db.analysis]", "[db.analysis]\nbogus_key = 1\n", "bogus_key"),
+            // A misspelt `allow_insecure_no_auth` must not silently leave the
+            // shared SQL wire listeners unauthenticated.
+            (
+                "[db.wire_auth]",
+                "[db.wire_auth]\nallow_insecure_no_auths = true\n",
+                "allow_insecure_no_auths",
+            ),
             ("[kv]", "[kv]\nbogus_key = 1\n", "bogus_key"),
             ("[kv.redis_compat]", "[kv.redis_compat]\nbogus_key = 1\n", "bogus_key"),
             // A misspelt `on_shutdown` must not silently leave snapshots on
@@ -12290,6 +12431,83 @@ mysql_wire_enabled = false
         // The listen address still parses/defaults — the frontend is skipped
         // by the server, not unset in config.
         assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
+    }
+
+    /// The shared SQL wire listeners authenticate by default: `[db.wire_auth]`
+    /// defaults to `allow_insecure_no_auth = false` with no password, whether
+    /// the section is present-but-empty or omitted entirely. A regression that
+    /// flipped this default back to open access is a silent security hole.
+    #[test]
+    fn wire_auth_is_required_by_default() {
+        // Section-level default.
+        let d = WireAuthConfig::default();
+        assert!(!d.allow_insecure_no_auth, "auth must be required by default");
+        assert!(d.password.is_none(), "no shared password by default");
+
+        // Omitted entirely.
+        let cfg = load_toml("");
+        assert!(!cfg.db.wire_auth.allow_insecure_no_auth);
+        assert!(cfg.db.wire_auth.password.is_none());
+
+        // The opt-out and an explicit password both round-trip.
+        let cfg =
+            load_toml("[db.wire_auth]\nallow_insecure_no_auth = true\npassword = \"s3cret\"\n");
+        assert!(cfg.db.wire_auth.allow_insecure_no_auth);
+        assert_eq!(cfg.db.wire_auth.password.as_deref(), Some("s3cret"));
+    }
+
+    /// L2: an empty `[db.wire_auth] password` must fail startup rather than
+    /// silently fall through to the derived/random credential (no-op knob).
+    #[test]
+    fn empty_wire_auth_password_is_a_startup_error() {
+        let err = load_toml("[db.wire_auth]\npassword = \"\"\n")
+            .validate()
+            .expect_err("an empty password must be rejected")
+            .to_string();
+        assert!(err.contains("[db.wire_auth] password"), "error should name the key: {err}");
+        assert!(err.contains("empty"), "error should explain the emptiness: {err}");
+    }
+
+    /// M2: `[db.mysql] inject_env = false` with no operator-readable credential
+    /// (no password, no `[kv] secret`) makes the authenticated proxy unreachable
+    /// — a hard startup error, not a silent come-up.
+    #[test]
+    fn mysql_inject_env_false_without_readable_credential_is_rejected() {
+        let err =
+            load_toml("[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\ninject_env = false\n")
+                .validate()
+                .expect_err("an unreachable proxy must be rejected")
+                .to_string();
+        assert!(err.contains("inject_env = false"), "error should name the trigger: {err}");
+        assert!(err.contains("[db.wire_auth] password"), "error should name the fix: {err}");
+    }
+
+    /// M2: any operator-readable credential (explicit password, `[kv] secret`) —
+    /// or the explicit opt-out — makes `inject_env = false` acceptable. Default
+    /// `inject_env = true` is fine regardless (PHP gets the shared `DB_*`).
+    #[test]
+    fn mysql_inject_env_false_with_a_readable_credential_is_accepted() {
+        const URL: &str = "[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\n";
+
+        // Explicit password.
+        load_toml(&format!("{URL}inject_env = false\n[db.wire_auth]\npassword = \"shared-pw\"\n"))
+            .validate()
+            .expect("an explicit password satisfies M2");
+
+        // A stable [kv] secret (the credential is derivable).
+        load_toml(&format!("[kv]\nsecret = \"s\"\n{URL}inject_env = false\n"))
+            .validate()
+            .expect("a [kv] secret satisfies M2");
+
+        // The explicit opt-out (credential-free is a deliberate choice).
+        load_toml(&format!(
+            "{URL}inject_env = false\n[db.wire_auth]\nallow_insecure_no_auth = true\n"
+        ))
+        .validate()
+        .expect("the opt-out satisfies M2");
+
+        // Default inject_env = true injects DB_* into PHP, so it is always fine.
+        load_toml(URL).validate().expect("inject_env defaults to true and is reachable");
     }
 
     /// A stale `[db.sqlite.sqld]` block from a pre-v0.7.0 config must still

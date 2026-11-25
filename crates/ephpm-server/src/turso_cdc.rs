@@ -579,7 +579,7 @@ mod serde_bytes_opt {
 /// Returns an error if either factory cannot open, if the elected role
 /// requires a peer address that isn't configured, or if the cluster
 /// channel is not available (indicating a startup ordering bug).
-pub async fn start_clustered_turso_cdc(
+pub(crate) async fn start_clustered_turso_cdc(
     sqlite_config: &SqliteConfig,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
     channel_handle: Option<&ephpm_cluster::ChannelHandle>,
@@ -595,6 +595,10 @@ pub async fn start_clustered_turso_cdc(
     // canonical primary flag for this path — the stream handlers and head
     // sampler read it too.
     primary_view: Arc<AtomicBool>,
+    // Baseline authentication for this shared MySQL wire listener (finding F4).
+    // Resolved once in `serve()` so the listener and the router's $_SERVER
+    // injection present the same credential.
+    shared_wire: &crate::wire_auth::SharedWireAuth,
 ) -> anyhow::Result<()> {
     let cluster = cluster.context(
         "clustered Turso CDC replication requires [cluster] enabled = true; \
@@ -612,6 +616,12 @@ pub async fn start_clustered_turso_cdc(
     crate::probe_sqlite_listeners(&crate::sqlite_frontend_addrs(&sqlite_config.proxy))
         .await
         .context("cannot start the embedded database's wire listeners")?;
+
+    // Fail closed before election/bootstrap if authentication is required and a
+    // frontend litewire cannot authenticate is configured (finding F4).
+    if shared_wire.is_required() {
+        crate::reject_unauthenticatable_sqlite_frontends(&sqlite_config.proxy, "clustered")?;
+    }
 
     tracing::warn!(
         engine = "turso",
@@ -845,6 +855,7 @@ pub async fn start_clustered_turso_cdc(
         crate::share_backend_with_php(locked),
         log_failed_sql,
         handles,
+        shared_wire,
     );
 
     // Kick off role-appropriate work for the initial role.
@@ -3763,33 +3774,71 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
     // logs the raw failing SQL (truncated) at WARN — see the config doc comment.
     log_failed_sql: bool,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    // Finding F4: baseline client authentication. When required, the MySQL
+    // frontend authenticates against the shared credential and the (already
+    // rejected-if-present, see the caller) Hrana/PostgreSQL/TDS frontends stay
+    // off; the opt-out keeps the historical fixed-backend, all-frontends shape.
+    shared_wire: &crate::wire_auth::SharedWireAuth,
 ) {
+    let proxy = &sqlite_config.proxy;
+
+    // Authenticated: MySQL frontend only, with_authenticator binding this one
+    // backend to every connection that proves the shared credential.
+    if shared_wire.is_required() {
+        let shared = Arc::new(backend) as litewire::backend::SharedBackend;
+        let authenticator =
+            shared_wire.authenticator(shared).expect("is_required() => authenticator() is Some");
+        let mut builder = litewire::LiteWire::with_authenticator(authenticator);
+        if log_failed_sql {
+            builder = builder.log_failed_sql(true);
+        }
+        builder = builder.mysql(&proxy.mysql_listen);
+        if proxy.max_connections > 0 {
+            builder = builder.max_connections(proxy.max_connections);
+        }
+        tracing::info!(
+            listen = %proxy.mysql_listen,
+            "SQLite MySQL wire protocol enabled (CDC-replicated Turso; authenticated with the \
+             shared [db.wire_auth] credential, injected into PHP's $_SERVER)"
+        );
+        handles.push(tokio::spawn(async move {
+            match builder.serve().await {
+                Ok(()) => tracing::info!("litewire stopped (CDC-replicated Turso)"),
+                Err(e) => tracing::error!("litewire error (CDC-replicated Turso): {e:#}"),
+            }
+        }));
+        return;
+    }
+
+    // Opt-out: the historical fixed-backend shape over every configured
+    // frontend, with no credential (the loud WARN was emitted at resolution).
     let mut builder = litewire::LiteWire::new(backend);
     if log_failed_sql {
         builder = builder.log_failed_sql(true);
     }
-    builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
+    builder = builder.mysql(&proxy.mysql_listen);
     tracing::info!(
-        listen = %sqlite_config.proxy.mysql_listen,
-        "SQLite MySQL wire protocol enabled (CDC-replicated Turso)"
+        listen = %proxy.mysql_listen,
+        "SQLite MySQL wire protocol enabled (CDC-replicated Turso; UNAUTHENTICATED — \
+         allow_insecure_no_auth)"
     );
 
-    if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
+    if let Some(ref hrana_addr) = proxy.hrana_listen {
         builder = builder.hrana(hrana_addr);
         tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled (CDC-replicated Turso)");
     }
-    if let Some(ref pg_addr) = sqlite_config.proxy.postgres_listen {
+    if let Some(ref pg_addr) = proxy.postgres_listen {
         builder = builder.postgres(pg_addr);
         tracing::info!(listen = %pg_addr, "SQLite PostgreSQL wire protocol enabled (CDC-replicated Turso)");
     }
-    if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
+    if let Some(ref tds_addr) = proxy.tds_listen {
         builder = builder.tds(tds_addr);
         tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled (CDC-replicated Turso)");
     }
-    if sqlite_config.proxy.max_connections > 0 {
-        builder = builder.max_connections(sqlite_config.proxy.max_connections);
+    if proxy.max_connections > 0 {
+        builder = builder.max_connections(proxy.max_connections);
         tracing::info!(
-            max_connections = sqlite_config.proxy.max_connections,
+            max_connections = proxy.max_connections,
             "SQLite wire frontends: connection cap enabled (CDC-replicated Turso)"
         );
     }

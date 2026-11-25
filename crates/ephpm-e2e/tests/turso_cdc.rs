@@ -91,6 +91,14 @@ path = "{DATA_DIR}/cdc.db"
 mysql_listen = "127.0.0.1:{MYSQL_PORT}"
 hrana_listen = "127.0.0.1:{HRANA_PORT}"
 
+# The shared SQL wire listeners authenticate by default ([db.wire_auth],
+# finding F4). litewire gates only the MySQL frontend, so a node also serving
+# hrana fails closed at startup (clustered mode) unless auth is turned off.
+# This suite tests CDC failover over the Hrana HTTP API without credentials,
+# so opt the listeners back to open loopback access.
+[db.wire_auth]
+allow_insecure_no_auth = true
+
 {REPLICATION_BLOCK}
 
 [cluster]

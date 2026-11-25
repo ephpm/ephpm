@@ -5,8 +5,12 @@
  * Connects to the litewire MySQL wire protocol frontend using PDO,
  * creates a table, inserts data, queries it, and returns JSON results.
  *
- * Expects DB_HOST and DB_PORT environment variables (set by ephpm
- * when [db.sqlite] is configured).
+ * Reads the DB connection parameters ephpm injects into $_SERVER when
+ * [db.sqlite] is configured: DB_HOST, DB_PORT, and — now that the shared
+ * MySQL wire listener authenticates by default ([db.wire_auth]) — DB_USER and
+ * DB_PASSWORD. ePHPm registers these as $_SERVER entries (not into the process
+ * environment), so getenv() does NOT see them; read $_SERVER first and fall
+ * back only for an older binary that injected nothing.
  *
  * Usage: GET /sqlite_test.php?action=<action>
  *   - setup:   CREATE TABLE + INSERT test data
@@ -17,15 +21,25 @@
 
 header('Content-Type: application/json');
 
-$host = getenv('DB_HOST') ?: '127.0.0.1';
-$port = getenv('DB_PORT') ?: '3306';
+function db_var(string $key, string $default): string {
+    if (isset($_SERVER[$key]) && $_SERVER[$key] !== '') {
+        return (string) $_SERVER[$key];
+    }
+    $v = getenv($key);
+    return ($v !== false && $v !== '') ? $v : $default;
+}
+
+$host = db_var('DB_HOST', '127.0.0.1');
+$port = db_var('DB_PORT', '3306');
+$user = db_var('DB_USER', 'root');
+$pass = db_var('DB_PASSWORD', '');
 $action = $_GET['action'] ?? 'query';
 
 try {
     $pdo = new PDO(
         "mysql:host={$host};port={$port}",
-        'root',
-        '',
+        $user,
+        $pass,
         [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
     );
 

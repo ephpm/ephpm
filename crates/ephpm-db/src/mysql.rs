@@ -9,8 +9,11 @@
 //! 2. When PHP connects to the proxy (e.g. `127.0.0.1:3306`), the proxy:
 //!    a. Sends a synthetic `HandshakeV10` to the client (using saved server
 //!    metadata and a fresh 20-byte challenge).
-//!    b. Reads the client's `HandshakeResponse41` and accepts it without
-//!    credential validation — the proxy port only listens on loopback.
+//!    b. Reads the client's `HandshakeResponse41` and, unless the operator
+//!    opted out (`[db.wire_auth] allow_insecure_no_auth = true`), verifies the
+//!    `mysql_native_password` scramble against the shared wire credential
+//!    *before* handing out a backend (see [`ClientAuth`]). A bad credential
+//!    gets `ER_ACCESS_DENIED_ERROR` and a closed connection.
 //!    c. Sends an `OK` packet.
 //!    d. Starts bidirectional byte forwarding between the client and a
 //!    checked-out backend connection.
@@ -169,6 +172,85 @@ pub struct MySqlProxy {
     /// [`QueryStats::is_enabled`] so `[db.analysis] query_stats = false`
     /// leaves the forwarding paths byte-for-byte as they were.
     stats: QueryStats,
+    /// Baseline client authentication. `Some` = verify the client's
+    /// `mysql_native_password` response against the shared credential before
+    /// forwarding (the default, `[db.wire_auth] allow_insecure_no_auth =
+    /// false`); `None` = accept any client credential-free (the historical
+    /// behavior, now an explicit opt-out).
+    client_auth: Option<ClientAuth>,
+}
+
+/// Verifier for the `mysql_native_password` response a PHP (or other) client
+/// sends to the proxy's synthetic handshake.
+///
+/// # Why the proxy authenticates its *client*
+///
+/// The proxy already authenticates to the real upstream with the `[db.mysql]`
+/// URL's credentials; those never reach the client. What was missing was a
+/// gate on the *inbound* side: the listener read and discarded the client's
+/// handshake, so any process that could reach the loopback port (a tenant's
+/// own PHP included) got full read/write access to the backend. This restores
+/// the inbound gate with a single shared credential — see
+/// [`WireAuthConfig`](ephpm_config::WireAuthConfig).
+///
+/// The client username is **not** checked: the secret is the password. A
+/// framework may send any `DB_USER`; only the scramble response is verified.
+#[derive(Clone)]
+pub struct ClientAuth {
+    /// `SHA1(SHA1(password))` — the value a real MySQL server stores for an
+    /// account, and all that is needed to verify a native-password scramble.
+    double_sha1: [u8; 20],
+}
+
+impl ClientAuth {
+    /// Build a verifier for the shared wire password.
+    #[must_use]
+    pub fn from_password(password: &str) -> Self {
+        let stage1: [u8; 20] = Sha1::digest(password.as_bytes()).into();
+        let double_sha1: [u8; 20] = Sha1::digest(stage1).into();
+        Self { double_sha1 }
+    }
+
+    /// Whether `auth_response` proves knowledge of the password for `salt`.
+    ///
+    /// `mysql_native_password`:
+    /// `auth_response = SHA1(password) XOR SHA1(salt ++ SHA1(SHA1(password)))`.
+    /// We hold `SHA1(SHA1(password))`, so we recompute the mask, recover the
+    /// claimed `SHA1(password)`, and check it hashes back to what we hold. An
+    /// empty response (a client that sent no password) fails the length gate.
+    #[must_use]
+    fn verify(&self, salt: &[u8], auth_response: &[u8]) -> bool {
+        if auth_response.len() != 20 {
+            return false;
+        }
+        let mut h = Sha1::new();
+        h.update(salt);
+        h.update(self.double_sha1);
+        let mask = h.finalize();
+        let mut stage1 = [0u8; 20];
+        for i in 0..20 {
+            stage1[i] = auth_response[i] ^ mask[i];
+        }
+        let check: [u8; 20] = Sha1::digest(stage1).into();
+        constant_time_eq(&check, &self.double_sha1)
+    }
+}
+
+/// Constant-time 20-byte comparison (both inputs are fixed-length digests).
+fn constant_time_eq(a: &[u8; 20], b: &[u8; 20]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..20 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// A parsed `HandshakeResponse41` — only the fields the proxy needs.
+struct ClientHandshake {
+    /// Client-supplied username (for the access-denied message and logging).
+    username: String,
+    /// The `mysql_native_password` scramble, or empty if the client sent none.
+    auth_response: Vec<u8>,
 }
 
 impl MySqlProxy {
@@ -206,6 +288,9 @@ impl MySqlProxy {
             stats,
             health,
             RetryBudget::Bounded(10),
+            // The eager constructor is used only by tests, which exercise
+            // forwarding, not the inbound auth gate.
+            None,
         )
         .await
     }
@@ -225,6 +310,7 @@ impl MySqlProxy {
         stats: QueryStats,
         health: Arc<ProxyHealth>,
         retry: RetryBudget,
+        client_auth: Option<ClientAuth>,
     ) -> Result<Self, DbError> {
         // Establish a single connection to capture server metadata.
         //
@@ -324,6 +410,7 @@ impl MySqlProxy {
             reset_strategy,
             rw_split,
             stats,
+            client_auth,
         })
     }
 
@@ -397,8 +484,26 @@ impl MySqlProxy {
         let challenge = fresh_challenge();
         send_greeting(&mut client, &self.meta, &challenge).await?;
 
-        // Step 2: read and discard client handshake response (no auth validation).
-        read_client_handshake(&mut client).await?;
+        // Step 2: read the client handshake response.
+        let handshake = read_client_handshake(&mut client).await?;
+
+        // Step 2b: authenticate the client against the shared wire credential,
+        // BEFORE handing it a backend. `None` is the explicit opt-out
+        // (`[db.wire_auth] allow_insecure_no_auth = true`), which keeps the old
+        // credential-free behavior.
+        if let Some(auth) = &self.client_auth
+            && !auth.verify(&challenge, &handshake.auth_response)
+        {
+            let peer = client.peer_addr().ok();
+            warn!(
+                ?peer,
+                user = %handshake.username,
+                "MySQL proxy: client authentication failed — refusing the connection"
+            );
+            // Best-effort ERR; the connection is closed either way.
+            let _ = send_access_denied(&mut client, &handshake.username).await;
+            return Ok(());
+        }
 
         // Step 3: send OK to PHP.
         send_ok(&mut client).await?;
@@ -1100,13 +1205,97 @@ async fn send_greeting(
     write_packet(client, 0, &payload).await
 }
 
-/// Read and discard the client's `HandshakeResponse41`.
+/// Read the client's `HandshakeResponse41` and extract the username and the
+/// `mysql_native_password` scramble.
 ///
-/// We accept any credentials from loopback clients without validation.
-async fn read_client_handshake(client: &mut TcpStream) -> Result<(), DbError> {
-    let (_, _payload) = read_packet(client).await?;
-    // Future: extract username/database from payload for logging.
-    Ok(())
+/// Whether the scramble is *checked* is decided by the caller
+/// ([`MySqlProxy::client_auth`]); this only parses. The greeting we sent
+/// advertises `mysql_native_password`, so a conforming client answers with
+/// that plugin's 20-byte scramble (or an empty response when it has no
+/// password).
+async fn read_client_handshake(client: &mut TcpStream) -> Result<ClientHandshake, DbError> {
+    let (_, payload) = read_packet(client).await?;
+    Ok(parse_handshake_response(&payload))
+}
+
+/// Parse the fields of a `HandshakeResponse41` the proxy's client auth needs.
+///
+/// Layout: 4-byte capability flags, 4-byte max packet, 1-byte charset, 23
+/// reserved, NUL-terminated username, then the auth response whose framing
+/// depends on the client's capability flags. A malformed/truncated packet
+/// yields an empty `auth_response`, which fails verification (fail closed).
+fn parse_handshake_response(payload: &[u8]) -> ClientHandshake {
+    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
+    let empty = |username: String| ClientHandshake { username, auth_response: Vec::new() };
+
+    if payload.len() < 32 {
+        return empty(String::new());
+    }
+    let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+    // Username: NUL-terminated string starting at offset 32.
+    let rest = &payload[32..];
+    let Some(nul) = rest.iter().position(|&b| b == 0) else {
+        return empty(String::new());
+    };
+    let username = String::from_utf8_lossy(&rest[..nul]).into_owned();
+    let after_user = &rest[nul + 1..];
+
+    // Auth response framing.
+    let auth_response = if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        read_lenenc_bytes(after_user)
+    } else if caps & CLIENT_SECURE_CONNECTION != 0 {
+        // 1-byte length prefix.
+        match after_user.split_first() {
+            Some((&len, tail)) if (len as usize) <= tail.len() => tail[..len as usize].to_vec(),
+            _ => Vec::new(),
+        }
+    } else {
+        // NUL-terminated (pre-4.1 clients — not expected, handled for safety).
+        let end = after_user.iter().position(|&b| b == 0).unwrap_or(after_user.len());
+        after_user[..end].to_vec()
+    };
+
+    ClientHandshake { username, auth_response }
+}
+
+/// Read a length-encoded-integer-prefixed byte string, returning its bytes.
+///
+/// Handles the common 1-byte length (`< 0xFB`, which covers the 20-byte
+/// native-password scramble) and the `0xFC`/`0xFD`/`0xFE` multi-byte prefixes;
+/// returns empty on `0xFB` (NULL) or any truncation.
+fn read_lenenc_bytes(buf: &[u8]) -> Vec<u8> {
+    let Some((&first, tail)) = buf.split_first() else {
+        return Vec::new();
+    };
+    let (len, data) = match first {
+        0xFB => return Vec::new(), // NULL
+        0xFC => {
+            if tail.len() < 2 {
+                return Vec::new();
+            }
+            (u16::from_le_bytes([tail[0], tail[1]]) as usize, &tail[2..])
+        }
+        0xFD => {
+            if tail.len() < 3 {
+                return Vec::new();
+            }
+            (u32::from_le_bytes([tail[0], tail[1], tail[2], 0]) as usize, &tail[3..])
+        }
+        0xFE => {
+            if tail.len() < 8 {
+                return Vec::new();
+            }
+            let n = u64::from_le_bytes([
+                tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7],
+            ]);
+            (usize::try_from(n).unwrap_or(0), &tail[8..])
+        }
+        n => (n as usize, tail),
+    };
+    if len <= data.len() { data[..len].to_vec() } else { Vec::new() }
 }
 
 /// Send an `OK_Packet` to the client.
@@ -1114,6 +1303,25 @@ async fn send_ok(client: &mut TcpStream) -> Result<(), DbError> {
     // 0x00=OK, affected_rows=0, last_insert_id=0, status=AUTOCOMMIT, warnings=0
     let ok = [0x00u8, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
     write_packet(client, 2, &ok).await
+}
+
+/// Send an `ERR_Packet` (1045 `ER_ACCESS_DENIED_ERROR`) in reply to a failed
+/// client authentication, then let the caller close the connection.
+///
+/// A real MySQL server answers a bad password with exactly this error, so
+/// drivers (PDO, mysqli, mysql CLI) surface a clean "Access denied" instead of
+/// a protocol error.
+async fn send_access_denied(client: &mut TcpStream, user: &str) -> Result<(), DbError> {
+    let mut payload = Vec::with_capacity(48);
+    payload.push(0xFF); // ERR marker
+    payload.extend_from_slice(&1045u16.to_le_bytes()); // ER_ACCESS_DENIED_ERROR
+    payload.push(b'#'); // SQL-state marker
+    payload.extend_from_slice(b"28000"); // SQL state
+    payload.extend_from_slice(
+        format!("Access denied for user '{user}' (using password: YES)").as_bytes(),
+    );
+    // Sequence 2: greeting was 0, the client's response was 1.
+    write_packet(client, 2, &payload).await
 }
 
 // ── Reset & health check ──────────────────────────────────────────────────────
@@ -2192,6 +2400,7 @@ pub async fn spawn_deferred(
     rw_split: RwSplitParams,
     stats: QueryStats,
     health: Arc<ProxyHealth>,
+    client_auth: Option<ClientAuth>,
 ) -> Result<tokio::task::JoinHandle<()>, DbError> {
     // Parse before binding: a malformed URL must fail startup with nothing
     // bound.
@@ -2207,6 +2416,7 @@ pub async fn spawn_deferred(
         rw_split,
         stats,
         health,
+        client_auth,
     )
 }
 
@@ -2231,6 +2441,7 @@ pub fn spawn_deferred_on(
     rw_split: RwSplitParams,
     stats: QueryStats,
     health: Arc<ProxyHealth>,
+    client_auth: Option<ClientAuth>,
 ) -> Result<tokio::task::JoinHandle<()>, DbError> {
     let db_url = Arc::new(DbUrl::parse(url)?);
     let listen_owned = listener.local_addr()?.to_string();
@@ -2261,6 +2472,7 @@ pub fn spawn_deferred_on(
             stats,
             health,
             RetryBudget::Unbounded,
+            client_auth,
         )
         .await
         {
@@ -3261,6 +3473,98 @@ mod tests {
         assert!(contains_ascii_ignore_case("select * from t for update", "FOR UPDATE"));
         assert!(contains_ascii_ignore_case("SELECT ... For Update", "FOR UPDATE"));
         assert!(contains_ascii_ignore_case("SELECT ... FOR share", "FOR SHARE"));
+    }
+
+    // ── client wire authentication ──────────────────────────────────────
+
+    /// Build the `mysql_native_password` scramble a real client would send for
+    /// `password` under `salt` — the inverse of what [`ClientAuth::verify`]
+    /// checks.
+    fn client_scramble(password: &str, salt: &[u8]) -> Vec<u8> {
+        let stage1: [u8; 20] = Sha1::digest(password.as_bytes()).into();
+        let stage2: [u8; 20] = Sha1::digest(stage1).into();
+        let mut h = Sha1::new();
+        h.update(salt);
+        h.update(stage2);
+        let mask = h.finalize();
+        stage1.iter().zip(mask).map(|(s, m)| s ^ m).collect()
+    }
+
+    #[test]
+    fn client_auth_accepts_the_right_password() {
+        let salt = [7u8; 20];
+        let auth = ClientAuth::from_password("s3cret");
+        assert!(auth.verify(&salt, &client_scramble("s3cret", &salt)));
+    }
+
+    #[test]
+    fn client_auth_rejects_wrong_password_and_empty_response() {
+        let salt = [7u8; 20];
+        let auth = ClientAuth::from_password("s3cret");
+        assert!(!auth.verify(&salt, &client_scramble("not-it", &salt)), "wrong password");
+        assert!(!auth.verify(&salt, b""), "a credential-free client (empty response) is refused");
+        assert!(!auth.verify(&salt, &[0u8; 19]), "a short response is refused");
+    }
+
+    #[test]
+    fn client_auth_rejects_response_under_wrong_salt() {
+        // Replay with a stale salt must fail — the salt is mixed into the mask.
+        let auth = ClientAuth::from_password("s3cret");
+        let scramble = client_scramble("s3cret", &[1u8; 20]);
+        assert!(!auth.verify(&[2u8; 20], &scramble));
+    }
+
+    /// Build a `HandshakeResponse41` with the given capability flags, username
+    /// and secure-connection (1-byte-length) auth response.
+    fn handshake_secure(caps: u32, user: &str, auth: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&caps.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes()); // max packet
+        p.push(33); // charset
+        p.extend_from_slice(&[0u8; 23]); // reserved
+        p.extend_from_slice(user.as_bytes());
+        p.push(0); // NUL
+        p.push(u8::try_from(auth.len()).unwrap());
+        p.extend_from_slice(auth);
+        p
+    }
+
+    #[test]
+    fn parse_handshake_extracts_user_and_secure_auth() {
+        const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+        let salt = [9u8; 20];
+        let scramble = client_scramble("pw", &salt);
+        let payload = handshake_secure(CLIENT_SECURE_CONNECTION, "appuser", &scramble);
+        let hs = parse_handshake_response(&payload);
+        assert_eq!(hs.username, "appuser");
+        assert_eq!(hs.auth_response, scramble);
+        assert!(ClientAuth::from_password("pw").verify(&salt, &hs.auth_response));
+    }
+
+    #[test]
+    fn parse_handshake_extracts_lenenc_auth() {
+        const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+        let salt = [3u8; 20];
+        let scramble = client_scramble("pw", &salt);
+        // lenenc: a 20-byte string encodes its length as a single byte (< 0xFB).
+        let mut p = Vec::new();
+        p.extend_from_slice(&CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.push(33);
+        p.extend_from_slice(&[0u8; 23]);
+        p.extend_from_slice(b"u\0");
+        p.push(u8::try_from(scramble.len()).unwrap());
+        p.extend_from_slice(&scramble);
+        let hs = parse_handshake_response(&p);
+        assert_eq!(hs.username, "u");
+        assert_eq!(hs.auth_response, scramble);
+    }
+
+    #[test]
+    fn parse_handshake_truncated_yields_empty_auth() {
+        let no_auth: [u8; 0] = [];
+        assert_eq!(parse_handshake_response(&[0u8; 10]).auth_response, no_auth);
+        assert_eq!(parse_handshake_response(&[]).auth_response, no_auth);
     }
 
     #[test]

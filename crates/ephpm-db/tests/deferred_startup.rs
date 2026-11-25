@@ -192,6 +192,7 @@ async fn spawn_proxy(upstream: SocketAddr) -> (String, Arc<ProxyHealth>) {
         RwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
         ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
         Arc::clone(&health),
+        None,
     )
     .expect("spawn_deferred_on must succeed without a reachable upstream");
     (listen, health)
@@ -351,6 +352,7 @@ async fn bind_failure_is_an_error_not_a_warning() {
         RwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
         ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
         health,
+        None,
     )
     .await;
 
@@ -376,6 +378,7 @@ async fn malformed_url_is_an_error() {
         RwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
         ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
         health,
+        None,
     )
     .await;
 

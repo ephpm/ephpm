@@ -125,7 +125,7 @@ HTTP/2 and HTTP/3 streams are framed independently, so a malformed request there
    - **Your SQL is normalized and exported.** Literals are replaced with `?`, the result is truncated to 64 characters and emitted as the `digest` Prometheus label, and slow queries are logged at WARN. Parameter *values* are never included — the normalizer strips them — but table, column, and query shape are visible to anyone who can read `/metrics` or the logs. "Anyone who can read `/metrics`" can be broad: the endpoint answers for every `Host` and is matched before `trusted_hosts`, `blocked_paths` and middleware, and on a single-site node its IP ACL is open by default. On a multi-site node it (and `/_ephpm/requests`) answers `403` until a `token` or an mTLS listener is configured. See [HTTP Endpoints → Exposure](/reference/http-endpoints/#exposure-read-this-first) for what they reveal and how to restrict them.
    - **Session state is reset between application connections** according to `[db.*] reset_strategy` (default `"smart"` — reset after any non-SELECT).
 
-   Whether the embedded-SQLite listeners authenticate depends on the mode. In **single-site** mode they do not — they assume only PHP inside this process reaches them, so bind them to loopback. In **multi-tenant** mode (`[server] sites_dir` with `[db.sqlite]`) the MySQL listener does: a connection must answer a `mysql_native_password` challenge for the site key it claims, and the connection's database is fixed by the credential it authenticated with, not by anything it asserts. See [DB Proxy Security](#db-proxy-security-implemented) below. The in-process [`ephpm_db_*` bridge](/guides/db-from-php/) skips the socket entirely and is reachable by any PHP code in the request.
+   The MySQL wire listeners authenticate by default in **every** mode. In **multi-tenant** mode (`[server] sites_dir` with `[db.sqlite]`) each connection answers a `mysql_native_password` challenge for its *own* site key (per-vhost credential). In **single-database** mode (single-site, or whole-database clustered `[db.sqlite]`, and the `[db.mysql]` proxy) one server-level credential gates the listener (`[db.wire_auth]`, finding F4); it is injected into `$_SERVER` so `pdo_mysql` authenticates transparently, and a credential-free client is refused. Set `[db.wire_auth] allow_insecure_no_auth = true` to restore the old open-loopback behavior (a loud startup `WARN`). See [DB Proxy Security](#db-proxy-security-implemented) below. The in-process [`ephpm_db_*` bridge](/guides/db-from-php/) skips the socket entirely and is reachable by any PHP code in the request.
 
 ---
 
@@ -305,10 +305,32 @@ multi-tenant guarantee gets misread in both directions:
   disk and never exposed to PHP; each site's own password is injected into that
   site's `$_SERVER` per request. Hrana, PostgreSQL, and TDS stay **off** in this
   mode — they cannot bind a backend per connection.
-- **Single-site: unauthenticated.** With no `sites_dir` there is one database
-  and one tenant, so the listeners (MySQL, Hrana, PostgreSQL, TDS) perform no
-  authentication and assume only PHP inside this process reaches them. A
-  non-loopback bind logs a warning but is not blocked.
+- **Single-database (single-site, and whole-database clustered): the MySQL
+  listener is authenticated by default** (`[db.wire_auth]`, finding F4). A
+  single server-level credential gates the shared MySQL frontend before a
+  client reaches the backend: `[db.wire_auth] password` when set, else
+  `HMAC-SHA256([kv] secret, "EPHPM:db-wire")`, else a per-process random value.
+  It is injected into every request's `$_SERVER` (`DB_USER` / `DB_PASSWORD` /
+  `DATABASE_URL`), never into the process environment and never logged, so
+  stock `pdo_mysql` authenticates transparently while an external
+  credential-free client is refused at the handshake. The Hrana / PostgreSQL /
+  TDS frontends cannot be authenticated (litewire authenticates only MySQL), so
+  configuring one while authentication is required is a **startup error** that
+  names the opt-out. Set `[db.wire_auth] allow_insecure_no_auth = true` to
+  restore the old credential-free behavior (a loud `WARN` at startup); it is
+  intended only for firewalled deployments. A non-loopback bind still logs a
+  warning.
+- **The `[db.mysql]` / `[db.postgres]` forwarding proxy** is covered the same
+  way for MySQL: the proxy verifies the client's `mysql_native_password`
+  response against the shared credential before forwarding, and injects that
+  credential (not the backend account) into `$_SERVER`. (`[db.postgres]` is not
+  yet gated by the shared credential.)
+- **Multi-tenant shared listener is a misconfiguration.** `[server] sites_dir`
+  together with a shared listener (`[db.mysql]`, or whole-database clustered
+  `[db.sqlite]`) gives every tenant the **same** database with no isolation —
+  the shared credential authenticates the server, not a tenant. Startup warns
+  loudly; use per-site mode (`[db.sqlite]` with `dir` set) for per-tenant
+  databases and per-tenant credentials.
 
 ---
 

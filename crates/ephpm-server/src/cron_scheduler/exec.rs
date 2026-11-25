@@ -58,6 +58,16 @@ pub struct ExecRequest {
     /// (`bin/cake.php`) resolves against the site root rather than the server's
     /// cwd. `Some(site_root)` for a per-site job, `None` (inherit) otherwise.
     pub cwd: Option<PathBuf>,
+    /// Extra environment variables to set on the child process (finding M3).
+    ///
+    /// Carries the shared wire listener's `DB_*` for **siteless (operator)** jobs
+    /// only, so an operator's own `pdo_mysql` cron script authenticates to the
+    /// now-required-by-default shared listener the same way an HTTP request does.
+    /// **Empty for per-site (tenant) jobs** — a tenant job authenticates with its
+    /// own per-site credential (`ephpm php --site` injects it), never the shared
+    /// one. Applied via `Command::env`, so it never enters this process's
+    /// environment, argv or logs.
+    pub extra_env: Vec<(String, String)>,
     /// Wall-clock cap.
     pub timeout: Duration,
     /// Resolved memory ceiling in bytes (`None` ⇒ none). On a binary child it
@@ -208,9 +218,10 @@ impl JobExecutor for ChildExecutor {
     ) -> Pin<Box<dyn Future<Output = RunOutcome> + Send + 'a>> {
         let (program, args) = build_argv(&req, &self.exe);
         let cwd = req.cwd.clone();
-        Box::pin(
-            async move { run_child(&program, &args, cwd.as_deref(), req.timeout, &cancel).await },
-        )
+        let extra_env = req.extra_env.clone();
+        Box::pin(async move {
+            run_child(&program, &args, cwd.as_deref(), &extra_env, req.timeout, &cancel).await
+        })
     }
 }
 
@@ -218,11 +229,16 @@ impl JobExecutor for ChildExecutor {
 /// `cwd`, when set, is the child's working directory (a per-site job's site
 /// root, so relative script paths resolve there, not against the server's cwd).
 ///
+/// `extra_env` sets additional variables on the child via `Command::env` — the
+/// shared wire `DB_*` for siteless operator jobs (finding M3), empty otherwise;
+/// child-only, so they never enter this process's environment, argv or logs.
+///
 /// stdout/stderr are inherited so a job's output reaches the server's logs.
 pub async fn run_child(
     program: &std::path::Path,
     args: &[String],
     cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> RunOutcome {
@@ -230,6 +246,9 @@ pub async fn run_child(
     cmd.args(args).stdin(Stdio::null());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
     cmd.kill_on_drop(true);
 
@@ -302,6 +321,7 @@ mod tests {
             command: vec!["maintenance".into(), "--sweep".into()],
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
@@ -320,6 +340,7 @@ mod tests {
             command: vec!["wp".into(), "cron".into(), "event".into()],
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
@@ -356,6 +377,7 @@ mod tests {
             command: vec!["artisan.php".into(), "schedule:run".into()],
             config_path: Some(PathBuf::from("/c.toml")),
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
@@ -395,6 +417,7 @@ mod tests {
             command: vec!["daily/cleanup.php".into()],
             config_path: None,
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
@@ -417,6 +440,7 @@ mod tests {
             command: vec!["cron.php".into()],
             config_path: Some(PathBuf::from("/c.toml")),
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: Some(512 * 1024 * 1024),
             cpu_secs: Some(90),
@@ -458,6 +482,7 @@ mod tests {
             command: vec!["wp".into(), "cron".into(), "event".into()],
             config_path: None,
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: Some(256 * 1024 * 1024),
             cpu_secs: Some(30),
@@ -495,6 +520,7 @@ mod tests {
             std::path::Path::new(ok_prog),
             &ok_args,
             None,
+            &[],
             Duration::from_secs(10),
             &cancel,
         )
@@ -509,6 +535,7 @@ mod tests {
             std::path::Path::new(bad_prog),
             &bad_args,
             None,
+            &[],
             Duration::from_secs(10),
             &cancel,
         )
@@ -523,9 +550,15 @@ mod tests {
         let (prog, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         #[cfg(windows)]
         let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
-        let out =
-            run_child(std::path::Path::new(prog), &args, None, Duration::from_millis(200), &cancel)
-                .await;
+        let out = run_child(
+            std::path::Path::new(prog),
+            &args,
+            None,
+            &[],
+            Duration::from_millis(200),
+            &cancel,
+        )
+        .await;
         assert_eq!(out, RunOutcome::Timeout);
     }
 
@@ -548,9 +581,15 @@ mod tests {
             vec!["/C".to_string(), format!("ping -n 3 127.0.0.1 >NUL & echo done > {marker_s}")],
         );
         let started = std::time::Instant::now();
-        let out =
-            run_child(std::path::Path::new(prog), &args, None, Duration::from_millis(200), &cancel)
-                .await;
+        let out = run_child(
+            std::path::Path::new(prog),
+            &args,
+            None,
+            &[],
+            Duration::from_millis(200),
+            &cancel,
+        )
+        .await;
         assert_eq!(out, RunOutcome::Timeout);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -572,6 +611,7 @@ mod tests {
             command: vec!["wp".into(), "post list; rm -rf /".into(), "$(id)".into()],
             config_path: None,
             cwd: None,
+            extra_env: Vec::new(),
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
@@ -596,9 +636,15 @@ mod tests {
         let (prog, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 30".to_string()]);
         #[cfg(windows)]
         let (prog, args) = ("cmd", vec!["/C".to_string(), "ping -n 30 127.0.0.1 >NUL".to_string()]);
-        let out =
-            run_child(std::path::Path::new(prog), &args, None, Duration::from_secs(30), &cancel)
-                .await;
+        let out = run_child(
+            std::path::Path::new(prog),
+            &args,
+            None,
+            &[],
+            Duration::from_secs(30),
+            &cancel,
+        )
+        .await;
         assert_eq!(out, RunOutcome::Killed);
     }
 
@@ -609,6 +655,7 @@ mod tests {
             std::path::Path::new("/nonexistent/definitely/not/here"),
             &[],
             None,
+            &[],
             Duration::from_secs(5),
             &cancel,
         )

@@ -16,15 +16,27 @@
 
 header('Content-Type: application/json');
 
-$host = getenv('DB_HOST') ?: '127.0.0.1';
-$port = getenv('DB_PORT') ?: '3306';
+// ePHPm injects DB_* into $_SERVER (not the process env), and the shared wire
+// listener authenticates by default ([db.wire_auth]) — read $_SERVER first.
+function db_var(string $key, string $default): string {
+    if (isset($_SERVER[$key]) && $_SERVER[$key] !== '') {
+        return (string) $_SERVER[$key];
+    }
+    $v = getenv($key);
+    return ($v !== false && $v !== '') ? $v : $default;
+}
+
+$host = db_var('DB_HOST', '127.0.0.1');
+$port = db_var('DB_PORT', '3306');
+$user = db_var('DB_USER', 'root');
+$pass = db_var('DB_PASSWORD', '');
 $action = $_GET['action'] ?? 'read';
 
 try {
     $pdo = new PDO(
         "mysql:host={$host};port={$port}",
-        'root',
-        '',
+        $user,
+        $pass,
         [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
     );
 
