@@ -1583,9 +1583,8 @@ fn resolve_tenant_memory_ceiling(
 ) -> anyhow::Result<Option<String>> {
     use anyhow::Context as _;
 
-    let cron_ceiling =
-        ephpm_config::parse_cron_memory_limit("--memory-max", cron_raw, None)
-            .context("parsing the cron --memory-max ceiling")?;
+    let cron_ceiling = ephpm_config::parse_cron_memory_limit("--memory-max", cron_raw, None)
+        .context("parsing the cron --memory-max ceiling")?;
     // `None` cron_ceiling with a present flag is an explicit opt-out; a `None`
     // cron_ceiling with no flag is simply "unset".
     let cron_opt_out = cron_raw.is_some() && cron_ceiling.is_none();
@@ -5112,15 +5111,9 @@ mod site_sandbox_tests {
             super::resolve_tenant_memory_ceiling(cron, cap).expect("resolves")
         };
         // Derived cron default (512M) above a 256M operator cap ⇒ capped at 256M.
-        assert_eq!(
-            r(Some(&(512 * MIB).to_string()), Some(256 * MIB)),
-            Some("256M".to_string())
-        );
+        assert_eq!(r(Some(&(512 * MIB).to_string()), Some(256 * MIB)), Some("256M".to_string()));
         // Cron asks tighter (128M) than the 256M cap ⇒ cron wins.
-        assert_eq!(
-            r(Some(&(128 * MIB).to_string()), Some(256 * MIB)),
-            Some("128M".to_string())
-        );
+        assert_eq!(r(Some(&(128 * MIB).to_string()), Some(256 * MIB)), Some("128M".to_string()));
         // No operator cap ⇒ the cron ceiling stands as-is.
         assert_eq!(r(Some(&(512 * MIB).to_string()), None), Some("512M".to_string()));
         // No cron flag, operator cap set ⇒ the cap is the ceiling.
