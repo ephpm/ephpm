@@ -155,6 +155,7 @@ impl ResolvedJob {
         &self,
         config_path: Option<PathBuf>,
         sites_dir: Option<&std::path::Path>,
+        siteless_db_env: &[(String, String)],
     ) -> ExecRequest {
         // A per-site job runs with its site root as the working directory, so a
         // relative command (e.g. `bin/cake.php`) resolves there rather than
@@ -178,6 +179,13 @@ impl ResolvedJob {
             let secs = (cores * self.timeout.as_secs_f64()).ceil();
             (secs as u64).max(1)
         });
+        // Finding M3: a *siteless* (operator) job gets the shared wire listener's
+        // `DB_*` so a raw-`pdo_mysql` operator cron script can authenticate to the
+        // now-required-by-default listener. A per-site (tenant) job gets NOTHING
+        // here — it authenticates with its own per-site credential, which
+        // `ephpm php --site` injects; handing it the shared credential would be a
+        // cross-tenant leak.
+        let extra_env = if self.site.is_none() { siteless_db_env.to_vec() } else { Vec::new() };
         ExecRequest {
             job: self.name.clone(),
             site: self.site.clone(),
@@ -185,6 +193,7 @@ impl ResolvedJob {
             command: self.command.clone(),
             config_path,
             cwd,
+            extra_env,
             timeout: self.timeout,
             memory_max_bytes: self.memory_max_bytes,
             cpu_secs,
@@ -287,6 +296,14 @@ pub struct CronScheduler {
     cursor: Arc<dyn CursorStore>,
     executor: Arc<dyn JobExecutor>,
 
+    /// The shared SQL wire listener's `DB_*`, injected into **siteless**
+    /// (operator) job children so an operator cron script can authenticate to the
+    /// now-required-by-default listener (finding M3). Empty when there is no
+    /// shared listener, auth is opted out, or `[db.mysql] inject_env = false`.
+    /// Never injected into per-site (tenant) jobs — those use their own per-site
+    /// credential.
+    siteless_db_env: Vec<(String, String)>,
+
     running: RunningState,
     // A plain `std` mutex: the status map is only ever locked briefly and never
     // across an `.await`, so the status endpoint (a sync dispatch) can read it
@@ -306,6 +323,7 @@ impl CronScheduler {
         lease: Arc<dyn LeaseStore>,
         cursor: Arc<dyn CursorStore>,
         executor: Arc<dyn JobExecutor>,
+        siteless_db_env: Vec<(String, String)>,
     ) -> Option<Self> {
         if !config.cron.enabled {
             return None;
@@ -399,6 +417,7 @@ impl CronScheduler {
             lease,
             cursor,
             executor,
+            siteless_db_env,
             running: RunningState::new(max_concurrent as usize),
             status: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -637,7 +656,11 @@ impl CronScheduler {
 
         let cancel = CancellationToken::new();
         let id = self.running.register(&job.name, cancel.clone()).await;
-        let req = job.exec_request(self.config_path.clone(), self.sites_dir.as_deref());
+        let req = job.exec_request(
+            self.config_path.clone(),
+            self.sites_dir.as_deref(),
+            &self.siteless_db_env,
+        );
         let executor = Arc::clone(&self.executor);
         let running = self.running.clone();
         let status = Arc::clone(&self.status);
@@ -906,6 +929,7 @@ pub fn spawn(
     cluster: Option<Arc<ClusterHandle>>,
     self_id: String,
     kv_store: Arc<ephpm_kv::store::Store>,
+    siteless_db_env: Vec<(String, String)>,
 ) -> Option<(Arc<CronScheduler>, tokio::task::JoinHandle<()>)> {
     let lease: Arc<dyn LeaseStore> = Arc::new(lease::KvStore::new(Arc::clone(&kv_store)));
     let cursor: Arc<dyn CursorStore> = Arc::new(lease::KvStore::new(kv_store));
@@ -917,8 +941,15 @@ pub fn spawn(
         }
     };
 
-    let scheduler =
-        Arc::new(CronScheduler::from_config(config, cluster, self_id, lease, cursor, executor)?);
+    let scheduler = Arc::new(CronScheduler::from_config(
+        config,
+        cluster,
+        self_id,
+        lease,
+        cursor,
+        executor,
+        siteless_db_env,
+    )?);
 
     tracing::info!(
         jobs = scheduler.operator_jobs.len(),

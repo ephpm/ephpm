@@ -654,11 +654,22 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         .map(|h| h.self_node().id.clone())
         .or_else(|| effective_node_id.clone())
         .unwrap_or_else(|| "local".to_string());
+    // Finding M3: hand siteless (operator) cron children the shared wire
+    // listener's DB_* — the same map an HTTP request's $_SERVER gets (php-cli
+    // reads $_SERVER from the environment) — so an operator's own pdo_mysql cron
+    // script authenticates to the now-required-by-default listener. `None`
+    // (auth disabled / [db.postgres] / [db.mysql] inject_env = false / no shared
+    // listener) → empty, so nothing is injected. Per-site (tenant) cron is never
+    // handed this (see `exec_request`).
+    let cron_siteless_db_env =
+        build_shared_db_env_vars(&config, &shared_db_wire, config.cluster.enabled)
+            .unwrap_or_default();
     let (cron_scheduler, cron_periodic) = match cron_scheduler::spawn(
         &config,
         cluster_handle.clone(),
         cron_self_id,
         Arc::clone(&kv_store),
+        cron_siteless_db_env,
     ) {
         Some((scheduler, handle)) => (Some(scheduler), Some(handle)),
         None => (None, None),

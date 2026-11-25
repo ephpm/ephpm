@@ -1182,18 +1182,44 @@ mode injects per-site credentials.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allow_insecure_no_auth` | bool | `false` | Opt out of authentication, restoring the pre-hardening credential-free behavior. Logs a loud `WARN` at startup. Intended only for deployments where the ports are firewalled from untrusted networks. |
-| `password` | string | *(none)* | Explicit shared password. When unset, the credential is `HMAC-SHA256([kv] secret, "ephpm-db-wire")`; when `[kv] secret` is also unset, a per-process random value (stable only for the process lifetime). Never logged. |
+| `password` | string | *(none)* | Explicit shared password. An **empty string is a startup error** — unset the key (to accept the derived/random credential) or give it a real value. When unset, the credential is `HMAC-SHA256([kv] secret, "EPHPM:db-wire")`; when `[kv] secret` is also unset, a per-process random value (stable only for the process lifetime). Never logged. |
 
 Notes:
 
-- With a configured `password` or a stable `[kv] secret`, the credential is
-  stable across restarts, so a co-located `ephpm php --site` / external client
-  can authenticate. **Anyone who can read the config file (or the `[kv] secret`)
-  can connect** — the same trust boundary `ephpm exec` documents.
-- The Hrana / PostgreSQL / TDS `[db.sqlite.proxy]` frontends **cannot** be
-  authenticated (litewire authenticates only its MySQL frontend). Configuring
-  one while authentication is required is a **startup error** that names the
-  opt-out. `[db.postgres]` proxy auth is not yet implemented.
+- **What changed for clients (behavior change).** The injected `DB_USER` is now
+  the shared wire user `ephpm` and `DB_PASSWORD` is the shared credential — not a
+  backend account. In-process PHP (HTTP requests) authenticates transparently
+  because the server injects these into `$_SERVER`. An external client, or a PHP
+  script that connects with the *old* empty-password / `root` credentials, now
+  gets `ER_ACCESS_DENIED` (MySQL error **1045**) unless it presents the shared
+  credential. `[db.postgres]` is **not** gated (its proxy auth is unimplemented),
+  and a configured Hrana / PostgreSQL / TDS `[db.sqlite.proxy]` frontend is a
+  **startup error** while authentication is required (litewire authenticates only
+  its MySQL frontend) — remove it or opt out.
+- **A standalone client or cron PHP needs a stable, knowable credential.** Set
+  `[db.wire_auth] password` (or a stable `[kv] secret`); the credential is then
+  stable across restarts and the operator can derive it
+  (`HMAC-SHA256([kv] secret, "EPHPM:db-wire")`). **Anyone who can read the config
+  file (or the `[kv] secret`) can connect** — the same trust boundary `ephpm exec`
+  documents. With neither set the credential is random per process: in-process
+  PHP still works, but nothing outside the process can authenticate and the
+  credential rotates on restart.
+- **`ephpm php --site` does *not* use this credential.** The `--site` CLI binds a
+  *per-site* database and authenticates with the per-site credential
+  (`HMAC-SHA256([kv] secret, site_key)`); it is available only in per-site modes,
+  which have no shared listener. It is not a consumer of the shared wire
+  credential.
+- **Operator (global-tier) cron.** Siteless `[[cron.jobs]]` run on the operator's
+  behalf (not a tenant), so the shared `DB_*` are injected into the child
+  process's environment and a raw-`pdo_mysql` cron script authenticates the same
+  way an HTTP request does. Per-site (tenant) cron is unaffected — it uses its own
+  per-site credential, never the shared one.
+- **`inject_env = false` requires an explicit, stable credential.** When
+  `[db.mysql] inject_env = false` the shared `DB_*` are *not* injected into PHP,
+  so the only way anything reaches the authenticated proxy is a credential the
+  operator can configure by hand. With no `[db.wire_auth] password` and no
+  `[kv] secret` the credential would be random and unreachable, so that
+  combination is a **startup error** telling you to set `[db.wire_auth] password`.
 - `[server] sites_dir` with a shared listener gives every tenant the **same**
   database (no isolation); startup warns and points you at per-site mode.
 

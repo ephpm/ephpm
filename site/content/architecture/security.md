@@ -309,7 +309,7 @@ multi-tenant guarantee gets misread in both directions:
   listener is authenticated by default** (`[db.wire_auth]`, finding F4). A
   single server-level credential gates the shared MySQL frontend before a
   client reaches the backend: `[db.wire_auth] password` when set, else
-  `HMAC-SHA256([kv] secret, "ephpm-db-wire")`, else a per-process random value.
+  `HMAC-SHA256([kv] secret, "EPHPM:db-wire")`, else a per-process random value.
   It is injected into every request's `$_SERVER` (`DB_USER` / `DB_PASSWORD` /
   `DATABASE_URL`), never into the process environment and never logged, so
   stock `pdo_mysql` authenticates transparently while an external

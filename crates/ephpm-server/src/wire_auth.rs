@@ -21,7 +21,7 @@
 //! true`, which restores the old credential-free behavior and logs a loud WARN.
 //!
 //! The credential is derived exactly like the per-site one — a configured
-//! `[db.wire_auth] password`, else `HMAC-SHA256([kv] secret, "ephpm-db-wire")`
+//! `[db.wire_auth] password`, else `HMAC-SHA256([kv] secret, "EPHPM:db-wire")`
 //! (stable across restarts), else a fresh per-process random value. It is
 //! injected into each request's `$_SERVER` by the router (never into the
 //! process environment, so `getenv()` cannot read it; never logged), so stock
