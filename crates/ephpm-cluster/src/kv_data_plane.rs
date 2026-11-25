@@ -57,6 +57,18 @@
 //!   on the gossip tier (`ClusteredStore::cold_fetch`). A peer predating the
 //!   op drops the connection; the caller falls back to a plain GET on it.
 //!
+//! ### Bulk pulls
+//!
+//! - `op = 0x05` (SHARE): a peer warm-up pull of **large** values the
+//!   requester is a replica for (see [`crate::kv_handoff`]).
+//! - `op = 0x08` (SHARE-GOSSIP): a bulk pull of the whole **small (gossip)**
+//!   tier, with no replica-set filter — the fast root-cause fill for a
+//!   (re)joining node's per-MTU gossip catch-up (#631, [`crate::kv_handoff::GossipBulkTransfer`]).
+//!
+//! Both answer with a stream of [`SHARE_BATCH`] messages ending in
+//! [`SHARE_END`], and the puller lands each entry through
+//! [`KvRouter::apply_stamped`] (newest stamp wins).
+//!
 //! The sentinel `u32::MAX` indicates the key was not found. This is
 //! unambiguous because real values are bounded by memory limits well
 //! below 4 GiB.
@@ -230,6 +242,29 @@ const OP_SET_IF_EQ: u8 = 0x06;
 /// last-applied stamp for the key (see the module docs, "Stamped reads").
 const OP_GET_STAMPED: u8 = 0x07;
 
+/// Op code for a **gossip-tier bulk pull** (`[key]` = empty, no value): the
+/// server streams back every live small-tier string entry it holds — the
+/// values that ride the gossip tier and reach every node on their own — as a
+/// sequence of [`SHARE_BATCH`] messages ending with [`SHARE_END`], exactly the
+/// framing [`OP_SHARE`] uses. Each entry carries the stamp this node holds for
+/// it, so the puller applies it through [`KvRouter::apply_stamped`] (newest
+/// stamp wins) and a bulk copy can never regress a newer value.
+///
+/// Unlike [`OP_SHARE`], there is **no replica-set filter**: every node holds
+/// every small-tier key, so a (re)joining node pulls the whole tier from each
+/// peer and keeps the newest copy across them — the fast root-cause fill for
+/// the per-MTU, version-ordered chitchat catch-up that otherwise takes
+/// seconds-to-minutes (#631). Large-tier values (above the gossip threshold)
+/// are **not** shared here: they are replica-set-partitioned and travel over
+/// [`OP_SHARE`] (peer handoff) instead, so sending them here would
+/// over-replicate.
+///
+/// A node that has not been configured for gossip sharing
+/// ([`KvRouter::with_gossip_share`]), or one predating this op, answers an
+/// empty stream / drops the connection; the puller reports that peer as unable
+/// to share and moves on.
+const OP_SHARE_GOSSIP: u8 = 0x08;
+
 /// Trailer of a found GET-STAMPED response:
 /// `[has_stamp: u8][write: u64][node_tag: u64][ttl_ms: u64]`, `ttl_ms` the
 /// value's remaining lifetime (`0` = no expiry). For a hash-field transport
@@ -329,13 +364,27 @@ pub struct KvRouter {
     /// answered with an empty stream, so a node without handoff still
     /// interoperates with one that pulls.
     handoff: Option<Arc<crate::kv_handoff::HandoffSource>>,
+    /// Answers [`OP_SHARE_GOSSIP`] (gossip-tier bulk pulls). `None` = the op
+    /// is answered with an empty stream, so a node that has not opted in still
+    /// interoperates with one that pulls.
+    gossip: Option<GossipShareConfig>,
+}
+
+/// What a node needs to answer an [`OP_SHARE_GOSSIP`] pull: the small-tier
+/// threshold (values at or below it ride gossip and are shared; larger ones
+/// are the replica-set-partitioned data plane's job) and this node's id for
+/// the fallback stamp of an entry whose write stamp is no longer recorded.
+#[derive(Clone, Debug)]
+struct GossipShareConfig {
+    threshold: usize,
+    self_id: String,
 }
 
 impl KvRouter {
     /// A router that sends every key to the process-wide store.
     #[must_use]
     pub fn global(store: Arc<Store>) -> Self {
-        Self { global: store, multi_tenant: None, applied: None, handoff: None }
+        Self { global: store, multi_tenant: None, applied: None, handoff: None, gossip: None }
     }
 
     /// A router that honours the per-site envelope.
@@ -344,7 +393,13 @@ impl KvRouter {
         store: Arc<Store>,
         multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
     ) -> Self {
-        Self { global: store, multi_tenant: Some(multi_tenant), applied: None, handoff: None }
+        Self {
+            global: store,
+            multi_tenant: Some(multi_tenant),
+            applied: None,
+            handoff: None,
+            gossip: None,
+        }
     }
 
     /// Gate stamped SETs through `applied` — the same map the gossip applier
@@ -360,6 +415,17 @@ impl KvRouter {
     #[must_use]
     pub fn with_handoff(mut self, source: Arc<crate::kv_handoff::HandoffSource>) -> Self {
         self.handoff = Some(source);
+        self
+    }
+
+    /// Answer gossip-tier bulk pulls ([`OP_SHARE_GOSSIP`]): stream every live
+    /// string entry whose value is at most `threshold` bytes (the small tier),
+    /// each with the stamp this node holds for it. `self_id` is used for the
+    /// fallback stamp of an entry with no recorded stamp (it loses to every
+    /// real write). Without this a node answers the op with an empty stream.
+    #[must_use]
+    pub fn with_gossip_share(mut self, threshold: usize, self_id: impl Into<String>) -> Self {
+        self.gossip = Some(GossipShareConfig { threshold, self_id: self_id.into() });
         self
     }
 
@@ -570,6 +636,11 @@ async fn handle_connection(
         if request.op == OP_SHARE {
             // A streamed answer: many messages, then the end marker.
             serve_share(&mut stream, router, &request.key, cipher).await?;
+            continue;
+        }
+        if request.op == OP_SHARE_GOSSIP {
+            // Same streamed framing as OP_SHARE, but the whole small tier.
+            serve_gossip_share(&mut stream, router, cipher).await?;
             continue;
         }
         let response = serve_request(request, router)?;
@@ -973,6 +1044,123 @@ async fn serve_share(
     let _ = walker.await;
     write_message(stream, &[SHARE_END], cipher).await?;
     tracing::info!(requester, keys = streamed, bytes, "KV warm-up share served");
+    Ok(())
+}
+
+/// Build the entry a gossip bulk share sends for a string `key`: the value,
+/// its remaining TTL and the stamp recorded for it, read as one consistent
+/// pair through [`KvRouter::read_stamped`] (the same discipline the handoff
+/// uses — pairing a stale value with a fresh stamp is a real bug). `None` when
+/// the key is gone, expired, or is **above** `threshold` (the large tier,
+/// which travels over [`OP_SHARE`] instead).
+fn stamped_string_entry(
+    router: &KvRouter,
+    store: &Store,
+    site: &str,
+    key: &str,
+    config: &GossipShareConfig,
+) -> Option<ShareEntry> {
+    let transport_key = crate::kv_handoff::transport_key(site, key);
+    let ((value, ttl), stamp) = router.read_stamped(&transport_key, || store.get_with_ttl(key))?;
+    if value.len() > config.threshold {
+        return None;
+    }
+    Some(ShareEntry {
+        transport_key,
+        value: value.to_vec(),
+        ttl_ms: ttl.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)),
+        // An entry with no recorded stamp (applied before the applied map's
+        // horizon) loses to every real write, exactly as a handoff's does.
+        stamp: stamp.unwrap_or_else(|| Stamp::new(0, &config.self_id)),
+    })
+}
+
+/// Answer an [`OP_SHARE_GOSSIP`]: stream every live small-tier string entry
+/// this node holds, then the end marker. Same streaming machinery as
+/// [`serve_share`] — a blocking store walk feeds a bounded channel, batches go
+/// out as they fill or when the queue drains, and no shard lock is held while
+/// the socket is slow. A node that has not opted in (`router.gossip` is
+/// `None`) answers an empty stream.
+async fn serve_gossip_share(
+    stream: &mut TcpStream,
+    router: &KvRouter,
+    cipher: Option<&ClusterCipher>,
+) -> anyhow::Result<()> {
+    let Some(config) = router.gossip.clone() else {
+        tracing::debug!("KV gossip bulk share requested but this node has not opted in");
+        return write_message(stream, &[SHARE_END], cipher).await;
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ShareEntry>(SHARE_QUEUE);
+    let walker = {
+        let router = router.clone();
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sent = 0u64;
+            let mut closed = false;
+            for (site, store) in router.stores() {
+                if closed {
+                    break;
+                }
+                // Enumerate every string (the walk's own value is not used —
+                // the value and stamp are re-read as a consistent pair below);
+                // the large tier is filtered out by `stamped_string_entry`.
+                store.scan_strings_decoded(0, |key, _value, _ttl| {
+                    if closed {
+                        return;
+                    }
+                    let Some(entry) = stamped_string_entry(&router, &store, &site, key, &config)
+                    else {
+                        return;
+                    };
+                    if tx.blocking_send(entry).is_err() {
+                        closed = true;
+                    } else {
+                        sent += 1;
+                    }
+                });
+            }
+            sent
+        })
+    };
+    let mut streamed = 0u64;
+    let mut bytes = 0u64;
+    let mut batch = ShareBatch::new();
+    loop {
+        let entry = match rx.try_recv() {
+            Ok(e) => Some(e),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if let Some((message, count, b)) =
+                    std::mem::replace(&mut batch, ShareBatch::new()).finish()
+                {
+                    send_share(stream, &message, cipher).await?;
+                    streamed += u64::from(count);
+                    bytes += b;
+                }
+                rx.recv().await
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        };
+        let Some(entry) = entry else { break };
+        if !batch.push(&entry) {
+            tracing::warn!(key = %entry.transport_key, "KV gossip share: entry too large; skipped");
+        }
+        if batch.is_full()
+            && let Some((message, count, b)) =
+                std::mem::replace(&mut batch, ShareBatch::new()).finish()
+        {
+            send_share(stream, &message, cipher).await?;
+            streamed += u64::from(count);
+            bytes += b;
+        }
+    }
+    if let Some((message, count, b)) = batch.finish() {
+        send_share(stream, &message, cipher).await?;
+        streamed += u64::from(count);
+        bytes += b;
+    }
+    let _ = walker.await;
+    write_message(stream, &[SHARE_END], cipher).await?;
+    tracing::info!(keys = streamed, bytes, "KV gossip bulk share served");
     Ok(())
 }
 
@@ -1563,12 +1751,50 @@ impl DataPlaneClient {
         addr: SocketAddr,
         requester_id: &str,
         deadline: Instant,
+        apply: impl FnMut(ShareEntry),
+    ) -> anyhow::Result<(u64, u64)> {
+        self.share_stream(addr, OP_SHARE, requester_id, deadline, apply).await
+    }
+
+    /// Pull the whole gossip (small) tier from the peer at `addr`
+    /// ([`OP_SHARE_GOSSIP`]): every small-tier string entry the peer holds is
+    /// handed to `apply`, one at a time, until the end marker or `deadline`.
+    /// Returns `(entries, value bytes)` received. The caller lands each entry
+    /// through [`KvRouter::apply_stamped`] (newest stamp wins), so pulling the
+    /// same tier from several peers is safe and converges on the freshest copy
+    /// — the fast fill for a (re)joining node's gossip catch-up (#631).
+    ///
+    /// # Errors
+    ///
+    /// As [`share_from`](Self::share_from): connect/I-O failure, the deadline
+    /// passing mid-stream (entries applied so far stay applied), a cipher
+    /// mismatch, or a peer that cannot share (predates the op, or has not
+    /// opted in — it answers an empty stream).
+    pub async fn share_gossip_from(
+        &self,
+        addr: SocketAddr,
+        deadline: Instant,
+        apply: impl FnMut(ShareEntry),
+    ) -> anyhow::Result<(u64, u64)> {
+        self.share_stream(addr, OP_SHARE_GOSSIP, "", deadline, apply).await
+    }
+
+    /// Shared body of [`share_from`](Self::share_from) and
+    /// [`share_gossip_from`](Self::share_gossip_from): send a one-byte `op`
+    /// with `request_key`, then read the [`SHARE_BATCH`] stream until
+    /// [`SHARE_END`] or `deadline`. Uses its own connection (a share is one
+    /// long exchange, not a pooled request).
+    async fn share_stream(
+        &self,
+        addr: SocketAddr,
+        op: u8,
+        request_key: &str,
+        deadline: Instant,
         mut apply: impl FnMut(ShareEntry),
     ) -> anyhow::Result<(u64, u64)> {
         let cipher = self.cipher.as_deref();
-        let request = encode_get_request(requester_id)?;
-        let mut message = request;
-        message[0] = OP_SHARE;
+        let mut message = encode_get_request(request_key)?;
+        message[0] = op;
         let mut stream = connect(addr).await.inspect_err(|_| self.trip_breaker(addr))?;
         tokio::time::timeout_at(deadline, async {
             write_message(&mut stream, &message, cipher).await?;
@@ -1616,7 +1842,7 @@ impl DataPlaneClient {
         })
         .await
         .map_err(|_| {
-            anyhow::anyhow!("KV warm-up pull from {addr} did not finish before the deadline")
+            anyhow::anyhow!("KV share pull from {addr} did not finish before the deadline")
         })?
     }
 
