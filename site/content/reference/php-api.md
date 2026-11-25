@@ -50,11 +50,14 @@ Signatures, return values and edge cases:
 
 `ephpm_db_query`, `ephpm_db_execute`, `ephpm_db_run`, `ephpm_db_columns`,
 `ephpm_db_in_transaction`, `ephpm_db_available`, `ephpm_db_errno`,
-`ephpm_db_error`.
+`ephpm_db_error`, `ephpm_db_cursor_open`, `ephpm_db_cursor_fetch`,
+`ephpm_db_cursor_close`.
 
 See [Database from PHP](/guides/db-from-php/). The bridge's reserved error
 codes (`2000`–`2004`) are exception codes, not PHP constants; compare
-against the integers.
+against the integers. The `ephpm_db_cursor_*` streaming functions were added
+in v0.20.0; feature-detect them with `function_exists()` if you support older
+servers.
 
 ### WebSockets — `ephpm_ws_*` (experimental)
 

@@ -5624,9 +5624,22 @@ typedef struct {
     void (*col_decltype)(size_t col, const char **p, size_t *len);
     /* Is this thread's session inside an explicit transaction? (issue #260) */
     int (*in_transaction)(void);
-    /* Would a statement issued right now reach a database? (issue #259)
-     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    /* Would a statement issued right now reach a database? (issue #259) */
     int (*available)(void);
+    /* Streaming cursors (issue #264). Open buffers the whole result in the
+     * bridge, writes the handle to *out_handle, and returns 1 = result-set
+     * cursor, 2 = OK/no-rowset cursor, -1 = error staged, -2 = no backend,
+     * -3 = bridge gone (issue #269; nothing ran). */
+    int (*cursor_open)(const char *sql, size_t sql_len,
+                       unsigned long long *out_handle);
+    /* Fetch up to `max` more rows into the staged row buffer (read via
+     * row_count, col_*, and cell, released by finish()). Returns the number
+     * staged (0 = cursor exhausted), -1 = no such handle on this thread,
+     * -3 = gone. */
+    long long (*cursor_fetch)(unsigned long long handle, size_t max);
+    /* Close a cursor and free its buffer. Returns 1 if it existed, else 0.
+     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    int (*cursor_close)(unsigned long long handle);
 } EphpmDbOps;
 
 /* Reserved error codes for infrastructure failures — the stable signal that
@@ -5691,30 +5704,21 @@ static int ephpm_db_push_params(HashTable *params)
  * RETURN_THROWS(). */
 #define EPHPM_DB_THREW (-1000)
 
-/* Run sql through the bridge, converting error outcomes into PHP
- * exceptions. Returns the bridge's run() code (1 = rows, 2 = OK) or
- * EPHPM_DB_THREW after throwing.
+/* Throw the PHP exception for a negative bridge run()/cursor_open() code.
+ * Shared by ephpm_db_run_or_throw() and ephpm_db_cursor_open() so the two can
+ * never drift in exception shape. Call only with rc < 0.
  *
  * Error shape follows PDO's convention: message "SQLSTATE[xxxxx]: <backend
  * message>", exception code = the mapped MySQL error code (e.g. 1062).
  * Infrastructure failures instead carry one of the reserved EPHPM_DB_ERR_*
  * codes above, with their message text unchanged from before those codes
  * existed — adapters that match on the wording keep working (issue #259). */
-static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *params)
+static void ephpm_db_throw_for_rc(int rc)
 {
-    if (!g_db_ops.run) {
-        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
-                             EPHPM_DB_ERR_UNAVAILABLE);
-        return EPHPM_DB_THREW;
-    }
-    if (ephpm_db_push_params(params) != 0) {
-        return EPHPM_DB_THREW;
-    }
-    int rc = g_db_ops.run(sql, sql_len);
     if (rc == -2) {
         zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
                              EPHPM_DB_ERR_UNAVAILABLE);
-        return EPHPM_DB_THREW;
+        return;
     }
     if (rc == -3) {
         /* Issue #269. The thread is exiting and the Rust bridge's per-thread
@@ -5727,22 +5731,40 @@ static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *par
             "(it is shutting down) — a shutdown function or destructor ran after "
             "per-thread database state was released; no statement was executed",
             EPHPM_DB_ERR_GONE);
+        return;
+    }
+    /* rc == -1: a SQL error triple is staged. */
+    unsigned int code = 0;
+    const char *sqlstate = NULL;
+    const char *msg = NULL;
+    size_t msg_len = 0;
+    g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
+    zend_throw_exception_ex(zend_ce_exception, (zend_long)code,
+        "SQLSTATE[%.5s]: %.*s",
+        sqlstate ? sqlstate : "HY000",
+        (int)msg_len, msg ? msg : "");
+    /* Releases the rows only — the error triple survives on purpose, so
+     * ephpm_db_errno() / ephpm_db_error() can still describe this failure
+     * after the exception has been caught (issue #259). */
+    g_db_ops.finish();
+}
+
+/* Run sql through the bridge, converting error outcomes into PHP
+ * exceptions. Returns the bridge's run() code (1 = rows, 2 = OK) or
+ * EPHPM_DB_THREW after throwing. */
+static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *params)
+{
+    if (!g_db_ops.run) {
+        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
+                             EPHPM_DB_ERR_UNAVAILABLE);
         return EPHPM_DB_THREW;
     }
+    if (ephpm_db_push_params(params) != 0) {
+        return EPHPM_DB_THREW;
+    }
+    int rc = g_db_ops.run(sql, sql_len);
     if (rc < 0) {
-        unsigned int code = 0;
-        const char *sqlstate = NULL;
-        const char *msg = NULL;
-        size_t msg_len = 0;
-        g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
-        zend_throw_exception_ex(zend_ce_exception, (zend_long)code,
-            "SQLSTATE[%.5s]: %.*s",
-            sqlstate ? sqlstate : "HY000",
-            (int)msg_len, msg ? msg : "");
-        /* Releases the rows only — the error triple survives on purpose, so
-         * ephpm_db_errno() / ephpm_db_error() can still describe this failure
-         * after the exception has been caught (issue #259). */
-        g_db_ops.finish();
+        ephpm_db_throw_for_rc(rc);
         return EPHPM_DB_THREW;
     }
     return rc;
@@ -6063,6 +6085,135 @@ PHP_FUNCTION(ephpm_db_error)
     add_assoc_stringl(return_value, "message", msg ? msg : "", msg_len);
 }
 
+/* ephpm_db_cursor_open(string $sql, array $params = []): int
+ *
+ * Open a forward-only streaming cursor over a result set and return an
+ * integer handle (issue #264). Pair with ephpm_db_cursor_fetch() to read the
+ * rows in chunks and ephpm_db_cursor_close() to release it.
+ *
+ * Unlike ephpm_db_query(), which materializes the whole result into one PHP
+ * array (a million rows is a million zvals at once), a cursor bounds the
+ * PHP-side memory to one chunk: fetch N rows, process them, let them go, fetch
+ * the next N. The result is buffered ONCE in the bridge at open and handed out
+ * in chunks, so the heavy per-row zval cost never piles up.
+ *
+ * The handle is valid only on the worker thread that opened it and only until
+ * the request ends — the server closes any cursor a script leaves open at
+ * request end (so a handle never leaks into the next request), but a script
+ * should close its own cursors as soon as it is done.
+ *
+ * Opening a cursor over a statement with no result set (e.g. an INSERT)
+ * succeeds and yields a cursor that fetches zero rows; ephpm_db_execute() is
+ * the right call for those. Errors throw Exception exactly as
+ * ephpm_db_query() does. */
+PHP_FUNCTION(ephpm_db_cursor_open)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_db_ops.cursor_open) {
+        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
+                             EPHPM_DB_ERR_UNAVAILABLE);
+        RETURN_THROWS();
+    }
+    if (ephpm_db_push_params(params) != 0) {
+        RETURN_THROWS();
+    }
+
+    unsigned long long handle = 0;
+    int rc = g_db_ops.cursor_open(sql, sql_len, &handle);
+    if (rc < 0) {
+        ephpm_db_throw_for_rc(rc);
+        RETURN_THROWS();
+    }
+    /* rc == 1 (result-set cursor) or 2 (OK cursor); both carry a handle. */
+    RETURN_LONG((zend_long)handle);
+}
+
+/* ephpm_db_cursor_fetch(int $handle, int $size = 1): array
+ *
+ * Fetch up to $size rows from the cursor as a list of associative arrays
+ * keyed by column name — the same row shape ephpm_db_query() returns. Returns
+ * fewer than $size rows (possibly []) at the end of the result; an empty array
+ * means the cursor is exhausted.
+ *
+ * $size must be >= 1. An unknown handle (closed, never opened, or opened on a
+ * different worker thread) throws, as does a fetch after the per-thread bridge
+ * state has been torn down. ephpm_db_columns() describes the cursor's columns
+ * between fetches. */
+PHP_FUNCTION(ephpm_db_cursor_fetch)
+{
+    zend_long handle_in;
+    zend_long size = 1;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_LONG(handle_in)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(size)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_db_ops.cursor_fetch) {
+        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
+                             EPHPM_DB_ERR_UNAVAILABLE);
+        RETURN_THROWS();
+    }
+    if (size < 1) {
+        zend_throw_exception_ex(zend_ce_exception, EPHPM_DB_ERR_BAD_PARAM,
+            "ephpm_db_cursor_fetch: $size must be >= 1, got " ZEND_LONG_FMT, size);
+        RETURN_THROWS();
+    }
+    if (handle_in <= 0) {
+        /* 0 is never a valid handle, and a negative one cannot be either. */
+        zend_throw_exception_ex(zend_ce_exception, EPHPM_DB_ERR_BAD_PARAM,
+            "ephpm_db_cursor_fetch: invalid cursor handle " ZEND_LONG_FMT, handle_in);
+        RETURN_THROWS();
+    }
+
+    long long n = g_db_ops.cursor_fetch((unsigned long long)handle_in, (size_t)size);
+    if (n == -3) {
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: the database bridge is no longer available on this thread "
+            "(it is shutting down)",
+            EPHPM_DB_ERR_GONE);
+        RETURN_THROWS();
+    }
+    if (n == -1) {
+        zend_throw_exception_ex(zend_ce_exception, EPHPM_DB_ERR_BAD_PARAM,
+            "ephpm_db_cursor_fetch: unknown cursor handle " ZEND_LONG_FMT
+            " (it was closed, never opened, or opened on another thread)", handle_in);
+        RETURN_THROWS();
+    }
+
+    /* n >= 0 rows were staged into the shared row buffer; build them exactly
+     * as ephpm_db_query() does, then release. n == 0 => []. */
+    array_init(return_value);
+    ephpm_db_append_rows(return_value);
+    g_db_ops.finish();
+}
+
+/* ephpm_db_cursor_close(int $handle): bool
+ *
+ * Close a cursor and free its buffered rows. Returns true if a cursor with
+ * that handle was open on this thread, false otherwise (already closed, never
+ * opened, or an invalid handle). Never throws — it is safe to close blindly in
+ * a finally block. */
+PHP_FUNCTION(ephpm_db_cursor_close)
+{
+    zend_long handle_in;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(handle_in)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_db_ops.cursor_close || handle_in <= 0) {
+        RETURN_FALSE;
+    }
+    RETURN_BOOL(g_db_ops.cursor_close((unsigned long long)handle_in));
+}
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_query, 0, 0, 1)
     ZEND_ARG_INFO(0, sql)
     ZEND_ARG_INFO(0, params)
@@ -6079,6 +6230,20 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_run, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_noargs, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_cursor_open, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_cursor_fetch, 0, 0, 1)
+    ZEND_ARG_INFO(0, handle)
+    ZEND_ARG_INFO(0, size)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_cursor_close, 0, 0, 1)
+    ZEND_ARG_INFO(0, handle)
 ZEND_END_ARG_INFO()
 
 /* ===================================================================
@@ -6837,6 +7002,9 @@ ZEND_END_ARG_INFO()
     PHP_FE(ephpm_db_available,      arginfo_ephpm_db_noargs) \
     PHP_FE(ephpm_db_errno,          arginfo_ephpm_db_noargs) \
     PHP_FE(ephpm_db_error,          arginfo_ephpm_db_noargs) \
+    PHP_FE(ephpm_db_cursor_open,    arginfo_ephpm_db_cursor_open) \
+    PHP_FE(ephpm_db_cursor_fetch,   arginfo_ephpm_db_cursor_fetch) \
+    PHP_FE(ephpm_db_cursor_close,   arginfo_ephpm_db_cursor_close) \
     /* WebSocket bridge (site-scoped connection registry). Implicit forms \
      * act on the connection that fired the current event; the \
      * ephpm_ws_connection_* forms take an explicit id. */ \
@@ -8021,7 +8189,8 @@ void ephpm_set_kv_ops(const EphpmKvOps *ops)
 
 /*
  * Set the DB ops function pointer table backing ephpm_db_query(),
- * ephpm_db_execute(), ephpm_db_run(), and the introspection functions.
+ * ephpm_db_execute(), ephpm_db_run(), the introspection functions, and the
+ * streaming cursor functions (ephpm_db_cursor_open/fetch/close).
  * Same timing contract as ephpm_set_kv_ops: called
  * once at startup, before any PHP scripts execute; g_db_ops is read-only
  * afterwards (ZTS-safe without locking).

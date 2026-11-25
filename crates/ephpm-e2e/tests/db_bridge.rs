@@ -322,3 +322,31 @@ async fn availability_is_reported_without_a_probe_query() {
         "this suite runs against a node configured with [db.sqlite], so the bridge is usable"
     );
 }
+
+/// #264: a streaming cursor walks a large result in chunks — only one chunk
+/// of PHP arrays is live at a time — in order, with sane close semantics and
+/// an unknown handle that throws rather than silently yielding nothing.
+#[tokio::test]
+async fn cursor_streams_a_result_in_chunks() {
+    setup().await;
+
+    let r = bridge_action("cursor", "").await;
+    assert_eq!(r.status, "ok", "cursor failed: {:?}", r.message);
+    let d = r.detail("cursor");
+
+    assert_eq!(
+        d["chunk_sizes"],
+        serde_json::json!([2, 2, 1]),
+        "five rows must stream as two full chunks of 2 and a final 1"
+    );
+    assert_eq!(
+        d["names"],
+        serde_json::json!(["c1", "c2", "c3", "c4", "c5"]),
+        "every row comes back exactly once, in order, across the chunks"
+    );
+    assert_eq!(d["closed"], true, "close reports the open cursor");
+    assert_eq!(d["closed_again"], false, "a second close is a no-op false");
+    assert_eq!(d["threw_unknown"], true, "fetching an unknown handle throws");
+
+    cleanup().await;
+}
