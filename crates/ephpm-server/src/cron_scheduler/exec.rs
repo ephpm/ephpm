@@ -60,6 +60,14 @@ pub struct ExecRequest {
     pub cwd: Option<PathBuf>,
     /// Wall-clock cap.
     pub timeout: Duration,
+    /// Resolved memory ceiling in bytes (`None` ⇒ none). On a binary child it
+    /// becomes `ephpm exec --memory-max` (OS `RLIMIT_AS`); on a PHP child it
+    /// becomes `ephpm php --memory-max` (the PHP `memory_limit` ceiling).
+    /// Hardening F5.
+    pub memory_max_bytes: Option<u64>,
+    /// Resolved CPU-time ceiling in whole seconds (`None` ⇒ none). Passed as
+    /// `--cpu-secs` to both child kinds (OS `RLIMIT_CPU`).
+    pub cpu_secs: Option<u64>,
 }
 
 /// The result of one run.
@@ -119,7 +127,24 @@ pub fn build_argv(req: &ExecRequest, exe: &std::path::Path) -> (PathBuf, Vec<Str
             }
             args.push("--site".to_string());
             args.push(site.clone());
+            // Resource ceilings (hardening F5) as leading options — before the
+            // PHP `-f` / the `--` command separator — so the child's clap parses
+            // them, not the inner interpreter/command. Both child kinds accept
+            // `--memory-max`/`--cpu-secs`.
+            if let Some(bytes) = req.memory_max_bytes {
+                args.push("--memory-max".to_string());
+                args.push(bytes.to_string());
+            }
+            if let Some(secs) = req.cpu_secs {
+                args.push("--cpu-secs".to_string());
+                args.push(secs.to_string());
+            }
             if req.is_php {
+                // A per-site PHP cron child runs confined: per-site Landlock +
+                // no_new_privs + (as root) uid drop + RLIMIT_CPU, in the child
+                // before PHP starts. `ephpm exec` (the binary branch) already
+                // enters the tenant sandbox by construction, so it needs no flag.
+                args.push("--confine".to_string());
                 // php-cli names the program with `-f`. A *leading* `--` instead
                 // (what this used to emit) is php's "read the program from
                 // stdin" signal — and the child's stdin is `Stdio::null()`, so
@@ -278,6 +303,8 @@ mod tests {
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
             cwd: None,
             timeout: Duration::from_secs(60),
+            memory_max_bytes: None,
+            cpu_secs: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("maintenance"));
@@ -294,6 +321,8 @@ mod tests {
             config_path: Some(PathBuf::from("/etc/ephpm/ephpm.toml")),
             cwd: None,
             timeout: Duration::from_secs(60),
+            memory_max_bytes: None,
+            cpu_secs: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
@@ -328,6 +357,8 @@ mod tests {
             config_path: Some(PathBuf::from("/c.toml")),
             cwd: None,
             timeout: Duration::from_secs(60),
+            memory_max_bytes: None,
+            cpu_secs: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
@@ -339,16 +370,18 @@ mod tests {
                 "/c.toml",
                 "--site",
                 "blog",
+                "--confine",
                 "-f",
                 "artisan.php",
                 "--",
                 "schedule:run",
             ]
         );
-        // The token right after the site is `-f`, not a bare `--`.
-        let site_pos = args.iter().position(|a| a == "blog").unwrap();
-        assert_eq!(args[site_pos + 1], "-f");
-        assert_ne!(args[site_pos + 1], "--");
+        // The script is still named with `-f`, never a bare `--` (the leading
+        // `--confine` now sits between the site and `-f`).
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[f_pos + 1], "artisan.php");
+        assert!(!args[..f_pos].contains(&"--".to_string()), "no bare -- before the script");
     }
 
     #[test]
@@ -363,9 +396,91 @@ mod tests {
             config_path: None,
             cwd: None,
             timeout: Duration::from_secs(60),
+            memory_max_bytes: None,
+            cpu_secs: None,
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
-        assert_eq!(args, vec!["php", "--site", "blog", "-f", "daily/cleanup.php"]);
+        // The directory tier is still confined (per-site cron), so `--confine`
+        // precedes the `-f <script>`.
+        assert_eq!(args, vec!["php", "--site", "blog", "--confine", "-f", "daily/cleanup.php"]);
+    }
+
+    /// F5 — a per-site PHP cron job emits the resource-limit options and
+    /// `--confine` as *leading* options, before the `-f <script>`, so the
+    /// child's clap parses them (not the PHP interpreter).
+    #[test]
+    fn argv_per_site_php_carries_limits_and_confine_before_script() {
+        let req = ExecRequest {
+            job: "j".into(),
+            site: Some("blog".into()),
+            is_php: true,
+            command: vec!["cron.php".into()],
+            config_path: Some(PathBuf::from("/c.toml")),
+            cwd: None,
+            timeout: Duration::from_secs(60),
+            memory_max_bytes: Some(512 * 1024 * 1024),
+            cpu_secs: Some(90),
+        };
+        let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
+        assert_eq!(
+            args,
+            vec![
+                "php",
+                "--config",
+                "/c.toml",
+                "--site",
+                "blog",
+                "--memory-max",
+                "536870912",
+                "--cpu-secs",
+                "90",
+                "--confine",
+                "-f",
+                "cron.php",
+            ]
+        );
+        // Every ePHPm-owned option precedes the `-f` script token.
+        let f = args.iter().position(|a| a == "-f").unwrap();
+        for opt in ["--memory-max", "--cpu-secs", "--confine", "--site"] {
+            assert!(args.iter().position(|a| a == opt).unwrap() < f, "{opt} must precede -f");
+        }
+    }
+
+    /// F5 — a per-site binary cron job emits the resource-limit options to
+    /// `ephpm exec` (which already confines by construction, so no `--confine`),
+    /// before the `--` command separator.
+    #[test]
+    fn argv_per_site_binary_carries_limits_before_separator() {
+        let req = ExecRequest {
+            job: "j".into(),
+            site: Some("shop".into()),
+            is_php: false,
+            command: vec!["wp".into(), "cron".into(), "event".into()],
+            config_path: None,
+            cwd: None,
+            timeout: Duration::from_secs(60),
+            memory_max_bytes: Some(256 * 1024 * 1024),
+            cpu_secs: Some(30),
+        };
+        let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
+        assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--site",
+                "shop",
+                "--memory-max",
+                "268435456",
+                "--cpu-secs",
+                "30",
+                "--",
+                "wp",
+                "cron",
+                "event",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--confine"), "exec confines by construction");
     }
 
     #[tokio::test]
@@ -458,6 +573,8 @@ mod tests {
             config_path: None,
             cwd: None,
             timeout: Duration::from_secs(60),
+            memory_max_bytes: None,
+            cpu_secs: None,
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         // No `--config` without a config path; the argv tail is byte-identical.

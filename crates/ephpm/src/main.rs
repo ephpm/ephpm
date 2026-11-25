@@ -206,6 +206,34 @@ enum Commands {
         #[arg(long)]
         site: Option<String>,
 
+        /// Confine this tenant run in an OS sandbox before PHP starts: per-site
+        /// Landlock (filesystem scoped to the vhost), `PR_SET_NO_NEW_PRIVS`,
+        /// `RLIMIT_CPU` (from `--cpu-secs`), and — when started as root — an
+        /// irreversible drop to the tenant uid/gid. Best-effort and Linux-only:
+        /// a layer the kernel/privileges cannot provide is warned and skipped,
+        /// never fatal (the `memory_limit` ceiling below still applies). Set by
+        /// the cron scheduler for per-site PHP cron children (hardening F5);
+        /// requires `--site`.
+        #[arg(long, requires = "site")]
+        confine: bool,
+
+        /// Tenant `memory_limit` ceiling for this `--site` run (a byte count or
+        /// a `K`/`M`/`G` quantity; `0`/`unlimited`/`none`/`-1` opt out). A tenant
+        /// cannot raise `memory_limit` above it. The effective ceiling is the
+        /// *tighter* of this value and `[php] memory_limit_max` (an operator's
+        /// HTTP-tenant cap is never exceeded by cron). Unset ⇒ `[php]
+        /// memory_limit_max`, else the PHP startup limit. Set by the cron
+        /// scheduler from the job's resolved `memory_max`. Ignored without
+        /// `--site`.
+        #[arg(long, requires = "site")]
+        memory_max: Option<String>,
+
+        /// `RLIMIT_CPU` CPU-time ceiling in seconds for a `--confine`d run (the
+        /// child is SIGKILLed after this much CPU time). Set by the cron
+        /// scheduler to `ceil(cpu_max × timeout)`. Ignored without `--confine`.
+        #[arg(long, requires = "confine")]
+        cpu_secs: Option<u64>,
+
         /// Arguments to pass to the PHP interpreter
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -277,6 +305,20 @@ enum Commands {
         /// removes all containment; prefer omitting it.
         #[arg(long)]
         no_sandbox: bool,
+
+        /// `RLIMIT_AS` address-space ceiling in bytes (a `K`/`M`/`G` quantity is
+        /// also accepted). The sandboxed command, and every descendant, is
+        /// capped at this much virtual memory. Unset ⇒ no memory cap. Set by the
+        /// cron scheduler from the job's resolved `memory_max` (hardening F5).
+        #[arg(long)]
+        memory_max: Option<String>,
+
+        /// `RLIMIT_CPU` CPU-time ceiling in seconds. The command is SIGKILLed
+        /// once it has consumed this much CPU time (distinct from the wall-clock
+        /// `--timeout`). Unset ⇒ no CPU-time cap. Set by the cron scheduler to
+        /// `ceil(cpu_max × timeout)`.
+        #[arg(long)]
+        cpu_secs: Option<u64>,
 
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -894,7 +936,22 @@ fn run() -> anyhow::Result<ExitCode> {
         is_ephpm_subcommand,
         |arg| std::path::Path::new(arg).is_file(),
     )? {
-        return run_php(None, None, &php_args);
+        // A `php`/`PHP_BINARY` re-invocation is never a tenant `--site` run, so
+        // no confinement or tenant memory ceiling applies here.
+        //
+        // L6 (known limitation): a confined tenant cron child that re-invokes
+        // this binary as `php`/`PHP_BINARY` escapes the PHP `memory_limit`
+        // ceiling (a process-global that does not survive `execve`), though the
+        // OS confinement from `confine_php_tenant` — the uid drop, Landlock,
+        // `no_new_privs`, `RLIMIT_CPU`, and `PR_SET_DUMPABLE = 0` — IS inherited
+        // across `execve`. This lane is only reachable with
+        // `disable_shell_exec = false` (the operator opted out of the shell-exec
+        // denylist that otherwise blocks spawning a child at all). Re-applying
+        // tenant mode here would require smuggling the site key + ceiling through
+        // the environment, which lands in the re-invoked child's tenant-readable
+        // `$_SERVER` and collides with the env-scrub surface, so it is
+        // deliberately NOT done; the denylist is the control for this escape.
+        return run_php(None, None, false, None, None, &php_args);
     }
 
     let cli = Cli::parse();
@@ -924,11 +981,22 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             run_analyze(path, config, overrides)
         }
-        Some(Commands::Php { config, site, args }) => run_php(config, site, &php_cli_args(&args)),
+        Some(Commands::Php { config, site, confine, memory_max, cpu_secs, args }) => {
+            run_php(config, site, confine, memory_max, cpu_secs, &php_cli_args(&args))
+        }
         Some(Commands::Composer { args }) => run_composer(args),
-        Some(Commands::Exec { config, site, timeout, no_sandbox, command }) => {
+        Some(Commands::Exec {
+            config,
+            site,
+            timeout,
+            no_sandbox,
+            memory_max,
+            cpu_secs,
+            command,
+        }) => {
             ensure_cli_tracing();
-            exec_sandbox::run(&config, &site, &command, timeout, no_sandbox)
+            let limits = exec_sandbox::ResourceLimits::from_cli(memory_max.as_deref(), cpu_secs)?;
+            exec_sandbox::run(&config, &site, &command, timeout, no_sandbox, limits)
         }
         Some(Commands::Db { command }) => run_db(command),
         // Cron CLI: `list` is standalone; `status`/`run-now` use a blocking
@@ -1440,14 +1508,22 @@ fn php_cli_args(parsed: &[String]) -> Vec<String> {
 /// first positional / `--`), so a `--site` appearing *after* a PHP script name
 /// is left untouched for the script, exactly as clap routes it into `args`.
 fn strip_leading_site_opts(raw: Vec<String>) -> Vec<String> {
+    // ePHPm-owned `ephpm php` options clap consumes as a leading prefix. Those
+    // that take a value (`--config`/`--site`/`--memory-max`/`--cpu-secs`) and
+    // the valueless `--confine`. All are long-only to avoid colliding with
+    // php-cli's own short flags in the passthrough.
+    const VALUE_OPTS: [&str; 4] = ["--config", "--site", "--memory-max", "--cpu-secs"];
+    const FLAG_OPTS: [&str; 1] = ["--confine"];
     let mut i = 0;
     while i < raw.len() {
         let tok = raw[i].as_str();
-        if tok == "--config" || tok == "--site" {
+        if VALUE_OPTS.contains(&tok) {
             // Option plus its value token (if present).
             i += if i + 1 < raw.len() { 2 } else { 1 };
-        } else if tok.starts_with("--config=") || tok.starts_with("--site=") {
+        } else if VALUE_OPTS.iter().any(|o| tok.starts_with(&format!("{o}="))) {
             // `--opt=value` is a single token.
+            i += 1;
+        } else if FLAG_OPTS.contains(&tok) {
             i += 1;
         } else {
             break;
@@ -1481,9 +1557,54 @@ fn restore_php_separator(raw: Option<Vec<String>>, parsed: &[String]) -> Vec<Str
 /// background tokio runtime drives the async backend work while PHP executes on
 /// this (main) thread, so the bridge's `Handle::block_on` is legal — this thread
 /// is never a runtime worker, the same invariant the server relies on.
+/// Resolve the `memory_limit` ceiling a tenant `ephpm php --site` run applies,
+/// from the cron/CLI `--memory-max` and the operator's `[php] memory_limit_max`.
+///
+/// Returns the PHP-quantity string for [`ephpm_php::PhpRuntime::set_memory_limit_max`]:
+/// `None` keeps the default (the startup `memory_limit`), `Some("-1")` lifts the
+/// ceiling, `Some("<n>M")` caps it.
+///
+/// * **L5** — `cron_raw` is parsed through the same keywords `ephpm exec` honors
+///   ([`ephpm_config::parse_cron_memory_limit`]): `0`/`unlimited`/`none`/`-1`
+///   mean "no cron-imposed ceiling" (an opt-out), not a literal 0-byte ceiling
+///   or a PHP ini parse error as the old raw-string path produced.
+/// * **M5** — an operator's explicit `[php] memory_limit_max` (`php_ceiling`,
+///   already in bytes; `None` when unset or `-1`) is the HTTP-tenant cap a cron
+///   run must never exceed, so the effective ceiling is the *tighter* of the
+///   two. The derived ~budget/`max_concurrent` cron default can lower, but never
+///   raise, an operator cap.
+///
+/// # Errors
+///
+/// When `cron_raw` is neither an opt-out keyword nor a valid byte quantity.
+fn resolve_tenant_memory_ceiling(
+    cron_raw: Option<&str>,
+    php_ceiling: Option<u64>,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+
+    let cron_ceiling = ephpm_config::parse_cron_memory_limit("--memory-max", cron_raw, None)
+        .context("parsing the cron --memory-max ceiling")?;
+    // `None` cron_ceiling with a present flag is an explicit opt-out; a `None`
+    // cron_ceiling with no flag is simply "unset".
+    let cron_opt_out = cron_raw.is_some() && cron_ceiling.is_none();
+    Ok(match (cron_ceiling, php_ceiling) {
+        (Some(cron), Some(op)) => Some(ephpm_config::format_php_memory_quantity(cron.min(op))),
+        (Some(bytes), None) | (None, Some(bytes)) => {
+            Some(ephpm_config::format_php_memory_quantity(bytes))
+        }
+        // No cron ceiling and no operator cap. An explicit opt-out means "raise
+        // freely" (`-1`); an absent flag keeps the default (startup limit).
+        (None, None) => cron_opt_out.then(|| "-1".to_string()),
+    })
+}
+
 fn run_php(
     config: Option<PathBuf>,
     site: Option<String>,
+    confine: bool,
+    memory_max: Option<String>,
+    cpu_secs: Option<u64>,
     args: &[String],
 ) -> anyhow::Result<ExitCode> {
     // Before any thread exists: let `PHP_BINARY …` re-invocations from this
@@ -1536,6 +1657,35 @@ fn run_php(
             // first thread this subcommand spawns.
             let strategy = site_db::plan_site_db(&cfg, &site_key)?;
             site_db::export_db_env(&strategy);
+            // F5 (hardening): bound this tenant's PHP memory. Tenant mode makes
+            // the embedded engine enforce the `memory_limit` ceiling and the
+            // `memory_hard_limit_percent` SYSTEM-lock that plain `ephpm php`
+            // skips, so a tenant cron script's `ini_set('memory_limit', '-1')`
+            // can no longer exhaust host memory. The ceiling is the per-job
+            // `--memory-max` (cron), else `[php] memory_limit_max`, else the PHP
+            // startup limit. Must happen before `cli_main` runs php_embed_init.
+            ephpm_php::PhpRuntime::enable_tenant_mode();
+            let ceiling = resolve_tenant_memory_ceiling(
+                memory_max.as_deref(),
+                cfg.php.memory_limit_ceiling_bytes(),
+            )
+            .context("resolving the tenant memory_limit ceiling")?;
+            ephpm_php::PhpRuntime::set_memory_limit_max(ceiling.as_deref())
+                .context("applying the tenant memory_limit ceiling")?;
+            // F5 (hardening): when the cron scheduler asks (`--confine`), confine
+            // the whole process in the OS sandbox before PHP starts — per-site
+            // Landlock, no-new-privs, RLIMIT_CPU, and (as root) a uid/gid drop,
+            // confined to THIS tenant. Best-effort: a layer the kernel or our
+            // privileges cannot provide is warned and skipped (the memory
+            // ceiling above still applies), never fatal, so a non-Linux or
+            // non-root cron keeps working. Config was already read above, so the
+            // Landlock scope (which denies /etc/ephpm) does not break startup;
+            // the DB bind below goes over the loopback wire, which Landlock —
+            // being filesystem-only — does not restrict.
+            if confine {
+                exec_sandbox::confine_php_tenant(&cfg, &site_key, cpu_secs)
+                    .context("confining the per-site cron PHP child")?;
+            }
             // A dedicated multi-thread runtime, NOT entered on this thread —
             // PHP runs here, the runtime's own worker threads drive the backend.
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -4028,6 +4178,38 @@ mod php_arg_tests {
         );
     }
 
+    /// F5 — the cron-scheduler-injected sandbox options (`--confine`, valueless;
+    /// `--memory-max`/`--cpu-secs`, valued) are ePHPm-owned and stripped from the
+    /// PHP passthrough, in both the space and `=` forms, leaving only the script.
+    #[test]
+    fn strips_leading_cron_sandbox_options() {
+        assert_eq!(
+            strip_leading_site_opts(v(&[
+                "--config",
+                "e.toml",
+                "--site",
+                "shop",
+                "--memory-max",
+                "536870912",
+                "--cpu-secs",
+                "90",
+                "--confine",
+                "-f",
+                "cron.php",
+            ])),
+            v(&["-f", "cron.php"])
+        );
+        assert_eq!(
+            strip_leading_site_opts(v(&[
+                "--site=shop",
+                "--memory-max=512M",
+                "--confine",
+                "daily/cleanup.php",
+            ])),
+            v(&["daily/cleanup.php"])
+        );
+    }
+
     #[test]
     fn strip_stops_at_the_first_php_argument() {
         // A `--site` appearing *after* a PHP token is the script's argument, not
@@ -4058,7 +4240,7 @@ mod php_arg_tests {
 
         // --site/--config before the passthrough are ePHPm's; the rest is PHP's.
         let cli = Cli::try_parse_from(["ephpm", "php", "--site", "shop", "-r", "echo 1;"]).unwrap();
-        let Some(Commands::Php { config, site, args }) = cli.command else {
+        let Some(Commands::Php { config, site, args, .. }) = cli.command else {
             panic!("expected a php command");
         };
         assert_eq!(site.as_deref(), Some("shop"));
@@ -4917,6 +5099,51 @@ mod site_sandbox_tests {
         std::fs::write(&path, body).expect("write config");
         let config = ephpm_config::Config::load(&path).expect("load config");
         (config, tmp)
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// M5 — an operator's `[php] memory_limit_max` is a cap cron can only lower.
+    /// The derived cron default (passed as a byte string) must never raise it.
+    #[test]
+    fn tenant_memory_ceiling_takes_the_tighter_of_cron_and_operator_cap() {
+        let r = |cron: Option<&str>, cap: Option<u64>| {
+            super::resolve_tenant_memory_ceiling(cron, cap).expect("resolves")
+        };
+        // Derived cron default (512M) above a 256M operator cap ⇒ capped at 256M.
+        assert_eq!(r(Some(&(512 * MIB).to_string()), Some(256 * MIB)), Some("256M".to_string()));
+        // Cron asks tighter (128M) than the 256M cap ⇒ cron wins.
+        assert_eq!(r(Some(&(128 * MIB).to_string()), Some(256 * MIB)), Some("128M".to_string()));
+        // No operator cap ⇒ the cron ceiling stands as-is.
+        assert_eq!(r(Some(&(512 * MIB).to_string()), None), Some("512M".to_string()));
+        // No cron flag, operator cap set ⇒ the cap is the ceiling.
+        assert_eq!(r(None, Some(256 * MIB)), Some("256M".to_string()));
+        // Nothing set ⇒ keep the default (startup memory_limit).
+        assert_eq!(r(None, None), None);
+    }
+
+    /// L5 — the opt-out keywords behave as they do for `ephpm exec`: `0`,
+    /// `unlimited`, `none` and `-1` all mean "no cron-imposed ceiling", never a
+    /// 0-byte ceiling or a parse error. An opt-out still cannot escape an
+    /// operator cap (M5).
+    #[test]
+    fn tenant_memory_ceiling_honours_opt_out_keywords() {
+        for kw in ["0", "unlimited", "none", "-1"] {
+            // Opt-out with no operator cap ⇒ "-1" (raise freely), not "0".
+            assert_eq!(
+                super::resolve_tenant_memory_ceiling(Some(kw), None).expect("resolves"),
+                Some("-1".to_string()),
+                "{kw:?} must opt out, not set a 0-byte ceiling"
+            );
+            // Opt-out with an operator cap ⇒ still bounded by the cap.
+            assert_eq!(
+                super::resolve_tenant_memory_ceiling(Some(kw), Some(256 * MIB)).expect("resolves"),
+                Some("256M".to_string()),
+                "{kw:?} must not escape [php] memory_limit_max"
+            );
+        }
+        // A malformed quantity is a hard error (not silently ignored).
+        assert!(super::resolve_tenant_memory_ceiling(Some("lots"), None).is_err());
     }
 
     /// The security property behind issue #698: a multi-tenant `ephpm php --site`

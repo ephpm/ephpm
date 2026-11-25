@@ -163,6 +163,8 @@ fn every_minute_job(name: &str, site: Option<&str>) -> ResolvedJob {
         concurrency_policy: ConcurrencyPolicy::Forbid,
         starting_deadline: None,
         suspend: false,
+        memory_max_bytes: None,
+        cpu_cores: None,
     }
 }
 
@@ -197,6 +199,8 @@ fn build(o: Opts) -> CronScheduler {
         directory_timeout: std::time::Duration::from_secs(3600),
         max_jobs_per_site: o.max_jobs_per_site,
         default_tz: chrono_tz::UTC,
+        section_memory_bytes: None,
+        section_cpu_cores: None,
         clustered: o.clustered,
         cluster: None,
         self_id: o.self_id,
@@ -1333,11 +1337,14 @@ async fn directory_jobs_are_discovered_live_and_run_as_php_for_their_site() {
     assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
     assert_eq!(args[0], "php");
     assert_eq!(args[1..3], ["--site".to_string(), "shop".to_string()]);
+    // The per-site cron child is confined (hardening F5), so `--confine`
+    // precedes the script.
+    assert!(args.contains(&"--confine".to_string()), "directory-tier PHP cron runs confined");
     // `-f <script>`, never a leading `--` (which would make php read the
     // program from stdin and the job silently no-op). See the regression test
     // `exec::tests::argv_per_site_php_names_script_with_dash_f`.
-    assert_eq!(args[3], "-f");
-    assert_eq!(args[4], script.to_string_lossy());
+    let f = args.iter().position(|a| a == "-f").expect("script named with -f");
+    assert_eq!(args[f + 1], script.to_string_lossy());
     // Removing the file stops it at the next scan — no restart either way.
     std::fs::remove_file(&script).unwrap();
     s.tick(at(2026, 1, 1, 3, 0), &[]).await;
@@ -1741,8 +1748,10 @@ fn resolve_operator_job_applies_default_timezone_and_per_job_override() {
         concurrency_policy: "forbid".into(),
         starting_deadline: None,
         suspend: false,
+        memory_max: None,
+        cpu_max: None,
     };
-    let r = resolve_operator_job(&base, "Europe/Berlin").unwrap();
+    let r = resolve_operator_job(&base, "Europe/Berlin", None, None).unwrap();
     assert_eq!(r.tz, chrono_tz::Europe::Berlin, "omitted timezone → the [cron] default");
     assert_eq!(r.timeout, std::time::Duration::from_secs(3600));
     assert_eq!(r.concurrency_policy, ConcurrencyPolicy::Forbid);
@@ -1755,12 +1764,41 @@ fn resolve_operator_job_applies_default_timezone_and_per_job_override() {
         starting_deadline: Some("10m".into()),
         ..base.clone()
     };
-    let r = resolve_operator_job(&overridden, "Europe/Berlin").unwrap();
+    let r = resolve_operator_job(&overridden, "Europe/Berlin", None, None).unwrap();
     assert_eq!(r.tz, chrono_tz::America::Chicago, "per-job timezone wins");
     assert_eq!(r.starting_deadline, Some(std::time::Duration::from_secs(600)));
 
-    let utc_default = resolve_operator_job(&base, "UTC").unwrap();
+    let utc_default = resolve_operator_job(&base, "UTC", None, None).unwrap();
     assert_eq!(utc_default.tz, chrono_tz::UTC);
+
+    // F5 — a job that sets neither ceiling inherits the section values; a
+    // per-job value overrides, and an opt-out keyword clears it for that job.
+    let inherits = resolve_operator_job(&base, "UTC", Some(512), Some(2.0)).unwrap();
+    assert_eq!(inherits.memory_max_bytes, Some(512));
+    assert_eq!(inherits.cpu_cores, Some(2.0));
+    let overrides =
+        ephpm_config::CronJob { memory_max: Some("1M".into()), cpu_max: Some(0.0), ..base.clone() };
+    let r = resolve_operator_job(&overrides, "UTC", Some(512), Some(2.0)).unwrap();
+    assert_eq!(r.memory_max_bytes, Some(1024 * 1024), "per-job memory_max wins");
+    assert_eq!(r.cpu_cores, None, "cpu_max = 0 opts this job out");
+}
+
+/// F5/M5 — the operator's `[php] memory_limit_max` clamps the cron ceiling in
+/// the parent: cron can lower it but never raise it, and an operator cap applies
+/// even to an unbounded cron default. This is the clamp the environment-scrubbed
+/// cron child cannot do for an env-var-set cap.
+#[test]
+fn operator_memory_ceiling_clamps_the_cron_default() {
+    use super::clamp_memory_to_operator_ceiling as clamp;
+    // Cron default (512M) above a 256M operator cap ⇒ capped at 256M.
+    assert_eq!(clamp(Some(512 * 1024 * 1024), Some(256 * 1024 * 1024)), Some(256 * 1024 * 1024));
+    // Cron asks tighter (128M) than the 256M cap ⇒ cron wins.
+    assert_eq!(clamp(Some(128 * 1024 * 1024), Some(256 * 1024 * 1024)), Some(128 * 1024 * 1024));
+    // No operator cap ⇒ the cron ceiling stands as-is (including unbounded).
+    assert_eq!(clamp(Some(512 * 1024 * 1024), None), Some(512 * 1024 * 1024));
+    assert_eq!(clamp(None, None), None);
+    // Unbounded cron default with an operator cap ⇒ the cap becomes the ceiling.
+    assert_eq!(clamp(None, Some(256 * 1024 * 1024)), Some(256 * 1024 * 1024));
 }
 
 // ── metrics presence ────────────────────────────────────────────────────────

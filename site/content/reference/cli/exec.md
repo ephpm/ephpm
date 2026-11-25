@@ -12,9 +12,11 @@ shell script, `wp`) without giving that step root or a view of other tenants'
 files.
 
 > **Linux only, and an early implementation.** On every other platform the
-> subcommand refuses with an error, with or without `--no-sandbox`. There are
-> no memory, CPU, or process-count limits yet. Only the wall-clock `--timeout`
-> exists. The design and its open items are in the
+> subcommand refuses with an error, with or without `--no-sandbox`. Memory
+> (`--memory-max`, `RLIMIT_AS`) and CPU-time (`--cpu-secs`, `RLIMIT_CPU`)
+> ceilings exist (hardening finding F5); a transient cgroup and a process-count
+> limit do not yet. `RLIMIT_AS` caps *virtual* address space, a coarser backstop
+> than a cgroup `memory.max` (RSS). The design and its open items are in the
 > [roadmap page](/roadmap/ephpm-exec-sandboxed-vhost/).
 
 ## Synopsis
@@ -42,6 +44,8 @@ caller's.
 | `-c` | `--config <FILE>` | `/etc/ephpm/ephpm.toml` | The ePHPm config. It supplies `[server] sites_dir`, any site overrides, and `[server] run_as_user` / `run_as_group`. `EPHPM_*` environment overrides apply, as for `serve`. |
 | `-s` | `--site <KEY>` | (required) | The site key: the vhost directory name under `[server] sites_dir`. |
 | `-t` | `--timeout <SECS>` | `0` (no limit) | Wall-clock limit in seconds. See [Timeout](#timeout). |
+| | `--memory-max <QTY>` | (no cap) | `RLIMIT_AS` address-space ceiling — a byte count or a `K`/`M`/`G` quantity. Bounds the command and every descendant (hardening F5). The cron scheduler sets it from the job's resolved `memory_max`. |
+| | `--cpu-secs <N>` | (no cap) | `RLIMIT_CPU` CPU-time ceiling in seconds; the command is killed once it has burned that much CPU time (distinct from the wall-clock `--timeout`). The cron scheduler sets it to `ceil(cpu_max × timeout)`. |
 | | `--no-sandbox` | off | Skip the sandbox entirely. See [`--no-sandbox`](#--no-sandbox). |
 
 **`ephpm exec --help` does not print help.** The subcommand disables clap's help
@@ -91,12 +95,14 @@ In order:
    entries are not reachable. Paths that don't exist on the host are skipped.
    If the kernel enforces only part of the ruleset, a warning is logged and the
    command still runs.
-5. Arms the `--timeout` alarm, if one is set.
-6. Drops to the tenant uid/gid (`setgroups`, `setgid`, `setuid`, then checks
+5. Applies the `--memory-max` (`RLIMIT_AS`) and `--cpu-secs` (`RLIMIT_CPU`)
+   ceilings, if set — before the uid drop, so the command cannot raise them.
+6. Arms the `--timeout` alarm, if one is set.
+7. Drops to the tenant uid/gid (`setgroups`, `setgid`, `setuid`, then checks
    that the drop took). The drop cannot be undone.
-7. Changes into the site's web root. If that fails, it logs a warning and
+8. Changes into the site's web root. If that fails, it logs a warning and
    stays in the current directory.
-8. Replaces itself with the command, with a cleared environment (see
+9. Replaces itself with the command, with a cleared environment (see
    [Environment](#environment)).
 
 Each run logs the site, uid/gid, timeout, and command at INFO before the
@@ -113,7 +119,9 @@ sandbox is entered.
   sandbox. Don't keep the ePHPm config or other secrets there.
 - **It does not bind the embedded database.** See
   [Database access](#database-access).
-- **No resource limits** beyond `--timeout`.
+- **Resource limits** are `--timeout` (wall-clock), `--memory-max`
+  (`RLIMIT_AS`, virtual address space) and `--cpu-secs` (`RLIMIT_CPU`, CPU
+  time). There is no cgroup `memory.max` (RSS) cap or process-count limit yet.
 
 `access(2)` (for example `test -r`) is not checked by Landlock. A sandboxed
 command can still learn that a file is readable by its uid, even though opening

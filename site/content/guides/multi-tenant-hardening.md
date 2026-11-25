@@ -530,7 +530,14 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   itself: ePHPm makes `memory_hard_limit_percent` system-only, so `ini_set()` on
   it returns `false`; only the operator's `[php] ini_file` and
   `[php] ini_overrides` set it, and both are server-wide (there is no per-site
-  INI setting).
+  INI setting). *Finding F5:* this ceiling now also applies to **tenant cron and
+  `ephpm php --site`** — previously the CLI skipped it, so a tenant cron script
+  could `ini_set('memory_limit', '-1')` and OOM the host. A per-site cron child
+  additionally runs under a configurable OS CPU-time cap (`RLIMIT_CPU`) and, for
+  a *binary* job, an `RLIMIT_AS` memory cap; see
+  [`[cron] memory_max`/`cpu_max`](/reference/config/#cron) and the
+  [cron guide](/guides/cron-and-scheduled-scripts/#native-distributed-cron-cron).
+  The bare operator `ephpm php` (no `--site`) stays unbounded, as php-cli is.
 - **Server endpoints are process-wide.** See the next section.
 
 ### Server endpoints are not tenant-scoped

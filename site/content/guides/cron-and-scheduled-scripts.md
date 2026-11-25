@@ -287,11 +287,19 @@ credentials; it does not serialize runs.
   above). With **no** server running there is no KV to attach to — the
   functions return their failure values and the `ephpm` session handler
   persists nothing. Branch on `ephpm_kv_attached()`.
-- **No sandbox.** The script runs as the user invoking `ephpm php`, with
-  that user's filesystem view. [`ephpm exec`](/reference/cli/exec/) provides
-  the sandbox and injects no credentials of its own; nesting
-  `ephpm php --site` inside it does not currently work with the config in
-  `/etc/ephpm` (the sandbox hides that file on purpose).
+- **A bounded memory ceiling (always).** Every `ephpm php --site` run — even
+  from your own crontab — enforces the PHP `memory_limit` ceiling
+  (`[php] memory_limit_max`, else the startup `memory_limit`): a tenant script's
+  `ini_set('memory_limit', '-1')` is refused, so it cannot exhaust host memory
+  (hardening finding F5). The plain operator `ephpm php` (no `--site`) stays
+  unbounded, as php-cli is.
+- **No OS sandbox unless you ask for it.** By default the script runs as the
+  user invoking `ephpm php`, with that user's filesystem view. Pass
+  `--confine` (what the native scheduler does for cron children) to add the
+  per-site OS sandbox in-process — Landlock scoped to the vhost,
+  `PR_SET_NO_NEW_PRIVS`, `RLIMIT_CPU`, and (as root) a uid/gid drop — best-effort
+  and Linux-only. [`ephpm exec`](/reference/cli/exec/) provides the same
+  sandbox for a *binary* command and injects no credentials of its own.
 
 ## Native distributed cron (`[cron]`)
 
@@ -343,14 +351,41 @@ files into `<site-root>/.ephpm/cron/{hourly,daily,weekly,monthly}/` or a
 `ephpm php --site` under the **same data-plane sandbox as the site's HTTP PHP** —
 the identical `open_basedir` (the site container plus its private temp/session
 dirs), the `disable_functions` denylist, and the operator's `[php] ini_overrides`
-hardening. That is a filesystem + denylist sandbox, **not** an OS-level one: a
-directory-tier script shares the server's uid and network namespace, so — unlike
-a tagged HTTP request thread — it is **not** confined by the per-vhost egress
-(eBPF) layer, and a custom `[php] ini_file` is not replayed to it. For untrusted
-tenant code that needs the full process sandbox, schedule a non-PHP `command`
-(it runs through `ephpm exec --site`) instead. The directory tier stays opt-in
-per site (a dropped file does nothing until the operator enables it). They are
-picked up live.
+hardening — **plus**, because the scheduler runs every per-site PHP cron child
+with `--confine`, an OS sandbox layered on top (hardening finding F5): per-site
+**Landlock** (the filesystem scoped to that one vhost — tighter than the server's
+own lock, which has to allow every site), `PR_SET_NO_NEW_PRIVS`, an `RLIMIT_CPU`
+CPU-time ceiling, and — when the server runs as root — an irreversible drop to the
+tenant uid/gid, which also arms the per-vhost egress (eBPF) firewall the way a
+tagged HTTP request is. Confinement is best-effort and Linux-only: a layer the
+kernel or the server's privileges cannot provide (a non-root server skips the uid
+drop; a Landlock-less kernel skips the filesystem scope; any non-Linux host skips
+all of it) is logged and skipped, never fatal. A custom `[php] ini_file` is still
+not replayed. The directory tier stays opt-in per site (a dropped file does
+nothing until the operator enables it). Jobs are picked up live.
+
+**Resource ceilings (DoS hardening, finding F5).** Every native cron child —
+operator `[[cron.jobs]]` and directory-tier alike — runs under a memory and CPU
+ceiling. Memory defaults to the memory budget ePHPm detects for itself (its own
+cgroup `memory.max`, else host RAM) **divided by `[cron] max_concurrent`**, so
+all the slots running at once stay within one node's budget rather than each
+claiming a third of it; CPU defaults to half the detected CPU (floored at one
+core). Set `[cron] memory_max` / `cpu_max` to change the default, or `memory_max`
+/ `cpu_max` on a single `[[cron.jobs]]` entry to override it for that job (`"0"` /
+`0` opts out). A **binary** cron child (`ephpm exec`) enforces memory as an OS
+`RLIMIT_AS`; a **PHP** cron child enforces it as the PHP `memory_limit` ceiling
+(ZendMM allocations only) — the embedded engine stops skipping the SYSTEM-locked
+`memory_hard_limit_percent` and the `memory_limit_max` ceiling for a tenant
+`--site` run, so a cron script's `ini_set('memory_limit', '-1')` can no longer
+exhaust host memory. When `[php] memory_limit_max` is set, a PHP cron child's
+ceiling is the *tighter* of it and the cron `memory_max`, so cron never exceeds
+the operator's HTTP-tenant cap. CPU is an `RLIMIT_CPU` ceiling of
+`ceil(cpu_max × timeout)` **CPU-seconds** on both — a per-process CPU-*time*
+budget the kernel SIGKILLs on, not a core-share cap: a single-threaded PHP child
+(CPU time ≤ wall time) is effectively bounded by the wall-clock `timeout`, and
+only a multi-threaded or sub-core job trips it sooner. A true per-core / aggregate
+CPU share cap (cgroup `cpu.max`) is a planned follow-up. This is **availability**
+hardening, not confidentiality.
 
 Inspect and trigger with the CLI:
 

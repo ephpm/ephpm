@@ -3584,6 +3584,32 @@ pub struct CronConfig {
     #[serde(default)]
     pub directory_monthly: Option<String>,
 
+    /// Default memory ceiling for a cron job that does not set its own
+    /// `memory_max`. A byte count or a number with `K`/`M`/`G` (1024-based,
+    /// PHP-style), or `"0"`/`"unlimited"`/`"none"` for no ceiling. **Unset
+    /// (default) ⇒ ≈ 33 % of the memory budget** ePHPm detects for itself (its
+    /// own cgroup `memory.max`, else host RAM; nothing on a platform with no
+    /// probe, e.g. macOS). This is **availability** (DoS) hardening, not
+    /// confidentiality: it stops a tenant cron script from exhausting host
+    /// memory. On a forked binary (`ephpm exec`) cron child it is an OS
+    /// `RLIMIT_AS` address-space cap; on a PHP (`ephpm php --site`) cron child
+    /// it is the PHP `memory_limit` ceiling (a tenant `ini_set('memory_limit',
+    /// '-1')` can no longer lift it — the `g_cli_mode` skip is not taken for a
+    /// tenant site). Env: `EPHPM_CRON__MEMORY_MAX`.
+    #[serde(default)]
+    pub memory_max: Option<String>,
+
+    /// Default CPU ceiling for a cron job that does not set its own `cpu_max`,
+    /// in CPU **cores** (e.g. `0.5`, `2.0`). `0` ⇒ no ceiling. **Unset
+    /// (default) ⇒ half the CPU** ePHPm detects for itself (its own cgroup
+    /// `cpu.max` quota, else host parallelism), floored at `1.0`. Enforced on
+    /// every forked per-site cron child (binary and PHP) as an `RLIMIT_CPU`
+    /// CPU-time ceiling of `ceil(cpu_max × timeout)` seconds — a runaway loop
+    /// is SIGKILLed once it has burned that much CPU time, independently of the
+    /// wall-clock `timeout`. Env: `EPHPM_CRON__CPU_MAX`.
+    #[serde(default)]
+    pub cpu_max: Option<f64>,
+
     /// Operator-defined jobs (`[[cron.jobs]]`).
     #[serde(default)]
     pub jobs: Vec<CronJob>,
@@ -3602,6 +3628,8 @@ impl Default for CronConfig {
             directory_daily: None,
             directory_weekly: None,
             directory_monthly: None,
+            memory_max: None,
+            cpu_max: None,
             jobs: Vec::new(),
         }
     }
@@ -3657,6 +3685,17 @@ pub struct CronJob {
     /// (but remains validated/listed). Default: `false`.
     #[serde(default)]
     pub suspend: bool,
+
+    /// Per-job override of `[cron] memory_max` (same syntax and semantics). A
+    /// byte count or a number with `K`/`M`/`G`, or `"0"`/`"unlimited"`/`"none"`
+    /// for no ceiling. Unset ⇒ the `[cron] memory_max` default.
+    #[serde(default)]
+    pub memory_max: Option<String>,
+
+    /// Per-job override of `[cron] cpu_max`, in CPU cores (`0` = no ceiling).
+    /// Unset ⇒ the `[cron] cpu_max` default.
+    #[serde(default)]
+    pub cpu_max: Option<f64>,
 }
 
 fn default_cron_timezone() -> String {
@@ -3792,6 +3831,14 @@ impl CronConfig {
             }
         }
 
+        // Section-level resource ceilings must parse (bytes / cores). The
+        // derived defaults are never invalid, so this only guards an explicit
+        // operator value.
+        let default_mem = default_cron_memory_bytes();
+        let default_cpu = default_cron_cpu_cores();
+        parse_cron_memory_limit("[cron] memory_max", self.memory_max.as_deref(), default_mem)?;
+        parse_cron_cpu_limit("[cron] cpu_max", self.cpu_max, default_cpu)?;
+
         // The directory tier is per-site, so it needs a sites directory.
         if (self.directory_cron || !self.directory_cron_sites.is_empty())
             && server.sites_dir.is_none()
@@ -3829,6 +3876,16 @@ impl CronConfig {
             job.timeout_duration()?;
             job.starting_deadline_duration()?;
             job.concurrency_policy_parsed()?;
+            parse_cron_memory_limit(
+                &format!("[[cron.jobs]] {:?} memory_max", job.name),
+                job.memory_max.as_deref(),
+                default_mem,
+            )?;
+            parse_cron_cpu_limit(
+                &format!("[[cron.jobs]] {:?} cpu_max", job.name),
+                job.cpu_max,
+                default_cpu,
+            )?;
 
             // Reject a syntactically valid but never-matching schedule (e.g.
             // `0 0 31 2 *` — 31 February). It parses fine, but would never fire
@@ -4753,6 +4810,106 @@ fn parse_size_knob(knob: &str, value: &str) -> Result<u64, ConfigError> {
         _ => return Err(bad()),
     };
     n.checked_mul(mult).ok_or_else(bad)
+}
+
+/// Resolve a cron memory-limit knob (`[cron] memory_max` / `[[cron.jobs]]
+/// memory_max`) to a concrete byte ceiling.
+///
+/// * `raw = None` ⇒ `fallback` (the derived default).
+/// * `raw = Some("0" | "unlimited" | "none" | "-1")` ⇒ `None` (no ceiling — an
+///   explicit operator opt-out).
+/// * `raw = Some("512M")` ⇒ `Some(bytes)`, parsed like [`parse_size_knob`].
+///
+/// # Errors
+///
+/// [`ConfigError::Validation`] naming `knob` when `raw` is neither an opt-out
+/// keyword nor a valid byte quantity.
+pub fn parse_cron_memory_limit(
+    knob: &str,
+    raw: Option<&str>,
+    fallback: Option<u64>,
+) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = raw else { return Ok(fallback) };
+    let t = value.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "0" | "unlimited" | "none" | "-1") {
+        return Ok(None);
+    }
+    parse_size_knob(knob, t).map(Some)
+}
+
+/// Resolve a cron CPU-limit knob (`[cron] cpu_max` / `[[cron.jobs]] cpu_max`)
+/// to a concrete core ceiling.
+///
+/// * `raw = None` ⇒ `fallback` (the derived default).
+/// * `raw = Some(0.0)` ⇒ `None` (no ceiling — an explicit opt-out).
+/// * `raw = Some(positive)` ⇒ `Some(cores)`.
+///
+/// # Errors
+///
+/// [`ConfigError::Validation`] naming `knob` when `raw` is negative or not
+/// finite.
+pub fn parse_cron_cpu_limit(
+    knob: &str,
+    raw: Option<f64>,
+    fallback: Option<f64>,
+) -> Result<Option<f64>, ConfigError> {
+    let Some(cores) = raw else { return Ok(fallback) };
+    if !cores.is_finite() || cores < 0.0 {
+        return Err(ConfigError::Validation(format!(
+            "{knob} must be a non-negative number of CPU cores (0 = no limit), got {cores}"
+        )));
+    }
+    Ok(if cores == 0.0 { None } else { Some(cores) })
+}
+
+/// The CPU ePHPm has available to itself, in cores: its own cgroup `cpu.max`
+/// quota when running under one, else host parallelism. Always returns a
+/// positive value (host parallelism is the universal fallback).
+#[must_use]
+pub fn detect_cpu_available() -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    read_cgroup_cpu_quota().unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as f64
+    })
+}
+
+/// The default cron memory ceiling: ≈ 33 % of the memory budget ePHPm detects
+/// for itself. `None` when no budget could be detected (e.g. macOS), in which
+/// case a binary cron child gets no `RLIMIT_AS` and a PHP cron child falls back
+/// to the configured `[php] memory_limit` as its ceiling.
+///
+/// This is the single-job view used by [`Config::validate`] only (to check the
+/// knob parses). The scheduler derives its *runtime* default from
+/// [`default_cron_memory_bytes_per_slot`] so the aggregate of all concurrent
+/// jobs stays within one node's budget.
+#[must_use]
+pub fn default_cron_memory_bytes() -> Option<u64> {
+    detect_memory_budget().0.map(|budget| budget / 3)
+}
+
+/// The default cron memory ceiling when `[cron] memory_max` is unset, aware of
+/// `[cron] max_concurrent`: the detected memory budget divided by the number of
+/// concurrent slots, so that all `max_concurrent` jobs running at once stay
+/// within one node's budget rather than each getting ≈ 33 % (which, at the
+/// default `max_concurrent = 4`, would let cron commit ≈ 132 % of the budget).
+/// Hardening F5/M6.
+///
+/// `None` when no budget could be detected (same fallback as
+/// [`default_cron_memory_bytes`]). Floored to a positive byte count so a large
+/// `max_concurrent` still yields a usable ceiling. The ceiling bounds only
+/// ZendMM allocations for a PHP child (and `RLIMIT_AS` for a binary child), not
+/// the whole process image.
+#[must_use]
+pub fn default_cron_memory_bytes_per_slot(max_concurrent: u32) -> Option<u64> {
+    let slots = u64::from(max_concurrent.max(1));
+    detect_memory_budget().0.map(|budget| (budget / slots).max(1))
+}
+
+/// The default cron CPU ceiling in cores: half the CPU ePHPm detects for
+/// itself, floored at `1.0`. Always `Some` (CPU detection always succeeds).
+#[must_use]
+pub fn default_cron_cpu_cores() -> Option<f64> {
+    Some((detect_cpu_available() * 0.5).max(1.0))
 }
 
 fn default_true() -> bool {
@@ -11032,6 +11189,90 @@ listen = "0.0.0.0:8080"
         let cfg = load_toml("[cron]\ndirectory_cron = true\n");
         let err = cfg.validate().expect_err("directory_cron needs sites_dir").to_string();
         assert!(err.contains("sites_dir"), "{err}");
+    }
+
+    /// F5 — the per-cron resource ceilings default to unset (the scheduler then
+    /// derives them), and both section and per-job values parse.
+    #[test]
+    fn cron_resource_limits_default_unset_and_parse() {
+        let def = load_toml("[cron]\n");
+        assert_eq!(def.cron.memory_max, None);
+        assert_eq!(def.cron.cpu_max, None);
+
+        let cfg = load_toml(
+            "[cron]\nmemory_max = \"512M\"\ncpu_max = 1.5\n\n\
+             [[cron.jobs]]\nname = \"j\"\nschedule = \"* * * * *\"\ncommand = [\"a\"]\n\
+             memory_max = \"0\"\ncpu_max = 0.0\n",
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.cron.memory_max.as_deref(), Some("512M"));
+        assert_eq!(cfg.cron.cpu_max, Some(1.5));
+        assert_eq!(cfg.cron.jobs[0].memory_max.as_deref(), Some("0"));
+        assert_eq!(cfg.cron.jobs[0].cpu_max, Some(0.0));
+    }
+
+    /// F5 — `parse_cron_memory_limit` resolves the three states: unset ⇒
+    /// fallback, opt-out keyword ⇒ no ceiling, quantity ⇒ bytes (1024-based).
+    #[test]
+    fn cron_memory_limit_resolution() {
+        let fb = Some(1024);
+        assert_eq!(parse_cron_memory_limit("m", None, fb).unwrap(), Some(1024));
+        for opt_out in ["0", "unlimited", "none", "-1", "NONE", " Unlimited "] {
+            assert_eq!(
+                parse_cron_memory_limit("m", Some(opt_out), fb).unwrap(),
+                None,
+                "{opt_out:?} is an opt-out"
+            );
+        }
+        assert_eq!(parse_cron_memory_limit("m", Some("512M"), fb).unwrap(), Some(512 << 20));
+        assert_eq!(parse_cron_memory_limit("m", Some("2G"), fb).unwrap(), Some(2 << 30));
+        assert_eq!(parse_cron_memory_limit("m", Some("1048576"), fb).unwrap(), Some(1_048_576));
+        assert!(parse_cron_memory_limit("[cron] memory_max", Some("lots"), fb).is_err());
+    }
+
+    /// F5 — `parse_cron_cpu_limit`: unset ⇒ fallback, `0` ⇒ no ceiling, a
+    /// positive value ⇒ cores, negative/NaN ⇒ error.
+    #[test]
+    fn cron_cpu_limit_resolution() {
+        let fb = Some(2.0);
+        assert_eq!(parse_cron_cpu_limit("c", None, fb).unwrap(), Some(2.0));
+        assert_eq!(parse_cron_cpu_limit("c", Some(0.0), fb).unwrap(), None);
+        assert_eq!(parse_cron_cpu_limit("c", Some(1.5), fb).unwrap(), Some(1.5));
+        assert!(parse_cron_cpu_limit("[cron] cpu_max", Some(-1.0), fb).is_err());
+        assert!(parse_cron_cpu_limit("[cron] cpu_max", Some(f64::NAN), fb).is_err());
+    }
+
+    /// F5 — the derived defaults are sane: the CPU default is always present and
+    /// at least one core; the memory default (when a budget is detectable) is
+    /// strictly below that budget (≈ 33 %).
+    #[test]
+    fn cron_derived_defaults_are_sane() {
+        let cpu = default_cron_cpu_cores().expect("cpu default is always present");
+        assert!(cpu >= 1.0, "cpu default floored at 1.0, got {cpu}");
+        if let Some(mem) = default_cron_memory_bytes() {
+            let budget = detect_memory_budget().0.expect("budget present if default is");
+            assert!(mem > 0 && mem < budget, "33% default {mem} must be below budget {budget}");
+        }
+    }
+
+    /// M6 — the per-slot cron memory default divides the budget by
+    /// `max_concurrent`, so the aggregate of all concurrent jobs stays within
+    /// one node's budget (rather than each slot getting ≈ 33 %). Asserted as a
+    /// ratio so it holds regardless of the host's absolute budget, and skipped
+    /// where no budget is detectable (macOS/Windows).
+    #[test]
+    fn cron_memory_default_divides_budget_by_max_concurrent() {
+        let Some(budget) = detect_memory_budget().0 else {
+            return; // No budget probe on this platform; nothing to assert.
+        };
+        assert_eq!(default_cron_memory_bytes_per_slot(1), Some(budget));
+        assert_eq!(default_cron_memory_bytes_per_slot(4), Some(budget / 4));
+        // 0 is treated as 1 (never divides by zero).
+        assert_eq!(default_cron_memory_bytes_per_slot(0), Some(budget));
+        // The aggregate at the default max_concurrent=4 stays within budget,
+        // unlike the ≈ 33 % single-job default (4 × budget/3 > budget).
+        let per_slot = default_cron_memory_bytes_per_slot(4).unwrap();
+        assert!(per_slot * 4 <= budget, "4 concurrent slots must fit the budget");
     }
 
     /// `[db.sqlite.backup]` absent (and present but off) is a usable default:

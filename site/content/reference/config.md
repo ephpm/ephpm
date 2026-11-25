@@ -1437,6 +1437,8 @@ for recipes. Clustered mode is experimental (lab-gated).
 | `directory_cron_sites` | list | `[]` | Site keys for which the directory tier is enabled, unioned with `directory_cron`. |
 | `max_jobs_per_site` | int | `20` | Cap on directory-tier jobs discovered per site; extras ignored with a WARN. |
 | `directory_hourly` / `directory_daily` / `directory_weekly` / `directory_monthly` | string | `"0 * * * *"` / `"0 0 * * *"` / `"0 0 * * 0"` / `"0 0 1 * *"` | Override the fixed clock for each cadence subdirectory (a five-field cron expression). |
+| `memory_max` | string | *(detected memory budget ÷ `max_concurrent`)* | Default memory ceiling for a cron job that sets no `memory_max`. A byte count or a `K`/`M`/`G` quantity (1024-based), or `"0"`/`"unlimited"`/`"none"` for no ceiling. Unset ⇒ ePHPm's own cgroup `memory.max` / host RAM divided by `max_concurrent`, so that all `max_concurrent` jobs running at once stay within one node's budget (nothing on a platform with no probe). A forked binary (`ephpm exec`) cron child enforces it as an OS `RLIMIT_AS`; a PHP (`ephpm php --site`) cron child enforces it as the PHP `memory_limit` ceiling (ZendMM allocations only), so a tenant `ini_set('memory_limit', '-1')` can no longer exhaust host memory. When `[php] memory_limit_max` is set, the effective ceiling for a PHP cron child is the *tighter* of the two — cron never exceeds the operator's HTTP-tenant cap. **Availability (DoS) hardening, not confidentiality.** |
+| `cpu_max` | float | *(half the detected CPU, floored at 1.0)* | Default CPU ceiling in **cores** (e.g. `0.5`, `2.0`) for a cron job that sets no `cpu_max`. `0` ⇒ no ceiling. Enforced on every forked per-site cron child as an `RLIMIT_CPU` ceiling of `ceil(cpu_max × timeout)` **CPU-seconds** — the kernel SIGKILLs the process once it has *consumed* that much CPU time (distinct from, and additive to, the wall-clock `timeout`). This is a per-process CPU-*time* budget, not a core-count / share ceiling: a single-threaded PHP child, whose CPU time cannot exceed wall time, is effectively bounded by `timeout` and only a multi-threaded or sub-core (`cpu_max < 1`) job trips it earlier. A true per-core / aggregate CPU share cap (cgroup `cpu.max`) is a planned follow-up. |
 
 ### `[[cron.jobs]]`
 
@@ -1454,6 +1456,8 @@ at startup (fail-closed, naming the job).
 | `concurrency_policy` | string | `"forbid"` | Overlap policy: `forbid`, `allow`, or `replace` (Kubernetes `concurrencyPolicy`). |
 | `starting_deadline` | string | *(unset)* | Kubernetes `startingDeadlineSeconds`. **Unset ⇒ no catch-up** (only the current tick fires). Set ⇒ the single most-recent missed tick within the window fires. |
 | `suspend` | bool | `false` | Kubernetes `suspend`: parsed and listed, but never fires. |
+| `memory_max` | string | `[cron] memory_max` | Per-job override of the section memory ceiling (same syntax; `"0"`/`"unlimited"`/`"none"` opts this job out). |
+| `cpu_max` | float | `[cron] cpu_max` | Per-job override of the section CPU ceiling in cores (`0` opts this job out). |
 
 The status endpoint is `GET /_ephpm/cron` (read-only, gated like
 `/_ephpm/db/backup`); `POST /_ephpm/cron/run/<name>` triggers a job now (a

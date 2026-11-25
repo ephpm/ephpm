@@ -45,11 +45,21 @@
 //! mode (refusing when it cannot reach the owner). See [`crate::site_db`] for
 //! the strategy picker; there is nothing further to wire in this module.
 //!
+//! # Resource ceilings (hardening finding F5)
+//!
+//! `setrlimit(RLIMIT_AS)` (memory) and `setrlimit(RLIMIT_CPU)` (CPU time) are
+//! applied from [`ResourceLimits`] before the command runs — they survive
+//! `execve` and bound every descendant. The cron scheduler sets them from each
+//! job's `memory_max` / `cpu_max`. `RLIMIT_AS` caps *virtual* address space, so
+//! it is a coarse backstop rather than an RSS cap; a cgroup `memory.max` (RSS,
+//! OOM-killed) would be tighter but needs the server to relocate its own cgroup
+//! leaf at startup (a larger change that interacts with the eBPF loopback
+//! policy) — a documented follow-up.
+//!
 //! # TODO — deliberately out of scope for this proof-of-concept
 //!
-//! - `TODO`: `setrlimit` (`RLIMIT_AS`/`RLIMIT_CPU`) resource caps and a
-//!   transient cgroup. The wall-clock `--timeout` is implemented via `alarm(2)`;
-//!   memory/CPU ceilings are follow-up.
+//! - `TODO`: a transient cgroup (`memory.max` / `cpu.max`) in place of the
+//!   `RLIMIT_*` caps above, once the server relocates its own cgroup leaf.
 //! - `TODO`: the `--no-sandbox` DB-bind-only path for Windows/dev. On Linux
 //!   `--no-sandbox` currently just runs the command uncontained (loudly warned);
 //!   on non-Linux the whole subcommand refuses.
@@ -74,6 +84,34 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// OS resource ceilings applied to a sandboxed child before it runs (hardening
+/// finding F5). Cross-platform so the CLI dispatch compiles everywhere; the
+/// limits are only *enforced* on Linux (via `setrlimit`), warned-and-skipped
+/// elsewhere.
+#[derive(Debug, Clone, Copy, Default)]
+// The fields are read only by the Linux `apply_rlimits`; off Linux the struct
+// is carried through the CLI dispatch but never inspected.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct ResourceLimits {
+    /// `RLIMIT_AS` address-space ceiling in bytes. `None` ⇒ no memory cap.
+    pub memory_bytes: Option<u64>,
+    /// `RLIMIT_CPU` CPU-time ceiling in seconds. `None` ⇒ no CPU-time cap.
+    pub cpu_secs: Option<u64>,
+}
+
+impl ResourceLimits {
+    /// Build from the `ephpm exec` CLI flags: `--memory-max` (a byte count or
+    /// a `K`/`M`/`G` quantity, or an opt-out keyword) and `--cpu-secs`.
+    ///
+    /// # Errors
+    ///
+    /// When `--memory-max` is neither an opt-out keyword nor a valid quantity.
+    pub fn from_cli(memory_max: Option<&str>, cpu_secs: Option<u64>) -> anyhow::Result<Self> {
+        let memory_bytes = ephpm_config::parse_cron_memory_limit("--memory-max", memory_max, None)?;
+        Ok(Self { memory_bytes, cpu_secs })
+    }
+}
+
 /// The tenant user `ephpm exec` drops to when `[server] run_as_user` is unset.
 ///
 /// On the preview nodes this resolves to uid 997, which is exactly the uid the
@@ -97,6 +135,7 @@ pub fn run(
     command: &[String],
     timeout: u64,
     no_sandbox: bool,
+    limits: ResourceLimits,
 ) -> anyhow::Result<ExitCode> {
     use anyhow::Context as _;
     use ephpm_server::{privdrop, router};
@@ -128,6 +167,8 @@ pub fn run(
         gid,
         timeout,
         no_sandbox,
+        memory_bytes = ?limits.memory_bytes,
+        cpu_secs = ?limits.cpu_secs,
         container = %site.container.display(),
         document_root = %site.document_root.display(),
         command = ?command,
@@ -156,6 +197,10 @@ pub fn run(
         // Block execve-based privilege regain (setuid binaries, file caps) in the
         // command we are about to run. Must precede Landlock and the uid drop.
         set_no_new_privs()?;
+        // OS cpu/memory ceilings (RLIMIT_AS / RLIMIT_CPU). Survive execve and
+        // bound every descendant of the command (hardening F5). Applied before
+        // the uid drop so an unprivileged command cannot raise them.
+        apply_rlimits(&limits);
         // Kernel filesystem boundary — the only fs scope for a non-PHP command.
         apply_landlock(&site).context("failed to apply the Landlock sandbox")?;
     }
@@ -518,6 +563,210 @@ fn set_no_new_privs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Clear `PR_SET_DUMPABLE` so the kernel marks the process non-dumpable.
+///
+/// This makes the kernel gate the memory-bearing `/proc/self` entries —
+/// `/proc/self/mem` and `/proc/self/environ` specifically — on
+/// `ptrace`-may-access rather than plain file permissions, so a read of them from
+/// *within* this process fails with `EACCES`, even for the process's own (dropped
+/// or undropped) uid and even when no uid drop happened at all. (The
+/// address-layout entries — `/proc/self/maps`, `cmdline`, `status` — stay
+/// self-readable, as the kernel always lets a task inspect its own layout; they
+/// carry no secret bytes, only addresses.) It also disables core dumps and
+/// `ptrace`-attach by the same uid. Used by [`confine_php_tenant`] as a defence
+/// beyond Landlock:
+/// that tier confines PHP **in-process**, sharing its address space and
+/// environment with the config this binary already parsed ([`[kv] secret`],
+/// `[cluster] secret`, `[db.wire_auth] password`, `[db.mysql] url`), so a tenant
+/// cron script that could read `/proc/self/mem` would recover every tenant's
+/// derived DB/KV password. `PR_SET_DUMPABLE = 0` closes that path regardless of
+/// whether the Landlock `/proc/self` grant or a uid drop is in effect.
+#[cfg(target_os = "linux")]
+fn set_not_dumpable() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) is the documented form with
+    // scalar arguments and no pointer operands; the return value is checked.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_DUMPABLE, 0) failed");
+    }
+    Ok(())
+}
+
+/// Apply the [`ResourceLimits`] as process `setrlimit`s (hardening F5).
+///
+/// `RLIMIT_AS` (virtual address space) bounds memory; `RLIMIT_CPU` (CPU
+/// seconds) bounds CPU time — on exceeding it the kernel sends `SIGXCPU`, then
+/// `SIGKILL`. Both survive `execve` and are inherited by every descendant, and
+/// both are applied **before** the uid drop so the dropped command cannot raise
+/// its own soft limit past the hard limit we set. Best-effort: a `setrlimit`
+/// that fails (e.g. the soft limit is already below our value) is warned, not
+/// fatal — the other containment layers still apply. An unset field leaves that
+/// resource at the inherited limit.
+#[cfg(target_os = "linux")]
+fn apply_rlimits(limits: &ResourceLimits) {
+    if let Some(bytes) = limits.memory_bytes {
+        set_one_rlimit("RLIMIT_AS", libc::RLIMIT_AS, bytes);
+    }
+    if let Some(secs) = limits.cpu_secs {
+        set_one_rlimit("RLIMIT_CPU", libc::RLIMIT_CPU, secs);
+    }
+}
+
+/// Set one `rlimit` (soft == hard == `value`), logging a warning on failure.
+#[cfg(target_os = "linux")]
+fn set_one_rlimit(name: &str, resource: libc::__rlimit_resource_t, value: u64) {
+    let rl = libc::rlimit { rlim_cur: value as libc::rlim_t, rlim_max: value as libc::rlim_t };
+    // SAFETY: `setrlimit` reads one `struct rlimit` through a valid pointer for
+    // a well-known resource id and takes no ownership; the return value is
+    // checked. It touches no PHP or Rust heap state.
+    let rc = unsafe { libc::setrlimit(resource, &raw const rl) };
+    if rc != 0 {
+        tracing::warn!(
+            limit = name,
+            value,
+            error = %std::io::Error::last_os_error(),
+            "ephpm sandbox: could not set resource limit (continuing without it)"
+        );
+    } else {
+        tracing::debug!(limit = name, value, "ephpm sandbox: resource limit set");
+    }
+}
+
+/// Confine the **current process** (an `ephpm php --site` cron child) to one
+/// tenant, in place, before PHP starts — the PHP counterpart of [`run`]'s
+/// binary sandbox (hardening F5).
+///
+/// Applies, in order: `PR_SET_DUMPABLE = 0` (so `/proc/self/{mem,environ}`
+/// become `EACCES` to this process and this in-process tier cannot leak the
+/// parsed Config secrets — see [`set_not_dumpable`]), the tenant's
+/// private-state-root
+/// preparation and an irreversible uid/gid drop (both only when started as
+/// root), `no_new_privs`, per-site Landlock, and `RLIMIT_CPU` (from `cpu_secs`).
+/// It deliberately does
+/// **not** set `RLIMIT_AS`: a PHP cron child is the full ePHPm binary plus the
+/// embedded engine and mimalloc, whose virtual-address reservations dwarf real
+/// usage, so a tight `RLIMIT_AS` would abort startup; PHP's own `memory_limit`
+/// ceiling (set by the caller via tenant mode) is the memory lever here.
+///
+/// **Best-effort, never fatal, and non-regressing**: unlike [`run`] (which
+/// refuses to run a binary it cannot sandbox), this warns-and-continues for any
+/// layer the kernel or our privileges cannot provide — a non-root server simply
+/// skips the uid drop, a Landlock-less kernel skips the filesystem scope — so a
+/// PHP cron that worked before (bounded by `open_basedir`, `disable_functions`,
+/// and the PHP `memory_limit` ceiling) keeps working, now with OS confinement
+/// added wherever the platform supports it. The config must already be loaded
+/// (the caller reads it before calling this, so the Landlock scope — which
+/// denies `/etc/ephpm` — does not break config access), and any database the
+/// child reaches must be over the loopback wire (Landlock is filesystem-only).
+///
+/// # Errors
+///
+/// Only when the `--site` key cannot be resolved to a tenant sandbox (a
+/// fail-closed misconfiguration), or a uid/gid the config names cannot be
+/// resolved. The containment syscalls themselves never error the call.
+#[cfg(target_os = "linux")]
+pub fn confine_php_tenant(
+    config: &ephpm_config::Config,
+    site_key: &str,
+    cpu_secs: Option<u64>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use ephpm_server::{privdrop, router};
+
+    let site = router::resolve_sandbox_site(config, site_key)
+        .context("failed to resolve --site to a tenant sandbox")?;
+
+    let user_spec = config.server.run_as_user.as_deref().unwrap_or(DEFAULT_TENANT_USER);
+    let (uid, primary_gid) = privdrop::resolve_user(user_spec)
+        .with_context(|| format!("failed to resolve tenant user {user_spec:?}"))?;
+    let gid = match config.server.run_as_group.as_deref() {
+        Some(group_spec) => privdrop::resolve_group(group_spec)
+            .with_context(|| format!("failed to resolve tenant group {group_spec:?}"))?,
+        None => primary_gid.unwrap_or(uid),
+    };
+
+    // SAFETY: geteuid never fails and takes no arguments.
+    let is_root = unsafe { libc::geteuid() } == 0;
+
+    tracing::info!(
+        site = %site.key,
+        uid,
+        gid,
+        is_root,
+        cpu_secs = ?cpu_secs,
+        container = %site.container.display(),
+        "ephpm php --site: confining the cron PHP child to this tenant"
+    );
+
+    // H1 (hardening): mark this process non-dumpable BEFORE Landlock and the uid
+    // drop. Unlike `run`'s binary sandbox, this tier confines PHP *in-process* —
+    // the cron child shares its address space and environment with the Config
+    // this binary parsed (the `[kv]`/`[cluster]` secrets, the wire-auth password,
+    // the `[db.mysql]` URL). Without this, a tenant cron script could read
+    // `/proc/self/mem` or `/proc/self/environ` and recover every tenant's derived
+    // DB/KV password. `PR_SET_DUMPABLE = 0` makes the kernel gate exactly those
+    // two memory-bearing entries on ptrace-may-access, so the read fails with
+    // EACCES whether or not a uid drop or the Landlock `/proc/self` grant is in
+    // effect — a defence that does not depend on the shared Landlock ruleset.
+    // (`/proc/self/maps` stays self-readable but exposes only addresses, no
+    // secret bytes.) Legitimate cron PHP never reads its own `/proc/self/mem`, so
+    // this is transparent to a well-behaved job.
+    if let Err(e) = set_not_dumpable() {
+        tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: PR_SET_DUMPABLE unavailable (continuing; /proc/self/mem may be self-readable)");
+    }
+    // Prepare + chown the private state root while still root, mirroring `run`.
+    if is_root && let Err(e) = prepare_state_root(&site, uid, gid) {
+        tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: could not prepare tenant state root (continuing)");
+    }
+    // no_new_privs + Landlock are unprivileged-capable (that is Landlock's
+    // design); warn-and-continue if the kernel declines, never refuse.
+    if let Err(e) = set_no_new_privs() {
+        tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: PR_SET_NO_NEW_PRIVS unavailable (continuing)");
+    }
+    if let Err(e) = apply_landlock(&site) {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "ephpm sandbox: Landlock unavailable on this kernel; the PHP cron child runs \
+             without a filesystem scope (still bounded by open_basedir + the memory ceiling)"
+        );
+    }
+    apply_rlimits(&ResourceLimits { memory_bytes: None, cpu_secs });
+    // Irreversible uid/gid drop — only possible as root.
+    if is_root {
+        privdrop::drop_to_user(uid, gid).context("failed to drop to the tenant uid/gid")?;
+    } else {
+        tracing::debug!(
+            "ephpm sandbox: not started as root, so no uid drop (the child keeps the \
+             caller's uid; Landlock + the memory ceiling still apply)"
+        );
+    }
+    Ok(())
+}
+
+/// Non-Linux stub: the OS confinement layers (Landlock, setuid, setrlimit) are
+/// Linux-only, so the PHP cron child runs with only the PHP-level sandbox
+/// (`open_basedir` + `disable_functions` + the `memory_limit` ceiling). Warns
+/// once and succeeds rather than refusing, so cron keeps working off Linux.
+#[cfg(not(target_os = "linux"))]
+// Mirrors the fallible Linux signature so `run_php` calls one shape everywhere;
+// the stub itself cannot fail.
+#[allow(clippy::unnecessary_wraps)]
+pub fn confine_php_tenant(
+    _config: &ephpm_config::Config,
+    site_key: &str,
+    _cpu_secs: Option<u64>,
+) -> anyhow::Result<()> {
+    tracing::warn!(
+        site = site_key,
+        "ephpm php --site --confine: OS confinement (Landlock / uid drop / RLIMIT) is \
+         Linux-only; the cron PHP child is bounded by open_basedir + disable_functions + \
+         the PHP memory_limit ceiling only"
+    );
+    Ok(())
+}
+
 /// Apply the Landlock filesystem ruleset for this tenant.
 ///
 /// Grants read/write beneath the site container and its private state root,
@@ -763,8 +1012,9 @@ pub fn run(
     command: &[String],
     timeout: u64,
     no_sandbox: bool,
+    limits: ResourceLimits,
 ) -> anyhow::Result<ExitCode> {
-    let _ = (config_path, site_key, command, timeout, no_sandbox);
+    let _ = (config_path, site_key, command, timeout, no_sandbox, limits);
     anyhow::bail!(
         "`ephpm exec` sandboxed execution is Linux-only — it relies on Landlock, \
          setuid, and the host uid-keyed egress firewall, none of which exist on \
@@ -818,6 +1068,42 @@ mod tests {
         // SAFETY: getuid/getgid take no arguments and cannot fail.
         let gid = unsafe { libc::getgid() };
         (uid, gid)
+    }
+
+    /// H1 — `set_not_dumpable` clears `PR_SET_DUMPABLE`, which is what makes
+    /// `/proc/self/{mem,environ}` `EACCES` to this process so a tenant cron child
+    /// cannot read the parsed Config secrets out of the shared process image.
+    /// Runs in its own process so the non-dumpable flag never leaks into the
+    /// other tests in this binary (it would disable their core dumps / ptrace).
+    #[test]
+    fn set_not_dumpable_marks_process_undumpable() {
+        // SAFETY: fork in a test with no threads yet touching shared state; the
+        // child only calls async-signal-safe prctl/_exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: default dumpable is 1; after the call PR_GET_DUMPABLE is 0.
+            // SAFETY: PR_GET_DUMPABLE takes no pointer operands.
+            let before = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+            let set_ok = super::set_not_dumpable().is_ok();
+            // SAFETY: PR_GET_DUMPABLE takes no pointer operands.
+            let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+            let code = i32::from(!(before == 1 && set_ok && after == 0));
+            // SAFETY: _exit is async-signal-safe and ends the forked child
+            // without running atexit handlers or unwinding the parent's state.
+            unsafe { libc::_exit(code) };
+        }
+        // Parent: reap and assert the child saw the expected transition.
+        let mut status = 0;
+        // SAFETY: waitpid with a child pid we own and a valid out-pointer.
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert_eq!(rc, pid, "waitpid failed: {}", std::io::Error::last_os_error());
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "set_not_dumpable did not take the process from dumpable=1 to dumpable=0"
+        );
     }
 
     #[test]
