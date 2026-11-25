@@ -156,6 +156,7 @@ impl ResolvedJob {
         config_path: Option<PathBuf>,
         sites_dir: Option<&std::path::Path>,
         siteless_db_env: &[(String, String)],
+        kv_secret: Option<&str>,
     ) -> ExecRequest {
         // A per-site job runs with its site root as the working directory, so a
         // relative command (e.g. `bin/cake.php`) resolves there rather than
@@ -186,6 +187,15 @@ impl ResolvedJob {
         // `ephpm php --site` injects; handing it the shared credential would be a
         // cross-tenant leak.
         let extra_env = if self.site.is_none() { siteless_db_env.to_vec() } else { Vec::new() };
+        // Give the `[kv] secret` back to a **PHP per-site** child only: that is
+        // the lane that runs `ephpm php --site`, whose `Config::load` →
+        // `plan_site_db` needs it to derive the wire credential (finding F1 —
+        // the parent server scrubbed `EPHPM_KV__SECRET` from its own env). A
+        // siteless job is spawned as the operator's own binary directly, so it
+        // must never receive the secret; a binary per-site job (`ephpm exec`)
+        // resolves its credentials by other means and does not need it here.
+        let kv_secret =
+            if self.is_php && self.site.is_some() { kv_secret.map(str::to_string) } else { None };
         ExecRequest {
             job: self.name.clone(),
             site: self.site.clone(),
@@ -197,6 +207,7 @@ impl ResolvedJob {
             timeout: self.timeout,
             memory_max_bytes: self.memory_max_bytes,
             cpu_secs,
+            kv_secret,
         }
     }
 }
@@ -272,6 +283,12 @@ impl RunningState {
 pub struct CronScheduler {
     operator_jobs: Vec<ResolvedJob>,
     config_path: Option<PathBuf>,
+    /// The `[kv] secret`, passed to a PHP per-site child via `Command::env` so
+    /// its `Config::load` can still derive the site's wire credential after the
+    /// parent server scrubbed `EPHPM_KV__SECRET` from its own environment
+    /// (finding F1). `None` when no secret is configured. Child-only — never
+    /// logged, never in argv.
+    kv_secret: Option<String>,
     /// Sites with the directory tier enabled: `None` ⇒ all sites under
     /// `sites_dir`; `Some(set)` ⇒ only those keys.
     directory_sites: Option<Vec<String>>,
@@ -403,6 +420,7 @@ impl CronScheduler {
         Some(Self {
             operator_jobs,
             config_path: config.source_path.clone(),
+            kv_secret: config.kv.secret.clone(),
             directory_sites,
             sites_dir: config.server.sites_dir.clone(),
             cadence,
@@ -660,6 +678,7 @@ impl CronScheduler {
             self.config_path.clone(),
             self.sites_dir.as_deref(),
             &self.siteless_db_env,
+            self.kv_secret.as_deref(),
         );
         let executor = Arc::clone(&self.executor);
         let running = self.running.clone();

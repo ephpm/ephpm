@@ -364,6 +364,21 @@ node's PHP. Prefer a `file:/abs/path` indirection for those secrets — the
 `preview-gate` and `github-auth` `session_secret` both accept it — so the
 literal never sits in the environment at all.
 
+**`/proc/self/environ`:** removing a variable from the live `environ` leaves its
+exec-time `NAME=VALUE` string in the kernel env region, which `/proc/self/environ`
+exposes. On glibc Linux the scrub therefore also zeroes each removed variable's
+**value** bytes in place (leaving `NAME=`), so after startup
+`/proc/self/environ` shows an empty value for every scrubbed variable — the
+secret is gone from the exec block, not just the live array. On non-glibc
+platforms (musl, macOS, Windows) only the live `environ` is cleared, so there the
+`open_basedir` layer (§1) that keeps PHP out of `/proc` is what closes this.
+
+**CLI tenant scripts:** `ephpm php --site` (the lane cron jobs and
+`wp` / `artisan` run through) applies the same `env_allowlist` scrub before any
+tenant PHP runs — keeping only that site's own injected `DB_*` credentials — so a
+tenant script cannot `getenv()` the operator's secrets any more than a request's
+PHP can.
+
 ### 11. AF_UNIX connect fence (Linux ≥ 6.7, on by default)
 
 Everything above is about IP. **Unix sockets are a separate door**, and

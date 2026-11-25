@@ -1656,7 +1656,26 @@ fn run_php(
             // process is still single-threaded: the runtime below is the
             // first thread this subcommand spawns.
             let strategy = site_db::plan_site_db(&cfg, &site_key)?;
-            site_db::export_db_env(&strategy);
+            let db_env_names = site_db::export_db_env(&strategy);
+            // Scrub the process environment before any tenant PHP runs (finding
+            // F1, half b): `ephpm php --site` imports the environment into
+            // `$_SERVER` and `getenv()`, so without this a tenant cron/`wp`/
+            // `artisan` script could read the operator's `[kv] secret` /
+            // `[cluster] secret` / `AWS_*` exactly as a server request's PHP
+            // could before the serve-mode scrub. Same allowlist + internal
+            // keep-set as serve mode; the per-site `DB_*` just exported are kept
+            // (they are *this* tenant's own credentials). Runs while the process
+            // is still single-threaded — the runtime below is the first thread
+            // this subcommand spawns, and `plan_site_kv`/`bind_site_kv` read the
+            // `[kv] secret` from the loaded config, not the environment, so
+            // scrubbing it here is safe. This is the single-tenant CLI lane, so
+            // it uses the pointer-only scrub (the `ephpm php` title constructor
+            // already relocated `environ` off the exec block). Also closes a
+            // cron path: the scheduler passes `[kv] secret` to this child via
+            // `Command::env` (the parent server's own environment was scrubbed),
+            // and this removes it again before tenant code runs.
+            let scrub = env_scrub::scrub_cli_environment(&cfg.php.env_allowlist, &db_env_names);
+            scrub.log();
             // F5 (hardening): bound this tenant's PHP memory. Tenant mode makes
             // the embedded engine enforce the `memory_limit` ceiling and the
             // `memory_hard_limit_percent` SYSTEM-lock that plain `ephpm php`
@@ -1681,7 +1700,9 @@ fn run_php(
             // non-root cron keeps working. Config was already read above, so the
             // Landlock scope (which denies /etc/ephpm) does not break startup;
             // the DB bind below goes over the loopback wire, which Landlock —
-            // being filesystem-only — does not restrict.
+            // being filesystem-only — does not restrict. The env scrub above has
+            // already run, so nothing after the confine depends on the dropped
+            // variables.
             if confine {
                 exec_sandbox::confine_php_tenant(&cfg, &site_key, cpu_secs)
                     .context("confining the per-site cron PHP child")?;
@@ -2950,8 +2971,10 @@ fn run_with_config(
     // warning has inspected the original environment, and BEFORE
     // `php_embed_init()` and any PHP pool thread exists, so mutating `environ`
     // is race-free and PHP's `getenv()` / `$_ENV` / `phpinfo()` are clean at
-    // the source. `AWS_*` are cached just before, so a later S3 upload still
-    // finds them. See `env_scrub`.
+    // the source. On glibc Linux it also zeroes each scrubbed variable's value
+    // bytes in the exec block so `/proc/self/environ` cannot leak them. `AWS_*`
+    // are cached just before, so a later S3 upload still finds them. See
+    // `env_scrub`.
     if config.php.scrub_environment {
         ephpm_server::cache_aws_credentials();
         // Keep both kinds of `env:NAME` reference the config consumes lazily,

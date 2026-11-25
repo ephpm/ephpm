@@ -241,12 +241,16 @@ pub(crate) fn plan_site_db(config: &Config, site_key: &str) -> anyhow::Result<St
 ///
 /// Must be called while the process is still single-threaded — before the
 /// `--site` database runtime, before PHP starts.
-pub(crate) fn export_db_env(strategy: &Strategy) {
+///
+/// Returns the names it exported, so the caller can keep them across the
+/// finding-F1 CLI environment scrub (they are this tenant's own credentials,
+/// not an operator secret).
+pub(crate) fn export_db_env(strategy: &Strategy) -> Vec<String> {
     let vars = strategy.db_env_vars();
     if vars.is_empty() {
-        return;
+        return Vec::new();
     }
-    let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+    let names: Vec<String> = vars.iter().map(|(k, _)| k.clone()).collect();
     #[allow(unsafe_code)]
     // SAFETY: `set_var` is unsound only when another thread reads or writes
     // the environment concurrently. The one caller (`run_php`) invokes this on
@@ -265,6 +269,7 @@ pub(crate) fn export_db_env(strategy: &Strategy) {
         "ephpm php --site: exported the per-site database credentials into $_SERVER (as a \
          request would get them)"
     );
+    names
 }
 
 /// Bind the `ephpm_db_*` bridge to the backend `strategy` names, registering

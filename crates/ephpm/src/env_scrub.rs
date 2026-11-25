@@ -18,6 +18,17 @@
 //! pool thread exists. After it runs, `getenv()`, `$_ENV` and `phpinfo()` are
 //! clean at the source.
 //!
+//! `remove_var` only drops the pointer out of libc's `environ` array; the
+//! exec-time `NAME=VALUE` string it pointed at stays in the kernel's env region
+//! and leaks through `/proc/self/environ` (readable by a tenant's PHP in
+//! single-site mode, where there is no `open_basedir` confining `/proc`). So in
+//! `serve` mode the scrub also zeroes each removed variable's **value** bytes in
+//! place before dropping the pointer (overwriting them through libc's `environ`),
+//! leaving `NAME=` intact so `remove_var` still unsets the entry. After the
+//! scrub `/proc/self/environ` shows `NAME=` with an empty value for every
+//! scrubbed variable — the secret value is gone from the exec block, not just
+//! from the live array.
+//!
 //! This mirrors what [`crate::exec_sandbox`] already does for the children
 //! `ephpm exec` spawns (`env_clear` + a fixed allowlist), applied here to the
 //! server's own process instead.
@@ -35,10 +46,12 @@
 //! that node's PHP unless a `file:` indirection is used instead.
 
 // `std::env::remove_var` is `unsafe` in the 2024 edition because mutating the
-// process environment races concurrent readers on other threads. The one call
-// site runs on the single-threaded startup path, before `php_embed_init()` and
-// before any tokio/PHP worker thread exists, so that hazard cannot occur here;
-// its SAFETY comment states the invariant.
+// process environment races any concurrent *reader* of it. The call sites run
+// on the single-threaded startup path, before `php_embed_init()` and before any
+// PHP pool thread exists; the threads that may exist by then (the tracing-
+// appender writer, an OTLP exporter) never read the environment, so that hazard
+// cannot occur here. The `/proc`-zeroing pass additionally reads libc's raw
+// `environ` directly, which is sound under the same single-reader invariant.
 #![allow(unsafe_code)]
 
 /// What [`scrub_process_environment`] did, for a single startup log line.
@@ -94,12 +107,50 @@ fn scrub_plan(
     (to_remove, kept)
 }
 
-/// Scrub the live process environment in place (finding F1).
+/// Scrub the live process environment in place for `ephpm serve` (finding F1).
 ///
-/// Removes every variable not kept by [`scrub_plan`]. Call on the
+/// Removes every variable not kept by [`scrub_plan`], and — on glibc Linux —
+/// zeroes each removed variable's value bytes in the exec block first so
+/// `/proc/self/environ` cannot leak it (see the module docs). Call on the
 /// single-threaded startup path, before `php_embed_init()` and before any
 /// worker thread is spawned.
 pub(crate) fn scrub_process_environment(allowlist: &[String], env_refs: &[String]) -> ScrubReport {
+    scrub_environment(allowlist, env_refs, ZeroBacking::Yes)
+}
+
+/// Scrub the environment for the `ephpm php --site` tenant CLI lane (finding
+/// F1, half b): a tenant cron/`wp`/`artisan` script must not be able to
+/// `getenv()` the operator's `[kv] secret` / `[cluster] secret` / `AWS_*`.
+///
+/// Pointer-only removal, no `/proc` value zeroing: by the time this runs the
+/// `ephpm php` process-title constructor (`ephpm_wrapper.c`,
+/// `ephpm_ps_capture_argv`, gated to `argv[1] == "php"`) has already relocated
+/// `environ` to heap copies, so the exec block is no longer what `environ`
+/// points at and zeroing those copies would clean nothing. (The `/proc` leak
+/// also matters far less here: this process serves exactly one tenant.) Caller
+/// keeps this single-site process's needed names — the per-site `DB_*` it just
+/// exported — via `env_refs`.
+pub(crate) fn scrub_cli_environment(allowlist: &[String], env_refs: &[String]) -> ScrubReport {
+    scrub_environment(allowlist, env_refs, ZeroBacking::No)
+}
+
+/// Whether [`scrub_environment`] zeroes a removed variable's value bytes in the
+/// exec block before dropping its `environ` pointer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZeroBacking {
+    /// `serve` mode: `environ` still points at the original exec block, so zero
+    /// the value bytes in place to close the `/proc/self/environ` residual.
+    Yes,
+    /// `ephpm php` CLI: `environ` was relocated to heap copies, so skip it.
+    No,
+}
+
+/// The shared scrub core for both lanes.
+fn scrub_environment(
+    allowlist: &[String],
+    env_refs: &[String],
+    zero_backing: ZeroBacking,
+) -> ScrubReport {
     // Collect the current names first (as lossy UTF-8 for matching, keeping the
     // original `OsString` for removal), so we never mutate `environ` while
     // iterating it. A name that is not valid UTF-8 cannot match a `String`
@@ -115,15 +166,24 @@ pub(crate) fn scrub_process_environment(allowlist: &[String], env_refs: &[String
     // by the exact key instead.
     let remove_set: std::collections::HashSet<&str> =
         to_remove.iter().map(String::as_str).collect();
+
+    // Zero each removed variable's value bytes in the exec block *before* the
+    // removal drops its `environ` pointer (serve mode only). Keeps `NAME=`
+    // intact so the `remove_var` below still unsets the entry.
+    if zero_backing == ZeroBacking::Yes {
+        zero_removed_value_bytes(&remove_set);
+    }
+
     let removed = current
         .iter()
         .filter(|(_, name)| remove_set.contains(name.as_str()))
         .map(|(key, _)| {
             // SAFETY: this runs on the single-threaded startup path — before
-            // `php_embed_init()` and before any tokio/PHP worker thread is
-            // spawned — so no other thread can be reading `environ` concurrently.
-            // `std::env::remove_var` is `unsafe` in the 2024 edition purely
-            // because of that cross-thread hazard, which cannot occur here.
+            // `php_embed_init()` and before any PHP pool thread is spawned — so
+            // no thread that reads the environment can be reading `environ`
+            // concurrently. `std::env::remove_var` is `unsafe` in the 2024
+            // edition purely because of that cross-thread hazard, which cannot
+            // occur here.
             unsafe { std::env::remove_var(key) };
         })
         .count();
@@ -131,12 +191,158 @@ pub(crate) fn scrub_process_environment(allowlist: &[String], env_refs: &[String
     ScrubReport { removed, kept }
 }
 
+/// Overwrite, in place, the value bytes of every `environ` entry whose name is
+/// in `remove_set` (glibc Linux only; a no-op elsewhere).
+///
+/// `remove_var` unlinks the pointer but leaves the exec-time `NAME=VALUE` string
+/// in the kernel env region, where `/proc/self/environ` still exposes it. This
+/// zeroes the bytes after the first `=`, leaving `NAME=` so the subsequent
+/// `remove_var` still matches. Only the value — never the name — is touched, and
+/// kept variables are not visited.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn zero_removed_value_bytes(remove_set: &std::collections::HashSet<&str>) {
+    // glibc exposes the process environment as the `environ` global. The `libc`
+    // crate only declares it under feature flags this crate does not enable, so
+    // declare it directly here; it resolves against glibc at link time.
+    unsafe extern "C" {
+        #[link_name = "environ"]
+        static mut ENVIRON: *mut *mut core::ffi::c_char;
+    }
+    // SAFETY: single-threaded startup path (see the module `#![allow]` note), so
+    // no concurrent reader of `environ`. In `serve` mode the process-title
+    // constructor has not run (it is gated to `ephpm php`), so each `environ[i]`
+    // still points at the original, writable exec-block string. We read the
+    // array pointers and overwrite only the value bytes after `=` with volatile
+    // writes (so the zeroing is not elided); we never free or move the array.
+    unsafe {
+        // Read the `environ` pointer value through a raw pointer to the static,
+        // never a reference to it (edition-2024 `static_mut_refs`).
+        let mut entry = (&raw const ENVIRON).read();
+        if entry.is_null() {
+            return;
+        }
+        while !(*entry).is_null() {
+            let s = *entry;
+            let cstr = std::ffi::CStr::from_ptr(s);
+            let bytes = cstr.to_bytes();
+            if let Some(eq) = bytes.iter().position(|&b| b == b'=')
+                && let Ok(name) = std::str::from_utf8(&bytes[..eq])
+                && remove_set.contains(name)
+            {
+                let value = s.add(eq + 1);
+                for i in 0..(bytes.len() - (eq + 1)) {
+                    core::ptr::write_volatile(value.add(i), 0);
+                }
+            }
+            entry = entry.add(1);
+        }
+    }
+}
+
+/// Non-glibc targets (musl, macOS, Windows): `remove_var` is the whole scrub —
+/// the `environ` symbol is not exposed the same way, or the `/proc/self/environ`
+/// surface does not exist.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn zero_removed_value_bytes(_remove_set: &std::collections::HashSet<&str>) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// Index of the first occurrence of `needle` in `haystack` (byte search over
+    /// the NUL-separated `/proc/self/environ` blob).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    // The `/proc/self/environ` value-zeroing is exercised by a parent/child
+    // pair. `/proc/self/environ` reflects the *exec-time* environment block, and
+    // a variable set at runtime with `set_var` lands on the heap (invisible to
+    // `/proc`), so the only way to drive the real `zero_removed_value_bytes` over
+    // a marker that `/proc` actually shows is to put it in a child's exec block
+    // (`Command::env`) and run the scrub inside that child. The parent spawns
+    // this test binary filtered to the child test, with a cleared, controlled
+    // environment; the child does the work and asserts.
+
+    /// Parent: spawn the child test with a controlled exec environment.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn proc_self_environ_value_is_zeroed() {
+        // When we are already the spawned child, do nothing here — the child
+        // test below is the one that runs the real assertions.
+        if std::env::var_os("SCRUBTEST_CHILD").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = std::process::Command::new(exe)
+            // Controlled exec environment: only what the child needs, so the
+            // marker and PATH are the only interesting entries in its exec block.
+            .env_clear()
+            .env("SCRUBTEST_CHILD", "1")
+            .env("SCRUBTEST_MARKER", "TOPSECRETVALUE_do_not_leak_12345")
+            .env("PATH", &path)
+            .args([
+                "--exact",
+                "env_scrub::tests::proc_self_environ_value_is_zeroed_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn child test");
+        assert!(
+            output.status.success(),
+            "child /proc scrub test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Child: the marker is in this process's exec block (set by the parent via
+    /// `Command::env`). Confirm `/proc/self/environ` shows it, run the serve-mode
+    /// scrub removing only the marker, then confirm its **value** is zeroed while
+    /// `NAME=` remains and `PATH` is untouched.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn proc_self_environ_value_is_zeroed_child() {
+        // Only run when spawned by the parent test above (with the full
+        // controlled environment); a normal suite run early-returns.
+        if std::env::var_os("SCRUBTEST_CHILD").is_none() {
+            return;
+        }
+        let secret = b"TOPSECRETVALUE_do_not_leak_12345";
+        let path_entry = format!("PATH={}", std::env::var("PATH").unwrap_or_default());
+
+        let before = std::fs::read("/proc/self/environ").expect("read /proc before");
+        assert!(
+            find_sub(&before, b"SCRUBTEST_MARKER=").is_some()
+                && find_sub(&before, secret).is_some(),
+            "marker must be present in the exec block before the scrub"
+        );
+
+        // Serve-mode path: this zeroes the marker's value bytes in place.
+        let remove_set: std::collections::HashSet<&str> =
+            ["SCRUBTEST_MARKER"].into_iter().collect();
+        zero_removed_value_bytes(&remove_set);
+
+        let after = std::fs::read("/proc/self/environ").expect("read /proc after");
+        // The NAME= prefix survives (so a later remove_var still matches)…
+        let marker_at =
+            find_sub(&after, b"SCRUBTEST_MARKER=").expect("NAME= prefix must remain after zeroing");
+        // …the byte immediately after `=` is now NUL (value gone)…
+        let after_eq = marker_at + b"SCRUBTEST_MARKER=".len();
+        assert_eq!(after[after_eq], 0, "value byte must be zeroed");
+        // …the secret value is gone from the exec block entirely…
+        assert!(find_sub(&after, secret).is_none(), "secret value must not leak via /proc");
+        // …and a kept variable is untouched.
+        assert!(
+            find_sub(&after, path_entry.as_bytes()).is_some(),
+            "PATH must survive the scrub untouched"
+        );
     }
 
     /// The default allowlist keeps exactly the four safe families and removes
