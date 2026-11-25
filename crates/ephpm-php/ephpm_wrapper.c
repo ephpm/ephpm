@@ -5633,8 +5633,9 @@ typedef struct {
     int (*cursor_open)(const char *sql, size_t sql_len,
                        unsigned long long *out_handle);
     /* Fetch up to `max` more rows into the staged row buffer (read via
-     * row_count/col_*/cell, released by finish()). Returns the number staged
-     * (0 = cursor exhausted), -1 = no such handle on this thread, -3 = gone. */
+     * row_count, col_*, and cell, released by finish()). Returns the number
+     * staged (0 = cursor exhausted), -1 = no such handle on this thread,
+     * -3 = gone. */
     long long (*cursor_fetch)(unsigned long long handle, size_t max);
     /* Close a cursor and free its buffer. Returns 1 if it existed, else 0.
      * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
