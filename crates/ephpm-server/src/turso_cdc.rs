@@ -5235,10 +5235,12 @@ fn rank_candidates_by_version(
 /// reseed, say) with a staler peer's that merely answered first. `NoCopy` and
 /// `Unreachable` pass through unchanged.
 ///
-/// A cold owner's `own` is the empty version `(0, 0, 0)`, which every real data
-/// copy (ownership epoch ≥ 1 once it has ever served) out-ranks, so the gate is
-/// a no-op there beyond preferring the freshest peer — a genuinely new site is
-/// still served empty by the `handoff_verdict` path.
+/// Applied **only to a warm owner replacing its data** (`discard_local`): that is
+/// the one case with local data to protect. A cold owner has nothing to protect
+/// and must pull from whichever peer holds the site — a held copy may carry the
+/// empty version `(0, 0, 0)` and a cold owner that gated it against its own empty
+/// version would serve empty — so the cold pull is version-ranked (freshest
+/// first) but not gated. See the caller in [`settle_round`].
 ///
 /// This does **not** weaken [`snapshot_may_replace_local_data`]'s empty-snapshot
 /// refusal or the `__ephpm_cdc_source` lineage invariant — it is an additional
@@ -5640,13 +5642,20 @@ async fn settle_round(
         return SettleRound::NotOwner;
     }
 
-    // Rank the pull candidates freshest-first by their durable version, and
-    // version-gate each snapshot against our local copy (#707): only a copy
-    // strictly newer than `own` may replace it. A cold owner's `own` is the empty
-    // version, so every real data copy passes and the freshest is taken; a
-    // warm-but-behind owner (`discard_local`) takes the freshest copy strictly
-    // newer than its stale one, never a staler peer that merely answers first
-    // (which would silently overwrite a fresh reseed with an older copy).
+    // Rank the pull candidates freshest-first by their durable version (#707),
+    // so the owner-elect always prefers the newest copy a peer holds — a reseed
+    // out-ranks a stale higher-epoch copy, whatever HRW order they fall in.
+    //
+    // The strict version GATE, on the other hand, applies only to a WARM owner
+    // that is replacing its own data (`discard_local`): that copy must only ever
+    // be overwritten by one STRICTLY NEWER than it, so a stale peer can never
+    // silently clobber a fresh reseed. A COLD owner holds nothing to protect and
+    // must pull from whichever peer holds the site — a held copy may legitimately
+    // carry the empty version (epoch/head 0, e.g. seeded before it ever had a CDC
+    // log), and a cold owner that gated it out against its own empty version
+    // would serve an empty database and fork the tenant's data
+    // (`per_site_handoff_any_peer::a_cold_owner_pulls_from_whichever_peer_holds_the_site`).
+    // Ranking already makes the cold pull version-aware without that hazard.
     let ranked = rank_candidates_by_version(&candidates, &peer_versions);
     let search = search_peers_for_copy(&ranked, |peer| {
         let addr = crate::sql_forward::member_channel_addr(peer);
@@ -5655,7 +5664,7 @@ async fn settle_round(
                 Some(addr) => probe_peer(addr, channel, max_snapshot_bytes, site).await,
                 None => PeerProbe::Unreachable("its gossip address is unusable".to_string()),
             };
-            gate_probe_by_version(probe, own)
+            if discard_local { gate_probe_by_version(probe, own) } else { probe }
         }
     })
     .await;
