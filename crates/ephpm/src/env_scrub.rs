@@ -240,8 +240,8 @@ fn zero_removed_value_bytes(remove_set: &std::collections::HashSet<&str>) {
 }
 
 /// Non-glibc targets (musl, macOS, Windows): `remove_var` is the whole scrub —
-/// libc either does not export `environ`/`explicit_bzero` the same way, or the
-/// `/proc/self/environ` surface does not exist.
+/// the `environ` symbol is not exposed the same way, or the `/proc/self/environ`
+/// surface does not exist.
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn zero_removed_value_bytes(_remove_set: &std::collections::HashSet<&str>) {}
 
@@ -251,6 +251,98 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// Index of the first occurrence of `needle` in `haystack` (byte search over
+    /// the NUL-separated `/proc/self/environ` blob).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    // The `/proc/self/environ` value-zeroing is exercised by a parent/child
+    // pair. `/proc/self/environ` reflects the *exec-time* environment block, and
+    // a variable set at runtime with `set_var` lands on the heap (invisible to
+    // `/proc`), so the only way to drive the real `zero_removed_value_bytes` over
+    // a marker that `/proc` actually shows is to put it in a child's exec block
+    // (`Command::env`) and run the scrub inside that child. The parent spawns
+    // this test binary filtered to the child test, with a cleared, controlled
+    // environment; the child does the work and asserts.
+
+    /// Parent: spawn the child test with a controlled exec environment.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn proc_self_environ_value_is_zeroed() {
+        // When we are already the spawned child, do nothing here — the child
+        // test below is the one that runs the real assertions.
+        if std::env::var_os("SCRUBTEST_CHILD").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = std::process::Command::new(exe)
+            // Controlled exec environment: only what the child needs, so the
+            // marker and PATH are the only interesting entries in its exec block.
+            .env_clear()
+            .env("SCRUBTEST_CHILD", "1")
+            .env("SCRUBTEST_MARKER", "TOPSECRETVALUE_do_not_leak_12345")
+            .env("PATH", &path)
+            .args([
+                "--exact",
+                "env_scrub::tests::proc_self_environ_value_is_zeroed_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn child test");
+        assert!(
+            output.status.success(),
+            "child /proc scrub test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Child: the marker is in this process's exec block (set by the parent via
+    /// `Command::env`). Confirm `/proc/self/environ` shows it, run the serve-mode
+    /// scrub removing only the marker, then confirm its **value** is zeroed while
+    /// `NAME=` remains and `PATH` is untouched.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn proc_self_environ_value_is_zeroed_child() {
+        // Only run when spawned by the parent test above (with the full
+        // controlled environment); a normal suite run early-returns.
+        if std::env::var_os("SCRUBTEST_CHILD").is_none() {
+            return;
+        }
+        let secret = b"TOPSECRETVALUE_do_not_leak_12345";
+        let path_entry = format!("PATH={}", std::env::var("PATH").unwrap_or_default());
+
+        let before = std::fs::read("/proc/self/environ").expect("read /proc before");
+        assert!(
+            find_sub(&before, b"SCRUBTEST_MARKER=").is_some()
+                && find_sub(&before, secret).is_some(),
+            "marker must be present in the exec block before the scrub"
+        );
+
+        // Serve-mode path: this zeroes the marker's value bytes in place.
+        let remove_set: std::collections::HashSet<&str> =
+            ["SCRUBTEST_MARKER"].into_iter().collect();
+        zero_removed_value_bytes(&remove_set);
+
+        let after = std::fs::read("/proc/self/environ").expect("read /proc after");
+        // The NAME= prefix survives (so a later remove_var still matches)…
+        let marker_at =
+            find_sub(&after, b"SCRUBTEST_MARKER=").expect("NAME= prefix must remain after zeroing");
+        // …the byte immediately after `=` is now NUL (value gone)…
+        let after_eq = marker_at + b"SCRUBTEST_MARKER=".len();
+        assert_eq!(after[after_eq], 0, "value byte must be zeroed");
+        // …the secret value is gone from the exec block entirely…
+        assert!(find_sub(&after, secret).is_none(), "secret value must not leak via /proc");
+        // …and a kept variable is untouched.
+        assert!(
+            find_sub(&after, path_entry.as_bytes()).is_some(),
+            "PATH must survive the scrub untouched"
+        );
     }
 
     /// The default allowlist keeps exactly the four safe families and removes

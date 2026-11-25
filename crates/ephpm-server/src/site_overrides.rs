@@ -633,6 +633,11 @@ const RESERVED_SERVER_VARS: &[&str] = &[
     "REDIRECT_STATUS",
     "HTTPS",
     "AUTH_TYPE",
+    // Derived from the request's Content-Type / Content-Length headers (they
+    // get the canonical, un-prefixed `$_SERVER` names, not `HTTP_*`), so an
+    // `[env]` override of either would otherwise win last.
+    "CONTENT_TYPE",
+    "CONTENT_LENGTH",
 ];
 
 /// Whether a per-site `[env]` entry names a variable ePHPm injects itself, so
@@ -1924,6 +1929,9 @@ mod tests {
             "HTTPS",
             "SCRIPT_FILENAME",
             "DOCUMENT_ROOT",
+            // The un-prefixed body-metadata vars (not HTTP_*).
+            "CONTENT_TYPE",
+            "CONTENT_LENGTH",
             // The request's header mirror and HTTP-auth vars.
             "HTTP_HOST",
             "HTTP_X_FORWARDED_FOR",
