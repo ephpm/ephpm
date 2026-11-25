@@ -1,32 +1,58 @@
 //! Build script for `ephpm-server`.
 //!
-//! On Linux it compiles the per-vhost network-policy BPF program
-//! (`bpf/vhostnet.bpf.c`) with `clang -target bpf` into
-//! `$OUT_DIR/vhostnet.bpf.o`, which `src/tenant_ebpf.rs` embeds via
-//! `include_bytes!`. On every other target it is a no-op — the non-Linux
-//! `tenant_ebpf` stub never `include_bytes!`s the object, so it is never needed,
-//! and the `[server.tenant_network] ebpf_policy` knob is a hard config error off
-//! Linux anyway.
+//! On Linux it compiles the per-vhost network-policy BPF programs with
+//! `clang -target bpf`:
+//!
+//! * `bpf/vhostnet.bpf.c` → `$OUT_DIR/vhostnet.bpf.o` — the `cgroup/bind4+6`
+//!   and `connect4+6` loopback/sidecar policy, embedded by
+//!   `src/tenant_ebpf.rs` and loaded with aya;
+//! * `bpf/unixsock.bpf.c` → `$OUT_DIR/unixsock.bpf.o` — the AF_UNIX connect
+//!   fence, embedded by `src/tenant_unix_fence.rs` and loaded by ePHPm's own
+//!   raw loader (aya 0.13 cannot attach the unix sockaddr hooks).
+//!
+//! On every other target it is a no-op — the non-Linux stubs never
+//! `include_bytes!` the objects, so they are never needed, and the
+//! `[server.tenant_network]` eBPF knobs are a hard config error off Linux
+//! anyway.
 //!
 //! `clang` is ALREADY a required build dependency (bindgen for the PHP SAPI in
-//! `crates/ephpm-php/build.rs`), so this adds no new toolchain requirement. If
-//! `clang` is genuinely absent on a Linux host we fail the build with a clear
-//! message rather than shipping a binary whose `ebpf_policy = true` would fault
-//! at load time.
+//! `crates/ephpm-php/build.rs`), so this adds no new toolchain requirement.
+//!
+//! If `clang` is genuinely absent (or the compile fails) we must still let a
+//! dev/stub build go through, so we emit an EMPTY placeholder object and a loud
+//! `cargo::warning` rather than panicking. That placeholder is fail-closed at
+//! load time (the loaders reject an empty object), but note that the AF_UNIX
+//! fence (`unix_socket_policy`) now defaults to `auto` — ON for a multi-tenant
+//! Linux >= 6.7 node — so a binary built without the real object comes up
+//! UNFENCED under the default and only logs about it. Dev builds tolerate that;
+//! a RELEASE must not. `release.yml` therefore makes the clang toolchain FATAL
+//! on the Linux release legs and asserts both objects are non-empty after the
+//! build (`.github/scripts/check-ebpf-objects.sh`) so a transient toolchain
+//! failure can never ship an unfenced release.
 
 fn main() {
     println!("cargo:rerun-if-changed=bpf/vhostnet.bpf.c");
+    println!("cargo:rerun-if-changed=bpf/unixsock.bpf.c");
+    println!("cargo:rerun-if-changed=bpf/vhostnet_common.h");
     println!("cargo:rerun-if-changed=bpf/include");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Non-Linux hosts: nothing to compile. The Linux-only `cfg` in
-    // `tenant_ebpf.rs` means the object is never `include_bytes!`d off Linux.
+    // `tenant_ebpf.rs` / `tenant_unix_fence.rs` means the objects are never
+    // `include_bytes!`d off Linux.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
-    let out = format!("{out_dir}/vhostnet.bpf.o");
+    compile_bpf("bpf/vhostnet.bpf.c", &format!("{out_dir}/vhostnet.bpf.o"), "ebpf_policy");
+    compile_bpf("bpf/unixsock.bpf.c", &format!("{out_dir}/unixsock.bpf.o"), "unix_socket_policy");
+}
+
+/// Compile one BPF C source to `out` (BTF kept, DWARF stripped). `knob` names
+/// the `[server.tenant_network]` key whose feature the object backs, for the
+/// warning emitted when the compile cannot happen.
+fn compile_bpf(src: &str, out: &str, knob: &str) {
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".to_string());
     // `llvm-strip` sits next to clang in every LLVM install; allow an override
     // to mirror `$CLANG`.
@@ -60,12 +86,15 @@ fn main() {
             // distro-independent. See bpf/include/NOTICE for provenance/license.
             "-I",
             "bpf/include",
+            // The shared map header (vhostnet_common.h) lives beside the sources.
+            "-I",
+            "bpf",
             "-idirafter",
             multiarch_inc,
             "-c",
-            "bpf/vhostnet.bpf.c",
+            src,
             "-o",
-            &out,
+            out,
         ])
         .status();
 
@@ -73,26 +102,37 @@ fn main() {
     // the PHP-linked release toolchain, not on stub-mode CI (which installs
     // `libclang-dev` for the PHP SAPI's bindgen but not the clang executable);
     // and a release leg for an unverified target could, in principle, hit an
-    // arch-specific compile quirk. Neither may break/park the `ephpm-server`
-    // build. On ANY failure — clang missing, or clang present but the compile
-    // errors — emit an EMPTY placeholder so `include_bytes_aligned!` still
-    // compiles, log a loud `cargo:warning`, and return. A binary built this way
-    // fails closed at load time (aya rejects the empty object) and
-    // `[server.tenant_network] ebpf_policy` is off by default, so nothing that
-    // did not build the real object ever exercises it. The release is
-    // smoke-tested afterwards to confirm the real object shipped.
+    // arch-specific compile quirk. Neither may break/park a dev/stub
+    // `ephpm-server` build. On ANY failure — clang missing, or clang present
+    // but the compile errors — emit an EMPTY placeholder so
+    // `include_bytes_aligned!` still compiles, log a loud `cargo::warning`, and
+    // return. A binary built this way fails closed at load time (the loaders
+    // reject the empty object).
+    //
+    // IMPORTANT: this is only safe for dev/stub builds. The `unix_socket_policy`
+    // AF_UNIX fence now defaults to `auto` (ON for a multi-tenant Linux >= 6.7
+    // node), so a RELEASE binary built from the placeholder would come up
+    // UNFENCED under the default and merely log about it. The warning below is
+    // deliberately loud about that. The RELEASE path does NOT rely on it:
+    // `release.yml` makes the clang toolchain fatal on the Linux legs and
+    // `.github/scripts/check-ebpf-objects.sh` asserts both objects are
+    // non-empty after the build, so a release can never reach this fallback.
     if !matches!(&run, Ok(status) if status.success()) {
-        std::fs::write(&out, [])
+        std::fs::write(out, [])
             .expect("write placeholder eBPF object so include_bytes_aligned! compiles");
         match &run {
             Ok(status) => println!(
-                "cargo:warning=clang compiled bpf/vhostnet.bpf.c with an error (exit {status}); \
-                 [server.tenant_network] ebpf_policy is unavailable in this build"
+                "cargo::warning=clang compiled {src} with an error (exit {status}); \
+                 [server.tenant_network] {knob} is UNAVAILABLE in this build — a multi-tenant node \
+                 would run UNFENCED under the default (unix_socket_policy = auto). Dev builds only; \
+                 releases are gated by check-ebpf-objects.sh."
             ),
             Err(e) => println!(
-                "cargo:warning=clang ({clang}) not runnable ({e}); \
-                 [server.tenant_network] ebpf_policy is unavailable in this build \
-                 (install the clang binary to enable it)"
+                "cargo::warning=clang ({clang}) not runnable ({e}); \
+                 [server.tenant_network] {knob} is UNAVAILABLE in this build — a multi-tenant node \
+                 would run UNFENCED under the default (unix_socket_policy = auto). Install the \
+                 clang binary to enable it. Dev builds only; releases are gated by \
+                 check-ebpf-objects.sh."
             ),
         }
         return;
@@ -104,15 +144,17 @@ fn main() {
     // DWARF sections `clang -g` emits — which are useless at load time. Non-fatal:
     // the unstripped object still loads, so a missing `llvm-strip` only forgoes
     // the size win.
-    let stripped = std::process::Command::new(&strip).args(["-g", &out]).status();
+    let stripped = std::process::Command::new(&strip).args(["-g", out]).status();
     match stripped {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("cargo:warning=llvm-strip exited with {s}; shipping unstripped BPF object");
+            println!(
+                "cargo:warning=llvm-strip exited with {s}; shipping unstripped BPF object {src}"
+            );
         }
         Err(e) => {
             println!(
-                "cargo:warning=could not run llvm-strip ({strip}): {e}; shipping unstripped BPF object"
+                "cargo:warning=could not run llvm-strip ({strip}): {e}; shipping unstripped BPF object {src}"
             );
         }
     }

@@ -184,14 +184,29 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
             sh -euc '
-              # ephpm-ci has libclang-dev (bindgen) but not the clang binary
-              # crates/ephpm-server/build.rs needs for the BPF object. Non-fatal:
-              # build.rs stubs the feature (fail-closed; ebpf_policy off by default).
+              # clang compiles the eBPF tenant-fence objects
+              # (crates/ephpm-server/build.rs). The AF_UNIX connect fence
+              # (unix_socket_policy) now defaults to ON for a multi-tenant
+              # Linux >= 6.7 node, so a RELEASE must never ship the fail-closed
+              # EMPTY placeholder build.rs writes when clang is absent (it would
+              # come up UNFENCED). ephpm-ci (almalinux8) already ships the clang
+              # binary, so `command -v clang` succeeds and the install below is
+              # only a safety net for a future image that drops it. A genuinely
+              # missing clang is FATAL here, not a warning.
               command -v clang >/dev/null 2>&1 \
+                || dnf install -y clang llvm \
                 || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
-                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+                || true
+              command -v clang >/dev/null 2>&1 \
+                || { echo "::error::clang is required to build the eBPF AF_UNIX tenant fence; refusing to build a release that would ship UNFENCED (unix_socket_policy=auto)"; exit 1; }
               cargo xtask release ${{ matrix.php.minor }}
             '
+
+      - name: Verify eBPF tenant-fence objects are real
+        # The AF_UNIX fence is on by default (unix_socket_policy=auto); assert
+        # build.rs emitted real (non-empty) objects, not the placeholder, so a
+        # transient toolchain failure can never ship an unfenced release.
+        run: bash .github/scripts/check-ebpf-objects.sh "${{ matrix.arch.triple }}"
 
       - name: Package archive
         id: pkg
@@ -266,11 +281,24 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             ephpm/ephpm-ci:latest-arm64 \
             sh -euc '
+              # See build-linux: clang compiles the eBPF tenant-fence objects
+              # and the AF_UNIX fence defaults to ON, so a missing clang is
+              # FATAL for a release (would ship UNFENCED), not a warning.
+              # ephpm-ci:latest-arm64 is built from the same Dockerfile.gha and
+              # ships the clang binary, so `command -v clang` succeeds here too.
               command -v clang >/dev/null 2>&1 \
+                || dnf install -y clang llvm \
                 || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
-                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+                || true
+              command -v clang >/dev/null 2>&1 \
+                || { echo "::error::clang is required to build the eBPF AF_UNIX tenant fence; refusing to build a release that would ship UNFENCED (unix_socket_policy=auto)"; exit 1; }
               cargo xtask release ${{ matrix.php.minor }}
             '
+
+      - name: Verify eBPF tenant-fence objects are real
+        # The AF_UNIX fence is on by default (unix_socket_policy=auto); assert
+        # build.rs emitted real (non-empty) objects, not the placeholder.
+        run: bash .github/scripts/check-ebpf-objects.sh aarch64-unknown-linux-gnu
 
       - name: Package archive
         id: pkg

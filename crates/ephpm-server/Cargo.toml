@@ -116,6 +116,16 @@ libc = "0.2"
 # so non-Linux builds never see aya and compile the inert stub instead.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.13"
+# The AF_UNIX connect fence ([server.tenant_network] unix_socket_policy) needs
+# the cgroup/connect_unix + sendmsg_unix hooks (Linux >= 6.7) and two kfunc
+# calls, neither of which aya 0.13 can attach or relocate. `tenant_unix_fence`
+# therefore drives the last mile itself: aya-obj (aya's own object parser, the
+# same version aya pins) for ELF parsing, CO-RE and map relocation plus the
+# generated `bpf_attr` layouts, and `object` (already in the graph via aya-obj,
+# same feature set) to read the kfunc relocations aya-obj skips. No new crates
+# enter the lock file.
+aya-obj = "0.2"
+object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
 
 [features]
 # OTLP trace export: `tracing` spans (http.request / worker.queue_wait /

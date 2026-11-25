@@ -224,8 +224,30 @@ Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, exper
 | `cgroup_path` | string | (none) | Cgroup the programs attach to. Unset means the process's own cgroup, read from `/proc/self/cgroup`, which covers exactly ePHPm's threads and any sidecars it spawns. Override only for unusual systemd slice layouts. |
 | `sidecar_port_range` | string | `"20000-32767"` | Inclusive `"low-high"` range of **real** sidecar ports ePHPm hands out; `bind4` pops a free port from it and range size is the box-wide sidecar concurrency cap. **Must not overlap the kernel ephemeral range** (`net.ipv4.ip_local_port_range`, default `32768-60999`) or a tenant's outbound connect could be assigned a source port ePHPm also wants to hand out — ePHPm reads `ip_local_port_range` at load time and refuses to start on overlap. |
 | `max_sidecar_ports_per_vhost` | u32 | `8` | Maximum concurrent sidecar real ports one vhost may hold. Enforced **in-kernel** at `bind4` against the un-forgeable ePHPm-set vhost tag, so a tenant cannot bypass it and cannot starve siblings out of the shared pool. |
+| `unix_socket_policy` | string | `"auto"` | AF_UNIX connect fence for tenant PHP (multi-tenant breakout audit finding F2). **On by default**: `"auto"` fences tenant unix connects on a node where the fence can run (**Linux ≥ 6.7**, multi-tenant, per-request mode, not `ephpm dev`) and is inert everywhere else, so single-tenant / dev / non-Linux / worker nodes are unaffected — where it applies it behaves as `"warn"`. `"required"`: attach `cgroup/connect_unix` + `cgroup/sendmsg_unix` programs so a tenant thread can `connect()`/`sendto()` only the unix sockets listed for its site in `unix_socket_allow` — **a site with no entry can reach no unix socket at all** — and **refuse to start** if the fence cannot be attached (the hard-guarantee posture). `"warn"`: same fence, but on failure log an ERROR and start **unfenced**. `"off"`: the explicit opt-out — nothing loaded; a node where the fence would otherwise run logs one WARN naming the exposure. Needs BTF and `CAP_BPF` + `CAP_NET_ADMIN`; `"auto"` is valid on every platform (it self-disables), but an explicit `"required"`/`"warn"` off Linux, without `[server] sites_dir`, or in worker mode is a hard startup error, as is any unrecognised value. Independent of `ebpf_policy` (either switch alone loads the per-thread tag). ePHPm's own threads are never fenced. |
+| `unix_socket_allow` | table | `{}` | Per-site allowlist for `unix_socket_policy`, keyed by **canonical site key** (vhost directory name): `"a.example" = ["/run/a/app.sock", "@a-bus"]`. Entries are absolute pathname sockets or abstract-namespace sockets written `@name`; a relative path, an embedded NUL, or a path over 108 bytes is a startup error, as is setting this while `unix_socket_policy = "off"`. Matched on the literal destination *before* the kernel resolves it, so list only paths in directories the tenant cannot write (a tenant-writable path can be swapped for a symlink to any other socket). |
 
 > **Known limitation.** Closed sidecar ports return to the pool only on ePHPm restart — the close-time reclaim path is not implemented (see the guide). A vhost re-binding the *same* virtual port reuses its existing real port, so a restarting sidecar does not consume a second slot; an app that opens many *different* sidecar ports over one process lifetime can reach `max_sidecar_ports_per_vhost` until restart.
+
+The fence is **on by default** (`unix_socket_policy = "auto"`), so a multi-tenant
+Linux ≥ 6.7 node already denies tenant unix connects — you only need a
+`[server.tenant_network.unix_socket_allow]` table for the sockets a site
+legitimately uses. Tune the allowlist; or set `unix_socket_policy = "required"`
+to make an unattachable fence refuse startup, or `unix_socket_policy = "off"` to
+opt out entirely:
+
+```toml
+# AF_UNIX fence: deny every unix socket to tenant PHP except these.
+# `unix_socket_policy` defaults to "auto" (on where the fence can run); set it
+# to "required" to also refuse startup if the fence cannot attach.
+[server.tenant_network]
+unix_socket_policy = "required"          # Linux >= 6.7 + BTF, CAP_BPF + CAP_NET_ADMIN
+# unix_socket_policy = "off"             # opt out: run tenant PHP unfenced
+
+[server.tenant_network.unix_socket_allow]
+"shop.example"  = ["/run/ephpm/shop/php-worker.sock"]
+"blog.example"  = []                     # same as absent: no unix socket at all
+```
 
 ### `[server.logging]`
 

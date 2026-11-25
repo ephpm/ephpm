@@ -34,12 +34,18 @@
 //
 // Only UAPI context fields are touched (user_ip4/user_ip6/user_port), which are
 // stable ABI — so no CO-RE relocation and no vmlinux.h are required.
+//
+// The `tag`, `nscfg` and `unix_allow` maps are declared in vhostnet_common.h
+// because the AF_UNIX fence (unixsock.bpf.c, a separately loaded object) shares
+// them by fd — see that header. This object is the one that CREATES them.
 
 #include <linux/bpf.h>
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+#include "vhostnet_common.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -90,15 +96,6 @@ static __always_inline int is_loopback6(const __u32 ip6[4])
 // the configured sidecar_port_range (default 20000-32767 ~= 12768) at load; this
 // bound just has to be >= the largest range an operator can configure.
 #define POOL_CAP 13000
-
-// TID -> vhost id. Written by ePHPm before each request's PHP runs, deleted at
-// request end (RAII TagGuard). The per-request kernel identity.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, __u32);   // tid (ns-local; see nscfg)
-    __type(value, __u32); // vhost id
-} tag SEC(".maps");
 
 // (vhost << 32 | virtual_port) -> assigned real_port, host order. Written by
 // bind on assignment; read by connect for the virtual->real rewrite; deleted by
@@ -158,39 +155,6 @@ struct {
     __type(key, __u32);
     __type(value, __u8);
 } infra_ports SEC(".maps");
-
-// PID-namespace of the tagging process (ePHPm): {dev, ino} of
-// /proc/self/ns/pid. Lets the programs resolve the caller's TID *as seen in
-// that namespace* even though cgroup-BPF hooks otherwise observe the GLOBAL
-// tid. Proven necessary in the PoC. dev==0 => host pid-ns, use the raw tid.
-struct nscfg_t {
-    __u64 dev;
-    __u64 ino;
-};
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct nscfg_t);
-} nscfg SEC(".maps");
-
-static __always_inline __u32 resolve_tid(void)
-{
-    __u32 zero = 0;
-    struct nscfg_t *c = bpf_map_lookup_elem(&nscfg, &zero);
-    if (c && c->dev) {
-        struct bpf_pidns_info ns = {};
-        if (bpf_get_ns_current_pid_tgid(c->dev, c->ino, &ns, sizeof(ns)) == 0)
-            return ns.pid; // .pid == TID in that namespace
-    }
-    return (__u32)bpf_get_current_pid_tgid(); // global TID (low 32 bits)
-}
-
-static __always_inline __u32 *current_vhost(void)
-{
-    __u32 tid = resolve_tid();
-    return bpf_map_lookup_elem(&tag, &tid);
-}
 
 static __always_inline __u32 quota_max(void)
 {

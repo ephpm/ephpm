@@ -646,6 +646,21 @@ rate(ephpm_sql_forward_timeouts_total{stage=~"send|reply"}[5m]) > 0
 `direction` and `stage` have 2–3 fixed values and `outcome` at most 6; there are
 no per-peer labels.
 
+## Tenant network (AF_UNIX fence)
+
+The AF_UNIX connect fence ([`[server.tenant_network] unix_socket_policy`](/reference/config/#server-tenant_network),
+audit finding F2) is on by default (`"auto"`) on a multi-tenant Linux ≥ 6.7
+per-request node. See the [eBPF guide](/guides/ebpf-per-vhost-network/#af_unix-connect-fence-unix_socket_policy).
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ephpm_tenant_unix_fence_active` | gauge | `policy` | `1` when the AF_UNIX tenant fence is attached and enforcing, `0` when it was intended but **degraded to unfenced** (kernel < 6.7, no BTF, missing `CAP_BPF`/`CAP_NET_ADMIN`, or `LimitMEMLOCK` too low). `policy` is the configured `unix_socket_policy` string (`auto`/`required`/`warn`). The series is **absent** where the fence does not apply (single-tenant, worker mode, non-Linux, or an explicit `off`) — so **alert on `== 0`**, which catches the secure default silently not taking (the ordinary systemd hardening, dropping `CAP_BPF`/`CAP_NET_ADMIN`, trips this on day one). The same state is on `GET /_ephpm/health` as `unix_fence_active` + `unix_fence_policy` for a probe that needs no metrics scrape. |
+
+```promql
+# The on-by-default AF_UNIX tenant fence intended to run but is NOT enforcing.
+ephpm_tenant_unix_fence_active == 0
+```
+
 ## Cardinality notes
 
 The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.

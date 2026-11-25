@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ephpm_server::tenant_ebpf::TenantEbpf;
+use ephpm_server::tenant_ebpf::{LoadOptions, TenantEbpf};
 
 /// EPERM — the errno a `cgroup/connect` BPF program returns to deny a connect.
 const EPERM: i32 = 1;
@@ -104,7 +104,8 @@ fn aliased_and_mapped_loopback_is_ownership_checked() {
     let _guard = scopeguard(move || leave_test_cgroup(&leaf_path));
 
     let cgroup = leaf.to_str().unwrap();
-    let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[3306, 6379])
+    let opts = LoadOptions { tcp_policy: true, unix_fence: false };
+    let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[3306, 6379], &opts)
         .expect("load+attach vhostnet BPF (need CAP_BPF and a real, non-placeholder object)");
     ebpf.fill_pool((20000, 20100), 8).expect("fill port pool");
 

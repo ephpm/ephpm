@@ -789,6 +789,11 @@ pub struct Router {
     /// vhost id (cleared on the same thread when the closure returns) so the
     /// kernel `bind`/`connect` hooks can scope the tenant's loopback network.
     tenant_ebpf: Option<Arc<crate::tenant_ebpf::TenantEbpf>>,
+    /// The configured `[server.tenant_network] unix_socket_policy` string
+    /// (`auto`/`required`/`warn`/`off`), surfaced in `/_ephpm/health` next to
+    /// the live `unix_fence_active` flag so a fleet can assert the on-by-default
+    /// AF_UNIX fence actually took (policy `auto` + `active:false` == degraded).
+    unix_fence_policy: String,
     /// What a PHP-bound request does when no execution slot is available
     /// (`[php] overload`, resolved against the `[server] preview`
     /// preset). [`OverloadPolicy::Wait`] is the historical behaviour — queue and
@@ -1595,6 +1600,7 @@ impl Router {
             // `[server.tenant_network] ebpf_policy = true` (Linux multi-tenant).
             // `None` here => no per-request tagging, zero cost.
             tenant_ebpf: None,
+            unix_fence_policy: config.server.tenant_network.unix_socket_policy.clone(),
             overload_policy: config.effective_overload(),
             shed_after: Duration::from_millis(config.php.shed_after_ms),
             worker_stream_threshold: config.php.worker.stream_threshold,
@@ -5668,6 +5674,35 @@ impl Router {
         }
     }
 
+    /// Whether the AF_UNIX tenant connect fence (audit finding F2) is attached
+    /// and enforcing on this node right now.
+    ///
+    /// `false` whenever no fence handle is held — the fence is off by config, is
+    /// not applicable (single-tenant / worker / non-Linux / `ephpm dev`), or was
+    /// intended but degraded to unfenced at startup (the handle is dropped on
+    /// the fence-only degrade path). Paired with [`Self::unix_fence_policy`] in
+    /// `/_ephpm/health`, that distinguishes "took" from "degraded": policy
+    /// `auto`/`required`/`warn` with `active:false` means the fence is NOT
+    /// enforcing.
+    fn unix_fence_active(&self) -> bool {
+        self.tenant_ebpf.as_ref().is_some_and(|e| e.unix_fence_active())
+    }
+
+    /// Body of the `/_ephpm/health` liveness probe.
+    ///
+    /// Always `status:"ok"` (a 200 means the server is up), plus the AF_UNIX
+    /// tenant-fence state so a fleet can machine-assert the on-by-default fence
+    /// took: `unix_fence_policy` is the configured `[server.tenant_network]
+    /// unix_socket_policy` and `unix_fence_active` is the live enforcing flag.
+    fn health_json(&self) -> String {
+        serde_json::json!({
+            "status": "ok",
+            "unix_fence_policy": self.unix_fence_policy,
+            "unix_fence_active": self.unix_fence_active(),
+        })
+        .to_string()
+    }
+
     /// Serve a request in the reserved [`INTERNAL_PREFIX`] namespace.
     ///
     /// Every path at or under `/_ephpm/` lands here, so the answer is the same
@@ -5711,8 +5746,10 @@ impl Router {
         }
 
         match uri_path {
-            // Liveness probe — always 200 if the server is running.
-            "/_ephpm/health" => (json_response(StatusCode::OK, r#"{"status":"ok"}"#), "health"),
+            // Liveness probe — always 200 if the server is running. Carries the
+            // AF_UNIX tenant-fence state so a fleet can assert the on-by-default
+            // fence took (see `health_json`).
+            "/_ephpm/health" => (json_response_owned(StatusCode::OK, self.health_json()), "health"),
 
             // Readiness probe — checks PHP initialization and DB proxy.
             "/_ephpm/ready" => {
@@ -8189,6 +8226,25 @@ mod tests {
         Router::new(&config, test_store(), None, None, None, None, None)
     }
 
+    /// The `/_ephpm/health` body carries the AF_UNIX tenant-fence state (audit
+    /// finding F2) so a fleet can machine-assert the on-by-default fence took.
+    /// A test router attaches no real fence, so `unix_fence_active` is false;
+    /// the policy string mirrors `[server.tenant_network] unix_socket_policy`
+    /// (default `auto`). The attached-vs-degraded gauge value itself needs real
+    /// kernel capabilities (CAP_BPF/CAP_NET_ADMIN, BTF, Linux >= 6.7) and is
+    /// covered only by the `#[ignore]`d fence tests CI cannot run.
+    #[test]
+    fn health_json_reports_unix_fence_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path());
+        assert!(!router.unix_fence_active());
+        let doc: serde_json::Value =
+            serde_json::from_str(&router.health_json()).expect("health serves JSON");
+        assert_eq!(doc["status"], "ok");
+        assert_eq!(doc["unix_fence_active"], serde_json::Value::Bool(false));
+        assert_eq!(doc["unix_fence_policy"], "auto");
+    }
+
     /// A browser over TLS negotiates HTTP/2, which carries the host in the
     /// `:authority` pseudo-header (surfaced as the request-URI authority), not a
     /// `Host` header. `extract_server_name` must read it, or every HTTPS request
@@ -10231,7 +10287,19 @@ mod tests {
             match *path {
                 "/_ephpm/health" => {
                     assert_eq!(status, StatusCode::OK, "{path}");
-                    assert_eq!(body, r#"{"status":"ok"}"#, "{path}");
+                    let doc: serde_json::Value =
+                        serde_json::from_str(&body).expect("health serves JSON");
+                    assert_eq!(doc["status"], "ok", "{path}: {body}");
+                    // The AF_UNIX tenant-fence state is always present so a
+                    // fleet can assert the on-by-default fence took.
+                    assert!(
+                        doc.get("unix_fence_active").is_some_and(serde_json::Value::is_boolean),
+                        "{path}: {body}"
+                    );
+                    assert!(
+                        doc.get("unix_fence_policy").is_some_and(serde_json::Value::is_string),
+                        "{path}: {body}"
+                    );
                 }
                 // 200 or 503 depending on whether a sibling test already
                 // initialized the process-global stub runtime, and on whether

@@ -364,6 +364,48 @@ node's PHP. Prefer a `file:/abs/path` indirection for those secrets — the
 `preview-gate` and `github-auth` `session_secret` both accept it — so the
 literal never sits in the environment at all.
 
+### 11. AF_UNIX connect fence (Linux ≥ 6.7, on by default)
+
+Everything above is about IP. **Unix sockets are a separate door**, and
+`open_basedir` does not gate it (multi-tenant breakout audit finding F2): one
+process, one uid, so tenant PHP can `connect()` to `/var/run/docker.sock`, a
+database's auth socket, D-Bus or journald through `unix://` streams,
+`socket_connect()`, PDO `unix_socket=` or curl `CURLOPT_UNIX_SOCKET_PATH`.
+ePHPm attaches `cgroup/connect_unix` + `cgroup/sendmsg_unix` programs that let a
+tenant thread reach **only the unix sockets allowlisted for its site** — the
+default allowlist is empty, so tenants reach none. It rides on the same
+per-thread tag as §9 but is an independent switch.
+
+**This is on by default.** `unix_socket_policy` defaults to `"auto"`, which
+fences a multi-tenant Linux ≥ 6.7 per-request node (and is inert on
+single-tenant, `ephpm dev`, non-Linux and worker nodes, so those are
+unaffected). A node that needs a socket an app legitimately uses must
+allowlist it — otherwise the app's unix connects fail with `EPERM`; that is the
+intended "secure by default, break-then-allowlist" posture. On a kernel older
+than 6.7 (or without BTF / `CAP_BPF`) `"auto"` logs a loud ERROR and runs
+unfenced — it never silently claims a protection it does not have. Set
+`unix_socket_policy = "required"` to turn that into a hard startup refusal, or
+`unix_socket_policy = "off"` to opt out. **Requires Linux 6.7 or newer** (the
+hooks do not exist before); see the
+[eBPF guide](/guides/ebpf-per-vhost-network/#af_unix-connect-fence-unix_socket_policy)
+for the kernel floor, the fail-closed modes, and the symlink caveat on
+allowlisted paths.
+
+**What §11 is — a reach control, not a breakout backstop.** Like `open_basedir`
+(§1), the fence constrains what ordinary tenant **PHP userland** can reach, not
+what code that has already escaped PHP can do. It tags the request thread and
+filters by that tag from *inside the same process that holds the map fds*, so
+in-process native code running in the data plane can delete its own TID from the
+tag map (or otherwise untag) before it `connect()`s, and an `io_uring`
+submission with `IOSQE_ASYNC` is punted to an untagged `io-wq` kernel worker that
+the tag never covers. Both reach a socket the tag would deny. So §11 closes the
+easy door that `unix://` streams, PDO `unix_socket=` and curl walk through — it
+is **not** a sandbox boundary that contains a tenant who has already broken out
+of PHP. For a true backstop you still need the per-uid mitigations (run the data
+plane as its own uid, kept out of every socket's group/ACL) and, where
+available, a `CONFIG_BPF_LSM` policy. (This qualification is the same one §8/§9
+carry for their cross-tenant IP controls.)
+
 ## Turning it on
 
 The layers divide into two groups, and it matters which is which:
@@ -373,6 +415,7 @@ The layers divide into two groups, and it matters which is which:
 | §1–§6 — `open_basedir`, the function denylist, persistence off, per-vhost temp/session, per-site database + wire credential, per-site KV keyspace | ePHPm | **On by default** whenever `[server] sites_dir` is set |
 | §7–§8 — the two-uid split, the systemd sandbox extras (`PrivateTmp`, `IPAddressDeny`), the nftables egress table | **You**, on the host | Not shipped, not written by `ephpm install`, not on by default |
 | §9 — eBPF per-vhost network policy | ePHPm (Linux only) | Off by default, opt in with `ebpf_policy = true`, plus host prerequisites |
+| §11 — AF_UNIX connect fence | ePHPm (Linux ≥ 6.7 only) | **On by default** (`unix_socket_policy = "auto"`) on a multi-tenant node; allowlist the sockets a site needs, set `"required"` to also fail closed, or `"off"` to opt out |
 
 A recommended production config makes the ePHPm-side intent explicit:
 
@@ -397,6 +440,10 @@ max_open_dbs = 16
 ebpf_policy = true
 sidecar_port_range = "20000-32767"
 max_sidecar_ports_per_vhost = 8
+# Linux >= 6.7 — tenant PHP may reach NO unix socket except a site's allowlist:
+unix_socket_policy = "required"
+# [server.tenant_network.unix_socket_allow]
+# "shop.example" = ["/run/ephpm/shop/php-worker.sock"]
 ```
 
 Enabling `ebpf_policy` additionally requires, on the host (see the eBPF guide):
@@ -437,6 +484,13 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   off-box exfil. eBPF (§9) governs loopback/sidecar ownership, not public
   egress. Close it with a destination allow-list if your threat model requires
   it (trades off preview convenience).
+- **Host unix sockets (without §11).** On a kernel older than 6.7, or with
+  `unix_socket_policy = "off"`, tenant PHP reaches every unix socket the
+  service uid can — `docker.sock` is root-equivalent if the uid is in the
+  `docker` group. Keep the data-plane uid out of every socket's group/ACL, and
+  turn §11 on where the kernel allows. With §11 on, the residual is the
+  allowlist itself: an allowlisted path in a tenant-writable directory can be
+  swapped for a symlink.
 - **Cross-tenant observability endpoints (enforced, with one limit).**
   `/metrics` (every tenant's normalized SQL digests, vhost names, upstream
   addresses) and `/_ephpm/requests` (every vhost's recent request paths) are
