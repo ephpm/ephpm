@@ -68,6 +68,13 @@ pub struct ExecRequest {
     /// one. Applied via `Command::env`, so it never enters this process's
     /// environment, argv or logs.
     pub extra_env: Vec<(String, String)>,
+    /// The `[kv] secret` to hand a PHP per-site child as `EPHPM_KV__SECRET` via
+    /// `Command::env` (child-only; never argv, never logged). Set only for the
+    /// PHP per-site lane — the parent server scrubbed it from its own
+    /// environment (finding F1), but the child's `Config::load` → `plan_site_db`
+    /// still needs it, and `ephpm php --site` scrubs it again before tenant
+    /// code runs. `None` otherwise.
+    pub kv_secret: Option<String>,
     /// Wall-clock cap.
     pub timeout: Duration,
     /// Resolved memory ceiling in bytes (`None` ⇒ none). On a binary child it
@@ -219,8 +226,21 @@ impl JobExecutor for ChildExecutor {
         let (program, args) = build_argv(&req, &self.exe);
         let cwd = req.cwd.clone();
         let extra_env = req.extra_env.clone();
+        // Child-only `EPHPM_KV__SECRET` for the PHP per-site lane (finding F1);
+        // `None` for every other job, so a siteless operator binary never
+        // receives the secret.
+        let kv_secret = req.kv_secret.clone();
         Box::pin(async move {
-            run_child(&program, &args, cwd.as_deref(), &extra_env, req.timeout, &cancel).await
+            run_child(
+                &program,
+                &args,
+                cwd.as_deref(),
+                &extra_env,
+                kv_secret.as_deref(),
+                req.timeout,
+                &cancel,
+            )
+            .await
         })
     }
 }
@@ -233,12 +253,17 @@ impl JobExecutor for ChildExecutor {
 /// shared wire `DB_*` for siteless operator jobs (finding M3), empty otherwise;
 /// child-only, so they never enter this process's environment, argv or logs.
 ///
+/// `kv_secret`, when set, is passed to the child as `EPHPM_KV__SECRET` via
+/// `Command::env` — child-only in the same way, and set only for the PHP
+/// per-site lane (finding F1).
+///
 /// stdout/stderr are inherited so a job's output reaches the server's logs.
 pub async fn run_child(
     program: &std::path::Path,
     args: &[String],
     cwd: Option<&std::path::Path>,
     extra_env: &[(String, String)],
+    kv_secret: Option<&str>,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> RunOutcome {
@@ -249,6 +274,13 @@ pub async fn run_child(
     }
     for (key, value) in extra_env {
         cmd.env(key, value);
+    }
+    if let Some(secret) = kv_secret {
+        // Child-only: the parent server's `EPHPM_KV__SECRET` was scrubbed, so
+        // reinstate it just for this child so its `Config::load` can derive the
+        // site's wire credential. `ephpm php --site` scrubs it again before any
+        // tenant PHP runs.
+        cmd.env("EPHPM_KV__SECRET", secret);
     }
     cmd.kill_on_drop(true);
 
@@ -325,6 +357,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
+            kv_secret: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("maintenance"));
@@ -344,6 +377,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
+            kv_secret: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
@@ -381,6 +415,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
+            kv_secret: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
@@ -421,6 +456,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
+            kv_secret: None,
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         // The directory tier is still confined (per-site cron), so `--confine`
@@ -444,6 +480,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: Some(512 * 1024 * 1024),
             cpu_secs: Some(90),
+            kv_secret: None,
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(
@@ -486,6 +523,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: Some(256 * 1024 * 1024),
             cpu_secs: Some(30),
+            kv_secret: None,
         };
         let (prog, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         assert_eq!(prog, PathBuf::from("/usr/bin/ephpm"));
@@ -521,6 +559,7 @@ mod tests {
             &ok_args,
             None,
             &[],
+            None,
             Duration::from_secs(10),
             &cancel,
         )
@@ -536,6 +575,7 @@ mod tests {
             &bad_args,
             None,
             &[],
+            None,
             Duration::from_secs(10),
             &cancel,
         )
@@ -555,6 +595,7 @@ mod tests {
             &args,
             None,
             &[],
+            None,
             Duration::from_millis(200),
             &cancel,
         )
@@ -586,6 +627,7 @@ mod tests {
             &args,
             None,
             &[],
+            None,
             Duration::from_millis(200),
             &cancel,
         )
@@ -615,6 +657,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             memory_max_bytes: None,
             cpu_secs: None,
+            kv_secret: None,
         };
         let (_, args) = build_argv(&req, std::path::Path::new("/usr/bin/ephpm"));
         // No `--config` without a config path; the argv tail is byte-identical.
@@ -641,6 +684,7 @@ mod tests {
             &args,
             None,
             &[],
+            None,
             Duration::from_secs(30),
             &cancel,
         )
@@ -656,6 +700,7 @@ mod tests {
             &[],
             None,
             &[],
+            None,
             Duration::from_secs(5),
             &cancel,
         )

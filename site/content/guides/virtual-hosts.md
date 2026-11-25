@@ -126,7 +126,7 @@ That is the opposite of what earlier versions did, and the reason is worth stati
 | `document_root` is a symlink resolving outside the container | **503** |
 | `auto_prepend_file` names a path outside the container, a directory, or a missing file | **503** |
 | `auto_prepend_file` set while `[php] mode = "worker"` | Key ignored with a `WARN`; the site still serves (see below) |
-| `[env]` has a non-string value, an empty name, or a name ePHPm injects (`DB_*`, `WS_*`, `EPHPM_*`, `DATABASE_URL`) | **503** |
+| `[env]` has a non-string value, an empty name, or a name ePHPm injects (`DB_*`, `WS_*`, `EPHPM_*`, `HTTP_*`, `PHP_AUTH_*`, `DATABASE_URL`, or a core CGI var such as `REMOTE_ADDR` / `HTTPS` / `SCRIPT_FILENAME` / `DOCUMENT_ROOT`) | **503** |
 | Override contains keys this ePHPm version doesn't know | Ignored — with a `WARN` naming the file, the site, every unrecognised key, and a "did you mean" hint. Recognised keys still apply |
 
 Row two remains the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing entirely**, which ePHPm cannot distinguish from a site that has none. Only a file that *exists* and is broken produces a 503. Startup names both cases: `grep` the boot log for `per-site document root overrides applied` and for `per-site overrides that cannot be honoured`.
@@ -236,7 +236,7 @@ FEATURE_X = "1"
 ```
 
 - **Injected per request, into that vhost's `$_SERVER` only** — thread-local, exactly like the `DB_*` credentials ePHPm already injects. It is **never** written into the process `environ`, so one tenant's declared env is invisible to another tenant's PHP (and to `getenv()` process-wide). Read it as `$_SERVER['APP_ENV']`; the same `$_SERVER`-first pattern the `DB_*` variables use (see [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
-- **Values must be strings.** A non-string value, an empty name, or a name ePHPm injects itself (`DB_*`, `WS_*`, `EPHPM_*`, `DATABASE_URL`) takes the one site out of service (503) — a key ePHPm understood and could not honour, the same fail-closed rule `document_root` follows.
+- **Values must be strings.** A non-string value, an empty name, or a name ePHPm injects itself takes the one site out of service (503) — a key ePHPm understood and could not honour, the same fail-closed rule `document_root` follows. The rejected names are `DB_*`, `WS_*`, `EPHPM_*`, `HTTP_*`, `PHP_AUTH_*`, `DATABASE_URL`, and the request's core CGI variables (`REMOTE_ADDR`, `HTTPS`, `SCRIPT_FILENAME`, `DOCUMENT_ROOT`, `HTTP_HOST`, …). An `[env]` entry is merged into `$_SERVER` after those, and `php_register_variable` is last-wins, so allowing one would let a vhost spoof the client address, scheme or script path — ePHPm's own value must win.
 - **Operator-owned, not tenant-owned.** Like the rest of this file it lives outside `sites_dir`; a tenant cannot write it. It is still the right place for a secret an app reads from `$_SERVER` — unlike the (scrubbed) process environment, it never leaks to another tenant.
 
 ### Other per-site configuration

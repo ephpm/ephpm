@@ -4586,14 +4586,18 @@ impl Router {
         // functions from the function table; runtime ini changes don't
         // re-disable them). Wiring lives in `crates/ephpm/src/main.rs`.
 
-        // Per-site declared environment (finding F1, half b). Injected FIRST so
-        // that if a declaration ever named a key ePHPm also injects, ePHPm's own
-        // value (pushed below) wins under `php_register_variable`'s last-wins
-        // rule — belt-and-braces, since `site_overrides::resolve_env` already
-        // rejects the reserved DB_*/WS_*/EPHPM_*/DATABASE_URL names. These reach
-        // the tenant's `$_SERVER` per request and thread-local, never the
-        // process `environ`, so one tenant's declared env is invisible to
-        // another's PHP.
+        // Per-site declared environment (finding F1, half b). These are the
+        // tenant's `[env]` entries, which reach the tenant's `$_SERVER` per
+        // request and thread-local, never the process `environ`, so one tenant's
+        // declared env is invisible to another's PHP. `site_overrides::resolve_env`
+        // has already rejected every name ePHPm injects itself — DB_*/WS_*/
+        // EPHPM_*/HTTP_*/PHP_AUTH_*/DATABASE_URL and the core CGI vars
+        // (REMOTE_ADDR, HTTPS, SCRIPT_FILENAME, DOCUMENT_ROOT, …) — so an `[env]`
+        // entry can never shadow the request's own values, which matters because
+        // env vars are appended to `$_SERVER` *after* the core CGI vars and
+        // `php_register_variable` is last-wins. The server's own DB/KV additions
+        // below sit after `site_env` in this vector, so ePHPm's value still wins
+        // for those regardless.
         let mut env_vars: Vec<(String, String)> = site_env;
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.

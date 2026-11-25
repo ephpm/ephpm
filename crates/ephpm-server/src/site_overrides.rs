@@ -608,11 +608,46 @@ pub(crate) fn load(
 /// already win) and a footgun at worst. Rejected by name or by `DB_`/`WS_`
 /// prefix; reusing the same reserved list keeps the rule stable as the injected
 /// set grows.
+/// The fixed CGI/`$_SERVER` variables ePHPm derives per request (see
+/// `ephpm_php::request` `build_server_vars`). A per-site `[env]` entry is
+/// appended to `$_SERVER` *after* these, and `php_register_variable` is
+/// last-wins, so letting `[env]` name one of them would let a vhost override the
+/// request's real `REMOTE_ADDR` / `HTTPS` / `SCRIPT_FILENAME` / `DOCUMENT_ROOT`
+/// / `HTTP_HOST` — contradicting the documented rule that ePHPm's own value
+/// wins. They are rejected here so the override cannot take effect at all.
+const RESERVED_SERVER_VARS: &[&str] = &[
+    "REQUEST_METHOD",
+    "REQUEST_URI",
+    "SCRIPT_FILENAME",
+    "SCRIPT_NAME",
+    "DOCUMENT_ROOT",
+    "SERVER_NAME",
+    "SERVER_PORT",
+    "SERVER_SOFTWARE",
+    "SERVER_PROTOCOL",
+    "GATEWAY_INTERFACE",
+    "QUERY_STRING",
+    "PHP_SELF",
+    "REMOTE_ADDR",
+    "REMOTE_PORT",
+    "REDIRECT_STATUS",
+    "HTTPS",
+    "AUTH_TYPE",
+];
+
+/// Whether a per-site `[env]` entry names a variable ePHPm injects itself, so
+/// an override of it must be refused (fail-closed). Covers the DB/KV/WS
+/// credentials and ePHPm's own `EPHPM_*` knobs, the request's core CGI vars
+/// ([`RESERVED_SERVER_VARS`]), and the request-derived `HTTP_*` header mirror
+/// and `PHP_AUTH_*` authentication vars — none of which a vhost may spoof.
 fn env_name_is_reserved(name: &str) -> bool {
     name.starts_with("DB_")
         || name.starts_with("WS_")
         || name.starts_with("EPHPM_")
+        || name.starts_with("HTTP_")
+        || name.starts_with("PHP_AUTH_")
         || name == "DATABASE_URL"
+        || RESERVED_SERVER_VARS.contains(&name)
 }
 
 /// Validate and normalise a per-site `[env]` table into sorted `(name, value)`
@@ -634,7 +669,9 @@ fn resolve_env(
         }
         if env_name_is_reserved(name) {
             return Err(
-                "[env] may not set a name ePHPm injects itself (DB_*, WS_*, EPHPM_*, DATABASE_URL)",
+                "[env] may not set a name ePHPm injects itself (DB_*, WS_*, EPHPM_*, HTTP_*, \
+                 PHP_AUTH_*, DATABASE_URL, or a core CGI var such as REMOTE_ADDR / HTTPS / \
+                 SCRIPT_FILENAME / DOCUMENT_ROOT)",
             );
         }
         let toml::Value::String(s) = value else {
@@ -1875,7 +1912,23 @@ mod tests {
     /// `[env]` may not shadow a name ePHPm injects itself — fail closed.
     #[test]
     fn per_site_env_reserved_name_is_unusable() {
-        for name in ["DB_PASSWORD", "WS_EVENT", "EPHPM_NODE_ID", "DATABASE_URL"] {
+        for name in [
+            "DB_PASSWORD",
+            "WS_EVENT",
+            "EPHPM_NODE_ID",
+            "DATABASE_URL",
+            // Core CGI vars the request derives — an [env] override of these
+            // would otherwise win under php_register_variable's last-wins rule
+            // and let a vhost spoof the client address / scheme / script path.
+            "REMOTE_ADDR",
+            "HTTPS",
+            "SCRIPT_FILENAME",
+            "DOCUMENT_ROOT",
+            // The request's header mirror and HTTP-auth vars.
+            "HTTP_HOST",
+            "HTTP_X_FORWARDED_FOR",
+            "PHP_AUTH_USER",
+        ] {
             let f = fixture();
             f.write(&format!("[env]\n{name} = \"x\"\n"));
             assert!(

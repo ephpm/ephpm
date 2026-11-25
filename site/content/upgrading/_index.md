@@ -21,6 +21,16 @@ Then read the per-version notes below for anything that needs action.
 
 ---
 
+## v0.20.0
+
+### PHP no longer sees the process environment by default (environment scrub)
+
+- **What changed:** `ephpm serve` now **scrubs the process environment before PHP starts** (`[php] scrub_environment`, default `true`; audit finding F1). A tenant's PHP reads the process environment through `getenv()`, `$_ENV` and `phpinfo()`, so in a multi-tenant deployment the shared environment would otherwise let any tenant read the operator's `EPHPM_KV__SECRET` / `EPHPM_CLUSTER__SECRET`, `AWS_*` credentials and any other exported secret. The scrub keeps only `[php] env_allowlist` (default `PATH`, `TZ`, `LANG`, `LC_*`) plus ePHPm's own small operational keep-set. On glibc Linux the scrubbed values are also zeroed in place so `/proc/self/environ` cannot leak them. The same scrub is applied by the `ephpm php --site` tenant CLI lane (cron / `wp` / `artisan`). This follows the v0.12.0 precedent where `ephpm exec` began running with a cleared environment.
+- **You'll see:** an app that read a non-allowlisted variable from `getenv()` / `$_ENV` (e.g. `APP_ENV`, a third-party API key you exported) now finds it unset. Secrets ePHPm itself consumes are unaffected (figment read them into config first; `AWS_*` are cached before the scrub), so the server, DB, KV and cloud backups keep working. On Windows, core OS variables (`SystemRoot`, `PATH`, `TEMP`, `COMPUTERNAME`, …) are kept automatically.
+- **Do:** list the exact variables your app legitimately reads in `[php] env_allowlist` — e.g. `env_allowlist = ["PATH", "TZ", "LANG", "LC_*", "APP_ENV", "AWS_REGION"]`; **never put a secret there** (hand per-vhost values to a tenant via the override file's `[env]` table instead, injected into that tenant's `$_SERVER`). A single-site deployment that genuinely relies on an inherited environment may set `[php] scrub_environment = false` (not permitted under `[server] sites_dir`). See [What PHP can see: the environment scrub](/reference/environment-variables/#what-php-can-see-the-environment-scrub) and [Multi-tenant hardening → Environment scrubbing](/guides/multi-tenant-hardening/#environment-scrubbing-finding-f1).
+
+---
+
 ## v0.13.1
 
 ### PHP `memory_limit` is now bounded, and an explicit value is honoured

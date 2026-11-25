@@ -174,6 +174,39 @@ fn daily_3am_job(name: &str, site: Option<&str>) -> ResolvedJob {
     job
 }
 
+/// The `[kv] secret` is given back only to a **PHP per-site** child (finding
+/// F1): that is the lane whose `Config::load` → `plan_site_db` needs it after
+/// the parent server scrubbed `EPHPM_KV__SECRET`. A siteless job (spawned as the
+/// operator's own binary) and a binary per-site job must never receive it.
+#[test]
+fn exec_request_hands_kv_secret_only_to_php_per_site() {
+    let secret = Some("s3cret");
+
+    let mut php_site = every_minute_job("wp", Some("shop"));
+    php_site.is_php = true;
+    assert_eq!(
+        php_site.exec_request(None, None, &[], secret).kv_secret.as_deref(),
+        Some("s3cret"),
+        "a PHP per-site job gets the secret so its Config::load can derive the wire credential"
+    );
+
+    let mut binary_site = every_minute_job("backup", Some("shop"));
+    binary_site.is_php = false;
+    assert_eq!(
+        binary_site.exec_request(None, None, &[], secret).kv_secret,
+        None,
+        "a binary per-site (ephpm exec) job must not receive the secret"
+    );
+
+    let mut php_siteless = every_minute_job("global", None);
+    php_siteless.is_php = true;
+    assert_eq!(
+        php_siteless.exec_request(None, None, &[], secret).kv_secret,
+        None,
+        "a siteless job is spawned as the operator's own binary — never give it the secret"
+    );
+}
+
 /// Everything a test scheduler can vary; the plain `scheduler()` wrapper
 /// covers the operator-only cases.
 struct Opts {
@@ -194,6 +227,7 @@ fn build(o: Opts) -> CronScheduler {
     CronScheduler {
         operator_jobs: o.jobs,
         config_path: None,
+        kv_secret: None,
         directory_sites: o.directory_sites,
         sites_dir: o.sites_dir,
         cadence: directory::CadenceSchedules::new(None, None, None, None).unwrap(),
@@ -250,11 +284,11 @@ fn siteless_job_gets_shared_db_env_but_per_site_does_not() {
     ];
 
     let siteless = every_minute_job("ops", None);
-    let req = siteless.exec_request(None, None, &db_env);
+    let req = siteless.exec_request(None, None, &db_env, None);
     assert_eq!(req.extra_env, db_env, "a siteless job must receive the shared DB_*");
 
     let tenant = every_minute_job("shop-job", Some("shop"));
-    let req = tenant.exec_request(None, None, &db_env);
+    let req = tenant.exec_request(None, None, &db_env, None);
     assert!(req.extra_env.is_empty(), "a per-site job must NOT receive the shared credential");
 }
 

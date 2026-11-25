@@ -183,27 +183,96 @@ pub const SCRUB_RESERVED_ENV_VARS: &[&str] = &[
 /// Name prefixes of [`SCRUB_RESERVED_ENV_VARS`] families kept across a scrub.
 const SCRUB_RESERVED_ENV_PREFIXES: &[&str] = &["OTEL_"];
 
+/// Core Windows environment variables kept across a scrub regardless of the
+/// operator's `[php] env_allowlist`.
+///
+/// Unlike Linux — where a server process needs almost nothing from the
+/// environment — core Windows behaviour reads it directly: `SystemRoot` /
+/// `windir` locate `ws2_32.dll` and the DNS resolver (dropping `SystemRoot`
+/// breaks Winsock and name resolution outright), `COMSPEC` / `PATHEXT` are the
+/// shell-out contract, and `TEMP` / `TMP` locate the temp directory that
+/// [`std::env::temp_dir`] (vhost state root, snapshot/backup staging) resolves
+/// after the scrub — losing them relocates those files to `C:\WINDOWS`.
+/// `COMPUTERNAME` is this node's snapshot identity on Windows
+/// (`ephpm_server::kv_snapshot::host_name`, which has no `gethostname` path
+/// there), so scrubbing it silently orphans the pre-upgrade KV snapshot. The
+/// user-profile dirs (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`) are where
+/// libraries put per-user state. None of these is a secret.
+#[cfg(windows)]
+pub const SCRUB_RESERVED_ENV_VARS_PLATFORM: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "TEMP",
+    "TMP",
+    "COMPUTERNAME",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// Core non-Windows environment variables kept across a scrub regardless of the
+/// operator's `[php] env_allowlist`.
+///
+/// `TMPDIR` (and the `TMP` / `TEMP` fallbacks some libraries honour) is what
+/// [`std::env::temp_dir`] resolves, and several things run it *after* the scrub
+/// (the per-vhost state root, snapshot/backup staging). Dropping `TMPDIR` would
+/// silently relocate those under `/tmp` instead of the operator's chosen temp
+/// directory. These are paths, not secrets.
+#[cfg(not(windows))]
+pub const SCRUB_RESERVED_ENV_VARS_PLATFORM: &[&str] = &["TMPDIR", "TMP", "TEMP"];
+
+/// Compare two environment variable names with the platform's case rule.
+///
+/// Windows environment names are case-insensitive (`Path`, `SystemRoot`,
+/// `systemroot` all name the same variable), so a keep-set / allowlist that
+/// matched case-sensitively would miss a differently-cased spelling and scrub a
+/// variable it meant to keep — breaking the runtime. Linux names are
+/// case-sensitive, so the comparison stays exact there.
+#[must_use]
+fn env_name_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+/// Whether `name` begins with `prefix`, under the platform's case rule (see
+/// [`env_name_eq`]). Used for the `LC_*` / `OTEL_` style prefix globs.
+#[must_use]
+fn env_name_has_prefix(name: &str, prefix: &str) -> bool {
+    if cfg!(windows) {
+        name.len() >= prefix.len()
+            && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    } else {
+        name.starts_with(prefix)
+    }
+}
+
 /// Whether `name` is permitted by `allowlist` (the `[php] env_allowlist`).
 ///
-/// Each entry is either an exact, case-sensitive variable name or — when it
-/// ends in `*` — a prefix glob (`LC_*` matches `LC_ALL`, `LC_TIME`, ...). A
-/// bare `*` matches everything (an operator's explicit "keep it all", the
-/// allowlist spelling of disabling the scrub). Empty entries never match.
+/// Each entry is either an exact variable name or — when it ends in `*` — a
+/// prefix glob (`LC_*` matches `LC_ALL`, `LC_TIME`, ...). A bare `*` matches
+/// everything (an operator's explicit "keep it all", the allowlist spelling of
+/// disabling the scrub). Empty entries never match. Matching is case-sensitive
+/// on Linux and case-insensitive on Windows (see [`env_name_eq`]), tracking the
+/// OS's own rule for environment names.
 #[must_use]
 pub fn env_allowlist_matches(allowlist: &[String], name: &str) -> bool {
     allowlist.iter().any(|entry| match entry.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => !entry.is_empty() && entry == name,
+        Some(prefix) => env_name_has_prefix(name, prefix),
+        None => !entry.is_empty() && env_name_eq(entry, name),
     })
 }
 
-/// Whether `name` is a variable ePHPm itself still needs after the scrub (see
-/// [`SCRUB_RESERVED_ENV_VARS`]), so the scrubber keeps it regardless of the
-/// operator's allowlist.
+/// Whether `name` is a variable ePHPm itself (or the OS) still needs after the
+/// scrub (see [`SCRUB_RESERVED_ENV_VARS`] and
+/// [`SCRUB_RESERVED_ENV_VARS_PLATFORM`]), so the scrubber keeps it regardless of
+/// the operator's allowlist. Case-insensitive on Windows (see [`env_name_eq`]).
 #[must_use]
 pub fn env_scrub_reserved(name: &str) -> bool {
-    SCRUB_RESERVED_ENV_VARS.contains(&name)
-        || SCRUB_RESERVED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+    SCRUB_RESERVED_ENV_VARS.iter().any(|r| env_name_eq(r, name))
+        || SCRUB_RESERVED_ENV_VARS_PLATFORM.iter().any(|r| env_name_eq(r, name))
+        || SCRUB_RESERVED_ENV_PREFIXES.iter().any(|p| env_name_has_prefix(name, p))
 }
 
 /// An `EPHPM_*` environment variable that maps to no configuration key, so
@@ -15013,6 +15082,54 @@ enabled = true
         // The wordpress-sample seed token is a token, not a worker path, so it
         // is not auto-kept — an operator names it in [php] env_allowlist.
         assert!(!env_scrub_reserved("EPHPM_SEED_TOKEN"), "token is not auto-reserved");
+    }
+
+    #[test]
+    fn env_scrub_reserved_keeps_the_temp_dir_vars() {
+        // std::env::temp_dir() runs after the scrub (vhost state root,
+        // snapshot/backup staging); losing its variable relocates those files.
+        #[cfg(not(windows))]
+        assert!(env_scrub_reserved("TMPDIR"), "TMPDIR drives temp_dir() on unix");
+        #[cfg(windows)]
+        {
+            assert!(env_scrub_reserved("TEMP"), "TEMP drives temp_dir() on Windows");
+            assert!(env_scrub_reserved("TMP"), "TMP is the Windows temp fallback");
+        }
+    }
+
+    /// The Windows keep-set covers the variables that core Windows behaviour
+    /// (Winsock/DNS, the temp dir, the snapshot identity) reads directly. These
+    /// assertions run on Linux too — the constant is platform-gated, so the set
+    /// under test is whichever one this target compiled.
+    #[cfg(windows)]
+    #[test]
+    fn env_scrub_reserved_keeps_core_windows_vars() {
+        for v in ["SystemRoot", "windir", "COMSPEC", "PATHEXT", "COMPUTERNAME"] {
+            assert!(env_scrub_reserved(v), "{v} must survive the scrub on Windows");
+        }
+    }
+
+    /// Windows environment names are case-insensitive, so the keep-set and the
+    /// allowlist must match regardless of spelling or a reader scrubs a variable
+    /// the OS needs. (On Linux the comparison stays exact — this test only
+    /// asserts the Windows rule where it applies.)
+    #[cfg(windows)]
+    #[test]
+    fn env_matching_is_case_insensitive_on_windows() {
+        assert!(env_scrub_reserved("systemroot"), "reserved keep-set is case-insensitive");
+        assert!(env_scrub_reserved("SYSTEMROOT"));
+        let allow = vec!["Path".to_string(), "lc_*".to_string()];
+        assert!(env_allowlist_matches(&allow, "PATH"), "allowlist exact is case-insensitive");
+        assert!(env_allowlist_matches(&allow, "LC_ALL"), "allowlist glob is case-insensitive");
+    }
+
+    /// On Linux the comparison must stay case-sensitive — `path` is not `PATH`.
+    #[cfg(not(windows))]
+    #[test]
+    fn env_matching_is_case_sensitive_on_linux() {
+        assert!(!env_scrub_reserved("rust_log"), "lower-cased reserved name must not match");
+        let allow = vec!["PATH".to_string()];
+        assert!(!env_allowlist_matches(&allow, "path"), "allowlist is case-sensitive on linux");
     }
 
     #[test]
