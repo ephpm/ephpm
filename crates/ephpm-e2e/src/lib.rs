@@ -912,6 +912,29 @@ impl ClusterFixture {
         }
     }
 
+    /// Abruptly **kill** one node (SIGKILL, no graceful shutdown) and leave the
+    /// rest of the cluster running — simulating a crash or power loss (#706).
+    ///
+    /// Unlike [`stop_node`](Self::stop_node) (SIGTERM → ephpm's graceful drain,
+    /// which runs the CDC drain gate), SIGKILL cannot be caught, so **none** of
+    /// the shutdown path runs: no drain gate, no clean WAL checkpoint. The
+    /// surviving cluster must detect the death through gossip and auto-promote a
+    /// replica. This is the path the promotion-side crash-safety gate
+    /// (`turso_cdc::await_promotion_settle`) is validated against.
+    ///
+    /// On a non-Unix host (where there is no SIGKILL) this falls back to
+    /// `Child::kill`, which is itself a forced, un-catchable terminate — fine,
+    /// since the clustered failover suite is skipped on Windows anyway. The
+    /// node's `child` handle is taken, so `Drop` will not terminate it twice;
+    /// an already-stopped or out-of-range index is a no-op.
+    pub fn kill_node(&mut self, index: usize) {
+        if let Some(node) = self.nodes.get_mut(index)
+            && let Some(mut child) = node.child.take()
+        {
+            hard_kill(&mut child);
+        }
+    }
+
     /// The last `max_lines` lines of node `index`'s `stderr.log`, for inlining
     /// into a test failure message.
     ///
@@ -1282,6 +1305,24 @@ fn terminate(child: &mut Child) {
             }
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL a child immediately (no SIGTERM, no grace) and reap it, simulating a
+/// crash / power loss. See [`ClusterFixture::kill_node`].
+fn hard_kill(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: libc::kill takes a pid and a signal; signal 9 is SIGKILL. A
+        // dead child returns ESRCH, which is harmless and ignored.
+        unsafe {
+            let pid = child.id() as i32;
+            libc_kill(pid, 9);
+        }
+    }
+    // `Child::kill` on Unix sends SIGKILL too, so this is both the non-Unix path
+    // and a belt-and-braces no-op after the explicit signal above.
     let _ = child.kill();
     let _ = child.wait();
 }

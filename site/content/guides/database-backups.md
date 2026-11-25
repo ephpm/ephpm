@@ -396,17 +396,26 @@ shipped binary: schedule, key layout, `db backup list`, the status endpoint,
 server-is-running refusal. `cargo xtask e2e --tests db_backup` on a host
 with `podman` or `docker`; it skips, loudly, where there is neither.
 
-### Clustered failover harness (graceful drain → promote → no loss)
+### Clustered failover harness (graceful drain and abrupt kill → promote → no loss)
 
 `crates/ephpm-e2e/tests/cluster_failover.rs` is the live validation for the
-v0.16.2 **drain gate** (#701): it proves a *graceful* drain of a whole-database
-clustered primary promotes a replica **without losing any already-written data**.
-It spawns a 3-node cluster on loopback, finds the elected primary via
-`/_ephpm/primary`, writes rows through that node's `pdo_mysql` wire listener,
-waits for them to replicate to a replica, then SIGTERMs the primary — which runs
-the drain gate (`drain_whole_db_primary`: it holds the cluster channel open until
-every attached replica has applied the CDC head). It then waits for a survivor to
-be promoted and asserts every written row is present on the new primary.
+whole-database failover guards. It spawns a 3-node cluster on loopback, finds the
+elected primary via `/_ephpm/primary`, and writes rows through that node's
+`pdo_mysql` wire listener. It holds two scenarios:
+
+- **Graceful drain** (the v0.16.2 **drain gate**, #701): after the rows replicate
+  to a replica it SIGTERMs the primary — which runs the drain gate
+  (`drain_whole_db_primary`: it stops the wire listener, then holds the cluster
+  channel open until every attached replica has applied the CDC head) — waits for
+  a survivor to be promoted, and asserts every written row is present on the new
+  primary.
+- **Abrupt kill** (the promotion-side crash-safety gate, #706): it first waits for
+  the rows to replicate to *every* survivor, then SIGKILLs the primary (no
+  graceful shutdown, so the drain gate never runs). It asserts the replicated data
+  is intact on every survivor after promotion, and that a fresh write to the new
+  primary commits and replicates — proving the promoted node accepted writes only
+  once its apply pipeline had settled. A tail that only the killed node held is
+  lost by design and is not asserted.
 
 It is **opt-in** and timing-sensitive, so it is kept out of the gating E2E leg —
 it runs only when **both** environment variables are set:

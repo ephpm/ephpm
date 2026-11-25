@@ -369,6 +369,24 @@ const DRAIN_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the drain-handover gate re-checks replica applied watermarks.
 const DRAIN_CATCHUP_POLL: Duration = Duration::from_millis(100);
 
+/// The hard ceiling the promotion-side crash-safety gate (#706) waits for a
+/// newly-elected whole-database primary's local apply pipeline to quiesce before
+/// it advertises itself writable. Same ceiling as the drain gate: a
+/// still-reachable but slow former primary must never block promotion forever —
+/// after the bound the node promotes anyway (and may then lose the former
+/// primary's still-shipping tail, the same loss an abrupt kill already causes).
+const PROMOTION_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the promotion-settle gate re-reads the local applied watermark.
+const PROMOTION_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// How many consecutive unchanged observations of the local applied watermark
+/// mark the apply pipeline as quiesced (the reachable tail is drained and
+/// nothing more is arriving). Three polls of [`PROMOTION_SETTLE_POLL`] ≈ 200 ms
+/// of no advance — enough to distinguish "drained" from a momentary gap between
+/// batches, while keeping the common SIGKILL-failover delay small.
+const PROMOTION_SETTLE_STABLE_POLLS: usize = 3;
+
 /// How long a replica waits for the primary's [`Frame::Hello`] before
 /// declaring the stream broken. Generous — the Hello is the primary's
 /// first write after accepting the stream — but bounded, so a peer that
@@ -830,6 +848,12 @@ pub async fn start_clustered_turso_cdc(
     );
 
     // Kick off role-appropriate work for the initial role.
+    // Whether this process *booted* as the primary. A boot-primary is the
+    // origin of its own data (or already cold-bootstrapped) and ran no replica
+    // driver in this process, so it has no former-primary tail to drain — the
+    // promotion-side settle gate below applies only to a *transition* into
+    // primary (a failover), never the initial role.
+    let initial_is_primary = matches!(initial_role, Role::Primary);
     let initial_driver = tokio::spawn(start_role(
         initial_role,
         Arc::clone(&mgmt_factory),
@@ -846,12 +870,39 @@ pub async fn start_clustered_turso_cdc(
         let channel = channel.clone();
         handles.push(tokio::spawn(async move {
             let mut current = initial_driver;
+            let mut was_primary = initial_is_primary;
             while watch_rx.changed().await.is_ok() {
                 let new_elected = watch_rx.borrow().clone();
                 let new_role = elected_to_role(new_elected);
                 tracing::info!(?new_role, "CDC replication: role change detected");
-                is_primary.store(matches!(new_role, Role::Primary), Ordering::Relaxed);
-                current.abort();
+                let becoming_primary = matches!(new_role, Role::Primary);
+                if becoming_primary && !was_primary {
+                    // (b) Promotion-side crash-safety gate (#706). Do NOT
+                    // advertise this node writable yet: keep `is_primary` false
+                    // (so `/_ephpm/primary` stays non-200 and an active-passive
+                    // LB routes it no writes) and leave the outgoing replica
+                    // driver (`current`) RUNNING — it is what drains whatever is
+                    // still reachable from the former primary — until the local
+                    // apply pipeline has quiesced. Only then abort it and flip
+                    // the flag. Bounded: a SIGKILLed/unreachable former primary
+                    // makes the applied watermark stable within a poll or two
+                    // (nothing left to drain), so promotion is only briefly
+                    // delayed; a still-reachable one is drained up to the bound.
+                    // This does not recover a tail only the dead primary held
+                    // (that loss is by design for an abrupt kill); it stops this
+                    // node committing NEW writes on top of a tail it was still
+                    // applying.
+                    await_promotion_settle().await;
+                    current.abort();
+                    is_primary.store(true, Ordering::Relaxed);
+                } else {
+                    // Demotion (or awaiting→replica): flip the writable flag
+                    // first — a demoted node must stop serving as primary at
+                    // once — then swap drivers (the pre-#706 ordering).
+                    is_primary.store(becoming_primary, Ordering::Relaxed);
+                    current.abort();
+                }
+                was_primary = becoming_primary;
                 current = tokio::spawn(start_role(
                     new_role,
                     Arc::clone(&mgmt),
@@ -1134,6 +1185,38 @@ fn spawn_head_sampler(
 /// closes that window.
 static WHOLE_DB_MGMT: std::sync::OnceLock<Arc<Turso>> = std::sync::OnceLock::new();
 
+/// Abort handle for the whole-database clustered wire listener (the litewire
+/// MySQL/Hrana/PG/TDS frontends spawned by [`spawn_litewire_serve`]), so
+/// shutdown can stop accepting — and stop serving — wire writes **before** the
+/// drain-handover catch-up gate samples the CDC head (#706). Without this the
+/// listener kept running until the generic `db_handles` sweep (well after the
+/// gate), so a wire client still connected during shutdown (a detached cron
+/// child's `pdo_mysql`, an operator's `mysql`) could commit a write *after* the
+/// gate read the head — the window the gate was meant to close was only shrunk,
+/// not closed. Registered once by `spawn_litewire_serve` (the sole whole-DB wire
+/// task); left `None` in every other mode and in unit tests.
+static WHOLE_DB_WIRE: std::sync::OnceLock<tokio::task::AbortHandle> = std::sync::OnceLock::new();
+
+/// Stop the whole-database clustered wire listener, if one is running (#706).
+///
+/// Called from `serve()`'s shutdown tail, immediately before
+/// [`drain_whole_db_primary`], on a whole-database clustered primary — so no new
+/// wire write can land after the gate samples the head. The CDC shipping drivers
+/// are deliberately **not** stopped here: the gate needs them up to ship the
+/// already-captured tail to replicas (they stop only at
+/// [`stop_replication_drivers`]).
+///
+/// Idempotent and safe in every mode: aborting an already-finished task is a
+/// no-op, the same handle is aborted again in the later `db_handles` sweep, and
+/// the slot is never set outside whole-database clustered mode (so this is a
+/// no-op there, including in per-site clustered mode, which sets `primary_view`
+/// on every node but runs a different path).
+pub fn stop_whole_db_wire_listener() {
+    if let Some(handle) = WHOLE_DB_WIRE.get() {
+        handle.abort();
+    }
+}
+
 /// Read the exact `MAX(turso_cdc.change_id)` from the registered whole-database
 /// mgmt factory, under the WAL-gate permit (a raw connection has no busy
 /// timeout). `None` if the factory is not registered or the read fails — the
@@ -1272,6 +1355,118 @@ pub async fn drain_whole_db_primary(expect_replicas: bool) {
                 waited_secs = waited.as_secs(),
                 "CDC whole-database drain: closing channel with replicas still behind their \
                  primary; their un-applied tail may be lost if this primary is now deleted"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Whole-database promotion-side crash-safety gate (#706).
+// ---------------------------------------------------------------------------
+
+/// Outcome of the promotion-settle wait, for the log line and the metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionSettleOutcome {
+    /// The local applied watermark held steady for the stability window — the
+    /// reachable tail is drained and nothing more is arriving.
+    Settled { watermark: i64, waited: Duration },
+    /// No local applied watermark was ever observed: this node never replicated
+    /// the database in this process (e.g. promoted from an unresolved role), so
+    /// there is nothing to drain.
+    NoLocalState { waited: Duration },
+    /// The bound elapsed with the watermark still advancing — a still-reachable
+    /// former primary shipped faster than this node could drain within the
+    /// bound. The node promotes anyway.
+    TimedOut { watermark: i64, waited: Duration },
+}
+
+/// The pure wait: poll `watermark` (the local applied-watermark gauge) every
+/// [`PROMOTION_SETTLE_POLL`] until the *same* observation repeats
+/// [`PROMOTION_SETTLE_STABLE_POLLS`] times in a row — the apply pipeline has
+/// quiesced — bounded by [`PROMOTION_SETTLE_TIMEOUT`]. An observation is an
+/// `Option<i64>`, so a node that never replicated (`None` throughout) settles to
+/// [`PromotionSettleOutcome::NoLocalState`] just as quickly as a drained one,
+/// rather than waiting out the whole bound. Factored out so the loop can be
+/// driven on a paused clock in tests, exactly like [`drain_catchup_wait`].
+async fn promotion_settle_wait<W>(mut watermark: W) -> PromotionSettleOutcome
+where
+    W: FnMut() -> Option<i64>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + PROMOTION_SETTLE_TIMEOUT;
+    // `None` = no poll taken yet; `Some(obs)` = the last observation, so the
+    // first poll always resets the run to 1 regardless of what it reads.
+    let mut last: Option<Option<i64>> = None;
+    let mut stable = 0usize;
+    loop {
+        let obs = watermark();
+        if last == Some(obs) {
+            stable += 1;
+        } else {
+            stable = 1;
+            last = Some(obs);
+        }
+        if stable >= PROMOTION_SETTLE_STABLE_POLLS {
+            let waited = started.elapsed();
+            return match obs {
+                Some(watermark) => PromotionSettleOutcome::Settled { watermark, waited },
+                None => PromotionSettleOutcome::NoLocalState { waited },
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let waited = started.elapsed();
+            return match obs {
+                Some(watermark) => PromotionSettleOutcome::TimedOut { watermark, waited },
+                None => PromotionSettleOutcome::NoLocalState { waited },
+            };
+        }
+        tokio::time::sleep(PROMOTION_SETTLE_POLL).await;
+    }
+}
+
+/// Hold a newly-elected whole-database primary back from advertising itself
+/// writable until its local apply pipeline has quiesced (#706).
+///
+/// Call this on a replica→primary transition **while the outgoing replica driver
+/// is still running** and **before** `is_primary` is flipped true: the replica
+/// driver is what drains whatever is still reachable from the former primary, and
+/// keeping `is_primary` false keeps `/_ephpm/primary` non-200 so an
+/// active-passive load balancer routes no writes here yet. The wait watches the
+/// local applied-watermark gauge for [`PROMOTION_SETTLE_STABLE_POLLS`]
+/// consecutive unchanged reads (drained; nothing more arriving), bounded by
+/// [`PROMOTION_SETTLE_TIMEOUT`].
+///
+/// This cannot recover a tail that **only** the former primary held — an abrupt
+/// kill still loses that, by design. What it prevents is this node committing
+/// *new* primary writes on top of a tail it was still applying when the election
+/// promoted it.
+async fn await_promotion_settle() {
+    let outcome =
+        promotion_settle_wait(|| cdc_metrics::current_applied_watermark(DEFAULT_SITE)).await;
+    match outcome {
+        PromotionSettleOutcome::Settled { watermark, waited } => {
+            cdc_metrics::record_promotion_settle(waited, false);
+            tracing::info!(
+                watermark,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "CDC whole-database promotion: local apply settled; promoting to primary"
+            );
+        }
+        PromotionSettleOutcome::NoLocalState { waited } => {
+            cdc_metrics::record_promotion_settle(waited, false);
+            tracing::info!(
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                "CDC whole-database promotion: no local replication state to drain; \
+                 promoting to primary"
+            );
+        }
+        PromotionSettleOutcome::TimedOut { watermark, waited } => {
+            cdc_metrics::record_promotion_settle(waited, true);
+            tracing::warn!(
+                watermark,
+                waited_secs = waited.as_secs(),
+                "CDC whole-database promotion: local apply still advancing at the settle bound; \
+                 promoting anyway — a still-reachable former primary may lose its un-applied tail"
             );
         }
     }
@@ -3598,12 +3793,18 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
             "SQLite wire frontends: connection cap enabled (CDC-replicated Turso)"
         );
     }
-    handles.push(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         match builder.serve().await {
             Ok(()) => tracing::info!("litewire stopped (CDC-replicated Turso)"),
             Err(e) => tracing::error!("litewire error (CDC-replicated Turso): {e:#}"),
         }
-    }));
+    });
+    // Register the listener's abort handle so shutdown can stop it before the
+    // drain-handover gate samples the head (#706). `spawn_litewire_serve` is the
+    // sole whole-database wire task, so `set` takes exactly once; a second call
+    // (there is none) would be ignored rather than replace it.
+    let _ = WHOLE_DB_WIRE.set(handle.abort_handle());
+    handles.push(handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -6426,6 +6627,85 @@ mod tests {
             start.elapsed() < DRAIN_CATCHUP_TIMEOUT,
             "must early-return without the registered factory, not wait the timeout"
         );
+    }
+
+    // ----- Promotion-side crash-safety gate (#706) -----
+
+    /// A local applied watermark that is already steady settles promptly — a
+    /// SIGKILLed/unreachable former primary leaves nothing to drain, so a newly
+    /// elected primary is only briefly delayed before it advertises writable.
+    #[tokio::test(start_paused = true)]
+    async fn promotion_settle_returns_once_the_watermark_holds_steady() {
+        let start = tokio::time::Instant::now();
+        let outcome = promotion_settle_wait(|| Some(100)).await;
+        match outcome {
+            PromotionSettleOutcome::Settled { watermark, waited } => {
+                assert_eq!(watermark, 100);
+                assert!(waited < PROMOTION_SETTLE_TIMEOUT, "waited {waited:?}");
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+        assert!(start.elapsed() < PROMOTION_SETTLE_TIMEOUT, "settled late: {:?}", start.elapsed());
+    }
+
+    /// A still-reachable former primary whose tail is still being applied keeps
+    /// the watermark advancing: the gate must wait for it to drain (stop
+    /// advancing) before promoting, not fire on the first poll.
+    #[tokio::test(start_paused = true)]
+    async fn promotion_settle_drains_an_advancing_watermark_then_settles() {
+        let start = tokio::time::Instant::now();
+        let mut wm: i64 = 0;
+        let outcome = promotion_settle_wait(move || {
+            if start.elapsed() < Duration::from_secs(1) {
+                wm += 1; // still draining the reachable tail
+            }
+            Some(wm)
+        })
+        .await;
+        match outcome {
+            PromotionSettleOutcome::Settled { waited, .. } => {
+                assert!(waited >= Duration::from_secs(1), "settled before it drained: {waited:?}");
+                assert!(waited < PROMOTION_SETTLE_TIMEOUT, "waited {waited:?}");
+            }
+            other => panic!("expected Settled after the drain, got {other:?}"),
+        }
+    }
+
+    /// A node that never replicated the database in this process observes no
+    /// local watermark (`None` throughout): it settles to `NoLocalState` just as
+    /// fast as a drained one rather than waiting out the whole bound.
+    #[tokio::test(start_paused = true)]
+    async fn promotion_settle_with_no_local_state_is_fast() {
+        let start = tokio::time::Instant::now();
+        let outcome = promotion_settle_wait(|| None).await;
+        assert!(
+            matches!(outcome, PromotionSettleOutcome::NoLocalState { .. }),
+            "expected NoLocalState, got {outcome:?}"
+        );
+        assert!(
+            start.elapsed() < PROMOTION_SETTLE_TIMEOUT,
+            "must not wait the bound with no local state: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A watermark that never stops advancing (a former primary shipping faster
+    /// than this node drains) hits the bound and promotes anyway — a stuck
+    /// promotion must never hang the cluster without a writable node.
+    #[tokio::test(start_paused = true)]
+    async fn promotion_settle_times_out_on_a_never_quiescing_watermark() {
+        let mut wm: i64 = 0;
+        let outcome = promotion_settle_wait(move || {
+            wm += 1;
+            Some(wm)
+        })
+        .await;
+        match outcome {
+            PromotionSettleOutcome::TimedOut { waited, .. } => {
+                assert!(waited >= PROMOTION_SETTLE_TIMEOUT, "waited {waited:?}");
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
     }
 
     /// A database's log identity is generated once and survives reopening

@@ -185,6 +185,18 @@ pub const METRIC_DRAIN_CATCHUP_SECONDS: &str = "ephpm_cdc_drain_catchup_seconds"
 /// behind (a tail may have been lost if the primary was then deleted).
 pub const METRIC_DRAIN_CATCHUP_TIMEOUTS: &str = "ephpm_cdc_drain_catchup_timeouts_total";
 
+/// Histogram: how long a newly-elected whole-database primary's local apply
+/// pipeline took to quiesce before it advertised itself writable, one
+/// observation per promotion (#706). The promotion-side crash-safety gate holds
+/// `/_ephpm/primary` non-200 until this settles, so an active-passive LB does
+/// not route a write onto a tail still being applied after an abrupt loss of the
+/// former primary.
+pub const METRIC_PROMOTION_SETTLE_SECONDS: &str = "ephpm_cdc_promotion_settle_seconds";
+/// Counter: promotions that hit the settle bound with the local applied
+/// watermark still advancing (a still-reachable former primary was shipping
+/// faster than it could be drained within the bound); the node promoted anyway.
+pub const METRIC_PROMOTION_SETTLE_TIMEOUTS: &str = "ephpm_cdc_promotion_settle_timeouts_total";
+
 /// The `site` label value of the whole-database clustered mode, which
 /// replicates one database over `cdc/default`. Same value as
 /// [`crate::wal_gate::DEFAULT_SITE_LABEL`], so dashboards can join the two.
@@ -382,6 +394,28 @@ pub fn record_drain_catchup(waited: Duration, timed_out: bool) {
     if timed_out {
         counter!(METRIC_DRAIN_CATCHUP_TIMEOUTS).increment(1);
     }
+}
+
+/// Record one whole-database promotion-settle gate outcome (#706): the wait
+/// duration (histogram), and the timeout counter when the node promoted with its
+/// local applied watermark still advancing at the bound.
+pub fn record_promotion_settle(waited: Duration, timed_out: bool) {
+    histogram!(METRIC_PROMOTION_SETTLE_SECONDS).record(waited.as_secs_f64());
+    if timed_out {
+        counter!(METRIC_PROMOTION_SETTLE_TIMEOUTS).increment(1);
+    }
+}
+
+/// The replica's current applied watermark for `site`, or `None` if this process
+/// has never recorded one (it never replicated the site in this run).
+///
+/// Read by the promotion-settle gate ([`crate::turso_cdc::promotion_settle_wait`])
+/// to detect when a newly-elected primary's local apply has quiesced: the gauge
+/// advances on every applied batch and on subscribe, so a value that holds steady
+/// means the reachable tail has been drained and nothing more is arriving.
+#[must_use]
+pub fn current_applied_watermark(site: &str) -> Option<i64> {
+    REGISTRY.applied.get(site).map(|e| *e.value())
 }
 
 /// Attach a subscriber of `site` that has announced `from_change_id` as its
@@ -609,6 +643,7 @@ pub fn init() {
         METRIC_APPLY_ERRORS,
         METRIC_SNAPSHOT_BYTES_RECEIVED,
         METRIC_DRAIN_CATCHUP_TIMEOUTS,
+        METRIC_PROMOTION_SETTLE_TIMEOUTS,
     ] {
         counter!(name).increment(0);
     }

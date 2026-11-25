@@ -363,12 +363,31 @@ attached and applies the head within 30 s**: as of **v0.16.2** a draining
 whole-database primary waits (up to that bound) for every attached replica to
 apply its CDC head before it closes the cluster channel
 (`ephpm_cdc_drain_catchup_seconds`; an `ephpm_cdc_drain_catchup_timeouts_total`
-increment means a replica was still behind). So the safe way to retire a primary
-— e.g. a **blue-green cutover**: add a node, let it cold-bootstrap, then retire
-the old one — is to **drain it** (a normal graceful shutdown) and let a replica
-promote, **not** to kill or delete it abruptly. If you will then delete the
-node's volume, first confirm that drain did not increment
-`ephpm_cdc_drain_catchup_timeouts_total`.
+increment means a replica was still behind). As of this release the draining
+primary also **stops its wire listener before that wait begins**, so a client
+still connected during shutdown (a detached cron child's `pdo_mysql`, an
+operator's `mysql`) cannot commit a write after the gate has sampled the head.
+So the safe way to retire a primary — e.g. a **blue-green cutover**: add a node,
+let it cold-bootstrap, then retire the old one — is to **drain it** (a normal
+graceful shutdown) and let a replica promote, **not** to kill or delete it
+abruptly. If you will then delete the node's volume, first confirm that drain did
+not increment `ephpm_cdc_drain_catchup_timeouts_total`.
+
+**Promotion after an abrupt kill is gated too.** A crash (SIGKILL, power loss,
+an OOM) runs none of that graceful path, so it still loses the dead primary's
+un-replicated tail. What the newly-elected primary does **not** do is accept
+writes the instant it is elected: it holds `/_ephpm/primary` non-200 — so an
+active-passive load balancer routes it no writes — until its own apply pipeline
+has quiesced (its applied watermark stops advancing: it has drained whatever was
+still reachable from the former primary and nothing more is arriving), bounded by
+30 s. This stops the promoted node committing fresh writes on top of a tail it
+was still applying. It does **not** recover data that only the dead node held —
+that is the unavoidable cost of an abrupt kill. Observed as
+`ephpm_cdc_promotion_settle_seconds` (near-zero for the common case, where the
+dead primary is unreachable so there is nothing to drain); an
+`ephpm_cdc_promotion_settle_timeouts_total` increment means a still-reachable
+former primary was shipping faster than the new one could drain within the bound,
+and it promoted anyway.
 
 > **Size the supervisor grace period.** The gate waits *outside* the
 > `[server.timeouts] shutdown` budget, so total graceful shutdown is now up to

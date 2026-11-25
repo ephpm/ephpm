@@ -796,11 +796,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // broader predicate would spin the full timeout on every per-site shutdown
     // (R1). Non-primaries are not the writer and skip it.
     //
-    // This shrinks but does not eliminate the straggler window — the wire
-    // listener is not stopped here, so a detached cron child or an operator's
-    // wire client could still commit during/after the gate. Fully closing that
-    // (stopping the listener before the gate) is a tracked follow-up; the
-    // graceful blue-green flow (no such writers) is covered.
+    // The wire listener is stopped *first* (immediately before the gate below,
+    // #706), so no new wire write — a detached cron child's `pdo_mysql`, an
+    // operator's `mysql` — can land after the gate samples the head. The CDC
+    // shipping drivers stay up through the gate (they stop only at
+    // `stop_replication_drivers()` below) so the already-captured tail still
+    // ships to replicas while the gate waits for them to apply it.
     let whole_db_drain = cluster_handle.as_ref().filter(|_| {
         embedded_sqlite_mode(&config) == EmbeddedSqliteMode::Clustered
             && primary_view.load(std::sync::atomic::Ordering::Relaxed)
@@ -861,6 +862,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // gossip still lists an alive peer, so a replica that dropped mid-drain is
     // waited for rather than closed past (F3).
     if let Some(cluster) = whole_db_drain {
+        // (a, #706) Stop accepting and serving wire writes BEFORE the gate
+        // samples the head, so a client still connected during shutdown cannot
+        // commit after the gate — the real closure of the straggler window that
+        // v0.16.2 only shrank. Only the wire listener is stopped; the CDC
+        // shipping drivers keep running so the gate can still ship and confirm
+        // the captured tail. Idempotent with the later `db_handles` sweep.
+        turso_cdc::stop_whole_db_wire_listener();
         let self_id = cluster.self_node().id;
         let expect_replicas = cluster
             .nodes()
