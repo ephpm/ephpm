@@ -1585,7 +1585,11 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 
     // watermark `>= floor`, so its next subscribe clears the floor and tails
     // cleanly. A floor of `0` (a log that never switched lineage — every cluster
     // that has not reseeded) refuses nothing.
-    let floor = read_owner_log_floor(mgmt).await;
+    // Fail the stream on a read failure rather than admitting the subscriber
+    // (#463): a wrongly-admitted below-floor subscriber would replay stale
+    // pre-switch history, and the floor never refuses it again once its cursor
+    // passes. The replica retries, exactly as it does for every other refusal.
+    let floor = read_owner_log_floor(mgmt).await.context("cdc: resolve the subscribe floor")?;
     if from < floor {
         cdc_metrics::record_stream_refused("cdc");
         tracing::warn!(
@@ -2674,15 +2678,30 @@ async fn read_owner_reseed_gen(mgmt: &Turso) -> u64 {
 }
 
 /// This serving owner's CDC log floor (#707), for the floor check
-/// [`serve_site_subscriber`] applies to each `Subscribe`. `0` on any error or
-/// when the table does not exist (a log that has never switched lineage) — a `0`
-/// floor refuses nothing, so a best-effort read here is fail-safe. Opens its own
-/// gated raw connection so it never races the stream connection. Mirrors
-/// [`read_owner_reseed_gen`].
-async fn read_owner_log_floor(mgmt: &Turso) -> i64 {
-    let Ok(conn) = mgmt.raw_connection() else { return 0 };
+/// [`serve_site_subscriber`] applies to each `Subscribe`. `0` only when the
+/// table does not exist (a log that has never switched lineage).
+///
+/// **Fails closed (#463).** Unlike [`read_owner_reseed_gen`] / [`read_owner_epoch`]
+/// — where a `0` is the fail-safe direction (it never forces anything) — a `0`
+/// floor *admits* a subscriber, and admitting a below-floor subscriber re-opens
+/// the exact stale-replay this guards against (once that replica's watermark
+/// passes the floor it is never refused again). So a read failure (a
+/// raw-connection `Busy`/locked at the instant a replica subscribes with cursor
+/// 0, say) must **not** collapse to `0`: this propagates the error, and
+/// [`serve_site_subscriber`] fails the stream so the replica retries — the same
+/// direction every other refusal takes. [`read_log_floor`] already errors on a
+/// corrupt value rather than returning a silent `0` for the same reason; this
+/// wrapper must not undo that. Opens its own gated raw connection so it never
+/// races the stream connection.
+///
+/// # Errors
+///
+/// The connection cannot be opened, or the floor cannot be read (a missing table
+/// is `0`, not an error).
+async fn read_owner_log_floor(mgmt: &Turso) -> anyhow::Result<i64> {
+    let conn = mgmt.raw_connection().context("cdc: open a connection to read the log floor")?;
     let _permit = mgmt.wal_gate_permit().await;
-    off_runtime(read_log_floor(&conn)).await.unwrap_or(0)
+    off_runtime(read_log_floor(&conn)).await.context("cdc: read the log floor")
 }
 
 /// The watermark we had reached in `log_id`, from the per-log history.
@@ -4868,20 +4887,38 @@ fn spawn_per_site_stream_handler(
                         //   version from the settle decision. Sticky `Ready` keeps a
                         //   previous/draining owner serving the full handoff.
                         let serveable = matches!(gate.state(&site), SiteServeState::Ready);
-                        let cold = if serveable {
-                            false
+                        // Determine coldness only when unsettled. #463 fail-closed:
+                        // a coldness-read FAILURE must NOT fall through to `no_copy`
+                        // — a warm holder answering `no_copy` could let the new owner
+                        // serve EMPTY and fork the tenant's data (exactly what the
+                        // gate exists to prevent). On any failure, drop the stream so
+                        // the puller reads EOF → Unreachable → Blocked → retry.
+                        let serve = if serveable {
+                            SnapshotServe::Full
                         } else {
-                            match site_mgmt.factory.raw_connection() {
-                                Ok(conn) => {
-                                    let _permit = site_mgmt.factory.wal_gate_permit().await;
-                                    off_runtime(local_db_is_cold(&conn)).await.unwrap_or(true)
+                            let cold = async {
+                                let conn = site_mgmt.factory.raw_connection()?;
+                                let _permit = site_mgmt.factory.wal_gate_permit().await;
+                                off_runtime(local_db_is_cold(&conn)).await
+                            }
+                            .await;
+                            match cold {
+                                Ok(cold) => snapshot_serve_decision(serveable, cold),
+                                Err(e) => {
+                                    cdc_metrics::record_stream_refused(kind.label());
+                                    tracing::warn!(
+                                        peer = %peer,
+                                        site = %site,
+                                        "per-site snapshot: cannot determine local coldness ({e:#}); \
+                                         refusing (dropping) rather than risk answering no_copy for a \
+                                         warm copy and letting the new owner serve empty — the puller \
+                                         retries (#463)"
+                                    );
+                                    return;
                                 }
-                                // Cannot even open the copy: treat as cold (answer
-                                // no_copy) rather than claim a version we can't read.
-                                Err(_) => true,
                             }
                         };
-                        match snapshot_serve_decision(serveable, cold) {
+                        match serve {
                             SnapshotServe::Full => {
                                 match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
                                     Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
@@ -5245,7 +5282,12 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                                     "per-site replica: this node holds a newer reseed generation \
                                      than the owner; refusing to tail the owner's stale data (it \
                                      would merge pre-reseed rows back over the restore). Backing \
-                                     off until the owner catches up (ephpm db restore --reseed)"
+                                     off until the owner catches up (ephpm db restore --reseed). \
+                                     If the owner stays running with ownership unchanged it never \
+                                     adopts the restore, so this refusal persists indefinitely — \
+                                     the restore is preserved, but convergence needs the owner to \
+                                     restart; the documented 'stop every node' reseed procedure \
+                                     avoids this"
                                 );
                                 force_reset = false;
                                 true
