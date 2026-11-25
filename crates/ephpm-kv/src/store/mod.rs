@@ -2633,6 +2633,22 @@ impl Store {
         }
     }
 
+    /// Whether `key` holds a live string entry and, if so, whether that entry
+    /// was materialised by a warm-restart snapshot restore rather than a live
+    /// write (`Some(restored)`); `None` when there is no live string entry.
+    ///
+    /// The large-tier anti-entropy reconciler reads this together with the
+    /// key's stamp to decide whether a disowned copy may be dropped (see
+    /// [`Entry::restored`]).
+    #[must_use]
+    pub fn string_restored(&self, key: &str) -> Option<bool> {
+        let entry = self.data.get(key)?;
+        if entry.is_expired() {
+            return None;
+        }
+        Some(entry.restored)
+    }
+
     /// A live string value, decoded, with its remaining TTL — both read
     /// under one shard read guard, so the pair is consistent. `None` when
     /// absent or expired. Does not touch the LRU clock.
@@ -2811,10 +2827,14 @@ impl Store {
         expires_at: Option<Instant>,
     ) -> bool {
         let now = self.now_nanos();
-        let entry = match expires_at {
+        let mut entry = match expires_at {
             Some(at) => Entry::with_expiry(data, key.len(), compressed, at, now),
             None => Entry::new(data, key.len(), compressed, now),
         };
+        // Mark the copy as snapshot-restored so large-tier anti-entropy can
+        // tell it from a copy whose stamp aged out of the applied-map horizon
+        // (#630): a restored copy may defer to a replica holding a real stamp.
+        entry.restored = true;
         let new_size = entry.mem_size;
         let deadline = entry.expires_at;
         let (old_size, old_had_ttl) =
@@ -5864,6 +5884,21 @@ mod tests {
         assert!(rep.sets.lock().unwrap().is_empty(), "set_local must not fire the hook");
         assert!(rep.removes.lock().unwrap().is_empty(), "remove_local must not fire the hook");
         assert!(rep.expires.lock().unwrap().is_empty(), "expire_local must not fire the hook");
+    }
+
+    #[test]
+    fn restore_string_marks_the_entry_restored_and_a_live_write_clears_it() {
+        // Anti-entropy relies on `string_restored` to tell a snapshot-restored
+        // copy (whose write order is unknown) from a live write (#630 / #632).
+        let s = test_store();
+        assert_eq!(s.string_restored("k"), None, "absent key has no restored flag");
+
+        assert!(s.restore_string("k".into(), bytes::Bytes::from_static(b"v"), false, None));
+        assert_eq!(s.string_restored("k"), Some(true), "a restored copy is flagged");
+
+        // A live overwrite replaces the whole entry, clearing the flag.
+        assert!(s.set_local("k".into(), b"v2".to_vec(), None));
+        assert_eq!(s.string_restored("k"), Some(false), "a live write clears the flag");
     }
 
     #[test]

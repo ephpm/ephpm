@@ -26,34 +26,60 @@
 //! from the **current** alive membership:
 //!
 //! - **Disowned copy** (this node is *not* in the replica set): the pass asks
-//!   the replica set for the key. If a replica holds an equal-or-newer copy it
-//!   **drops** the local string copy — readers then fetch through to the
-//!   authoritative replica. It drops a copy whose own stamp is unknown (a
-//!   snapshot-restored one, #630) as soon as any replica holds the key.
+//!   the replica set for the key and acts only on **proof**. A copy is
+//!   **dropped** only when a reachable replica reports a **real stamp strictly
+//!   newer** than this copy's (ours is superseded; readers then fetch through),
+//!   or — for a snapshot-restored copy of unknown order — when a replica holds
+//!   it with any real stamp (#630). A copy strictly **newer** than every
+//!   replica is instead **pushed** to the replica set to repair the divergence.
+//!   Everything else is **kept**.
 //! - **Owned copy** (this node *is* a replica): the pass asks the other
 //!   replicas and, if one holds a **strictly newer** stamp, **adopts** it
 //!   through [`KvRouter::apply_stamped`] (newest-stamp-wins).
 //!
+//! ## Two invariants behind "drop"
+//!
+//! The naive rule "drop once a replica holds an equal-or-newer copy" is wrong
+//! in two ways this module must avoid:
+//!
+//! - The applied-map stamp of a key not written in the last
+//!   [`APPLIED_HORIZON`](crate::clustered_store::APPLIED_HORIZON) (10 minutes)
+//!   is pruned, so a local copy reads as stamp-`None` and a replica reports
+//!   [`Stamp::ZERO`]. Treating `ZERO` as "equal-or-newer" would drop a
+//!   newer-but-fanout-failed origin copy once any replica merely holds the key.
+//!   So a drop requires a **real** peer stamp, and a stamp-`None` local copy is
+//!   dropped **only** when it is snapshot-restored (its order is genuinely
+//!   unknown); an unrestored stamp-`None` copy is kept.
+//! - A **broadcast** value (written to every node at one shared stamp, outside
+//!   the replica-set model — an ACME certificate above all) would be dropped on
+//!   every non-replica node the moment "equal-or-newer" fired on its identical
+//!   stamp. So a drop requires the replica stamp to be **strictly newer**; an
+//!   equal stamp is the same version, never a supersession. This replaces the
+//!   need to recognise broadcast keys by name.
+//!
 //! # Why it is replication-safe
 //!
-//! The pass never publishes a value outward and never deletes an *owned* copy,
-//! so by construction it can neither **publish a winning stamp over newer
+//! The pass never deletes an *owned* copy, and the one case where it writes
+//! outward (a **push**) lands through the same applied-stamp map every write
+//! uses, so by construction it can neither **publish a winning stamp over newer
 //! data** nor **resurrect a deleted key**:
 //!
 //! - A **drop** only removes a local copy; it emits no gossip and no stamp, so
 //!   it cannot resurrect anything. It happens only when a reachable replica
-//!   confirms an equal-or-newer copy, so it cannot lose the newest data. When
-//!   **no** replica holds the key the copy is **kept** — an orphan (a write
-//!   that never replicated) must not be dropped, and a genuine delete is
-//!   cleaned by the gossip tombstone, not here. A drop re-reads the stamp
-//!   immediately beforehand and skips if it changed, so a write that landed
-//!   locally mid-pass (and already fanned out to the replica set) is never
-//!   dropped from under a reader.
-//! - An **adopt** lands through the same applied-stamp map every write uses
+//!   proves a strictly-newer real copy (or holds a restored copy's key with a
+//!   real stamp), so it cannot lose the newest data. When no replica proves a
+//!   newer copy the copy is **kept** — an orphan (a write that never
+//!   replicated), a horizon-aged copy of unknown order, or a broadcast value
+//!   must not be dropped, and a genuine delete is cleaned by the gossip
+//!   tombstone, not here. A drop re-reads the stamp immediately beforehand and
+//!   skips if it changed, so a write that landed locally mid-pass (and already
+//!   fanned out to the replica set) is never dropped from under a reader.
+//! - A **push** and an **adopt** both land through the same applied-stamp map
+//!   every write uses
 //!   ([`apply_if_newer`](crate::clustered_store::apply_if_newer)), so a stamp
-//!   that is not strictly newer than this node's record — including a delete
+//!   that is not strictly newer than the receiver's record — including a delete
 //!   tombstone's stamp — is acknowledged but not applied. A pass can only ever
-//!   move a copy *forward* to a value a co-replica already holds.
+//!   move a copy *forward* to a value a replica does not yet hold.
 //!
 //! Small (gossip-tier) values are untouched: chitchat already converges them,
 //! and the local-store walk filters to `small_key_threshold + 1` bytes and up,
@@ -97,25 +123,49 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// What [`decide_disowned`] concluded for a local copy this node does not own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disowned {
-    /// Leave the local copy: either no replica could be reached, or the replica
-    /// set holds no equal-or-newer copy (an orphan we must not lose; a genuine
-    /// delete is handled by the gossip tombstone, not here).
+    /// Leave the local copy: nothing proved it superseded. No replica could be
+    /// reached; or no replica reported a **real** stamp (one whose own record
+    /// aged out reports [`Stamp::ZERO`], which orders nothing); or the newest
+    /// real replica stamp is **equal** to ours (the same version — e.g. a
+    /// broadcast value present cluster-wide, Fix 1 / #632); or it is **older**
+    /// (an orphan we must not lose; a genuine delete is cleaned by the gossip
+    /// tombstone, not here).
     Keep,
-    /// Drop the local string copy: the replica set holds an equal-or-newer
-    /// copy, so readers fetch through to it.
+    /// Drop the local string copy: a reachable replica proved a **real stamp
+    /// strictly newer** than ours (or, for a snapshot-restored copy of unknown
+    /// order, any real stamp), so readers fetch through to the newer copy.
     Drop,
+    /// Repair forward: our disowned copy is **strictly newer** than every
+    /// reachable replica's real stamp — a write that never reached the current
+    /// replica set — so push it to the replica set (safe under
+    /// `apply_if_newer`) instead of leaving the cluster divergent (#632).
+    Push,
 }
 
 /// Decide the fate of a **disowned** copy (this node is not a replica) from
 /// what the replica set reported.
 ///
 /// `local` is this node's recorded stamp for the key (`None` when it predates
-/// the applied-map horizon or was restored from a snapshot). `best_held` is the
-/// newest stamp any reachable replica holds (`None` when no replica holds it; a
-/// replica holding it with no recorded stamp contributes [`Stamp::ZERO`]).
-/// `any_reachable` says at least one replica answered.
+/// the applied-map horizon or was restored from a snapshot). `local_restored`
+/// says this node's copy was materialised by a snapshot restore rather than a
+/// live write — the only case in which a copy of unknown order may still defer
+/// to a replica (#630). `best_held` is the newest stamp any reachable replica
+/// holds (`None` when no replica holds it; a replica holding it with no
+/// recorded stamp contributes [`Stamp::ZERO`]). `any_reachable` says at least
+/// one replica answered.
+///
+/// The governing invariant: **drop only a copy a reachable replica proves is
+/// superseded by a real, strictly-newer stamp** (or, for a snapshot-restored
+/// copy whose own order is unknown, any real stamp). A replica's `Stamp::ZERO`
+/// (its stamp aged out of the 10-minute applied-map horizon) proves nothing and
+/// never licenses a drop — otherwise a never-replicated newer origin copy whose
+/// own stamp has aged out would be lost once any replica merely holds the key
+/// (the horizon bug, #632). An **equal** real stamp is the same version, not a
+/// supersession, so it is kept — which is what lets a broadcast/ACME value
+/// (identical stamp on every node) survive on a non-replica node.
 pub(crate) fn decide_disowned(
     local: Option<Stamp>,
+    local_restored: bool,
     best_held: Option<Stamp>,
     any_reachable: bool,
 ) -> Disowned {
@@ -124,19 +174,27 @@ pub(crate) fn decide_disowned(
         // fetch through either — keep what we have.
         return Disowned::Keep;
     }
-    match (local, best_held) {
-        // Unknown local stamp with an authoritative copy present: the replica
-        // set is the source of truth — drop (fixes a snapshot-restored copy
-        // served next to live peers, #630).
-        (None, Some(_)) => Disowned::Drop,
-        // Known stamps: drop only when the replica is at least as new.
-        (Some(ls), Some(r)) if r >= ls => Disowned::Drop,
-        // No replica holds the key — an orphan (a write that never replicated)
-        // or a delete still propagating: dropping an orphan would lose the only
-        // copy, and a real delete is cleaned by the gossip tombstone, not here.
-        // Or the replica's copy is older than ours (orphan-ish): keep either
-        // way.
-        (_, None) | (Some(_), Some(_)) => Disowned::Keep,
+    // Only a REAL stamp orders anything. A replica that holds the key with no
+    // recorded stamp (its own applied record aged past the horizon) reports
+    // Stamp::ZERO; that is "I have a copy of unknown age", not "mine is newer".
+    let real = best_held.filter(|s| *s != Stamp::ZERO);
+    match (local, real) {
+        // Our copy is strictly newer than every replica's proven copy: a write
+        // that never reached the current replica set. Repair the replicas
+        // forward rather than leave them serving the older value (Fix 3).
+        (Some(ls), Some(r)) if ls > r => Disowned::Push,
+        // A replica proved a strictly-newer copy: ours is superseded, drop it.
+        (Some(ls), Some(r)) if r > ls => Disowned::Drop,
+        // Unknown local order: a snapshot-restored copy defers to a replica
+        // holding a real stamp (#630). A copy whose stamp merely aged out of
+        // the horizon is NOT restored and must be kept — it could be a
+        // fanout-failed newer write (the horizon bug, #632).
+        (None, Some(_)) if local_restored => Disowned::Drop,
+        // Everything else — equal real stamps (same version, e.g. a broadcast
+        // value, Fix 1), an older/absent replica copy (orphan or propagating
+        // delete), or an unknown-order copy with no real replica stamp — cannot
+        // be proved superseded: keep it.
+        _ => Disowned::Keep,
     }
 }
 
@@ -158,6 +216,10 @@ enum KeyOutcome {
     Dropped,
     /// An owned copy adopted a newer co-replica value.
     Refreshed,
+    /// A disowned copy strictly newer than the replica set was pushed to it to
+    /// repair the divergence (local copy kept for now; a later pass drops it
+    /// once the replicas report the pushed stamp).
+    Repaired,
     /// Nothing to do, or deliberately kept (orphan / local newest).
     Kept,
     /// No replica (or co-replica) could be reached for this key.
@@ -186,7 +248,10 @@ impl ReconcileReport {
         match outcome {
             KeyOutcome::Dropped => self.dropped += 1,
             KeyOutcome::Refreshed => self.refreshed += 1,
-            KeyOutcome::Kept | KeyOutcome::Gone => self.kept += 1,
+            // A repair leaves the local copy in place and only pushes outward,
+            // so it is tallied with the "kept" copies — it is not a drop or a
+            // local refresh.
+            KeyOutcome::Repaired | KeyOutcome::Kept | KeyOutcome::Gone => self.kept += 1,
             KeyOutcome::Unreachable => self.unreachable += 1,
         }
     }
@@ -362,11 +427,12 @@ impl AntiEntropy {
         let replicas = replica_nodes_for(alive, hash_key(&transport), self.factor);
         let self_is_replica = replicas.iter().any(|n| n.id == self.self_id);
 
-        // The stamp this node currently records for the key, paired with "the
-        // key still exists locally" under the applied-map slot. `None` => the
-        // key is gone (reaped, deleted, overwritten small), nothing to do.
-        let Some(((), local_stamp)) =
-            self.router.read_stamped(&transport, || store.exists(key).then_some(()))
+        // The stamp this node currently records for the key, paired — under the
+        // applied-map slot, so the pair is consistent — with whether the local
+        // copy is snapshot-restored. `None` => the key is gone (reaped,
+        // deleted, overwritten small), nothing to do.
+        let Some((local_restored, local_stamp)) =
+            self.router.read_stamped(&transport, || store.string_restored(key))
         else {
             return KeyOutcome::Gone;
         };
@@ -374,7 +440,7 @@ impl AntiEntropy {
         if self_is_replica {
             self.refresh_owned(&replicas, &transport, local_stamp).await
         } else {
-            self.drop_disowned(&replicas, &transport, store, key, local_stamp).await
+            self.drop_disowned(&replicas, &transport, store, key, local_restored, local_stamp).await
         }
     }
 
@@ -410,22 +476,29 @@ impl AntiEntropy {
             let (stamp, value, ttl_ms) = best.expect("should_adopt is false when best is None");
             // Lands through the applied map: newest-stamp-wins, so a newer
             // local write (or a delete tombstone's stamp) that arrived mid-pass
-            // is never regressed.
-            if self.router.apply_stamped(transport, value, ttl_ms, stamp).is_some() {
+            // is never regressed. Count a refresh ONLY when the value was
+            // genuinely written: `apply_stamped_wrote` answers `Some(true)` for
+            // a real write, but `Some(false)` when the write was ordered out as
+            // stale (a newer stamp landed between the probe and here) or the
+            // store declined it — neither moved this copy forward.
+            if self.router.apply_stamped_wrote(transport, value, ttl_ms, stamp) == Some(true) {
                 return KeyOutcome::Refreshed;
             }
         }
         if any_reachable { KeyOutcome::Kept } else { KeyOutcome::Unreachable }
     }
 
-    /// Disowned-copy path: drop the local copy once the replica set confirms an
-    /// equal-or-newer copy.
+    /// Disowned-copy path: drop the local copy only when a reachable replica
+    /// proves a strictly-newer real copy (or, for a snapshot-restored copy, any
+    /// real stamp); push it to the replica set when it is strictly newer than
+    /// them (Fix 3); otherwise keep it.
     async fn drop_disowned(
         &self,
         replicas: &[NodeInfo],
         transport: &str,
         store: &Arc<Store>,
         key: &str,
+        local_restored: bool,
         local_stamp: Option<Stamp>,
     ) -> KeyOutcome {
         let mut best_held: Option<Stamp> = None;
@@ -443,7 +516,7 @@ impl AntiEntropy {
             }
         }
 
-        match decide_disowned(local_stamp, best_held, any_reachable) {
+        match decide_disowned(local_stamp, local_restored, best_held, any_reachable) {
             Disowned::Drop => {
                 // Re-check under the applied slot: a write that landed locally
                 // since we read the stamp (which also fanned out to the replica
@@ -458,8 +531,53 @@ impl AntiEntropy {
                     KeyOutcome::Kept
                 }
             }
+            Disowned::Push => self.push_to_replicas(replicas, transport, store, key).await,
             Disowned::Keep if any_reachable => KeyOutcome::Kept,
             Disowned::Keep => KeyOutcome::Unreachable,
+        }
+    }
+
+    /// Repair a divergent replica set: this disowned copy is strictly newer
+    /// than every replica holds, so push it to them. Safe because every peer
+    /// lands it through `apply_if_newer` (it loses to anything newer already
+    /// there); the local copy is left in place and a later pass drops it once
+    /// the replicas report the pushed stamp. Value and stamp are read as one
+    /// consistent pair, so a write that lands mid-pass is never shipped under a
+    /// stale stamp.
+    async fn push_to_replicas(
+        &self,
+        replicas: &[NodeInfo],
+        transport: &str,
+        store: &Arc<Store>,
+        key: &str,
+    ) -> KeyOutcome {
+        let Some(((value, ttl), Some(stamp))) =
+            self.router.read_stamped(transport, || store.get_with_ttl(key))
+        else {
+            // The key vanished or lost its stamp since the decision — nothing
+            // safe to push.
+            return KeyOutcome::Kept;
+        };
+        let mut pushed = false;
+        for node in replicas.iter().filter(|n| n.id != self.self_id) {
+            let Some(addr) = node_data_addr(node, self.data_port) else { continue };
+            if self
+                .client
+                .store_stamped(addr, transport, value.as_ref(), ttl, stamp)
+                .await
+                .unwrap_or(false)
+            {
+                pushed = true;
+            }
+        }
+        if pushed {
+            tracing::debug!(
+                key = transport,
+                "anti-entropy pushed a strictly-newer disowned copy to its replica set"
+            );
+            KeyOutcome::Repaired
+        } else {
+            KeyOutcome::Kept
         }
     }
 
@@ -517,31 +635,73 @@ mod tests {
 
     #[test]
     fn disowned_kept_when_no_replica_reachable() {
-        assert_eq!(decide_disowned(Some(at(10, "a")), Some(at(10, "a")), false), Disowned::Keep);
-        assert_eq!(decide_disowned(None, None, false), Disowned::Keep);
+        assert_eq!(
+            decide_disowned(Some(at(10, "a")), false, Some(at(10, "a")), false),
+            Disowned::Keep
+        );
+        assert_eq!(decide_disowned(None, true, None, false), Disowned::Keep);
     }
 
     #[test]
     fn disowned_kept_when_no_replica_holds_the_key() {
         // Orphan (never replicated) or a delete still propagating: do not drop.
-        assert_eq!(decide_disowned(Some(at(10, "a")), None, true), Disowned::Keep);
-        assert_eq!(decide_disowned(None, None, true), Disowned::Keep);
+        assert_eq!(decide_disowned(Some(at(10, "a")), false, None, true), Disowned::Keep);
+        assert_eq!(decide_disowned(None, true, None, true), Disowned::Keep);
     }
 
     #[test]
-    fn disowned_dropped_when_local_stamp_unknown_and_a_replica_holds_it() {
-        // The snapshot-restored case (#630): no local stamp, replica is truth.
-        assert_eq!(decide_disowned(None, Some(at(1, "a")), true), Disowned::Drop);
-        assert_eq!(decide_disowned(None, Some(Stamp::ZERO), true), Disowned::Drop);
+    fn disowned_dropped_only_for_a_restored_copy_a_replica_holds_with_a_real_stamp() {
+        // The snapshot-restored case (#630): no local stamp, replica is truth —
+        // but only with a REAL stamp, and only because the copy is restored.
+        assert_eq!(decide_disowned(None, true, Some(at(1, "a")), true), Disowned::Drop);
+        // A real replica stamp is required: ZERO (the replica's own stamp aged
+        // out of the horizon) proves nothing, even for a restored copy.
+        assert_eq!(decide_disowned(None, true, Some(Stamp::ZERO), true), Disowned::Keep);
     }
 
     #[test]
-    fn disowned_dropped_only_when_replica_is_at_least_as_new() {
-        assert_eq!(decide_disowned(Some(at(10, "a")), Some(at(20, "b")), true), Disowned::Drop);
-        assert_eq!(decide_disowned(Some(at(10, "a")), Some(at(10, "a")), true), Disowned::Drop);
-        // Our disowned copy is newer than the replica's — an orphan-ish case we
-        // must not lose by dropping.
-        assert_eq!(decide_disowned(Some(at(20, "a")), Some(at(10, "b")), true), Disowned::Keep);
+    fn disowned_horizon_aged_copy_is_kept_not_dropped() {
+        // Fix 2 / #632: a local copy whose stamp aged out of the applied-map
+        // horizon (local None) that is NOT snapshot-restored could be a
+        // never-replicated newer write. It must be kept even when a replica
+        // holds the key with a real stamp — the "+10min fanout-failed" case.
+        assert_eq!(decide_disowned(None, false, Some(at(5, "b")), true), Disowned::Keep);
+        assert_eq!(decide_disowned(None, false, Some(Stamp::ZERO), true), Disowned::Keep);
+    }
+
+    #[test]
+    fn disowned_dropped_only_when_replica_is_strictly_newer_real() {
+        assert_eq!(
+            decide_disowned(Some(at(10, "a")), false, Some(at(20, "b")), true),
+            Disowned::Drop
+        );
+        // Fix 1 / #632: an EQUAL real stamp is the same version (e.g. a
+        // broadcast value present cluster-wide) and must be kept, not dropped.
+        assert_eq!(
+            decide_disowned(Some(at(10, "a")), false, Some(at(10, "a")), true),
+            Disowned::Keep
+        );
+        // A replica whose stamp aged out (ZERO) proves nothing: keep.
+        assert_eq!(
+            decide_disowned(Some(at(10, "a")), false, Some(Stamp::ZERO), true),
+            Disowned::Keep
+        );
+    }
+
+    #[test]
+    fn disowned_strictly_newer_than_the_replica_set_is_pushed() {
+        // Fix 3 / #632: our disowned copy is strictly newer than the replica's
+        // real stamp — a never-replicated newer write. Repair the replicas.
+        assert_eq!(
+            decide_disowned(Some(at(20, "a")), false, Some(at(10, "b")), true),
+            Disowned::Push
+        );
+        // ...but only when the replica's newer-or-older stamp is real; ZERO
+        // cannot be ordered against, so keep.
+        assert_eq!(
+            decide_disowned(Some(at(20, "a")), false, Some(Stamp::ZERO), true),
+            Disowned::Keep
+        );
     }
 
     #[test]
@@ -742,5 +902,89 @@ mod tests {
             Some(large_value(9).as_slice()),
             "the newest local value is untouched"
         );
+    }
+
+    /// Fix 1 / #632: a broadcast value is written to **every** node (outside
+    /// the replica-set model, for cluster-wide state such as an ACME
+    /// certificate) at **one shared stamp**. The old "equal-or-newer → drop"
+    /// rule dropped it on every non-replica node, so the cert vanished. A copy
+    /// a replica holds at the **same** stamp is the same version and must
+    /// survive a reconcile pass.
+    #[tokio::test]
+    async fn broadcast_copy_survives_reconcile_on_a_non_replica() {
+        let clock = StampClock::new("origin");
+        let shared = clock.next();
+
+        // The replica (owner) holds the broadcast value at the shared stamp.
+        let peer_store = Store::new(StoreConfig::default());
+        let peer_router =
+            KvRouter::global(Arc::clone(&peer_store)).with_applied(new_applied_write_map());
+        assert!(peer_router.apply_stamped("big", large_value(7), 0, shared).unwrap());
+        let peer_addr = spawn_peer(peer_router).await;
+
+        // This (non-replica) node holds the SAME value at the SAME stamp — what
+        // a broadcast leaves behind on a node outside the replica set.
+        let local_store = Store::new(StoreConfig::default());
+        let local_router =
+            KvRouter::global(Arc::clone(&local_store)).with_applied(new_applied_write_map());
+        assert!(local_router.apply_stamped("big", large_value(7), 0, shared).unwrap());
+        assert!(local_store.exists("big"));
+
+        let mut ring = vec![node_placeholder("n1"), node_placeholder("n2")];
+        ring.sort_by(|a, b| a.id.cmp(&b.id));
+        let owner_id = replica_nodes_for(&ring, hash_key("big"), 1)[0].id.clone();
+        let self_id = if owner_id == "n1" { "n2" } else { "n1" };
+        let mut alive = vec![node_at(&owner_id, peer_addr), node_placeholder(self_id)];
+        alive.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let ae = test_reconciler(self_id, local_router, peer_addr.port());
+        let outcome = ae.reconcile_key(&alive, "", &local_store, "big").await;
+        assert_eq!(outcome, KeyOutcome::Kept, "an equal-stamp (broadcast) copy is never dropped");
+        assert!(local_store.exists("big"), "the broadcast copy survived the pass");
+    }
+
+    /// Fix 3 / #632: a disowned copy strictly newer than the replica set — a
+    /// write that never fanned out — is pushed to the replicas to repair the
+    /// divergence rather than left with the cluster serving the older value.
+    #[tokio::test]
+    async fn disowned_copy_strictly_newer_than_replica_is_pushed() {
+        let clock = StampClock::new("origin");
+        let older = clock.next();
+        let newer = clock.next();
+
+        // The replica (owner) holds only the OLDER value.
+        let peer_store = Store::new(StoreConfig::default());
+        let peer_applied = new_applied_write_map();
+        let peer_router =
+            KvRouter::global(Arc::clone(&peer_store)).with_applied(Arc::clone(&peer_applied));
+        assert!(peer_router.apply_stamped("big", large_value(1), 0, older).unwrap());
+        let peer_addr = spawn_peer(peer_router).await;
+
+        // This (non-replica) node holds the NEWER value whose fan-out failed.
+        let local_store = Store::new(StoreConfig::default());
+        let local_router =
+            KvRouter::global(Arc::clone(&local_store)).with_applied(new_applied_write_map());
+        assert!(local_router.apply_stamped("big", large_value(2), 0, newer).unwrap());
+
+        let mut ring = vec![node_placeholder("n1"), node_placeholder("n2")];
+        ring.sort_by(|a, b| a.id.cmp(&b.id));
+        let owner_id = replica_nodes_for(&ring, hash_key("big"), 1)[0].id.clone();
+        let self_id = if owner_id == "n1" { "n2" } else { "n1" };
+        let mut alive = vec![node_at(&owner_id, peer_addr), node_placeholder(self_id)];
+        alive.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let ae = test_reconciler(self_id, local_router, peer_addr.port());
+        let outcome = ae.reconcile_key(&alive, "", &local_store, "big").await;
+        assert_eq!(outcome, KeyOutcome::Repaired);
+        // The replica now holds the newer value and its stamp.
+        assert_eq!(
+            peer_store.get("big").as_deref(),
+            Some(large_value(2).as_slice()),
+            "the replica adopted the pushed strictly-newer copy"
+        );
+        assert_eq!(*peer_applied.get("big").unwrap(), newer, "and its stamp");
+        // The local copy is left in place; a later pass drops it once the
+        // replica reports the pushed stamp.
+        assert!(local_store.exists("big"), "the local copy is kept after a repair push");
     }
 }

@@ -6327,6 +6327,21 @@ impl Config {
             )));
         }
 
+        // [cluster.kv] anti_entropy_interval_secs: `0` disables anti-entropy;
+        // any other value is the gap between full large-tier reconcile scans.
+        // A sub-floor value (e.g. `1`) runs back-to-back scans that walk every
+        // large value and probe its replica set each time, so it is refused —
+        // fail closed like the other mode knobs, rather than silently pinning a
+        // node to a reconcile hot loop.
+        let interval = self.cluster.kv.anti_entropy_interval_secs;
+        if interval != 0 && interval < MIN_ANTI_ENTROPY_INTERVAL_SECS {
+            return Err(ConfigError::Validation(format!(
+                "[cluster.kv] anti_entropy_interval_secs must be 0 (disabled) or at least {} \
+                 seconds, got {}",
+                MIN_ANTI_ENTROPY_INTERVAL_SECS, interval,
+            )));
+        }
+
         // [db.sqlite.replication] role selects the database *mode*
         // (`is_clustered_sqlite` in ephpm-server matches the exact strings
         // "primary" / "replica" / "auto"); anything else used to mean
@@ -7900,14 +7915,30 @@ pub struct ClusterKvConfig {
     /// a superseded value until a gossip delete marker arrives — seconds on a
     /// long-running node, minutes on a freshly restarted one.
     ///
-    /// Each pass walks this node's local large values and, for every one:
-    /// drops a copy this node no longer owns once the authoritative replica
-    /// set confirms an equal-or-newer copy (readers then fetch through), and
-    /// refreshes a copy this node *does* own from a co-replica that holds a
-    /// strictly newer stamp (newest-stamp-wins). It never deletes an owned
-    /// copy and never pushes a value outward, so it can neither resurrect a
-    /// deleted key nor publish a winning stamp over newer data. Small
+    /// Each pass walks this node's local large values and, for every one,
+    /// acts only on proof. A copy this node no longer owns is **dropped** only
+    /// when a reachable replica reports a *real* stamp strictly newer than it
+    /// (readers then fetch through), or — for a snapshot-restored copy of
+    /// unknown order — when a replica holds it with any real stamp; a copy
+    /// strictly newer than the replica set is **pushed** to it to repair the
+    /// divergence. A copy this node *does* own is **refreshed** from a
+    /// co-replica holding a strictly newer stamp (newest-stamp-wins). Small
     /// (gossip-tier) values are unaffected — chitchat already converges them.
+    ///
+    /// # Interaction with the applied-map horizon
+    ///
+    /// Ordering stamps are pruned after `APPLIED_HORIZON` (10 minutes), so a
+    /// large value not written in that window has no local stamp and a replica
+    /// reports it with none. Anti-entropy treats an absent/zero stamp as "cannot
+    /// order" and **keeps** the copy — it never drops a copy it cannot prove is
+    /// superseded by a real newer stamp (nor a broadcast value, which carries
+    /// the same stamp on every node). The practical effect is that anti-entropy
+    /// reclaims copies that drifted within the last ~10 minutes; older stale
+    /// copies are left for the gossip delete marker, never dropped on a guess.
+    ///
+    /// `0` disables the pass. A non-zero value must be at least
+    /// [`MIN_ANTI_ENTROPY_INTERVAL_SECS`] seconds (a smaller interval would run
+    /// back-to-back full scans); [`Config::validate`] rejects anything between.
     ///
     /// Default: `300` (5 minutes).
     #[serde(default = "default_anti_entropy_interval_secs")]
@@ -8535,6 +8566,11 @@ fn default_kv_data_port() -> u16 {
 fn default_anti_entropy_interval_secs() -> u64 {
     300
 }
+
+/// Floor for a non-zero `[cluster.kv] anti_entropy_interval_secs`. Below this a
+/// node would run back-to-back full large-tier reconcile scans; `0` (disabled)
+/// is still accepted. Enforced in [`Config::validate`].
+pub const MIN_ANTI_ENTROPY_INTERVAL_SECS: u64 = 10;
 
 fn default_listen() -> String {
     "0.0.0.0:8080".to_string()
@@ -12703,6 +12739,27 @@ eviction_policy = "lru"
             msg.contains("\"synch\"") && msg.contains("async") && msg.contains("sync"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn test_anti_entropy_interval_floor() {
+        // `0` (disabled) and any value at or above the floor validate.
+        for secs in [0, MIN_ANTI_ENTROPY_INTERVAL_SECS, 300] {
+            validate_toml(&format!("[cluster.kv]\nanti_entropy_interval_secs = {secs}\n"))
+                .unwrap_or_else(|e| panic!("{secs}s must validate, got: {e}"));
+        }
+        // A non-zero sub-floor value is refused, naming the value and the floor.
+        for bad in [1, MIN_ANTI_ENTROPY_INTERVAL_SECS - 1] {
+            let err = validate_toml(&format!("[cluster.kv]\nanti_entropy_interval_secs = {bad}\n"))
+                .expect_err("a sub-floor interval must fail startup");
+            let msg = err.to_string();
+            assert!(msg.contains("anti_entropy_interval_secs"), "{msg}");
+            assert!(msg.contains(&bad.to_string()), "must name the bad value: {msg}");
+            assert!(
+                msg.contains(&MIN_ANTI_ENTROPY_INTERVAL_SECS.to_string()),
+                "must name floor: {msg}"
+            );
+        }
     }
 
     #[test]

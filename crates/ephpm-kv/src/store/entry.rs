@@ -38,6 +38,16 @@ pub struct Entry {
     pub data: Bytes,
     /// `true` if `data` is compressed; `false` if raw.
     pub compressed: bool,
+    /// `true` if this entry was materialised by a warm-restart snapshot
+    /// restore (`Store::restore_string`) rather than a live write. The
+    /// large-tier anti-entropy reconciler uses
+    /// it to tell a snapshot-restored copy (whose own write order is unknown)
+    /// from a copy whose stamp merely aged out of the applied-map horizon: the
+    /// former may defer to a replica holding a real stamp (#630), the latter
+    /// must not (it could be a never-replicated newer write). Packs into the
+    /// padding beside `compressed`, so it costs no extra bytes per entry. A
+    /// live overwrite replaces the whole entry and so clears the flag.
+    pub restored: bool,
     /// Absolute expiry time, or `None` for persistent keys.
     pub expires_at: Option<Instant>,
     /// Last access time for LRU eviction, as nanoseconds since the
@@ -60,6 +70,7 @@ impl Entry {
         Self {
             data,
             compressed,
+            restored: false,
             expires_at: None,
             last_accessed: AtomicU64::new(now_nanos),
             mem_size,
@@ -80,6 +91,7 @@ impl Entry {
         Self {
             data,
             compressed,
+            restored: false,
             expires_at: Some(expires_at),
             last_accessed: AtomicU64::new(now_nanos),
             mem_size,
