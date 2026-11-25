@@ -491,7 +491,7 @@ Replication modes (`[cluster.kv] replication_mode`):
 
 Read path: reads try the primary owner first, then fall back to the other replicas in ring order until one returns the value. A large value therefore survives up to `replication_factor - 1` node failures.
 
-> **Membership caveat:** *forward placement* is write-time only — there is no active forward rebalancing, so a node that was down during a write, or that newly owns a key after a membership change, does not receive the key until it is rewritten or fetched-through. A periodic large-tier **anti-entropy** pass (`[cluster.kv] anti_entropy_interval_secs`, default 5 min; `0` disables) does reconcile each node's *own* large copies against the current replica set — dropping copies it no longer owns once a replica confirms an equal-or-newer copy, and refreshing owned copies from a co-replica with a strictly newer stamp (newest-stamp-wins) — so origin and ex-replica copies no longer serve a stale value until a gossip marker arrives (#632). It only converges this node's copies; it never pushes data to a cold new owner.
+> **Membership caveat:** *forward placement* is write-time only — there is no active forward rebalancing, so a node that was down during a write, or that newly owns a key after a membership change, does not receive the key until it is rewritten or fetched-through. A periodic large-tier **anti-entropy** pass (`[cluster.kv] anti_entropy_interval_secs`, default 5 min; `0` disables) does reconcile each node's *own* large copies against the current replica set — dropping a copy it no longer owns only when a reachable replica proves a strictly-newer real stamp (an equal, absent, or horizon-pruned stamp is kept), refreshing owned copies from a co-replica with a strictly newer stamp (newest-stamp-wins), and pushing a disowned copy that is itself strictly newer than the replica set forward to repair the divergence — so origin and ex-replica copies no longer serve a stale value until a gossip marker arrives (#632). It only converges this node's copies; apart from that repair push it does no active forward rebalancing onto a cold new owner.
 
 For sessions and cache data, async replication is the right default. PHP apps doing `$_SESSION['cart'] = ...` on one request and reading it on the next hit the same owner (ownership is a deterministic function of the session id and the current membership), so within a stable cluster they get read-your-writes for free.
 
@@ -503,7 +503,7 @@ replication_mode = "async"    # async (default) or sync
 
 ### 5. Node Join / Leave / Failure
 
-Because ownership is `hash % alive_nodes` and forward placement is write-time only (no active forward rebalancing; the anti-entropy pass only drops or refreshes a node's *own* copies, never pushes to a new owner), membership changes remap ownership but do **not** move existing data onto its new owners:
+Because ownership is `hash % alive_nodes` and forward placement is write-time only (no active forward rebalancing; the anti-entropy pass reconciles a node's *own* copies — dropping or refreshing them, and pushing one forward only to repair a replica set that holds a strictly-older copy), membership changes remap ownership but do **not** systematically move existing data onto its new owners:
 
 | Event | What happens |
 |-------|-------------|

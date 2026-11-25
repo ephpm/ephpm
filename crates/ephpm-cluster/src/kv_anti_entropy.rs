@@ -100,8 +100,9 @@ use crate::kv_handoff::transport_key;
 use crate::node::{ClusterHandle, NodeInfo, NodeState};
 use crate::secure_transport::ClusterCipher;
 
-/// Counter: disowned large-tier copies dropped because the replica set holds
-/// an equal-or-newer copy.
+/// Counter: disowned large-tier copies dropped because a reachable replica
+/// proved a strictly-newer real stamp (or, for a snapshot-restored copy, holds
+/// it with a real stamp).
 pub const METRIC_DROPPED: &str = "ephpm_kv_anti_entropy_dropped_total";
 
 /// Counter: owned large-tier copies refreshed from a co-replica holding a
@@ -217,8 +218,11 @@ enum KeyOutcome {
     /// An owned copy adopted a newer co-replica value.
     Refreshed,
     /// A disowned copy strictly newer than the replica set was pushed to it to
-    /// repair the divergence (local copy kept for now; a later pass drops it
-    /// once the replicas report the pushed stamp).
+    /// repair the divergence. The local copy is kept: once the replicas hold
+    /// our stamp it is equal to theirs, and an equal stamp is never dropped
+    /// (the broadcast-safety rule), so the redundant copy is reclaimed only
+    /// when a newer write or a gossip delete supersedes it — fetch-through
+    /// serves the replica set meanwhile.
     Repaired,
     /// Nothing to do, or deliberately kept (orphan / local newest).
     Kept,
@@ -540,8 +544,10 @@ impl AntiEntropy {
     /// Repair a divergent replica set: this disowned copy is strictly newer
     /// than every replica holds, so push it to them. Safe because every peer
     /// lands it through `apply_if_newer` (it loses to anything newer already
-    /// there); the local copy is left in place and a later pass drops it once
-    /// the replicas report the pushed stamp. Value and stamp are read as one
+    /// there); the local copy is left in place — once the replicas hold our
+    /// stamp it is equal to theirs, which anti-entropy keeps (an equal stamp is
+    /// never a supersession), so the redundant copy stays until a newer write
+    /// or a gossip delete supersedes it. Value and stamp are read as one
     /// consistent pair, so a write that lands mid-pass is never shipped under a
     /// stale stamp.
     async fn push_to_replicas(
@@ -983,8 +989,8 @@ mod tests {
             "the replica adopted the pushed strictly-newer copy"
         );
         assert_eq!(*peer_applied.get("big").unwrap(), newer, "and its stamp");
-        // The local copy is left in place; a later pass drops it once the
-        // replica reports the pushed stamp.
+        // The local copy is left in place: it now equals the replica set's
+        // stamp, and an equal copy is never dropped (broadcast-safety).
         assert!(local_store.exists("big"), "the local copy is kept after a repair push");
     }
 }
