@@ -565,11 +565,16 @@ fn set_no_new_privs() -> anyhow::Result<()> {
 
 /// Clear `PR_SET_DUMPABLE` so the kernel marks the process non-dumpable.
 ///
-/// This re-owns `/proc/self/{mem,environ,maps,cmdline,…}` to `root:root` mode
-/// `0400`, so any read of them from *within* this process fails with `EACCES`
-/// — even for the process's own (dropped or undropped) uid, and even when no
-/// uid drop happened at all. It also disables core dumps and `ptrace`-attach by
-/// the same uid. Used by [`confine_php_tenant`] as a defence beyond Landlock:
+/// This makes the kernel gate the memory-bearing `/proc/self` entries —
+/// `/proc/self/mem` and `/proc/self/environ` specifically — on
+/// `ptrace`-may-access rather than plain file permissions, so a read of them from
+/// *within* this process fails with `EACCES`, even for the process's own (dropped
+/// or undropped) uid and even when no uid drop happened at all. (The
+/// address-layout entries — `/proc/self/maps`, `cmdline`, `status` — stay
+/// self-readable, as the kernel always lets a task inspect its own layout; they
+/// carry no secret bytes, only addresses.) It also disables core dumps and
+/// `ptrace`-attach by the same uid. Used by [`confine_php_tenant`] as a defence
+/// beyond Landlock:
 /// that tier confines PHP **in-process**, sharing its address space and
 /// environment with the config this binary already parsed ([`[kv] secret`],
 /// `[cluster] secret`, `[db.wire_auth] password`, `[db.mysql] url`), so a tenant
@@ -633,9 +638,10 @@ fn set_one_rlimit(name: &str, resource: libc::__rlimit_resource_t, value: u64) {
 /// tenant, in place, before PHP starts — the PHP counterpart of [`run`]'s
 /// binary sandbox (hardening F5).
 ///
-/// Applies, in order: `PR_SET_DUMPABLE = 0` (so `/proc/self/{mem,environ,maps}`
-/// become root-owned `0400` and this in-process tier cannot leak the parsed
-/// Config secrets — see [`set_not_dumpable`]), the tenant's private-state-root
+/// Applies, in order: `PR_SET_DUMPABLE = 0` (so `/proc/self/{mem,environ}`
+/// become `EACCES` to this process and this in-process tier cannot leak the
+/// parsed Config secrets — see [`set_not_dumpable`]), the tenant's
+/// private-state-root
 /// preparation and an irreversible uid/gid drop (both only when started as
 /// root), `no_new_privs`, per-site Landlock, and `RLIMIT_CPU` (from `cpu_secs`).
 /// It deliberately does
@@ -699,12 +705,14 @@ pub fn confine_php_tenant(
     // the cron child shares its address space and environment with the Config
     // this binary parsed (the `[kv]`/`[cluster]` secrets, the wire-auth password,
     // the `[db.mysql]` URL). Without this, a tenant cron script could read
-    // `/proc/self/mem` (or `environ`/`maps`) and recover every tenant's derived
-    // DB/KV password. `PR_SET_DUMPABLE = 0` re-owns those files to `root:root`
-    // 0400, so the read fails with EACCES whether or not a uid drop or the
-    // Landlock `/proc/self` grant is in effect — a defence that does not depend
-    // on the shared Landlock ruleset. Legitimate cron PHP never reads its own
-    // `/proc/self/mem`, so this is transparent to a well-behaved job.
+    // `/proc/self/mem` or `/proc/self/environ` and recover every tenant's derived
+    // DB/KV password. `PR_SET_DUMPABLE = 0` makes the kernel gate exactly those
+    // two memory-bearing entries on ptrace-may-access, so the read fails with
+    // EACCES whether or not a uid drop or the Landlock `/proc/self` grant is in
+    // effect — a defence that does not depend on the shared Landlock ruleset.
+    // (`/proc/self/maps` stays self-readable but exposes only addresses, no
+    // secret bytes.) Legitimate cron PHP never reads its own `/proc/self/mem`, so
+    // this is transparent to a well-behaved job.
     if let Err(e) = set_not_dumpable() {
         tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: PR_SET_DUMPABLE unavailable (continuing; /proc/self/mem may be self-readable)");
     }
@@ -1062,8 +1070,8 @@ mod tests {
         (uid, gid)
     }
 
-    /// H1 — `set_not_dumpable` clears `PR_SET_DUMPABLE`, which is what re-owns
-    /// `/proc/self/{mem,environ,maps}` to `root:root` 0400 so a tenant cron child
+    /// H1 — `set_not_dumpable` clears `PR_SET_DUMPABLE`, which is what makes
+    /// `/proc/self/{mem,environ}` `EACCES` to this process so a tenant cron child
     /// cannot read the parsed Config secrets out of the shared process image.
     /// Runs in its own process so the non-dumpable flag never leaks into the
     /// other tests in this binary (it would disable their core dumps / ptrace).

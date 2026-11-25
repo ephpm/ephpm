@@ -1783,6 +1783,24 @@ fn resolve_operator_job_applies_default_timezone_and_per_job_override() {
     assert_eq!(r.cpu_cores, None, "cpu_max = 0 opts this job out");
 }
 
+/// F5/M5 — the operator's `[php] memory_limit_max` clamps the cron ceiling in
+/// the parent: cron can lower it but never raise it, and an operator cap applies
+/// even to an unbounded cron default. This is the clamp the environment-scrubbed
+/// cron child cannot do for an env-var-set cap.
+#[test]
+fn operator_memory_ceiling_clamps_the_cron_default() {
+    use super::clamp_memory_to_operator_ceiling as clamp;
+    // Cron default (512M) above a 256M operator cap ⇒ capped at 256M.
+    assert_eq!(clamp(Some(512 * 1024 * 1024), Some(256 * 1024 * 1024)), Some(256 * 1024 * 1024));
+    // Cron asks tighter (128M) than the 256M cap ⇒ cron wins.
+    assert_eq!(clamp(Some(128 * 1024 * 1024), Some(256 * 1024 * 1024)), Some(128 * 1024 * 1024));
+    // No operator cap ⇒ the cron ceiling stands as-is (including unbounded).
+    assert_eq!(clamp(Some(512 * 1024 * 1024), None), Some(512 * 1024 * 1024));
+    assert_eq!(clamp(None, None), None);
+    // Unbounded cron default with an operator cap ⇒ the cap becomes the ceiling.
+    assert_eq!(clamp(None, Some(256 * 1024 * 1024)), Some(256 * 1024 * 1024));
+}
+
 // ── metrics presence ────────────────────────────────────────────────────────
 
 /// Every `reason` label is emitted by a real path at least once — `overlap`,

@@ -333,6 +333,19 @@ impl CronScheduler {
             derived_mem,
         )
         .unwrap_or(derived_mem);
+        // Honor the operator's `[php] memory_limit_max` as a hard ceiling on the
+        // cron child's memory, however it was set (M5). The clamp must happen in
+        // the parent: F1 scrubs the child's environment, so a cap set via
+        // `EPHPM_PHP__MEMORY_LIMIT_MAX` is invisible to the child's `Config::load`
+        // and its child-side clamp (`resolve_tenant_memory_ceiling`) would miss
+        // it — the child would run at the `budget/max_concurrent` default instead.
+        // The parent holds the full resolved Config here, so clamp the value that
+        // becomes `--memory-max` now. Cron may lower the ceiling but never raise
+        // it.
+        let section_memory_bytes = clamp_memory_to_operator_ceiling(
+            section_memory_bytes,
+            config.php.memory_limit_ceiling_bytes(),
+        );
         let section_cpu_cores =
             ephpm_config::parse_cron_cpu_limit("[cron] cpu_max", cron.cpu_max, derived_cpu)
                 .unwrap_or(derived_cpu);
@@ -778,6 +791,25 @@ enum FireOutcome {
     LeaseHeld,
     /// Skipped: the lease owner was unreachable (fail-closed).
     LeaseUnavailable,
+}
+
+/// Clamp a cron memory ceiling to the operator's `[php] memory_limit_max`.
+///
+/// `section` is the resolved cron ceiling (`None` ⇒ no cron ceiling); `operator`
+/// is [`PhpConfig::memory_limit_ceiling_bytes`] (`None` ⇒ unset or `-1`). The
+/// result is the tighter of the two: an operator cap always applies — even to an
+/// otherwise-unbounded cron default — while cron can lower it further but never
+/// raise it. With no operator cap the cron value stands unchanged.
+///
+/// This runs in the scheduler's parent process so an operator cap set via
+/// `EPHPM_PHP__MEMORY_LIMIT_MAX` (which the environment-scrubbed cron child never
+/// sees) is still honored.
+fn clamp_memory_to_operator_ceiling(section: Option<u64>, operator: Option<u64>) -> Option<u64> {
+    match (section, operator) {
+        (Some(s), Some(o)) => Some(s.min(o)),
+        (None, Some(o)) => Some(o),
+        (s, None) => s,
+    }
 }
 
 /// Resolve one operator `CronJob` into a `ResolvedJob`.
