@@ -526,7 +526,7 @@ The site key is the vhost's canonical name: the `Host` header lowercased, with a
 
 These are **`$_SERVER` entries, not process environment variables**: read `$_SERVER['EPHPM_REDIS_PASSWORD']`. `getenv()` returns `false` for them, because a process-wide environment would be shared by every tenant's threads.
 
-The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port. In this mode `[kv.redis_compat] password` is ignored.
+The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port. In this mode `[kv.redis_compat] password`, when set, is the **operator** credential: a one-argument `AUTH <password>` reaches the process-global store (what native middleware reads), never a tenant's store — see [KV RESP → Reaching the process-global store](/reference/kv-resp/#reaching-the-process-global-store-multi-tenant).
 
 A PHP app consumes them like any other Redis credentials — Predis, phpredis, or the `ephpm_kv_*` SAPI functions all work without code changes:
 

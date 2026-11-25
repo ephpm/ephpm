@@ -36,12 +36,46 @@ succeeds. What `AUTH` checks depends on the configuration:
 |---|---|
 | No `[kv.redis_compat] password`, no `[kv] secret` | No authentication. `AUTH` with any arguments returns `OK`. |
 | `[kv.redis_compat] password` set, single-site (no `sites_dir`) | `AUTH <password>`. Only the **first** argument is compared, so the two-argument form `AUTH <user> <password>` compares `<user>` and fails. Configure clients with a password and no username. |
-| `[kv] secret` set and `[server] sites_dir` set (multi-tenant) | `AUTH <site-key> <HMAC-SHA256(secret, site-key)>`, both arguments required. The connection is then bound to that site's own store for its lifetime. **`[kv.redis_compat] password` is ignored** in this mode. |
+| `[kv] secret` set and `[server] sites_dir` set (multi-tenant) | `AUTH <site-key> <HMAC-SHA256(secret, site-key)>`, both arguments required. The connection is then bound to that site's own store for its lifetime. A **one-argument** `AUTH <password>` is the operator/global path — see [Reaching the process-global store](#reaching-the-process-global-store-multi-tenant) below. With no `[kv.redis_compat] password` set there is no global path, and a one-argument `AUTH` is rejected. |
 | `[server] sites_dir` set, no `[kv] secret` | Startup error. The listener refuses to serve one shared, unauthenticated store to every tenant. |
 | `[kv] secret` set, single-site, no `password` | Startup error (an empty `password` counts as unset). There is no per-site derivation in single-site mode, so the secret cannot authenticate anyone. Set `[kv.redis_compat] password` to protect a single-site listener, or remove `[kv] secret` to run it unauthenticated (keep it bound to loopback). Before this was fixed, such a listener answered `NOAUTH` and then accepted **any** `AUTH`. |
 | `[kv] secret` set, single-site, `password` set | `AUTH <password>`, as in the second row. |
 
 Passwords are compared in constant time.
+
+### Reaching the process-global store (multi-tenant)
+
+In multi-tenant mode every per-site `AUTH` binds the connection to one vhost's
+isolated store. Native middleware, however, reads and writes the **process-global**
+store (`ephpm_middleware::host` — operator-scoped state such as per-site
+credentials, allow/deny lists, feature flags or maintenance switches that a
+tenant must not be able to change). Before, that store had no RESP path in
+multi-tenant mode: it was readable by middleware but writable by no one.
+
+Set `[kv.redis_compat] password` to open an **operator path** to it. A
+**one-argument** `AUTH <password>` that matches it binds the connection to the
+process-global store instead of a site store:
+
+```bash
+# Seed an operator-scoped key the middleware will read, over RESP:
+redis-cli -h 127.0.0.1 -p 6379 -a "$OPERATOR_PASSWORD" \
+  SET 'basicauth:shop.example' '{"dev":"$pbkdf2-sha256$..."}'
+```
+
+The split is deliberate and fail-closed:
+
+- A **tenant** is only ever handed its own per-site password
+  (`EPHPM_REDIS_PASSWORD` = `HMAC-SHA256(secret, site-key)`), never the operator
+  password, so **no tenant credential can reach the global store**. A tenant's
+  derived password used as a one-argument `AUTH` is rejected, and a two-argument
+  `AUTH` with an empty site key (which would otherwise resolve to the global
+  store) is refused.
+- Knowing the operator password is an **operator-level capability**, on par with
+  `[kv] secret`: both live in the same config file, and anyone who can read it
+  can already impersonate any tenant. Keep the listener on loopback (or behind
+  your own network controls) accordingly.
+- With `[kv.redis_compat] password` unset there is **no** RESP path to the
+  global store at all (the server logs this at startup).
 
 ### Credentials injected into PHP (multi-tenant)
 

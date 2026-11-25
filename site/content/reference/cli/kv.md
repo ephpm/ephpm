@@ -41,11 +41,11 @@ ephpm kv keys '*'
 ephpm kv --user blog.example.com --password "$DERIVED" keys '*'
 ```
 
-`[kv.redis_compat] password` is ignored in this mode.
+In this mode `[kv.redis_compat] password`, when also set, is the **operator** credential for the *process-global* store, not a per-site one: pass `--password <operator>` **without** `--user` and the single-argument `AUTH` reaches the global store (what native middleware and the OPcache watcher read). A tenant's derived password can never reach it. See [KV RESP → Reaching the process-global store](/reference/kv-resp/#reaching-the-process-global-store-multi-tenant).
 
-The CLI does not derive that value itself — it never reads `[kv] secret`.
+The CLI does not derive the per-site HMAC itself — it never reads `[kv] secret`.
 
-**Limitation:** `ephpm deploy` and `ephpm cache reset` accept `--password` but not `--user`. They write `opcache:version:*`, which the server's OPcache watcher reads from the *default* store, and a site-scoped HMAC connection can only reach one vhost's store. Under per-site HMAC auth there is currently no CLI route to those keys.
+**Reaching the global store under per-site HMAC:** `ephpm deploy` and `ephpm cache reset` accept `--password` but not `--user`. They write `opcache:version:*`, which the server's OPcache watcher reads from the *process-global* store. A site-scoped HMAC connection (`--user` + derived password) can only reach one vhost's store, so to write those keys in multi-tenant mode set `[kv.redis_compat] password` and pass that operator password with `--password` (no `--user`) — the one-argument `AUTH` binds the connection to the global store.
 
 ## Subcommands
 

@@ -649,7 +649,7 @@ SET cache:page:home "<html>..."
 GET cache:page:home   → "<html>..."
 ```
 
-When `[kv] secret` is set, unauthenticated connections are rejected with `NOAUTH` — they do **not** fall back to the default store. The single-argument form `AUTH <password>` is only the legacy plain-password mode (no site isolation); it does not select a site store.
+When `[kv] secret` is set, unauthenticated connections are rejected with `NOAUTH` — they do **not** fall back to the default store. The single-argument form `AUTH <password>` does not select a site store: it is the **operator** path to the process-global store (what native middleware reads), active only when `[kv.redis_compat] password` is set, and reachable only with that operator password — never a tenant's derived one. See [KV RESP → Reaching the process-global store](/reference/kv-resp/#reaching-the-process-global-store-multi-tenant).
 
 ### Architecture
 
