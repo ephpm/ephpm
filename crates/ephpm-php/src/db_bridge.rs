@@ -276,11 +276,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use litewire::backend::{Column, SharedBackend, Value};
+use litewire::backend::{BackendError, Column, ExecuteResult, SharedBackend, Value};
 use litewire::session::ER_PARSE_ERROR;
 use litewire::session::error_map::ER_UNKNOWN_ERROR;
-use litewire::translate::{Dialect, TranslateCache};
-use litewire::{Session, SessionError, SessionResult};
+use litewire::translate::{
+    Dialect, StatementKind, TranslateCache, TranslateResult, translate_cached,
+};
+use litewire::{Session, SessionError, SessionOk, SessionResult};
 
 // ── Reserved infrastructure error codes (issue #259) ────────────────────
 
@@ -343,6 +345,28 @@ pub trait SiteBackendResolver: Send + Sync {
     /// database cannot be opened. The bridge surfaces it to PHP as an
     /// exception and **never** falls back to another site's database.
     fn resolve(&self, site_key: &str) -> Result<SharedBackend, String>;
+
+    /// Whether a qualifying write burst for `site_key` should be forwarded to
+    /// the site's owner as **one** [`Session::exec_batch`] over the pinned
+    /// session connection, rather than one statement at a time (issue #439).
+    ///
+    /// Returns `true` only when **both** hold: this node forwards the site (it
+    /// is not the site's owner, and an owner is alive), and the site's owner
+    /// advertises support for the batch-forwarding request. When `false` — the
+    /// site is served locally (no hop to amortize), or the owner predates the
+    /// batch request (a rolling upgrade) — the bridge forwards the burst per
+    /// statement, so a mixed-version cluster degrades to the slower path, never
+    /// a hard failure.
+    ///
+    /// The default is `false`: the plain single-node registry serves every site
+    /// locally, so it never batches. Only the clustered resolver overrides it.
+    ///
+    /// Called from a PHP execution thread, like [`resolve`](Self::resolve), so
+    /// it may block to resolve current ownership.
+    fn forward_batch_supported(&self, site_key: &str) -> bool {
+        let _ = site_key;
+        false
+    }
 }
 
 /// Executes **raw, untranslated** SQL against a remote ePHPm server's wire
@@ -1223,6 +1247,72 @@ fn run_held(
 
     // `slot` is Some here: either it already matched, or we just set it.
     let held = slot.as_mut().expect("held session was just ensured");
+
+    // Fast path (#439): a single `ephpm_db_*` call carrying a *burst of writes*
+    // — several `INSERT`/`UPDATE`/`DELETE`/`REPLACE` statements, no parameters,
+    // outside a transaction — would otherwise be split by litewire and
+    // forwarded to the site's owner one statement at a time, paying the
+    // cluster-channel hop (~265 µs) per statement. When this node forwards the
+    // site (per-site clustered, non-owner), send the whole burst in one hop
+    // over the pinned session's forwarding connection (`Session::exec_batch`).
+    //
+    // This only engages for the subset where a batch is observably identical to
+    // per-statement execution (see `try_build_mutation_batch`), and
+    // `forward_batch_supported` is `true` only on a forwarding node whose owner
+    // advertises batch support — on the owner, in any non-clustered mode, or
+    // against an owner that predates the batch request (a rolling upgrade), this
+    // is skipped and the statements run through the normal per-statement
+    // `Session` path below. The whole-string screen already ran in `run_on`, and
+    // the batch is pure DML (no ATTACH/VACUUM/PRAGMA), so bypassing the frontend
+    // session's own screen forbids nothing a Mutation could carry.
+    //
+    // The guards are ordered cheapest-first so the common single-statement path
+    // pays almost nothing: a statement with no `;` cannot be a multi-statement
+    // burst (the `;` may be inside a literal — this is a necessary, not
+    // sufficient, precondition). Only an actual multi-statement call reaches
+    // `try_build_mutation_batch`, which is itself checked *before*
+    // `forward_batch_supported`: translating + classifying the burst is cheaper
+    // than resolving the site's current owner and the owner's advertised
+    // support, and a burst that is not a pure-write batch (a multi-statement
+    // SELECT, a transaction) must not pay the ownership lookup only to fall
+    // through to the per-statement path.
+    if params.is_empty()
+        && sql.contains(';')
+        && !held.session.in_transaction
+        && let BackendSource::PerSite(resolver) = &bridge.source
+        && let Some(batch) = try_build_mutation_batch(&bridge.cache, sql)
+        && resolver.forward_batch_supported(&held.site)
+    {
+        // Ride the pinned session's *own* forwarding connection — the one the
+        // per-statement path already uses — so the batch and any following
+        // LAST_INSERT_ID()/ROW_COUNT() (both per-connection in SQLite) resolve
+        // on one owner-side connection. A throw-away per-batch connection would
+        // re-dial + re-handshake + open a fresh owner session, and that fresh
+        // connection's last_insert_rowid()/changes() would diverge from the
+        // pinned stream the next statement forwards over.
+        let outcome = bridge.handle.block_on(held.session.exec_batch(&batch));
+        return match outcome {
+            Ok(results) => Ok(batch_success_result(results.last())),
+            Err(e) => {
+                // Mirror the per-statement path below: a connection-shaped
+                // failure on the pinned forwarding stream recycles this thread's
+                // session so the next call re-resolves the site's current owner.
+                // The batch is non-transactional by construction, so there is
+                // never an open transaction to protect by keeping the session.
+                let mapped = batch_backend_error(&e);
+                if batch_error_is_connection_shaped(&mapped) {
+                    tracing::warn!(
+                        error = %e,
+                        "forwarded write batch hit a connection-class error — dropping this \
+                         thread's session so the next call reconnects"
+                    );
+                    *slot = None;
+                }
+                Err(RunFailure::Error(mapped))
+            }
+        };
+    }
+
     let result = bridge.handle.block_on(held.session.query(sql, params));
     if let Err(e) = &result {
         // Recycle a session whose connection looks dead so the NEXT
@@ -1243,6 +1333,116 @@ fn run_held(
         }
     }
     result.map_err(|e| RunFailure::Error(BridgeError::from(e)))
+}
+
+/// Largest number of statements the bridge will fold into one forwarded batch,
+/// and the largest total translated-SQL byte count. Both bound the single
+/// forwarding message (sql_forward caps a message at 64 MiB); a burst larger
+/// than either falls back to per-statement forwarding rather than risk an
+/// over-large frame. Generous — a real import burst is dozens to low hundreds
+/// of statements.
+const MAX_BATCH_STATEMENTS: usize = 1000;
+const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Decide whether `sql` is a **burst of writes** that may be forwarded as one
+/// batch, and if so return the already-translated SQLite statements in order.
+///
+/// Returns `Some` only when **every** statement of a multi-statement input
+/// translates to a plain [`StatementKind::Mutation`] (`INSERT`/`UPDATE`/
+/// `DELETE`/`REPLACE` with no top-level `RETURNING`). That is precisely the
+/// subset where running the statements as a batch is observably identical to
+/// running them one at a time through the per-statement [`Session`] path:
+///
+/// * **No row-returning statement** (`SELECT`, `… RETURNING`, metadata) — the
+///   batch reply carries only OK counters, and the caller's result is the last
+///   statement's OK, which for a text-protocol multi-statement is exactly what
+///   [`Session::query`] returns.
+/// * **No transaction control** and **no named-lock / `DO` / `FOUND_ROWS` /
+///   `SET sql_mode`** session specials — each Mutation autocommits
+///   independently, so neither session transaction state nor lock scope is
+///   involved, and the batch can safely run on its own owner-side connection.
+/// * **No `ATTACH`/`VACUUM`/path-`PRAGMA`** — those never classify as
+///   `Mutation`, and the whole string was already screened in [`run_on`].
+///
+/// Anything else (a single statement, any non-Mutation statement, a parse/
+/// translate failure, a lock function anywhere, or a burst over the size caps)
+/// returns `None`, and the caller runs the statement(s) through the normal
+/// [`Session`] path — so the fast path never changes an observable result.
+fn try_build_mutation_batch(cache: &TranslateCache, sql: &str) -> Option<Vec<String>> {
+    // A named-lock function (`GET_LOCK()` & co.) or `DO` is a session operation
+    // litewire evaluates specially; it must not be folded into a raw batch even
+    // when it rides inside a DML statement. Refuse the whole burst if detected.
+    if litewire::translate::user_locks::detect(sql, Dialect::MySQL).is_some() {
+        return None;
+    }
+    let translated = translate_cached(cache, sql, Dialect::MySQL).ok()?;
+    if translated.len() <= 1 || translated.len() > MAX_BATCH_STATEMENTS {
+        return None;
+    }
+    let mut statements = Vec::with_capacity(translated.len());
+    let mut total = 0usize;
+    for result in translated.iter() {
+        let TranslateResult::Sql(stmt) = result else {
+            return None;
+        };
+        if stmt.is_empty() || litewire::translate::classify(stmt) != StatementKind::Mutation {
+            return None;
+        }
+        total = total.checked_add(stmt.len())?;
+        if total > MAX_BATCH_BYTES {
+            return None;
+        }
+        statements.push(stmt.clone());
+    }
+    Some(statements)
+}
+
+/// Build the [`SessionResult`] for a fully-successful batch: the **last**
+/// statement's OK counters, mirroring [`Session::query`]'s "result of the last
+/// statement" contract for a text-protocol multi-statement. The batch is
+/// non-transactional by construction, so `in_transaction` is `false`.
+fn batch_success_result(last: Option<&ExecuteResult>) -> SessionResult {
+    let (affected_rows, last_insert_id) = last.map_or((0, 0), |r| {
+        let id = r.last_insert_rowid.and_then(|v| u64::try_from(v.max(0)).ok()).unwrap_or(0);
+        (r.affected_rows, id)
+    });
+    SessionResult::Ok(SessionOk {
+        affected_rows,
+        last_insert_id,
+        in_transaction: false,
+        noop: false,
+    })
+}
+
+/// Map a failed batch statement's [`BackendError`] to a [`BridgeError`] with
+/// the MySQL code / SQLSTATE the per-statement path would have assigned, using
+/// the **same** classifier litewire's session uses (so e.g. a duplicate key
+/// stays `1062`). Statements before the failure already committed; the one that
+/// failed, and every statement after it, did not.
+fn batch_backend_error(err: &BackendError) -> BridgeError {
+    let mapped = litewire::session::error_map::classify(&err.to_string());
+    BridgeError { code: mapped.code, sqlstate: mapped.sqlstate, message: mapped.message }
+}
+
+/// Whether a failed forwarded-batch error is connection-shaped — the pinned
+/// forwarding stream, not the SQL, is what failed — so the bridge should
+/// recycle this thread's session and re-resolve the site's owner on the next
+/// call.
+///
+/// The same rule as [`is_connection_error`], applied to the [`BridgeError`] a
+/// batch produces: only the `ER_UNKNOWN_ERROR` (1105) fallback is considered,
+/// and then only when the message carries a [`CONNECTION_ERROR_MARKERS`]
+/// substring. This works because [`batch_backend_error`] preserves the
+/// forwarder's transport wording — litewire's `error_map::classify` forwards an
+/// unclassified message verbatim — so the forwarding producer's connection
+/// markers (`connection refused`, `error sending request`, `channel closed`,
+/// …) still match.
+fn batch_error_is_connection_shaped(err: &BridgeError) -> bool {
+    if err.code != ER_UNKNOWN_ERROR {
+        return false;
+    }
+    let msg = err.message.to_ascii_lowercase();
+    CONNECTION_ERROR_MARKERS.iter().any(|marker| msg.contains(marker))
 }
 
 // ── Engine panic containment ────────────────────────────────────────────
@@ -5690,5 +5890,138 @@ mod remote_tests {
     fn remote_is_always_available() {
         let bridge = remote_bridge(RecordingRemote::new());
         assert!(available_on(Some(&bridge)));
+    }
+
+    // ── #439: batch-forwarding producer (`try_build_mutation_batch`) ────────
+
+    /// A multi-statement burst of plain writes is recognised as a batch, and
+    /// each statement is translated to SQLite in order.
+    #[test]
+    fn a_multi_write_burst_becomes_a_batch() {
+        let cache = TranslateCache::default();
+        let batch = try_build_mutation_batch(
+            &cache,
+            "INSERT INTO t (id) VALUES (1); UPDATE t SET id = 2; DELETE FROM t WHERE id = 3",
+        )
+        .expect("a pure-DML multi-statement burst must batch");
+        assert_eq!(batch.len(), 3, "one translated statement per input statement");
+        assert!(batch[0].to_ascii_uppercase().starts_with("INSERT"));
+        assert!(batch[1].to_ascii_uppercase().starts_with("UPDATE"));
+        assert!(batch[2].to_ascii_uppercase().starts_with("DELETE"));
+    }
+
+    /// A single statement is never a batch — there is no hop to amortize, and
+    /// the per-statement path must keep handling it (and its result shape).
+    #[test]
+    fn a_single_write_is_not_a_batch() {
+        let cache = TranslateCache::default();
+        assert!(try_build_mutation_batch(&cache, "INSERT INTO t (id) VALUES (1)").is_none());
+    }
+
+    /// Only pure writes batch: a row-returning statement, a transaction, or
+    /// DDL anywhere in the burst disqualifies it, so it falls back to the
+    /// per-statement `Session` path with its full semantics.
+    #[test]
+    fn non_write_statements_disqualify_the_batch() {
+        let cache = TranslateCache::default();
+        // A SELECT in the burst → row-returning → not a pure-write batch.
+        assert!(
+            try_build_mutation_batch(&cache, "INSERT INTO t (id) VALUES (1); SELECT * FROM t")
+                .is_none()
+        );
+        // Explicit transaction control → the Session must track it.
+        assert!(
+            try_build_mutation_batch(&cache, "BEGIN; INSERT INTO t (id) VALUES (1); COMMIT")
+                .is_none()
+        );
+        // DDL → rebuild/metadata handling lives in the Session.
+        assert!(
+            try_build_mutation_batch(
+                &cache,
+                "INSERT INTO t (id) VALUES (1); CREATE TABLE u (id INT)"
+            )
+            .is_none()
+        );
+    }
+
+    /// A bare named-lock / `DO` statement is a session operation litewire
+    /// evaluates specially (it is not a `Mutation`, and the `user_locks::detect`
+    /// guard flags it too), so a burst containing one is refused and falls back
+    /// to the per-statement `Session` path. (A lock *function buried inside* a
+    /// DML statement is not special-cased by litewire's own dispatch either —
+    /// both paths translate and execute it identically — so only the forms
+    /// litewire evaluates as session operations need excluding.)
+    #[test]
+    fn a_lock_or_do_statement_disqualifies_the_batch() {
+        let cache = TranslateCache::default();
+        assert!(
+            try_build_mutation_batch(&cache, "DO GET_LOCK('x', 1); INSERT INTO t (id) VALUES (2)")
+                .is_none()
+        );
+    }
+
+    /// `… RETURNING` is row-returning (litewire classifies it as a query), so a
+    /// burst containing one is not a pure-write batch.
+    #[test]
+    fn a_returning_write_is_not_batched() {
+        let cache = TranslateCache::default();
+        assert!(
+            try_build_mutation_batch(
+                &cache,
+                "INSERT INTO t (id) VALUES (1) RETURNING id; INSERT INTO t (id) VALUES (2)"
+            )
+            .is_none()
+        );
+    }
+
+    /// A fully-successful batch surfaces the **last** statement's OK counters
+    /// (matching `Session::query`'s multi-statement contract) and is never in a
+    /// transaction.
+    #[test]
+    fn batch_success_result_reports_the_last_statements_ok() {
+        let last = ExecuteResult { affected_rows: 7, last_insert_rowid: Some(42) };
+        match batch_success_result(Some(&last)) {
+            SessionResult::Ok(ok) => {
+                assert_eq!(ok.affected_rows, 7);
+                assert_eq!(ok.last_insert_id, 42);
+                assert!(!ok.in_transaction);
+                assert!(!ok.noop);
+            }
+            SessionResult::Rows(_) => panic!("a write batch never returns rows"),
+        }
+    }
+
+    /// A failed batch statement maps to the same MySQL code the per-statement
+    /// path assigns — a duplicate key stays `1062`.
+    #[test]
+    fn batch_backend_error_preserves_the_mysql_code() {
+        let err = BackendError::Sqlite("UNIQUE constraint failed: t.id".to_string());
+        let mapped = batch_backend_error(&err);
+        assert_eq!(mapped.code, litewire::session::error_map::ER_DUP_ENTRY);
+    }
+
+    /// A forwarded-batch **transport** failure is recognised as
+    /// connection-shaped — so the fast path recycles this thread's session and
+    /// re-resolves the owner — because `batch_backend_error` preserves the
+    /// forwarder's wording verbatim (a `1105` with a connection marker). A real
+    /// SQL error (a duplicate key, `1062`) is never connection-shaped.
+    #[test]
+    fn a_batch_transport_failure_is_connection_shaped_but_a_sql_error_is_not() {
+        let transport = batch_backend_error(&BackendError::Other(
+            "connection refused forwarding to site owner 10.0.0.2:9000: dial failed".to_string(),
+        ));
+        assert_eq!(transport.code, ER_UNKNOWN_ERROR, "an unclassified transport error is 1105");
+        assert!(
+            batch_error_is_connection_shaped(&transport),
+            "a forwarding transport failure must recycle the session"
+        );
+
+        let dup = batch_backend_error(&BackendError::Sqlite(
+            "UNIQUE constraint failed: t.id".to_string(),
+        ));
+        assert!(
+            !batch_error_is_connection_shaped(&dup),
+            "a SQL error (1062) is the statement's own fault, not a dead connection"
+        );
     }
 }

@@ -300,7 +300,18 @@ With `[db.sqlite.replication] per_site = true` on a clustered node, each site's
 database also replicates across the cluster (**experimental**). Each site has
 one owner, chosen by rendezvous hashing (HRW) over the alive nodes; a node that
 does not own a site forwards that site's statements to the owner, on both the
-bridge and `pdo_mysql` routes, so reads and writes work on any node. There is
+bridge and `pdo_mysql` routes, so reads and writes work on any node. Each
+forwarded statement costs one cluster-channel round trip, so a single
+`ephpm_db_*` call that carries a **burst of writes** — several
+`INSERT`/`UPDATE`/`DELETE`/`REPLACE` statements in one multi-statement string,
+with no parameters and outside a transaction — is forwarded as **one batch** on
+the `ephpm_db_*` bridge route, amortizing the hop across the burst instead of
+paying it per statement. The owner runs the batch in source order, each
+statement autocommitting, and stops at the first error (statements before it
+commit, statements after it never run — exactly as running them one at a time
+would leave them). Anything outside that subset — a row-returning statement, a
+transaction, DDL, a named-lock operation, or bound parameters — falls back to
+per-statement forwarding, so batching never changes a result. There is
 no cluster-wide primary in this mode, and `/_ephpm/primary` returns `200` on
 every healthy node. See
 [`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only)

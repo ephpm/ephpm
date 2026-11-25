@@ -1626,6 +1626,7 @@ mod tests {
             data_port: Some(6000),
             hrw_scheme: Some(2),
             draining: false,
+            sql_forward_batch: true,
         }
     }
 

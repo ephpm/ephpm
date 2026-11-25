@@ -355,6 +355,27 @@ impl From<WireColumn> for Column {
     }
 }
 
+/// Wire twin of litewire's [`ExecuteResult`] — one statement's OK counters,
+/// carried back in a [`SqlResponse::BatchOk`] (one per statement of a
+/// [`SqlRequest::Batch`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireExecuteResult {
+    affected_rows: u64,
+    last_insert_rowid: Option<i64>,
+}
+
+impl From<&ExecuteResult> for WireExecuteResult {
+    fn from(r: &ExecuteResult) -> Self {
+        Self { affected_rows: r.affected_rows, last_insert_rowid: r.last_insert_rowid }
+    }
+}
+
+impl From<WireExecuteResult> for ExecuteResult {
+    fn from(r: WireExecuteResult) -> Self {
+        Self { affected_rows: r.affected_rows, last_insert_rowid: r.last_insert_rowid }
+    }
+}
+
 /// Wire twin of litewire's [`UserLockOp`]. `timeout` carries MySQL's own
 /// convention (`< 0` forever, `0` one attempt, `> 0` seconds) so the message
 /// is self-describing and version-stable.
@@ -449,15 +470,47 @@ enum SqlRequest {
         #[serde(default)]
         progress: bool,
     },
+    /// A **burst of already-translated, non-transactional write statements**
+    /// (`INSERT`/`UPDATE`/`DELETE`/`REPLACE`, i.e. litewire
+    /// [`StatementKind::Mutation`](litewire::translate::StatementKind)) run in
+    /// one round trip to amortize the forwarding hop (issue #439). The owner
+    /// executes them **in source order on this stream's one backend
+    /// connection**, each autocommitting, and **stops at the first error** —
+    /// so a statement that fails neither runs nor commits any statement after
+    /// it. On full success the owner answers [`SqlResponse::BatchOk`] with one
+    /// result per statement; on a failure it answers [`SqlResponse::Error`]
+    /// carrying that statement's error (every statement before it has already
+    /// committed, exactly as the per-statement path would have left them).
+    ///
+    /// Scope is deliberately narrow — no parameters, no transaction-control,
+    /// no row-returning statements — because that is the subset whose result
+    /// (the last statement's OK) and error semantics are identical whether run
+    /// as a batch or one statement at a time. The producer
+    /// ([`ephpm_php::db_bridge`]) falls back to per-statement forwarding for
+    /// anything outside it, so the batch never changes an observable result.
+    ///
+    /// Mixed versions: an owner that predates this variant cannot parse it and
+    /// ends the stream, which the client reports as a connection error; the
+    /// producer only ever emits a batch after resolving a current owner, and a
+    /// pre-batch owner simply makes the client's batch attempt fail (the
+    /// bridge surfaces it like any forwarding error). An old client never
+    /// sends one.
+    Batch {
+        statements: Vec<String>,
+        #[serde(default)]
+        progress: bool,
+    },
 }
 
 impl SqlRequest {
-    /// The statement's SQL; empty for a lock operation (which touches no
-    /// transaction state).
+    /// The statement's SQL; empty for a lock operation or a batch (neither
+    /// touches the client stream's explicit-transaction tracking — a lock has
+    /// no SQL, and a batch is non-transactional by construction and rides its
+    /// own transient connection).
     fn sql(&self) -> &str {
         match self {
             Self::Query { sql, .. } | Self::Execute { sql, .. } => sql,
-            Self::Lock { .. } => "",
+            Self::Lock { .. } | Self::Batch { .. } => "",
         }
     }
 
@@ -465,7 +518,8 @@ impl SqlRequest {
         match self {
             Self::Query { progress, .. }
             | Self::Execute { progress, .. }
-            | Self::Lock { progress, .. } => *progress,
+            | Self::Lock { progress, .. }
+            | Self::Batch { progress, .. } => *progress,
         }
     }
 
@@ -508,6 +562,13 @@ enum SqlResponse {
     /// or `None` for `NULL`.
     Lock {
         value: Option<i64>,
+    },
+    /// Every statement of a [`SqlRequest::Batch`] succeeded; one OK per
+    /// statement, in order. A batch that hits an error answers with
+    /// [`SqlResponse::Error`] instead (the owner stops there), so this variant
+    /// implies all statements committed.
+    BatchOk {
+        results: Vec<WireExecuteResult>,
     },
 }
 
@@ -561,6 +622,18 @@ impl RemoteProxyBackend {
     }
 }
 
+impl RemoteProxyBackend {
+    /// Build a fresh forwarding session (stream dialed lazily on first use).
+    fn new_conn(&self) -> RemoteProxyConn {
+        RemoteProxyConn {
+            channel: self.channel.clone(),
+            owner_addr: self.owner_addr,
+            stream_type: self.stream_type.clone(),
+            stream: Mutex::new(None),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for RemoteProxyBackend {
     async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
@@ -568,12 +641,7 @@ impl Backend for RemoteProxyBackend {
         // session — which the bridge does on a thread's first query — does not
         // itself pay a round trip, and a transient owner blip fails the
         // statement rather than the session open.
-        Ok(Box::new(RemoteProxyConn {
-            channel: self.channel.clone(),
-            owner_addr: self.owner_addr,
-            stream_type: self.stream_type.clone(),
-            stream: Mutex::new(None),
-        }))
+        Ok(Box::new(self.new_conn()))
     }
 }
 
@@ -717,7 +785,8 @@ impl RemoteProxyConn {
                     SqlResponse::Error { closed: true, .. } => *guard = None,
                     SqlResponse::Error { .. }
                     | SqlResponse::Progress
-                    | SqlResponse::Lock { .. } => {}
+                    | SqlResponse::Lock { .. }
+                    | SqlResponse::BatchOk { .. } => {}
                     SqlResponse::Rows { .. } | SqlResponse::Ok { .. } => {
                         if let Some(open_now) = transaction_effect(req.sql()) {
                             open.in_transaction = open_now;
@@ -797,9 +866,11 @@ impl BackendConn for RemoteProxyConn {
                 rows: rows.into_iter().map(|r| r.into_iter().map(Value::from).collect()).collect(),
             }),
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
-            SqlResponse::Ok { .. } | SqlResponse::Lock { .. } => Err(BackendError::Other(
-                "site owner returned a non-rowset reply to a forwarded query".to_string(),
-            )),
+            SqlResponse::Ok { .. } | SqlResponse::Lock { .. } | SqlResponse::BatchOk { .. } => {
+                Err(BackendError::Other(
+                    "site owner returned a non-rowset reply to a forwarded query".to_string(),
+                ))
+            }
             // exchange() consumes heartbeats; this arm exists for exhaustiveness.
             SqlResponse::Progress => Err(BackendError::Other(
                 "site owner sent a stray heartbeat in place of a reply".to_string(),
@@ -817,9 +888,12 @@ impl BackendConn for RemoteProxyConn {
         match self.forward(&req).await? {
             SqlResponse::Lock { value } => Ok(value),
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
-            SqlResponse::Rows { .. } | SqlResponse::Ok { .. } => Err(BackendError::Other(
-                "site owner returned a statement reply to a forwarded lock operation".to_string(),
-            )),
+            SqlResponse::Rows { .. } | SqlResponse::Ok { .. } | SqlResponse::BatchOk { .. } => {
+                Err(BackendError::Other(
+                    "site owner returned a statement reply to a forwarded lock operation"
+                        .to_string(),
+                ))
+            }
             SqlResponse::Progress => Err(BackendError::Other(
                 "site owner sent a stray heartbeat in place of a reply".to_string(),
             )),
@@ -837,9 +911,65 @@ impl BackendConn for RemoteProxyConn {
                 Ok(ExecuteResult { affected_rows, last_insert_rowid })
             }
             SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
-            SqlResponse::Rows { .. } | SqlResponse::Lock { .. } => Err(BackendError::Other(
-                "site owner returned a non-OK reply to a forwarded execute".to_string(),
+            SqlResponse::Rows { .. } | SqlResponse::Lock { .. } | SqlResponse::BatchOk { .. } => {
+                Err(BackendError::Other(
+                    "site owner returned a non-OK reply to a forwarded execute".to_string(),
+                ))
+            }
+            // exchange() consumes heartbeats; this arm exists for exhaustiveness.
+            SqlResponse::Progress => Err(BackendError::Other(
+                "site owner sent a stray heartbeat in place of a reply".to_string(),
             )),
+        }
+    }
+
+    /// Forward a **burst of already-translated, non-transactional write
+    /// statements** to the owner in one round trip over **this session's own
+    /// pinned stream** (issue #439).
+    ///
+    /// Riding the pinned stream — not a throw-away connection — is what keeps
+    /// the batch and any following `LAST_INSERT_ID()`/`ROW_COUNT()` on one
+    /// owner-side connection: the owner runs the batch on the same connection it
+    /// serves this stream's other statements with ([`serve_owner_statements`]),
+    /// so `last_insert_rowid()`/`changes()` (both per-connection in SQLite) stay
+    /// coherent with it. The bridge only ever calls this for a burst where that
+    /// is observably identical to per-statement forwarding.
+    async fn exec_batch(&self, statements: &[String]) -> Result<Vec<ExecuteResult>, BackendError> {
+        self.forward_batch(statements).await
+    }
+}
+
+impl RemoteProxyConn {
+    /// Forward a [`SqlRequest::Batch`] of non-transactional write statements
+    /// and map the owner's reply back to one [`ExecuteResult`] per statement.
+    ///
+    /// On full success every statement committed, in order, and the returned
+    /// vector has one result per input statement. On a failure the owner
+    /// stopped at the failing statement (statements before it committed,
+    /// statements after it never ran), and this returns that statement's
+    /// [`BackendError`] with its SQL-vs-infrastructure distinction preserved —
+    /// so the producer re-maps it to the same MySQL error code the
+    /// per-statement path would have.
+    ///
+    /// A transport failure is a connection-shaped [`BackendError`] exactly as
+    /// for a single forwarded statement; the producer treats it like any other
+    /// forwarding error (it does not silently fall back, because some
+    /// statements may already have committed on the owner).
+    async fn forward_batch(
+        &self,
+        statements: &[String],
+    ) -> Result<Vec<ExecuteResult>, BackendError> {
+        let req = SqlRequest::Batch { statements: statements.to_vec(), progress: true };
+        match self.forward(&req).await? {
+            SqlResponse::BatchOk { results } => {
+                Ok(results.into_iter().map(ExecuteResult::from).collect())
+            }
+            SqlResponse::Error { sqlite, message, .. } => Err(error_from_response(sqlite, message)),
+            SqlResponse::Rows { .. } | SqlResponse::Ok { .. } | SqlResponse::Lock { .. } => {
+                Err(BackendError::Other(
+                    "site owner returned a non-batch reply to a forwarded batch".to_string(),
+                ))
+            }
             // exchange() consumes heartbeats; this arm exists for exhaustiveness.
             SqlResponse::Progress => Err(BackendError::Other(
                 "site owner sent a stray heartbeat in place of a reply".to_string(),
@@ -979,6 +1109,44 @@ impl SiteBackendResolver for ClusteredSiteResolver {
         // panics. It calls `resolve_backend` directly — see `SiteWireRoute`.
         self.handle.clone().block_on(self.resolve_backend(site_key))
     }
+
+    /// Batch a qualifying burst only when this node **forwards** `site_key` (it
+    /// is not the site's owner, and an owner is alive) **and** that owner
+    /// advertises batch support ([`NodeInfo::sql_forward_batch`], the
+    /// rolling-upgrade gate). When this node owns the site — or no node is alive
+    /// to own it, so it is served locally — there is no cluster-channel hop to
+    /// amortize; when the owner predates the batch request, sending one would
+    /// end the stream on an undecodable frame. In either case this returns
+    /// `false` and the bridge forwards the burst one statement at a time.
+    ///
+    /// The batch itself rides the bridge's **pinned** session stream (via
+    /// [`RemoteProxyConn::exec_batch`]), which already forwards to the owner
+    /// this node resolved at session open; this method only gates whether to
+    /// use that fast path. Announcement of the site to the replication plane is
+    /// deliberately **not** repeated here — it is [`resolve`](Self::resolve)'s
+    /// responsibility (via `plan_serve`), which the bridge always calls first to
+    /// open this thread's session.
+    fn forward_batch_supported(&self, site_key: &str) -> bool {
+        self.handle.clone().block_on(async {
+            let nodes = self.cluster.nodes().await;
+            owner_supports_batch_forwarding(&nodes, &self.self_id, site_key)
+        })
+    }
+}
+
+/// Whether a qualifying write burst for `site` should be forwarded to its owner
+/// as a single batch: this node forwards the site (it is not the owner, and an
+/// owner is alive) **and** that owner advertises batch support.
+///
+/// `false` makes the bridge forward the burst per statement — the behaviour
+/// before batching — so a node served locally pays nothing, and a mixed-version
+/// cluster whose owner predates the batch request never sends a frame the owner
+/// would reject.
+fn owner_supports_batch_forwarding(nodes: &[NodeInfo], self_id: &str, site: &str) -> bool {
+    if should_serve_locally(nodes, self_id, site) {
+        return false;
+    }
+    hrw_owner(nodes, site).is_some_and(|owner| owner.sql_forward_batch)
 }
 
 /// The same local-or-forward decision, for the multi-tenant MySQL wire
@@ -1486,6 +1654,21 @@ async fn execute_forwarded(conn: &dyn BackendConn, req: SqlRequest) -> SqlRespon
             Ok(value) => SqlResponse::Lock { value },
             Err(e) => error_response(&e),
         },
+        // Run each statement in source order on this one connection, each
+        // autocommitting; stop at the first error so no statement after a
+        // failure runs or commits (the client maps that error to the same
+        // MySQL code the per-statement path would). On full success, one OK
+        // per statement comes back in order (issue #439).
+        SqlRequest::Batch { statements, .. } => {
+            let mut results = Vec::with_capacity(statements.len());
+            for stmt in &statements {
+                match conn.execute(stmt, &[]).await {
+                    Ok(r) => results.push(WireExecuteResult::from(&r)),
+                    Err(e) => return error_response(&e),
+                }
+            }
+            SqlResponse::BatchOk { results }
+        }
     }
 }
 
@@ -1560,6 +1743,11 @@ mod tests {
 
     fn node(id: &str, state: NodeState) -> NodeInfo {
         NodeInfo::new(id, "10.0.0.1:7946", state)
+    }
+
+    /// An alive node that advertises SQL-forwarding batch support.
+    fn batch_node(id: &str) -> NodeInfo {
+        NodeInfo { sql_forward_batch: true, ..node(id, NodeState::Alive) }
     }
 
     #[test]
@@ -1681,6 +1869,40 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
+    /// **Rolling-upgrade gate (#439).** A forwarding node batches a write burst
+    /// only when the site's owner advertises batch support; otherwise it falls
+    /// back to per-statement forwarding, so an owner that predates
+    /// `SqlRequest::Batch` is never sent a frame it would reject.
+    #[test]
+    fn batch_forwarding_is_gated_on_the_owner_advertising_support() {
+        let site = "tenant-a";
+        let mut nodes = vec![batch_node("ephpm-0"), batch_node("ephpm-1"), batch_node("ephpm-2")];
+        let owner = hrw_owner(&nodes, site).unwrap().id.clone();
+        let forwarder = nodes.iter().find(|n| n.id != owner).unwrap().id.clone();
+
+        // Every node advertises support → a non-owner forwards as a batch.
+        assert!(owner_supports_batch_forwarding(&nodes, &forwarder, site));
+
+        // The owner serves locally — no hop to amortize, so it never batches.
+        assert!(!owner_supports_batch_forwarding(&nodes, &owner, site));
+
+        // Rolling upgrade: the owner predates the batch request (advertises no
+        // support). A forwarder must fall back to per-statement forwarding —
+        // only the owner's advertisement gates this, not the forwarder's.
+        for n in &mut nodes {
+            if n.id == owner {
+                n.sql_forward_batch = false;
+            }
+        }
+        assert!(
+            !owner_supports_batch_forwarding(&nodes, &forwarder, site),
+            "an owner that does not advertise batch support must not be sent a batch"
+        );
+
+        // No alive node to own the site → served locally → never batches.
+        assert!(!owner_supports_batch_forwarding(&[], &forwarder, site));
+    }
+
     /// The owner side needs BOTH gates. HRW ownership alone would let any
     /// cluster member reach any tenant database on any node just by naming it;
     /// membership alone would let a member reach a database on a node that is
@@ -1759,7 +1981,9 @@ mod tests {
                 assert_eq!(params.len(), 3);
                 assert!(matches!(params[1], WireValue::Blob(ref bytes) if bytes == &[0, 1, 255]));
             }
-            SqlRequest::Query { .. } | SqlRequest::Lock { .. } => panic!("expected Execute"),
+            SqlRequest::Query { .. } | SqlRequest::Lock { .. } | SqlRequest::Batch { .. } => {
+                panic!("expected Execute")
+            }
         }
 
         let resp = SqlResponse::Rows {
@@ -2190,5 +2414,215 @@ mod tests {
             serde_json::from_str(r#"{"Error":{"sqlite":true,"message":"database is locked"}}"#)
                 .unwrap();
         assert!(matches!(resp, SqlResponse::Error { sqlite: true, closed: false, .. }));
+    }
+
+    fn batch(statements: &[&str]) -> SqlRequest {
+        SqlRequest::Batch {
+            statements: statements.iter().map(|s| (*s).to_string()).collect(),
+            progress: true,
+        }
+    }
+
+    /// A batch request and its OK reply survive the wire codec, carrying one
+    /// result per statement in order.
+    #[tokio::test]
+    async fn batch_request_and_reply_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        write_msg(&mut a, &batch(&["INSERT INTO t VALUES (1)", "UPDATE t SET x = 2"]))
+            .await
+            .unwrap();
+        match read_msg::<_, SqlRequest>(&mut b).await.unwrap() {
+            SqlRequest::Batch { statements, progress } => {
+                assert!(progress);
+                assert_eq!(statements, ["INSERT INTO t VALUES (1)", "UPDATE t SET x = 2"]);
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+
+        let reply = SqlResponse::BatchOk {
+            results: vec![
+                WireExecuteResult { affected_rows: 1, last_insert_rowid: Some(1) },
+                WireExecuteResult { affected_rows: 1, last_insert_rowid: None },
+            ],
+        };
+        write_msg(&mut a, &reply).await.unwrap();
+        match read_msg::<_, SqlResponse>(&mut b).await.unwrap() {
+            SqlResponse::BatchOk { results } => {
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].last_insert_rowid, Some(1));
+            }
+            other => panic!("expected BatchOk, got {other:?}"),
+        }
+    }
+
+    /// **#439 amortization.** A burst of N writes crosses the stream as a
+    /// *single* request/reply exchange, not N — the whole point of batching.
+    /// A mock owner proves exactly one request arrives and no statement is sent
+    /// after the one batch.
+    #[tokio::test]
+    async fn a_batch_of_n_writes_is_one_exchange() {
+        let (mut client, mut owner) = tokio::io::duplex(64 * 1024);
+        let owner_task = tokio::spawn(async move {
+            // Exactly one request, carrying all ten statements.
+            let req: SqlRequest = read_msg(&mut owner).await.unwrap();
+            let SqlRequest::Batch { statements, .. } = req else {
+                panic!("expected a single Batch request, got {req:?}");
+            };
+            let n = statements.len();
+            let results = (0..n)
+                .map(|i| WireExecuteResult {
+                    affected_rows: 1,
+                    last_insert_rowid: i64::try_from(i + 1).ok(),
+                })
+                .collect();
+            write_msg(&mut owner, &SqlResponse::BatchOk { results }).await.unwrap();
+            // No further request from the client: the burst was one exchange.
+            let after = read_msg::<_, SqlRequest>(&mut owner).await;
+            (n, after.is_err())
+        });
+
+        let stmts = [
+            "INSERT INTO t VALUES (0)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (2)",
+            "INSERT INTO t VALUES (3)",
+            "INSERT INTO t VALUES (4)",
+            "INSERT INTO t VALUES (5)",
+            "INSERT INTO t VALUES (6)",
+            "INSERT INTO t VALUES (7)",
+            "INSERT INTO t VALUES (8)",
+            "INSERT INTO t VALUES (9)",
+        ];
+        match exchange(&mut client, &batch(&stmts)).await.unwrap() {
+            SqlResponse::BatchOk { results } => assert_eq!(results.len(), 10),
+            other => panic!("expected BatchOk, got {other:?}"),
+        }
+        drop(client);
+        let (seen, no_more) = owner_task.await.unwrap();
+        assert_eq!(seen, 10, "all ten statements rode one request");
+        assert!(no_more, "the client sent no statement after the single batch");
+    }
+
+    /// The owner runs a batch against the real engine **in order**, autocommits
+    /// each statement, and returns one OK per statement — the last carrying the
+    /// burst's final `last_insert_rowid`.
+    #[tokio::test]
+    async fn the_owner_runs_a_batch_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry(dir.path());
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let owner_registry = registry.clone();
+        let served = tokio::spawn(async move {
+            serve_owner_statements(&mut owner, &owner_registry, "s1", None, || false)
+                .await
+                .unwrap();
+        });
+
+        let resp =
+            exchange(&mut client, &execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)"))
+                .await
+                .unwrap();
+        assert!(matches!(resp, SqlResponse::Ok { .. }), "{resp:?}");
+
+        let resp = exchange(
+            &mut client,
+            &batch(&[
+                "INSERT INTO t (id, v) VALUES (1, 10)",
+                "INSERT INTO t (id, v) VALUES (2, 20)",
+                "INSERT INTO t (id, v) VALUES (3, 30)",
+            ]),
+        )
+        .await
+        .unwrap();
+        match resp {
+            SqlResponse::BatchOk { results } => {
+                assert_eq!(results.len(), 3, "one OK per statement");
+                assert_eq!(results[2].last_insert_rowid, Some(3), "last statement's rowid");
+            }
+            other => panic!("expected BatchOk, got {other:?}"),
+        }
+
+        let rows =
+            match exchange(&mut client, &query("SELECT id FROM t ORDER BY id")).await.unwrap() {
+                SqlResponse::Rows { rows, .. } => rows,
+                other => panic!("expected Rows, got {other:?}"),
+            };
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                WireValue::Integer(n) => n,
+                ref other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, [1, 2, 3], "all three inserts committed, in order");
+
+        drop(client);
+        served.await.unwrap();
+    }
+
+    /// **Correctness-critical (#439).** A batch stops at the first failing
+    /// statement: statements before it committed, the failure is reported with
+    /// its SQL error (so the client re-maps the right MySQL code), and **no
+    /// statement after it ran or committed** — never a silent partial commit of
+    /// the tail.
+    #[tokio::test]
+    async fn a_batch_stops_at_the_first_error_and_runs_nothing_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry(dir.path());
+        let (mut owner, mut client) = tokio::io::duplex(64 * 1024);
+        let owner_registry = registry.clone();
+        let served = tokio::spawn(async move {
+            serve_owner_statements(&mut owner, &owner_registry, "s1", None, || false)
+                .await
+                .unwrap();
+        });
+
+        assert!(matches!(
+            exchange(&mut client, &execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)"))
+                .await
+                .unwrap(),
+            SqlResponse::Ok { .. }
+        ));
+
+        // First insert commits; the second collides on the primary key and
+        // fails; the third must never run.
+        let resp = exchange(
+            &mut client,
+            &batch(&[
+                "INSERT INTO t (id, v) VALUES (10, 1)",
+                "INSERT INTO t (id, v) VALUES (10, 2)",
+                "INSERT INTO t (id, v) VALUES (11, 3)",
+            ]),
+        )
+        .await
+        .unwrap();
+        match resp {
+            SqlResponse::Error { sqlite, closed, .. } => {
+                assert!(sqlite, "a constraint violation is a SQL error, not infrastructure");
+                assert!(!closed, "a batch statement error does not end the stream");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let rows =
+            match exchange(&mut client, &query("SELECT id FROM t ORDER BY id")).await.unwrap() {
+                SqlResponse::Rows { rows, .. } => rows,
+                other => panic!("expected Rows, got {other:?}"),
+            };
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                WireValue::Integer(n) => n,
+                ref other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [10],
+            "only the committed first insert survives — the tail after the error never ran"
+        );
+
+        drop(client);
+        served.await.unwrap();
     }
 }
