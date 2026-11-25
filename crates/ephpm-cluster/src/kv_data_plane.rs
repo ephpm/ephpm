@@ -501,6 +501,47 @@ impl KvRouter {
         ttl_ms: u64,
         stamp: Stamp,
     ) -> Option<bool> {
+        let (verdict, ok) = self.apply_stamped_verdict(transport_key, value, ttl_ms, stamp)?;
+        if verdict == Apply::Skip {
+            tracing::trace!(key = %transport_key, ?stamp, "stamped SET skipped as stale");
+            return Some(true);
+        }
+        Some(ok)
+    }
+
+    /// Like [`apply_stamped`](Self::apply_stamped), but reports whether the
+    /// value was **genuinely written**: `Some(true)` only when the write was
+    /// strictly newer (or first-seen) *and* the store accepted it, `Some(false)`
+    /// when it was ordered out as stale or the store declined it (eviction /
+    /// limit), and `None` when the key claims a vhost this node cannot route.
+    ///
+    /// [`apply_stamped`](Self::apply_stamped) collapses "ordered out as stale"
+    /// into `Some(true)` (the sender's write *did* succeed, it was just
+    /// overtaken), which is the right answer for a replica write but overcounts
+    /// when a caller — large-tier anti-entropy — needs to tally only the copies
+    /// it actually moved forward.
+    pub(crate) fn apply_stamped_wrote(
+        &self,
+        transport_key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        stamp: Stamp,
+    ) -> Option<bool> {
+        let (verdict, ok) = self.apply_stamped_verdict(transport_key, value, ttl_ms, stamp)?;
+        Some(verdict != Apply::Skip && ok)
+    }
+
+    /// The shared core of [`apply_stamped`](Self::apply_stamped) and
+    /// [`apply_stamped_wrote`](Self::apply_stamped_wrote): land `value` through
+    /// the applied map and return the ordering verdict together with whether
+    /// the store accepted the write. `None` when the key is unroutable.
+    fn apply_stamped_verdict(
+        &self,
+        transport_key: &str,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        stamp: Stamp,
+    ) -> Option<(Apply, bool)> {
         let (store, key) = self.resolve(transport_key)?;
         let ttl =
             (ttl_ms > 0).then(|| std::time::Duration::from_millis(ttl_ms.min(MAX_REMOTE_TTL_MS)));
@@ -514,11 +555,7 @@ impl KvRouter {
                 Apply::Newer
             }
         };
-        if verdict == Apply::Skip {
-            tracing::trace!(key = %transport_key, ?stamp, "stamped SET skipped as stale");
-            return Some(true);
-        }
-        Some(ok)
+        Some((verdict, ok))
     }
 
     /// Resolve `transport_key` to its store and the bare key within it.
@@ -2180,6 +2217,31 @@ mod tests {
         }
         writer.join().unwrap();
         assert!(seen > 0, "the reader must have overlapped the writer");
+    }
+
+    /// `apply_stamped_wrote` reports a real write apart from a stale-skip, so
+    /// anti-entropy does not overcount a refresh (#632, Fix 4). `apply_stamped`
+    /// answers `Some(true)` for both an applied write and one ordered out as
+    /// stale; `apply_stamped_wrote` answers `Some(true)` only for the former.
+    #[test]
+    fn apply_stamped_wrote_separates_a_real_write_from_a_stale_skip() {
+        let store = Store::new(ephpm_kv::store::StoreConfig::default());
+        let applied = crate::clustered_store::new_applied_write_map();
+        let router = KvRouter::global(Arc::clone(&store)).with_applied(applied);
+        let older = Stamp { write: 10, node_tag: 1 };
+        let newer = Stamp { write: 20, node_tag: 1 };
+
+        // A first-seen write is a genuine write.
+        assert_eq!(router.apply_stamped_wrote("k", b"v1".to_vec(), 0, older), Some(true));
+        // A strictly-newer write is a genuine write.
+        assert_eq!(router.apply_stamped_wrote("k", b"v2".to_vec(), 0, newer), Some(true));
+        // Re-applying the older stamp is ordered out as stale: `apply_stamped`
+        // still answers `Some(true)` (the sender's write succeeded), but
+        // `apply_stamped_wrote` must report `Some(false)` — nothing moved.
+        assert_eq!(router.apply_stamped("k", b"v1".to_vec(), 0, older), Some(true));
+        assert_eq!(router.apply_stamped_wrote("k", b"v1".to_vec(), 0, older), Some(false));
+        // The newest value is intact.
+        assert_eq!(store.get("k").as_deref(), Some(b"v2".as_slice()));
     }
 
     /// Spawn a data plane listener that handles a single connection.

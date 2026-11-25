@@ -30,7 +30,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Clustered SQLite | **Implemented — experimental** | `litewire` + in-process Turso CDC replication over the cluster channel (no sqld sidecar) |
 | Primary election | **Implemented** | Gossip KV tier (`kv:sqlite:primary`), lowest ordinal wins, TTL heartbeat |
 | KV store (single-node) | **Implemented** | RESP2 server (~65 Redis commands incl. SCAN and hash field TTLs), TTL/expiry, DashMap-backed, SAPI bridge (39 `ephpm_kv_*` functions) for zero-overhead PHP access |
-| KV store (clustering) | **Implemented** | Gossip discovery, `hash % nodes` key ownership, large-value replication (owner + N-1 replicas, async/sync, write-time only) |
+| KV store (clustering) | **Implemented** | Gossip discovery, `hash % nodes` key ownership, large-value replication (owner + N-1 replicas, async/sync, write-time forward placement + periodic large-tier anti-entropy of a node's own copies) |
 | KV compression | **Implemented** | gzip / zstd / brotli for stored values |
 | Clustering / gossip | **Implemented** | SWIM via `chitchat` in `ephpm-cluster` |
 | Admin UI / API | Planned | Management interface — not started |
@@ -519,7 +519,7 @@ Write mode is controlled by `replication_mode`:
 - `"async"` (default) — the client write returns after the primary/local copy is written; the remaining replicas are updated in the background (fire-and-forget, failures logged and counted).
 - `"sync"` — the write also awaits every *reachable* replica before returning (best-effort read-your-writes durability against live peers). A replica that is down is logged but does **not** fail the write; this is not a quorum or consensus protocol, and no rollback is performed.
 
-Replication is **write-time only** — there is no active anti-entropy or rebalancing. A node that was down during a write does not receive the key until it is rewritten or fetched-through, and existing keys are not re-replicated when membership changes.
+Forward placement is **write-time only** — there is no active forward rebalancing, so a node that was down during a write, or that newly owns a key after a membership change, does not receive the key until it is rewritten or fetched-through. A periodic large-tier **anti-entropy** pass (`[cluster.kv] anti_entropy_interval_secs`, default 5 min; `0` disables) reconciles each node's *own* large copies against the current replica set — dropping a copy it no longer owns only when a reachable replica proves a strictly-newer real stamp (an equal, absent, or horizon-pruned stamp is kept), refreshing owned copies from a co-replica holding a strictly newer stamp (newest-stamp-wins), and pushing a disowned copy that is itself strictly newer than the replica set forward to repair the divergence — so origin and ex-replica copies no longer serve stale until a gossip marker arrives (#632). It converges only this node's copies; apart from that repair push it does no active forward rebalancing onto a cold new owner.
 
 ```toml
 [cluster.kv]
@@ -531,7 +531,7 @@ replication_mode = "async"    # async (default) or sync
 
 | Event | What happens |
 |---|---|
-| **Node joins** | Gossip announces the new member. Ownership is recomputed (hash modulo the new node list) — most large-tier keys remap to new owner/replica sets. Because replication is write-time only, a remapped key isn't present on its *new* replicas until it's rewritten or fetched-through; the old replicas may still serve it during read fallback. |
+| **Node joins** | Gossip announces the new member. Ownership is recomputed (hash modulo the new node list) — most large-tier keys remap to new owner/replica sets. Because forward placement is write-time only, a remapped key isn't present on its *new* replicas until it's rewritten or fetched-through; the old (now-disowned) replicas may still serve it during read fallback, until the anti-entropy pass drops that copy once a current replica proves a strictly-newer copy (an equal-stamped copy is kept). |
 | **Node leaves gracefully** | Departure propagates via gossip; ownership is recomputed the same way. Large values it held survive if another replica in their set is still up (`replication_factor ≥ 2`); with `replication_factor = 1` they are gone. |
 | **Node crashes** | Gossip failure detector triggers after missed heartbeats. Surviving nodes recompute ownership and read via replicas — a large value survives up to `replication_factor - 1` simultaneous crashes. With `replication_factor = 1` (or more crashes than replicas) the affected large values are lost. Small gossip-tier values always survive — every node has a copy. |
 | **Network partition** | Nodes on each side continue serving their local keys and any replicas they hold. On heal, conflict resolution via last-write-wins (LWW) timestamps. |

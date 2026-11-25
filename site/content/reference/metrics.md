@@ -565,6 +565,10 @@ Recorded only when `[kv.snapshot] mode != "off"` ([config](/reference/config/#kv
 | `ephpm_kv_handoff_keys_total` | counter | `direction` (`out`, `in`, `gossip-in`) | Large values pushed to peers at shutdown (`out`, one per replica target) and pulled from peers at startup (`in`) on nodes with `peer_handoff`; plus the whole small (gossip) tier pulled from every peer at startup (`gossip-in`) on **every** clustered node — the #631 bulk fill of the gossip tier. |
 | `ephpm_kv_handoff_bytes_total` | counter | `direction` | Value bytes handed off, by direction. |
 | `ephpm_kv_handoff_duration_seconds` | histogram | `direction` | Wall time of the push (`out`), large-value pull (`in`), or gossip-tier bulk pull (`gossip-in`). Bounded by `load_timeout`; the log line says whether it timed out or a peer failed. |
+| `ephpm_kv_anti_entropy_cycles_total` | counter | — | Large-tier anti-entropy passes completed (one every `[cluster.kv] anti_entropy_interval_secs`; `0` disables the pass, so this stays flat). A node alone in the cluster still counts a cycle but scans nothing. |
+| `ephpm_kv_anti_entropy_scanned_total` | counter | — | Local large (data-plane tier) keys examined across all passes. |
+| `ephpm_kv_anti_entropy_dropped_total` | counter | — | Disowned local copies dropped because a reachable replica proved a strictly-newer real copy (or, for a snapshot-restored copy, holds it with a real stamp). Readers then fetch the value through from the replica set. |
+| `ephpm_kv_anti_entropy_refreshed_total` | counter | — | Owned local copies moved forward to a strictly-newer stamp held by a co-replica (genuine writes only; a probe that found nothing newer, or a write ordered out as stale mid-pass, is not counted). |
 
 ```promql
 # A node that started cold for a reason other than "no snapshot yet".

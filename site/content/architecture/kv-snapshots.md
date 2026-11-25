@@ -340,9 +340,14 @@ node's large values, through the pull).
 
 **Follow-ups that would change this.** Bulk gossip-state transfer for a
 fresh chitchat generation (so a rejoining node catches up in seconds, not
-minutes), and anti-entropy for the large tier (so a copy a non-replica
-holds is either refreshed or never served). With both, restoring a
-snapshot next to live peers would be safe again.
+minutes) remains outstanding. Large-tier anti-entropy now ships (#632): a
+periodic pass (`[cluster.kv] anti_entropy_interval_secs`, default 5 min)
+drops a copy a non-replica holds only when a current replica proves a
+strictly-newer real stamp — or, for a snapshot-restored copy of unknown
+order, holds it with any real stamp (#630) — and refreshes an owned copy
+from a co-replica with a strictly newer stamp, so a disowned copy
+(including a snapshot-restored one) stops being served next to live peers
+without waiting for a gossip marker.
 
 **What it does not do.** It does not rebalance on every membership change
 (only the leaving and the joining node move data), it does not hand off

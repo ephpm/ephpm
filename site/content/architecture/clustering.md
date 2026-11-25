@@ -491,7 +491,7 @@ Replication modes (`[cluster.kv] replication_mode`):
 
 Read path: reads try the primary owner first, then fall back to the other replicas in ring order until one returns the value. A large value therefore survives up to `replication_factor - 1` node failures.
 
-> **Membership caveat (v1):** replication is write-time only. There is no active anti-entropy or rebalancing — a node that was down during a write does not receive the key until it is rewritten or fetched-through, and existing keys are not re-replicated when membership changes.
+> **Membership caveat:** *forward placement* is write-time only — there is no active forward rebalancing, so a node that was down during a write, or that newly owns a key after a membership change, does not receive the key until it is rewritten or fetched-through. A periodic large-tier **anti-entropy** pass (`[cluster.kv] anti_entropy_interval_secs`, default 5 min; `0` disables) does reconcile each node's *own* large copies against the current replica set — dropping a copy it no longer owns only when a reachable replica proves a strictly-newer real stamp (an equal, absent, or horizon-pruned stamp is kept), refreshing owned copies from a co-replica with a strictly newer stamp (newest-stamp-wins), and pushing a disowned copy that is itself strictly newer than the replica set forward to repair the divergence — so origin and ex-replica copies no longer serve a stale value until a gossip marker arrives (#632). It only converges this node's copies; apart from that repair push it does no active forward rebalancing onto a cold new owner.
 
 For sessions and cache data, async replication is the right default. PHP apps doing `$_SESSION['cart'] = ...` on one request and reading it on the next hit the same owner (ownership is a deterministic function of the session id and the current membership), so within a stable cluster they get read-your-writes for free.
 
@@ -503,7 +503,7 @@ replication_mode = "async"    # async (default) or sync
 
 ### 5. Node Join / Leave / Failure
 
-Because ownership is `hash % alive_nodes` and replication is write-time only (no active rebalancing), membership changes remap ownership but do **not** move existing data:
+Because ownership is `hash % alive_nodes` and forward placement is write-time only (no active forward rebalancing; the anti-entropy pass reconciles a node's *own* copies — dropping or refreshing them, and pushing one forward only to repair a replica set that holds a strictly-older copy), membership changes remap ownership but do **not** systematically move existing data onto its new owners:
 
 | Event | What happens |
 |-------|-------------|
@@ -721,7 +721,7 @@ Session data is ordinary KV data. Small sessions (under `[cluster.kv] small_key_
 
 Caveats, all from the clustered KV's design:
 
-- Replication is asynchronous by default and write-time only. A session written on one node is visible elsewhere only after gossip converges or the data-plane write completes, and there is no background re-replication after a node loss.
+- Replication is asynchronous by default, and forward placement is write-time only: a session written on one node is visible elsewhere only after gossip converges or the data-plane write completes, and a node loss does not re-replicate a large session onto a new owner (readers fall back to surviving replicas). The large-tier anti-entropy pass drops and refreshes a node's own copies but does not populate a new owner.
 - When membership changes, ownership of large sessions remaps and existing copies are not moved; reads fall back to surviving replicas.
 - `session_destroy()` (a `DEL`, replicated as a tombstone) and lazy-write TTL refreshes (an `EXPIRE`) do replicate, last-arrival-wins, so like every other session write they are eventually consistent rather than immediate.
 - Sessions count against `[kv] memory_limit` and can be evicted under memory pressure like any other key.
@@ -798,7 +798,7 @@ The KV store and clustering should be built incrementally:
 | **6. Gossip** | `chitchat` integration, peer discovery, health, symmetric encryption | Nothing — can start in parallel with Phase 1 |
 | **6b. Data plane PSK encryption** | ChaCha20-Poly1305 sealing of the TCP data plane with a key derived from `[cluster] secret` (symmetric PSK, not mTLS) | Phase 6 |
 | **7. Key ownership** | `hash % nodes` owner selection, local vs remote routing over the (optionally sealed) data plane | Phase 1 + Phase 6b |
-| **8. Replication** | Async/sync large-value replication to `replication_factor` nodes, owner-then-replica read fallback (write-time only; no active rebalancing) | Phase 7 |
+| **8. Replication** | Async/sync large-value replication to `replication_factor` nodes, owner-then-replica read fallback (write-time forward placement; a periodic large-tier anti-entropy pass drops disowned copies and refreshes owned ones, but does not populate a new owner) | Phase 7 |
 | **9. ACME on KV** | Swap `DirCache` for `KvCache` in rustls-acme | Phase 8 |
 | **10. PHP response cache** | ETag interception, 304 short-circuit | Phase 7 |
 | **11. Distributed locks** | TTL-based locks, leader election | Phase 7 |
