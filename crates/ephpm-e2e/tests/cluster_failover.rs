@@ -2,7 +2,7 @@
 //!
 //! This is the live validation for ePHPm's v0.16.2 drain gate (#701) and
 //! `ephpm db restore --reseed` (#704): a graceful drain of the elected primary
-//! must promote a replica **without losing any already-written data**. Two
+//! must promote a replica **without losing any already-written data**. Three
 //! scenarios run here:
 //!
 //! - [`graceful_primary_drain_promotes_a_replica_without_data_loss`] — the drain
@@ -11,13 +11,17 @@
 //!   --reseed` converges a running cluster onto the restored data, each replica
 //!   discarding its own copy. (Offline install correctness is unit-tested in the
 //!   `ephpm` crate; this proves the live end-to-end convergence.)
+//! - [`hard_kill_primary_promotes_a_replica_without_corrupting_replicated_data`]
+//!   — #732: a SIGKILL of the primary (no graceful drain) still promotes a
+//!   survivor with the already-replicated data intact and fresh writes accepted
+//!   only once the new primary's apply pipeline has settled.
 //!
 //! # What this proves, and how it differs from `turso_cdc.rs`
 //!
 //! The sibling [`turso_cdc`](super) suite already covers a **hard-kill** failover
 //! (SIGKILL the primary) observed over litewire's **Hrana** HTTP API, keyed on
-//! the `ephpm_cdc_subscribers` metric. This suite holds two MySQL-wire scenarios
-//! on a different axis:
+//! the `ephpm_cdc_subscribers` metric. This suite holds three MySQL-wire
+//! scenarios on a different axis:
 //!
 //! - **Graceful drain, not a crash**
 //!   ([`graceful_primary_drain_promotes_a_replica_without_data_loss`]). The

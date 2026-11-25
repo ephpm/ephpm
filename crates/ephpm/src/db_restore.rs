@@ -58,8 +58,8 @@ pub struct RestoreRequest {
     /// into the restored image so every replica force-discards its old data and
     /// cold re-bootstraps from this node on restart, instead of the manual "wipe
     /// every other node's `.db`" step. Works for whole-database clustered
-    /// (v0.16.2, every node on v0.16.2+) and per-site clustered (v0.16.3 / #707,
-    /// every node on v0.16.3+). Rejected only in single-node mode — a single,
+    /// (v0.16.2, every node on v0.16.2+) and per-site clustered (v0.20.0 / #707,
+    /// every node on v0.20.0+). Rejected only in single-node mode — a single,
     /// non-clustered database has no replicas to reseed.
     pub reseed: bool,
 }
@@ -137,19 +137,24 @@ enum ClusterRestoreKind {
     /// higher `SiteVersion` epoch could overwrite the restore silently —
     /// convergence then needs the manual wipe procedure.
     ///
-    /// With `--reseed` (v0.16.3, #707), the restore stamps a monotonic reseed
+    /// With `--reseed` (v0.20.0, #707), the restore stamps a monotonic reseed
     /// generation into the site's `.db` (`db_backup::stamp_reseed_generation`),
     /// which the site's owner advertises in its CDC `Hello`/snapshot header and
     /// which **dominates** the per-site `SiteVersion` order. A replica that sees
     /// a newer generation force-discards and cold re-bootstraps from the owner
     /// (`run_site_replication` → `ReseedRequired` → `force_reset`), and a stale
-    /// peer that carries a higher epoch can no longer out-rank the restore in the
-    /// ownership-settle decision — so neither the tail-on-top mix nor the
-    /// higher-epoch silent overwrite can happen. The procedure mirrors
-    /// whole-database: stop every node, `ephpm db restore --reseed --site <key>`
-    /// on one node, start it first, then the others (which auto-converge).
-    /// Requires every node on v0.16.3+; an older peer ignores the signal and
-    /// stays divergent (fail-safe, not corruption).
+    /// peer that carries a higher epoch can no longer out-rank the restore —
+    /// neither in the ownership-settle decision (reseed dominance) nor in the
+    /// ownership-handoff pull, which is ranked by durable version and installs
+    /// only a copy strictly newer than the local one (#707) — so neither the
+    /// tail-on-top mix nor the higher-epoch silent overwrite can happen. This
+    /// convergence is implemented and unit-tested but not yet live-cluster
+    /// validated. The procedure mirrors whole-database: stop every node, `ephpm db
+    /// restore --reseed --site <key>` on one node, start it first, then the others
+    /// (which auto-converge). Requires every node on v0.20.0+; until a node is
+    /// upgraded to v0.20.0 and the reseed re-run it does not honor the signal, and
+    /// an older HRW owner actively serves its stale copy (fail-safe against
+    /// corruption, but divergent).
     PerSite,
 }
 
@@ -222,7 +227,7 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
 }
 
 /// `--reseed` automates convergence for a **clustered** restore — whole-database
-/// (v0.16.2) or per-site (v0.16.3, #707). It is refused, rather than silently
+/// (v0.16.2) or per-site (v0.20.0, #707). It is refused, rather than silently
 /// ignored, only for a single, non-clustered database: there are no replicas to
 /// reseed. Fail-closed, pointing at the right path.
 ///
@@ -496,19 +501,22 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
                  restored `.db` is stamped with a new reseed generation, which the site's owner \
                  advertises and which dominates the per-site version order — so a peer that still \
                  holds the site force-discards it and cold re-bootstraps from the owner, and a peer \
-                 returning with a higher ownership epoch can no longer overwrite the restore. \
+                 returning with a higher ownership epoch can no longer overwrite the restore (the \
+                 handoff pull is ranked by version and installs only a strictly newer copy — \
+                 implemented and unit-tested, not yet live-cluster-validated). \
                  Required procedure: (1) stop EVERY node; (2) run `ephpm db restore --reseed \
                  --site <key>` on one node; (3) start that node FIRST, then the others — each peer \
                  holding the site auto-discards and re-bootstraps; (4) verify each converged (its \
                  log shows \"force-discarding local data and cold re-bootstrapping\" then \
-                 ephpm_cdc_bootstrap_total{{outcome=\"handoff_ok\"}}). --reseed requires EVERY node \
-                 on v0.16.3 or newer; an older peer ignores the signal and stays divergent (it \
-                 keeps its old data — fail-safe, not corruption), so upgrade every node first. \
-                 See https://ephpm.dev/roadmap/clustered-db-backups/ ."
+                 ephpm_cdc_bootstrap_total{{outcome=\"ok\"}}). --reseed requires EVERY node \
+                 on v0.20.0 or newer; until a node is upgraded to v0.20.0 and the reseed re-run it \
+                 does not honor the signal, and if it is the site's HRW owner it ACTIVELY SERVES \
+                 its stale copy (fail-safe against corruption, but divergent), so upgrade every \
+                 node first. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
             );
             "This installs an EXPERIMENTAL per-site clustered restore on THIS node and stamps a \
              reseed generation so peers auto-discard and re-bootstrap. Confirm every node is \
-             stopped and every node runs v0.16.3+ before starting the cluster."
+             stopped and every node runs v0.20.0+ before starting the cluster."
         }
         Some(ClusterRestoreKind::PerSite) => {
             // F5 (per-site): a PLAIN restore of a site that was reseeded before
@@ -539,7 +547,7 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
                  node; (2) restore on this node; (3) DELETE this site's <key>.db and its -wal/-shm \
                  on EVERY OTHER node so they cold-bootstrap from here; (4) start THIS node FIRST, \
                  then the wiped peers; (5) verify each peer re-bootstrapped the site. Pass --reseed \
-                 (every node on v0.16.3+) to automate step 3. \
+                 (every node on v0.20.0+) to automate step 3. \
                  See https://ephpm.dev/roadmap/clustered-db-backups/ ."
             );
             "This installs an EXPERIMENTAL per-site clustered restore on THIS node. Confirm every \
@@ -589,11 +597,11 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // `--reseed` (whole-database clustered only, gated above): stamp a monotonic
-    // reseed generation so a replica force-discards its old data and cold
-    // re-bootstraps from this node. After the strip (which dropped any stale
-    // reseed table) and before verification, so the integrity check sees the
-    // final shape.
+    // `--reseed` (whole-database OR per-site clustered — both are gated and
+    // warned above): stamp a monotonic reseed generation so a replica/peer
+    // force-discards its old data and cold re-bootstraps from this node. After the
+    // strip (which dropped any stale reseed table) and before verification, so the
+    // integrity check sees the final shape.
     if req.reseed {
         let now_ms = u64::try_from(
             std::time::SystemTime::now()
@@ -624,9 +632,17 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
             );
             return Ok(ExitCode::from(2));
         }
+        // The upgrade floor differs by topology: whole-database reseed shipped in
+        // v0.16.2, per-site reseed in v0.20.0 (#707). A node below the floor does
+        // not honor the signal — the restore is not applied cluster-wide until
+        // every node is upgraded past it and the reseed re-run.
+        let floor = match target.cluster {
+            Some(ClusterRestoreKind::PerSite) => "v0.20.0",
+            _ => "v0.16.2",
+        };
         println!(
-            "reseed:  stamped generation {generation} — replicas on v0.16.2+ will force-discard \
-             and cold re-bootstrap from this node on restart"
+            "reseed:  stamped generation {generation} — replicas/peers on {floor}+ will \
+             force-discard and cold re-bootstrap from this node on restart"
         );
     }
 

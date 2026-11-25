@@ -17,7 +17,7 @@
 //! lexicographically:
 //!
 //! - `reseed_gen` is the per-site **reseed generation** stamped by `ephpm db
-//!   restore --reseed` (v0.16.3 for per-site; [`turso_cdc`'s
+//!   restore --reseed` (v0.20.0 for per-site; [`turso_cdc`'s
 //!   `RESEED_GEN_TABLE`](crate::turso_cdc)). It **dominates** the ordering: an
 //!   operator-restored copy out-ranks every copy that predates the restore
 //!   regardless of epoch or head, so a stale peer that happens to carry a higher
@@ -83,10 +83,10 @@ impl PartialOrd for SiteVersion {
 ///
 /// The `reseed_gen` field is **appended only when non-zero**, so a site that has
 /// never been reseeded (the common case) advertises the exact two-field value a
-/// pre-v0.16.3 node published — byte-identical, and still decodable by an older
+/// pre-v0.20.0 node published — byte-identical, and still decodable by an older
 /// node. A node on an older build that reads a three-field value decodes `None`
 /// (an unparseable head), i.e. "no usable peer version" — the fail-safe
-/// direction, and why per-site `--reseed` requires every node on v0.16.3+.
+/// direction, and why per-site `--reseed` requires every node on v0.20.0+.
 pub(crate) fn encode(v: SiteVersion) -> Vec<u8> {
     if v.reseed_gen == 0 {
         format!("{}:{}", v.epoch, v.head).into_bytes()

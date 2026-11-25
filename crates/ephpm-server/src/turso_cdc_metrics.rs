@@ -170,11 +170,12 @@ pub const METRIC_APPLY_DURATION: &str = "ephpm_cdc_apply_duration_seconds";
 /// `outcome` (`closed` / `dial_error` / `stream_error` / `watermark_error`).
 pub const METRIC_REPLICA_CONNECTS: &str = "ephpm_cdc_replica_connects_total";
 /// Counter: cold-start snapshot bootstrap outcomes. Label: `outcome`
-/// (`ok` / `skipped` / `failed` in whole-database mode; `handoff_ok` /
-/// `handoff_new` / `handoff_blocked` / `handoff_contended` for a per-site
-/// ownership handoff — `handoff_contended` is an install that lost a race for
-/// the local write lock and fast-retries, distinct from a peer-unreachable
-/// `handoff_blocked`).
+/// (`ok` / `skipped` / `failed` in whole-database mode; per-site mode also uses
+/// `ok` for a replica bootstrap — a fresh/cold replica or a `--reseed`
+/// re-bootstrap — and `handoff_ok` / `handoff_new` / `handoff_blocked` /
+/// `handoff_contended` for a cold new owner's ownership handoff —
+/// `handoff_contended` is an install that lost a race for the local write lock
+/// and fast-retries, distinct from a peer-unreachable `handoff_blocked`).
 pub const METRIC_BOOTSTRAP: &str = "ephpm_cdc_bootstrap_total";
 /// Counter: snapshot dump bytes received during bootstrap.
 pub const METRIC_SNAPSHOT_BYTES_RECEIVED: &str = "ephpm_cdc_snapshot_bytes_received_total";
@@ -583,9 +584,11 @@ pub fn record_snapshot_received(bytes: u64, elapsed: Duration) {
 
 /// Record the outcome of the cold-start bootstrap decision. `outcome` is
 /// `ok`, `skipped` (local DB already populated) or `failed` (retry budget
-/// exhausted — startup aborts); per-site mode records `handoff_ok`,
-/// `handoff_new`, `handoff_blocked` and `handoff_contended` (see
-/// `turso_cdc::settle_site_serving`).
+/// exhausted — startup aborts). Per-site mode also records `ok` for a **replica**
+/// bootstrap (a fresh/cold replica or a `--reseed` re-bootstrap — the series that
+/// confirms a per-site reseed convergence, #707), and records `handoff_ok`,
+/// `handoff_new`, `handoff_blocked` and `handoff_contended` for a cold new
+/// **owner**'s ownership handoff (see `turso_cdc::settle_site_serving`).
 pub fn record_bootstrap(outcome: &'static str) {
     counter!(METRIC_BOOTSTRAP, "outcome" => outcome).increment(1);
 }

@@ -730,7 +730,7 @@ enum DbCommand {
         /// old data and cold re-bootstraps from this node on restart — the
         /// automatic replacement for the manual "wipe every other node's `.db`"
         /// step. Works for whole-database (requires every node on v0.16.2+) and
-        /// per-site clustered (requires every node on v0.16.3+); an older peer
+        /// per-site clustered (requires every node on v0.20.0+); an older peer
         /// ignores the signal and stays divergent — fail-safe, not corruption.
         /// Rejected in single-node mode (no replicas to reseed).
         #[arg(long)]

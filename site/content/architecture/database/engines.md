@@ -513,7 +513,7 @@ What it is and is not:
   experimental for both topologies**: a *plain* restore does not auto-converge a
   running cluster (a replica still holding old data tails the restore on top of
   it). `ephpm db restore --reseed` automates convergence — whole-database since
-  v0.16.2, per-site since v0.16.3 (#707): it stamps a reseed generation so every
+  v0.16.2, per-site since v0.20.0 (#707): it stamps a reseed generation so every
   peer force-discards and cold re-bootstraps from the restored node (for per-site
   the generation dominates the `SiteVersion` order, so a higher-epoch peer cannot
   overwrite the restore). Every node must still be stopped and the restored node

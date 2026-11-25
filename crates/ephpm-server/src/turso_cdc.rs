@@ -1859,7 +1859,7 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 /// is recorded under `site`. `honor_reseed` is whether this replica path honors
 /// the reseed force-discard signal (`ephpm db restore --reseed`): the predicate
 /// is evaluated only when true. Both clustered modes set it now — whole-database
-/// since v0.16.2 and per-site since v0.16.3 (#707) — and the per-site owner only
+/// since v0.16.2 and per-site since v0.20.0 (#707) — and the per-site owner only
 /// ever advertises a non-zero generation on a file an operator actually reseeded
 /// (`stamp_reseed_generation` writes the per-site `.db`), so honoring it on both
 /// paths is safe; a site that has never been reseeded advertises `0`, which
@@ -1892,7 +1892,7 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     adopt_site_epoch(factory, source_epoch).await;
 
     // Automatic reseed convergence (`ephpm db restore --reseed`; whole-database
-    // v0.16.2, per-site v0.16.3 / #707). Before resolving a watermark or
+    // v0.16.2, per-site v0.20.0 / #707). Before resolving a watermark or
     // subscribing, check whether the owner advertised a reseed generation
     // **strictly greater** than this node has adopted — the signal that the
     // operator installed fresh origin data on the owner and this replica must
@@ -5151,31 +5151,110 @@ async fn probe_peer_version(
     })
 }
 
-/// The freshest site version known from a **durable** source: the gossip advert
-/// folded with every alive candidate peer's persisted epoch (probed header-only
-/// over the channel). Closes the #654 crash-restart hole where a returning
-/// owner could not learn the interim owner's higher epoch once the interim
-/// owner released ownership and its 10 s advert lapsed.
+/// Every alive candidate peer's **durable** site version for `site`, probed
+/// header-only over the cluster channel ([`probe_peer_version`]). `(peer,
+/// version)` for each peer that answered; a peer that holds no copy or is
+/// unreachable reports no version and is omitted — it cannot rank or justify a
+/// pull, though it is still asked in the pull search (it may hold a copy its
+/// header probe could not report).
 ///
-/// Only called for a **warm owner** — the one case that can serve a stale copy
-/// and so needs the robust answer. Settle rounds happen only on an ownership
+/// This per-peer form does two jobs (#654, #707):
+///
+/// - folded with the gossip advert it gives `best_peer` — the freshest version
+///   any peer holds — which [`decide_warm_settle`](crate::site_version::decide_warm_settle)
+///   compares against the local copy. The advert alone is insufficient for a
+///   **warm owner**: the interim owner stops advertising the instant it releases
+///   ownership and the advert lapses after `SITE_VERSION_TTL` (10 s), so a
+///   returning owner that settles a little later would see no fresher peer and
+///   serve stale (#654). Probing peers' *persisted* epoch directly over the
+///   channel closes that hole.
+/// - it ranks the ownership-handoff pull candidates freshest-first
+///   ([`rank_candidates_by_version`]) and gates the install
+///   ([`gate_probe_by_version`]), so a discard is only ever justified by a copy
+///   strictly newer than the local one — a reseeded owner-elect never installs a
+///   stale lower-generation peer's copy over its restore (#707).
+///
+/// Only called for an **owner** — the only role that pulls, and the warm-owner
+/// case that can serve a stale copy. Settle rounds happen only on an ownership
 /// change, so probing the candidates here is infrequent; each probe is bounded
 /// by [`HANDOFF_PROBE_TIMEOUT`], as the existing handoff probe already is.
-async fn best_peer_version_durable(
+async fn peer_versions_durable(
     channel: &ephpm_cluster::ChannelHandle,
     site: &str,
-    advert: Option<crate::site_version::SiteVersion>,
     candidates: &[NodeInfo],
-) -> Option<crate::site_version::SiteVersion> {
+) -> Vec<(NodeInfo, crate::site_version::SiteVersion)> {
     let mut peer_versions = Vec::new();
     for peer in candidates {
         if let Some(addr) = crate::sql_forward::member_channel_addr(peer)
             && let Some(v) = probe_peer_version(addr, channel, site).await
         {
-            peer_versions.push(v);
+            peer_versions.push((peer.clone(), v));
         }
     }
-    crate::site_version::fold_best_version(advert, peer_versions)
+    peer_versions
+}
+
+/// The [`SiteVersion`](crate::site_version::SiteVersion) a snapshot header
+/// carries: its reseed generation, ownership epoch and watermark (the stint
+/// head). Used to version-gate an ownership-handoff pull against the local copy.
+fn header_site_version(header: &SnapshotHeader) -> crate::site_version::SiteVersion {
+    crate::site_version::SiteVersion {
+        reseed_gen: header.reseed_gen,
+        epoch: header.epoch,
+        head: header.watermark,
+    }
+}
+
+/// Order handoff candidates so the peer advertising the **freshest** durable
+/// version (from [`peer_versions_durable`]) is asked for its snapshot first, then
+/// the rest. A candidate without a probed version keeps its HRW position *after*
+/// every versioned peer — deprioritised, never dropped, because it may still hold
+/// a copy its header probe could not report. `sort_by` is stable, so the HRW
+/// order the handoff already relies on is preserved within each group.
+fn rank_candidates_by_version(
+    candidates: &[NodeInfo],
+    peer_versions: &[(NodeInfo, crate::site_version::SiteVersion)],
+) -> Vec<NodeInfo> {
+    let version_of = |id: &str| peer_versions.iter().find(|(p, _)| p.id == id).map(|(_, v)| *v);
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|a, b| match (version_of(&a.id), version_of(&b.id)) {
+        (Some(va), Some(vb)) => vb.cmp(&va),         // freshest first
+        (Some(_), None) => std::cmp::Ordering::Less, // a versioned peer before an unversioned one
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal, // keep incoming HRW order
+    });
+    ranked
+}
+
+/// Version-gate an ownership-handoff probe against the local copy's version
+/// (#707). A discard-and-replace is only ever justified by a copy **strictly
+/// newer** than the one already held, so a [`PeerProbe::Data`] whose snapshot
+/// header is not newer than `own` is demoted to [`PeerProbe::NoCopy`]: the search
+/// keeps looking, and the round ends `Blocked` (refuse, WARN, retry) if no peer
+/// offers a newer copy — never replacing good local data (a fresh operator
+/// reseed, say) with a staler peer's that merely answered first. `NoCopy` and
+/// `Unreachable` pass through unchanged.
+///
+/// A cold owner's `own` is the empty version `(0, 0, 0)`, which every real data
+/// copy (ownership epoch ≥ 1 once it has ever served) out-ranks, so the gate is
+/// a no-op there beyond preferring the freshest peer — a genuinely new site is
+/// still served empty by the `handoff_verdict` path.
+///
+/// This does **not** weaken [`snapshot_may_replace_local_data`]'s empty-snapshot
+/// refusal or the `__ephpm_cdc_source` lineage invariant — it is an additional
+/// filter on *which* peer may justify a discard, applied before the install,
+/// which still runs every one of those checks.
+fn gate_probe_by_version(probe: PeerProbe, own: crate::site_version::SiteVersion) -> PeerProbe {
+    match probe {
+        PeerProbe::Data { header, dump, received } => {
+            if header_site_version(&header) > own {
+                PeerProbe::Data { header, dump, received }
+            } else {
+                PeerProbe::NoCopy
+            }
+        }
+        other => other,
+    }
 }
 
 /// What a cold owner does when no peer answered with data.
@@ -5509,8 +5588,22 @@ async fn settle_round(
     // adopts the epoch anyway (a cold owner's handoff), so the plain advert is
     // enough and the extra probe is skipped.
     let advert = read_advertised_site_version(cluster, site).await;
+    // Per-peer durable versions over the channel (header-only). Only an OWNER
+    // pulls, so these are probed only when this node owns the site. They do two
+    // jobs (#654, #707): (1) folded with the advert they give `best_peer`, which
+    // `decide_warm_settle` compares against this copy for the warm-owner block
+    // decision; (2) they rank the pull candidates freshest-first and gate the
+    // install, so a discard is only ever justified by a strictly newer copy — a
+    // reseeded owner-elect never installs a stale lower-generation peer's copy
+    // over its restore. A non-owner never pulls as owner and uses only the
+    // advert.
+    let peer_versions = if owner_is_self {
+        peer_versions_durable(channel, site, &candidates).await
+    } else {
+        Vec::new()
+    };
     let best_peer = if !cold && owner_is_self {
-        best_peer_version_durable(channel, site, advert, &candidates).await
+        crate::site_version::fold_best_version(advert, peer_versions.iter().map(|(_, v)| *v))
     } else {
         advert
     };
@@ -5547,13 +5640,22 @@ async fn settle_round(
         return SettleRound::NotOwner;
     }
 
-    let search = search_peers_for_copy(&candidates, |peer| {
+    // Rank the pull candidates freshest-first by their durable version, and
+    // version-gate each snapshot against our local copy (#707): only a copy
+    // strictly newer than `own` may replace it. A cold owner's `own` is the empty
+    // version, so every real data copy passes and the freshest is taken; a
+    // warm-but-behind owner (`discard_local`) takes the freshest copy strictly
+    // newer than its stale one, never a staler peer that merely answers first
+    // (which would silently overwrite a fresh reseed with an older copy).
+    let ranked = rank_candidates_by_version(&candidates, &peer_versions);
+    let search = search_peers_for_copy(&ranked, |peer| {
         let addr = crate::sql_forward::member_channel_addr(peer);
         async move {
-            match addr {
+            let probe = match addr {
                 Some(addr) => probe_peer(addr, channel, max_snapshot_bytes, site).await,
                 None => PeerProbe::Unreachable("its gossip address is unusable".to_string()),
-            }
+            };
+            gate_probe_by_version(probe, own)
         }
     })
     .await;
@@ -5584,7 +5686,7 @@ async fn settle_round(
                     site = %site,
                     source = %peer.id,
                     watermark = header.watermark,
-                    source_rank = candidates.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
+                    source_rank = ranked.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
                     caught_up = discard_local,
                     "ownership handoff complete: pulled the site's data from a peer before serving it"
                 );
@@ -5914,6 +6016,13 @@ async fn bootstrap_site_from(
             .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
     }
     cdc_metrics::record_snapshot_received(received, started.elapsed());
+    // A per-site replica bootstrap (a fresh/cold replica, or a `--reseed`
+    // force-discard re-bootstrap — #707) records the same `outcome="ok"` the
+    // whole-database cold bootstrap does, so an operator can verify a per-site
+    // reseed convergence by watching `ephpm_cdc_bootstrap_total{outcome="ok"}`
+    // rise on each converging node. Owner-settle records `handoff_ok`
+    // separately; a reseeded replica never reaches that path.
+    cdc_metrics::record_bootstrap("ok");
     cdc_metrics::record_applied_watermark(site, header.watermark);
     Ok(header.watermark)
 }
@@ -7519,6 +7628,115 @@ mod tests {
 
         // A sole member has nobody to ask.
         assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
+    }
+
+    /// **#707 (d), the 3-node ownership-handoff hazard this PR's headline feature
+    /// turned on.** A reseeded copy of a site must win the ownership-handoff pull
+    /// even when a *staler* peer that merely holds a higher ownership epoch sits
+    /// earlier in HRW order. Before the version ranking + gate, `settle_round`
+    /// installed the first HRW candidate that declared a table, ignoring its
+    /// `(reseed_gen, epoch, head)` — so a warm-but-behind owner discarded its copy
+    /// and replaced it with a stale, *non-reseeded* peer's, silently undoing an
+    /// operator restore. The prior tests only covered `decide_warm_settle` on 2
+    /// nodes, which never exercises the pull, which is why this slipped through.
+    ///
+    /// This drives the exact production pull: rank the candidates by their durable
+    /// version ([`rank_candidates_by_version`]), then probe + version-gate each
+    /// ([`gate_probe_by_version`]). The `old` witness at the end reproduces the
+    /// pre-fix behaviour (first HRW candidate wins) to pin what the fix prevents.
+    #[tokio::test]
+    async fn a_reseed_wins_the_handoff_pull_over_a_staler_higher_epoch_peer() {
+        use crate::site_version::SiteVersion;
+
+        // A snapshot-header probe answer carrying a given version, one table.
+        fn data(reseed_gen: u64, epoch: u64, head: i64) -> PeerProbe {
+            PeerProbe::Data {
+                header: SnapshotHeader {
+                    watermark: head,
+                    total_len: 0,
+                    log_id: "log-x".to_string(),
+                    no_copy: false,
+                    epoch,
+                    reseed_gen,
+                },
+                dump: "CREATE TABLE t (a);".to_string(),
+                received: 0,
+            }
+        }
+
+        // This owner-elect is WARM but behind: its copy predates the restore.
+        let own = SiteVersion { reseed_gen: 0, epoch: 2, head: 50 };
+
+        // `reseed` holds the operator restore (generation 5, a fresh low epoch).
+        // `stale_hi` holds a PRE-reseed copy at a far higher ownership epoch —
+        // newer than `own`, but not the restore. `empty` holds no copy. HRW order
+        // deliberately puts the stale peer FIRST, so a first-wins pull takes it.
+        let reseed = alive("ephpm-reseed", "10.0.0.2");
+        let stale_hi = alive("ephpm-stale", "10.0.0.1");
+        let empty = alive("ephpm-empty", "10.0.0.3");
+        let candidates = vec![stale_hi.clone(), reseed.clone(), empty.clone()];
+
+        let peer_versions = vec![
+            (stale_hi.clone(), SiteVersion { reseed_gen: 0, epoch: 9, head: 100 }),
+            (reseed.clone(), SiteVersion { reseed_gen: 5, epoch: 1, head: 3 }),
+        ];
+
+        // Ranking puts the reseed first — reseed_gen dominates epoch/head — even
+        // though the stale peer leads in HRW order.
+        let ranked = rank_candidates_by_version(&candidates, &peer_versions);
+        assert_eq!(ranked[0].id, "ephpm-reseed", "the reseed must be asked first");
+
+        let found = search_peers_for_copy(&ranked, |peer: &NodeInfo| {
+            let answer = match peer.id.as_str() {
+                "ephpm-reseed" => data(5, 1, 3),
+                "ephpm-stale" => data(0, 9, 100),
+                _ => PeerProbe::NoCopy,
+            };
+            async move { gate_probe_by_version(answer, own) }
+        })
+        .await
+        .found
+        .expect("a copy newer than our own must be found");
+        assert_eq!(
+            found.0.id, "ephpm-reseed",
+            "the reseed, not the stale higher-epoch peer, must win the pull"
+        );
+        assert_eq!(found.1.reseed_gen, 5, "the installed copy is the restore");
+
+        // The gate alone refuses a copy that is NOT strictly newer than ours: a
+        // lone peer at (or below) `own` is demoted to NoCopy, so the round ends
+        // with nothing to install (→ Blocked, never a silent downgrade).
+        let only_stale = vec![stale_hi.clone()];
+        let stale_versions =
+            vec![(stale_hi.clone(), SiteVersion { reseed_gen: 0, epoch: 1, head: 0 })];
+        let ranked_stale = rank_candidates_by_version(&only_stale, &stale_versions);
+        let search_older = search_peers_for_copy(&ranked_stale, |_: &NodeInfo| async move {
+            gate_probe_by_version(data(0, 1, 0), own)
+        })
+        .await;
+        assert!(
+            search_older.found.is_none(),
+            "a peer not strictly newer than our copy must never justify a discard"
+        );
+
+        // Regression witness: the OLD path — search the HRW-ordered candidates
+        // with no version gate — returns the stale higher-epoch peer that leads
+        // HRW order, silently overwriting the reseed. Exactly what the ranking +
+        // gate above prevent.
+        let old = search_peers_for_copy(&candidates, |peer: &NodeInfo| {
+            let answer = match peer.id.as_str() {
+                "ephpm-reseed" => data(5, 1, 3),
+                "ephpm-stale" => data(0, 9, 100),
+                _ => PeerProbe::NoCopy,
+            };
+            async move { answer }
+        })
+        .await;
+        assert_eq!(
+            old.found.expect("the first-wins pull finds the stale peer").0.id,
+            "ephpm-stale",
+            "pre-fix: the first HRW candidate with a table wins — the bug this closes"
+        );
     }
 
     /// **#654 crash-restart, the hole 47ff6093 did not close.** A promotion must

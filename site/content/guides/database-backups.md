@@ -365,18 +365,24 @@ Available only because you opted into the experimental
 [`[db.sqlite.replication] per_site = true`](/reference/config/#dbsqlitereplication-clustered-mode-only).
 Each site is snapshotted once by its HRW owner (`source = "replica"` is not yet
 supported here and falls back to the owner with a `WARN`). **`ephpm db restore
---reseed --site <key>` converges a per-site clustered deployment (v0.16.3+),**
+--reseed --site <key>` converges a per-site clustered deployment (v0.20.0+),**
 the same way the whole-database path does: it stamps a per-site reseed generation
 into the site's `.db`, the site's owner advertises it, and it **dominates the
 per-site `SiteVersion` order** — so a peer that still holds the site
 force-discards it and cold re-bootstraps from the owner, and the former hazard (a
-peer returning with a higher ownership epoch silently overwriting the restore)
-can no longer occur. Procedure: stop every node, `ephpm db restore --reseed
+peer returning with a higher ownership epoch silently overwriting the restore) is
+prevented in the ownership-handoff pull itself, which is ranked by durable
+version and installs only a copy strictly newer than the local one. This
+convergence is **implemented and unit-tested but not yet live-cluster-validated**
+(the live failover harness covers the whole-database path only — see below).
+Procedure: stop every node, `ephpm db restore --reseed
 --site <key>` on one node, start it **first**, then the others. Requires every
-node on **v0.16.3+** (an older peer ignores the signal and stays divergent —
-fail-safe, not corruption). *Without* `--reseed` the **manual wipe procedure**
-applies and the higher-epoch-overwrite hazard remains, so prefer `--reseed`.
-`ephpm db restore` prints the full procedure before it asks you to confirm.
+node on **v0.20.0+**; until a node is upgraded to v0.20.0 and the reseed re-run it
+does not honor the signal, and an older HRW owner **actively serves its stale
+copy** (fail-safe against corruption, but divergent). *Without* `--reseed` the
+**manual wipe procedure** applies and the higher-epoch-overwrite hazard remains,
+so prefer `--reseed`. `ephpm db restore` prints the full procedure before it asks
+you to confirm.
 
 The CLI can only check the local node, so a clustered restore demands every node
 be stopped and asks you to confirm. See the

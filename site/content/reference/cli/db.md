@@ -570,7 +570,7 @@ live database. It is a **file install**, not an SQL replay, and it is
    tails the restored log *on top of* its old rows. So the whole cluster must be
    stopped, and convergence then needs one of two things. Pass **`--reseed`** —
    supported for **whole-database clustered** (every node on v0.16.2+) and
-   **per-site clustered** (every node on v0.16.3+): it stamps a reseed generation
+   **per-site clustered** (every node on v0.20.0+): it stamps a reseed generation
    into the restored image (for per-site, into that site's `.db`) so every peer
    that sees it force-discards its own data and cold re-bootstraps from the
    restored node automatically — restore on one node, start it first, and the
@@ -630,7 +630,7 @@ live database. It is a **file install**, not an SQL replay, and it is
 | `--from <SOURCE>` | configured dest. | `s3://bucket[/prefix]` (the prefix is the configured `s3_path`), a local backup **directory**, or a local `.db` / `.db.gz` **file**. Omit to use the configured `[db.sqlite.backup]` destination (S3 bucket or local `dir`) |
 | `--at <TIME>` | newest | Restore the newest object taken at or before this UTC time; store sources (`s3://` or a directory) only |
 | `-y`, `--yes` | off | Skip the confirmation (required when stdin is not a terminal) |
-| `--reseed` | off | **Clustered only** (rejected in single-node mode — no replicas to reseed): also stamp a reseed generation into the restored image so every replica/peer force-discards its data and cold re-bootstraps from this node on restart — the automatic replacement for the manual "wipe every other node's `.db`" step. Works for **whole-database clustered** (every node on v0.16.2+) and **per-site clustered** (every node on v0.16.3+); an older peer ignores the signal and stays divergent — fail-safe, not corruption |
+| `--reseed` | off | **Clustered only** (rejected in single-node mode — no replicas to reseed): also stamp a reseed generation into the restored image so every replica/peer force-discards its data and cold re-bootstraps from this node on restart — the automatic replacement for the manual "wipe every other node's `.db`" step. Works for **whole-database clustered** (every node on v0.16.2+) and **per-site clustered** (every node on v0.20.0+); an older peer ignores the signal and stays divergent — fail-safe, not corruption |
 
 ### Exit codes
 
