@@ -744,9 +744,10 @@ impl FpmPool {
         // prove replacements come from the unsandboxed spawner (fresh Landlock
         // lineage) and never from a sandboxed pool thread.
         #[cfg(test)]
-        self.spawn_origins.lock().unwrap().push(
-            std::thread::current().name().unwrap_or("<unnamed>").to_string(),
-        );
+        self.spawn_origins
+            .lock()
+            .unwrap()
+            .push(std::thread::current().name().unwrap_or("<unnamed>").to_string());
 
         let pool = Arc::clone(self);
         let thread_id = pool.state.next_id.fetch_add(1, Ordering::Relaxed);
