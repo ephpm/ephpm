@@ -1810,6 +1810,17 @@ struct Cursor {
     last_insert_id: u64,
 }
 
+/// Upper bound on the number of cursors one thread may hold open at once.
+///
+/// Each open cursor buffers a whole materialized result set in Rust heap that
+/// PHP's `memory_limit` / hard limit never sees (it lives outside the Zend
+/// allocator), so an unbounded `for (;;) ephpm_db_cursor_open('SELECT * FROM
+/// big')` would grow RSS with every PHP limit still green. The cap turns that
+/// into a loud per-statement error instead. 64 is far above any legitimate
+/// concurrent-cursor use (callers normally hold one) and well below a level
+/// that could matter for memory on its own.
+const MAX_OPEN_CURSORS: usize = 64;
+
 /// This thread's open cursors. A `Vec` rather than a `HashMap` because a
 /// request holds a small handful of cursors (usually one), the lookup is a
 /// short linear scan, and `Vec::new` is `const` so the thread-local initializes
@@ -1932,6 +1943,23 @@ fn cursor_open_on(bridge: Option<&DbBridge>, sql: &[u8]) -> CursorOpen {
         return CursorOpen::Gone;
     }
 
+    // Resource bound (issue #264): refuse once this thread already holds
+    // `MAX_OPEN_CURSORS`, BEFORE executing/materializing another result set.
+    // Staged with the same `ER_UNKNOWN_ERROR` / `HY000` shape as a screen
+    // rejection, so the C accessor side needs no new branch. `DB_CURSORS` is
+    // live (just gated above).
+    let open_now = DB_CURSORS.with(|c| c.borrow().cursors.len());
+    if open_now >= MAX_OPEN_CURSORS {
+        let staged = stage_error(BridgeError {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: format!(
+                "too many open cursors ({open_now}); close one with ephpm_db_cursor_close()"
+            ),
+        });
+        return if staged == RunStatus::Gone { CursorOpen::Gone } else { CursorOpen::Err };
+    }
+
     match produce_result(bridge, sql, &params) {
         Ok(result) => stage_cursor(result),
         Err(RunFailure::Error(e)) => {
@@ -2029,12 +2057,21 @@ pub fn cursor_close(handle: u64) -> bool {
     DB_CURSORS.try_with(|c| c.borrow_mut().remove(handle)).unwrap_or(false)
 }
 
-/// Close every cursor this thread left open and reset the handle counter.
+/// Close every cursor this thread left open.
 ///
 /// Called from [`on_request_end`] so a request's cursors never leak into the
 /// next request on a persistent worker thread. Pure heap frees (no session, no
 /// engine), so it is safe anywhere, including a retiring thread — `try_with`
 /// makes it a no-op there (the thread-local's own destructor frees the rows).
+///
+/// The handle counter (`next`) is deliberately **not** reset. In worker mode
+/// the thread-local survives the request, so resetting it to 1 would let the
+/// next request's `cursor_open` re-issue handle 1; a stale integer held by a
+/// long-lived object from the previous request would then address a *different*
+/// cursor instead of failing with "unknown handle". Keeping `next` monotonic
+/// per thread makes that aliasing impossible — the documented "unknown handle"
+/// contract holds across requests. The counter is a `u64` and `insert`'s
+/// roll-over guard covers the (unreachable) wrap.
 fn close_all_cursors() {
     let _ = DB_CURSORS.try_with(|c| {
         let mut table = c.borrow_mut();
@@ -2046,7 +2083,6 @@ fn close_all_cursors() {
             );
             table.cursors.clear();
         }
-        table.next = 1;
     });
 }
 
@@ -3160,6 +3196,69 @@ mod tests {
         on_request_end();
         assert_eq!(open_cursor_count(), 0, "request end must close leaked cursors");
         assert_eq!(cursor_fetch(h, 1), CursorFetch::NoSuchHandle);
+    }
+
+    /// Worker-mode safety: handles must not repeat across requests on a
+    /// persistent thread. A stale handle from request 1 must keep failing in
+    /// request 2 rather than silently addressing request 2's new cursor.
+    #[test]
+    #[serial]
+    fn cursor_handles_do_not_repeat_across_requests() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_cur_wm (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_cur_wm (id) VALUES (1)"), RunStatus::Ok);
+
+        // Request 1 opens a cursor and leaves it for request end to reap.
+        let h1 = open_handle("SELECT id FROM bridge_cur_wm");
+        on_request_end();
+
+        // Request 2 (same thread) opens another cursor. Its handle must differ
+        // from request 1's, and request 1's handle must still be unknown.
+        let h2 = open_handle("SELECT id FROM bridge_cur_wm");
+        assert_ne!(h1, h2, "handle counter must stay monotonic across requests");
+        assert_eq!(
+            cursor_fetch(h1, 1),
+            CursorFetch::NoSuchHandle,
+            "a stale handle from the previous request must not address a live cursor"
+        );
+        assert_eq!(fetch(h2, 1), 1, "the new cursor's own handle still works");
+        assert!(cursor_close(h2));
+        finish();
+    }
+
+    /// A tenant cannot hold unbounded server-side cursor buffers: past
+    /// `MAX_OPEN_CURSORS` the open is refused with an HY000 error rather than
+    /// materializing another result set.
+    #[test]
+    #[serial]
+    fn cursor_open_is_capped() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_cur_cap (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_cur_cap (id) VALUES (1)"), RunStatus::Ok);
+
+        let mut handles = Vec::new();
+        for _ in 0..MAX_OPEN_CURSORS {
+            match cursor_open(b"SELECT id FROM bridge_cur_cap") {
+                CursorOpen::Rows(h) => handles.push(h),
+                other => panic!("open under the cap must succeed: {other:?}"),
+            }
+        }
+        assert_eq!(open_cursor_count(), MAX_OPEN_CURSORS);
+
+        // One past the cap is refused, with nothing new opened.
+        assert_eq!(cursor_open(b"SELECT id FROM bridge_cur_cap"), CursorOpen::Err);
+        with_error(|e| {
+            let (code, _, msg) = e.expect("the cap must stage an error");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert!(msg.contains("too many open cursors"), "got: {msg}");
+        });
+        assert_eq!(open_cursor_count(), MAX_OPEN_CURSORS, "a refused open opens nothing");
+
+        // Closing one frees a slot, and a subsequent open succeeds again.
+        assert!(cursor_close(handles.pop().expect("at least one open cursor")));
+        assert!(matches!(cursor_open(b"SELECT id FROM bridge_cur_cap"), CursorOpen::Rows(_)));
+        on_request_end();
+        finish();
     }
 
     #[test]

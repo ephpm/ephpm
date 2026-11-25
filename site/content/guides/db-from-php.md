@@ -628,11 +628,15 @@ try {
   an integer **handle**. Rows come back from `ephpm_db_cursor_fetch()` in the
   same shape `ephpm_db_query()` returns them (assoc arrays keyed by column
   name, native types). It throws on a SQL or infrastructure error exactly as
-  `ephpm_db_query()` does.
+  `ephpm_db_query()` does. A thread may hold at most **64** cursors open at
+  once; opening a 65th throws `too many open cursors` — close cursors you are
+  done with (see the memory note below).
 - **`ephpm_db_cursor_fetch($handle, $size)`** returns up to `$size` rows
   (default 1). It returns fewer than `$size` — and finally `[]` — as the
   result runs out; an empty array means the cursor is exhausted. `$size` must
-  be at least 1. An unknown handle throws.
+  be at least 1. An unknown handle throws. A fetch is a *continuation* of the
+  opened statement, not a new one, so `ephpm_db_errno()` still reflects the
+  last executed statement (the `open`, or any later query), not the fetch.
 - **`ephpm_db_cursor_close($handle)`** frees the cursor's buffer and returns
   whether the handle was open. It never throws, so it is safe in a `finally`.
   `ephpm_db_columns()` describes the cursor's columns between fetches.
@@ -645,8 +649,13 @@ so that buffer shrinks as you iterate, but ePHPm does not yet stream rows out
 of the engine one page at a time (that needs a litewire primitive and is a
 follow-up to [#264](https://github.com/ephpm/ephpm/issues/264)). So a cursor
 keeps PHP memory flat across a large result, but is **not** a zero-buffer
-constant-memory stream end to end. It is the right tool for an export or a
-batch job; it is not a reason to `SELECT *` a table you only need part of.
+constant-memory stream end to end. That server-side buffer lives in the engine,
+**outside** the Zend allocator, so it is **not** counted against PHP's
+`memory_limit` (or the hard memory limit) — which is why a thread is capped at
+64 open cursors, and why you should close each one as soon as you are done
+rather than rely on `memory_limit` to bound them. It is the right tool for an
+export or a batch job; it is not a reason to `SELECT *` a table you only need
+part of.
 
 A handle is valid **only on the worker thread that opened it** and **only
 until the request ends**. The server closes any cursor a script leaves open at
