@@ -107,6 +107,104 @@ const NON_CONFIG_ENV_VARS: &[&str] = &[
 /// see [`NON_CONFIG_ENV_VARS`].
 const NON_CONFIG_ENV_PREFIXES: &[&str] = &["CLUSTER_URL_", "TEST_"];
 
+/// The default `[php] env_allowlist` — the four safe variable families a
+/// tenant's PHP may see once the process environment has been scrubbed
+/// (multi-tenant breakout audit finding **F1**).
+///
+/// `PATH`, `TZ`, `LANG` and every `LC_*` locale variable: none of them can
+/// carry a secret, name a credential, or change how the dynamic loader or an
+/// interpreter behaves. This is the same posture `ephpm exec` applies to the
+/// children it spawns (`is_passthrough_var` in `crates/ephpm/src/exec_sandbox.rs`),
+/// expressed here as config so an operator can widen it per deployment.
+///
+/// A `*` suffix is a prefix glob (`LC_*` matches `LC_ALL`, `LC_TIME`, ...);
+/// everything else is an exact, case-sensitive name. See [`env_allowlist_matches`].
+pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &["PATH", "TZ", "LANG", "LC_*"];
+
+/// Environment variables ePHPm itself reads **after** the environment is
+/// scrubbed (so they must survive the scrub regardless of the operator's
+/// `[php] env_allowlist`), none of which is a secret PHP must not see.
+///
+/// The `EPHPM_*` entries are the operational, non-config knobs enumerated in
+/// [`NON_CONFIG_ENV_VARS`] that `serve`/`dev` consult once the server is
+/// running — the PHP-pool spin tuning (`ephpm_php::handoff::SpinPolicy`), the
+/// middleware search path and the `github-auth` cdylib override, plus the
+/// Windows service-log route and the crash-handler hook. The worker-mode
+/// bootstrap paths (`EPHPM_APP_BASE`, `EPHPM_WORKER_BOOTSTRAP`, `EPHPM_WP_PATH`)
+/// the org's PHP worker packages read with `getenv()` are kept too — they are
+/// paths, not secrets, and scrubbing them would break worker mode. The unprefixed
+/// entries are the Rust/tokio runtime and host-discovery variables the process
+/// (and its dependencies) read while standing up the tokio runtime and the
+/// cluster identity. The `OTEL_` prefix keeps OpenTelemetry export working.
+///
+/// Config **secrets** (`EPHPM_KV__SECRET`, `EPHPM_CLUSTER__SECRET`, every other
+/// `EPHPM_*` that maps to a config key) are deliberately **absent**: figment
+/// has already read them into [`Config`] by the time the scrub runs, so
+/// dropping them from the live environment costs ePHPm nothing and is exactly
+/// what closes F1. Cloud credentials (`AWS_*`) are likewise absent — the server
+/// caches them into a process-global before the scrub (see
+/// `ephpm_server::cache_aws_credentials`).
+pub const SCRUB_RESERVED_ENV_VARS: &[&str] = &[
+    // PHP-pool dispatch spin tuning, read at pool startup (after the scrub).
+    "EPHPM_DISPATCH_SPIN_US",
+    "EPHPM_DISPATCH_SPIN_PURE",
+    "EPHPM_DISPATCH_SPIN_ADAPTIVE",
+    "EPHPM_FPM_DISPATCH_SPIN_US",
+    // Native-middleware loading (search path + github-auth cdylib override).
+    "EPHPM_MIDDLEWARE_DIR",
+    "EPHPM_GITHUB_AUTH_CDYLIB",
+    // Service / crash plumbing.
+    "EPHPM_SERVICE_LOG_FILE",
+    "EPHPM_FATAL_HANDLER",
+    // Worker-mode bootstrap paths the org's PHP worker packages read via
+    // getenv() (the docs tell operators to export these before `ephpm serve`):
+    // EPHPM_APP_BASE (ephpm/octane-driver), EPHPM_WORKER_BOOTSTRAP
+    // (ephpm/psr15-worker), EPHPM_WP_PATH (ephpm/wordpress-worker). They are
+    // filesystem paths, not secrets, and scrubbing them would silently break
+    // worker mode — so they survive the scrub regardless of the allowlist. The
+    // wordpress-sample EPHPM_SEED_TOKEN is deliberately absent (it is a token;
+    // an operator who needs it names it in [php] env_allowlist).
+    "EPHPM_APP_BASE",
+    "EPHPM_WORKER_BOOTSTRAP",
+    "EPHPM_WP_PATH",
+    // Rust / tokio runtime, built after the scrub.
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "TOKIO_WORKER_THREADS",
+    // Host identity + temp/runtime dirs the runtime and middleware loader use.
+    "HOSTNAME",
+    "XDG_RUNTIME_DIR",
+    "ProgramData",
+    // `ephpm dev --xdebug`.
+    "XDEBUG_MODE",
+];
+
+/// Name prefixes of [`SCRUB_RESERVED_ENV_VARS`] families kept across a scrub.
+const SCRUB_RESERVED_ENV_PREFIXES: &[&str] = &["OTEL_"];
+
+/// Whether `name` is permitted by `allowlist` (the `[php] env_allowlist`).
+///
+/// Each entry is either an exact, case-sensitive variable name or — when it
+/// ends in `*` — a prefix glob (`LC_*` matches `LC_ALL`, `LC_TIME`, ...). A
+/// bare `*` matches everything (an operator's explicit "keep it all", the
+/// allowlist spelling of disabling the scrub). Empty entries never match.
+#[must_use]
+pub fn env_allowlist_matches(allowlist: &[String], name: &str) -> bool {
+    allowlist.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => !entry.is_empty() && entry == name,
+    })
+}
+
+/// Whether `name` is a variable ePHPm itself still needs after the scrub (see
+/// [`SCRUB_RESERVED_ENV_VARS`]), so the scrubber keeps it regardless of the
+/// operator's allowlist.
+#[must_use]
+pub fn env_scrub_reserved(name: &str) -> bool {
+    SCRUB_RESERVED_ENV_VARS.contains(&name)
+        || SCRUB_RESERVED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 /// An `EPHPM_*` environment variable that maps to no configuration key, so
 /// figment drops it on the floor (the root [`Config`] is deliberately
 /// lenient — see its docs).
@@ -4416,6 +4514,12 @@ fn default_true() -> bool {
     true
 }
 
+/// The default `[php] env_allowlist` as an owned `Vec` (see
+/// [`DEFAULT_ENV_ALLOWLIST`]).
+fn default_env_allowlist() -> Vec<String> {
+    DEFAULT_ENV_ALLOWLIST.iter().map(|s| (*s).to_string()).collect()
+}
+
 fn default_kv_snapshot_mode() -> String {
     "off".to_string()
 }
@@ -5217,6 +5321,58 @@ pub struct PhpConfig {
     #[serde(default = "default_admission")]
     pub admission: AdmissionPolicy,
 
+    /// Whether to scrub the process environment before PHP starts
+    /// (multi-tenant breakout audit finding **F1**).
+    ///
+    /// A PHP request reads the *process* environment through `getenv()`,
+    /// `$_ENV` and `phpinfo()`. In a multi-tenant deployment that environment
+    /// holds the operator's secrets — `[kv] secret` / `[cluster] secret` (as
+    /// `EPHPM_KV__SECRET` / `EPHPM_CLUSTER__SECRET`), `AWS_*` credentials, API
+    /// tokens — so any tenant's PHP could read them and, with `[kv] secret`,
+    /// derive every other tenant's database/KV password. When this is `true`
+    /// (the default) ePHPm clears every variable not on [`Self::env_allowlist`]
+    /// (and not on the small internal keep-set ePHPm itself needs,
+    /// [`env_scrub_reserved`]) once, on the single-threaded startup path,
+    /// *before* `php_embed_init()` and before any PHP pool thread exists — so
+    /// `getenv()`, `$_ENV` and `phpinfo()` are clean at the source. Secrets
+    /// ePHPm consumes from the environment are already cached (figment read the
+    /// `EPHPM_*` config at load; `AWS_*` are cached just before the scrub), so
+    /// the scrub never breaks the server.
+    ///
+    /// Scrubbing **cannot** be disabled under `[server] sites_dir` (multi-tenant
+    /// vhosting): `Config::validate` refuses to start, because disabling it
+    /// reopens F1 for every tenant. In a single-site deployment it may be set to
+    /// `false` as an opt-out for an app that reads its own secrets from
+    /// `getenv()`; prefer widening [`Self::env_allowlist`] to naming the exact
+    /// variables that app needs.
+    ///
+    /// Env override: `EPHPM_PHP__SCRUB_ENVIRONMENT=false`.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub scrub_environment: bool,
+
+    /// Environment variable names a tenant's PHP is permitted to see after the
+    /// scrub (multi-tenant breakout audit finding **F1**; see
+    /// [`Self::scrub_environment`]).
+    ///
+    /// Each entry is an exact, case-sensitive variable name, or — when it ends
+    /// in `*` — a prefix glob (`LC_*` matches `LC_ALL`, `LC_TIME`, ...). The
+    /// default is the four safe families [`DEFAULT_ENV_ALLOWLIST`]: `PATH`,
+    /// `TZ`, `LANG` and `LC_*`. Widen it to the exact variables an app legitimately
+    /// reads from `getenv()` / `$_ENV`; never add a secret here. A small internal
+    /// keep-set that ePHPm needs to keep running ([`env_scrub_reserved`]) is
+    /// preserved regardless and need not be listed.
+    ///
+    /// Ignored when [`Self::scrub_environment`] is `false`.
+    ///
+    /// Env override: `EPHPM_PHP__ENV_ALLOWLIST` is not expressible (a list), so
+    /// set this in the TOML config.
+    ///
+    /// Default: [`DEFAULT_ENV_ALLOWLIST`].
+    #[serde(default = "default_env_allowlist")]
+    pub env_allowlist: Vec<String>,
+
     /// Worker-mode configuration (`[php.worker]`). See [`WorkerConfig`].
     ///
     /// Only meaningful when `mode = "worker"` — the subsection is structurally
@@ -6002,6 +6158,29 @@ impl Config {
             return Err(ConfigError::Validation(reason));
         }
 
+        // Fail closed (multi-tenant breakout audit finding F1): the process
+        // environment holds the operator's secrets, and a PHP request reads it
+        // through `getenv()` / `$_ENV` / `phpinfo()`. Under `[server] sites_dir`
+        // one process serves every tenant, so disabling the environment scrub
+        // would let any tenant's PHP read `[kv] secret` / `[cluster] secret`
+        // (and thus mint every other tenant's password), `AWS_*` and any other
+        // secret in the environment. The scrub is therefore mandatory in
+        // multi-tenant mode — refuse to start rather than reopen the breakout.
+        if self.server.sites_dir.is_some() && !self.php.scrub_environment {
+            return Err(ConfigError::Validation(
+                "[php] scrub_environment = false with [server] sites_dir \
+                 (multi-tenant vhosting): a tenant's PHP would read the whole \
+                 process environment via getenv()/$_ENV/phpinfo(), exposing \
+                 [kv] secret, [cluster] secret, AWS_* credentials and every \
+                 other secret to every tenant (audit finding F1). The \
+                 environment scrub cannot be disabled in multi-tenant mode. \
+                 Remove the setting (it defaults to true), and name the \
+                 variables a tenant legitimately needs in [php] env_allowlist, \
+                 or inject them per-site via the override file's [env] table."
+                    .to_string(),
+            ));
+        }
+
         // [kv] eviction_policy: `EvictionPolicy::from_str_lossy` maps every
         // unrecognised string to `allkeys-lru`, so a typo like
         // "allkey-lru" would silently turn `noeviction` into eviction —
@@ -6506,6 +6685,8 @@ impl Default for PhpConfig {
             overload: None,
             shed_after_ms: default_shed_after_ms(),
             admission: default_admission(),
+            scrub_environment: default_true(),
+            env_allowlist: default_env_allowlist(),
             worker: WorkerConfig::default(),
         }
     }
@@ -14005,6 +14186,82 @@ enabled = true
                 assert!(msg.contains("[kv.redis_compat] password"), "should name the fix: {msg}");
             }
         }
+    }
+
+    // ── [php] environment scrub (finding F1) ──────────────────────────────
+
+    #[test]
+    fn env_allowlist_default_is_the_four_safe_families() {
+        let php = PhpConfig::default();
+        assert!(php.scrub_environment, "scrub must default on");
+        assert_eq!(php.env_allowlist, ["PATH", "TZ", "LANG", "LC_*"]);
+    }
+
+    #[test]
+    fn env_allowlist_matches_exact_and_prefix() {
+        let allow = vec!["PATH".to_string(), "LC_*".to_string()];
+        assert!(env_allowlist_matches(&allow, "PATH"));
+        assert!(env_allowlist_matches(&allow, "LC_ALL"));
+        assert!(env_allowlist_matches(&allow, "LC_TIME"));
+        assert!(!env_allowlist_matches(&allow, "PATHOLOGICAL"), "exact match, not prefix");
+        assert!(!env_allowlist_matches(&allow, "LC"), "prefix needs the LC_ stem");
+        assert!(!env_allowlist_matches(&allow, "EPHPM_KV__SECRET"));
+        // A bare `*` keeps everything (the allowlist spelling of "no scrub").
+        assert!(env_allowlist_matches(&["*".to_string()], "ANYTHING"));
+        // An empty entry never matches.
+        assert!(!env_allowlist_matches(&[String::new()], ""));
+    }
+
+    #[test]
+    fn env_scrub_reserved_keeps_operational_not_secrets() {
+        assert!(env_scrub_reserved("EPHPM_MIDDLEWARE_DIR"));
+        assert!(env_scrub_reserved("EPHPM_DISPATCH_SPIN_US"));
+        assert!(env_scrub_reserved("OTEL_EXPORTER_OTLP_ENDPOINT"), "OTEL_ prefix kept");
+        assert!(!env_scrub_reserved("EPHPM_KV__SECRET"), "config secrets are never reserved");
+        assert!(!env_scrub_reserved("AWS_ACCESS_KEY_ID"), "cloud creds are cached, not reserved");
+    }
+
+    #[test]
+    fn env_scrub_reserved_keeps_worker_bootstrap_vars() {
+        // The org's PHP worker packages read these with getenv() after the
+        // scrub; dropping them would silently break worker mode (fold-in b).
+        assert!(env_scrub_reserved("EPHPM_APP_BASE"), "octane-driver app base kept");
+        assert!(env_scrub_reserved("EPHPM_WORKER_BOOTSTRAP"), "psr15-worker bootstrap kept");
+        assert!(env_scrub_reserved("EPHPM_WP_PATH"), "wordpress-worker path kept");
+        // The wordpress-sample seed token is a token, not a worker path, so it
+        // is not auto-kept — an operator names it in [php] env_allowlist.
+        assert!(!env_scrub_reserved("EPHPM_SEED_TOKEN"), "token is not auto-reserved");
+    }
+
+    #[test]
+    fn multi_tenant_scrub_disabled_fails_closed() {
+        // Multi-tenant may not disable the scrub: it would expose every secret
+        // in the environment to every tenant (F1).
+        let mut cfg = kv_matrix_config(true, true, Some("s3cret-value"));
+        cfg.php.scrub_environment = false;
+        let err = cfg.validate().expect_err("multi-tenant + scrub off must fail closed");
+        assert!(matches!(err, ConfigError::Validation(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("scrub_environment"), "error should name the knob: {msg}");
+        assert!(msg.contains("sites_dir"), "error should mention multi-tenant: {msg}");
+        assert!(msg.contains("F1"), "error should cite the finding: {msg}");
+    }
+
+    #[test]
+    fn multi_tenant_scrub_enabled_starts() {
+        // The default (scrub on) is the secure multi-tenant config.
+        let cfg = kv_matrix_config(true, true, Some("s3cret-value"));
+        assert!(cfg.php.scrub_environment, "scrub defaults on");
+        assert!(cfg.validate().is_ok(), "multi-tenant + scrub on is the secure mode");
+    }
+
+    #[test]
+    fn single_site_scrub_disabled_is_allowed() {
+        // Single-site (no sites_dir) may opt out — there is no cross-tenant
+        // exposure, and an app may read its own secrets from getenv().
+        let mut cfg = Config::default();
+        cfg.php.scrub_environment = false;
+        assert!(cfg.validate().is_ok(), "single-site opt-out is permitted");
     }
 
     #[test]
