@@ -395,6 +395,29 @@ mod imp {
                 rw_owned.push(dir);
             }
 
+            // Whole-database modes (single-node whole-DB, whole-DB clustered)
+            // open the single `[db.sqlite].path` file on a PHP thread, and Turso
+            // defers the `-wal`/`-shm` open to the first connect/statement, which
+            // can land on a sandboxed PHP thread. Grant that file's PARENT
+            // directory rw so the deferred open (and its sibling journal files)
+            // is allowed. Per-site modes open `<dir>/<key>.db` instead — the
+            // `dir` grant above covers them and `path` is ignored there — so this
+            // is skipped for them: granting the default `path`'s parent (the cwd)
+            // to the engine would be a needless widening.
+            if let Some(sqlite) = config.db.sqlite.as_ref() {
+                let cluster_enabled = config.cluster.enabled;
+                let per_site = crate::is_per_site_sqlite(config, cluster_enabled)
+                    || crate::is_per_site_clustered(config, cluster_enabled);
+                if !per_site {
+                    let db_path = PathBuf::from(&sqlite.path);
+                    let parent = db_path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+                    rw_owned.push(parent);
+                }
+            }
+
             // A Landlock rule must open each path, so a directory that does not
             // exist yet would be silently dropped by `existing_owned` below and
             // then blocked by the kernel the moment PHP tried to use it. ePHPm
@@ -433,6 +456,16 @@ mod imp {
             // and entropy — deliberately NOT /etc, /proc, or /dev wholesale,
             // which would re-expose /etc/ephpm, /etc/shadow, and other pids'
             // /proc/<pid>/environ.
+            //
+            // `/etc/resolv.conf` is granted as a file leaf, which pins the inode
+            // at arm time. On a systemd-resolved / NetworkManager host it is a
+            // symlink into `/run/systemd/resolve` (or `/run/NetworkManager`), and
+            // those backing files are *regenerated* (new inode) on a network
+            // change — after which the pinned read fails `EACCES` and PHP-thread
+            // DNS breaks until restart. Granting the backing **directories**
+            // read-only (not just the leaf) keeps resolution working across a
+            // regeneration. They hold only public DNS config, no secret. Absent
+            // ones are dropped by `existing`.
             let mut ro: Vec<PathBuf> = existing(&[
                 Path::new("/etc/passwd"),
                 Path::new("/etc/group"),
@@ -443,6 +476,8 @@ mod imp {
                 Path::new("/etc/localtime"),
                 Path::new("/etc/resolv.conf"),
                 Path::new("/etc/hosts"),
+                Path::new("/run/systemd/resolve"),
+                Path::new("/run/NetworkManager"),
                 Path::new("/dev/urandom"),
                 Path::new("/dev/random"),
             ]);
@@ -502,9 +537,47 @@ mod imp {
             .unwrap_or(Enforcement::None)
     }
 
+    /// Whether an error from [`apply`] is Landlock layer-cap exhaustion:
+    /// `E2BIG` from `landlock_restrict_self(2)`, returned when a thread's domain
+    /// already holds `LANDLOCK_MAX_NUM_LAYERS` (16) stacked layers. The landlock
+    /// crate wraps the raw `io::Error` inside
+    /// `RestrictSelfError::RestrictSelfCall`, so walk the `anyhow` source chain
+    /// for an `io::Error` carrying `E2BIG`.
+    fn is_layer_cap_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error)
+                == Some(libc::E2BIG)
+        })
+    }
+
     /// Arm the ruleset on the **current** thread (the PHP pool thread).
     pub(super) fn restrict_current_thread(spec: &SandboxSpec) -> anyhow::Result<()> {
-        match apply(spec).context("self-sandbox: failed to arm Landlock on this PHP thread")? {
+        let status = match apply(spec) {
+            Ok(status) => status,
+            Err(e) if is_layer_cap_error(&e) => {
+                // E2BIG means this thread's Landlock lineage was already at the
+                // 16-layer cap before we stacked our one layer. That is only
+                // possible if a PHP pool thread was (re)spawned from an
+                // already-sandboxed thread instead of the pool's dedicated
+                // unsandboxed spawner — a spawn-lineage bug, never a transient
+                // condition. Name it loudly and distinctly so it is never
+                // mistaken for an ordinary boot failure the pool retries forever
+                // (the very permanent-503 loop this must not become).
+                return Err(e).context(
+                    "self-sandbox: Landlock restrict_self failed with E2BIG — the per-thread \
+                     Landlock layer cap (LANDLOCK_MAX_NUM_LAYERS = 16) is exhausted. This is a \
+                     spawn-lineage bug: a PHP pool thread reached this already sandboxed, which \
+                     means a replacement was spawned from a sandboxed thread instead of the \
+                     pool's unsandboxed spawner. Every pool thread must be (re)spawned from the \
+                     spawner so it starts a fresh 0-layer lineage and stacks exactly one layer. \
+                     Refusing to serve this thread.",
+                );
+            }
+            Err(e) => {
+                return Err(e).context("self-sandbox: failed to arm Landlock on this PHP thread");
+            }
+        };
+        match status {
             RulesetStatus::NotEnforced => {
                 // init() already confirmed enforcement on a probe thread, so
                 // reaching here means the kernel changed under us or a resource
@@ -520,8 +593,16 @@ mod imp {
 
     /// Build and apply the ruleset on the current thread, returning its status.
     ///
-    /// ABI v1 (widest kernel support) in best-effort mode, so a newer kernel
-    /// still enforces the v1 rights and an older one degrades rather than erroring.
+    /// ABI v3 in best-effort mode. v3 adds `Refer` (ABI v2 — cross-directory
+    /// `rename(2)`/`link(2)` *within* the granted read-write trees, which a bare
+    /// v1 ruleset blocks with a blanket `EXDEV`, breaking Laravel `File::move`,
+    /// the WordPress upgrader's `wp-content/upgrade/` → `plugins/` rename, and
+    /// Symfony cache rotation) and `Truncate` (ABI v3 — governs `truncate(2)` /
+    /// `O_TRUNC`). Best-effort means a newer kernel enforces the full v3 rights
+    /// while an older one (v1/v2) silently degrades the unsupported rights rather
+    /// than erroring. `Refer` is only granted on the read-write trees, so a
+    /// cross-directory move is allowed only where **both** endpoints are under a
+    /// granted rw dir — never out of the sandbox.
     ///
     /// Sets `PR_SET_NO_NEW_PRIVS` first. Landlock without `CAP_SYS_ADMIN`
     /// requires it, and the PHP pools respawn threads *after* the process has
@@ -539,7 +620,7 @@ mod imp {
                 .context("landlock: prctl(PR_SET_NO_NEW_PRIVS) failed");
         }
 
-        let abi = ABI::V1;
+        let abi = ABI::V3;
         let read_exec = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
         let read_only = AccessFs::from_read(abi);
         let read_write = AccessFs::from_all(abi);
@@ -586,14 +667,22 @@ mod imp {
     /// `/proc/self` directory is never granted; only these leaves/subtrees are.
     /// Deliberately **excluded**: `environ` (the process's own environment, with
     /// `AWS_*` S3 credentials and any other secret in the service env),
-    /// `mem`/`pagemap`/`clear_refs` (process memory), and `root`/`cwd` (magic
-    /// symlinks to `/` and the cwd whose targets are escape-shaped). Verified on
-    /// a live kernel (Landlock ABI 7): PHP 8.5 self-inspection (`memory_get_usage`,
-    /// `/proc/self/status`, `cmdline`, `maps`, `fd`) works with this set while
-    /// `/proc/self/environ` and `/proc/self/mem` are denied `EACCES`. `existing`
-    /// drops any entry a given `/proc` layout lacks; each is independently
-    /// non-critical (PHP boots even with none granted).
-    fn proc_self_paths() -> [&'static Path; 17] {
+    /// `mem`/`pagemap`/`clear_refs` (process memory), `root`/`cwd` (magic
+    /// symlinks to `/` and the cwd whose targets are escape-shaped), and —
+    /// crucially — `task` (the per-thread directory). `/proc/self/task` is a
+    /// **directory**, and Landlock granting it read grants its whole subtree:
+    /// every `/proc/self/task/<tid>/` holds the *full* per-task file set,
+    /// including `environ` and `mem`. Granting `task` would therefore re-open the
+    /// exact host-secret leak this curated set exists to close
+    /// (`file_get_contents("/proc/self/task/$tid/environ")`). There is no
+    /// allow-list way to grant `task` without its sensitive leaves, and nothing
+    /// in normal PHP needs thread enumeration, so it is never granted. Verified
+    /// on a live kernel (Landlock ABI 7): PHP 8.5 self-inspection
+    /// (`memory_get_usage`, `/proc/self/status`, `cmdline`, `maps`, `fd`) works
+    /// with this set while `/proc/self/environ` and `/proc/self/mem` are denied
+    /// `EACCES`. `existing` drops any entry a given `/proc` layout lacks; each is
+    /// independently non-critical (PHP boots even with none granted).
+    fn proc_self_paths() -> [&'static Path; 16] {
         [
             Path::new("/proc/self/stat"),
             Path::new("/proc/self/statm"),
@@ -605,7 +694,6 @@ mod imp {
             Path::new("/proc/self/auxv"),
             Path::new("/proc/self/fd"),
             Path::new("/proc/self/fdinfo"),
-            Path::new("/proc/self/task"),
             Path::new("/proc/self/exe"),
             Path::new("/proc/self/cgroup"),
             Path::new("/proc/self/mounts"),
@@ -683,8 +771,13 @@ mod imp {
         /// The `/proc/self` grant is curated leaves, never the directory — so
         /// the process's own environment (`/proc/self/environ`: `AWS_*` and any
         /// service secret) and memory (`/proc/self/mem`) stay unreachable, while
-        /// the self-inspection files PHP/glibc use are granted. Regression guard
-        /// for the F3 host-secret leak found on a live kernel (Landlock ABI 7).
+        /// the self-inspection files PHP/glibc use are granted. It also never
+        /// grants `/proc/self/task`: that directory's subtree re-exposes
+        /// `environ`/`mem` through every `/proc/self/task/<tid>/`, which is
+        /// exactly how the leak was re-opened after the first fix (the
+        /// per-thread directory was granted as a read-only dir). Regression
+        /// guard for the F3 host-secret leak found on a live kernel
+        /// (Landlock ABI 7).
         #[test]
         fn proc_self_grant_excludes_environ_and_mem() {
             let tmp = std::env::temp_dir().join(format!("ephpm-sbx-proc-{}", std::process::id()));
@@ -697,10 +790,19 @@ mod imp {
 
             let ro: Vec<String> =
                 spec.read_only.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-            // Never the directory itself, nor the sensitive leaves.
+            // Never the `/proc/self` directory itself (we grant individual
+            // leaves, never the parent), nor the sensitive leaves.
             for bad in ["/proc/self", "/proc/self/environ", "/proc/self/mem"] {
                 assert!(!ro.iter().any(|p| p == bad), "must not grant {bad}: {ro:?}");
             }
+            // Never `/proc/self/task`, nor anything beneath it: granting the
+            // per-thread directory (even read-only) re-exposes `environ`/`mem`
+            // via every `/proc/self/task/<tid>/`. Assert the whole subtree is
+            // absent, since a child grant is just as dangerous as the dir.
+            assert!(
+                !ro.iter().any(|p| std::path::Path::new(p).starts_with("/proc/self/task")),
+                "must not grant /proc/self/task or any child: {ro:?}"
+            );
             // The self-inspection leaves PHP/glibc use are granted (they exist on
             // any Linux test host).
             for good in ["/proc/self/status", "/proc/self/stat", "/proc/self/maps"] {

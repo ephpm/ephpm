@@ -453,18 +453,29 @@ root** — to exactly:
 | Access | Paths |
 |---|---|
 | read + write | the site trees (`sites_dir`, `document_root`), the per-vhost temp/session root, the embedded-database dir (`[db.sqlite] dir`), and `/dev/{null,zero,full}` |
-| read only | the operator-owned per-site overrides, the public CA trust store (so a tenant's HTTPS client can verify certificates), a minimal non-secret slice of `/etc` (name resolution, the loader cache, timezone), `/dev/{u,}random`, and a **curated set of `/proc/self` leaves** for self-inspection (`stat`, `status`, `maps`, `fd`, … — **never** the `/proc/self` directory, so `/proc/self/environ` (the service env, incl. `AWS_*`) and `/proc/self/mem` stay unreachable) |
+| read only | the operator-owned per-site overrides, the public CA trust store (so a tenant's HTTPS client can verify certificates), a minimal non-secret slice of `/etc` (name resolution, the loader cache, timezone) plus the systemd-resolved / NetworkManager DNS dirs (`/run/systemd/resolve`, `/run/NetworkManager`, so resolution survives a `resolv.conf` regeneration), `/dev/{u,}random`, and a **curated set of `/proc/self` leaves** for self-inspection (`stat`, `status`, `maps`, `fd`, …). It grants **neither** the `/proc/self` directory **nor** `/proc/self/task`: the per-thread `task` subtree (`/proc/self/task/<tid>/environ`, `.../mem`) would re-expose the very secrets the curation hides, so it is excluded. `/proc/self/environ` (the service env, incl. `AWS_*`) and `/proc/self/mem` therefore stay unreachable — blocked by **both** the environment scrub above (finding F1) **and** this sandbox's exclusion of the `/proc/self` directory and `/proc/self/task`, not by a curated-leaf grant alone. |
 | read + execute | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/opt` (loader + shared libraries) |
 
 Everything else becomes unreachable, including the files a tenant breakout
 would otherwise read with the process uid: **`/etc/ephpm`** (the cluster
 secret), **`/etc/ssl/private`** (TLS private keys), **`/etc/shadow`**,
 **`/root`**, other tenants' home directories, and any host path outside the
-ePHPm tree. This converts "tenant PHP can read any host file the uid can" into
-"only the ePHPm tree." Landlock governs the filesystem only — it does not
+granted set. Landlock governs the filesystem only — it does not
 restrict the network, and already-open descriptors (listeners, the loaded
 config, the generated `php.ini`, TLS keys) keep working, which is why the TLS
 private key is **never** granted to the sandboxed engine.
+
+> **The read+execute grant covers `/opt`, `/usr`, and `/usr/local` — so do not
+> put config or secrets there.** The loader and shared libraries live under
+> `/usr`, `/lib*`, `/bin`, `/sbin`, and `/opt`, so the sandbox grants those trees
+> **read**. A secret placed inside one of them — `/opt/ephpm/ephpm.toml`,
+> `/usr/local/etc/ephpm.toml`, an app `.env` under `/opt` — is therefore readable
+> by **every tenant's PHP thread**, defeating the sandbox for that file. Keep the
+> ePHPm config, the `[kv]`/`[cluster]` secret, and any operator credential under
+> **`/etc/ephpm`** (which is *not* granted and stays unreachable), never under
+> `/opt` or `/usr/local/etc`. The sandbox narrows "any host file the uid can read"
+> to "the granted set" — but the granted read+execute system trees are part of
+> that set, which is exactly why secrets must not live in them.
 
 **This is not the cross-tenant boundary.** A PHP pool thread serves many
 tenants over its lifetime and a Landlock domain can only be set once per thread

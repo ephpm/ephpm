@@ -830,15 +830,27 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
     // carries whatever the server passed it) and `/proc/self/mem`. Only the
     // curated self-inspection leaves are granted (see `proc_self_paths`);
     // per-pid entries for *other* pids stay unreachable.
+    //
+    // This set is kept **identical** to `ephpm-server`'s engine sandbox
+    // (`server_sandbox::SandboxSpec::from_config`): `/etc/gai.conf` for
+    // getaddrinfo ordering, and the systemd-resolved / NetworkManager backing
+    // directories (`/run/systemd/resolve`, `/run/NetworkManager`) as read-only
+    // dirs so DNS keeps working after `/etc/resolv.conf` (a symlink into them) is
+    // regenerated — the pinned-inode failure that otherwise breaks resolution.
+    // They hold only public DNS config, never a secret; `existing` drops any
+    // path absent on this host.
     let mut ro: Vec<PathBuf> = existing(&[
         Path::new("/etc/passwd"),
         Path::new("/etc/group"),
         Path::new("/etc/nsswitch.conf"),
+        Path::new("/etc/gai.conf"),
         Path::new("/etc/ld.so.cache"),
         Path::new("/etc/ld.so.preload"),
         Path::new("/etc/localtime"),
         Path::new("/etc/resolv.conf"),
         Path::new("/etc/hosts"),
+        Path::new("/run/systemd/resolve"),
+        Path::new("/run/NetworkManager"),
         Path::new("/dev/urandom"),
         Path::new("/dev/random"),
     ]);
@@ -922,10 +934,13 @@ fn apply_landlock(site: &ephpm_server::router::SandboxSite) -> anyhow::Result<()
 /// granted read-only **individually**. Landlock is allow-list only, so the
 /// `/proc/self` directory is never granted — that keeps `/proc/self/environ`
 /// (the command's own environment) and `/proc/self/mem` (process memory)
-/// unreachable. Mirrors `ephpm-server`'s engine-sandbox set. `existing` drops
-/// any entry a given `/proc` layout lacks.
+/// unreachable. `/proc/self/task` is likewise **never** granted: it is a
+/// directory whose subtree (`/proc/self/task/<tid>/environ`, `.../mem`, …)
+/// re-exposes exactly those secrets per thread, so an allow-list grant of it
+/// defeats the curation. Mirrors `ephpm-server`'s engine-sandbox set. `existing`
+/// drops any entry a given `/proc` layout lacks.
 #[cfg(target_os = "linux")]
-fn proc_self_paths() -> [&'static std::path::Path; 17] {
+fn proc_self_paths() -> [&'static std::path::Path; 16] {
     use std::path::Path;
     [
         Path::new("/proc/self/stat"),
@@ -938,7 +953,6 @@ fn proc_self_paths() -> [&'static std::path::Path; 17] {
         Path::new("/proc/self/auxv"),
         Path::new("/proc/self/fd"),
         Path::new("/proc/self/fdinfo"),
-        Path::new("/proc/self/task"),
         Path::new("/proc/self/exe"),
         Path::new("/proc/self/cgroup"),
         Path::new("/proc/self/mounts"),

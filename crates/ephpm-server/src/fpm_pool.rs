@@ -276,6 +276,29 @@ pub struct FpmPool {
     /// An `Instant` cannot live in an atomic, so poison timestamps are stored as
     /// milliseconds elapsed from here.
     started: Instant,
+    /// Signals the pool's **unsandboxed spawner thread** to create one
+    /// replacement thread. A retiring PHP pool thread is itself
+    /// Landlock-sandboxed (the F3 engine sandbox); if it called
+    /// [`FpmPool::spawn_thread`] directly, `std::thread::spawn` would make the
+    /// replacement **inherit its Landlock domain**, and the replacement's
+    /// [`crate::server_sandbox::restrict_current_php_thread`] would then stack a
+    /// *second* layer. A thread that retires-and-respawns would deepen the
+    /// lineage once per cycle and, after `LANDLOCK_MAX_NUM_LAYERS` (16) crashes
+    /// on a slot, hit `E2BIG` — a permanent boot-failure loop that 503s the node
+    /// for every tenant (an availability DoS a tenant can trigger with ~16
+    /// contained crashes). Replacement requests therefore go to a spawner thread
+    /// created **before any sandbox is applied** (see [`FpmPool::spawn`]), so
+    /// every replacement starts from a clean 0-layer lineage and stacks exactly
+    /// one layer. The initial pool fill and [`FpmPool::note_hung`] already spawn
+    /// from unsandboxed threads (startup / tokio), so only the pool-thread
+    /// respawn path ([`respawn_if_running`]) routes through here.
+    respawn_tx: std::sync::mpsc::Sender<()>,
+    /// Test-only record of the name of the OS thread that invoked each
+    /// [`FpmPool::spawn_thread`]. The fresh-lineage invariant is "a replacement
+    /// is spawned by the unsandboxed spawner, never by a (sandboxed) pool
+    /// thread"; this lets a stub-mode test assert it without a live kernel.
+    #[cfg(test)]
+    spawn_origins: std::sync::Mutex<Vec<String>>,
 }
 
 /// Sliding window for the crash-storm backoff: poisons further apart than this
@@ -348,6 +371,8 @@ impl FpmPool {
         gauge!("ephpm_fpm_pool_size").set(thread_count as f64);
         gauge!("ephpm_fpm_pool_queue_depth").set(0.0);
 
+        let (respawn_tx, respawn_rx) = std::sync::mpsc::channel::<()>();
+
         let pool = Arc::new(Self {
             dispatcher: Dispatcher::new(backlog.max(1)),
             admission: Arc::new(tokio::sync::Semaphore::new(backlog.max(1))),
@@ -355,7 +380,31 @@ impl FpmPool {
             state,
             thread_count,
             started: Instant::now(),
+            respawn_tx,
+            #[cfg(test)]
+            spawn_origins: std::sync::Mutex::new(Vec::new()),
         });
+
+        // The unsandboxed spawner thread. It is created HERE — before any PHP
+        // pool thread exists and before any Landlock sandbox is armed — so it
+        // never inherits a sandbox and never arms one itself. It holds only a
+        // `Weak` to the pool (so the pool can still drop), and exits when the
+        // pool is dropped (its `respawn_tx` goes away and `recv` returns `Err`).
+        // Routing replacements through it is what gives every respawned thread a
+        // fresh 0-layer Landlock lineage — see the `respawn_tx` field docs.
+        {
+            let weak = Arc::downgrade(&pool);
+            if let Err(e) = std::thread::Builder::new()
+                .name("ephpm-fpm-spawner".to_string())
+                .spawn(move || respawn_loop(&weak, &respawn_rx))
+            {
+                tracing::error!(
+                    %e,
+                    "failed to spawn the fpm pool spawner thread — pool-thread replacement \
+                     after a crash/retire will not happen"
+                );
+            }
+        }
 
         for _ in 0..thread_count {
             pool.spawn_thread();
@@ -398,6 +447,15 @@ impl FpmPool {
     #[cfg(test)]
     fn threads_spawned(&self) -> usize {
         self.state.next_id.load(Ordering::Acquire)
+    }
+
+    /// Names of the OS threads that have invoked [`FpmPool::spawn_thread`], in
+    /// order. Test-only: used to prove replacements come from the unsandboxed
+    /// spawner thread (fresh Landlock lineage), never from a sandboxed pool
+    /// thread.
+    #[cfg(test)]
+    fn spawn_origin_log(&self) -> Vec<String> {
+        self.spawn_origins.lock().unwrap().clone()
     }
 
     /// Dispatch one request to the pool and return the receiver for its
@@ -682,6 +740,14 @@ impl FpmPool {
     /// Spawn one dedicated OS thread that registers with TSRM, serves requests
     /// until drain / panic-retire, then releases its TSRM slot and exits.
     fn spawn_thread(self: &Arc<Self>) {
+        // Record which OS thread is creating this pool thread, so a test can
+        // prove replacements come from the unsandboxed spawner (fresh Landlock
+        // lineage) and never from a sandboxed pool thread.
+        #[cfg(test)]
+        self.spawn_origins.lock().unwrap().push(
+            std::thread::current().name().unwrap_or("<unnamed>").to_string(),
+        );
+
         let pool = Arc::clone(self);
         let thread_id = pool.state.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -705,6 +771,32 @@ impl FpmPool {
             tracing::error!(thread_id, %e, "failed to spawn fpm pool thread");
             counter!("ephpm_fpm_pool_boot_failures_total").increment(1);
         }
+    }
+
+    /// Ask the unsandboxed spawner thread to create one replacement thread.
+    ///
+    /// Called by [`respawn_if_running`], which runs on a retiring (and therefore
+    /// Landlock-sandboxed) PHP pool thread. That thread must never call
+    /// [`FpmPool::spawn_thread`] itself — see the [`respawn_tx`](Self::respawn_tx)
+    /// field docs for why (Landlock layer-cap exhaustion / DoS). A failed send
+    /// means the pool (and its spawner) is being dropped, so the request is
+    /// simply discarded.
+    fn request_respawn(&self) {
+        let _ = self.respawn_tx.send(());
+    }
+}
+
+/// Body of the pool's unsandboxed spawner thread: block on the respawn channel
+/// and create one replacement pool thread per signal, from this thread's clean
+/// (0-layer) Landlock lineage. Exits when every [`FpmPool::respawn_tx`] sender
+/// is gone (the pool was dropped) or the pool can no longer be upgraded.
+fn respawn_loop(weak: &std::sync::Weak<FpmPool>, rx: &std::sync::mpsc::Receiver<()>) {
+    while rx.recv().is_ok() {
+        // Upgrade only transiently so a draining/stopping pool can still drop.
+        let Some(pool) = weak.upgrade() else {
+            break;
+        };
+        pool.spawn_thread();
     }
 }
 
@@ -939,7 +1031,11 @@ fn respawn_if_running(pool: &Arc<FpmPool>) {
         let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1u64 << shift));
         std::thread::sleep(backoff.min(std::time::Duration::from_secs(10)));
     }
-    pool.spawn_thread();
+    // Route the actual spawn through the unsandboxed spawner thread rather than
+    // calling `spawn_thread` here: this function runs on the retiring PHP pool
+    // thread, which is Landlock-sandboxed, so a direct spawn would deepen the
+    // replacement's Landlock lineage and eventually exhaust the 16-layer cap.
+    pool.request_respawn();
 }
 
 #[cfg(test)]
@@ -1138,6 +1234,62 @@ mod tests {
 
         pool.drain();
         assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the replacement");
+    }
+
+    /// Fresh-lineage invariant (F3 availability fix): a pool thread that
+    /// retires and is replaced many times must not accumulate Landlock layers.
+    /// The accumulation would happen if the retiring (sandboxed) thread spawned
+    /// its own replacement, because the child would inherit the parent's
+    /// Landlock domain and then stack another layer — after 16 cycles the arm
+    /// fails `E2BIG` and the node wedges in a boot-failure loop (503 for every
+    /// tenant). Landlock is inactive in stub mode, so we assert the structural
+    /// cause instead: every replacement is spawned by the dedicated unsandboxed
+    /// spawner thread (`ephpm-fpm-spawner`), never by a pool thread
+    /// (`ephpm-fpm-<id>`). With the bug (direct `spawn_thread` from
+    /// `thread_main`), the respawn origin would be a pool thread and this fails.
+    #[tokio::test]
+    async fn respawn_runs_on_the_unsandboxed_spawner_not_a_pool_thread() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(1, 4, AdmissionPolicy::Fifo);
+        assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
+
+        // Force many poison-retirements on the single slot — far more cycles
+        // than a bug would need to exhaust the 16-layer cap — each retiring the
+        // sandboxed thread and triggering a respawn.
+        let cycles = 8;
+        for _ in 0..cycles {
+            let spawned_before = pool.threads_spawned();
+            let rx = pool.dispatch(contained_task()).await.expect("dispatch ok");
+            assert!(
+                matches!(rx.await, Ok(Err(PhpError::Contained(_)))),
+                "the contained crash is delivered to the caller"
+            );
+            assert!(
+                wait_for(|| pool.threads_spawned() > spawned_before).await,
+                "a replacement must be spawned for each poisoned thread"
+            );
+            assert!(wait_for(|| pool.ready_count() == 1).await, "the pool refills each time");
+        }
+
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the thread");
+
+        let origins = pool.spawn_origin_log();
+        // The first entry is the initial fill from `FpmPool::spawn` (the test /
+        // tokio thread). Every later entry is a respawn and must come from the
+        // unsandboxed spawner — never a pool thread, which would deepen the
+        // Landlock lineage.
+        assert!(
+            origins.len() > cycles,
+            "expected one initial spawn plus one per poison cycle: {origins:?}"
+        );
+        for origin in &origins[1..] {
+            assert_eq!(
+                origin, "ephpm-fpm-spawner",
+                "every replacement must be spawned by the unsandboxed spawner (fresh \
+                 Landlock lineage), not a pool thread: {origins:?}"
+            );
+        }
     }
 
     // ── Load shedding (`[php] overload = "shed"`, issue #301) ────────────
