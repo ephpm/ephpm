@@ -563,6 +563,32 @@ fn set_no_new_privs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Clear `PR_SET_DUMPABLE` so the kernel marks the process non-dumpable.
+///
+/// This re-owns `/proc/self/{mem,environ,maps,cmdline,…}` to `root:root` mode
+/// `0400`, so any read of them from *within* this process fails with `EACCES`
+/// — even for the process's own (dropped or undropped) uid, and even when no
+/// uid drop happened at all. It also disables core dumps and `ptrace`-attach by
+/// the same uid. Used by [`confine_php_tenant`] as a defence beyond Landlock:
+/// that tier confines PHP **in-process**, sharing its address space and
+/// environment with the config this binary already parsed ([`[kv] secret`],
+/// `[cluster] secret`, `[db.wire_auth] password`, `[db.mysql] url`), so a tenant
+/// cron script that could read `/proc/self/mem` would recover every tenant's
+/// derived DB/KV password. `PR_SET_DUMPABLE = 0` closes that path regardless of
+/// whether the Landlock `/proc/self` grant or a uid drop is in effect.
+#[cfg(target_os = "linux")]
+fn set_not_dumpable() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) is the documented form with
+    // scalar arguments and no pointer operands; the return value is checked.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_DUMPABLE, 0) failed");
+    }
+    Ok(())
+}
+
 /// Apply the [`ResourceLimits`] as process `setrlimit`s (hardening F5).
 ///
 /// `RLIMIT_AS` (virtual address space) bounds memory; `RLIMIT_CPU` (CPU
@@ -607,9 +633,12 @@ fn set_one_rlimit(name: &str, resource: libc::__rlimit_resource_t, value: u64) {
 /// tenant, in place, before PHP starts — the PHP counterpart of [`run`]'s
 /// binary sandbox (hardening F5).
 ///
-/// Applies, in order: the tenant's private-state-root preparation and an
-/// irreversible uid/gid drop (both only when started as root), `no_new_privs`,
-/// per-site Landlock, and `RLIMIT_CPU` (from `cpu_secs`). It deliberately does
+/// Applies, in order: `PR_SET_DUMPABLE = 0` (so `/proc/self/{mem,environ,maps}`
+/// become root-owned `0400` and this in-process tier cannot leak the parsed
+/// Config secrets — see [`set_not_dumpable`]), the tenant's private-state-root
+/// preparation and an irreversible uid/gid drop (both only when started as
+/// root), `no_new_privs`, per-site Landlock, and `RLIMIT_CPU` (from `cpu_secs`).
+/// It deliberately does
 /// **not** set `RLIMIT_AS`: a PHP cron child is the full ePHPm binary plus the
 /// embedded engine and mimalloc, whose virtual-address reservations dwarf real
 /// usage, so a tight `RLIMIT_AS` would abort startup; PHP's own `memory_limit`
@@ -665,6 +694,20 @@ pub fn confine_php_tenant(
         "ephpm php --site: confining the cron PHP child to this tenant"
     );
 
+    // H1 (hardening): mark this process non-dumpable BEFORE Landlock and the uid
+    // drop. Unlike `run`'s binary sandbox, this tier confines PHP *in-process* —
+    // the cron child shares its address space and environment with the Config
+    // this binary parsed (the `[kv]`/`[cluster]` secrets, the wire-auth password,
+    // the `[db.mysql]` URL). Without this, a tenant cron script could read
+    // `/proc/self/mem` (or `environ`/`maps`) and recover every tenant's derived
+    // DB/KV password. `PR_SET_DUMPABLE = 0` re-owns those files to `root:root`
+    // 0400, so the read fails with EACCES whether or not a uid drop or the
+    // Landlock `/proc/self` grant is in effect — a defence that does not depend
+    // on the shared Landlock ruleset. Legitimate cron PHP never reads its own
+    // `/proc/self/mem`, so this is transparent to a well-behaved job.
+    if let Err(e) = set_not_dumpable() {
+        tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: PR_SET_DUMPABLE unavailable (continuing; /proc/self/mem may be self-readable)");
+    }
     // Prepare + chown the private state root while still root, mirroring `run`.
     if is_root && let Err(e) = prepare_state_root(&site, uid, gid) {
         tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: could not prepare tenant state root (continuing)");
@@ -1017,6 +1060,42 @@ mod tests {
         // SAFETY: getuid/getgid take no arguments and cannot fail.
         let gid = unsafe { libc::getgid() };
         (uid, gid)
+    }
+
+    /// H1 — `set_not_dumpable` clears `PR_SET_DUMPABLE`, which is what re-owns
+    /// `/proc/self/{mem,environ,maps}` to `root:root` 0400 so a tenant cron child
+    /// cannot read the parsed Config secrets out of the shared process image.
+    /// Runs in its own process so the non-dumpable flag never leaks into the
+    /// other tests in this binary (it would disable their core dumps / ptrace).
+    #[test]
+    fn set_not_dumpable_marks_process_undumpable() {
+        // SAFETY: fork in a test with no threads yet touching shared state; the
+        // child only calls async-signal-safe prctl/_exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // Child: default dumpable is 1; after the call PR_GET_DUMPABLE is 0.
+            // SAFETY: PR_GET_DUMPABLE takes no pointer operands.
+            let before = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+            let set_ok = super::set_not_dumpable().is_ok();
+            // SAFETY: PR_GET_DUMPABLE takes no pointer operands.
+            let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+            let code = i32::from(!(before == 1 && set_ok && after == 0));
+            // SAFETY: _exit is async-signal-safe and ends the forked child
+            // without running atexit handlers or unwinding the parent's state.
+            unsafe { libc::_exit(code) };
+        }
+        // Parent: reap and assert the child saw the expected transition.
+        let mut status = 0;
+        // SAFETY: waitpid with a child pid we own and a valid out-pointer.
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert_eq!(rc, pid, "waitpid failed: {}", std::io::Error::last_os_error());
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "set_not_dumpable did not take the process from dumpable=1 to dumpable=0"
+        );
     }
 
     #[test]

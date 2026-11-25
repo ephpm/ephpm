@@ -366,18 +366,26 @@ nothing until the operator enables it). Jobs are picked up live.
 
 **Resource ceilings (DoS hardening, finding F5).** Every native cron child —
 operator `[[cron.jobs]]` and directory-tier alike — runs under a memory and CPU
-ceiling. Memory defaults to ≈ 33 % of the memory budget ePHPm detects for itself
-(its own cgroup `memory.max`, else host RAM) and CPU to half the detected CPU
-(floored at one core); set `[cron] memory_max` / `cpu_max` to change the default,
-or `memory_max` / `cpu_max` on a single `[[cron.jobs]]` entry to override it for
-that job (`"0"` / `0` opts out). A **binary** cron child (`ephpm exec`) enforces
-memory as an OS `RLIMIT_AS`; a **PHP** cron child enforces it as the PHP
-`memory_limit` ceiling — the embedded engine stops skipping the SYSTEM-locked
+ceiling. Memory defaults to the memory budget ePHPm detects for itself (its own
+cgroup `memory.max`, else host RAM) **divided by `[cron] max_concurrent`**, so
+all the slots running at once stay within one node's budget rather than each
+claiming a third of it; CPU defaults to half the detected CPU (floored at one
+core). Set `[cron] memory_max` / `cpu_max` to change the default, or `memory_max`
+/ `cpu_max` on a single `[[cron.jobs]]` entry to override it for that job (`"0"` /
+`0` opts out). A **binary** cron child (`ephpm exec`) enforces memory as an OS
+`RLIMIT_AS`; a **PHP** cron child enforces it as the PHP `memory_limit` ceiling
+(ZendMM allocations only) — the embedded engine stops skipping the SYSTEM-locked
 `memory_hard_limit_percent` and the `memory_limit_max` ceiling for a tenant
 `--site` run, so a cron script's `ini_set('memory_limit', '-1')` can no longer
-exhaust host memory. CPU is an `RLIMIT_CPU` CPU-time ceiling of
-`ceil(cpu_max × timeout)` seconds on both. This is **availability** hardening, not
-confidentiality.
+exhaust host memory. When `[php] memory_limit_max` is set, a PHP cron child's
+ceiling is the *tighter* of it and the cron `memory_max`, so cron never exceeds
+the operator's HTTP-tenant cap. CPU is an `RLIMIT_CPU` ceiling of
+`ceil(cpu_max × timeout)` **CPU-seconds** on both — a per-process CPU-*time*
+budget the kernel SIGKILLs on, not a core-share cap: a single-threaded PHP child
+(CPU time ≤ wall time) is effectively bounded by the wall-clock `timeout`, and
+only a multi-threaded or sub-core job trips it sooner. A true per-core / aggregate
+CPU share cap (cgroup `cpu.max`) is a planned follow-up. This is **availability**
+hardening, not confidentiality.
 
 Inspect and trigger with the CLI:
 

@@ -313,13 +313,19 @@ impl CronScheduler {
         let cron = &config.cron;
         let default_tz = ephpm_config::parse_timezone(&cron.timezone).unwrap_or(chrono_tz::UTC);
 
+        let max_concurrent = cron.max_concurrent.max(1);
+
         // Resolve the section-level resource ceilings once (hardening F5): the
-        // operator's `[cron] memory_max`/`cpu_max`, else the derived defaults
-        // (≈ 33 % of the detected memory budget; half the detected CPU). These
-        // are the directory tier's ceilings and the fallback for an operator
-        // job that sets neither. `Config::validate` already rejected a bad
-        // value, so a parse error here falls back to the derived default.
-        let derived_mem = ephpm_config::default_cron_memory_bytes();
+        // operator's `[cron] memory_max`/`cpu_max`, else the derived defaults.
+        // The memory default is the detected budget divided by `max_concurrent`
+        // (M6) so that all concurrent jobs together stay within one node's
+        // budget, rather than each getting ≈ 33 % (which at the default
+        // `max_concurrent = 4` would commit ≈ 132 % of the budget if every slot
+        // fired at once). The CPU default is half the detected CPU. These are
+        // the directory tier's ceilings and the fallback for an operator job
+        // that sets neither. `Config::validate` already rejected a bad value, so
+        // a parse error here falls back to the derived default.
+        let derived_mem = ephpm_config::default_cron_memory_bytes_per_slot(max_concurrent);
         let derived_cpu = ephpm_config::default_cron_cpu_cores();
         let section_memory_bytes = ephpm_config::parse_cron_memory_limit(
             "[cron] memory_max",
@@ -362,7 +368,6 @@ impl CronScheduler {
         .unwrap_or_else(|_| default_cadence());
 
         let clustered = cluster.is_some();
-        let max_concurrent = cron.max_concurrent.max(1) as usize;
 
         Some(Self {
             operator_jobs,
@@ -381,7 +386,7 @@ impl CronScheduler {
             lease,
             cursor,
             executor,
-            running: RunningState::new(max_concurrent),
+            running: RunningState::new(max_concurrent as usize),
             status: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }

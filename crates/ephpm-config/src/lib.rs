@@ -4636,9 +4636,32 @@ pub fn detect_cpu_available() -> f64 {
 /// for itself. `None` when no budget could be detected (e.g. macOS), in which
 /// case a binary cron child gets no `RLIMIT_AS` and a PHP cron child falls back
 /// to the configured `[php] memory_limit` as its ceiling.
+///
+/// This is the single-job view used by [`Config::validate`] only (to check the
+/// knob parses). The scheduler derives its *runtime* default from
+/// [`default_cron_memory_bytes_per_slot`] so the aggregate of all concurrent
+/// jobs stays within one node's budget.
 #[must_use]
 pub fn default_cron_memory_bytes() -> Option<u64> {
     detect_memory_budget().0.map(|budget| budget / 3)
+}
+
+/// The default cron memory ceiling when `[cron] memory_max` is unset, aware of
+/// `[cron] max_concurrent`: the detected memory budget divided by the number of
+/// concurrent slots, so that all `max_concurrent` jobs running at once stay
+/// within one node's budget rather than each getting ≈ 33 % (which, at the
+/// default `max_concurrent = 4`, would let cron commit ≈ 132 % of the budget).
+/// Hardening F5/M6.
+///
+/// `None` when no budget could be detected (same fallback as
+/// [`default_cron_memory_bytes`]). Floored to a positive byte count so a large
+/// `max_concurrent` still yields a usable ceiling. The ceiling bounds only
+/// ZendMM allocations for a PHP child (and `RLIMIT_AS` for a binary child), not
+/// the whole process image.
+#[must_use]
+pub fn default_cron_memory_bytes_per_slot(max_concurrent: u32) -> Option<u64> {
+    let slots = u64::from(max_concurrent.max(1));
+    detect_memory_budget().0.map(|budget| (budget / slots).max(1))
 }
 
 /// The default cron CPU ceiling in cores: half the CPU ePHPm detects for
@@ -10930,6 +10953,26 @@ listen = "0.0.0.0:8080"
             let budget = detect_memory_budget().0.expect("budget present if default is");
             assert!(mem > 0 && mem < budget, "33% default {mem} must be below budget {budget}");
         }
+    }
+
+    /// M6 — the per-slot cron memory default divides the budget by
+    /// `max_concurrent`, so the aggregate of all concurrent jobs stays within
+    /// one node's budget (rather than each slot getting ≈ 33 %). Asserted as a
+    /// ratio so it holds regardless of the host's absolute budget, and skipped
+    /// where no budget is detectable (macOS/Windows).
+    #[test]
+    fn cron_memory_default_divides_budget_by_max_concurrent() {
+        let Some(budget) = detect_memory_budget().0 else {
+            return; // No budget probe on this platform; nothing to assert.
+        };
+        assert_eq!(default_cron_memory_bytes_per_slot(1), Some(budget));
+        assert_eq!(default_cron_memory_bytes_per_slot(4), Some(budget / 4));
+        // 0 is treated as 1 (never divides by zero).
+        assert_eq!(default_cron_memory_bytes_per_slot(0), Some(budget));
+        // The aggregate at the default max_concurrent=4 stays within budget,
+        // unlike the ≈ 33 % single-job default (4 × budget/3 > budget).
+        let per_slot = default_cron_memory_bytes_per_slot(4).unwrap();
+        assert!(per_slot * 4 <= budget, "4 concurrent slots must fit the budget");
     }
 
     /// `[db.sqlite.backup]` absent (and present but off) is a usable default:
