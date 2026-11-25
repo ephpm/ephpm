@@ -1947,7 +1947,16 @@ impl SingleNodeSpawn {
                      mysql_listen = \"127.0.0.1:{}\"\n\
                      hrana_listen = \"127.0.0.1:{}\"\n\
                      postgres_listen = \"127.0.0.1:{}\"\n\
-                     tds_listen = \"127.0.0.1:{}\"",
+                     tds_listen = \"127.0.0.1:{}\"\n\n\
+                     # The shared SQL wire listeners authenticate by default\n\
+                     # ([db.wire_auth], finding F4). litewire gates only the\n\
+                     # MySQL frontend, so a node that also serves hrana / PG /\n\
+                     # TDS fails closed at startup unless auth is turned off for\n\
+                     # all of them. These single-site suites reach the database\n\
+                     # over every frontend without credentials, so opt the\n\
+                     # listeners back to open loopback access.\n\
+                     [db.wire_auth]\n\
+                     allow_insecure_no_auth = true",
                     escape_toml(&data_dir),
                     ports.mysql,
                     ports.hrana,
