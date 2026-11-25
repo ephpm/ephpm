@@ -337,8 +337,13 @@ the replicas** so they come up cold:
   lower-generation header; the ownership-handoff pull is ranked by durable version
   and installs only a copy at or above the local generation (and refuses while a
   *known-fresher* peer is unreachable); `decide_warm_settle` blocks a stale warm
-  owner by reseed dominance; and an owner ships no CDC/snapshot for a site it has
-  not settled for serving. The procedure mirrors whole-database: stop every node,
+  owner by reseed dominance; an owner ships no CDC/snapshot for a site it has
+  not settled for serving; and a **CDC log floor** closes the last replay path — a
+  node that installs the restore over its own data keeps its existing `turso_cdc`
+  log (which still holds pre-switch rows), so it records the head at the switch as
+  a floor and answers any subscribe below it with a re-bootstrap signal, which
+  sends a replica with a stale cursor to a fresh snapshot instead of replaying that
+  pre-switch history. The procedure mirrors whole-database: stop every node,
   `ephpm db restore --reseed --site <key>` on one node, start it **first**, then
   the others; verify each converged. Each converging peer records
   `ephpm_cdc_bootstrap_total{outcome="ok"}` (the per-site re-bootstrap) alongside

@@ -157,17 +157,31 @@ enum ClusterRestoreKind {
     ///   generation, and refuses while a *known-fresher* peer is unreachable),
     ///   and the serving gate (an owner ships no CDC/snapshot for a site it has
     ///   not settled) keep a stale higher-epoch peer from out-ranking or
-    ///   clobbering the restore.
+    ///   clobbering the restore;
+    /// - and a **CDC log floor** closes the one remaining replay path: a node
+    ///   that installs the restore over its own data (`discard_local`) keeps its
+    ///   existing `turso_cdc` log, which still holds pre-switch rows, so it
+    ///   records the head at the switch as a floor and refuses any subscribe
+    ///   below it with a re-bootstrap signal — a replica with a stale cursor
+    ///   re-bootstraps from a fresh snapshot instead of being shipped and
+    ///   replaying that pre-switch history.
     ///
-    /// So neither the tail-on-top mix nor the higher-epoch silent overwrite can
-    /// happen. This convergence is implemented and unit-tested but **not yet
-    /// live-cluster validated** (Turso is Beta upstream). The procedure mirrors
-    /// whole-database: stop every node, `ephpm db
+    /// So neither the tail-on-top mix, the higher-epoch silent overwrite, nor the
+    /// stale-CDC-replay can happen. This convergence is implemented and
+    /// unit-tested but **not yet live-cluster validated** (Turso is Beta
+    /// upstream). The procedure mirrors whole-database: stop every node, `ephpm db
     /// restore --reseed --site <key>` on one node, start it first, then the others
     /// (which auto-converge). Requires every node on v0.20.0+; until a node is
     /// upgraded to v0.20.0 and the reseed re-run it does not honor the signal, and
     /// an older HRW owner actively serves its stale copy (fail-safe against
     /// corruption, but divergent).
+    ///
+    /// **A *plain* (gen-0) restore after a prior `--reseed` is refused loudly, not
+    /// silently merged.** A plain restore strips the reseed generation to `0`, so
+    /// a replica that already adopted the old generation now out-ranks the
+    /// restored owner and refuses to replicate from it (it will not merge its
+    /// higher-generation data away) until that replica's `.db` is wiped per the
+    /// manual procedure. Prefer `--reseed` for a reseeded deployment.
     PerSite,
 }
 
@@ -514,11 +528,12 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
                  restored `.db` is stamped with a new reseed generation, which the site's owner \
                  advertises and which dominates the per-site version order — so a peer that still \
                  holds the site force-discards it and cold re-bootstraps from the owner, a peer \
-                 that itself holds the restore refuses to tail a staler owner, and the \
+                 that itself holds the restore refuses to tail a staler owner, the \
                  ownership-handoff pull and the destructive snapshot install only ever take a copy \
-                 at the restore's generation or newer — so a stale peer returning with a higher \
-                 ownership epoch cannot overwrite the restore (implemented and unit-tested, not \
-                 yet live-cluster-validated). \
+                 at the restore's generation or newer, and a CDC log floor makes a replica with a \
+                 stale cursor re-bootstrap instead of replaying pre-switch history — so a stale \
+                 peer returning with a higher ownership epoch cannot overwrite the restore \
+                 (implemented and unit-tested, not yet live-cluster-validated). \
                  Required procedure: (1) stop EVERY node; (2) run `ephpm db restore --reseed \
                  --site <key>` on one node; (3) start that node FIRST, then the others — each peer \
                  holding the site auto-discards and re-bootstraps; (4) verify each converged (its \

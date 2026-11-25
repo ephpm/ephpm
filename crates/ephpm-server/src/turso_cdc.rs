@@ -473,6 +473,19 @@ enum Frame {
     /// Heartbeat — sent every ~5s from primary to keep the subscriber
     /// stream warm even during idle periods.
     Ping,
+    /// **Primary → replica, in place of any `Batch`, when the subscriber's
+    /// `from_change_id` is below this log's floor (#707).** The owner switched
+    /// this site's data lineage (a `discard_local` snapshot install — a reseed
+    /// convergence or a divergence re-bootstrap) but kept the same `turso_cdc`
+    /// log, which still holds the pre-switch rows `1..floor`. A subscriber at a
+    /// cursor below `floor` would be shipped that stale history and replay it
+    /// over its own post-switch data, so the owner refuses to tail it and tells
+    /// it to re-bootstrap from a fresh snapshot (whose watermark is `>= floor`)
+    /// instead. Carries the floor for the replica's log line. Only ever sent
+    /// when the floor is non-zero, which requires a prior reseed/re-bootstrap —
+    /// so a cluster that has never switched a lineage never puts it on the wire.
+    #[serde(rename = "RebootstrapRequired")]
+    RebootstrapRequired { floor: i64 },
 }
 
 /// Wire-format twin of [`litewire_turso::cdc::CdcRow`] — Serde-derived
@@ -1560,6 +1573,35 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
     };
     anyhow::ensure!(from >= 0, "subscriber sent a negative watermark: {from}");
+
+    // #707 issue C: refuse a subscribe below this log's floor. The floor is the
+    // CDC head at the last `discard_local` install (a reseed convergence or a
+    // divergence re-bootstrap) — this node switched the site's data lineage but
+    // kept the same `turso_cdc` log, which still holds the pre-switch rows
+    // `1..floor`. A subscriber at a cursor below `floor` (a replica whose restore
+    // stripped its cursor, so its watermark resolves to 0 against this log) would
+    // be shipped that stale history and replay it over its own post-switch data.
+    // Tell it to re-bootstrap instead: the fresh snapshot it then installs has a
+    // watermark `>= floor`, so its next subscribe clears the floor and tails
+    // cleanly. A floor of `0` (a log that never switched lineage — every cluster
+    // that has not reseeded) refuses nothing.
+    let floor = read_owner_log_floor(mgmt).await;
+    if from < floor {
+        cdc_metrics::record_stream_refused("cdc");
+        tracing::warn!(
+            from_change_id = from,
+            log_floor = floor,
+            site = %site,
+            "CDC: refusing a subscribe below the log floor — this owner switched the site's \
+             data lineage and its log still holds pre-switch history; telling the replica to \
+             re-bootstrap from a fresh snapshot instead of replaying it (#707)"
+        );
+        write_frame(&mut wr, &Frame::RebootstrapRequired { floor })
+            .await
+            .context("send rebootstrap-required frame")?;
+        return Ok(());
+    }
+
     tracing::info!(from_change_id = from, "CDC: subscriber attached");
 
     // RAII: every exit path below is a `?` or a `bail!`, so the
@@ -1727,6 +1769,31 @@ impl std::fmt::Display for StaleOwnerRefused {
 
 impl std::error::Error for StaleOwnerRefused {}
 
+/// Returned by [`subscribe_and_consume_site`] (from [`consume_frames`]) when the
+/// owner answered a `Subscribe` with [`Frame::RebootstrapRequired`] — the
+/// subscriber's cursor is below the owner's CDC log floor, so tailing would
+/// replay the owner's pre-lineage-switch history over this node's data (#707,
+/// issue C). The replica loops turn it into a forced cold re-bootstrap (the same
+/// `force_reset` path a schema collision takes), which installs a fresh snapshot
+/// whose watermark is `>= floor` and then tails from there. `floor` is the
+/// owner's advertised floor, for the log line.
+#[derive(Debug, Clone, Copy)]
+struct RebootstrapRequired {
+    floor: i64,
+}
+
+impl std::fmt::Display for RebootstrapRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "owner requires a re-bootstrap: subscribe cursor is below the log floor {}",
+            self.floor
+        )
+    }
+}
+
+impl std::error::Error for RebootstrapRequired {}
+
 /// The replica driver: dial the primary's `cdc/default` stream, announce
 /// the local watermark, apply what arrives, and retry forever.
 ///
@@ -1843,6 +1910,49 @@ pub async fn run_replica(
                                  pre-reseed rows back over the restore). Backing off until the \
                                  primary catches up (ephpm db restore --reseed)"
                             );
+                        }
+                        // The primary refused our subscribe as below its log floor
+                        // (#707 issue C): it switched lineage (a reseed
+                        // re-bootstrap) but kept the same turso_cdc log, which still
+                        // holds pre-switch rows. Force-discard and cold re-bootstrap
+                        // from the primary's fresh snapshot (watermark >= floor), so
+                        // the next subscribe clears the floor. Reuse `reseed_bootstrap`
+                        // with THIS node's adopted generation: the install passes the
+                        // reseed guard at equal generation and adopts nothing new.
+                        else if let Some(req) = e.downcast_ref::<RebootstrapRequired>() {
+                            let floor = req.floor;
+                            cdc_metrics::record_connect_outcome("rebootstrap");
+                            let generation = {
+                                let _permit = mgmt.wal_gate_permit().await;
+                                off_runtime(read_local_reseed_gen(&apply_conn)).await.unwrap_or(0)
+                            };
+                            tracing::warn!(
+                                log_floor = floor,
+                                primary = %primary_addr,
+                                "CDC replica: primary refused our cursor as below its CDC log floor; \
+                                 force-discarding and re-bootstrapping from the primary so stale \
+                                 pre-switch history is not replayed (#707)"
+                            );
+                            match reseed_bootstrap(
+                                &mgmt,
+                                &apply_conn,
+                                primary_addr,
+                                &channel,
+                                max_snapshot_bytes,
+                                generation,
+                            )
+                            .await
+                            {
+                                Ok(()) => tracing::info!(
+                                    "CDC replica: re-bootstrap above the log floor complete; resuming tail"
+                                ),
+                                Err(be) => {
+                                    cdc_metrics::record_bootstrap("failed");
+                                    tracing::warn!(
+                                        "CDC replica: log-floor re-bootstrap failed (will retry): {be:#}"
+                                    );
+                                }
+                            }
                         }
                         // Failures of the local watermark bookkeeping keep
                         // their own outcome label — they mean "this node
@@ -2089,6 +2199,15 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 }
             }
             Frame::Ping => {}
+            Frame::RebootstrapRequired { floor } => {
+                // The owner refused our cursor as below its log floor (#707
+                // issue C): tailing would replay its pre-lineage-switch history
+                // over our post-switch data. Return a typed, downcastable error
+                // so the replica loop force-discards and cold re-bootstraps (the
+                // same path a schema collision takes), installing a fresh snapshot
+                // whose watermark clears the floor.
+                return Err(anyhow::Error::new(RebootstrapRequired { floor }));
+            }
             Frame::Subscribe { .. } => {
                 anyhow::bail!("primary sent a Subscribe frame; wrong direction");
             }
@@ -2156,6 +2275,20 @@ const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
 /// leaving generation `0`, so only an explicit `--reseed` ever forces a discard.
 const RESEED_GEN_TABLE: &str = "__ephpm_cdc_reseed_gen";
 
+/// Per-site **CDC log floor** (#707, issue C): the `MAX(turso_cdc.change_id)`
+/// this node's log had at the last `discard_local` snapshot install — the point
+/// at which it switched this site's data lineage but **kept the same
+/// `turso_cdc` log**, which still holds the pre-switch rows `1..floor`. A
+/// subscriber whose cursor is below the floor would be shipped that stale
+/// history and replay it, so [`serve_site_subscriber`] answers such a subscribe
+/// with [`Frame::RebootstrapRequired`] instead of tailing. `0` (absent) on a log
+/// that has never switched lineage, so ordinary replication is unaffected.
+/// `__`-prefixed and written through the mgmt connection, like the other CDC
+/// bookkeeping tables, so [`reset_local_user_tables`] never drops it on a future
+/// re-bootstrap and a **plain** restore clears it (it is in
+/// [`CDC_BOOKKEEPING_TABLES`]) — leaving floor `0`.
+const LOG_FLOOR_TABLE: &str = "__ephpm_cdc_log_floor";
+
 /// Every CDC / replication bookkeeping table a clustered database carries
 /// that a single-node database does not — the change-capture log and the
 /// ePHPm/litewire cursor tables.
@@ -2181,6 +2314,7 @@ pub const CDC_BOOKKEEPING_TABLES: &[&str] = &[
     LOG_WATERMARKS_TABLE,
     EPOCH_TABLE,
     RESEED_GEN_TABLE,
+    LOG_FLOOR_TABLE,
     WATERMARK_TABLE,
 ];
 
@@ -2465,6 +2599,68 @@ pub(crate) async fn write_local_reseed_gen(
     Ok(())
 }
 
+/// Read this node's CDC log floor ([`LOG_FLOOR_TABLE`]). `0` when the table does
+/// not exist (the log has never switched lineage — the common case and the
+/// fail-safe value: it refuses nothing). Stored as `INTEGER` to match
+/// `change_id`'s type; a non-integer value is an error rather than a silent `0`
+/// (a corrupt floor that read back as `0` would silently re-enable the stale
+/// replay this guards against).
+///
+/// # Errors
+///
+/// The underlying table read fails (a missing table is not an error — it is `0`).
+async fn read_log_floor(conn: &turso::Connection) -> anyhow::Result<i64> {
+    let mut probe = conn
+        .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (LOG_FLOOR_TABLE,))
+        .await
+        .context("cdc: probe for the log-floor table")?;
+    if probe.next().await.context("cdc: read the log-floor probe")?.is_none() {
+        return Ok(0); // the table does not exist — this log never switched lineage
+    }
+    let mut stmt = conn
+        .prepare(&format!("SELECT change_id FROM {LOG_FLOOR_TABLE} WHERE id = 0"))
+        .await
+        .context("cdc: prepare the log-floor read")?;
+    let mut rows = stmt.query(()).await.context("cdc: query the log floor")?;
+    match rows.next().await.context("cdc: read the log floor")? {
+        Some(row) => match row.get_value(0).context("cdc: log-floor value")? {
+            turso::Value::Integer(i) => Ok(i),
+            other => anyhow::bail!("cdc: log floor has an unexpected type: {other:?}"),
+        },
+        None => Ok(0), // table present but row 0 unset
+    }
+}
+
+/// Persist this node's CDC log floor, `max(existing, floor)` so it never moves
+/// backwards (a lower value would re-admit a stale cursor). Written through the
+/// mgmt connection inside the `discard_local` install transaction, so it commits
+/// atomically with the lineage switch it records.
+///
+/// # Errors
+///
+/// The table cannot be created, read, or written.
+async fn write_log_floor(conn: &turso::Connection, floor: i64) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {LOG_FLOOR_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                change_id INTEGER NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create log-floor table")?;
+    let existing = read_log_floor(conn).await?;
+    let floor = existing.max(floor);
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {LOG_FLOOR_TABLE} (id, change_id) VALUES (0, ?)"),
+        (floor,),
+    )
+    .await
+    .context("cdc: write log floor")?;
+    Ok(())
+}
+
 /// This serving owner's adopted reseed generation, for the [`Frame::Hello`] /
 /// [`SnapshotHeader`] it sends a replica. `0` on any error or when the table
 /// does not exist (a cluster that has never been reseeded). A `0` never triggers
@@ -2475,6 +2671,18 @@ async fn read_owner_reseed_gen(mgmt: &Turso) -> u64 {
     let Ok(conn) = mgmt.raw_connection() else { return 0 };
     let _permit = mgmt.wal_gate_permit().await;
     off_runtime(read_local_reseed_gen(&conn)).await.unwrap_or(0)
+}
+
+/// This serving owner's CDC log floor (#707), for the floor check
+/// [`serve_site_subscriber`] applies to each `Subscribe`. `0` on any error or
+/// when the table does not exist (a log that has never switched lineage) — a `0`
+/// floor refuses nothing, so a best-effort read here is fail-safe. Opens its own
+/// gated raw connection so it never races the stream connection. Mirrors
+/// [`read_owner_reseed_gen`].
+async fn read_owner_log_floor(mgmt: &Turso) -> i64 {
+    let Ok(conn) = mgmt.raw_connection() else { return 0 };
+    let _permit = mgmt.wal_gate_permit().await;
+    off_runtime(read_log_floor(&conn)).await.unwrap_or(0)
 }
 
 /// The watermark we had reached in `log_id`, from the per-log history.
@@ -2819,6 +3027,52 @@ async fn serve_no_copy<S: AsyncWriteExt + Unpin>(stream: &mut S) -> anyhow::Resu
     write_snapshot_header(stream, &header).await?;
     write_snapshot_chunk(stream, &[]).await?;
     stream.flush().await?;
+    Ok(())
+}
+
+/// Answer a `snapshot/<site>` request by sending the real [`SnapshotHeader`]
+/// (this copy's [`SiteVersion`](crate::site_version::SiteVersion) — epoch, head,
+/// reseed generation) and then **no body** (#707 B).
+///
+/// Used when this node holds a **warm** copy of the site but has not settled it
+/// for serving (a cold/just-promoted owner whose copy may be stale). The header
+/// is read-only and cheap, so a puller's version probe
+/// ([`probe_peer_version`]) still learns this node's version — which keeps
+/// [`gate_probe_by_version`] / [`fresher_unreachable_outranks`] able to reason
+/// about it — while the missing body makes a *full* snapshot probe
+/// ([`probe_peer`]) read as [`PeerProbe::Unreachable`] rather than installing a
+/// possibly-stale copy or (wrongly) concluding `no_copy`. The stream is dropped
+/// after the header, so the body read ends in EOF, which the puller already
+/// classifies as unreachable.
+async fn serve_snapshot_version_header_only<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    mgmt: &Turso,
+    local_log_id: &str,
+) -> anyhow::Result<()> {
+    let conn = mgmt.raw_connection().context("snapshot header: open mgmt connection")?;
+    let (epoch, head, reseed_gen) = {
+        let _permit = mgmt.wal_gate_permit().await;
+        off_runtime(async {
+            let epoch = read_site_epoch(&conn).await?;
+            let head = current_max_change_id(&conn).await?;
+            let reseed_gen = read_local_reseed_gen(&conn).await?;
+            anyhow::Ok((epoch, head, reseed_gen))
+        })
+        .await
+        .context("snapshot header: read site version")?
+    };
+    let header = SnapshotHeader {
+        watermark: head,
+        total_len: 0,
+        log_id: local_log_id.to_string(),
+        no_copy: false,
+        epoch,
+        reseed_gen,
+    };
+    write_snapshot_header(stream, &header).await?;
+    stream.flush().await?;
+    // No body: returning drops the write half, so the puller's body read ends in
+    // EOF and classifies this peer as Unreachable (with the version it just read).
     Ok(())
 }
 
@@ -4464,6 +4718,34 @@ impl StreamKind {
     }
 }
 
+/// What a `snapshot/<site>` handler answers for a site this node holds, given
+/// whether it is settled for serving (`ready`) and whether the local copy is
+/// cold (#707 A/B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotServe {
+    /// Settled: serve the full snapshot (header + body).
+    Full,
+    /// Unsettled and cold (no data): answer `no_copy`, so a cold holder reads as
+    /// NoCopy (→ `NewSite` for an empty site), never Unreachable — closing the
+    /// empty-site ownership-change deadlock (A).
+    NoCopy,
+    /// Unsettled but warm: serve the version header and refuse the body, so a
+    /// puller's version probe still learns this node's version (B) while a full
+    /// snapshot probe reads Unreachable-with-version (which
+    /// [`fresher_unreachable_outranks`] can then act on).
+    HeaderOnly,
+}
+
+/// Decide what a `snapshot/<site>` handler answers (#707 A/B). Pure so the
+/// liveness rules are unit-testable without a cluster.
+fn snapshot_serve_decision(ready: bool, cold: bool) -> SnapshotServe {
+    match (ready, cold) {
+        (true, _) => SnapshotServe::Full,
+        (false, true) => SnapshotServe::NoCopy,
+        (false, false) => SnapshotServe::HeaderOnly,
+    }
+}
+
 /// Spawn one owner-side per-site handler for `kind`, routing every site
 /// under its prefix. Each inbound stream is gated on HRW ownership of the
 /// parsed site before this node's (owner) mgmt factory is resolved and the
@@ -4565,34 +4847,64 @@ fn spawn_per_site_stream_handler(
                         }
                     }
                     StreamKind::Snapshot => {
-                        // #707: this node HOLDS the site (mgmt.existing returned a
-                        // copy) but has not settled it for serving — a cold or
-                        // just-promoted owner whose copy may be stale. Do not hand
-                        // out a possibly-stale snapshot; drop the stream so the
-                        // puller treats it as unreachable (NOT `no_copy`, which
-                        // would let a new owner conclude the site is empty and serve
-                        // nothing) and keeps the site Blocked, retrying until a node
-                        // that has settled the site answers. A node holding no copy
-                        // already answered `no_copy` above, so new-site convergence
-                        // is unaffected. Sticky `Ready` keeps a previous/draining
-                        // owner serving the handoff.
-                        if !matches!(
-                            gate.state(&site),
-                            SiteServeState::Ready
-                        ) {
-                            cdc_metrics::record_stream_refused(kind.label());
-                            tracing::warn!(
-                                peer = %peer,
-                                site = %site,
-                                "per-site snapshot: this node holds the site but has not settled \
-                                 it for serving yet (serving gate not Ready); refusing to serve a \
-                                 possibly-stale snapshot — the peer will retry"
-                            );
-                            return;
-                        }
-                        match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
-                            Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
-                            Err(e) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot bootstrap failed: {e:#}"),
+                        // #707: this node holds the site (mgmt.existing returned a
+                        // copy) but may not have settled it for serving. Decide what
+                        // to answer by (settled?, cold?):
+                        //
+                        // - Ready → serve the full snapshot (header + body).
+                        // - not Ready + COLD → answer `no_copy`. A cold holder (an
+                        //   empty/freshly-provisioned site, Pending until it settles)
+                        //   holds no data, so it must read as NoCopy, not
+                        //   Unreachable — otherwise an empty site whose owner changes
+                        //   deadlocks: the new cold owner Blocks on cold holders
+                        //   while they Block bootstrapping from it (A).
+                        // - not Ready + WARM → serve the version HEADER but refuse
+                        //   the BODY (B). The header is read-only and cheap, so the
+                        //   puller's version probe still sees this node's SiteVersion
+                        //   even while it settles — and a refused body reads as
+                        //   Unreachable WITH a known version, exactly what
+                        //   `fresher_unreachable_outranks` (guard 4) catches, so the
+                        //   two guards compose rather than hiding a stale owner's
+                        //   version from the settle decision. Sticky `Ready` keeps a
+                        //   previous/draining owner serving the full handoff.
+                        let serveable = matches!(gate.state(&site), SiteServeState::Ready);
+                        let cold = if serveable {
+                            false
+                        } else {
+                            match site_mgmt.factory.raw_connection() {
+                                Ok(conn) => {
+                                    let _permit = site_mgmt.factory.wal_gate_permit().await;
+                                    off_runtime(local_db_is_cold(&conn)).await.unwrap_or(true)
+                                }
+                                // Cannot even open the copy: treat as cold (answer
+                                // no_copy) rather than claim a version we can't read.
+                                Err(_) => true,
+                            }
+                        };
+                        match snapshot_serve_decision(serveable, cold) {
+                            SnapshotServe::Full => {
+                                match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
+                                    Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
+                                    Err(e) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot bootstrap failed: {e:#}"),
+                                }
+                            }
+                            SnapshotServe::NoCopy => {
+                                // Unsettled and cold: hold no data → no_copy.
+                                let mut stream = stream;
+                                match serve_no_copy(&mut stream).await {
+                                    Ok(()) => tracing::debug!(peer = %peer, site = %site, "per-site snapshot: unsettled cold copy; answered no-copy"),
+                                    Err(e) => tracing::info!(peer = %peer, site = %site, "per-site snapshot: no-copy answer failed: {e:#}"),
+                                }
+                            }
+                            SnapshotServe::HeaderOnly => {
+                                // Unsettled but warm: expose the version, refuse the body.
+                                cdc_metrics::record_stream_refused(kind.label());
+                                let mut stream = stream;
+                                match serve_snapshot_version_header_only(&mut stream, &site_mgmt.factory, &site_mgmt.log_id).await {
+                                    Ok(()) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot: holding a warm but unsettled copy; sent the version header and refused the body so the puller sees the version and retries (#707)"),
+                                    Err(e) => tracing::info!(peer = %peer, site = %site, "per-site snapshot: version-header answer failed: {e:#}"),
+                                }
+                            }
                         }
                     }
                 }
@@ -4867,6 +5179,31 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                                     "per-site replica: owner advertised a newer reseed generation; \
                                      force-discarding local data and cold re-bootstrapping from the \
                                      owner (ephpm db restore --reseed)"
+                                );
+                                force_reset = true;
+                                true
+                            }
+                            Err(e) if e.downcast_ref::<RebootstrapRequired>().is_some() => {
+                                // The owner refused our subscribe as below its log
+                                // floor (#707 issue C): it switched lineage (a
+                                // reseed convergence or a divergence re-bootstrap)
+                                // but kept the same turso_cdc log, which still holds
+                                // pre-switch rows. Force a clean re-bootstrap: the
+                                // fresh snapshot's watermark is >= the floor, so the
+                                // next subscribe clears it and tails cleanly, and
+                                // the stale history is never replayed. The install
+                                // passes the reseed-generation guard (equal/higher
+                                // gen) because the owner holds the restore.
+                                let floor = e
+                                    .downcast_ref::<RebootstrapRequired>()
+                                    .map_or(0, |r| r.floor);
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    log_floor = floor,
+                                    "per-site replica: owner refused our cursor as below its CDC \
+                                     log floor; force-discarding and re-bootstrapping from the \
+                                     owner so stale pre-switch history is not replayed (#707)"
                                 );
                                 force_reset = true;
                                 true
@@ -6345,6 +6682,22 @@ async fn install_snapshot(
             reset_local_user_tables(conn)
                 .await
                 .context("per-site replica: discard divergent local tables")?;
+            // #707 issue C: a `discard_local` install switches this site's data
+            // lineage but keeps the SAME `turso_cdc` log, which still holds the
+            // pre-switch rows `1..head`. Record that head as the log FLOOR (in the
+            // same transaction as the switch) so that if this node later serves
+            // CDC, a subscriber whose cursor is below the floor is sent to
+            // re-bootstrap instead of being shipped the stale pre-switch history.
+            // Read before `apply_snapshot` runs — the install is capture-off and
+            // never touches `turso_cdc`, so the head is identical before and after,
+            // but reading it first keeps the floor a pure function of the log as it
+            // was at the switch. A node that never captured (no `turso_cdc`) reads
+            // `0`, so a pure replica's floor stays `0`. `max()`-merged in
+            // `write_log_floor`, so it never moves backwards across re-bootstraps.
+            let floor = current_max_change_id(conn)
+                .await
+                .context("snapshot: read the CDC head for the log floor")?;
+            write_log_floor(conn, floor).await.context("snapshot: record the CDC log floor")?;
         }
         apply_snapshot(conn, header, dump).await
     }
@@ -8196,6 +8549,220 @@ mod tests {
                 .is_none(),
             "nothing blocks installing the freshest copy"
         );
+    }
+
+    /// **#707 A: the snapshot-serve decision closes the empty-site deadlock.** A
+    /// settled copy serves the full snapshot; an unsettled **cold** copy must
+    /// answer `no_copy` (so an empty site whose owner changes still converges to
+    /// `NewSite` rather than every cold holder reading as Unreachable and the new
+    /// owner Blocking forever); an unsettled **warm** copy serves the version
+    /// header only (B).
+    #[test]
+    fn snapshot_serve_decision_cold_holder_answers_no_copy_not_unreachable() {
+        assert_eq!(snapshot_serve_decision(true, false), SnapshotServe::Full);
+        assert_eq!(snapshot_serve_decision(true, true), SnapshotServe::Full);
+        assert_eq!(
+            snapshot_serve_decision(false, true),
+            SnapshotServe::NoCopy,
+            "an unsettled COLD holder answers no_copy — the empty-site deadlock fix (A)"
+        );
+        assert_eq!(
+            snapshot_serve_decision(false, false),
+            SnapshotServe::HeaderOnly,
+            "an unsettled WARM holder exposes its version but refuses the body (B)"
+        );
+    }
+
+    /// **#707 B: a warm-but-unsettled copy still exposes its version.** The
+    /// header-only serve writes the real [`SnapshotHeader`] (epoch, head, reseed
+    /// generation) so a puller's version probe learns this node's
+    /// [`SiteVersion`](crate::site_version::SiteVersion) even while it is settling
+    /// — then sends no body, so a full snapshot probe reads EOF (→ Unreachable,
+    /// which `fresher_unreachable_outranks` can act on). Without this the stale
+    /// owner's version was hidden and `decide_warm_settle` saw `best_peer=None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsettled_warm_copy_still_serves_its_version_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let mgmt = Turso::open(&path).await.unwrap();
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            write_site_epoch(&conn, 7).await.unwrap();
+            write_local_reseed_gen(&conn, 1_700_000_000_500).await.unwrap();
+        }
+
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(async move {
+            serve_snapshot_version_header_only(&mut server, &mgmt, "site-log").await
+        });
+
+        // The puller's version probe reads the header and learns the version.
+        let header = read_snapshot_header(&mut client).await.unwrap();
+        assert!(!header.no_copy, "a warm holder does not answer no_copy");
+        assert_eq!(header.epoch, 7);
+        assert_eq!(header.reseed_gen, 1_700_000_000_500);
+        assert_eq!(header.log_id, "site-log");
+
+        // A full-body probe then reads EOF → Unreachable (no body followed).
+        let body = read_snapshot_body(&mut client, &header, 1 << 20).await;
+        assert!(
+            body.is_err(),
+            "the body is refused, so a full probe reads this peer as unreachable"
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    /// **#707 C: a `discard_local` install records the CDC log floor.** Installing
+    /// a snapshot with `discard_local` switches the site's data lineage but keeps
+    /// the same `turso_cdc` log, so the pre-switch head is recorded as the floor —
+    /// the value [`serve_site_subscriber`] later refuses subscribes below.
+    #[tokio::test]
+    async fn install_snapshot_discard_local_records_the_log_floor() {
+        use litewire::backend::Backend;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+
+        // Capture some writes so turso_cdc holds change_ids (the pre-switch
+        // history a divergent replica must not be allowed to replay).
+        let wire = Turso::builder(&path).enable_cdc_on_connect(true).build().await.unwrap();
+        let session = wire.connect().await.unwrap();
+        session
+            .execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", &[])
+            .await
+            .unwrap();
+        session.execute("INSERT INTO posts (title) VALUES ('old 1')", &[]).await.unwrap();
+        session.execute("INSERT INTO posts (title) VALUES ('old 2')", &[]).await.unwrap();
+
+        let mgmt = Turso::open(&path).await.unwrap();
+        let conn = mgmt.raw_connection().unwrap();
+        let head = current_max_change_id(&conn).await.unwrap();
+        assert!(head > 0, "precondition: turso_cdc captured the writes (head {head})");
+        assert_eq!(read_log_floor(&conn).await.unwrap(), 0, "no floor before a lineage switch");
+
+        // A discard_local install switches lineage → records floor = head.
+        let header = SnapshotHeader {
+            watermark: head,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+            epoch: 0,
+            reseed_gen: 0,
+        };
+        let dump = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'new');\n";
+        install_snapshot(&conn, &header, dump, true).await.unwrap();
+        assert_eq!(
+            read_log_floor(&conn).await.unwrap(),
+            head,
+            "the floor is the pre-switch CDC head"
+        );
+
+        // A cold bootstrap (discard_local = false) never sets a floor.
+        let db2 = tempfile::NamedTempFile::new().unwrap();
+        let path2 = db2.path().to_str().unwrap().to_string();
+        let mgmt2 = Turso::open(&path2).await.unwrap();
+        let conn2 = mgmt2.raw_connection().unwrap();
+        install_snapshot(&conn2, &header, dump, false).await.unwrap();
+        assert_eq!(read_log_floor(&conn2).await.unwrap(), 0, "a cold bootstrap sets no floor");
+        drop(session);
+        drop(wire);
+    }
+
+    /// **#707 C, the core data-loss test (owner side).** A subscriber whose cursor
+    /// is below the log floor is answered with [`Frame::RebootstrapRequired`] (so
+    /// it re-bootstraps instead of replaying the owner's pre-switch history);
+    /// a subscriber at or above the floor is NOT refused and tails normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_site_subscriber_refuses_a_subscribe_below_the_log_floor() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let mgmt = Arc::new(Turso::open(&path).await.unwrap());
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            write_log_floor(&conn, 5).await.unwrap();
+        }
+
+        // Below the floor → RebootstrapRequired.
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mgmt2 = Arc::clone(&mgmt);
+        let task = tokio::spawn(async move {
+            serve_site_subscriber(server, &mgmt2, "owner-log", "shop.test").await
+        });
+        match read_frame(&mut client).await.unwrap() {
+            Frame::Hello { .. } => {}
+            o => panic!("expected Hello, got {o:?}"),
+        }
+        write_frame(&mut client, &Frame::Subscribe { from_change_id: 0 }).await.unwrap();
+        match read_frame(&mut client).await.unwrap() {
+            Frame::RebootstrapRequired { floor } => assert_eq!(floor, 5),
+            o => panic!("expected RebootstrapRequired for a below-floor subscribe, got {o:?}"),
+        }
+        task.await.unwrap().unwrap();
+
+        // At the floor → NOT refused (a cold log then just holds the stream open).
+        let (mut client2, server2) = tokio::io::duplex(1 << 16);
+        let mgmt3 = Arc::clone(&mgmt);
+        let task2 = tokio::spawn(async move {
+            serve_site_subscriber(server2, &mgmt3, "owner-log", "shop.test").await
+        });
+        match read_frame(&mut client2).await.unwrap() {
+            Frame::Hello { .. } => {}
+            o => panic!("expected Hello, got {o:?}"),
+        }
+        write_frame(&mut client2, &Frame::Subscribe { from_change_id: 5 }).await.unwrap();
+        if let Ok(Ok(Frame::RebootstrapRequired { .. })) =
+            tokio::time::timeout(Duration::from_millis(300), read_frame(&mut client2)).await
+        {
+            panic!("a subscribe AT the floor must not be refused");
+        }
+        task2.abort();
+    }
+
+    /// **#707 C, the replica side.** A replica that receives
+    /// [`Frame::RebootstrapRequired`] returns the typed [`RebootstrapRequired`]
+    /// error (which the replica loop turns into a force-discard re-bootstrap)
+    /// rather than tailing and replaying pre-switch rows.
+    #[tokio::test]
+    async fn a_replica_receiving_rebootstrap_required_returns_the_typed_error() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let factory = Turso::open(&path).await.unwrap();
+        let apply_conn = factory.raw_connection().unwrap();
+        // A production replica reaches `Subscribe` only after bootstrapping, so its
+        // watermark table exists; seed it so watermark resolution succeeds here.
+        seed_watermark(&apply_conn, 0).await.unwrap();
+
+        let (mut owner, mut replica) = tokio::io::duplex(1 << 16);
+        // Owner: Hello (gen 0 — no reseed signal) then RebootstrapRequired.
+        write_frame(
+            &mut owner,
+            &Frame::Hello {
+                log_id: "owner-log".into(),
+                epoch: 0,
+                applied_acks: true,
+                reseed_gen: 0,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut owner, &Frame::RebootstrapRequired { floor: 9 }).await.unwrap();
+
+        let err =
+            subscribe_and_consume_site(&mut replica, &factory, &apply_conn, "shop.test", true)
+                .await
+                .expect_err("the replica must not tail below the floor");
+        let req = err
+            .downcast_ref::<RebootstrapRequired>()
+            .expect("the error must be the typed RebootstrapRequired, not a generic stream error");
+        assert_eq!(req.floor, 9);
+
+        // The replica sent a Subscribe before it read the refusal (it resolved its
+        // watermark and asked to tail; the owner answered re-bootstrap).
+        match tokio::time::timeout(Duration::from_millis(100), read_frame(&mut owner)).await {
+            Ok(Ok(Frame::Subscribe { .. })) => {}
+            other => panic!("expected the replica's Subscribe, got {other:?}"),
+        }
     }
 
     /// **#654 crash-restart, the hole 47ff6093 did not close.** A promotion must
