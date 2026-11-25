@@ -126,6 +126,13 @@ aya = "0.13"
 # enter the lock file.
 aya-obj = "0.2"
 object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
+# Self-applied Landlock filesystem sandbox on the PHP execution engine
+# (src/server_sandbox.rs, multi-tenant breakout finding F3). Pure Rust, ABI 1-4,
+# no CAP_SYS_ADMIN, MSRV-compatible — the same crate and version the
+# out-of-process `ephpm exec` sandbox (crates/ephpm/src/exec_sandbox.rs) uses.
+# Linux-only: restrict_self is a Linux syscall; other platforms compile the
+# inert stub in server_sandbox.rs.
+landlock = "0.4"
 
 [features]
 # OTLP trace export: `tracing` spans (http.request / worker.queue_wait /

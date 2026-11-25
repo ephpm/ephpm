@@ -406,6 +406,133 @@ plane as its own uid, kept out of every socket's group/ACL) and, where
 available, a `CONFIG_BPF_LSM` policy. (This qualification is the same one §8/§9
 carry for their cross-tenant IP controls.)
 
+## What ePHPm self-enforces
+
+The layers above confine what a tenant's PHP *can express*. This section is
+about the privilege the engine runs with in the first place, and it draws a
+sharp line between what ePHPm now enforces on itself and what remains the
+operator's job (multi-tenant breakout audit finding **F3**).
+
+The problem F3 named: nothing used to *force* ePHPm off root. `[server]
+run_as_user` is a no-op when unset, and the in-process PHP engine had no
+self-applied kernel sandbox — so a process started as root with no drop ran
+every tenant's PHP, and anything that broke out of the engine, as **host root**,
+with every health check green.
+
+### 1. Fail closed on a root-with-no-drop posture — `require_privilege_drop`
+
+In multi-tenant mode (`sites_dir` set), if the process is running as root
+(`euid == 0`) and no `run_as_user` is configured, ePHPm **refuses to start**:
+
+```text
+refusing to serve as root without a privilege drop (multi-tenant breakout
+audit finding F3). Set [server] run_as_user to an unprivileged account, or set
+[server] require_privilege_drop = false to acknowledge running as root with no
+drop (only safe when an external sandbox already confines the process).
+```
+
+Set [`run_as_user`](/reference/config/#server) (recommended — ePHPm then binds
+privileged ports, opens its files, and drops the whole process to that
+unprivileged uid before serving), or set
+[`require_privilege_drop`](/reference/config/#server)` = false` to acknowledge
+the posture when something outside ePHPm already confines it. A root process
+with no drop always logs a WARN regardless of the flag; the flag only decides
+whether it is fatal. `ephpm dev` downgrades the failure to a warning so local
+iteration is never blocked. **Still a single non-root uid for the whole
+process, not a per-tenant uid** — cross-tenant isolation remains §1–§6, not this.
+
+### 2. Self-applied Landlock sandbox on the PHP engine — `self_sandbox`
+
+After the privilege drop, ePHPm arms a **Landlock** ruleset on every thread that
+executes tenant PHP (the per-request pool, the worker pool, the Xdebug debug
+lane). This is the same kernel mechanism the out-of-process
+[`ephpm exec`](/reference/cli/exec/) sandbox uses, now applied to the long-running
+server. Each PHP thread is restricted — enforced by the kernel **even against
+root** — to exactly:
+
+| Access | Paths |
+|---|---|
+| read + write | the site trees (`sites_dir`, `document_root`), the per-vhost temp/session root, the embedded-database dir (`[db.sqlite] dir`), and `/dev/{null,zero,full}` |
+| read only | the operator-owned per-site overrides, the public CA trust store (so a tenant's HTTPS client can verify certificates), a minimal non-secret slice of `/etc` (name resolution, the loader cache, timezone) plus the systemd-resolved / NetworkManager DNS dirs (`/run/systemd/resolve`, `/run/NetworkManager`, so resolution survives a `resolv.conf` regeneration), `/dev/{u,}random`, and a **curated set of `/proc/self` leaves** for self-inspection (`stat`, `status`, `maps`, `fd`, …). It grants **neither** the `/proc/self` directory **nor** `/proc/self/task`: the per-thread `task` subtree (`/proc/self/task/<tid>/environ`, `.../mem`) would re-expose the very secrets the curation hides, so it is excluded. `/proc/self/environ` (the service env, incl. `AWS_*`) and `/proc/self/mem` therefore stay unreachable — blocked by **both** the environment scrub above (finding F1) **and** this sandbox's exclusion of the `/proc/self` directory and `/proc/self/task`, not by a curated-leaf grant alone. |
+| read + execute | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/opt` (loader + shared libraries) |
+
+Everything else becomes unreachable, including the files a tenant breakout
+would otherwise read with the process uid: **`/etc/ephpm`** (the cluster
+secret), **`/etc/ssl/private`** (TLS private keys), **`/etc/shadow`**,
+**`/root`**, other tenants' home directories, and any host path outside the
+granted set. Landlock governs the filesystem only — it does not
+restrict the network, and already-open descriptors (listeners, the loaded
+config, the generated `php.ini`, TLS keys) keep working, which is why the TLS
+private key is **never** granted to the sandboxed engine.
+
+> **The read+execute grant covers `/opt`, `/usr`, and `/usr/local` — so do not
+> put config or secrets there.** The loader and shared libraries live under
+> `/usr`, `/lib*`, `/bin`, `/sbin`, and `/opt`, so the sandbox grants those trees
+> **read**. A secret placed inside one of them — `/opt/ephpm/ephpm.toml`,
+> `/usr/local/etc/ephpm.toml`, an app `.env` under `/opt` — is therefore readable
+> by **every tenant's PHP thread**, defeating the sandbox for that file. Keep the
+> ePHPm config, the `[kv]`/`[cluster]` secret, and any operator credential under
+> **`/etc/ephpm`** (which is *not* granted and stays unreachable), never under
+> `/opt` or `/usr/local/etc`. The sandbox narrows "any host file the uid can read"
+> to "the granted set" — but the granted read+execute system trees are part of
+> that set, which is exactly why secrets must not live in them. The same rule
+> applies to the embedded database: in whole-database mode the **parent
+> directory** of `[db.sqlite] path` is granted **read-write** to PHP threads (so
+> Turso's deferred `-wal`/`-shm` open is allowed), so do not point `[db.sqlite]
+> path` inside a secret-bearing directory such as `/etc/ephpm` — keep the
+> database in its own data dir.
+
+**This is not the cross-tenant boundary.** A PHP pool thread serves many
+tenants over its lifetime and a Landlock domain can only be set once per thread
+and only narrowed, so the ruleset necessarily grants the *whole* `sites_dir`,
+embedded-DB dir and per-vhost state root — one tenant's PHP can reach another's
+files, database and sessions *through the filesystem* under Landlock alone.
+Keeping tenants out of each other's trees is the job of §1–§6
+(`open_basedir` + `disable_functions` + the per-site database/wire credential),
+not this sandbox. What Landlock adds is the kernel backstop against reaching
+**host** secrets and escaping the ePHPm tree entirely, even if `open_basedir`
+is bypassed.
+
+Controlled by [`self_sandbox`](/reference/config/#server):
+
+- `"auto"` (default) — **secure by default**: armed in multi-tenant mode when
+  the kernel enforces Landlock (Linux ≥ 5.13, ABI 1), and **fails startup
+  closed** if the kernel lacks it (the same posture `require_privilege_drop`
+  takes — a node that isolates tenants must not run the shared-uid engine
+  unsandboxed). There is no "warn and serve unsandboxed" tier; use `"off"` to
+  accept that explicitly. Off in single-tenant mode.
+- `"enforce"` — require it: startup fails closed without kernel support, and a
+  PHP thread that cannot arm the sandbox refuses to serve.
+- `"off"` — disabled.
+
+Linux-only (Windows/macOS are single-tenant/development targets); ignored under
+`ephpm dev`. It does **not** replace §1–§6: `open_basedir` is still the
+cross-tenant boundary, and the sandbox grants the whole embedded-database dir, so
+it hardens against *host* escape, not against one tenant reading another tenant's
+`.db` file (that remains open_basedir + the single-uid model).
+
+### What the operator must still do
+
+The kernel-enforced guarantees above stop at the process boundary. These remain
+your responsibility (they are §7–§9 above, restated as a checklist):
+
+- **Run under a dedicated, unprivileged, non-root uid** — set `run_as_user` (or
+  start ePHPm already as that uid). ePHPm now *refuses* the dangerous posture but
+  cannot invent the account for you. For the strongest split, use the two-uid
+  (`ephpm-web` / `ephpm-ctl`) model in §7.
+- **Harden the service manager / container** — the systemd sandbox directives in
+  §7 (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  a minimal `CapabilityBoundingSet`, `IPAddressDeny`) or the equivalent container
+  security context. Landlock is defense in depth *inside* the process, not a
+  substitute for confining the process itself.
+- **Enforce egress** at the network/kernel layer (§8 nftables, §9 eBPF) — Landlock
+  does not restrict the network.
+
+> **Self-enforced (this section) vs. operator-supplied (§7–§9).** `require_privilege_drop`
+> and `self_sandbox` are produced and enforced by ePHPm and on by default in
+> multi-tenant mode. The uid you drop *to*, the systemd/container hardening, and
+> the egress policy are yours to provide — ePHPm cannot create or verify them.
+
 ## Turning it on
 
 The layers divide into two groups, and it matters which is which:
@@ -413,6 +540,7 @@ The layers divide into two groups, and it matters which is which:
 | Layers | Who provides them | State |
 |---|---|---|
 | §1–§6 — `open_basedir`, the function denylist, persistence off, per-vhost temp/session, per-site database + wire credential, per-site KV keyspace | ePHPm | **On by default** whenever `[server] sites_dir` is set |
+| [F3 self-enforcement](#what-ephpm-self-enforces) — refuse the root-with-no-drop posture (`require_privilege_drop`); self-apply a Landlock sandbox to the PHP engine (`self_sandbox`) | ePHPm (Linux) | **On by default** in multi-tenant mode; still needs a `run_as_user` uid to drop *to* |
 | §7–§8 — the two-uid split, the systemd sandbox extras (`PrivateTmp`, `IPAddressDeny`), the nftables egress table | **You**, on the host | Not shipped, not written by `ephpm install`, not on by default |
 | §9 — eBPF per-vhost network policy | ePHPm (Linux only) | Off by default, opt in with `ebpf_policy = true`, plus host prerequisites |
 | §11 — AF_UNIX connect fence | ePHPm (Linux ≥ 6.7 only) | **On by default** (`unix_socket_policy = "auto"`) on a multi-tenant node; allowlist the sockets a site needs, set `"required"` to also fail closed, or `"off"` to opt out |
@@ -422,6 +550,11 @@ A recommended production config makes the ePHPm-side intent explicit:
 ```toml
 [server]
 sites_dir = "/srv/ephpm/sites"
+run_as_user = "ephpm-web"         # drop root → unprivileged uid before serving (F3)
+# require_privilege_drop defaults to true in multi-tenant: startup fails if root
+# with no run_as_user. self_sandbox defaults to "auto" (Landlock engine sandbox
+# on Linux ≥ 5.13). Make the intent explicit / require the sandbox:
+self_sandbox = "enforce"          # fail startup if the kernel can't enforce Landlock
 
 [server.security]
 open_basedir = true               # per-vhost filesystem sandbox

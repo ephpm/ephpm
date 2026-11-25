@@ -97,6 +97,21 @@ pub struct WorkerPool {
     /// How long `response_chunk` waits for a stalled client before aborting a
     /// streaming response (see `worker_bridge::set_stream_send_timeout`).
     stream_send_timeout: Duration,
+    /// Signals the pool's **unsandboxed spawner thread** to create one
+    /// replacement worker. A retiring worker thread is itself Landlock-sandboxed
+    /// (the F3 engine sandbox); if it called [`WorkerPool::spawn_worker`]
+    /// directly, `std::thread::spawn` would make the replacement inherit its
+    /// Landlock domain, and the replacement's
+    /// [`crate::server_sandbox::restrict_current_php_thread`] would then stack a
+    /// *second* layer. A worker that recycles/retires-and-respawns would deepen
+    /// the lineage each cycle and, after `LANDLOCK_MAX_NUM_LAYERS` (16), hit
+    /// `E2BIG` — a permanent boot-failure loop that 503s the node. Replacement
+    /// requests therefore go to a spawner thread created **before any sandbox is
+    /// applied** (see [`WorkerPool::spawn`]), so every replacement starts from a
+    /// clean 0-layer lineage. The initial fill and [`WorkerPool::note_hung`]
+    /// already spawn from unsandboxed threads (startup / tokio), so only the
+    /// worker respawn path ([`respawn_if_running`]) routes through here.
+    respawn_tx: std::sync::mpsc::Sender<()>,
 }
 
 /// Shared, atomically-updated pool state.
@@ -152,6 +167,8 @@ impl WorkerPool {
         gauge!("ephpm_worker_idle").set(0.0);
         gauge!("ephpm_worker_busy").set(0.0);
 
+        let (respawn_tx, respawn_rx) = std::sync::mpsc::channel::<()>();
+
         let pool = Arc::new(Self {
             dispatcher: Dispatcher::new(backlog.max(1)),
             admission: Arc::new(tokio::sync::Semaphore::new(backlog.max(1))),
@@ -162,7 +179,27 @@ impl WorkerPool {
             worker_count,
             boot_timeout,
             stream_send_timeout,
+            respawn_tx,
         });
+
+        // The unsandboxed spawner thread, created BEFORE any worker thread exists
+        // and before any Landlock sandbox is armed, so it never inherits or arms
+        // one. Routing replacements through it gives every respawned worker a
+        // fresh 0-layer Landlock lineage — see the `respawn_tx` field docs. It
+        // holds only a `Weak` and exits when the pool is dropped.
+        {
+            let weak = Arc::downgrade(&pool);
+            if let Err(e) = std::thread::Builder::new()
+                .name("ephpm-worker-spawner".to_string())
+                .spawn(move || respawn_loop(&weak, &respawn_rx))
+            {
+                tracing::error!(
+                    %e,
+                    "failed to spawn the worker pool spawner thread — worker replacement after \
+                     a recycle/retire will not happen"
+                );
+            }
+        }
 
         for _ in 0..worker_count {
             pool.spawn_worker();
@@ -419,6 +456,30 @@ impl WorkerPool {
             counter!("ephpm_worker_boot_failures_total").increment(1);
         }
     }
+
+    /// Ask the unsandboxed spawner thread to create one replacement worker.
+    ///
+    /// Called by [`respawn_if_running`], which runs on a retiring (and therefore
+    /// Landlock-sandboxed) worker thread. That thread must never call
+    /// [`WorkerPool::spawn_worker`] itself — see the
+    /// [`respawn_tx`](Self::respawn_tx) field docs for why. A failed send means
+    /// the pool is being dropped, so the request is discarded.
+    fn request_respawn(&self) {
+        let _ = self.respawn_tx.send(());
+    }
+}
+
+/// Body of the pool's unsandboxed spawner thread: block on the respawn channel
+/// and create one replacement worker per signal, from this thread's clean
+/// (0-layer) Landlock lineage. Exits when every [`WorkerPool::respawn_tx`]
+/// sender is gone (the pool was dropped) or the pool can no longer be upgraded.
+fn respawn_loop(weak: &std::sync::Weak<WorkerPool>, rx: &std::sync::mpsc::Receiver<()>) {
+    while rx.recv().is_ok() {
+        let Some(pool) = weak.upgrade() else {
+            break;
+        };
+        pool.spawn_worker();
+    }
 }
 
 /// Body of one worker OS thread: register with TSRM, install its dispatch
@@ -446,6 +507,23 @@ fn worker_main(
     {
         let pool = Arc::clone(pool);
         ephpm_php::worker_bridge::set_retire_check(Box::new(move || pool.claim_surplus()));
+    }
+
+    // Arm the self-applied Landlock sandbox on this worker BEFORE the framework
+    // boots (finding F3) — worker-mode boot executes application PHP (autoload,
+    // framework bootstrap) immediately in worker_thread_init below, so the
+    // sandbox must be in place first. A no-op unless `[server] self_sandbox`
+    // enabled it; when it did and arming fails, refuse to serve on an
+    // unsandboxed worker (fail closed), with the same cleanup a TSRM-init
+    // failure performs.
+    if let Err(e) = crate::server_sandbox::restrict_current_php_thread() {
+        ephpm_php::worker_bridge::clear_dispatch_source();
+        tracing::error!(worker_id, ?e, "worker could not arm the engine sandbox");
+        pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
+        counter!("ephpm_worker_boot_failures_total").increment(1);
+        pool.state.live.fetch_sub(1, Ordering::AcqRel);
+        respawn_if_running(pool);
+        return;
     }
 
     // TSRM register + start the one long-lived request the whole loop runs in.
@@ -727,7 +805,11 @@ fn respawn_if_running(pool: &Arc<WorkerPool>) {
         let backoff = Duration::from_millis(100u64.saturating_mul(1u64 << shift));
         std::thread::sleep(backoff.min(Duration::from_secs(10)));
     }
-    pool.spawn_worker();
+    // Route the actual spawn through the unsandboxed spawner thread rather than
+    // calling `spawn_worker` here: this function runs on the retiring worker
+    // thread, which is Landlock-sandboxed, so a direct spawn would deepen the
+    // replacement's Landlock lineage and eventually exhaust the 16-layer cap.
+    pool.request_respawn();
 }
 
 #[cfg(test)]

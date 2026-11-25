@@ -118,6 +118,140 @@ pub fn drop_privileges(config: &Config, extra_paths: &[std::path::PathBuf]) -> a
     Ok(())
 }
 
+/// Fail closed on a dangerous privilege posture (multi-tenant breakout audit
+/// **F3**): a root process with no `[server] run_as_user` to drop to runs every
+/// tenant's PHP — and anything that breaks out of the in-process engine — as
+/// **host root**, because [`drop_privileges`] is a no-op when `run_as_user` is
+/// unset.
+///
+/// Called once, early in `serve`, before any port is bound. The behaviour:
+///
+/// * `euid != 0`, or `run_as_user` is set: nothing to warn about, return `Ok`.
+///   (Whether the drop then succeeds is [`drop_privileges`]'s concern.)
+/// * `euid == 0` and `run_as_user` is unset: emit a loud `WARN` (mirroring the
+///   exposed-DB-listener warnings), then **fail closed** with an explanatory
+///   error when `ServerConfig::require_privilege_drop_enforced` resolves `true`
+///   (the multi-tenant default). `dev_mode` downgrades the failure to a warning
+///   so a developer iterating locally is never blocked.
+///
+/// # Errors
+///
+/// Returns an error when the process is root, no `run_as_user` is configured,
+/// `require_privilege_drop` resolves to `true`, and `dev_mode` is `false`.
+#[cfg(unix)]
+pub fn enforce_posture(config: &Config, dev_mode: bool) -> anyhow::Result<()> {
+    // SAFETY: geteuid never fails and takes no arguments.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let inputs = PostureInputs {
+        is_root,
+        run_as_user_set: config.server.run_as_user.is_some(),
+        require_drop: config.server.require_privilege_drop_enforced(),
+        dev_mode,
+    };
+    apply_posture_decision(posture_decision(inputs), config.server.sites_dir.is_some())
+}
+
+/// The posture inputs [`posture_decision`] reasons over. A struct rather than a
+/// row of `bool` parameters (both for readability and to keep the decision
+/// exhaustively testable without tripping `clippy::fn_params_excessive_bools`).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct PostureInputs {
+    /// `euid == 0`.
+    is_root: bool,
+    /// `[server] run_as_user` is set (a drop target is configured).
+    run_as_user_set: bool,
+    /// `require_privilege_drop` resolved to `true` (the multi-tenant default).
+    require_drop: bool,
+    /// Running under `ephpm dev` (never fatal).
+    dev_mode: bool,
+}
+
+/// What [`enforce_posture`] should do about the current privilege posture.
+///
+/// Pure (no syscalls, no logging) so the F3 fail-fast logic is exhaustively
+/// unit-testable without needing to actually be root.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostureDecision {
+    /// Posture is fine (not root, or a drop is configured) — stay quiet.
+    Ok,
+    /// Root with no drop, but not fatal — warn and continue.
+    WarnOnly,
+    /// Root with no drop in `ephpm dev` while enforcement is on — warn that it
+    /// would be fatal under `ephpm serve`, then continue.
+    WarnDevExempt,
+    /// Root with no drop and enforcement is on — fail closed.
+    Fail,
+}
+
+/// Decide the posture outcome. See [`PostureDecision`].
+#[cfg(unix)]
+fn posture_decision(inputs: PostureInputs) -> PostureDecision {
+    if !inputs.is_root || inputs.run_as_user_set {
+        return PostureDecision::Ok;
+    }
+    if !inputs.require_drop {
+        return PostureDecision::WarnOnly;
+    }
+    if inputs.dev_mode { PostureDecision::WarnDevExempt } else { PostureDecision::Fail }
+}
+
+/// Carry out a [`PostureDecision`]: emit the matching log line and, for
+/// [`PostureDecision::Fail`], return the fail-closed error.
+#[cfg(unix)]
+fn apply_posture_decision(decision: PostureDecision, multi_tenant: bool) -> anyhow::Result<()> {
+    if decision == PostureDecision::Ok {
+        return Ok(());
+    }
+
+    let detail = if multi_tenant {
+        "This is a MULTI-TENANT deployment: every tenant's PHP — and anything \
+         that breaks out of the in-process engine — executes as host root."
+    } else {
+        "Every PHP request — and anything that breaks out of the in-process \
+         engine — executes as host root."
+    };
+    tracing::warn!(
+        "ePHPm is running as root (euid=0) and [server] run_as_user is not set, so \
+         it will NOT drop privileges. {detail} Set [server] run_as_user to an \
+         unprivileged account so the process drops to it after binding privileged \
+         ports (see the multi-tenant hardening guide)."
+    );
+
+    match decision {
+        PostureDecision::Ok => unreachable!("handled above"),
+        PostureDecision::WarnOnly => Ok(()),
+        PostureDecision::WarnDevExempt => {
+            tracing::warn!(
+                "[server] require_privilege_drop is in effect but `ephpm dev` does not \
+                 enforce it — continuing as root for local iteration only. This posture \
+                 would FAIL startup under `ephpm serve`."
+            );
+            Ok(())
+        }
+        PostureDecision::Fail => anyhow::bail!(
+            "refusing to serve as root without a privilege drop (multi-tenant breakout \
+             audit finding F3). Set [server] run_as_user to an unprivileged account, or \
+             set [server] require_privilege_drop = false to acknowledge running as root \
+             with no drop (only safe when an external sandbox already confines the \
+             process)."
+        ),
+    }
+}
+
+/// Non-Unix stub for [`enforce_posture`]: there is no uid to drop, so the
+/// dangerous posture does not exist. Always `Ok`.
+///
+/// # Errors
+///
+/// Never fails on non-Unix.
+#[cfg(not(unix))]
+pub fn enforce_posture(config: &Config, _dev_mode: bool) -> anyhow::Result<()> {
+    let _ = config;
+    Ok(())
+}
+
 /// The irreversible credential drop itself: `setgroups` → `setgid` → `setuid`,
 /// then a fail-closed verification that the drop took and cannot be undone.
 ///
@@ -401,5 +535,74 @@ mod tests {
         let config = Config::default_config().expect("default config");
         assert!(config.server.run_as_user.is_none());
         drop_privileges(&config, &[]).expect("no-op drop must succeed");
+    }
+
+    // --- F3 posture fail-fast logic (pure, independent of the real euid) ---
+
+    use super::{PostureDecision, PostureInputs, posture_decision};
+
+    // A terse positional constructor for the posture-decision table tests; the
+    // bool row is the point of the exhaustive matrix, so the lint is noise here.
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn inputs(
+        is_root: bool,
+        run_as_user_set: bool,
+        require_drop: bool,
+        dev_mode: bool,
+    ) -> PostureInputs {
+        PostureInputs { is_root, run_as_user_set, require_drop, dev_mode }
+    }
+
+    #[test]
+    fn posture_ok_when_not_root() {
+        // Not root: nothing to enforce, whatever the other inputs are.
+        for &run_as in &[false, true] {
+            for &req in &[false, true] {
+                for &dev in &[false, true] {
+                    assert_eq!(
+                        posture_decision(inputs(false, run_as, req, dev)),
+                        PostureDecision::Ok,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn posture_ok_when_run_as_user_is_set() {
+        // Root but a drop target is configured: drop_privileges will do the work.
+        assert_eq!(posture_decision(inputs(true, true, true, false)), PostureDecision::Ok);
+    }
+
+    #[test]
+    fn posture_fails_closed_for_root_multi_tenant_default() {
+        // The dangerous posture: root, no run_as_user, enforcement on (the
+        // multi-tenant default), not dev. Must be fatal.
+        assert_eq!(posture_decision(inputs(true, false, true, false)), PostureDecision::Fail);
+    }
+
+    #[test]
+    fn posture_warns_only_when_enforcement_disabled() {
+        // Root, no run_as_user, but the operator set require_privilege_drop =
+        // false (or single-tenant default): warn, do not fail.
+        assert_eq!(posture_decision(inputs(true, false, false, false)), PostureDecision::WarnOnly);
+    }
+
+    #[test]
+    fn posture_dev_mode_never_fails() {
+        // `ephpm dev` as root with enforcement on: downgraded to a warning.
+        assert_eq!(
+            posture_decision(inputs(true, false, true, true)),
+            PostureDecision::WarnDevExempt
+        );
+    }
+
+    #[test]
+    fn enforce_posture_default_config_is_ok_in_tests() {
+        // The default config sets no run_as_user; the test harness is not root,
+        // so enforce_posture must return Ok regardless of dev_mode.
+        let config = Config::default_config().expect("default config");
+        enforce_posture(&config, false).expect("non-root posture must be Ok");
+        enforce_posture(&config, true).expect("non-root posture must be Ok in dev too");
     }
 }

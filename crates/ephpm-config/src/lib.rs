@@ -688,6 +688,78 @@ pub struct ServerConfig {
     #[serde(default)]
     pub run_as_group: Option<String>,
 
+    /// **Fail closed on a dangerous privilege posture** (Unix).
+    ///
+    /// Multi-tenant breakout audit finding **F3**: nothing forces ePHPm off
+    /// root. When the process runs as `euid == 0` with no
+    /// [`run_as_user`](Self::run_as_user) to drop to, every tenant's PHP — and
+    /// anything that breaks out of the in-process engine — executes as **host
+    /// root**. [`run_as_user`](Self::run_as_user) is a *no-op* when unset, so
+    /// that posture used to come up silently with every health check green.
+    ///
+    /// When this resolves to `true` and the process is root with no
+    /// `run_as_user`, startup **fails closed** with an explanatory error
+    /// (mirroring the existing exposed-DB-listener warnings) instead of serving
+    /// as root. The remedy is to set `run_as_user` (recommended) or, if running
+    /// as root with no drop is genuinely intended (e.g. an external sandbox
+    /// already confines the process), set this to `false` to acknowledge it.
+    ///
+    /// Regardless of this flag, a root process with no `run_as_user` always
+    /// emits a loud `WARN` at startup — this flag only controls whether the
+    /// dangerous posture is *fatal*.
+    ///
+    /// Default (absent): **`true` in multi-tenant mode** (`sites_dir` set),
+    /// `false` otherwise. Single-tenant deployments are unchanged unless they
+    /// opt in explicitly. Ignored on non-Unix and in `ephpm dev` (a developer
+    /// iterating locally is downgraded to a WARN, never blocked).
+    ///
+    /// Env: `EPHPM_SERVER__REQUIRE_PRIVILEGE_DROP`.
+    #[serde(default)]
+    pub require_privilege_drop: Option<bool>,
+
+    /// **Self-applied Landlock filesystem sandbox** on the PHP execution engine
+    /// (Linux only). Multi-tenant breakout audit finding **F3**.
+    ///
+    /// Even after a privilege drop, the in-process PHP engine can open any file
+    /// the process uid can — cross-tenant isolation rests entirely on
+    /// `open_basedir` + `disable_functions`, with no kernel backstop. This knob
+    /// arms a **Landlock** ruleset on every thread that executes tenant PHP (the
+    /// per-request pool, the worker pool, the Xdebug debug lane), restricting
+    /// that thread to the paths ePHPm legitimately needs — the site trees, the
+    /// per-vhost state root, the embedded-database directory, and the standard
+    /// read-only system directories a program needs to run. Everything else —
+    /// `/etc/ephpm` (the cluster secret), `/etc/ssl/private` (TLS keys),
+    /// `/etc/shadow`, `/root`, other tenants' home directories — becomes
+    /// unreachable, enforced by the kernel even against root. It reuses the same
+    /// mechanism as the out-of-process `ephpm exec` sandbox.
+    ///
+    /// Accepted values (fail closed on a typo — a silently-ignored security
+    /// knob is worse than none):
+    ///
+    /// * `"auto"` (default) — **secure by default in multi-tenant mode**: enable
+    ///   when multi-tenant (`sites_dir` set) and the kernel enforces Landlock
+    ///   (≥ 5.13, ABI 1), and **fail startup closed** if the kernel does not —
+    ///   the same posture [`require_privilege_drop`](Self::require_privilege_drop)
+    ///   takes, because a node that isolates tenants must not run the shared-uid
+    ///   PHP engine without the kernel backstop. Single-tenant: left off (opt in
+    ///   with `"enforce"`). There is deliberately no "warn and serve unsandboxed"
+    ///   tier — use `"off"` to accept that explicitly.
+    /// * `"enforce"` — require it regardless of tenancy: startup **fails closed**
+    ///   if the kernel does not enforce Landlock, and a thread that cannot arm
+    ///   the sandbox refuses to serve. Use this to sandbox a single-tenant node.
+    /// * `"off"` — disabled. The explicit escape hatch; startup logs a loud
+    ///   `WARN` in multi-tenant mode so opting out of the secure default is never
+    ///   silent.
+    ///
+    /// Landlock governs filesystem access only; it does not restrict the
+    /// network, and already-open file descriptors (listeners, the loaded config,
+    /// the generated `php.ini`, TLS keys) keep working. Ignored on non-Linux
+    /// (Windows/macOS unaffected) and in `ephpm dev`.
+    ///
+    /// Env: `EPHPM_SERVER__SELF_SANDBOX`.
+    #[serde(default = "default_self_sandbox")]
+    pub self_sandbox: String,
+
     /// Optional domain suffix to strip from incoming `Host` headers when
     /// resolving vhosts. When set (e.g. `.localhost`), a directory named
     /// `~/sites/blog/` matches `Host: blog.localhost` — the suffix is
@@ -1968,6 +2040,36 @@ impl TenantNetworkConfig {
 }
 
 impl ServerConfig {
+    /// Whether a root process with no [`run_as_user`](Self::run_as_user) should
+    /// **fail startup** rather than serve (multi-tenant breakout audit F3).
+    ///
+    /// Resolves [`require_privilege_drop`](Self::require_privilege_drop): an
+    /// explicit value wins; absent, it defaults to `true` in multi-tenant mode
+    /// (`sites_dir` set) and `false` otherwise. This only decides whether the
+    /// dangerous posture is *fatal* — the WARN is emitted regardless — and the
+    /// caller (`privdrop::enforce_posture`) still gates on `euid == 0` and an
+    /// unset `run_as_user`, so a single-tenant deployment that never runs as
+    /// root is unaffected.
+    #[must_use]
+    pub fn require_privilege_drop_enforced(&self) -> bool {
+        self.require_privilege_drop.unwrap_or_else(|| self.sites_dir.is_some())
+    }
+
+    /// Resolved [`self_sandbox`](Self::self_sandbox) mode.
+    ///
+    /// [`Config::validate`] has already rejected any value outside
+    /// [`SELF_SANDBOX_MODES`], so this maps the validated string onto
+    /// [`SelfSandboxMode`]; an unexpected value falls back to the safe default
+    /// (`Auto`) rather than panicking.
+    #[must_use]
+    pub fn self_sandbox_mode(&self) -> SelfSandboxMode {
+        match self.self_sandbox.trim().to_ascii_lowercase().as_str() {
+            "enforce" => SelfSandboxMode::Enforce,
+            "off" => SelfSandboxMode::Off,
+            _ => SelfSandboxMode::Auto,
+        }
+    }
+
     /// The directory of operator-supplied per-site overrides, or `None` when the
     /// mechanism is switched off.
     ///
@@ -6518,6 +6620,21 @@ impl Config {
             )));
         }
 
+        // Fail closed: `[server] self_sandbox` selects a security feature, so a
+        // typo must not silently leave the PHP engine unsandboxed (the same rule
+        // as `[kv] compression` / `[php] mode`). Matched case-insensitively like
+        // `self_sandbox_mode`.
+        if !SELF_SANDBOX_MODES
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(self.server.self_sandbox.trim()))
+        {
+            return Err(ConfigError::Validation(format!(
+                "[server] self_sandbox must be one of {}, got {:?}",
+                SELF_SANDBOX_MODES.join(", "),
+                self.server.self_sandbox,
+            )));
+        }
+
         // Fail closed: `[server.host_map]` is a routing instruction, so a
         // malformed entry must stop startup rather than quietly route nowhere.
         // The alias is matched against the normalized `Host` and must be a
@@ -7184,6 +7301,34 @@ pub fn normalize_capability(name: &str) -> Option<&'static str> {
     GRANTABLE_CAPABILITIES.iter().copied().find(|c| *c == lower)
 }
 
+/// Every accepted `[server] self_sandbox` value (compared case-insensitively).
+///
+/// Fail-closed: [`Config::validate`] rejects anything else, so a typo like
+/// `"enforce"` cannot silently leave the PHP engine unsandboxed. See
+/// [`ServerConfig::self_sandbox`].
+pub const SELF_SANDBOX_MODES: &[&str] = &["auto", "enforce", "off"];
+
+/// Resolved [`ServerConfig::self_sandbox`] mode (via
+/// [`ServerConfig::self_sandbox_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfSandboxMode {
+    /// Secure by default: enable in multi-tenant mode and **fail startup closed**
+    /// if the kernel does not enforce Landlock (no "warn and serve unsandboxed"
+    /// tier). Off in single-tenant mode (opt in with [`Enforce`](Self::Enforce)).
+    Auto,
+    /// Require the sandbox: fail startup if the kernel does not enforce
+    /// Landlock, and a thread that cannot arm it refuses to serve.
+    Enforce,
+    /// Disabled.
+    Off,
+}
+
+/// Default for [`ServerConfig::self_sandbox`] — `"auto"` (on in multi-tenant
+/// when the kernel supports Landlock, off otherwise).
+fn default_self_sandbox() -> String {
+    "auto".to_string()
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -7193,6 +7338,8 @@ impl Default for ServerConfig {
             site_overrides_dir: None,
             run_as_user: None,
             run_as_group: None,
+            require_privilege_drop: None,
+            self_sandbox: default_self_sandbox(),
             sites_domain_suffix: None,
             host_map: BTreeMap::new(),
             index_files: default_index_files(),
@@ -13417,6 +13564,68 @@ eviction_policy = "lru"
         for algo in KV_COMPRESSION_ALGOS {
             assert!(msg.contains(algo), "the error must list {algo}: {msg}");
         }
+    }
+
+    #[test]
+    fn self_sandbox_accepts_every_documented_value_case_insensitively() {
+        for mode in SELF_SANDBOX_MODES.iter().copied().chain(["AUTO", "Enforce", "OFF"]) {
+            validate_toml(&format!("[server]\nself_sandbox = \"{mode}\"\n"))
+                .unwrap_or_else(|e| panic!("{mode} must validate, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn self_sandbox_typo_is_rejected() {
+        let err = validate_toml("[server]\nself_sandbox = \"enfore\"\n")
+            .expect_err("a typo must not silently leave the engine unsandboxed");
+        let msg = err.to_string();
+        assert!(msg.contains("\"enfore\""), "the error must name the bad value: {msg}");
+        for mode in SELF_SANDBOX_MODES {
+            assert!(msg.contains(mode), "the error must list {mode}: {msg}");
+        }
+    }
+
+    #[test]
+    fn self_sandbox_default_is_auto() {
+        let config = Config::default_config().expect("default config");
+        assert_eq!(config.server.self_sandbox, "auto");
+        assert_eq!(config.server.self_sandbox_mode(), SelfSandboxMode::Auto);
+    }
+
+    #[test]
+    fn self_sandbox_mode_maps_every_value() {
+        let mode = |s: &str| {
+            ServerConfig { self_sandbox: s.to_string(), ..Default::default() }.self_sandbox_mode()
+        };
+        assert_eq!(mode("auto"), SelfSandboxMode::Auto);
+        assert_eq!(mode("enforce"), SelfSandboxMode::Enforce);
+        assert_eq!(mode("off"), SelfSandboxMode::Off);
+        assert_eq!(mode("  ENFORCE  "), SelfSandboxMode::Enforce);
+    }
+
+    #[test]
+    fn require_privilege_drop_defaults_true_in_multi_tenant_only() {
+        // Single-tenant: not enforced unless opted in.
+        let single = ServerConfig::default();
+        assert!(single.sites_dir.is_none());
+        assert!(!single.require_privilege_drop_enforced());
+
+        // Multi-tenant: enforced by default (the F3 fail-closed posture).
+        let multi = ServerConfig {
+            sites_dir: Some(std::path::PathBuf::from("/srv/sites")),
+            ..Default::default()
+        };
+        assert!(multi.require_privilege_drop_enforced());
+
+        // Explicit values always win over the tenancy-derived default.
+        let forced_off = ServerConfig {
+            sites_dir: Some(std::path::PathBuf::from("/srv/sites")),
+            require_privilege_drop: Some(false),
+            ..Default::default()
+        };
+        assert!(!forced_off.require_privilege_drop_enforced());
+        let forced_on = ServerConfig { require_privilege_drop: Some(true), ..Default::default() };
+        assert!(forced_on.require_privilege_drop_enforced());
     }
 
     #[test]

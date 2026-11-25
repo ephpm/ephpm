@@ -654,6 +654,17 @@ fn debug_worker_main(
         "debug worker starting: pre-seeded request startup, then framework boot"
     );
 
+    // Arm the self-applied Landlock sandbox on this debug worker before any PHP
+    // runs (finding F3). Normally a no-op here — the debug lane only runs under
+    // `ephpm dev --xdebug`, where the sandbox is disabled — but kept for
+    // completeness and to fail closed in any non-dev shared build. No TSRM slot
+    // is taken yet, so a failure needs no teardown.
+    if let Err(e) = crate::server_sandbox::restrict_current_php_thread() {
+        tracing::error!(debug_worker = id, ?e, "debug worker could not arm the engine sandbox");
+        counter!("ephpm_xdebug_debug_requests_total", "outcome" => "startup_failed").increment(1);
+        return;
+    }
+
     // TSRM register + php_request_startup with the HTTP request pre-seeded,
     // so Xdebug sees the trigger before the framework boots.
     if let Err(e) = PhpRuntime::worker_thread_init_preseeded(seed, script) {
