@@ -368,11 +368,13 @@ supported here and falls back to the owner with a `WARN`). **`ephpm db restore
 --reseed --site <key>` converges a per-site clustered deployment (v0.20.0+),**
 the same way the whole-database path does: it stamps a per-site reseed generation
 into the site's `.db`, the site's owner advertises it, and it **dominates the
-per-site `SiteVersion` order** — so a peer that still holds the site
-force-discards it and cold re-bootstraps from the owner, and the former hazard (a
-peer returning with a higher ownership epoch silently overwriting the restore) is
-prevented in the ownership-handoff pull itself, which is ranked by durable
-version and installs only a copy strictly newer than the local one. This
+per-site `SiteVersion` order** in every direction the restore could be lost — so
+a peer that still holds the site force-discards it and cold re-bootstraps from the
+owner, a peer that itself holds the restore refuses to tail a staler owner (rather
+than merging its pre-reseed rows back), the destructive snapshot install refuses a
+lower-generation copy, and the ownership-handoff pull (ranked by durable version,
+installs only a copy at or above the local generation) and the serving gate keep a
+peer returning with a higher ownership epoch from overwriting the restore. This
 convergence is **implemented and unit-tested but not yet live-cluster-validated**
 (the live failover harness covers the whole-database path only — see below).
 Procedure: stop every node, `ephpm db restore --reseed

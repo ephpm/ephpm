@@ -575,8 +575,13 @@ live database. It is a **file install**, not an SQL replay, and it is
    that sees it force-discards its own data and cold re-bootstraps from the
    restored node automatically — restore on one node, start it first, and the
    others converge. For per-site the generation **dominates the `SiteVersion`
-   order**, so a peer returning with a higher ownership epoch can no longer
-   overwrite the restore. Without `--reseed`, convergence is the manual wipe:
+   order** in every direction, so a stale peer cannot overwrite the restore: a
+   replica with an older generation re-bootstraps, a replica that holds the
+   restore refuses to tail a staler owner, and the handoff pull and destructive
+   install only ever take a copy at the restore's generation or newer. (This
+   per-site convergence is implemented and unit-tested, but **not yet validated on
+   a live multi-node cluster** — Turso is Beta upstream.) Without `--reseed`,
+   convergence is the manual wipe:
    every other node's `<key>.db`/`-wal`/`-shm` must be **deleted** so they
    cold-bootstrap, and a *plain* per-site restore still carries the
    higher-epoch-overwrite hazard. The command prints the full procedure and asks

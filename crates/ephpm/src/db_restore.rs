@@ -140,16 +140,29 @@ enum ClusterRestoreKind {
     /// With `--reseed` (v0.20.0, #707), the restore stamps a monotonic reseed
     /// generation into the site's `.db` (`db_backup::stamp_reseed_generation`),
     /// which the site's owner advertises in its CDC `Hello`/snapshot header and
-    /// which **dominates** the per-site `SiteVersion` order. A replica that sees
-    /// a newer generation force-discards and cold re-bootstraps from the owner
-    /// (`run_site_replication` → `ReseedRequired` → `force_reset`), and a stale
-    /// peer that carries a higher epoch can no longer out-rank the restore —
-    /// neither in the ownership-settle decision (reseed dominance) nor in the
-    /// ownership-handoff pull, which is ranked by durable version and installs
-    /// only a copy strictly newer than the local one (#707) — so neither the
-    /// tail-on-top mix nor the higher-epoch silent overwrite can happen. This
-    /// convergence is implemented and unit-tested but not yet live-cluster
-    /// validated. The procedure mirrors whole-database: stop every node, `ephpm db
+    /// which **dominates** the per-site `SiteVersion` order. The generation is
+    /// the tie-break in every direction the restore could otherwise be lost:
+    /// - a replica that sees a **newer** generation force-discards and cold
+    ///   re-bootstraps from the owner (`run_site_replication` → `ReseedRequired`
+    ///   → `force_reset`);
+    /// - a replica that itself holds a **newer** generation than the owner
+    ///   refuses to tail it (tailing would merge the owner's pre-reseed rows back
+    ///   over the restore) and backs off until the owner, or HRW, catches up;
+    /// - a destructive snapshot install refuses a header at a **lower**
+    ///   generation, so a schema-collision re-bootstrap or a handoff that slipped
+    ///   the version gate cannot replace the restore with stale rows stamped at
+    ///   the high generation;
+    /// - the ownership-settle decision (reseed dominance), the version-ranked
+    ///   ownership-handoff pull (installs only a copy at or above the local
+    ///   generation, and refuses while a *known-fresher* peer is unreachable),
+    ///   and the serving gate (an owner ships no CDC/snapshot for a site it has
+    ///   not settled) keep a stale higher-epoch peer from out-ranking or
+    ///   clobbering the restore.
+    ///
+    /// So neither the tail-on-top mix nor the higher-epoch silent overwrite can
+    /// happen. This convergence is implemented and unit-tested but **not yet
+    /// live-cluster validated** (Turso is Beta upstream). The procedure mirrors
+    /// whole-database: stop every node, `ephpm db
     /// restore --reseed --site <key>` on one node, start it first, then the others
     /// (which auto-converge). Requires every node on v0.20.0+; until a node is
     /// upgraded to v0.20.0 and the reseed re-run it does not honor the signal, and
@@ -500,10 +513,12 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
                 "WARNING: per-site clustered restore is EXPERIMENTAL. With --reseed the site's \
                  restored `.db` is stamped with a new reseed generation, which the site's owner \
                  advertises and which dominates the per-site version order — so a peer that still \
-                 holds the site force-discards it and cold re-bootstraps from the owner, and a peer \
-                 returning with a higher ownership epoch can no longer overwrite the restore (the \
-                 handoff pull is ranked by version and installs only a strictly newer copy — \
-                 implemented and unit-tested, not yet live-cluster-validated). \
+                 holds the site force-discards it and cold re-bootstraps from the owner, a peer \
+                 that itself holds the restore refuses to tail a staler owner, and the \
+                 ownership-handoff pull and the destructive snapshot install only ever take a copy \
+                 at the restore's generation or newer — so a stale peer returning with a higher \
+                 ownership epoch cannot overwrite the restore (implemented and unit-tested, not \
+                 yet live-cluster-validated). \
                  Required procedure: (1) stop EVERY node; (2) run `ephpm db restore --reseed \
                  --site <key>` on one node; (3) start that node FIRST, then the others — each peer \
                  holding the site auto-discards and re-bootstraps; (4) verify each converged (its \

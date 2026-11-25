@@ -328,19 +328,23 @@ the replicas** so they come up cold:
   So convergence no longer *relies* on the restored node's epoch happening to
   dominate a returning peer's: the reseed generation dominates unconditionally.
   The site's owner advertises it (gossip `sqlite:ver:<site>` and the CDC
-  `Hello`/snapshot header); a replica that sees a newer generation force-discards
-  and cold re-bootstraps from the owner (`run_site_replication` →
-  `ReseedRequired` → `force_reset`), and a peer that returns with a higher
-  *ownership epoch* can no longer out-rank the restore — neither in
-  `decide_warm_settle` (reseed dominance) nor in the ownership-handoff pull, which
-  is ranked by durable version and installs only a copy strictly newer than the
-  local one (#707). The procedure mirrors whole-database: stop every node, `ephpm
-  db restore --reseed --site <key>` on one node, start it **first**, then the
-  others; verify each converged. Each converging peer records
+  `Hello`/snapshot header). The generation is the tie-break in **every** direction
+  a restore could be lost, so a stale peer cannot out-rank it by ownership epoch:
+  a replica that sees a newer generation force-discards and cold re-bootstraps
+  from the owner (`run_site_replication` → `ReseedRequired` → `force_reset`); a
+  replica that itself holds the restore refuses to tail a staler owner rather than
+  merging its pre-reseed rows back; the destructive snapshot install refuses a
+  lower-generation header; the ownership-handoff pull is ranked by durable version
+  and installs only a copy at or above the local generation (and refuses while a
+  *known-fresher* peer is unreachable); `decide_warm_settle` blocks a stale warm
+  owner by reseed dominance; and an owner ships no CDC/snapshot for a site it has
+  not settled for serving. The procedure mirrors whole-database: stop every node,
+  `ephpm db restore --reseed --site <key>` on one node, start it **first**, then
+  the others; verify each converged. Each converging peer records
   `ephpm_cdc_bootstrap_total{outcome="ok"}` (the per-site re-bootstrap) alongside
-  `ephpm_cdc_connect_total{outcome="reseed"}` and the "force-discarding local data
-  and cold re-bootstrapping" log line — **not** `{outcome="handoff_ok"}`, which
-  fires only on owner-settle, not on a reseeded replica's convergence. Requires
+  `ephpm_cdc_replica_connects_total{outcome="reseed"}` and the "force-discarding
+  local data and cold re-bootstrapping" log line — **not** `{outcome="handoff_ok"}`,
+  which fires only on owner-settle, not on a reseeded replica's convergence. Requires
   **every node on v0.20.0+**; until a node is upgraded to v0.20.0 and the reseed
   re-run it does not honor the signal, and an older HRW owner **actively serves
   its stale copy** (fail-safe against corruption, but divergent). Still reachable
@@ -466,10 +470,15 @@ returning peer could carry a *higher* epoch and silently overwrite the restore.
 generation it stamps is the **most-significant component of `SiteVersion`**
 (above `epoch` and `head`), so a reseeded copy out-ranks any pre-restore copy
 unconditionally, whatever epoch a returning peer brings. The restored owner
-advertises the generation, replicas force-discard and re-bootstrap from it, and
-neither `decide_warm_settle` nor the ownership-handoff pull (ranked by durable
-version, installs only a strictly newer copy) can prefer a stale higher-epoch
-peer over the reseed.
+advertises the generation, and every path that could re-introduce the stale data
+now defers to it: replicas with an older generation force-discard and
+re-bootstrap; a replica that *holds* the restore refuses to tail a staler owner
+(so it never merges pre-reseed rows back); the destructive snapshot install
+refuses a lower-generation header; the ownership-handoff pull (ranked by durable
+version) installs only a copy at or above the local generation and refuses while a
+known-fresher peer is unreachable; `decide_warm_settle` blocks a stale warm owner;
+and an owner ships no CDC/snapshot for a site it has not settled. None can prefer
+a stale higher-epoch peer over the reseed.
 `--reseed` requires every node on **v0.20.0+**. A *plain* per-site restore still
 carries the old epoch-dominance hazard and is not recommended — use `--reseed`.
 Whole-DB clustered restore converges the same way via `ephpm db restore --reseed`
