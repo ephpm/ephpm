@@ -619,8 +619,8 @@ fn set_one_rlimit(name: &str, resource: libc::__rlimit_resource_t, value: u64) {
 /// refuses to run a binary it cannot sandbox), this warns-and-continues for any
 /// layer the kernel or our privileges cannot provide — a non-root server simply
 /// skips the uid drop, a Landlock-less kernel skips the filesystem scope — so a
-/// PHP cron that worked before (bounded by `open_basedir` + `disable_functions`
-/// + the PHP `memory_limit` ceiling) keeps working, now with OS confinement
+/// PHP cron that worked before (bounded by `open_basedir`, `disable_functions`,
+/// and the PHP `memory_limit` ceiling) keeps working, now with OS confinement
 /// added wherever the platform supports it. The config must already be loaded
 /// (the caller reads it before calling this, so the Landlock scope — which
 /// denies `/etc/ephpm` — does not break config access), and any database the
@@ -666,10 +666,8 @@ pub fn confine_php_tenant(
     );
 
     // Prepare + chown the private state root while still root, mirroring `run`.
-    if is_root {
-        if let Err(e) = prepare_state_root(&site, uid, gid) {
-            tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: could not prepare tenant state root (continuing)");
-        }
+    if is_root && let Err(e) = prepare_state_root(&site, uid, gid) {
+        tracing::warn!(error = %format!("{e:#}"), "ephpm sandbox: could not prepare tenant state root (continuing)");
     }
     // no_new_privs + Landlock are unprivileged-capable (that is Landlock's
     // design); warn-and-continue if the kernel declines, never refuse.
