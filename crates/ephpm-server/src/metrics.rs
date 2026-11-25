@@ -159,6 +159,20 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
         "Number of cluster members this node currently sees as alive (includes self)."
     );
 
+    // AF_UNIX tenant-fence state (audit finding F2). Described here for a HELP
+    // line; set by `start_tenant_ebpf` only on a node where the fence was
+    // intended (the secure default `unix_socket_policy = auto` on a fenceable
+    // node, or an explicit `warn`/`required`). `1` = attached and enforcing,
+    // `0` = degraded to unfenced (e.g. missing CAP_BPF/CAP_NET_ADMIN, no BTF,
+    // kernel < 6.7). Absent when the fence does not apply (single-tenant,
+    // worker mode, non-Linux, or an explicit `off`), so a fleet can alert on
+    // `== 0` to catch the default silently not taking.
+    describe_gauge!(
+        "ephpm_tenant_unix_fence_active",
+        "Whether the AF_UNIX tenant connect fence is attached and enforcing (1) or degraded to \
+         unfenced (0) on a node where it was intended."
+    );
+
     Ok(handle)
 }
 

@@ -16,10 +16,19 @@
 //! anyway.
 //!
 //! `clang` is ALREADY a required build dependency (bindgen for the PHP SAPI in
-//! `crates/ephpm-php/build.rs`), so this adds no new toolchain requirement. If
-//! `clang` is genuinely absent on a Linux host we fail the build with a clear
-//! message rather than shipping a binary whose `ebpf_policy = true` would fault
-//! at load time.
+//! `crates/ephpm-php/build.rs`), so this adds no new toolchain requirement.
+//!
+//! If `clang` is genuinely absent (or the compile fails) we must still let a
+//! dev/stub build go through, so we emit an EMPTY placeholder object and a loud
+//! `cargo::warning` rather than panicking. That placeholder is fail-closed at
+//! load time (the loaders reject an empty object), but note that the AF_UNIX
+//! fence (`unix_socket_policy`) now defaults to `auto` — ON for a multi-tenant
+//! Linux >= 6.7 node — so a binary built without the real object comes up
+//! UNFENCED under the default and only logs about it. Dev builds tolerate that;
+//! a RELEASE must not. `release.yml` therefore makes the clang toolchain FATAL
+//! on the Linux release legs and asserts both objects are non-empty after the
+//! build (`.github/scripts/check-ebpf-objects.sh`) so a transient toolchain
+//! failure can never ship an unfenced release.
 
 fn main() {
     println!("cargo:rerun-if-changed=bpf/vhostnet.bpf.c");
@@ -93,26 +102,37 @@ fn compile_bpf(src: &str, out: &str, knob: &str) {
     // the PHP-linked release toolchain, not on stub-mode CI (which installs
     // `libclang-dev` for the PHP SAPI's bindgen but not the clang executable);
     // and a release leg for an unverified target could, in principle, hit an
-    // arch-specific compile quirk. Neither may break/park the `ephpm-server`
-    // build. On ANY failure — clang missing, or clang present but the compile
-    // errors — emit an EMPTY placeholder so `include_bytes_aligned!` still
-    // compiles, log a loud `cargo:warning`, and return. A binary built this way
-    // fails closed at load time (the loaders reject the empty object) and every
-    // `[server.tenant_network]` eBPF knob is off by default, so nothing that
-    // did not build the real object ever exercises it. The release is
-    // smoke-tested afterwards to confirm the real objects shipped.
+    // arch-specific compile quirk. Neither may break/park a dev/stub
+    // `ephpm-server` build. On ANY failure — clang missing, or clang present
+    // but the compile errors — emit an EMPTY placeholder so
+    // `include_bytes_aligned!` still compiles, log a loud `cargo::warning`, and
+    // return. A binary built this way fails closed at load time (the loaders
+    // reject the empty object).
+    //
+    // IMPORTANT: this is only safe for dev/stub builds. The `unix_socket_policy`
+    // AF_UNIX fence now defaults to `auto` (ON for a multi-tenant Linux >= 6.7
+    // node), so a RELEASE binary built from the placeholder would come up
+    // UNFENCED under the default and merely log about it. The warning below is
+    // deliberately loud about that. The RELEASE path does NOT rely on it:
+    // `release.yml` makes the clang toolchain fatal on the Linux legs and
+    // `.github/scripts/check-ebpf-objects.sh` asserts both objects are
+    // non-empty after the build, so a release can never reach this fallback.
     if !matches!(&run, Ok(status) if status.success()) {
         std::fs::write(out, [])
             .expect("write placeholder eBPF object so include_bytes_aligned! compiles");
         match &run {
             Ok(status) => println!(
-                "cargo:warning=clang compiled {src} with an error (exit {status}); \
-                 [server.tenant_network] {knob} is unavailable in this build"
+                "cargo::warning=clang compiled {src} with an error (exit {status}); \
+                 [server.tenant_network] {knob} is UNAVAILABLE in this build — a multi-tenant node \
+                 would run UNFENCED under the default (unix_socket_policy = auto). Dev builds only; \
+                 releases are gated by check-ebpf-objects.sh."
             ),
             Err(e) => println!(
-                "cargo:warning=clang ({clang}) not runnable ({e}); \
-                 [server.tenant_network] {knob} is unavailable in this build \
-                 (install the clang binary to enable it)"
+                "cargo::warning=clang ({clang}) not runnable ({e}); \
+                 [server.tenant_network] {knob} is UNAVAILABLE in this build — a multi-tenant node \
+                 would run UNFENCED under the default (unix_socket_policy = auto). Install the \
+                 clang binary to enable it. Dev builds only; releases are gated by \
+                 check-ebpf-objects.sh."
             ),
         }
         return;

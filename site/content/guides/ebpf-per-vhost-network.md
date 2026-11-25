@@ -241,7 +241,21 @@ database admin sockets).
   `tenant_network: AF_UNIX connect fence attached (cgroup/connect_unix +
   sendmsg_unix)`; `bpftool cgroup show /sys/fs/cgroup/<ephpm cgroup>` lists two
   `ephpm_connect_unix` / `ephpm_sendmsg_unix` programs. Nothing is pinned to
-  bpffs; the programs vanish with the process.
+  bpffs; the programs vanish with the process. For a **machine-readable** check
+  a fleet can assert on, `GET /_ephpm/health` carries
+  `{"unix_fence_policy": "<configured value>", "unix_fence_active": true|false}`
+  — `policy = "auto"` with `active = false` is a node that degraded to unfenced
+  — and the gauge
+  [`ephpm_tenant_unix_fence_active{policy}`](/reference/metrics/) is `1` when the
+  fence is enforcing and `0` when it was intended but degraded. This matters
+  because the ordinary systemd hardening (a `CapabilityBoundingSet` without
+  `CAP_BPF`/`CAP_NET_ADMIN`) trips the degrade path on day one, and under `auto`
+  that is only an ERROR log otherwise.
+- **Architecture.** `build.rs` compiles the fence object for both `x86_64` and
+  `aarch64`, and the raw loader handles both, but the raw-`bpf_attr` loader path
+  has been developed and exercised on **x86_64 only**; treat live enforcement on
+  arm64 as experimental and verify it (`bpftool`, a denied connect, the health
+  field above) before relying on it there.
 
 ## Known limitation
 

@@ -2945,6 +2945,25 @@ fn start_tenant_ebpf(
         unix_fence: unix_policy.is_enabled(),
     };
 
+    // A configured `unix_socket_allow` list that will never be enforced is a
+    // silent no-op. `Config::validate` already hard-errors the EXPLICIT
+    // `unix_socket_policy = "off"` + non-empty-allowlist combination, but it
+    // cannot catch `"auto"` RESOLVING to off here (worker mode, non-Linux,
+    // single-tenant, or `ephpm dev`) — the resolution depends on the running
+    // node, not the config text. Warn so the operator knows the allowlist is
+    // being ignored, consistent with the repo's "never a silent no-op config
+    // knob" rule.
+    if !unix_policy.is_enabled() && !tn.unix_socket_allow.is_empty() {
+        tracing::warn!(
+            policy = %tn.unix_socket_policy,
+            sites = tn.unix_socket_allow.len(),
+            "tenant_network: unix_socket_allow is set but the AF_UNIX fence is OFF on this node \
+             (unix_socket_policy resolved to \"off\" — worker mode, non-Linux, single-tenant, or \
+             `ephpm dev`), so the allowlist is IGNORED. Set unix_socket_policy = \"required\" or \
+             \"warn\" on a fenceable node to enforce it, or remove the allowlist."
+        );
+    }
+
     if !opts.tcp_policy && !opts.unix_fence {
         // The fence is not active. Warn about the exposure only where the
         // operator EXPLICITLY opted out (`"off"`) on a node where the secure
@@ -3000,6 +3019,16 @@ fn start_tenant_ebpf(
     // base load stays fail-closed as it always was. The log names the
     // configured policy string (`auto`/`warn`) so it is never misleading.
     let warn_unfenced = |e: &anyhow::Error| {
+        // Machine-readable signal for a fleet: the fence was intended (auto on a
+        // fenceable node, or explicit warn) but degraded to unfenced. `0` ==
+        // degraded; the attach-success path below sets `1`. Lets an operator
+        // alert on the default silently not taking (e.g. the ordinary systemd
+        // hardening drops CAP_BPF/CAP_NET_ADMIN), rather than grepping logs.
+        ::metrics::gauge!(
+            "ephpm_tenant_unix_fence_active",
+            "policy" => tn.unix_socket_policy.clone()
+        )
+        .set(0.0);
         tracing::error!(
             error = %format!("{e:#}"),
             policy = %tn.unix_socket_policy,
@@ -3056,14 +3085,22 @@ fn start_tenant_ebpf(
             entries += targets.len();
         }
         match handle.attach_unix_fence() {
-            Ok(()) => tracing::info!(
-                policy = %tn.unix_socket_policy,
-                sites_allowlisted = allow.len(),
-                allow_entries = entries,
-                "tenant_network: AF_UNIX connect fence attached (cgroup/connect_unix + \
-                 sendmsg_unix) — tenant PHP may reach ONLY the allowlisted unix sockets; every \
-                 other unix connect from a tenant thread is denied (EPERM)"
-            ),
+            Ok(()) => {
+                // `1` == attached and enforcing; the degraded path sets `0`.
+                ::metrics::gauge!(
+                    "ephpm_tenant_unix_fence_active",
+                    "policy" => tn.unix_socket_policy.clone()
+                )
+                .set(1.0);
+                tracing::info!(
+                    policy = %tn.unix_socket_policy,
+                    sites_allowlisted = allow.len(),
+                    allow_entries = entries,
+                    "tenant_network: AF_UNIX connect fence attached (cgroup/connect_unix + \
+                     sendmsg_unix) — tenant PHP may reach ONLY the allowlisted unix sockets; every \
+                     other unix connect from a tenant thread is denied (EPERM)"
+                );
+            }
             Err(e) => match unix_policy {
                 UnixSocketPolicy::Required => {
                     return Err(e.context(

@@ -391,6 +391,21 @@ hooks do not exist before); see the
 for the kernel floor, the fail-closed modes, and the symlink caveat on
 allowlisted paths.
 
+**What §11 is — a reach control, not a breakout backstop.** Like `open_basedir`
+(§1), the fence constrains what ordinary tenant **PHP userland** can reach, not
+what code that has already escaped PHP can do. It tags the request thread and
+filters by that tag from *inside the same process that holds the map fds*, so
+in-process native code running in the data plane can delete its own TID from the
+tag map (or otherwise untag) before it `connect()`s, and an `io_uring`
+submission with `IOSQE_ASYNC` is punted to an untagged `io-wq` kernel worker that
+the tag never covers. Both reach a socket the tag would deny. So §11 closes the
+easy door that `unix://` streams, PDO `unix_socket=` and curl walk through — it
+is **not** a sandbox boundary that contains a tenant who has already broken out
+of PHP. For a true backstop you still need the per-uid mitigations (run the data
+plane as its own uid, kept out of every socket's group/ACL) and, where
+available, a `CONFIG_BPF_LSM` policy. (This qualification is the same one §8/§9
+carry for their cross-tenant IP controls.)
+
 ## Turning it on
 
 The layers divide into two groups, and it matters which is which:
