@@ -790,23 +790,39 @@ mod imp {
 
             let ro: Vec<String> =
                 spec.read_only.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            // The sensitive paths must be absent from EVERY access class — not
+            // just read-only. The leak path is a *grant* of these paths through
+            // any mode (a future rw/exec grant of `/proc/self/task` would re-open
+            // it just as a read-only one did), so assert against the union of
+            // read-write, read+execute, and read-only.
+            let granted: Vec<String> = spec
+                .read_write
+                .iter()
+                .chain(&spec.read_exec)
+                .chain(&spec.read_only)
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             // Never the `/proc/self` directory itself (we grant individual
-            // leaves, never the parent), nor the sensitive leaves.
+            // leaves, never the parent), nor the sensitive leaves, in any mode.
             for bad in ["/proc/self", "/proc/self/environ", "/proc/self/mem"] {
-                assert!(!ro.iter().any(|p| p == bad), "must not grant {bad}: {ro:?}");
+                assert!(
+                    !granted.iter().any(|p| p == bad),
+                    "must not grant {bad} in any access mode: {granted:?}"
+                );
             }
-            // Never `/proc/self/task`, nor anything beneath it: granting the
-            // per-thread directory (even read-only) re-exposes `environ`/`mem`
-            // via every `/proc/self/task/<tid>/`. Assert the whole subtree is
-            // absent, since a child grant is just as dangerous as the dir.
+            // Never `/proc/self/task`, nor anything beneath it, in any access
+            // mode: granting the per-thread directory (read, write, or execute)
+            // re-exposes `environ`/`mem` via every `/proc/self/task/<tid>/`.
+            // Assert the whole subtree is absent, since a child grant is just as
+            // dangerous as the dir.
             assert!(
-                !ro.iter().any(|p| std::path::Path::new(p).starts_with("/proc/self/task")),
-                "must not grant /proc/self/task or any child: {ro:?}"
+                !granted.iter().any(|p| std::path::Path::new(p).starts_with("/proc/self/task")),
+                "must not grant /proc/self/task or any child in any access mode: {granted:?}"
             );
-            // The self-inspection leaves PHP/glibc use are granted (they exist on
-            // any Linux test host).
+            // The self-inspection leaves PHP/glibc use are granted read-only
+            // (they exist on any Linux test host).
             for good in ["/proc/self/status", "/proc/self/stat", "/proc/self/maps"] {
-                assert!(ro.iter().any(|p| p == good), "must grant {good}: {ro:?}");
+                assert!(ro.iter().any(|p| p == good), "must grant {good} read-only: {ro:?}");
             }
             let _ = std::fs::remove_dir_all(&tmp);
         }

@@ -475,7 +475,12 @@ private key is **never** granted to the sandboxed engine.
 > **`/etc/ephpm`** (which is *not* granted and stays unreachable), never under
 > `/opt` or `/usr/local/etc`. The sandbox narrows "any host file the uid can read"
 > to "the granted set" — but the granted read+execute system trees are part of
-> that set, which is exactly why secrets must not live in them.
+> that set, which is exactly why secrets must not live in them. The same rule
+> applies to the embedded database: in whole-database mode the **parent
+> directory** of `[db.sqlite] path` is granted **read-write** to PHP threads (so
+> Turso's deferred `-wal`/`-shm` open is allowed), so do not point `[db.sqlite]
+> path` inside a secret-bearing directory such as `/etc/ephpm` — keep the
+> database in its own data dir.
 
 **This is not the cross-tenant boundary.** A PHP pool thread serves many
 tenants over its lifetime and a Landlock domain can only be set once per thread
