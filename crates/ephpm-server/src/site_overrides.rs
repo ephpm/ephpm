@@ -103,7 +103,7 @@ use std::path::{Component, Path, PathBuf};
 /// step with [`RawOverride`]'s fields — pinned by
 /// [`tests::known_keys_matches_the_parsed_schema`].
 const KNOWN_KEYS: &[&str] =
-    &["document_root", "auto_prepend_file", "preview_auth", "security", "rewrite", "env"];
+    &["document_root", "auto_prepend_file", "preview_auth", "security", "rewrite", "env", "limits"];
 
 /// Shortest accepted preview-gate `session_secret`, in bytes.
 ///
@@ -236,6 +236,30 @@ pub(crate) struct SiteOverride {
     /// compares equal across a `SITE_CONFIG_TTL` re-read (this struct is
     /// `PartialEq`).
     pub(crate) env: Vec<(String, String)>,
+    /// This site's per-tenant **resource envelope** (`[limits]` in the override
+    /// file). Today it carries only the two PHP-concurrency fairness knobs
+    /// (**F-DoS-1**); the block is the designated home for the future F-DoS-2
+    /// quotas (`max_db_bytes`, `max_memory`). `None`/`None` for the
+    /// overwhelming majority of sites — they take the global `[php]` defaults.
+    ///
+    /// Carried raw (the per-vhost overrides, each `Option`) rather than resolved,
+    /// because the effective values depend on the pool size and the global
+    /// defaults, which the admission controller owns. `Copy`, so the per-request
+    /// clone of [`SiteOverride`] / `SiteRoots` allocates nothing new.
+    pub(crate) limits: SiteConcurrencyLimits,
+}
+
+/// Per-site PHP concurrency overrides from the `[limits]` block. Each `None`
+/// falls through to the global `[php]` default; the admission controller clamps
+/// and resolves them (`crates/ephpm-server/src/site_admission.rs`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SiteConcurrencyLimits {
+    /// Override for this vhost's concurrency *ceiling* (`[php]
+    /// per_site_max_concurrency`). `None` = take the global default.
+    pub(crate) max_concurrency: Option<usize>,
+    /// Override for this vhost's concurrency *reservation* (`[php]
+    /// per_site_reserved`). `None` = take the global default.
+    pub(crate) reserved_concurrency: Option<usize>,
 }
 
 /// The override file's schema.
@@ -264,6 +288,40 @@ struct RawOverride {
     /// type error that fails the file closed like any other understood key.
     #[serde(default)]
     env: Option<std::collections::BTreeMap<String, toml::Value>>,
+    /// Per-site resource envelope. Only the two concurrency knobs are read today;
+    /// unknown keys inside it are tolerated (forward-compat with the F-DoS-2
+    /// quotas) and surfaced with a `limits.` prefix, exactly like
+    /// `[preview_auth]`.
+    #[serde(default)]
+    limits: Option<RawLimits>,
+    #[serde(flatten)]
+    unknown: toml::Table,
+}
+
+/// The `[limits]` section: this vhost's **resource envelope**. Written by the
+/// operator (the overrides directory is outside `sites_dir`, never tenant-
+/// writable), it is the admin's dial for "which sites get CPU" — raise the cap
+/// and reservation for a VIP, tighten the cap on a cheap/untrusted tenant.
+///
+/// Only [`max_concurrency`](Self::max_concurrency) and
+/// [`reserved_concurrency`](Self::reserved_concurrency) are implemented. The
+/// block is deliberately the home for the planned F-DoS-2 quotas (`max_db_bytes`,
+/// `max_memory`); an unknown key here is **tolerated** (forward-compat) and
+/// reported with a `limits.` prefix, not fatal — a newer provisioning daemon
+/// writing a future quota must not take an older ePHPm's sites off their limits.
+#[derive(serde::Deserialize)]
+struct RawLimits {
+    /// Ceiling: most in-flight pool requests this vhost may hold at once. Absent
+    /// = the global `[php] per_site_max_concurrency` default.
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    /// Floor: execution slots other tenants may not borrow, held for this vhost.
+    /// Absent = the global `[php] per_site_reserved` default. Clamped to
+    /// `max_concurrency`.
+    #[serde(default)]
+    reserved_concurrency: Option<usize>,
+    /// Unknown keys inside `[limits]` — tolerated and surfaced with a `limits.`
+    /// prefix (the planned F-DoS-2 quotas will land here).
     #[serde(flatten)]
     unknown: toml::Table,
 }
@@ -503,6 +561,9 @@ pub(crate) fn load(
     if let Some(sec) = &raw.security {
         unknown_keys.extend(sec.unknown.keys().map(|k| format!("security.{k}")));
     }
+    if let Some(lim) = &raw.limits {
+        unknown_keys.extend(lim.unknown.keys().map(|k| format!("limits.{k}")));
+    }
     unknown_keys.sort_unstable();
 
     // Validate `[security] capabilities` defensively. The authoritative grant is
@@ -597,6 +658,18 @@ pub(crate) fn load(
         // a TOML parse error above (the rule struct is strict).
         rewrites: raw.rewrite,
         env,
+        // Per-site concurrency overrides. Carried raw (each `Option`); the
+        // admission controller resolves them against the global defaults and the
+        // pool size, and clamps `reserved <= max <= pool`. Operator-written and
+        // trusted, so no fail-closed validation here — an out-of-range value is
+        // clamped, not a site-down.
+        limits: match &raw.limits {
+            Some(lim) => SiteConcurrencyLimits {
+                max_concurrency: lim.max_concurrency,
+                reserved_concurrency: lim.reserved_concurrency,
+            },
+            None => SiteConcurrencyLimits::default(),
+        },
     }
 }
 
@@ -1864,6 +1937,8 @@ mod tests {
                 "rewrite" => format!("[[{key}]]\nregex = \"^/x$\"\nto = \"/x.php\"\n"),
                 // A TOML table of string values, so nothing lands in `unknown`.
                 "env" => format!("[{key}]\nAPP_ENV = \"production\"\n"),
+                // A TOML table with one recognized sub-key.
+                "limits" => format!("[{key}]\nmax_concurrency = 4\n"),
                 _ => format!("{key} = \"x\"\n"),
             };
             let raw: RawOverride = toml::from_str(&toml).unwrap();
@@ -1875,6 +1950,37 @@ mod tests {
         // And nothing outside the list parses as typed.
         let raw: RawOverride = toml::from_str("some_future_key = \"x\"\n").unwrap();
         assert_eq!(raw.unknown.len(), 1);
+    }
+
+    // ── [limits] — per-site resource envelope (F-DoS-1) ──────────────────
+
+    /// A `[limits]` block parses both concurrency knobs, and an unknown sub-key
+    /// (a future F-DoS-2 quota) is tolerated and reported with a `limits.`
+    /// prefix — never fatal, so a newer daemon writing a future quota cannot take
+    /// an older ePHPm's sites off their limits.
+    #[test]
+    fn per_site_limits_block_parses_and_tolerates_future_keys() {
+        let f = fixture();
+        f.write("[limits]\nmax_concurrency = 8\nreserved_concurrency = 2\nmax_db_bytes = 1000\n");
+        let over = f.load();
+        assert_eq!(over.unusable, None, "a tolerated future key must not fail the site");
+        assert_eq!(over.limits.max_concurrency, Some(8));
+        assert_eq!(over.limits.reserved_concurrency, Some(2));
+        assert_eq!(over.unknown_keys, vec!["limits.max_db_bytes".to_string()]);
+    }
+
+    /// No `[limits]` block (and a block that sets only one knob) leaves the other
+    /// as `None`, which the admission controller fills from the global default.
+    #[test]
+    fn per_site_limits_absent_or_partial_default_to_none() {
+        let f = fixture();
+        f.write("document_root = \".\"\n");
+        assert_eq!(f.load().limits, SiteConcurrencyLimits::default());
+
+        f.write("[limits]\nmax_concurrency = 3\n");
+        let over = f.load();
+        assert_eq!(over.limits.max_concurrency, Some(3));
+        assert_eq!(over.limits.reserved_concurrency, None);
     }
 
     // ── [env] — per-site declared environment (finding F1, half b) ────────

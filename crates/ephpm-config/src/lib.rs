@@ -6252,6 +6252,68 @@ pub struct PhpConfig {
     #[serde(default = "default_admission")]
     pub admission: AdmissionPolicy,
 
+    /// Default **per-site** PHP concurrency *ceiling* in multi-tenant mode — the
+    /// most in-flight pool requests any one virtual host may hold at once
+    /// (red-team finding **F-DoS-1**). The safety lever: without it one tenant
+    /// can park every pool thread with slow requests (`sleep()`, a slow upstream)
+    /// and starve every other tenant.
+    ///
+    /// Enforced by a per-site admission gate in front of the execution pool
+    /// (`crates/ephpm-server/src/site_admission.rs`), **per-request mode, multi-
+    /// tenant only**: a single-site deployment and a request to an unmatched host
+    /// bypass it. The cap is *work-conserving* — a site may borrow idle capacity
+    /// and exceed this value when nothing else is running, and is held back to it
+    /// only when the box is saturated, so a lone busy site still uses the whole
+    /// box while a contended one converges to its ceiling.
+    ///
+    /// `0` (**default**) derives the ceiling by dividing the pool equally among
+    /// the configured vhosts — `ceil(effective_concurrency / known_sites)`,
+    /// floored at `2` and capped at the pool. Equal division (rather than a flat
+    /// fraction) keeps the *sum* of default ceilings near the pool size, so a
+    /// tenant controlling several vhosts cannot default its way to the whole box;
+    /// for one or two vhosts it is half the pool. A non-zero value is used as-is,
+    /// clamped to the pool size. A per-site `[limits] max_concurrency` in the
+    /// site-overrides file overrides this for that one vhost (raise it for a VIP,
+    /// tighten it for a cheap/untrusted tenant).
+    ///
+    /// Keep it `>= 2` where PHP loopback subrequests are used (a script that
+    /// HTTP-requests its own server), for the same reason the pool floors its
+    /// thread count at 2 (issue #461).
+    ///
+    /// Env override: `EPHPM_PHP__PER_SITE_MAX_CONCURRENCY=8`.
+    ///
+    /// Default: `0` (derived = pool size split evenly across the vhosts, floored
+    /// at 2).
+    #[serde(default)]
+    pub per_site_max_concurrency: usize,
+
+    /// Default **per-site** PHP concurrency *reservation* in multi-tenant mode —
+    /// idle execution slots other tenants may **not** borrow, held available for
+    /// a site (**F-DoS-1**).
+    ///
+    /// **What it does and does not guarantee (honest):** a site's within-ceiling
+    /// requests are always admitted, and this additionally stops *other* tenants
+    /// from *borrowing* into the last `reserved` idle slots, so those slots stay
+    /// free for this site's requests to land on promptly rather than queue behind
+    /// borrowed work. It does **not** guarantee a thread when the sum of all
+    /// sites' ceilings already exceeds the pool — two tenants filling their
+    /// within-ceiling shares can saturate the box with no borrowing, and this
+    /// admission-time gate never blocks a within-ceiling request. A strict
+    /// per-site thread guarantee needs pool-side priority (per-site queues +
+    /// weighted dispatch), which is planned, not implemented. Clamped to the
+    /// site's `max_concurrency`.
+    ///
+    /// The default (`0`) reserves nothing. Setting it **globally** reserves slots
+    /// for *every* tenant, which is rarely wanted and oversubscribes a busy box;
+    /// the normal use is a per-site `[limits] reserved_concurrency` override on a
+    /// specific VIP vhost, leaving this `0`.
+    ///
+    /// Env override: `EPHPM_PHP__PER_SITE_RESERVED=2`.
+    ///
+    /// Default: `0`.
+    #[serde(default)]
+    pub per_site_reserved: usize,
+
     /// Whether to scrub the process environment before PHP starts
     /// (multi-tenant breakout audit finding **F1**).
     ///
@@ -6626,6 +6688,21 @@ impl Config {
         rewrite::compile_rules(&self.server.rewrite).map_err(|e| {
             ConfigError::Validation(format!("[server] rewrite rule is invalid: {e}"))
         })?;
+
+        // [php] per-site concurrency fairness (F-DoS-1). A reservation above the
+        // ceiling is meaningless; reject it loudly rather than silently clamp, so
+        // a mistyped VIP policy fails startup instead of quietly capping the
+        // reservation. Only checkable here when both are explicit (a `0` ceiling
+        // is derived from the pool at runtime, where the reservation is clamped).
+        if self.php.per_site_max_concurrency > 0
+            && self.php.per_site_reserved > self.php.per_site_max_concurrency
+        {
+            return Err(ConfigError::Validation(format!(
+                "[php] per_site_reserved ({}) must not exceed per_site_max_concurrency ({}) \
+                 — a reservation cannot be larger than the ceiling it sits under",
+                self.php.per_site_reserved, self.php.per_site_max_concurrency
+            )));
+        }
 
         // [server.tenant_network] ebpf_policy: fail closed, never a silent
         // no-op. The runtime-capability gate (kernel too old / no BTF / missing
@@ -7840,6 +7917,8 @@ impl Default for PhpConfig {
             overload: None,
             shed_after_ms: default_shed_after_ms(),
             admission: default_admission(),
+            per_site_max_concurrency: 0,
+            per_site_reserved: 0,
             scrub_environment: default_true(),
             env_allowlist: default_env_allowlist(),
             worker: WorkerConfig::default(),
@@ -11148,6 +11227,52 @@ idle_timeout_secs = 15
         std::fs::write(&file, "[php.worker]\nworker_count = 4\n").unwrap();
         let err = Config::load(&file).expect_err("[php.worker] worker_count must be rejected");
         assert!(err.to_string().contains("worker_count"), "unhelpful error: {err}");
+    }
+
+    // ── [php] per-site concurrency fairness (F-DoS-1) ────────────────────
+
+    /// Both knobs default to `0` — from the struct default, an empty file, and a
+    /// `[php]` section that omits them (the serde section-default trap).
+    #[test]
+    fn per_site_concurrency_knobs_default_to_zero() {
+        assert_eq!(PhpConfig::default().per_site_max_concurrency, 0);
+        assert_eq!(PhpConfig::default().per_site_reserved, 0);
+        let config = Config::default_config().expect("default config should load");
+        assert_eq!(config.php.per_site_max_concurrency, 0);
+        assert_eq!(config.php.per_site_reserved, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("partial.toml");
+        std::fs::write(&partial, "[php]\nmax_execution_time = 60\n").unwrap();
+        let loaded = Config::load(&partial).unwrap();
+        assert_eq!(loaded.php.per_site_max_concurrency, 0);
+        assert_eq!(loaded.php.per_site_reserved, 0);
+    }
+
+    /// The knobs parse and the `EPHPM_PHP__*` overrides reach them.
+    #[test]
+    fn per_site_concurrency_knobs_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nper_site_max_concurrency = 8\nper_site_reserved = 2\n")
+            .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.per_site_max_concurrency, 8);
+        assert_eq!(config.php.per_site_reserved, 2);
+        config.validate().expect("reserved <= max is valid");
+    }
+
+    /// A reservation above the explicit ceiling is a hard startup error, not a
+    /// silent clamp.
+    #[test]
+    fn per_site_reserved_above_max_is_a_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nper_site_max_concurrency = 4\nper_site_reserved = 9\n")
+            .unwrap();
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("reserved > max must be rejected");
+        assert!(err.to_string().contains("per_site_reserved"), "unhelpful error: {err}");
     }
 
     // ── [php] admission (issue #442 / PR #443 escape hatch) ──────────────

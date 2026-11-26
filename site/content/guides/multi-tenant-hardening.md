@@ -513,6 +513,93 @@ destinations it protects are all TCP. And **the distributed cron / `ephpm php
 process, so a cron-scheduled tenant script can reach IMDS (Landlock on that lane
 restricts by port, not IP). Until that lane is tagged (a v0.21 roadmap item),
 **block `169.254.0.0/16` at the host firewall if you schedule tenant cron.**
+### 13. Per-tenant concurrency fairness (F-DoS-1)
+
+The layers above stop a tenant reaching another tenant's *data*. This one stops a
+tenant reaching another tenant's *CPU*. The PHP execution pool
+([`[php] concurrency`](/reference/config/#php)) is shared by every vhost, and
+before this layer its admission was fair *between requests* but blind to *which
+tenant* each belonged to. So one tenant could park every pool thread with slow
+requests — a `sleep()`, a slow upstream, an accidental `while (true)` — and every
+other tenant's requests queued behind them until the attacker's finished. A
+single noisy or hostile tenant denied service to the whole box (red-team finding
+**F-DoS-1**).
+
+ePHPm now gates PHP admission **per site**, in front of the pool. Two per-site
+levers, both default-safe:
+
+- **`max_concurrency`** — the *ceiling*: the most in-flight pool requests a vhost
+  may hold at once under contention. The safety lever. Its zero-config default
+  divides the pool equally among the configured vhosts
+  (`ceil(concurrency / known_sites)`, floored at 2), so neither one hostile tenant
+  **nor one controlling several vhosts** can take the whole box out of the box
+  (for one or two vhosts this is half the pool). The slot is charged to the PHP
+  thread for the whole request, so a `sleep()` that 504s at the deadline keeps
+  counting against its tenant's ceiling until its thread actually finishes — it
+  can never "time out" its way back under the ceiling while still holding a
+  thread.
+- **`reserved_concurrency`** — the *floor*: idle execution slots other tenants may
+  not *borrow*, held available for a site. Default `0`. **Honest scope:** it stops
+  other tenants borrowing into the last *R* idle slots; it does **not** guarantee
+  a thread when the sum of all sites' ceilings already exceeds the pool (two
+  tenants filling their within-ceiling shares can saturate the box with no
+  borrowing, and this admission-time gate never blocks a within-ceiling request).
+  A strict per-site thread guarantee needs pool-side priority (per-site queues +
+  weighted dispatch), which is planned, not shipped.
+
+The cap is **work-conserving**: a lone busy site borrows idle capacity and uses
+the whole box when nothing else is running, and is held back to its ceiling only
+when another tenant actually needs the threads. You lose no throughput on an
+uncontended box; you gain a hard bound on what any one tenant can take when the
+box is contended. (It cannot preempt a running PHP request — there is no
+mid-request pause — so this is admission-time fairness. A request over its
+tenant's ceiling with no idle slot to borrow waits, or sheds under
+[`overload = "shed"`](/reference/config/#php), holding **no** pool thread, so it
+never occupies a slot a neighbour needs.)
+
+Zero config is already safe — every multi-tenant node gets the half-the-pool
+default. Tune per vhost in the [override file](/reference/config/#per-site-override-files-site_overrides_dir)'s
+`[limits]` block: raise the ceiling and reservation for a VIP, tighten the ceiling
+on a cheap or untrusted tenant.
+
+```toml
+# ephpm.toml — global defaults for every vhost
+[php]
+per_site_max_concurrency = 0   # 0 = derive: pool split evenly across vhosts, floored at 2 (default)
+per_site_reserved        = 0   # reserve nothing globally (default)
+```
+
+```toml
+# <site_overrides_dir>/vip.example.toml — a VIP tenant
+[limits]
+max_concurrency      = 24      # may hold more of the pool under contention
+reserved_concurrency = 4       # 4 slots no other tenant may borrow
+```
+
+```toml
+# <site_overrides_dir>/cheap-tenant.example.toml — a bargain tenant
+[limits]
+max_concurrency = 2            # tightly capped
+```
+
+**Scope and limits.** Per-request mode, multi-tenant only (it needs a resolved
+per-request site key to be fair between tenants); single-site and worker
+deployments ignore the knobs (startup WARNs if they are set). It bounds *pool
+admission*, not CPU shares or memory — a tenant within its ceiling can still run
+CPU-heavy PHP; the ceiling bounds how many such requests it runs **at once**. The
+`[limits]` block is the designated home for the planned per-site resource quotas
+(`max_db_bytes`, `max_memory`, finding F-DoS-2), not yet implemented. Keep
+`max_concurrency >= 2` where a tenant makes PHP loopback subrequests, for the same
+reason the pool floors its thread count at 2 (a 1-slot tenant can self-deadlock an
+HTTP request to its own server — #461).
+
+**Observability.** Per-site gauges `ephpm_php_site_in_flight{site}` and
+`ephpm_php_site_queued{site}`, and the counter `ephpm_php_site_shed_total{site}`
+(plus `ephpm_http_timeouts_total{stage="site_admission"}` on the default wait
+policy), show exactly which tenant is being throttled and when — see the
+[metrics reference](/reference/metrics/#per-site-concurrency-fairness-f-dos-1). A
+tenant pinned at its ceiling with a non-zero `queued` is the fairness mechanism
+working, not a fault.
 
 ## What ePHPm self-enforces
 
