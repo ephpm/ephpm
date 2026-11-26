@@ -54,6 +54,19 @@ tenant's database file, or `/proc/<pid>/environ`. `..`, symlink, `realpath`,
 `chdir`, and `glob` escapes are all blocked by the realpath check. Controlled by
 `[server.security] open_basedir` (default on in multi-tenant mode).
 
+> **The PHP SDK build is a security dependency.** In the single-process model,
+> `open_basedir` is the **only** cross-tenant file-access control — there is no
+> per-tenant uid or mount namespace to fall back on. Its correctness, and the
+> correctness of the stream wrappers that must honour it, is a property of the
+> *exact* PHP build you ship: the `glob://` wrapper, for example, is confined by
+> `open_basedir` on the shipped PHP 8.5.13 (verified — a tenant cannot list a
+> sibling vhost's filenames through it) but has leaked directory listings past
+> `open_basedir` on some older PHP versions. Which security-relevant extensions
+> are compiled in (notably `ext-ffi`, see §2) likewise changes the attack
+> surface. So treat the pinned PHP SDK version as a **security dependency** — pin
+> it exactly (ePHPm pins each SDK per minor in `xtask`), review its changelog for
+> isolation-relevant changes before bumping, and never float it loosely.
+
 ### 2. The function denylist — `disable_functions`
 
 The `multi_tenant_hardening` preset (default on when `sites_dir` is set) removes
@@ -155,6 +168,41 @@ difference.
 > directory chooses the grants. Capabilities are honoured in per-request mode
 > (the default); in worker mode the gate has no per-request site and fails
 > closed.
+
+#### The class denylist — `ext-ffi` off (`disable_classes` + `ffi.enable`)
+
+PHP's **FFI** extension (`ext-ffi`) is a wholesale escape of the single-process
+sandbox: `FFI::cdef` / `FFI::load` / `new FFI()` `dlopen` an arbitrary shared
+library, call any native symbol, and read or write any address — straight past
+`disable_functions` **and** `open_basedir`. One tenant with FFI owns the whole
+process and every other tenant's data.
+
+The shipped PHP SDK does **not** compile `ext-ffi` in, so the `FFI` class does
+not exist today. ePHPm does not *depend* on that incidental build fact — it owns
+the guarantee. The hardening preset:
+
+- forces **`ffi.enable = 0`** in the generated php.ini. Like
+  `mysqli.allow_persistent` (§3), this is a `PHP_INI_SYSTEM` directive — the
+  strictest access level — so a tenant's `ini_set()` cannot turn it back on, and
+  a per-vhost `.user.ini` (which can only carry `PHP_INI_PERDIR`/`PHP_INI_USER`
+  settings) cannot either.
+- adds **`FFI` to `disable_classes`**, composed as a **union** with any operator
+  `disable_classes` the same way `disable_functions` is (your additions are
+  never clobbered). PHP records every `disable_classes` name in its
+  disabled-classes registry at MINIT *whether or not the class currently
+  exists*, so this is belt-and-suspenders: a future SDK that compiles `ext-ffi`
+  in finds `FFI` already neutralised — instantiation throws — with no ePHPm
+  change and no window where FFI is reachable. Naming a class no loaded
+  extension defines is a harmless no-op, so it never breaks startup on today's
+  build.
+
+The same `ffi.enable = 0` + `disable_classes=FFI` ride the `ephpm php --site`
+cron/CLI sandbox, so a tenant's scheduled scripts are confined exactly as its
+HTTP requests are.
+
+> Verified on the shipped PHP 8.5.13: `ext-ffi` is not loaded, the `FFI` class
+> does not exist, `FFI::cdef(...)` raises `Error: Class "FFI" not found`, and the
+> two directives load with no startup error or warning.
 
 ### 3. Persistent connections — off
 

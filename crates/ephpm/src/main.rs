@@ -2056,6 +2056,26 @@ const HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION: &[&str] = &[
 /// executing script's path and would block ePHPm's invalidator too.
 const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disabled";
 
+/// Classes the multi-tenant hardening preset disables via PHP's
+/// `disable_classes`. `FFI` is the gateway to ext-ffi: `FFI::cdef`,
+/// `FFI::load`, `FFI::scope` and `new FFI()` hand a tenant arbitrary
+/// native-memory access and foreign-function calls that bypass
+/// `disable_functions` **and** `open_basedir` wholesale (load any `.so`, call
+/// any libc symbol, read/write any address) — a near-total escape of the
+/// single-process sandbox. ePHPm therefore owns this guarantee rather than
+/// depending on the incidental build fact that the shipped PHP SDK does not
+/// compile ext-ffi in.
+///
+/// Belt-and-suspenders by design: when ext-ffi is absent the `FFI` class does
+/// not exist, but PHP records every `disable_classes` name in its
+/// disabled-classes registry at MINIT regardless, so a *future* SDK that adds
+/// ext-ffi finds `FFI` already neutralised — instantiation throws — with no
+/// ePHPm change required. Paired with `ffi.enable=0` in the generated ini
+/// (`PHP_INI_SYSTEM`, so a tenant cannot `ini_set` it back on). Naming a class
+/// that no loaded extension defines is a harmless no-op, so this never breaks
+/// startup on today's SDK.
+const HARDENING_CLASSES: &[&str] = &["FFI"];
+
 /// How long stopping the async runtime may take after `serve` has finished
 /// its own drain. Covers the background tasks being dropped and the joins of
 /// tokio's worker and blocking-pool threads; a blocking task still running
@@ -2106,6 +2126,51 @@ fn collect_operator_disable_functions(ini_overrides: &[[String; 2]]) -> Vec<Stri
         }
     }
     out
+}
+
+/// Split every operator `disable_classes` entry in `ini_overrides` into
+/// individual, trimmed class names. Mirrors
+/// [`collect_operator_disable_functions`] so an operator's own
+/// `disable_classes` is folded into the composed union below rather than
+/// emitted verbatim (and silently clobbered by ePHPm's own line, PHP ini being
+/// last-wins).
+fn collect_operator_disable_classes(ini_overrides: &[[String; 2]]) -> Vec<String> {
+    let mut out = Vec::new();
+    for [k, v] in ini_overrides {
+        if k.trim().eq_ignore_ascii_case("disable_classes") {
+            for name in v.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compose the effective `disable_classes` value as the UNION of any
+/// operator-supplied list and the multi-tenant hardening preset's classes
+/// ([`HARDENING_CLASSES`]), so neither clobbers the other. The preset set is
+/// added only when `include_hardening` is `true` — exactly the gate that adds
+/// the hardening `disable_functions` baseline. Returns `None` when the union is
+/// empty (nothing to emit), so a build with the preset off and no operator
+/// `disable_classes` emits no line at all (byte-identical to before).
+fn compose_disable_classes(operator: &[String], include_hardening: bool) -> Option<String> {
+    let mut ordered: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Operator list first: preserve their explicit intent and ordering.
+    for c in operator {
+        push_unique(&mut ordered, &mut seen, c);
+    }
+    if include_hardening {
+        for c in HARDENING_CLASSES {
+            push_unique(&mut ordered, &mut seen, c);
+        }
+    }
+
+    if ordered.is_empty() { None } else { Some(ordered.join(",")) }
 }
 
 /// Case-insensitively append `name` to `ordered` if not already present.
@@ -2240,15 +2305,16 @@ fn site_sandbox_cli_defines(
     site_key: &str,
 ) -> anyhow::Result<Vec<String>> {
     // Keys the router owns: never taken from operator `ini_overrides`, so an
-    // override cannot widen the sandbox. (`disable_functions` is folded into the
-    // composed union below; the four path keys come from the resolved vhost
-    // state.)
-    const SANDBOX_MANAGED_KEYS: [&str; 5] = [
+    // override cannot widen the sandbox. (`disable_functions` and
+    // `disable_classes` are folded into the composed unions below; the four
+    // path keys come from the resolved vhost state.)
+    const SANDBOX_MANAGED_KEYS: [&str; 6] = [
         "open_basedir",
         "sys_temp_dir",
         "upload_tmp_dir",
         "session.save_path",
         "disable_functions",
+        "disable_classes",
     ];
 
     // Validate the --site key fail-closed and resolve/create the vhost's private
@@ -2305,6 +2371,21 @@ fn site_sandbox_cli_defines(
     ) {
         out.push("-d".to_string());
         out.push(format!("disable_functions={df}"));
+    }
+    // disable_classes + ffi.enable: the same multi-tenant FFI lockdown the serve
+    // path writes into the generated ini, so a cron child cannot reach ext-ffi
+    // even though its HTTP siblings cannot. Emitted LAST (after the operator
+    // replay) so the preset wins; php-cli is last-define-wins. `ffi.enable` is
+    // `PHP_INI_SYSTEM`, so a `-d` sets it authoritatively and tenant code cannot
+    // `ini_set` it back on. See `HARDENING_CLASSES`.
+    let operator_classes = collect_operator_disable_classes(&config.php.ini_overrides);
+    if let Some(classes) = compose_disable_classes(&operator_classes, hardening) {
+        out.push("-d".to_string());
+        out.push(format!("disable_classes={classes}"));
+    }
+    if hardening {
+        out.push("-d".to_string());
+        out.push("ffi.enable=0".to_string());
     }
     Ok(out)
 }
@@ -3174,13 +3255,16 @@ fn run_with_config(
             {
                 let _ = writeln!(content, "max_execution_time={}", config.php.max_execution_time);
             }
-            // Emit every operator `ini_overrides` line EXCEPT `disable_functions`:
-            // that one is folded into the composed union below so an operator's
-            // additions can never be clobbered by ePHPm's baseline (PHP ini is
-            // last-wins, and historically ePHPm appended its own
-            // `disable_functions` line last — silently discarding the operator's).
+            // Emit every operator `ini_overrides` line EXCEPT `disable_functions`
+            // and `disable_classes`: those two are folded into the composed
+            // unions below so an operator's additions can never be clobbered by
+            // ePHPm's baseline (PHP ini is last-wins, and historically ePHPm
+            // appended its own line last — silently discarding the operator's).
             for [k, v] in &config.php.ini_overrides {
-                if k.trim().eq_ignore_ascii_case("disable_functions") {
+                let key = k.trim();
+                if key.eq_ignore_ascii_case("disable_functions")
+                    || key.eq_ignore_ascii_case("disable_classes")
+                {
                     continue;
                 }
                 let _ = writeln!(content, "{k}={v}");
@@ -3202,6 +3286,14 @@ fn run_with_config(
             ) {
                 let _ = writeln!(content, "disable_functions={df}");
             }
+            // Compose the effective `disable_classes` as the UNION of ePHPm's
+            // hardening baseline (`FFI` when the preset is on) and any operator
+            // `disable_classes`. Emitted whenever the union is non-empty so an
+            // operator's own list survives even with the preset off.
+            let operator_classes = collect_operator_disable_classes(&config.php.ini_overrides);
+            if let Some(classes) = compose_disable_classes(&operator_classes, vhost_hardening) {
+                let _ = writeln!(content, "disable_classes={classes}");
+            }
             // Extra hardening ini (multi-tenant preset only). Persistent
             // connection handles live in `EG(persistent_list)`, keyed without a
             // tenant component and surviving request end on a shared ZTS worker,
@@ -3213,6 +3305,16 @@ fn run_with_config(
             // a tenant cannot reset/inspect the shared cache — but only when
             // ePHPm's own cluster invalidator does not itself need that API.
             if vhost_hardening {
+                // ext-ffi is a wholesale escape of the single-process sandbox
+                // (arbitrary dlopen + native calls + raw memory, past both
+                // `disable_functions` and `open_basedir`). `ffi.enable` is
+                // `PHP_INI_SYSTEM`, so setting it here is authoritative and a
+                // tenant cannot `ini_set` it back on. Paired with the `FFI`
+                // entry in the composed `disable_classes` above. ePHPm owns the
+                // guarantee rather than relying on the SDK not compiling ext-ffi
+                // in — see `HARDENING_CLASSES`. Harmless no-op when ext-ffi is
+                // absent (unknown ini keys are ignored).
+                let _ = writeln!(content, "ffi.enable=0");
                 let _ = writeln!(content, "mysqli.allow_persistent=0");
                 let _ = writeln!(content, "pgsql.allow_persistent=0");
                 let _ = writeln!(content, "odbc.allow_persistent=0");
@@ -4395,6 +4497,32 @@ mod disable_functions_tests {
         assert_eq!(compose_disable_functions(&[], false, false, true, false, &no_gates()), None);
     }
 
+    /// The multi-tenant hardening preset owns the FFI guarantee: with hardening
+    /// on, the composed `disable_classes` includes `FFI` so a tenant cannot
+    /// instantiate it even if a future SDK compiles ext-ffi in. With hardening
+    /// off (and no operator list) it emits nothing — byte-identical to before.
+    #[test]
+    fn hardening_disable_classes_includes_ffi() {
+        // Preset on ⇒ FFI is disabled.
+        assert_eq!(compose_disable_classes(&[], true).as_deref(), Some("FFI"));
+        // Preset off, no operator list ⇒ nothing emitted.
+        assert_eq!(compose_disable_classes(&[], false), None);
+    }
+
+    /// An operator's own `disable_classes` is unioned with the preset's `FFI`,
+    /// never clobbered by it (and vice versa): both survive, deduplicated.
+    #[test]
+    fn operator_disable_classes_unioned_with_ffi() {
+        let operator = collect_operator_disable_classes(&ov(&[("disable_classes", "SoapClient")]));
+        // Preset on: operator first (order preserved), then the preset's FFI.
+        assert_eq!(compose_disable_classes(&operator, true).as_deref(), Some("SoapClient,FFI"));
+        // Preset off: the operator's list still stands on its own.
+        assert_eq!(compose_disable_classes(&operator, false).as_deref(), Some("SoapClient"));
+        // An operator who already named FFI does not get it twice (case-insensitive).
+        let dup = collect_operator_disable_classes(&ov(&[("disable_classes", "ffi")]));
+        assert_eq!(compose_disable_classes(&dup, true).as_deref(), Some("ffi"));
+    }
+
     #[test]
     fn shell_only_matches_legacy_line() {
         let df = compose_disable_functions(&[], true, false, true, false, &no_gates()).unwrap();
@@ -5194,6 +5322,15 @@ mod site_sandbox_tests {
         for f in ["system", "shell_exec", "proc_open", "passthru"] {
             assert!(df.contains(f), "disable_functions blocks {f}: {df}");
         }
+
+        // The multi-tenant FFI lockdown rides the same sandbox: `disable_classes`
+        // names `FFI`, and `ffi.enable=0` is forced (PHP_INI_SYSTEM — a tenant
+        // cannot `ini_set` it back on), so a cron child cannot reach ext-ffi.
+        assert!(
+            defines.iter().any(|a| a == "disable_classes=FFI"),
+            "disables the FFI class: {joined}"
+        );
+        assert!(defines.iter().any(|a| a == "ffi.enable=0"), "forces ffi.enable off: {joined}");
 
         // Fails closed on an unknown / traversal-shaped --site key.
         assert!(site_sandbox_cli_defines(&config, "ghost").is_err());
