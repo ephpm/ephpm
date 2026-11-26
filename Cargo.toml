@@ -652,15 +652,16 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
 # Current pin 1b2312f3 adds two catalog-emulation correctness fixes over the
-# previous 664d4aef (SECURITY note above still applies — do not move backwards):
-# litewire#68 reports a `DEFAULT NULL` column's COLUMN_DEFAULT / SHOW COLUMNS
-# Default as SQL NULL instead of the literal string "NULL" (hit every nullable
-# column after a mysqldump import; ORMs like CakePHP pre-filled forms with
-# "NULL"), and litewire#69 keeps MySQL's boolean idiom — `BOOL` / `BOOLEAN` /
-# `tinyint(1)` are rewritten to `TINYINT(1)` at CREATE time and reported as
-# `tinyint(1)` so ORM bool detection works (new tables only; existing INTEGER
-# columns keep reporting `bigint`).
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "9e87fbabc31aed7449a515172e4b60297f85eed7", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+# previous 9e87fbab (SECURITY note above still applies — do not move backwards):
+# litewire#71 prepares literal statements uncached to bound memory. The current
+# pin adds litewire#72: `Session::exec_batch` / `BackendConn::exec_batch` — a
+# connection-level batch primitive that runs a burst of already-final,
+# parameter-free write statements in source order on one connection, stopping at
+# the first error. ePHPm's per-site clustered write-forwarding (#439) sends a
+# qualifying burst as one round trip over the pinned session stream, keeping the
+# batch and a following LAST_INSERT_ID()/ROW_COUNT() on one owner-side
+# connection. This rev is litewire#72's squash-merge commit on litewire main.
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "03ab44fc8b4ddf82f222aeeaae519b85830be9a9", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.8.3)

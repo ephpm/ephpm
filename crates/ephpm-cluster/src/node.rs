@@ -40,6 +40,14 @@ pub struct NodeInfo {
     /// is no longer a candidate to own a per-site database
     /// ([`crate::hrw_owner`]).
     pub draining: bool,
+    /// Whether the node advertises support for the per-site SQL-forwarding
+    /// **batch** protocol ([`SQL_FORWARD_BATCH_KEY`]) — i.e. its `sql/<site>`
+    /// handler can decode a `SqlRequest::Batch`. `false` for a node that
+    /// predates the batch request (a rolling upgrade). A forwarding node only
+    /// sends a batch to an owner that advertises this, and otherwise forwards
+    /// the burst one statement at a time, so a mixed-version cluster never hard
+    /// fails on an undecodable frame.
+    pub sql_forward_batch: bool,
 }
 
 impl NodeInfo {
@@ -54,6 +62,7 @@ impl NodeInfo {
             data_port: None,
             hrw_scheme: None,
             draining: false,
+            sql_forward_batch: false,
         }
     }
 }
@@ -81,6 +90,19 @@ pub const HRW_SCHEME_KEY: &str = "ephpm:hrw_scheme";
 /// Read a node's advertised ownership-hash scheme from its gossip state.
 fn advertised_hrw_scheme(state: &chitchat::NodeState) -> Option<u32> {
     state.get(HRW_SCHEME_KEY).and_then(|s| s.parse().ok())
+}
+
+/// Chitchat key a node sets to say its per-site SQL-forwarding handler can
+/// decode a batched write burst (`SqlRequest::Batch`). A forwarding node reads
+/// this on the site's **owner** before sending a batch; an owner that predates
+/// the batch request advertises nothing, so the forwarder falls back to
+/// per-statement forwarding rather than send a frame the owner would reject.
+/// Outside the `kv:` prefix so the KV applier never sees it.
+pub const SQL_FORWARD_BATCH_KEY: &str = "ephpm:sql_forward_batch";
+
+/// Read whether a node advertises SQL-forwarding batch support.
+fn advertised_sql_forward_batch(state: &chitchat::NodeState) -> bool {
+    state.get(SQL_FORWARD_BATCH_KEY).is_some()
 }
 
 /// Chitchat key under which a node advertises its KV data plane port.
@@ -312,6 +334,7 @@ pub(crate) fn present_peers_locked(
             data_port: advertised_data_port(state),
             hrw_scheme: advertised_hrw_scheme(state),
             draining: advertised_draining(state),
+            sql_forward_batch: advertised_sql_forward_batch(state),
         })
         .collect();
     peers.sort_by(|a, b| a.id.cmp(&b.id));
@@ -385,6 +408,7 @@ impl ClusterHandle {
                     data_port: node_state.and_then(advertised_data_port),
                     hrw_scheme: node_state.and_then(advertised_hrw_scheme),
                     draining: node_state.is_some_and(advertised_draining),
+                    sql_forward_batch: node_state.is_some_and(advertised_sql_forward_batch),
                 });
             }
         }
@@ -410,6 +434,8 @@ impl ClusterHandle {
             data_port: Some(self.data_port),
             hrw_scheme: Some(crate::sqlite_election::HRW_SCHEME),
             draining: self.is_draining(),
+            // This build's `sql/<site>` handler decodes `SqlRequest::Batch`.
+            sql_forward_batch: true,
         }
     }
 
@@ -610,6 +636,7 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         let state = guard.self_node_state();
         state.set(KV_DATA_PORT_KEY, data_port.to_string());
         state.set(HRW_SCHEME_KEY, crate::sqlite_election::HRW_SCHEME.to_string());
+        state.set(SQL_FORWARD_BATCH_KEY, "1");
         state.set(KV_CATCH_UP_KEY, "1");
         state.set(KV_MARK_KEY, started_ms.to_string());
     }
