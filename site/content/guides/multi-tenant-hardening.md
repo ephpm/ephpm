@@ -529,12 +529,23 @@ ePHPm now gates PHP admission **per site**, in front of the pool. Two per-site
 levers, both default-safe:
 
 - **`max_concurrency`** — the *ceiling*: the most in-flight pool requests a vhost
-  may hold at once under contention. The safety lever. Its zero-config default is
-  half the pool (`ceil(concurrency × 0.5)`, floored at 2), so one hostile tenant
-  can degrade its neighbours but **cannot take the whole box out of the box**.
-- **`reserved_concurrency`** — the *floor*: execution slots other tenants may not
-  borrow, held available for a site even under saturation so a VIP never starves.
-  Default `0`.
+  may hold at once under contention. The safety lever. Its zero-config default
+  divides the pool equally among the configured vhosts
+  (`ceil(concurrency / known_sites)`, floored at 2), so neither one hostile tenant
+  **nor one controlling several vhosts** can take the whole box out of the box
+  (for one or two vhosts this is half the pool). The slot is charged to the PHP
+  thread for the whole request, so a `sleep()` that 504s at the deadline keeps
+  counting against its tenant's ceiling until its thread actually finishes — it
+  can never "time out" its way back under the ceiling while still holding a
+  thread.
+- **`reserved_concurrency`** — the *floor*: idle execution slots other tenants may
+  not *borrow*, held available for a site. Default `0`. **Honest scope:** it stops
+  other tenants borrowing into the last *R* idle slots; it does **not** guarantee
+  a thread when the sum of all sites' ceilings already exceeds the pool (two
+  tenants filling their within-ceiling shares can saturate the box with no
+  borrowing, and this admission-time gate never blocks a within-ceiling request).
+  A strict per-site thread guarantee needs pool-side priority (per-site queues +
+  weighted dispatch), which is planned, not shipped.
 
 The cap is **work-conserving**: a lone busy site borrows idle capacity and uses
 the whole box when nothing else is running, and is held back to its ceiling only
@@ -554,7 +565,7 @@ on a cheap or untrusted tenant.
 ```toml
 # ephpm.toml — global defaults for every vhost
 [php]
-per_site_max_concurrency = 0   # 0 = derive half the pool, floored at 2 (default)
+per_site_max_concurrency = 0   # 0 = derive: pool split evenly across vhosts, floored at 2 (default)
 per_site_reserved        = 0   # reserve nothing globally (default)
 ```
 

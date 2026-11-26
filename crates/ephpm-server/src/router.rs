@@ -1429,23 +1429,81 @@ impl Router {
         // `site_identities` is a field read, not a re-scan.
         let multi_site = config.server.sites_dir.is_some() || !sites.is_empty();
 
+        // Whether a per-site `auto_prepend_file` can run (per-request mode only);
+        // also the mode the per-site override loader needs. Computed once and
+        // reused by the `prepend_support` field below.
+        let prepend_support = if config.php.is_worker_mode() {
+            crate::site_overrides::PrependSupport::NoWorkerMode
+        } else {
+            crate::site_overrides::PrependSupport::Yes
+        };
+
         // Per-tenant PHP concurrency fairness (F-DoS-1). Only meaningful in
         // per-request multi-tenant mode: it needs the per-request pool to gate
         // pool admission AND a resolved per-request site key so there are
         // distinct tenants to be fair between. Single-site and worker
         // deployments get `None`, so the gate is skipped and the uncontended
         // path is byte-for-byte unchanged.
-        let site_admission = if fpm_pool.is_some() && multi_site {
+        let site_admission = if let Some(pool) = fpm_pool.clone().filter(|_| multi_site) {
             let capacity = config.php.effective_concurrency();
-            let controller = crate::site_admission::SiteAdmission::new(
+            // Divide the default ceiling among the configured vhosts so a tenant
+            // controlling several of them cannot default its way to the whole box.
+            let known_sites = sites.len().max(1);
+            // Bound each site's parked-waiter set at the pool's queue depth, so a
+            // tenant cannot grow an unbounded wait queue at the gate.
+            let max_waiters = config.php.effective_queue_depth();
+            // The borrow decision reads live serving capacity, not the static
+            // size, so a hung-thread storm cannot admit a borrow into a thread
+            // that cannot serve it.
+            let serving: crate::site_admission::ServingFn = {
+                let pool = Arc::clone(&pool);
+                Arc::new(move || pool.serving_threads())
+            };
+            let controller = crate::site_admission::SiteAdmission::new_with_serving(
                 capacity,
+                known_sites,
+                serving,
                 config.php.per_site_max_concurrency,
                 config.php.per_site_reserved,
+                max_waiters,
             );
+            // Pre-register every known vhost's resolved limits so a reservation is
+            // honoured from the FIRST request, not only after the site is first
+            // seen (findings F-DoS-1 / review P3). Reads each override once at
+            // startup; sites without one take the global defaults.
+            if let Some(dir) = site_overrides_dir.as_deref() {
+                for (key, site) in &sites {
+                    let over =
+                        crate::site_overrides::load(dir, key, &site.container, prepend_support);
+                    let requested =
+                        over.limits.reserved_concurrency.unwrap_or(config.php.per_site_reserved);
+                    let limits = controller.resolve_limits(
+                        over.limits.max_concurrency,
+                        over.limits.reserved_concurrency,
+                    );
+                    if controller.register_site(key, requested, limits) {
+                        tracing::warn!(
+                            site = %key,
+                            requested_reserved = requested,
+                            effective_reserved = limits.reserved,
+                            ceiling = limits.max,
+                            "per-site [limits] reserved_concurrency exceeds the site's ceiling and \
+                             was clamped down to it (F-DoS-1)"
+                        );
+                    }
+                }
+            } else {
+                for key in sites.keys() {
+                    let limits = controller.resolve_limits(None, None);
+                    controller.register_site(key, config.php.per_site_reserved, limits);
+                }
+            }
             tracing::info!(
                 capacity,
+                known_sites,
                 default_max = controller.default_max(),
                 default_reserved = config.php.per_site_reserved.min(controller.default_max()),
+                max_waiters,
                 "per-site PHP concurrency fairness enabled (F-DoS-1)"
             );
             Some(controller)
@@ -1470,11 +1528,7 @@ impl Router {
             websocket_files: config.server.websocket_files.clone(),
             sites_dir: config.server.sites_dir.clone(),
             site_overrides_dir,
-            prepend_support: if config.php.is_worker_mode() {
-                crate::site_overrides::PrependSupport::NoWorkerMode
-            } else {
-                crate::site_overrides::PrependSupport::Yes
-            },
+            prepend_support,
             site_roots_cache: dashmap::DashMap::new(),
             sites_domain_suffix: config
                 .server
@@ -4983,85 +5037,104 @@ impl Router {
         // occupy a pool thread, it must get an admission slot for its tenant: a
         // site over its ceiling that cannot borrow idle capacity waits (or sheds)
         // HERE, holding no pool thread and no pool queue slot, so one noisy
-        // tenant can never park the whole pool and starve its neighbours. The
-        // permit is held across the dispatch + reply below and dropped when this
-        // method returns on EVERY path (answered, shed, timed out), releasing the
-        // tenant's slot the instant its request leaves the pool.
+        // tenant can never park the whole pool and starve its neighbours.
+        //
+        // CRITICAL: the permit is NOT held for the lifetime of this handler
+        // future. It is moved into the job below and parked with
+        // `fpm_pool::hold_until_finished`, so it is charged to the PHP THREAD and
+        // released only when the thread has finished the request (execution AND
+        // teardown), on every exit path. Releasing it when this future returns
+        // would be broken against the attack itself: a `sleep(3600)` request 504s
+        // at the deadline, this future returns, and the slot would be freed while
+        // the thread runs on for an hour — never "over ceiling". See the module
+        // docs.
         //
         // `None` for single-site deployments and unmatched hosts (no tenant to be
         // fair between) — the uncontended path then pays nothing. A within-share
         // request is admitted immediately and never parks here; only an
         // over-ceiling request under contention reaches the wait/shed arms.
-        let _site_permit = if let (Some(admission), Some(key)) =
-            (self.site_admission.as_ref(), site_key.as_deref())
-        {
-            let limits = admission
-                .resolve_limits(site_limits.max_concurrency, site_limits.reserved_concurrency);
-            match self.overload_policy {
-                ephpm_config::OverloadPolicy::Wait => {
-                    // Wait for a per-site slot, bounded by the request deadline so
-                    // a starved tenant 504s on the same ceiling a starved pool
-                    // queue does. A `request` timeout of 0 disables the deadline.
-                    let admitted = match crate::php_wait::current_deadline(self.request_timeout) {
-                        Some(deadline) => {
-                            tokio::time::timeout_at(deadline, admission.acquire(key, limits))
+        let site_permit: Option<crate::site_admission::SitePermit> =
+            if let (Some(admission), Some(key)) =
+                (self.site_admission.as_ref(), site_key.as_deref())
+            {
+                let limits = admission
+                    .resolve_limits(site_limits.max_concurrency, site_limits.reserved_concurrency);
+                match self.overload_policy {
+                    ephpm_config::OverloadPolicy::Wait => {
+                        // Wait for a per-site slot, bounded by the request deadline so
+                        // a starved tenant 504s on the same ceiling a starved pool
+                        // queue does. A `request` timeout of 0 disables the deadline.
+                        let admitted: Option<crate::site_admission::SitePermit> =
+                            match crate::php_wait::current_deadline(self.request_timeout) {
+                                Some(deadline) => tokio::time::timeout_at(
+                                    deadline,
+                                    admission.acquire(key, limits),
+                                )
                                 .await
                                 .ok()
+                                .flatten(),
+                                None => admission.acquire(key, limits).await,
+                            };
+                        match admitted {
+                            Some(permit) => Some(permit),
+                            None => {
+                                drop(php_span);
+                                counter!("ephpm_http_timeouts_total", "stage" => "site_admission")
+                                    .increment(1);
+                                let mut resp = apply_response_headers(
+                                    error_response(
+                                        StatusCode::GATEWAY_TIMEOUT,
+                                        "504 Gateway Timeout",
+                                    ),
+                                    &mw_response_headers,
+                                );
+                                resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                                    queue_wait: Some(php_start.elapsed()),
+                                    execute: None,
+                                });
+                                return resp;
+                            }
                         }
-                        None => Some(admission.acquire(key, limits).await),
-                    };
-                    match admitted {
-                        Some(permit) => Some(permit),
-                        None => {
-                            drop(php_span);
-                            counter!("ephpm_http_timeouts_total", "stage" => "site_admission")
-                                .increment(1);
-                            let mut resp = apply_response_headers(
-                                error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),
-                                &mw_response_headers,
-                            );
-                            resp.extensions_mut().insert(crate::timeline::PhpTimings {
-                                queue_wait: Some(php_start.elapsed()),
-                                execute: None,
-                            });
-                            return resp;
+                    }
+                    ephpm_config::OverloadPolicy::Shed => {
+                        // Take a slot now if one is free, else wait up to `shed_after`,
+                        // else shed (503 + Retry-After) — the pool's shed budget,
+                        // applied per tenant.
+                        let admitted: Option<crate::site_admission::SitePermit> =
+                            if let Some(permit) = admission.try_acquire(key, limits) {
+                                Some(permit)
+                            } else if self.shed_after.is_zero() {
+                                None
+                            } else {
+                                tokio::time::timeout(
+                                    self.shed_after,
+                                    admission.acquire(key, limits),
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                            };
+                        match admitted {
+                            Some(permit) => Some(permit),
+                            None => {
+                                admission.note_shed(key, limits);
+                                drop(php_span);
+                                let mut resp = apply_response_headers(
+                                    shed_response(ShedReason::Overloaded, "site"),
+                                    &mw_response_headers,
+                                );
+                                resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                                    queue_wait: Some(php_start.elapsed()),
+                                    execute: None,
+                                });
+                                return resp;
+                            }
                         }
                     }
                 }
-                ephpm_config::OverloadPolicy::Shed => {
-                    // Take a slot now if one is free, else wait up to `shed_after`,
-                    // else shed (503 + Retry-After) — the pool's shed budget,
-                    // applied per tenant.
-                    let admitted = if let Some(permit) = admission.try_acquire(key, limits) {
-                        Some(permit)
-                    } else if self.shed_after.is_zero() {
-                        None
-                    } else {
-                        tokio::time::timeout(self.shed_after, admission.acquire(key, limits))
-                            .await
-                            .ok()
-                    };
-                    match admitted {
-                        Some(permit) => Some(permit),
-                        None => {
-                            crate::site_admission::SitePermit::note_shed(admission, key, limits);
-                            drop(php_span);
-                            let mut resp = apply_response_headers(
-                                shed_response(ShedReason::Overloaded, "site"),
-                                &mw_response_headers,
-                            );
-                            resp.extensions_mut().insert(crate::timeline::PhpTimings {
-                                queue_wait: Some(php_start.elapsed()),
-                                execute: None,
-                            });
-                            return resp;
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // `wait` (default) queues behind a full dispatch queue; `shed` refuses
         // to, after an optional `shed_after` grace, so overload becomes a fast
@@ -5072,7 +5145,20 @@ impl Router {
         // request that times out while still queued is not mistaken for a
         // hung thread (see `php_wait`).
         let started = crate::php_wait::StartFlag::default();
-        let task = crate::php_wait::track_start(Box::new(run_php), &started);
+        // Charge the per-site permit to the PHP THREAD, not this future: park it
+        // with `hold_until_finished` at the top of the job so it is released only
+        // after the request's teardown, on every exit path (normal, contained
+        // crash, `_exit(137)`, panic). While the job is still QUEUED the permit
+        // rides this closure, so a drain or cancel that drops the job unqueued
+        // releases the tenant's slot too. `site_permit` is `None` outside
+        // multi-tenant per-request mode, where this is a no-op.
+        let task_fn = move || {
+            if let Some(permit) = site_permit {
+                crate::fpm_pool::hold_until_finished(permit);
+            }
+            run_php()
+        };
+        let task = crate::php_wait::track_start(Box::new(task_fn), &started);
         let recv = match self.overload_policy {
             ephpm_config::OverloadPolicy::Wait => {
                 pool.dispatch(task).await.map_err(ShedReason::from)
@@ -8797,6 +8883,55 @@ mod tests {
         };
         let limiter = Some(Arc::new(crate::rate_limit::Limiter::new(limits)));
         Router::new(&config, test_store(), None, None, limiter, None, None)
+    }
+
+    /// The per-site concurrency gate (F-DoS-1) is built only in multi-tenant
+    /// per-request mode — it needs the per-request pool to gate and distinct
+    /// tenants to be fair between. It is `None` for single-site and for worker
+    /// mode (where `fpm_pool` is `None`). Review finding P6.
+    #[test]
+    fn site_admission_is_enabled_only_in_multi_tenant_per_request_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Multi-site, per-request (default): the gate is active, sized to the pool.
+        let multi =
+            per_site_router(tmp.path(), &["a", "b"], ephpm_config::ResolvedLimits::default());
+        let gate =
+            multi.site_admission.as_ref().expect("multi-tenant per-request enables the gate");
+        assert_eq!(gate.pool_size(), 2, "gate capacity is the pool size");
+        // pool 2 / 2 vhosts = 1, floored at PER_SITE_MAX_FLOOR (2).
+        assert_eq!(gate.default_max(), 2, "default ceiling divides the pool, floored at 2");
+
+        // Single-site: no tenants to be fair between → no gate.
+        let single = preview_router(tmp.path(), None);
+        assert!(single.site_admission.is_none(), "single-site must not enable the gate");
+
+        // Worker mode, multi-site: fpm_pool is None, so the gate is off too.
+        let wsites = tmp.path().join("wsites");
+        fs::create_dir_all(wsites.join("a")).unwrap();
+        fs::write(wsites.join("a").join("index.php"), "<?php echo 'hi';").unwrap();
+        let wconfig = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: tmp.path().to_path_buf(),
+                sites_dir: Some(wsites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig {
+                concurrency: 2,
+                mode: ephpm_config::PhpMode::Worker,
+                ..PhpConfig::default()
+            },
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+            cron: ephpm_config::CronConfig::default(),
+            source_path: None,
+        };
+        let worker = Router::new(&wconfig, test_store(), None, None, None, None, None);
+        assert!(worker.site_admission.is_none(), "worker mode must not enable the gate");
     }
 
     fn get_with_host(uri: &str, host: &str) -> Request<Empty<Bytes>> {

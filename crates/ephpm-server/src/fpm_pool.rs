@@ -434,6 +434,23 @@ impl FpmPool {
         self.state.live.load(Ordering::Acquire)
     }
 
+    /// Number of threads currently able to serve a request: the configured size
+    /// minus the shortfall once hung (abandoned-but-not-replaced) threads exceed
+    /// the replacement cap.
+    ///
+    /// Hung threads are replaced up to `thread_count` outstanding
+    /// ([`FpmPool::note_hung`]), so while `hung <= thread_count` the pool still
+    /// has `thread_count` serving threads; beyond the cap each further hung thread
+    /// is one fewer serving thread. The per-site admission gate
+    /// ([`crate::site_admission`]) reads this, not the static size, so it never
+    /// admits a *borrow* into serving capacity a hung-thread storm has already
+    /// consumed (finding F-DoS-1).
+    #[must_use]
+    pub fn serving_threads(&self) -> usize {
+        let hung = self.state.hung.load(Ordering::Acquire);
+        self.thread_count.saturating_sub(hung.saturating_sub(self.thread_count))
+    }
+
     /// Current overflow-queue depth (jobs waiting for a busy thread; a job
     /// handed straight to an idle thread never counts). Test-only.
     #[cfg(test)]
