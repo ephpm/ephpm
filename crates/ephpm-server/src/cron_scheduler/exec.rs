@@ -258,6 +258,27 @@ impl JobExecutor for ChildExecutor {
 /// per-site lane (finding F1).
 ///
 /// stdout/stderr are inherited so a job's output reaches the server's logs.
+///
+/// **File-descriptor hygiene (tenant isolation).** The child is a fresh
+/// `execve` (`Command::spawn` → execve, never a bare `fork`), so every file
+/// descriptor the server holds marked close-on-exec (`O_CLOEXEC`/`FD_CLOEXEC`)
+/// is closed before the child's `main` runs. The child therefore inherits only
+/// stdin (`/dev/null`), stdout and stderr — *not* the server's open database
+/// files, wire/HTTP/KV listener sockets, or cluster-channel sockets. This
+/// matters because a per-site PHP cron child could otherwise `php://fd/N` onto a
+/// server-held descriptor (another tenant's DB file, a listening socket) —
+/// `open_basedir` does not gate the `php://fd/` wrapper.
+///
+/// The guarantee rests on every such descriptor being `O_CLOEXEC`, which holds
+/// by construction: Rust's `std::fs`/`std::net` and the `socket2`/`mio` sockets
+/// under tokio all set `O_CLOEXEC`/`SOCK_CLOEXEC` unconditionally, the embedded
+/// Turso engine opens its DB/WAL files through `std::fs::OpenOptions` (also
+/// `O_CLOEXEC`), and ePHPm's own raw opens pass `O_CLOEXEC` explicitly. We do
+/// **not** rely on an fd-clearing `pre_exec` hook (which would be `unsafe` and
+/// must be async-signal-safe); CLOEXEC is the portable, race-free mechanism and
+/// is verified by `run_child_does_not_leak_cloexec_fds` below. A new long-lived
+/// server fd must likewise be CLOEXEC — the default for the APIs above, so this
+/// is a note, not a step.
 pub async fn run_child(
     program: &std::path::Path,
     args: &[String],
@@ -706,5 +727,41 @@ mod tests {
         )
         .await;
         assert_eq!(out, RunOutcome::SpawnError);
+    }
+
+    /// Tenant-isolation guarantee: a cron child does not inherit the server's
+    /// close-on-exec file descriptors. We stand in for "any server fd" with a
+    /// plain `std::fs::File` — which, like every DB file, listener socket, and
+    /// cluster socket the server holds, is opened `O_CLOEXEC` — and assert the
+    /// child spawned by `run_child` cannot see it. (`/dev/fd/N` is `/proc/self/fd`
+    /// on Linux; `test ! -e` exits 0 when the fd is absent in the child.) If a
+    /// regression ever cleared CLOEXEC or added an fd-passing `pre_exec`, the
+    /// child would see the fd, exit 1, and this test would report `Failed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_child_does_not_leak_cloexec_fds() {
+        use std::os::fd::AsRawFd as _;
+
+        // A representative server fd: a std File is always O_CLOEXEC. Held open
+        // for the whole test so its number cannot be reused by tokio/std.
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = f.as_raw_fd();
+        assert!(fd >= 3, "a fresh fd is past stdio: {fd}");
+
+        let cancel = CancellationToken::new();
+        let script = format!("test ! -e /dev/fd/{fd}");
+        let out = run_child(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), script],
+            None,
+            &[],
+            None,
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await;
+        // Ok ⇒ the child did NOT inherit the CLOEXEC fd (test exited 0).
+        assert_eq!(out, RunOutcome::Ok, "cron child inherited a close-on-exec server fd");
+        drop(f);
     }
 }
