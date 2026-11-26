@@ -451,6 +451,15 @@ static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback
     __u32 flags = policy_flags();
     __u32 dport = bpf_ntohs(ctx->user_port);
 
+    // DNS-over-TCP (destination port 53) is never fenced — the resolver fallback
+    // for truncated/DNSSEC answers goes to the nameserver over TCP, and the
+    // resolver may be loopback (127.0.0.53) or RFC-1918 (k8s CoreDNS 10.x) which
+    // the tiers below would EPERM, causing sporadic resolution failures. A DNS
+    // server is not an IMDS/control-plane/credential target, so allowing TCP-53
+    // egress loses nothing security-relevant (same rationale as unfenced UDP).
+    if (dport == 53)
+        return 1;
+
     if (is_loopback) {
         // 1) Sidecar virtual-port rewrite (ebpf_policy only).
         if (flags & POL_SIDECAR) {

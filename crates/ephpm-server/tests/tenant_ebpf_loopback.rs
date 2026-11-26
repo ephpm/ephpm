@@ -292,6 +292,21 @@ fn egress_fence_denies_imds_loopback_and_rfc1918() {
         "UDP connect to the DNS address must NOT be fenced (SOCK_STREAM gate)"
     );
 
+    // RESIDUAL-1: DNS-over-TCP (destination port 53) is NOT fenced, even to a
+    // loopback resolver the floor would otherwise deny. Nothing listens on
+    // 127.0.0.53:53/tcp here, so expect connection-refused — never EPERM.
+    let dns_tcp = probe(SocketAddr::from((Ipv4Addr::new(127, 0, 0, 53), 53)));
+    assert!(
+        !is_denied(&dns_tcp),
+        "DNS-over-TCP (127.0.0.53:53) must NOT be EPERM'd, got {dns_tcp:?}"
+    );
+    // And TCP-53 to an RFC-1918 resolver (k8s CoreDNS shape) is likewise allowed.
+    let dns_tcp_rfc = probe(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 53), 53)));
+    assert!(
+        !is_denied(&dns_tcp_rfc),
+        "TCP-53 to 10.0.0.53 must NOT be EPERM'd, got {dns_tcp_rfc:?}"
+    );
+
     // --- Invariants the fence must NOT break ---
 
     // ePHPm's own infra port stays reachable and serves its marker.

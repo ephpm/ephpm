@@ -1359,11 +1359,17 @@ async fn bind_listeners(
     // overlap failure aborts startup; with unix_socket_policy = "required" a
     // fence failure does too — ePHPm must never come up with a policy the
     // operator asked for silently absent (docs-must-match-code).
-    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> = start_tenant_ebpf(
+    // Loopback service ports a tagged tenant is meant to reach — every bound
+    // SQL wire listener + the KV RESP listener — so the egress fence's loopback
+    // floor exempts exactly them (F-SSRF-1 review F-NEW-1). Computed here, where
+    // the per-site wire listener and the cluster state are both known.
+    let infra_ports = tenant_infra_ports(
         config,
+        config.cluster.enabled,
         per_site_db_wire.as_ref().map(|(_, listen)| listen.as_str()),
-        dev_mode,
-    )?;
+    );
+    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> =
+        start_tenant_ebpf(config, &infra_ports, dev_mode)?;
 
     // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
     // request that created it and keeps dispatching PHP events through this
@@ -2763,6 +2769,74 @@ fn db_listen_exposure(addr: &str) -> Option<&'static str> {
 /// port is a configuration error, and the previous behavior (log, continue,
 /// leave the port dead) is precisely the failure mode this function is being
 /// fixed for.
+/// Every loopback service port a *tagged tenant thread* is legitimately meant
+/// to reach — ePHPm's own SQL wire listeners and the KV RESP listener — so the
+/// TCP egress fence's loopback floor ([`start_tenant_ebpf`]) exempts exactly
+/// them. Mirrors the listeners [`start_db_proxies`] actually binds for this
+/// config (plus the per-site stock-`pdo_mysql` listener passed in and the KV
+/// RESP port), computed from config because the fence is loaded before the
+/// proxies bind.
+///
+/// This is the F-SSRF-1 review fix for F-NEW-1: a `sites_dir` node with a
+/// **shared** SQL listener (`[db.mysql]`, `[db.postgres]`, or single-node /
+/// whole-database clustered `[db.sqlite]`) must keep its tenant DB path
+/// (`pdo_mysql` to `127.0.0.1:3306`) working under `tcp_egress_policy = "auto"`.
+/// The security consequence is nil: those are the tenant's intended DB path,
+/// and a shared listener already warns about the isolation trade (see
+/// `shared_db_wire_present`).
+fn tenant_infra_ports(
+    config: &Config,
+    cluster_enabled: bool,
+    per_site_db_wire_listen: Option<&str>,
+) -> Vec<u16> {
+    fn port_of(addr: &str) -> Option<u16> {
+        addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
+    }
+
+    // Every loopback address `start_db_proxies` (and the per-site/KV wiring)
+    // actually binds for this config.
+    let mut addrs: Vec<&str> = Vec::new();
+    // [db.mysql] proxy (default 127.0.0.1:3306).
+    if let Some(mysql) = &config.db.mysql {
+        addrs.push(mysql.listen.as_deref().unwrap_or("127.0.0.1:3306"));
+    }
+    // [db.postgres] proxy (default 127.0.0.1:5432).
+    if let Some(pg) = &config.db.postgres {
+        addrs.push(pg.listen.as_deref().unwrap_or("127.0.0.1:5432"));
+    }
+    // Shared [db.sqlite] proxy (single-node or whole-database clustered): the
+    // mysql_listen always, plus each optional frontend that is set. Per-site
+    // modes bind no shared listener (covered by `per_site_db_wire_listen`).
+    if let Some(sqlite) = &config.db.sqlite
+        && !is_per_site_sqlite(config, cluster_enabled)
+        && !is_per_site_clustered(config, cluster_enabled)
+    {
+        addrs.push(&sqlite.proxy.mysql_listen);
+        if let Some(a) = &sqlite.proxy.hrana_listen {
+            addrs.push(a);
+        }
+        if let Some(a) = &sqlite.proxy.postgres_listen {
+            addrs.push(a);
+        }
+        if let Some(a) = &sqlite.proxy.tds_listen {
+            addrs.push(a);
+        }
+    }
+    // Per-site stock pdo_mysql wire listener (per-site single / clustered).
+    if let Some(a) = per_site_db_wire_listen {
+        addrs.push(a);
+    }
+    // KV RESP listener.
+    if config.kv.redis_compat.enabled {
+        addrs.push(&config.kv.redis_compat.listen);
+    }
+
+    let mut ports: Vec<u16> = addrs.iter().filter_map(|a| port_of(a)).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
@@ -3066,15 +3140,17 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
 ///   ERROR and startup continues with tenant unix connects **unfenced** (the
 ///   TCP policy, if on, still applies).
 ///
-/// `per_site_db_wire_listen` is the stock-`pdo_mysql` listener address in
-/// per-site mode (an infra port every tagged vhost may reach).
+/// `infra_ports` are ePHPm's own loopback service ports a tagged tenant is
+/// meant to reach (every bound SQL wire listener + the KV RESP listener),
+/// computed by [`tenant_infra_ports`] from the config so the egress fence's
+/// loopback floor exempts exactly them.
 ///
 /// When an operator **explicitly** sets the fence `"off"` on a node where the
 /// secure default would otherwise fence, logs one WARN naming the exposure
 /// (audit finding F2), so the opt-out never passes silently.
 fn start_tenant_ebpf(
     config: &Config,
-    per_site_db_wire_listen: Option<&str>,
+    infra_ports: &[u16],
     dev_mode: bool,
 ) -> anyhow::Result<Option<Arc<tenant_ebpf::TenantEbpf>>> {
     use ephpm_config::{TcpEgressPolicy, UnixSocketPolicy};
@@ -3164,22 +3240,6 @@ fn start_tenant_ebpf(
         return Ok(None);
     }
 
-    let port_of = |addr: &str| -> Option<u16> {
-        addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
-    };
-    // ePHPm's own loopback infra ports every tagged vhost may reach: the stock
-    // pdo_mysql wire listener and the KV RESP listener. Consulted by the TCP
-    // policy only, but harmless to populate regardless.
-    let mut infra_ports: Vec<u16> = Vec::new();
-    if let Some(p) = per_site_db_wire_listen.and_then(port_of) {
-        infra_ports.push(p);
-    }
-    if config.kv.redis_compat.enabled
-        && let Some(p) = port_of(&config.kv.redis_compat.listen)
-    {
-        infra_ports.push(p);
-    }
-
     let range = if opts.tcp_policy {
         let range = tn.parse_range().map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
         // The sidecar range must not overlap the kernel ephemeral range, or an
@@ -3243,7 +3303,7 @@ fn start_tenant_ebpf(
         || unix_policy == UnixSocketPolicy::Required;
 
     let loaded =
-        tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
+        tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), infra_ports, &opts)
             .context(
                 "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
              tcp_egress_policy / unix_socket_policy). Requires Linux >= 5.10 with \
@@ -4639,6 +4699,61 @@ mod lib_tests {
         ));
         // No database → nothing to gate.
         assert!(!shared_db_wire_present(&cfg_from(""), false));
+    }
+
+    // ── F-SSRF-1 review F-NEW-1: every bound SQL listener is an infra port ──
+
+    #[test]
+    fn infra_ports_cover_every_bound_sql_listener() {
+        // [db.mysql] proxy on the default 3306 — the signature regression: a
+        // sites_dir + [db.mysql] node must keep pdo_mysql to 127.0.0.1:3306.
+        let cfg = cfg_from(
+            "[server]\nsites_dir = \"/srv/sites\"\n[db.mysql]\nurl = \"mysql://u:p@db:3306/d\"\n",
+        );
+        assert!(
+            tenant_infra_ports(&cfg, false, None).contains(&3306),
+            "[db.mysql] listener 3306 must be an infra port"
+        );
+
+        // [db.mysql] with a custom listen port.
+        let cfg =
+            cfg_from("[db.mysql]\nurl = \"mysql://u:p@db:3306/d\"\nlisten = \"127.0.0.1:3310\"\n");
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&3310));
+
+        // [db.postgres] proxy on the default 5432 (shared_db_wire_present omits
+        // postgres, but the listener still binds — it must be an infra port).
+        let cfg = cfg_from("[db.postgres]\nurl = \"postgres://u:p@db:5432/d\"\n");
+        assert!(
+            tenant_infra_ports(&cfg, false, None).contains(&5432),
+            "[db.postgres] listener 5432 must be an infra port"
+        );
+
+        // Shared single-node [db.sqlite]: the proxy mysql_listen binds.
+        let cfg = cfg_from(
+            "[db.sqlite]\npath = \"app.db\"\n[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:3399\"\n",
+        );
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&3399));
+
+        // Whole-database clustered [db.sqlite] (cluster_enabled): still shared,
+        // proxy mysql_listen binds.
+        let cfg = cfg_from(
+            "[cluster]\nenabled = true\n[db.sqlite]\npath = \"app.db\"\n[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:3401\"\n",
+        );
+        assert!(
+            tenant_infra_ports(&cfg, true, None).contains(&3401),
+            "whole-DB clustered sqlite listener must be an infra port"
+        );
+
+        // Per-site [db.sqlite]: no SHARED listener binds; the per-site wire
+        // listener (passed in) is the infra port instead.
+        let cfg =
+            cfg_from("[server]\nsites_dir = \"/srv/sites\"\n[db.sqlite]\ndir = \"/srv/dbs\"\n");
+        let ports = tenant_infra_ports(&cfg, false, Some("127.0.0.1:3306"));
+        assert!(ports.contains(&3306), "per-site wire listener must be an infra port");
+
+        // KV RESP listener is always included when enabled.
+        let cfg = cfg_from("[kv.redis_compat]\nenabled = true\nlisten = \"127.0.0.1:6380\"\n");
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&6380));
     }
 
     #[test]

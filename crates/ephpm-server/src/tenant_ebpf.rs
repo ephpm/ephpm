@@ -950,6 +950,8 @@ pub struct ConnFacts {
     pub infra: bool,
     /// The per-site `tcp_egress_allow` matches this destination.
     pub allowed: bool,
+    /// The destination port (host order). Port 53 — DNS-over-TCP — is exempt.
+    pub dport: u16,
     /// The IPv4 destination (for `connect6`, the embedded v4 of a v4-mapped
     /// address).
     pub dst: std::net::Ipv4Addr,
@@ -966,6 +968,11 @@ pub struct ConnFacts {
 pub fn egress_verdict_model(flags: PolicyFlags, c: ConnFacts) -> EgressVerdict {
     // TCP-only fence: UDP (DNS, QUIC, ...) is never touched.
     if !c.is_tcp {
+        return EgressVerdict::Allow;
+    }
+    // DNS-over-TCP (port 53) is never fenced — a resolver is not an
+    // IMDS/control-plane/credential target.
+    if c.dport == 53 {
         return EgressVerdict::Allow;
     }
     let PolicyFlags { sidecar, egress, deny_rfc1918 } = flags;
@@ -1008,10 +1015,14 @@ pub fn egress_verdict6_model(
     flags: PolicyFlags,
     is_tcp: bool,
     is_loopback: bool,
+    dport: u16,
     dst: std::net::Ipv6Addr,
 ) -> EgressVerdict {
     if !is_tcp {
         return EgressVerdict::Allow;
+    }
+    if dport == 53 {
+        return EgressVerdict::Allow; // DNS-over-TCP
     }
     if is_loopback {
         // `::` and `::1`; the loopback floor applies under either policy.
@@ -1100,11 +1111,18 @@ mod tests {
     /// Egress fence on, sidecar off — the F-SSRF-1 secure default.
     const FENCE: PolicyFlags = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true };
 
-    /// A TCP connect to `dst`, using the real loopback classifier, with the
-    /// given `infra`/`allowed` flags.
+    /// A TCP connect to `dst` on a non-DNS port (9999), using the real loopback
+    /// classifier, with the given `infra`/`allowed` flags.
     fn tcp(dst: &str, infra: bool, allowed: bool) -> ConnFacts {
         let ip: Ipv4Addr = dst.parse().unwrap();
-        ConnFacts { is_tcp: true, is_loopback: classify_loopback4(ip), infra, allowed, dst: ip }
+        ConnFacts {
+            is_tcp: true,
+            is_loopback: classify_loopback4(ip),
+            infra,
+            allowed,
+            dport: 9999,
+            dst: ip,
+        }
     }
 
     #[test]
@@ -1152,10 +1170,39 @@ mod tests {
                 is_loopback: classify_loopback4(ip),
                 infra: false,
                 allowed: false,
+                dport: 53,
                 dst: ip,
             };
             assert_eq!(egress_verdict_model(FENCE, udp), EgressVerdict::Allow, "UDP {dst}");
         }
+    }
+
+    /// RESIDUAL-1: DNS-over-TCP (destination port 53) is never fenced, even to a
+    /// loopback resolver (`127.0.0.53`) or an RFC-1918 one (k8s CoreDNS) that the
+    /// deny tiers would otherwise block.
+    #[test]
+    fn dns_over_tcp_is_never_fenced() {
+        for dst in ["127.0.0.53", "10.0.0.53", "169.254.169.253", "::ffff:127.0.0.53"] {
+            let ip: Ipv4Addr = match dst.parse::<std::net::Ipv6Addr>() {
+                Ok(v6) => v6.to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED),
+                Err(_) => dst.parse().unwrap(),
+            };
+            let dns = ConnFacts {
+                is_tcp: true,
+                is_loopback: classify_loopback4(ip),
+                infra: false,
+                allowed: false,
+                dport: 53,
+                dst: ip,
+            };
+            assert_eq!(egress_verdict_model(FENCE, dns), EgressVerdict::Allow, "TCP-53 {dst}");
+        }
+        // Native-v6 DNS-over-TCP to a ULA resolver is likewise allowed.
+        assert_eq!(
+            egress_verdict6_model(FENCE, true, false, 53, "fd12:3456::53".parse().unwrap()),
+            EgressVerdict::Allow,
+            "native v6 TCP-53"
+        );
     }
 
     /// Finding 2: `0.0.0.0` routes to loopback (the kernel rewrites it to
@@ -1194,7 +1241,7 @@ mod tests {
     #[test]
     fn ipv6_egress_ranges() {
         let v = |dst: &str, lp: bool| {
-            egress_verdict6_model(FENCE, true, lp, dst.parse::<Ipv6Addr>().unwrap())
+            egress_verdict6_model(FENCE, true, lp, 443, dst.parse::<Ipv6Addr>().unwrap())
         };
         // Link-local fe80::/10 and the AWS v6 IMDS fd00:ec2::254 are IMDS-class.
         assert_eq!(v("fe80::1", false), EgressVerdict::Deny(EgressDenyReason::Imds), "fe80::/10");
@@ -1220,19 +1267,19 @@ mod tests {
         );
         // UDP v6 and ULA with the RFC-1918 toggle off.
         assert_eq!(
-            egress_verdict6_model(FENCE, false, false, "fe80::1".parse().unwrap()),
+            egress_verdict6_model(FENCE, false, false, 443, "fe80::1".parse().unwrap()),
             EgressVerdict::Allow,
             "UDP v6 not fenced"
         );
         let no_rfc = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: false };
         assert_eq!(
-            egress_verdict6_model(no_rfc, true, false, "fd12:3456::1".parse().unwrap()),
+            egress_verdict6_model(no_rfc, true, false, 443, "fd12:3456::1".parse().unwrap()),
             EgressVerdict::Allow,
             "ULA allowed when RFC-1918 toggle off"
         );
         // But the AWS v6 IMDS is STILL denied with the RFC-1918 toggle off.
         assert_eq!(
-            egress_verdict6_model(no_rfc, true, false, "fd00:ec2::254".parse().unwrap()),
+            egress_verdict6_model(no_rfc, true, false, 443, "fd00:ec2::254".parse().unwrap()),
             EgressVerdict::Deny(EgressDenyReason::Imds),
             "v6 IMDS denied regardless of RFC-1918 toggle"
         );

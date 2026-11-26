@@ -371,7 +371,7 @@ gated separately):
 # "blog.example" = ["10.0.5.10:443"]
 ```
 
-### UDP is not fenced
+### UDP, DNS-over-TCP, and SCTP are not fenced
 
 The fence is **TCP-only** (`tcp_egress_policy`). A UDP connect is never touched —
 not denied, not rewritten. This is deliberate and load-bearing: glibc's resolver
@@ -382,6 +382,19 @@ UDP-fencing egress policy would break all tenant DNS. Everything the fence
 protects (IMDS, the loopback control plane, cluster peers) is TCP, so nothing
 security-relevant is lost. QUIC (HTTP/3 over UDP) to a blocked range is likewise
 not caught; use the host firewall if you must constrain UDP.
+
+**TCP destination port 53 is also exempt.** The resolver falls back to
+DNS-over-TCP for truncated or DNSSEC answers, and that goes to the nameserver —
+often loopback (`127.0.0.53`) or an RFC-1918 CoreDNS — which the tiers would
+otherwise `EPERM`, causing *intermittent* resolution failures that are miserable
+to diagnose. A DNS server is not an IMDS/control-plane/credential target, so
+allowing TCP-53 egress loses nothing security-relevant (same rationale as UDP).
+
+**SCTP is not hooked.** The `cgroup/connect4+6` programs see TCP and UDP; an
+SCTP `connect` is not intercepted. This is not a reachable bypass — IMDS, the
+loopback control plane and the cluster peers are all TCP services with no SCTP
+listener — but if you run an SCTP service on a blocked range, constrain it at the
+host firewall.
 
 ### Caveats
 
@@ -404,6 +417,11 @@ not caught; use the host firewall if you must constrain UDP.
   resolving `metadata.google.internal` still hits the fence at the *resolved*
   `169.254.169.254`, so DNS tricks do not bypass it — but an allowlist entry must
   be the IP/CIDR, not a name.
+- **`[::1]:port` cannot be allowlisted.** The per-site allowlist is keyed on the
+  IPv4 destination (for `connect6`, the embedded v4 of a v4-mapped address), so a
+  **native-IPv6 loopback** target has no allowlist key and stays denied by the
+  floor. A tenant whose own loopback service must be reachable should connect to
+  it over `127.0.0.1` (which *can* be allowlisted), or over `::ffff:127.0.0.1`.
 
 ## Known limitation
 
@@ -417,3 +435,13 @@ real port (the assignment is idempotent), so a restarting sidecar does not
 consume a second slot. An app that opens *many different* sidecar ports over one
 process lifetime can reach its `max_sidecar_ports_per_vhost` cap until ePHPm is
 restarted. For the typical one-stable-sidecar-per-app model this is a non-issue.
+
+**Behavior change for `ebpf_policy` sidecar users: UDP sidecars are no longer
+connect-rewritten.** The TCP-only gate that the egress fence added sits ahead of
+the sidecar logic in `connect4/6`, so a tagged tenant's **UDP** connect is now
+passed through untouched. `bind4/6` still rewrites a UDP bind to a private real
+port, but the matching UDP *connect* is no longer rewritten to it — so a
+loopback **UDP** sidecar reached by its virtual port will not resolve to its real
+port. TCP sidecars (the only kind the feature was built and tested for) are
+unaffected. If you relied on UDP sidecar rewriting, pin the sidecar to its real
+port directly, or keep it on TCP.
