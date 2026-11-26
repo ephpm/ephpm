@@ -305,6 +305,30 @@ mod imp {
             let cgroup = std::fs::File::open(&cg_path)
                 .with_context(|| format!("opening cgroup {cg_path} for BPF attach"))?;
 
+            // Runtime policy flags the connect programs read (which branches
+            // run). Written BEFORE attach: the programs must never observe the
+            // zero-initialised default, which clears POL_EGRESS and so would
+            // fail OPEN (allow-all non-loopback) for the window between attach
+            // and this write. Written once; never changes after load.
+            {
+                let mut flags = 0u32;
+                if opts.tcp_policy {
+                    flags |= POL_SIDECAR;
+                }
+                if opts.tcp_egress {
+                    flags |= POL_EGRESS;
+                    if opts.deny_rfc1918 {
+                        flags |= POL_DENY_RFC1918;
+                    }
+                }
+                let mut policy: Array<_, u32> = bpf
+                    .map_mut("policy")
+                    .ok_or_else(|| anyhow!("policy map missing"))?
+                    .try_into()
+                    .context("policy map is not an ARRAY")?;
+                policy.set(0, flags, 0).context("writing policy flags")?;
+            }
+
             // sockaddr programs. `bind4/6` (sidecar port-rewrite) attach only
             // for the sidecar feature; `connect4/6` attach for EITHER the
             // sidecar feature or the egress fence, which share them. Attaching
@@ -326,27 +350,6 @@ mod imp {
                 prog.load().with_context(|| format!("verifier rejected {name}"))?;
                 prog.attach(&cgroup, CgroupAttachMode::Single)
                     .with_context(|| format!("attaching {name} to {cg_path}"))?;
-            }
-
-            // Runtime policy flags the connect programs read (which branches
-            // run). Written once; never changes after load.
-            {
-                let mut flags = 0u32;
-                if opts.tcp_policy {
-                    flags |= POL_SIDECAR;
-                }
-                if opts.tcp_egress {
-                    flags |= POL_EGRESS;
-                    if opts.deny_rfc1918 {
-                        flags |= POL_DENY_RFC1918;
-                    }
-                }
-                let mut policy: Array<_, u32> = bpf
-                    .map_mut("policy")
-                    .ok_or_else(|| anyhow!("policy map missing"))?
-                    .try_into()
-                    .context("policy map is not an ARRAY")?;
-                policy.set(0, flags, 0).context("writing policy flags")?;
             }
 
             // Write nscfg[0] = {dev, ino} of /proc/self/ns/pid so the kernel can
@@ -524,8 +527,10 @@ mod imp {
         /// F-SSRF-1). A CIDR/bare-IP entry goes into the `egress_cidr` LPM trie
         /// (any port); an `ip:port` entry into the `egress_hostport` exact map.
         /// The site's vhost id is allocated now so the id the connect program
-        /// sees at request time is the same one. An allowlist hit overrides
-        /// every deny category, including IMDS.
+        /// sees at request time is the same one. An allowlist hit overrides the
+        /// loopback-floor and RFC-1918 denies, but **not** IMDS
+        /// (`169.254.0.0/16`), which the connect program checks first and is
+        /// un-allowlistable.
         ///
         /// # Errors
         ///
@@ -931,32 +936,45 @@ pub struct PolicyFlags {
     pub deny_rfc1918: bool,
 }
 
+/// Per-connection facts the v4 connect verdict depends on (mirrors the inputs
+/// `do_connect` reads in `bpf/vhostnet.bpf.c`). Bundled into a struct so the
+/// model's signature stays under the bool-parameter lint.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnFacts {
+    /// `ctx->type == SOCK_STREAM`. UDP (and anything non-TCP) is not fenced.
+    pub is_tcp: bool,
+    /// The destination classified as loopback (`is_loopback4_be`, incl. the
+    /// all-zero address `0.0.0.0`).
+    pub is_loopback: bool,
+    /// The destination port is one of ePHPm's own infra ports.
+    pub infra: bool,
+    /// The per-site `tcp_egress_allow` matches this destination.
+    pub allowed: bool,
+    /// The IPv4 destination (for `connect6`, the embedded v4 of a v4-mapped
+    /// address).
+    pub dst: std::net::Ipv4Addr,
+}
+
 /// **Pure-Rust mirror of the egress decision in `bpf/vhostnet.bpf.c`
-/// `do_connect`** for an IPv4 destination of a *tagged* tenant thread, covering
-/// the branches the TCP egress fence governs (the sidecar virtual-port rewrite
-/// and ownership branches are omitted — they only reorder ALLOW outcomes). This
-/// is the unit-tested model; the live BPF is exercised by the `#[ignore]`
-/// attach test. **KEEP IN SYNC with the C** — the two must agree branch for
-/// branch.
-///
-/// `flags` are the `POL_*` flags, `is_loopback` is the loopback classification,
-/// `infra` is true for an ePHPm infra port, `allowed` is true when the per-site
-/// allowlist matches, and `dst` is the IPv4 destination.
+/// `do_connect`** for an IPv4 (or v4-mapped-IPv6) destination of a *tagged*
+/// tenant thread, covering the branches the TCP egress fence governs (the
+/// sidecar virtual-port rewrite and ownership branches are omitted — they only
+/// reorder ALLOW outcomes). This is the unit-tested model; the live BPF is
+/// exercised by the `#[ignore]` attach test. **KEEP IN SYNC with the C** — the
+/// two must agree branch for branch.
 #[must_use]
-pub fn egress_verdict_model(
-    flags: PolicyFlags,
-    is_loopback: bool,
-    infra: bool,
-    allowed: bool,
-    dst: std::net::Ipv4Addr,
-) -> EgressVerdict {
+pub fn egress_verdict_model(flags: PolicyFlags, c: ConnFacts) -> EgressVerdict {
+    // TCP-only fence: UDP (DNS, QUIC, ...) is never touched.
+    if !c.is_tcp {
+        return EgressVerdict::Allow;
+    }
     let PolicyFlags { sidecar, egress, deny_rfc1918 } = flags;
-    if is_loopback {
+    if c.is_loopback {
         // (sidecar virtual-port rewrite + ownership omitted — ALLOW reorderings)
-        if infra {
+        if c.infra {
             return EgressVerdict::Allow; // ePHPm infra port (mysql wire, KV RESP)
         }
-        if allowed {
+        if c.allowed {
             return EgressVerdict::Allow; // explicit per-site allowlist
         }
         if sidecar || egress {
@@ -970,16 +988,71 @@ pub fn egress_verdict_model(
     }
     // IMDS is checked FIRST and is UN-ALLOWLISTABLE — a per-site allow must not
     // re-open the instance-role-cred-theft path (owner decision).
-    if is_link_local(dst) {
+    if is_link_local(c.dst) {
         return EgressVerdict::Deny(EgressDenyReason::Imds); // 169.254.0.0/16, always
     }
-    if allowed {
+    if c.allowed {
         return EgressVerdict::Allow; // explicit allow overrides the denies below (not IMDS)
     }
-    if deny_rfc1918 && is_rfc1918(dst) {
+    if deny_rfc1918 && is_rfc1918(c.dst) {
         return EgressVerdict::Deny(EgressDenyReason::Rfc1918);
     }
     EgressVerdict::Allow // public egress
+}
+
+/// **Pure-Rust mirror of the NATIVE-IPv6 (non-v4-mapped) egress decision** in
+/// `connect6` / `egress_verdict6`. v6 is not allowlistable (the allowlist is
+/// IPv4 only). KEEP IN SYNC with the C.
+#[must_use]
+pub fn egress_verdict6_model(
+    flags: PolicyFlags,
+    is_tcp: bool,
+    is_loopback: bool,
+    dst: std::net::Ipv6Addr,
+) -> EgressVerdict {
+    if !is_tcp {
+        return EgressVerdict::Allow;
+    }
+    if is_loopback {
+        // `::` and `::1`; the loopback floor applies under either policy.
+        if flags.sidecar || flags.egress {
+            return EgressVerdict::Deny(EgressDenyReason::Loopback);
+        }
+        return EgressVerdict::Allow;
+    }
+    if !flags.egress {
+        return EgressVerdict::Allow;
+    }
+    // Link-local (fe80::/10) and the AWS v6 IMDS are metadata-class, always
+    // denied and un-allowlistable.
+    if is_link_local6(dst) || is_imds6(dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Imds);
+    }
+    if flags.deny_rfc1918 && is_ula6(dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Rfc1918);
+    }
+    EgressVerdict::Allow
+}
+
+/// `127.0.0.0/8` or the all-zero address — mirrors `is_loopback4_be` in the
+/// BPF. `0.0.0.0` is loopback because the kernel rewrites a connect to it into
+/// `127.0.0.1`.
+#[must_use]
+pub fn classify_loopback4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_unspecified() || ip.octets()[0] == 127
+}
+
+/// `::`, `::1`, or `::ffff:a.b.c.d` with a loopback embedded v4 — mirrors
+/// `is_loopback6` in the BPF.
+#[must_use]
+pub fn classify_loopback6(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip == std::net::Ipv6Addr::LOCALHOST {
+        return true;
+    }
+    match ip.to_ipv4_mapped() {
+        Some(v4) => classify_loopback4(v4),
+        None => false,
+    }
 }
 
 /// `169.254.0.0/16` — mirrors `is_linklocal4_be` in the BPF.
@@ -996,131 +1069,226 @@ fn is_rfc1918(ip: std::net::Ipv4Addr) -> bool {
     o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
 }
 
+/// `fe80::/10` link-local — mirrors `is_linklocal6` in the BPF.
+#[must_use]
+fn is_link_local6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] & 0xffc0) == 0xfe80
+}
+
+/// The AWS IPv6 IMDS address `fd00:ec2::254` — mirrors `is_imds6` in the BPF.
+#[must_use]
+fn is_imds6(ip: std::net::Ipv6Addr) -> bool {
+    ip.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+}
+
+/// `fc00::/7` unique-local (the IPv6 analogue of RFC-1918) — mirrors `is_ula6`.
+#[must_use]
+fn is_ula6(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use super::{EgressDenyReason, EgressVerdict, PolicyFlags, egress_verdict_model};
+    use super::{
+        ConnFacts, EgressDenyReason, EgressVerdict, PolicyFlags, classify_loopback4,
+        classify_loopback6, egress_verdict_model, egress_verdict6_model,
+    };
 
-    /// The egress fence active, sidecar off — the F-SSRF-1 secure default. The
-    /// signature cases the task calls out.
+    /// Egress fence on, sidecar off — the F-SSRF-1 secure default.
+    const FENCE: PolicyFlags = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true };
+
+    /// A TCP connect to `dst`, using the real loopback classifier, with the
+    /// given `infra`/`allowed` flags.
+    fn tcp(dst: &str, infra: bool, allowed: bool) -> ConnFacts {
+        let ip: Ipv4Addr = dst.parse().unwrap();
+        ConnFacts { is_tcp: true, is_loopback: classify_loopback4(ip), infra, allowed, dst: ip }
+    }
+
     #[test]
     fn egress_fence_default_decisions() {
-        // Helper: egress on, RFC-1918 denied, no allowlist match, not infra.
-        let v = |is_loopback: bool, infra: bool, allowed: bool, dst: &str| {
-            egress_verdict_model(
-                PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true },
-                is_loopback,
-                infra,
-                allowed,
-                dst.parse::<Ipv4Addr>().unwrap(),
-            )
+        let v = |dst: &str, infra: bool, allowed: bool| {
+            egress_verdict_model(FENCE, tcp(dst, infra, allowed))
         };
 
-        // IMDS is always denied.
-        assert_eq!(
-            v(false, false, false, "169.254.169.254"),
-            EgressVerdict::Deny(EgressDenyReason::Imds)
-        );
+        // IMDS always denied.
+        assert_eq!(v("169.254.169.254", false, false), EgressVerdict::Deny(EgressDenyReason::Imds));
 
-        // Loopback: an ePHPm infra port (e.g. 127.0.0.1:3306 marked infra) is
-        // allowed; a non-infra loopback port (e.g. 127.0.0.1:9999) is denied.
-        assert_eq!(v(true, true, false, "127.0.0.1"), EgressVerdict::Allow, "infra port allowed");
+        // Loopback: infra port allowed; any other loopback port denied.
+        assert_eq!(v("127.0.0.1", true, false), EgressVerdict::Allow, "infra port allowed");
         assert_eq!(
-            v(true, false, false, "127.0.0.1"),
+            v("127.0.0.1", false, false),
             EgressVerdict::Deny(EgressDenyReason::Loopback),
-            "non-infra loopback denied"
+            "non-infra 127.0.0.1:9999 denied"
         );
 
         // RFC-1918 denied by default.
-        assert_eq!(
-            v(false, false, false, "10.0.0.5"),
-            EgressVerdict::Deny(EgressDenyReason::Rfc1918)
-        );
-        assert_eq!(
-            v(false, false, false, "172.16.3.4"),
-            EgressVerdict::Deny(EgressDenyReason::Rfc1918)
-        );
-        assert_eq!(
-            v(false, false, false, "192.168.1.1"),
-            EgressVerdict::Deny(EgressDenyReason::Rfc1918)
-        );
+        for dst in ["10.0.0.5", "172.16.3.4", "192.168.1.1"] {
+            assert_eq!(
+                v(dst, false, false),
+                EgressVerdict::Deny(EgressDenyReason::Rfc1918),
+                "{dst}"
+            );
+        }
         // 172.15/172.32 are NOT in 172.16/12.
-        assert_eq!(v(false, false, false, "172.15.0.1"), EgressVerdict::Allow);
-        assert_eq!(v(false, false, false, "172.32.0.1"), EgressVerdict::Allow);
+        assert_eq!(v("172.15.0.1", false, false), EgressVerdict::Allow);
+        assert_eq!(v("172.32.0.1", false, false), EgressVerdict::Allow);
 
         // Public egress stays allowed.
-        assert_eq!(v(false, false, false, "1.1.1.1"), EgressVerdict::Allow);
-        assert_eq!(v(false, false, false, "8.8.8.8"), EgressVerdict::Allow);
+        assert_eq!(v("1.1.1.1", false, false), EgressVerdict::Allow);
+        assert_eq!(v("8.8.8.8", false, false), EgressVerdict::Allow);
+    }
+
+    /// Finding 1: the fence is TCP-only — a UDP (non-TCP) connect is never
+    /// fenced, even to IMDS / loopback / RFC-1918 (so DNS keeps working).
+    #[test]
+    fn udp_is_never_fenced() {
+        for dst in ["169.254.169.254", "127.0.0.53", "10.0.0.53", "127.0.0.11"] {
+            let ip: Ipv4Addr = dst.parse().unwrap();
+            let udp = ConnFacts {
+                is_tcp: false,
+                is_loopback: classify_loopback4(ip),
+                infra: false,
+                allowed: false,
+                dst: ip,
+            };
+            assert_eq!(egress_verdict_model(FENCE, udp), EgressVerdict::Allow, "UDP {dst}");
+        }
+    }
+
+    /// Finding 2: `0.0.0.0` routes to loopback (the kernel rewrites it to
+    /// 127.0.0.1), so it must classify as loopback and hit the floor — not slip
+    /// through the non-loopback allow branch onto a control-plane port.
+    #[test]
+    fn zero_address_is_loopback() {
+        assert!(classify_loopback4("0.0.0.0".parse().unwrap()), "0.0.0.0 is loopback");
+        assert!(classify_loopback4("127.0.0.1".parse().unwrap()));
+        assert!(classify_loopback4("127.1.2.3".parse().unwrap()));
+        assert!(
+            !classify_loopback4("0.0.0.5".parse().unwrap()),
+            "0.0.0.5 does NOT route to loopback"
+        );
+        assert!(!classify_loopback4("1.1.1.1".parse().unwrap()));
+        // A connect to 0.0.0.0:<control-plane port> is denied by the floor.
+        assert_eq!(
+            egress_verdict_model(FENCE, tcp("0.0.0.0", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+            "0.0.0.0 must be floored, not allowed"
+        );
+
+        // v6: `::` and `::ffff:0.0.0.0` are loopback; `::ffff:1.1.1.1` is not.
+        assert!(classify_loopback6("::".parse().unwrap()), ":: is loopback");
+        assert!(classify_loopback6("::1".parse().unwrap()));
+        assert!(classify_loopback6("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(
+            classify_loopback6("::ffff:0.0.0.0".parse().unwrap()),
+            "::ffff:0.0.0.0 is loopback"
+        );
+        assert!(!classify_loopback6("::ffff:1.1.1.1".parse().unwrap()));
+        assert!(!classify_loopback6("2606:4700::1111".parse().unwrap()));
+    }
+
+    /// Finding 5: native-IPv6 metadata/link-local/ULA.
+    #[test]
+    fn ipv6_egress_ranges() {
+        let v = |dst: &str, lp: bool| {
+            egress_verdict6_model(FENCE, true, lp, dst.parse::<Ipv6Addr>().unwrap())
+        };
+        // Link-local fe80::/10 and the AWS v6 IMDS fd00:ec2::254 are IMDS-class.
+        assert_eq!(v("fe80::1", false), EgressVerdict::Deny(EgressDenyReason::Imds), "fe80::/10");
+        assert_eq!(
+            v("febf::1", false),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "fe80::/10 top"
+        );
+        assert_eq!(
+            v("fd00:ec2::254", false),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "aws v6 imds"
+        );
+        // Other ULA (fc00::/7) is RFC-1918-class (under the flag).
+        assert_eq!(v("fd12:3456::1", false), EgressVerdict::Deny(EgressDenyReason::Rfc1918), "ula");
+        assert_eq!(v("fc00::1", false), EgressVerdict::Deny(EgressDenyReason::Rfc1918));
+        // Public v6 allowed; v6 loopback floored.
+        assert_eq!(v("2606:4700::1111", false), EgressVerdict::Allow, "public v6");
+        assert_eq!(
+            v("::1", true),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+            "v6 loopback floor"
+        );
+        // UDP v6 and ULA with the RFC-1918 toggle off.
+        assert_eq!(
+            egress_verdict6_model(FENCE, false, false, "fe80::1".parse().unwrap()),
+            EgressVerdict::Allow,
+            "UDP v6 not fenced"
+        );
+        let no_rfc = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: false };
+        assert_eq!(
+            egress_verdict6_model(no_rfc, true, false, "fd12:3456::1".parse().unwrap()),
+            EgressVerdict::Allow,
+            "ULA allowed when RFC-1918 toggle off"
+        );
+        // But the AWS v6 IMDS is STILL denied with the RFC-1918 toggle off.
+        assert_eq!(
+            egress_verdict6_model(no_rfc, true, false, "fd00:ec2::254".parse().unwrap()),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "v6 IMDS denied regardless of RFC-1918 toggle"
+        );
     }
 
     /// An explicit allowlist hit overrides the loopback-floor and RFC-1918
-    /// denies — but **NOT IMDS**: `169.254.0.0/16` is un-allowlistable (owner
-    /// decision), so a per-site allow can never re-open the metadata path.
+    /// denies — but **NOT IMDS** (un-allowlistable, owner decision).
     #[test]
     fn allowlist_overrides_everything_except_imds() {
-        let flags = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true };
         // RFC-1918 and loopback: allowlist wins.
-        for dst in ["10.0.0.5", "127.0.0.1"] {
-            let ip = dst.parse::<Ipv4Addr>().unwrap();
-            assert_eq!(
-                egress_verdict_model(flags, dst == "127.0.0.1", false, true, ip),
-                EgressVerdict::Allow,
-                "allowlisted {dst} must be allowed"
-            );
-        }
-        // IMDS: allowlisting it is STILL denied (checked before the allowlist).
+        assert_eq!(egress_verdict_model(FENCE, tcp("10.0.0.5", false, true)), EgressVerdict::Allow);
         assert_eq!(
-            egress_verdict_model(flags, false, false, true, "169.254.169.254".parse().unwrap()),
+            egress_verdict_model(FENCE, tcp("127.0.0.1", false, true)),
+            EgressVerdict::Allow
+        );
+        // IMDS: allowlisting it is STILL denied.
+        assert_eq!(
+            egress_verdict_model(FENCE, tcp("169.254.169.254", false, true)),
             EgressVerdict::Deny(EgressDenyReason::Imds),
             "allowlisting IMDS must NOT override the deny"
         );
     }
 
-    /// With RFC-1918 NOT denied, IMDS + loopback-floor still apply but RFC-1918
-    /// is allowed (the opt-out sub-toggle).
+    /// With RFC-1918 NOT denied, IMDS + loopback-floor still apply.
     #[test]
     fn rfc1918_toggle_off_keeps_imds_and_loopback() {
-        let m = |deny_rfc1918: bool, is_loopback: bool, infra: bool, dst: &str| {
-            egress_verdict_model(
-                PolicyFlags { sidecar: false, egress: true, deny_rfc1918 },
-                is_loopback,
-                infra,
-                false,
-                dst.parse::<Ipv4Addr>().unwrap(),
-            )
-        };
-        assert_eq!(m(false, false, false, "10.0.0.5"), EgressVerdict::Allow, "rfc1918 allowed");
+        let no_rfc = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: false };
         assert_eq!(
-            m(false, false, false, "169.254.169.254"),
-            EgressVerdict::Deny(EgressDenyReason::Imds),
-            "IMDS still denied"
+            egress_verdict_model(no_rfc, tcp("10.0.0.5", false, false)),
+            EgressVerdict::Allow
         );
         assert_eq!(
-            m(false, true, false, "127.0.0.1"),
+            egress_verdict_model(no_rfc, tcp("169.254.169.254", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+        );
+        assert_eq!(
+            egress_verdict_model(no_rfc, tcp("127.0.0.1", false, false)),
             EgressVerdict::Deny(EgressDenyReason::Loopback),
-            "loopback floor still applies"
         );
     }
 
-    /// With the egress fence OFF (sidecar-only or neither), non-loopback egress
-    /// is unrestricted — preserving the historical `ebpf_policy` behavior.
+    /// Egress fence OFF (sidecar-only or neither): non-loopback egress is
+    /// unrestricted — preserving the historical `ebpf_policy` behavior.
     #[test]
     fn egress_off_allows_all_non_loopback() {
         let sidecar_only = PolicyFlags { sidecar: true, egress: false, deny_rfc1918: false };
         for dst in ["169.254.169.254", "10.0.0.5", "1.1.1.1"] {
-            let ip = dst.parse::<Ipv4Addr>().unwrap();
-            // sidecar on, egress off.
             assert_eq!(
-                egress_verdict_model(sidecar_only, false, false, false, ip),
+                egress_verdict_model(sidecar_only, tcp(dst, false, false)),
                 EgressVerdict::Allow,
                 "egress off must not fence {dst}"
             );
         }
-        // Sidecar loopback floor still denies non-infra loopback even with the
-        // egress fence off.
+        // Sidecar loopback floor still denies non-infra loopback.
         assert_eq!(
-            egress_verdict_model(sidecar_only, true, false, false, "127.0.0.1".parse().unwrap()),
+            egress_verdict_model(sidecar_only, tcp("127.0.0.1", false, false)),
             EgressVerdict::Deny(EgressDenyReason::Loopback)
         );
     }

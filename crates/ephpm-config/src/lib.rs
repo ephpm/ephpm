@@ -1953,10 +1953,12 @@ pub struct TenantNetworkConfig {
     /// allowlisted** (there is no legitimate tenant reason to reach cloud
     /// metadata); the only way to reach it is `tcp_egress_policy = "off"`.
     ///
-    /// IPv6 egress allowlisting is not supported (the deny ranges are IPv4
-    /// concepts; a native-IPv6 destination is never fenced). Setting this while
-    /// `tcp_egress_policy = "off"` is a hard startup error (never a silent
-    /// no-op).
+    /// IPv6 egress allowlisting is not supported: native-IPv6 metadata/
+    /// link-local (`fe80::/10`, `fd00:ec2::254`) is denied unconditionally and
+    /// `fc00::/7` ULA under `tcp_egress_deny_rfc1918`, but neither can be
+    /// allowlisted. The fence is TCP-only (UDP, including DNS, is never
+    /// touched). Setting this while `tcp_egress_policy = "off"` is a hard
+    /// startup error (never a silent no-op).
     #[serde(default)]
     pub tcp_egress_allow: BTreeMap<String, Vec<String>>,
 }

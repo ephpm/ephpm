@@ -49,6 +49,16 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+// `struct bpf_sock_addr.type` is the socket type (UAPI-stable). The TCP egress
+// fence governs TCP only: the knob is `tcp_egress_policy`, and the IMDS /
+// control-plane / cluster destinations it protects are all TCP. Fencing UDP too
+// would break DNS — glibc's resolver connect()s its UDP socket to the
+// nameserver (systemd-resolved 127.0.0.53, Docker 127.0.0.11, k8s CoreDNS on
+// 10.x), all of which the tiers below would deny. SOCK_STREAM is 1 in the UAPI.
+#ifndef SOCK_STREAM
+#define SOCK_STREAM 1
+#endif
+
 // ---- loopback classification (shared by bind + connect, v4 + v6) -----------
 //
 // Linux treats the ENTIRE 127.0.0.0/8 range as loopback (RFC 1122 §3.2.1.3),
@@ -65,10 +75,16 @@ char LICENSE[] SEC("license") = "GPL";
 // bpf_htonl(). All loads are of the aligned 32-bit context words, so the
 // verifier is happy and there are no unaligned reads.
 
-// 127.0.0.0/8 in network byte order.
+// 127.0.0.0/8 in network byte order, plus the all-zero address. The kernel
+// rewrites a connect to 0.0.0.0 into a connect to 127.0.0.1 (INADDR_ANY as a
+// destination means "this host"), so 0.0.0.0 reaches the same loopback services
+// the floor denies — it must classify as loopback or it slips through the
+// non-loopback allow branch (and, with the sidecar policy on, past the
+// port_owner check). 0.0.0.5 etc. do NOT route to loopback, so the special case
+// is kept narrow to the exact zero address.
 static __always_inline int is_loopback4_be(__u32 ip_be)
 {
-    return (ip_be & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
+    return ip_be == 0 || (ip_be & bpf_htonl(0xff000000)) == bpf_htonl(0x7f000000);
 }
 
 // Classify a 128-bit IPv6 address (four network-order 32-bit words) as loopback:
@@ -83,10 +99,14 @@ static __always_inline int is_loopback4_be(__u32 ip_be)
 // (embedded 0.0.0.1, outside 127/8) as non-loopback.
 static __always_inline int is_loopback6(const __u32 ip6[4])
 {
-    // ::1 (network order: high 96 bits zero, low word == 1).
-    if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == 0 && ip6[3] == bpf_htonl(1))
+    // :: (all-zero) and ::1 both route to loopback (the kernel rewrites a
+    // connect to :: into ::1), so classify both as loopback — otherwise :: and
+    // ::ffff:0.0.0.0 slip past the floor onto the control-plane ports.
+    if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == 0 &&
+        (ip6[3] == 0 || ip6[3] == bpf_htonl(1)))
         return 1;
     // ::ffff:0:0/96 — IPv4-mapped: first 80 bits zero, next 16 bits 0xffff.
+    // is_loopback4_be now also matches the embedded 0.0.0.0 (-> ::ffff:127.0.0.1).
     if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == bpf_htonl(0x0000ffff))
         return is_loopback4_be(ip6[3]);
     return 0;
@@ -176,10 +196,10 @@ struct {
 // Per-site egress CIDR allowlist (IPv4), an LPM trie. Key is {prefixlen, vhost
 // (network order), addr (network order)}: the top 32 bits (vhost) are always
 // matched exactly (every entry has prefixlen >= 32), the next up-to-32 bits are
-// the CIDR. A hit means "this vhost may reach this destination on ANY port",
-// and it OVERRIDES every deny category (including IMDS) — an explicit per-site
-// allow is a deliberate operator decision. ePHPm writes it at startup from
-// [server.tenant_network] tcp_egress_allow.
+// the CIDR. A hit means "this vhost may reach this destination on ANY port" and
+// OVERRIDES the loopback-floor and RFC-1918 denies — but NOT IMDS
+// (169.254.0.0/16), which is checked first and is un-allowlistable. ePHPm writes
+// it at startup from [server.tenant_network] tcp_egress_allow.
 struct egress_cidr_key_t {
     __u32 prefixlen;
     __u32 vhost; // network order, matched exactly (prefixlen >= 32)
@@ -304,6 +324,44 @@ static __always_inline int v4_mapped(const __u32 ip6[4], __u32 *v4)
     return 0;
 }
 
+// fe80::/10 link-local in network byte order (top 10 bits == 1111111010).
+static __always_inline int is_linklocal6(const __u32 ip6[4])
+{
+    return (ip6[0] & bpf_htonl(0xffc00000)) == bpf_htonl(0xfe800000);
+}
+
+// The AWS IPv6 IMDS address fd00:ec2::254 — a specific ULA, treated as metadata
+// (unconditional, un-allowlistable IMDS deny) rather than ordinary ULA.
+static __always_inline int is_imds6(const __u32 ip6[4])
+{
+    // fd00:0ec2:0000:0000:0000:0000:0000:0254 -> words fd000ec2, 0, 0, 00000254.
+    return ip6[0] == bpf_htonl(0xfd000ec2) && ip6[1] == 0 && ip6[2] == 0 &&
+           ip6[3] == bpf_htonl(0x00000254);
+}
+
+// fc00::/7 unique-local (the IPv6 analogue of RFC-1918), top 7 bits 1111110.
+static __always_inline int is_ula6(const __u32 ip6[4])
+{
+    return (ip6[0] & bpf_htonl(0xfe000000)) == bpf_htonl(0xfc000000);
+}
+
+// Egress verdict for a NATIVE (non-v4-mapped, non-loopback) IPv6 destination
+// under POL_EGRESS. v6 is NOT allowlistable (tcp_egress_allow is IPv4 only).
+static __always_inline int egress_verdict6(const __u32 ip6[4], __u32 flags)
+{
+    // Link-local (fe80::/10) and the AWS v6 IMDS are metadata-class: always
+    // denied, un-allowlistable, same as v4 169.254.0.0/16.
+    if (is_linklocal6(ip6) || is_imds6(ip6)) {
+        bump_deny(DENY_IMDS);
+        return 0;
+    }
+    if ((flags & POL_DENY_RFC1918) && is_ula6(ip6)) {
+        bump_deny(DENY_RFC1918);
+        return 0;
+    }
+    return 1; // public IPv6 egress allowed
+}
+
 static __always_inline __u32 quota_max(void)
 {
     __u32 zero = 0;
@@ -375,16 +433,20 @@ int vhost_bind6(struct bpf_sock_addr *ctx) { return do_bind(ctx); }
 //
 // `has_v4`/`v4_be` carry the destination's IPv4 address when one exists: the
 // bare v4 (connect4) or the embedded v4 of an ::ffff:a.b.c.d v4-mapped address
-// (connect6). Native IPv6 has has_v4 == 0. The egress-range rules are IPv4
-// concepts, so a native-IPv6 non-loopback destination is never fenced (a
-// documented limitation — IMDS/RFC-1918 are IPv4).
+// (connect6). Native IPv6 passes `ip6` (the four network-order words) and
+// has_v4 == 0; connect4 passes ip6 == NULL (never dereferenced, has_v4 == 1).
 static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback,
-                                      int has_v4, __u32 v4_be)
+                                      int has_v4, __u32 v4_be, const __u32 *ip6)
 {
     __u32 *vhostp = current_vhost();
     if (!vhostp)
         return 1; // untagged (an ePHPm thread, or a request that matched no vhost)
     __u32 vhost = *vhostp;
+
+    // TCP-only fence: a UDP connect (DNS, QUIC, ...) is never touched — not
+    // rewritten, not floored, not denied. See the SOCK_STREAM note at the top.
+    if (ctx->type != SOCK_STREAM)
+        return 1;
 
     __u32 flags = policy_flags();
     __u32 dport = bpf_ntohs(ctx->user_port);
@@ -435,16 +497,18 @@ static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback
     if (has_v4)
         return egress_verdict4(vhost, v4_be, dport, flags);
 
-    // Native IPv6 non-loopback: an explicit allowlist can never match (v4-only),
-    // and there is no v6 range fence, so allow.
+    // Native IPv6 non-loopback: fence link-local / AWS v6 IMDS (unconditional)
+    // and ULA (under the RFC-1918 flag). Not allowlistable (v4-only allowlist).
+    if (ip6)
+        return egress_verdict6(ip6, flags);
     return 1;
 }
 
 SEC("cgroup/connect4")
 int vhost_connect4(struct bpf_sock_addr *ctx)
 {
-    // Whole 127.0.0.0/8, not just 127.0.0.1 — see is_loopback4_be().
-    return do_connect(ctx, is_loopback4_be(ctx->user_ip4), 1, ctx->user_ip4);
+    // Whole 127.0.0.0/8 + 0.0.0.0, not just 127.0.0.1 — see is_loopback4_be().
+    return do_connect(ctx, is_loopback4_be(ctx->user_ip4), 1, ctx->user_ip4, (const __u32 *)0);
 }
 
 SEC("cgroup/connect6")
@@ -452,6 +516,8 @@ int vhost_connect6(struct bpf_sock_addr *ctx)
 {
     __u32 v4 = 0;
     int has_v4 = v4_mapped(ctx->user_ip6, &v4);
-    // ::1 and IPv4-mapped loopback (::ffff:127.x) — see is_loopback6().
-    return do_connect(ctx, is_loopback6(ctx->user_ip6), has_v4, v4);
+    // :: / ::1 and IPv4-mapped loopback (::ffff:127.x, ::ffff:0.0.0.0) —
+    // see is_loopback6(). Native-v6 egress ranges are handled in do_connect
+    // via egress_verdict6(ctx->user_ip6).
+    return do_connect(ctx, is_loopback6(ctx->user_ip6), has_v4, v4, ctx->user_ip6);
 }

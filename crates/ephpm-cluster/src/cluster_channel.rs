@@ -598,23 +598,37 @@ impl Handle {
             !self.inner.shutdown.is_cancelled(),
             "cluster channel is shut down; not dialing {peer_addr}"
         );
-        let mut tcp =
-            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await {
-                Ok(Ok(tcp)) => tcp,
-                Ok(Err(e)) => {
-                    record_handshake("dial", "connect_error");
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("cluster channel: connect to {peer_addr}")));
-                }
-                Err(_) => {
-                    record_handshake("dial", "connect_error");
-                    anyhow::bail!(
-                        "cluster channel: connect to {peer_addr} timed out after {}s (connection \
+        // Issue the connect(2) from a runtime worker, never inline on the
+        // caller's thread. A PHP worker that forwards a write/KV op dials via
+        // `Handle::block_on` while carrying the tenant eBPF tag; the TCP egress
+        // fence (F-SSRF-1) would then EPERM a connect to an RFC-1918 cluster
+        // peer, breaking per-site clustered write-forwarding and KV cold-fetch
+        // under the default. `tokio::spawn` moves only the connect syscall to an
+        // untagged runtime thread (the handshake can stay inline — the tag only
+        // matters at `connect`). The spawned task self-bounds at CONNECT_TIMEOUT.
+        let connect =
+            tokio::spawn(tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer_addr)));
+        let mut tcp = match connect.await {
+            Ok(Ok(Ok(tcp))) => tcp,
+            Ok(Ok(Err(e))) => {
+                record_handshake("dial", "connect_error");
+                return Err(anyhow::Error::new(e)
+                    .context(format!("cluster channel: connect to {peer_addr}")));
+            }
+            Ok(Err(_)) => {
+                record_handshake("dial", "connect_error");
+                anyhow::bail!(
+                    "cluster channel: connect to {peer_addr} timed out after {}s (connection \
                      refused or peer unreachable)",
-                        CONNECT_TIMEOUT.as_secs()
-                    );
-                }
-            };
+                    CONNECT_TIMEOUT.as_secs()
+                );
+            }
+            Err(join) => {
+                record_handshake("dial", "connect_error");
+                return Err(anyhow::Error::new(join)
+                    .context(format!("cluster channel: connect task to {peer_addr} failed")));
+            }
+        };
         configure_socket(&tcp, peer_addr);
         let handshake = handshake_initiate(&mut tcp, &self.inner.keys);
         let session = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {

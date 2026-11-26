@@ -456,7 +456,15 @@ to refuse startup if the fence cannot attach, or `"off"` to opt out.
 > firewall / require IMDSv2 with a hop limit of 1**. The same §11 "reach control,
 > not a breakout backstop" qualification applies. See the
 > [eBPF guide](/guides/ebpf-per-vhost-network/#tcp-egress-fence-tcp_egress_policy)
-> for the capabilities, the IPv6 gap, and the fail-closed modes.
+> for the capabilities, the IPv6 coverage, and the fail-closed modes.
+
+Two scope gaps to know about. **The fence is TCP-only** — UDP (including DNS) is
+never touched, so tenant DNS keeps working; the IMDS / control-plane / cluster
+destinations it protects are all TCP. And **the distributed cron / `ephpm php
+--site` lane is NOT fenced** — it runs tenant code in a separate, untagged
+process, so a cron-scheduled tenant script can reach IMDS (Landlock on that lane
+restricts by port, not IP). Until that lane is tagged (a v0.21 roadmap item),
+**block `169.254.0.0/16` at the host firewall if you schedule tenant cron.**
 
 ## What ePHPm self-enforces
 

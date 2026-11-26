@@ -276,21 +276,25 @@ bucket (every tenant's snapshot) and other internal services. `open_basedir`,
 connect. The `connect4/6` hooks sit exactly there, and for a tagged tenant thread
 deny:
 
-- **`169.254.0.0/16` (link-local / IMDS) — always, and un-allowlistable.** The
-  critical fix; there is no legitimate tenant reason to reach it, so a
-  `tcp_egress_allow` entry can **not** override this deny — the only way to reach
-  IMDS is `tcp_egress_policy = "off"`. A v4-mapped `::ffff:169.254.x.x` is caught
-  the same way.
-- **Loopback (`127.0.0.0/8`, `::1`) except ePHPm's own service ports** — the
-  stock `pdo_mysql` wire listener and the KV RESP listener, which `pdo_mysql` and
-  phpredis legitimately use. Every *other* loopback connect (co-located services,
-  the diagnostics/metrics/snapshot control ports, another process) is denied.
-- **RFC-1918 (`10/8`, `172.16/12`, `192.168/16`)** — by default, closing
-  internal-network SSRF and cluster-peer reach. Relax this one tier with
-  `tcp_egress_deny_rfc1918 = false`, or permit specific destinations per site.
+- **IMDS / link-local — always, and un-allowlistable.** `169.254.0.0/16` (incl.
+  v4-mapped `::ffff:169.254.x.x`), and on native IPv6 `fe80::/10` and the AWS v6
+  IMDS `fd00:ec2::254`. There is no legitimate tenant reason to reach cloud
+  metadata, so a `tcp_egress_allow` entry can **not** override this deny — the
+  only way to reach it is `tcp_egress_policy = "off"`.
+- **Loopback (`127.0.0.0/8` incl. `0.0.0.0`, `::`/`::1`) except ePHPm's own
+  service ports** — the stock `pdo_mysql` wire listener and the KV RESP listener,
+  which `pdo_mysql` and phpredis legitimately use. Every *other* loopback connect
+  (co-located services, the diagnostics/metrics/snapshot control ports, another
+  process) is denied. (`0.0.0.0`/`::` are treated as loopback because the kernel
+  rewrites a connect to them into `127.0.0.1`/`::1`.)
+- **RFC-1918 / ULA** — `10/8`, `172.16/12`, `192.168/16`, and IPv6 `fc00::/7` —
+  by default, closing internal-network SSRF and cluster-peer reach. Relax this
+  one tier with `tcp_egress_deny_rfc1918 = false`, or permit specific
+  destinations per site (IPv4 only).
 
 **Public-internet egress stays allowed** — a tenant calling a public API is
-normal; this is an SSRF fence, not a deny-all egress wall. Denied connects fail
+normal; this is an SSRF fence, not a deny-all egress wall. **The fence is
+TCP-only** (UDP, incl. DNS, is never touched — see below). Denied connects fail
 with `EPERM` at the syscall (the hook runs before routing, so even an unroutable
 IMDS address returns `EPERM`, not a hang). ePHPm's own threads carry no tag and
 are never fenced.
@@ -349,15 +353,53 @@ since the ordinary systemd hardening (a `CapabilityBoundingSet` without
 what is being blocked; a rising `imds` rate is a tenant probing the metadata
 service.
 
+### WordPress and other loopback self-calls
+
+The loopback floor denies *every* loopback port except ePHPm's own
+`pdo_mysql`/KV listeners, so an app that calls **itself** over loopback breaks
+under the default: WordPress wp-cron, Site Health and REST self-calls hit
+`127.0.0.1:<the HTTP(S) listener port>` (or an internal load balancer). Permit
+exactly that destination per site — do **not** blanket-add the HTTP port to the
+infra ports (that port is also the `/_ephpm` loopback-peer surface, which is
+gated separately):
+
+```toml
+[server.tenant_network.tcp_egress_allow]
+# wp self-calls to the local HTTPS listener (adjust to your [server] listen port)
+"blog.example" = ["127.0.0.1:443"]
+# or, behind an internal LB on a private address:
+# "blog.example" = ["10.0.5.10:443"]
+```
+
+### UDP is not fenced
+
+The fence is **TCP-only** (`tcp_egress_policy`). A UDP connect is never touched —
+not denied, not rewritten. This is deliberate and load-bearing: glibc's resolver
+`connect()`s its **UDP** socket to the nameserver, and systemd-resolved
+(`127.0.0.53`), Docker's embedded DNS (`127.0.0.11`) and k8s CoreDNS (a `10.x`
+ClusterIP) all sit on addresses the deny tiers would otherwise block — a
+UDP-fencing egress policy would break all tenant DNS. Everything the fence
+protects (IMDS, the loopback control plane, cluster peers) is TCP, so nothing
+security-relevant is lost. QUIC (HTTP/3 over UDP) to a blocked range is likewise
+not caught; use the host firewall if you must constrain UDP.
+
 ### Caveats
 
-- **IPv6 is not fenced.** Only IPv4 (and v4-mapped IPv6) destinations are
-  classified; a native-IPv6 egress is allowed. IMDS and RFC-1918 are IPv4
-  concepts, but an internal service on a v6 ULA is not covered here — use the
-  host firewall for v6.
-- **Scope is the server's request path.** `ephpm php --site` and the distributed
-  cron run tenant code in a process ePHPm does not tag; worker mode is not
-  supported.
+- **IPv6 is partially fenced.** Native IPv6 now denies the metadata/link-local
+  classes — `fe80::/10` and the AWS v6 IMDS `fd00:ec2::254` (always,
+  un-allowlistable) — and `fc00::/7` ULA under the RFC-1918 tier. But the
+  **per-site allowlist is IPv4 only**, so a legitimate internal service on a v6
+  ULA cannot be allowlisted; relax the whole v6 ULA tier with
+  `tcp_egress_deny_rfc1918 = false`, or use the host firewall. Ordinary public
+  IPv6 egress is allowed.
+- **Scope is the server's request path, and the cron lane is NOT fenced.**
+  `ephpm php --site` and the distributed cron run tenant code in a **separate,
+  untagged process**, so a cron-scheduled tenant script **can reach IMDS**
+  (`169.254.169.254`). Landlock (ABI 4) on that lane restricts by *port*, not IP,
+  so it does not close this. Until the cron lane is tagged (a v0.21 roadmap item
+  — per-site child cgroup + a `cgroup→vhost` map, or parent-side pid tagging via
+  a pre-exec sync pipe), **block `169.254.0.0/16` at the host firewall** if you
+  schedule tenant cron. Worker mode is also not supported.
 - **The allowlist matches the connect address, not a hostname.** A tenant
   resolving `metadata.google.internal` still hits the fence at the *resolved*
   `169.254.169.254`, so DNS tricks do not bypass it — but an allowlist entry must

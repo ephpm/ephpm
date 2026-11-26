@@ -239,18 +239,20 @@ fn egress_fence_denies_imds_loopback_and_rfc1918() {
     let cgroup = leaf.to_str().unwrap();
 
     // Egress fence only — no sidecar. Deny IMDS / loopback-except-infra /
-    // RFC-1918; 3306 is ePHPm's own infra port.
+    // RFC-1918; 13306 is ePHPm's own infra port (a distinct port from the
+    // sidecar test's 3306 so both #[ignore] tests can run in one process).
+    const INFRA_PORT: u16 = 13306;
     let opts =
         LoadOptions { tcp_policy: false, tcp_egress: true, deny_rfc1918: true, unix_fence: false };
-    let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[3306], &opts)
+    let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[INFRA_PORT], &opts)
         .expect("load+attach egress fence (need CAP_BPF and a real, non-placeholder object)");
 
-    // Infra listener on 3306 (untagged bind => not touched by the fence).
-    let infra = TcpListener::bind("127.0.0.1:3306").expect("bind infra 3306");
+    // Infra listener on INFRA_PORT (untagged bind => not touched by the fence).
+    let infra = TcpListener::bind(("127.0.0.1", INFRA_PORT)).expect("bind infra port");
     std::thread::spawn(move || {
         for s in infra.incoming().flatten() {
             let mut s = s;
-            let _ = s.write_all(b"INFRA-3306-OK");
+            let _ = s.write_all(b"INFRA-OK");
         }
     });
 
@@ -269,14 +271,35 @@ fn egress_fence_denies_imds_loopback_and_rfc1918() {
     let rfc1918 = probe(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 9)));
     assert!(is_denied(&rfc1918), "RFC-1918 10.0.0.5:9 must be EPERM, got {rfc1918:?}");
 
+    // Finding 2: 0.0.0.0 routes to loopback (kernel rewrites it to 127.0.0.1),
+    // so a tagged connect to 0.0.0.0:<non-infra> must hit the loopback floor —
+    // NOT slip through the non-loopback allow branch.
+    let zero = probe(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9999)));
+    assert!(is_denied(&zero), "0.0.0.0:9999 must be floored (EPERM), got {zero:?}");
+
+    // Finding 5: the AWS IPv6 IMDS fd00:ec2::254 is denied (the hook runs before
+    // routing, so EPERM comes back even with no v6 route configured).
+    let imds6 = probe(SocketAddr::from((Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254), 80)));
+    assert!(is_denied(&imds6), "AWS v6 IMDS fd00:ec2::254 must be EPERM, got {imds6:?}");
+
+    // Finding 1: the fence is TCP-only — a UDP connect (as glibc's resolver does
+    // to its nameserver) is NOT fenced, even to a loopback DNS address that the
+    // TCP floor would deny. This is what keeps tenant DNS working.
+    let dns = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 53), 53));
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind udp");
+    assert!(
+        udp.connect(dns).is_ok(),
+        "UDP connect to the DNS address must NOT be fenced (SOCK_STREAM gate)"
+    );
+
     // --- Invariants the fence must NOT break ---
 
     // ePHPm's own infra port stays reachable and serves its marker.
-    let infra_probe = probe(SocketAddr::from((Ipv4Addr::LOCALHOST, 3306)));
+    let infra_probe = probe(SocketAddr::from((Ipv4Addr::LOCALHOST, INFRA_PORT)));
     assert_eq!(
         infra_probe.as_ref().ok().and_then(Clone::clone).as_deref(),
-        Some("INFRA-3306-OK"),
-        "infra port 3306 must stay reachable, got {infra_probe:?}"
+        Some("INFRA-OK"),
+        "infra port must stay reachable, got {infra_probe:?}"
     );
 
     // Public egress must NOT be denied by the fence. 192.0.2.1 (TEST-NET-1) is

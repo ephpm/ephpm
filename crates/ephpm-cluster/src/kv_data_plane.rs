@@ -1401,9 +1401,18 @@ enum ResponseKind {
 }
 
 /// Dial `addr` within [`CONNECT_TIMEOUT`].
+///
+/// The connect(2) is issued from a runtime worker via [`tokio::spawn`], never
+/// inline on the caller's thread: a PHP worker doing a KV cold-fetch dials via
+/// `Handle::block_on` while carrying the tenant eBPF tag, and the TCP egress
+/// fence (F-SSRF-1) would EPERM a connect to an RFC-1918 cluster peer under the
+/// default. Spawning moves only the syscall off the tagged thread; the spawned
+/// task self-bounds at [`CONNECT_TIMEOUT`].
 async fn connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+    let joined = tokio::spawn(tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)))
         .await
+        .map_err(|e| anyhow::anyhow!("connect task to {addr} failed: {e}"))?;
+    let stream = joined
         .map_err(|_| anyhow::anyhow!("connect to {addr} timed out after {CONNECT_TIMEOUT:?}"))??;
     let _ = stream.set_nodelay(true);
     Ok(stream)
