@@ -38,6 +38,7 @@ pub mod s3;
 pub mod screened_backend;
 pub mod server_sandbox;
 pub mod sigv4;
+pub mod site_admission;
 pub mod site_backends;
 mod site_overrides;
 mod site_version;
