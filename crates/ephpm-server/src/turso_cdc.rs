@@ -473,6 +473,19 @@ enum Frame {
     /// Heartbeat — sent every ~5s from primary to keep the subscriber
     /// stream warm even during idle periods.
     Ping,
+    /// **Primary → replica, in place of any `Batch`, when the subscriber's
+    /// `from_change_id` is below this log's floor (#707).** The owner switched
+    /// this site's data lineage (a `discard_local` snapshot install — a reseed
+    /// convergence or a divergence re-bootstrap) but kept the same `turso_cdc`
+    /// log, which still holds the pre-switch rows `1..floor`. A subscriber at a
+    /// cursor below `floor` would be shipped that stale history and replay it
+    /// over its own post-switch data, so the owner refuses to tail it and tells
+    /// it to re-bootstrap from a fresh snapshot (whose watermark is `>= floor`)
+    /// instead. Carries the floor for the replica's log line. Only ever sent
+    /// when the floor is non-zero, which requires a prior reseed/re-bootstrap —
+    /// so a cluster that has never switched a lineage never puts it on the wire.
+    #[serde(rename = "RebootstrapRequired")]
+    RebootstrapRequired { floor: i64 },
 }
 
 /// Wire-format twin of [`litewire_turso::cdc::CdcRow`] — Serde-derived
@@ -1571,6 +1584,39 @@ async fn serve_site_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
     };
     anyhow::ensure!(from >= 0, "subscriber sent a negative watermark: {from}");
+
+    // #707 issue C: refuse a subscribe below this log's floor. The floor is the
+    // CDC head at the last `discard_local` install (a reseed convergence or a
+    // divergence re-bootstrap) — this node switched the site's data lineage but
+    // kept the same `turso_cdc` log, which still holds the pre-switch rows
+    // `1..floor`. A subscriber at a cursor below `floor` (a replica whose restore
+    // stripped its cursor, so its watermark resolves to 0 against this log) would
+    // be shipped that stale history and replay it over its own post-switch data.
+    // Tell it to re-bootstrap instead: the fresh snapshot it then installs has a
+    // watermark `>= floor`, so its next subscribe clears the floor and tails
+    // cleanly. A floor of `0` (a log that never switched lineage — every cluster
+    // that has not reseeded) refuses nothing.
+    // Fail the stream on a read failure rather than admitting the subscriber
+    // (#463): a wrongly-admitted below-floor subscriber would replay stale
+    // pre-switch history, and the floor never refuses it again once its cursor
+    // passes. The replica retries, exactly as it does for every other refusal.
+    let floor = read_owner_log_floor(mgmt).await.context("cdc: resolve the subscribe floor")?;
+    if from < floor {
+        cdc_metrics::record_stream_refused("cdc");
+        tracing::warn!(
+            from_change_id = from,
+            log_floor = floor,
+            site = %site,
+            "CDC: refusing a subscribe below the log floor — this owner switched the site's \
+             data lineage and its log still holds pre-switch history; telling the replica to \
+             re-bootstrap from a fresh snapshot instead of replaying it (#707)"
+        );
+        write_frame(&mut wr, &Frame::RebootstrapRequired { floor })
+            .await
+            .context("send rebootstrap-required frame")?;
+        return Ok(());
+    }
+
     tracing::info!(from_change_id = from, "CDC: subscriber attached");
 
     // RAII: every exit path below is a `?` or a `bail!`, so the
@@ -1708,6 +1754,61 @@ impl std::fmt::Display for ReseedRequired {
 
 impl std::error::Error for ReseedRequired {}
 
+/// Returned by [`subscribe_and_consume_site`] (before it would `Subscribe`) when
+/// **this** node holds a reseed generation *strictly newer* than the serving
+/// owner advertises (#707). That is the protective mirror of [`ReseedRequired`]:
+/// after `ephpm db restore --reseed` ran here and HRW re-homed the site onto a
+/// node that still holds pre-reseed data, this node becomes a *replica* of a
+/// stale owner. Subscribing from change_id 0 would replay the owner's entire
+/// pre-reseed history as `INSERT OR REPLACE`, silently merging stale rows back
+/// over the restore. The replica loops ([`run_replica`], [`run_site_replication`])
+/// turn this into a WARN + backoff retry — never a tail and never a discard: the
+/// fresher copy must win, so the node simply refuses to follow the stale owner
+/// until the owner (or HRW) catches up to the restore. `local` / `owner` are the
+/// two generations, for the log line.
+#[derive(Debug, Clone, Copy)]
+struct StaleOwnerRefused {
+    local: u64,
+    owner: u64,
+}
+
+impl std::fmt::Display for StaleOwnerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to tail an owner at reseed generation {} below this node's adopted {}",
+            self.owner, self.local
+        )
+    }
+}
+
+impl std::error::Error for StaleOwnerRefused {}
+
+/// Returned by [`subscribe_and_consume_site`] (from [`consume_frames`]) when the
+/// owner answered a `Subscribe` with [`Frame::RebootstrapRequired`] — the
+/// subscriber's cursor is below the owner's CDC log floor, so tailing would
+/// replay the owner's pre-lineage-switch history over this node's data (#707,
+/// issue C). The replica loops turn it into a forced cold re-bootstrap (the same
+/// `force_reset` path a schema collision takes), which installs a fresh snapshot
+/// whose watermark is `>= floor` and then tails from there. `floor` is the
+/// owner's advertised floor, for the log line.
+#[derive(Debug, Clone, Copy)]
+struct RebootstrapRequired {
+    floor: i64,
+}
+
+impl std::fmt::Display for RebootstrapRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "owner requires a re-bootstrap: subscribe cursor is below the log floor {}",
+            self.floor
+        )
+    }
+}
+
+impl std::error::Error for RebootstrapRequired {}
+
 /// The replica driver: dial the primary's `cdc/default` stream, announce
 /// the local watermark, apply what arrives, and retry forever.
 ///
@@ -1806,6 +1907,68 @@ pub async fn run_replica(
                                 }
                             }
                         }
+                        // This node holds a NEWER reseed generation than the
+                        // primary (#707): it was reseeded and the primary still
+                        // serves pre-reseed data. Do NOT tail (that would merge
+                        // the primary's old rows back over the restore) and do
+                        // NOT discard (this copy is the fresh one). Back off and
+                        // retry — the primary converges to the restore, or the
+                        // election names a primary that already holds it.
+                        else if let Some(stale) = e.downcast_ref::<StaleOwnerRefused>() {
+                            cdc_metrics::record_connect_outcome("stale_owner");
+                            tracing::warn!(
+                                local_generation = stale.local,
+                                owner_generation = stale.owner,
+                                primary = %primary_addr,
+                                "CDC replica: this node holds a newer reseed generation than the \
+                                 primary; refusing to tail the primary's stale data (it would merge \
+                                 pre-reseed rows back over the restore). Backing off until the \
+                                 primary catches up (ephpm db restore --reseed)"
+                            );
+                        }
+                        // The primary refused our subscribe as below its log floor
+                        // (#707 issue C): it switched lineage (a reseed
+                        // re-bootstrap) but kept the same turso_cdc log, which still
+                        // holds pre-switch rows. Force-discard and cold re-bootstrap
+                        // from the primary's fresh snapshot (watermark >= floor), so
+                        // the next subscribe clears the floor. Reuse `reseed_bootstrap`
+                        // with THIS node's adopted generation: the install passes the
+                        // reseed guard at equal generation and adopts nothing new.
+                        else if let Some(req) = e.downcast_ref::<RebootstrapRequired>() {
+                            let floor = req.floor;
+                            cdc_metrics::record_connect_outcome("rebootstrap");
+                            let generation = {
+                                let _permit = mgmt.wal_gate_permit().await;
+                                off_runtime(read_local_reseed_gen(&apply_conn)).await.unwrap_or(0)
+                            };
+                            tracing::warn!(
+                                log_floor = floor,
+                                primary = %primary_addr,
+                                "CDC replica: primary refused our cursor as below its CDC log floor; \
+                                 force-discarding and re-bootstrapping from the primary so stale \
+                                 pre-switch history is not replayed (#707)"
+                            );
+                            match reseed_bootstrap(
+                                &mgmt,
+                                &apply_conn,
+                                primary_addr,
+                                &channel,
+                                max_snapshot_bytes,
+                                generation,
+                            )
+                            .await
+                            {
+                                Ok(()) => tracing::info!(
+                                    "CDC replica: re-bootstrap above the log floor complete; resuming tail"
+                                ),
+                                Err(be) => {
+                                    cdc_metrics::record_bootstrap("failed");
+                                    tracing::warn!(
+                                        "CDC replica: log-floor re-bootstrap failed (will retry): {be:#}"
+                                    );
+                                }
+                            }
+                        }
                         // Failures of the local watermark bookkeeping keep
                         // their own outcome label — they mean "this node
                         // cannot ground a cursor", which an operator debugs
@@ -1861,23 +2024,26 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
-    // `whole_db = true`: the reseed force-discard signal is honored ONLY on the
-    // whole-database path (the only one `--reseed` can stamp). See F4.
+    // `honor_reseed = true`: the whole-database replica honors the reseed
+    // force-discard signal (`ephpm db restore --reseed`).
     subscribe_and_consume_site(stream, factory, apply_conn, DEFAULT_SITE, true).await
 }
 
 /// [`subscribe_and_consume`] for one named site: the applied-watermark gauge
-/// is recorded under `site`. `whole_db` is whether this is the whole-database
-/// replica path (vs a per-site one): the reseed force-discard predicate is
-/// evaluated only when true, so a per-site replica can never be forced to
-/// discard — even if a vhost is named `default` or a reseed-stamped file is
-/// mis-placed into a per-site directory (F4).
+/// is recorded under `site`. `honor_reseed` is whether this replica path honors
+/// the reseed force-discard signal (`ephpm db restore --reseed`): the predicate
+/// is evaluated only when true. Both clustered modes set it now — whole-database
+/// since v0.16.2 and per-site since v0.20.0 (#707) — and the per-site owner only
+/// ever advertises a non-zero generation on a file an operator actually reseeded
+/// (`stamp_reseed_generation` writes the per-site `.db`), so honoring it on both
+/// paths is safe; a site that has never been reseeded advertises `0`, which
+/// loses every [`reseed_decision`] and discards nothing.
 async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     factory: &Turso,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     site: &str,
-    whole_db: bool,
+    honor_reseed: bool,
 ) -> anyhow::Result<()> {
     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
         anyhow::anyhow!(
@@ -1899,21 +2065,20 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // owner's short-lived gossip advertisement is still live at that time.
     adopt_site_epoch(factory, source_epoch).await;
 
-    // Whole-database automatic reseed convergence (v0.16.2). Before resolving a
-    // watermark or subscribing, check whether the owner advertised a reseed
-    // generation **strictly greater** than this node has adopted — the signal
-    // that `ephpm db restore --reseed` installed fresh origin data on the owner
-    // and this replica must force-discard its old copy and cold re-bootstrap.
-    // The forced discard itself is driven by `run_replica` (reusing the existing
-    // fetch → vet → discard → apply snapshot primitives), so we return a typed,
-    // downcastable error here — the same pattern as `WatermarkResolution` — and
-    // never send `Subscribe`. A table-absent / zero generation reads `0`, so an
-    // ordinary promotion or failover (which re-advertises the adopted max) has
+    // Automatic reseed convergence (`ephpm db restore --reseed`; whole-database
+    // v0.16.2, per-site v0.20.0 / #707). Before resolving a watermark or
+    // subscribing, check whether the owner advertised a reseed generation
+    // **strictly greater** than this node has adopted — the signal that the
+    // operator installed fresh origin data on the owner and this replica must
+    // force-discard its old copy and cold re-bootstrap. The forced discard
+    // itself is driven by the caller (`run_replica` for whole-database,
+    // `run_site_replication` for per-site), reusing the existing fetch → vet →
+    // discard → apply snapshot primitives, so we return a typed, downcastable
+    // error here — the same pattern as `WatermarkResolution` — and never send
+    // `Subscribe`. A table-absent / zero generation reads `0`, so an ordinary
+    // promotion or failover (which re-advertises the adopted max) has
     // `incoming == adopted` and never triggers a discard.
-    // Whole-database path only (F4): `--reseed` can never stamp a per-site file,
-    // so a per-site replica must never be forced to discard — skip the read and
-    // the predicate entirely there rather than relying on the generation being 0.
-    if whole_db {
+    if honor_reseed {
         let adopted_reseed_gen = {
             let _permit = factory.wal_gate_permit().await;
             off_runtime(read_local_reseed_gen(apply_conn))
@@ -1922,6 +2087,24 @@ async fn subscribe_and_consume_site<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         };
         if reseed_decision(source_reseed_gen, adopted_reseed_gen) {
             return Err(anyhow::Error::new(ReseedRequired { generation: source_reseed_gen }));
+        }
+        // #707 replica-side protection (the mirror of the discard above). If THIS
+        // node has adopted a reseed generation **strictly newer** than the owner
+        // advertises, the owner is serving pre-reseed data: `ephpm db restore
+        // --reseed` ran here and HRW then re-homed the site onto a node that still
+        // holds its old copy. This node's restore stripped the CDC bookkeeping, so
+        // a watermark resolves to 0 and `Subscribe` would replay the owner's entire
+        // pre-reseed history as `INSERT OR REPLACE (rowid, …)`, silently merging
+        // stale rows back over the restore. Refuse rather than tail; the loop backs
+        // off and retries, and the fresher copy wins once the owner (or HRW) catches
+        // up to the restore. `adopted == source` (an ordinary promotion/failover)
+        // and `adopted < source` (handled above) both fall through untouched, so
+        // normal replication — where both generations are `0` — never triggers it.
+        if adopted_reseed_gen > source_reseed_gen {
+            return Err(anyhow::Error::new(StaleOwnerRefused {
+                local: adopted_reseed_gen,
+                owner: source_reseed_gen,
+            }));
         }
     }
 
@@ -2031,6 +2214,15 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 }
             }
             Frame::Ping => {}
+            Frame::RebootstrapRequired { floor } => {
+                // The owner refused our cursor as below its log floor (#707
+                // issue C): tailing would replay its pre-lineage-switch history
+                // over our post-switch data. Return a typed, downcastable error
+                // so the replica loop force-discards and cold re-bootstraps (the
+                // same path a schema collision takes), installing a fresh snapshot
+                // whose watermark clears the floor.
+                return Err(anyhow::Error::new(RebootstrapRequired { floor }));
+            }
             Frame::Subscribe { .. } => {
                 anyhow::bail!("primary sent a Subscribe frame; wrong direction");
             }
@@ -2098,6 +2290,20 @@ const EPOCH_TABLE: &str = "__ephpm_cdc_epoch";
 /// leaving generation `0`, so only an explicit `--reseed` ever forces a discard.
 const RESEED_GEN_TABLE: &str = "__ephpm_cdc_reseed_gen";
 
+/// Per-site **CDC log floor** (#707, issue C): the `MAX(turso_cdc.change_id)`
+/// this node's log had at the last `discard_local` snapshot install — the point
+/// at which it switched this site's data lineage but **kept the same
+/// `turso_cdc` log**, which still holds the pre-switch rows `1..floor`. A
+/// subscriber whose cursor is below the floor would be shipped that stale
+/// history and replay it, so [`serve_site_subscriber`] answers such a subscribe
+/// with [`Frame::RebootstrapRequired`] instead of tailing. `0` (absent) on a log
+/// that has never switched lineage, so ordinary replication is unaffected.
+/// `__`-prefixed and written through the mgmt connection, like the other CDC
+/// bookkeeping tables, so [`reset_local_user_tables`] never drops it on a future
+/// re-bootstrap and a **plain** restore clears it (it is in
+/// [`CDC_BOOKKEEPING_TABLES`]) — leaving floor `0`.
+const LOG_FLOOR_TABLE: &str = "__ephpm_cdc_log_floor";
+
 /// Every CDC / replication bookkeeping table a clustered database carries
 /// that a single-node database does not — the change-capture log and the
 /// ePHPm/litewire cursor tables.
@@ -2123,6 +2329,7 @@ pub const CDC_BOOKKEEPING_TABLES: &[&str] = &[
     LOG_WATERMARKS_TABLE,
     EPOCH_TABLE,
     RESEED_GEN_TABLE,
+    LOG_FLOOR_TABLE,
     WATERMARK_TABLE,
 ];
 
@@ -2258,12 +2465,19 @@ async fn write_site_epoch(conn: &turso::Connection, epoch: u64) -> anyhow::Resul
     Ok(())
 }
 
-/// This copy's full [`SiteVersion`](crate::site_version::SiteVersion): its
-/// persisted ownership epoch and the head of the current stint's CDC log.
+/// This copy's full [`SiteVersion`](crate::site_version::SiteVersion): the
+/// per-site reseed generation (`ephpm db restore --reseed`), the persisted
+/// ownership epoch, and the head of the current stint's CDC log.
+///
+/// The reseed generation dominates the version order, so a copy an operator has
+/// reseeded out-ranks a pre-restore copy on any node regardless of epoch — the
+/// property that keeps a stale higher-epoch peer from silently overwriting a
+/// per-site restore (#707).
 async fn read_site_version(
     conn: &turso::Connection,
 ) -> anyhow::Result<crate::site_version::SiteVersion> {
     Ok(crate::site_version::SiteVersion {
+        reseed_gen: read_local_reseed_gen(conn).await?,
         epoch: read_site_epoch(conn).await?,
         head: current_max_change_id(conn).await?,
     })
@@ -2400,6 +2614,68 @@ pub(crate) async fn write_local_reseed_gen(
     Ok(())
 }
 
+/// Read this node's CDC log floor ([`LOG_FLOOR_TABLE`]). `0` when the table does
+/// not exist (the log has never switched lineage — the common case and the
+/// fail-safe value: it refuses nothing). Stored as `INTEGER` to match
+/// `change_id`'s type; a non-integer value is an error rather than a silent `0`
+/// (a corrupt floor that read back as `0` would silently re-enable the stale
+/// replay this guards against).
+///
+/// # Errors
+///
+/// The underlying table read fails (a missing table is not an error — it is `0`).
+async fn read_log_floor(conn: &turso::Connection) -> anyhow::Result<i64> {
+    let mut probe = conn
+        .query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (LOG_FLOOR_TABLE,))
+        .await
+        .context("cdc: probe for the log-floor table")?;
+    if probe.next().await.context("cdc: read the log-floor probe")?.is_none() {
+        return Ok(0); // the table does not exist — this log never switched lineage
+    }
+    let mut stmt = conn
+        .prepare(&format!("SELECT change_id FROM {LOG_FLOOR_TABLE} WHERE id = 0"))
+        .await
+        .context("cdc: prepare the log-floor read")?;
+    let mut rows = stmt.query(()).await.context("cdc: query the log floor")?;
+    match rows.next().await.context("cdc: read the log floor")? {
+        Some(row) => match row.get_value(0).context("cdc: log-floor value")? {
+            turso::Value::Integer(i) => Ok(i),
+            other => anyhow::bail!("cdc: log floor has an unexpected type: {other:?}"),
+        },
+        None => Ok(0), // table present but row 0 unset
+    }
+}
+
+/// Persist this node's CDC log floor, `max(existing, floor)` so it never moves
+/// backwards (a lower value would re-admit a stale cursor). Written through the
+/// mgmt connection inside the `discard_local` install transaction, so it commits
+/// atomically with the lineage switch it records.
+///
+/// # Errors
+///
+/// The table cannot be created, read, or written.
+async fn write_log_floor(conn: &turso::Connection, floor: i64) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {LOG_FLOOR_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                change_id INTEGER NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create log-floor table")?;
+    let existing = read_log_floor(conn).await?;
+    let floor = existing.max(floor);
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {LOG_FLOOR_TABLE} (id, change_id) VALUES (0, ?)"),
+        (floor,),
+    )
+    .await
+    .context("cdc: write log floor")?;
+    Ok(())
+}
+
 /// This serving owner's adopted reseed generation, for the [`Frame::Hello`] /
 /// [`SnapshotHeader`] it sends a replica. `0` on any error or when the table
 /// does not exist (a cluster that has never been reseeded). A `0` never triggers
@@ -2410,6 +2686,33 @@ async fn read_owner_reseed_gen(mgmt: &Turso) -> u64 {
     let Ok(conn) = mgmt.raw_connection() else { return 0 };
     let _permit = mgmt.wal_gate_permit().await;
     off_runtime(read_local_reseed_gen(&conn)).await.unwrap_or(0)
+}
+
+/// This serving owner's CDC log floor (#707), for the floor check
+/// [`serve_site_subscriber`] applies to each `Subscribe`. `0` only when the
+/// table does not exist (a log that has never switched lineage).
+///
+/// **Fails closed (#463).** Unlike [`read_owner_reseed_gen`] / [`read_owner_epoch`]
+/// — where a `0` is the fail-safe direction (it never forces anything) — a `0`
+/// floor *admits* a subscriber, and admitting a below-floor subscriber re-opens
+/// the exact stale-replay this guards against (once that replica's watermark
+/// passes the floor it is never refused again). So a read failure (a
+/// raw-connection `Busy`/locked at the instant a replica subscribes with cursor
+/// 0, say) must **not** collapse to `0`: this propagates the error, and
+/// [`serve_site_subscriber`] fails the stream so the replica retries — the same
+/// direction every other refusal takes. [`read_log_floor`] already errors on a
+/// corrupt value rather than returning a silent `0` for the same reason; this
+/// wrapper must not undo that. Opens its own gated raw connection so it never
+/// races the stream connection.
+///
+/// # Errors
+///
+/// The connection cannot be opened, or the floor cannot be read (a missing table
+/// is `0`, not an error).
+async fn read_owner_log_floor(mgmt: &Turso) -> anyhow::Result<i64> {
+    let conn = mgmt.raw_connection().context("cdc: open a connection to read the log floor")?;
+    let _permit = mgmt.wal_gate_permit().await;
+    off_runtime(read_log_floor(&conn)).await.context("cdc: read the log floor")
 }
 
 /// The watermark we had reached in `log_id`, from the per-log history.
@@ -2754,6 +3057,52 @@ async fn serve_no_copy<S: AsyncWriteExt + Unpin>(stream: &mut S) -> anyhow::Resu
     write_snapshot_header(stream, &header).await?;
     write_snapshot_chunk(stream, &[]).await?;
     stream.flush().await?;
+    Ok(())
+}
+
+/// Answer a `snapshot/<site>` request by sending the real [`SnapshotHeader`]
+/// (this copy's [`SiteVersion`](crate::site_version::SiteVersion) — epoch, head,
+/// reseed generation) and then **no body** (#707 B).
+///
+/// Used when this node holds a **warm** copy of the site but has not settled it
+/// for serving (a cold/just-promoted owner whose copy may be stale). The header
+/// is read-only and cheap, so a puller's version probe
+/// ([`probe_peer_version`]) still learns this node's version — which keeps
+/// [`gate_probe_by_version`] / [`fresher_unreachable_outranks`] able to reason
+/// about it — while the missing body makes a *full* snapshot probe
+/// ([`probe_peer`]) read as [`PeerProbe::Unreachable`] rather than installing a
+/// possibly-stale copy or (wrongly) concluding `no_copy`. The stream is dropped
+/// after the header, so the body read ends in EOF, which the puller already
+/// classifies as unreachable.
+async fn serve_snapshot_version_header_only<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    mgmt: &Turso,
+    local_log_id: &str,
+) -> anyhow::Result<()> {
+    let conn = mgmt.raw_connection().context("snapshot header: open mgmt connection")?;
+    let (epoch, head, reseed_gen) = {
+        let _permit = mgmt.wal_gate_permit().await;
+        off_runtime(async {
+            let epoch = read_site_epoch(&conn).await?;
+            let head = current_max_change_id(&conn).await?;
+            let reseed_gen = read_local_reseed_gen(&conn).await?;
+            anyhow::Ok((epoch, head, reseed_gen))
+        })
+        .await
+        .context("snapshot header: read site version")?
+    };
+    let header = SnapshotHeader {
+        watermark: head,
+        total_len: 0,
+        log_id: local_log_id.to_string(),
+        no_copy: false,
+        epoch,
+        reseed_gen,
+    };
+    write_snapshot_header(stream, &header).await?;
+    stream.flush().await?;
+    // No body: returning drops the write half, so the puller's body read ends in
+    // EOF and classifies this peer as Unreachable (with the version it just read).
     Ok(())
 }
 
@@ -4317,6 +4666,15 @@ pub async fn start_clustered_per_site_turso(
     let mgmt = SiteMgmtRegistry::new(dir.clone());
     wal_gate::register_source(Arc::new(mgmt.clone()));
 
+    // The per-site serving gate (shared with the local resolver). The owner-side
+    // CDC/snapshot handlers consult it so a node that has NOT settled a site for
+    // serving never ships that site's log or snapshot (#707): an unsettled owner's
+    // local copy may be cold or stale, and tailing it would merge the wrong rows
+    // onto a replica. Obtained before the handlers are spawned so they can be
+    // handed a clone; `arm()` below flips it from "serve everything" (its unarmed
+    // default) to the handoff gate.
+    let gate = Arc::clone(registry.handoff_gate());
+
     // Owner-side handlers (reactive; registered up front so a promotion is
     // served immediately).
     spawn_per_site_stream_handler(
@@ -4324,6 +4682,7 @@ pub async fn start_clustered_per_site_turso(
         Arc::clone(cluster),
         self_id.clone(),
         mgmt.clone(),
+        Arc::clone(&gate),
         StreamKind::Cdc,
         handles,
     );
@@ -4332,6 +4691,7 @@ pub async fn start_clustered_per_site_turso(
         Arc::clone(cluster),
         self_id.clone(),
         mgmt.clone(),
+        Arc::clone(&gate),
         StreamKind::Snapshot,
         handles,
     );
@@ -4344,7 +4704,6 @@ pub async fn start_clustered_per_site_turso(
     // From here on a site is served locally only once its driver has settled
     // it — the local copy holds data, or a peer's copy was pulled into it, or
     // no peer has one (`crate::handoff_gate`, `settle_site_serving`).
-    let gate = Arc::clone(registry.handoff_gate());
     gate.arm();
 
     // Every node must compute site ownership with the same hash scheme. While
@@ -4427,6 +4786,34 @@ impl StreamKind {
     }
 }
 
+/// What a `snapshot/<site>` handler answers for a site this node holds, given
+/// whether it is settled for serving (`ready`) and whether the local copy is
+/// cold (#707 A/B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotServe {
+    /// Settled: serve the full snapshot (header + body).
+    Full,
+    /// Unsettled and cold (no data): answer `no_copy`, so a cold holder reads as
+    /// NoCopy (→ `NewSite` for an empty site), never Unreachable — closing the
+    /// empty-site ownership-change deadlock (A).
+    NoCopy,
+    /// Unsettled but warm: serve the version header and refuse the body, so a
+    /// puller's version probe still learns this node's version (B) while a full
+    /// snapshot probe reads Unreachable-with-version (which
+    /// [`fresher_unreachable_outranks`] can then act on).
+    HeaderOnly,
+}
+
+/// Decide what a `snapshot/<site>` handler answers (#707 A/B). Pure so the
+/// liveness rules are unit-testable without a cluster.
+fn snapshot_serve_decision(ready: bool, cold: bool) -> SnapshotServe {
+    match (ready, cold) {
+        (true, _) => SnapshotServe::Full,
+        (false, true) => SnapshotServe::NoCopy,
+        (false, false) => SnapshotServe::HeaderOnly,
+    }
+}
+
 /// Spawn one owner-side per-site handler for `kind`, routing every site
 /// under its prefix. Each inbound stream is gated on HRW ownership of the
 /// parsed site before this node's (owner) mgmt factory is resolved and the
@@ -4436,6 +4823,7 @@ fn spawn_per_site_stream_handler(
     cluster: Arc<ephpm_cluster::ClusterHandle>,
     self_id: String,
     mgmt: SiteMgmtRegistry,
+    gate: Arc<HandoffGate>,
     kind: StreamKind,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
@@ -4454,6 +4842,7 @@ fn spawn_per_site_stream_handler(
             };
             let cluster = Arc::clone(&cluster);
             let mgmt = mgmt.clone();
+            let gate = Arc::clone(&gate);
             let self_id = self_id.clone();
             tokio::spawn(async move {
                 if !stream_is_authorized(&cluster, &self_id, &site, kind, peer).await {
@@ -4464,6 +4853,32 @@ fn spawn_per_site_stream_handler(
                         "per-site {}: refusing (not this site's owner, or the peer is not a \
                          known cluster member); a peer chasing a stale owner will retry",
                         kind.label()
+                    );
+                    return;
+                }
+                // #707: an owner must not ship CDC for a site it has not SETTLED
+                // for serving. `stream_is_authorized` proves HRW ownership, but
+                // ownership moves no bytes — a cold/just-promoted owner holds an
+                // empty or stale copy until `settle_site_serving` pulls the data,
+                // and tailing that log from a replica would replicate the wrong
+                // sequence. The serving gate (`SiteServeState::Ready`) is exactly
+                // "this node's copy is authoritative", so gate CDC on it; a replica
+                // dialling an unsettled owner is refused and retries. (Snapshot is
+                // gated below, after the mgmt open, so a node that genuinely holds
+                // NO copy still answers `no_copy` for new-site convergence rather
+                // than being dropped and read as unreachable.) An unarmed gate —
+                // single-node per-site or a test registry — reports every site
+                // Ready, so this is a no-op outside clustered mode.
+                if matches!(kind, StreamKind::Cdc)
+                    && !matches!(gate.state(&site), SiteServeState::Ready)
+                {
+                    cdc_metrics::record_stream_refused(kind.label());
+                    tracing::warn!(
+                        peer = %peer,
+                        site = %site,
+                        "per-site cdc: this node owns the site but has not settled it for serving \
+                         yet (serving gate not Ready); refusing to ship CDC until its local copy \
+                         is authoritative — the replica will retry"
                     );
                     return;
                 }
@@ -4499,10 +4914,85 @@ fn spawn_per_site_stream_handler(
                             tracing::info!(peer = %peer, site = %site, "per-site CDC subscriber disconnected: {e:#}");
                         }
                     }
-                    StreamKind::Snapshot => match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
-                        Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
-                        Err(e) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot bootstrap failed: {e:#}"),
-                    },
+                    StreamKind::Snapshot => {
+                        // #707: this node holds the site (mgmt.existing returned a
+                        // copy) but may not have settled it for serving. Decide what
+                        // to answer by (settled?, cold?):
+                        //
+                        // - Ready → serve the full snapshot (header + body).
+                        // - not Ready + COLD → answer `no_copy`. A cold holder (an
+                        //   empty/freshly-provisioned site, Pending until it settles)
+                        //   holds no data, so it must read as NoCopy, not
+                        //   Unreachable — otherwise an empty site whose owner changes
+                        //   deadlocks: the new cold owner Blocks on cold holders
+                        //   while they Block bootstrapping from it (A).
+                        // - not Ready + WARM → serve the version HEADER but refuse
+                        //   the BODY (B). The header is read-only and cheap, so the
+                        //   puller's version probe still sees this node's SiteVersion
+                        //   even while it settles — and a refused body reads as
+                        //   Unreachable WITH a known version, exactly what
+                        //   `fresher_unreachable_outranks` (guard 4) catches, so the
+                        //   two guards compose rather than hiding a stale owner's
+                        //   version from the settle decision. Sticky `Ready` keeps a
+                        //   previous/draining owner serving the full handoff.
+                        let serveable = matches!(gate.state(&site), SiteServeState::Ready);
+                        // Determine coldness only when unsettled. #463 fail-closed:
+                        // a coldness-read FAILURE must NOT fall through to `no_copy`
+                        // — a warm holder answering `no_copy` could let the new owner
+                        // serve EMPTY and fork the tenant's data (exactly what the
+                        // gate exists to prevent). On any failure, drop the stream so
+                        // the puller reads EOF → Unreachable → Blocked → retry.
+                        let serve = if serveable {
+                            SnapshotServe::Full
+                        } else {
+                            let cold = async {
+                                let conn = site_mgmt.factory.raw_connection()?;
+                                let _permit = site_mgmt.factory.wal_gate_permit().await;
+                                off_runtime(local_db_is_cold(&conn)).await
+                            }
+                            .await;
+                            match cold {
+                                Ok(cold) => snapshot_serve_decision(serveable, cold),
+                                Err(e) => {
+                                    cdc_metrics::record_stream_refused(kind.label());
+                                    tracing::warn!(
+                                        peer = %peer,
+                                        site = %site,
+                                        "per-site snapshot: cannot determine local coldness ({e:#}); \
+                                         refusing (dropping) rather than risk answering no_copy for a \
+                                         warm copy and letting the new owner serve empty — the puller \
+                                         retries (#463)"
+                                    );
+                                    return;
+                                }
+                            }
+                        };
+                        match serve {
+                            SnapshotServe::Full => {
+                                match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
+                                    Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
+                                    Err(e) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot bootstrap failed: {e:#}"),
+                                }
+                            }
+                            SnapshotServe::NoCopy => {
+                                // Unsettled and cold: hold no data → no_copy.
+                                let mut stream = stream;
+                                match serve_no_copy(&mut stream).await {
+                                    Ok(()) => tracing::debug!(peer = %peer, site = %site, "per-site snapshot: unsettled cold copy; answered no-copy"),
+                                    Err(e) => tracing::info!(peer = %peer, site = %site, "per-site snapshot: no-copy answer failed: {e:#}"),
+                                }
+                            }
+                            SnapshotServe::HeaderOnly => {
+                                // Unsettled but warm: expose the version, refuse the body.
+                                cdc_metrics::record_stream_refused(kind.label());
+                                let mut stream = stream;
+                                match serve_snapshot_version_header_only(&mut stream, &site_mgmt.factory, &site_mgmt.log_id).await {
+                                    Ok(()) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot: holding a warm but unsettled copy; sent the version header and refused the body so the puller sees the version and retries (#707)"),
+                                    Err(e) => tracing::info!(peer = %peer, site = %site, "per-site snapshot: version-header answer failed: {e:#}"),
+                                }
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -4748,6 +5238,62 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                                 backoff.reset();
                                 false
                             }
+                            Err(e) if e.downcast_ref::<ReseedRequired>().is_some() => {
+                                // The owner advertised a reseed generation newer
+                                // than this replica has adopted (`ephpm db restore
+                                // --reseed` on this site, #707). Force a clean
+                                // re-bootstrap from the owner on the next attempt:
+                                // `plan_replica_attempt` then discards local
+                                // tables (fetch → vet → discard → apply), and
+                                // `install_snapshot` adopts the owner's generation
+                                // from the snapshot header, so the next subscribe
+                                // no longer signals a reseed. The local copy is
+                                // only discarded inside `install_snapshot`, after
+                                // the replacement snapshot is fetched and vetted —
+                                // and never to an empty snapshot
+                                // (`snapshot_may_replace_local_data`), so a node
+                                // whose own data is the restore origin (its
+                                // generation is already the max) never reaches
+                                // here.
+                                let generation =
+                                    e.downcast_ref::<ReseedRequired>().map_or(0, |r| r.generation);
+                                cdc_metrics::record_connect_outcome("reseed");
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    generation,
+                                    "per-site replica: owner advertised a newer reseed generation; \
+                                     force-discarding local data and cold re-bootstrapping from the \
+                                     owner (ephpm db restore --reseed)"
+                                );
+                                force_reset = true;
+                                true
+                            }
+                            Err(e) if e.downcast_ref::<RebootstrapRequired>().is_some() => {
+                                // The owner refused our subscribe as below its log
+                                // floor (#707 issue C): it switched lineage (a
+                                // reseed convergence or a divergence re-bootstrap)
+                                // but kept the same turso_cdc log, which still holds
+                                // pre-switch rows. Force a clean re-bootstrap: the
+                                // fresh snapshot's watermark is >= the floor, so the
+                                // next subscribe clears it and tails cleanly, and
+                                // the stale history is never replayed. The install
+                                // passes the reseed-generation guard (equal/higher
+                                // gen) because the owner holds the restore.
+                                let floor = e
+                                    .downcast_ref::<RebootstrapRequired>()
+                                    .map_or(0, |r| r.floor);
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    log_floor = floor,
+                                    "per-site replica: owner refused our cursor as below its CDC \
+                                     log floor; force-discarding and re-bootstrapping from the \
+                                     owner so stale pre-switch history is not replayed (#707)"
+                                );
+                                force_reset = true;
+                                true
+                            }
                             Err(e) if is_schema_collision_error(&e) => {
                                 // Divergence: the replica holds a local-origin
                                 // object the owner's CDC batch collides with.
@@ -4760,6 +5306,39 @@ async fn run_site_replication(site: String, ctx: SiteDriverCtx) -> anyhow::Resul
                                      and re-bootstrapping from the owner: {e:#}"
                                 );
                                 force_reset = true;
+                                true
+                            }
+                            Err(e) if e.downcast_ref::<StaleOwnerRefused>().is_some() => {
+                                // This node holds a NEWER reseed generation than
+                                // the owner (#707): `ephpm db restore --reseed`
+                                // ran here and HRW re-homed the site onto a node
+                                // that still holds pre-reseed data. Do NOT tail
+                                // (it would merge the owner's old rows back over
+                                // the restore) and do NOT force_reset (this copy
+                                // is the fresh one — discarding it would throw the
+                                // restore away). Back off and retry; the fresher
+                                // copy wins once the owner, or HRW, converges to
+                                // the restore.
+                                let (local, owner_gen) = e
+                                    .downcast_ref::<StaleOwnerRefused>()
+                                    .map_or((0, 0), |s| (s.local, s.owner));
+                                cdc_metrics::record_connect_outcome("stale_owner");
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    local_generation = local,
+                                    owner_generation = owner_gen,
+                                    "per-site replica: this node holds a newer reseed generation \
+                                     than the owner; refusing to tail the owner's stale data (it \
+                                     would merge pre-reseed rows back over the restore). Backing \
+                                     off until the owner catches up (ephpm db restore --reseed). \
+                                     If the owner stays running with ownership unchanged it never \
+                                     adopts the restore, so this refusal persists indefinitely — \
+                                     the restore is preserved, but convergence needs the owner to \
+                                     restart; the documented 'stop every node' reseed procedure \
+                                     avoids this"
+                                );
+                                force_reset = false;
                                 true
                             }
                             Err(e) => {
@@ -5126,9 +5705,10 @@ where
 /// [`SITE_VERSION_TTL`] (10 s) — this reads the peer's **durable** epoch over
 /// the reliable cluster channel. It is what lets a returning owner learn an
 /// interim owner's higher epoch *after* that owner has released ownership and
-/// its advert has lapsed (the #654 crash-restart hole). The header carries both
-/// the persisted `epoch` and the stint `watermark` (head), so the full
-/// [`SiteVersion`] is available without transferring the dump.
+/// its advert has lapsed (the #654 crash-restart hole). The header carries the
+/// persisted `epoch`, the stint `watermark` (head) and the reseed generation
+/// (#707), so the full [`SiteVersion`] is available without transferring the
+/// dump.
 ///
 /// `None` when the peer holds no copy (`no_copy`), is unreachable, or does not
 /// answer within [`HANDOFF_PROBE_TIMEOUT`] — every one of which only ever
@@ -5152,34 +5732,146 @@ async fn probe_peer_version(
     if header.no_copy {
         return None;
     }
-    Some(crate::site_version::SiteVersion { epoch: header.epoch, head: header.watermark })
+    Some(crate::site_version::SiteVersion {
+        reseed_gen: header.reseed_gen,
+        epoch: header.epoch,
+        head: header.watermark,
+    })
 }
 
-/// The freshest site version known from a **durable** source: the gossip advert
-/// folded with every alive candidate peer's persisted epoch (probed header-only
-/// over the channel). Closes the #654 crash-restart hole where a returning
-/// owner could not learn the interim owner's higher epoch once the interim
-/// owner released ownership and its 10 s advert lapsed.
+/// Every alive candidate peer's **durable** site version for `site`, probed
+/// header-only over the cluster channel ([`probe_peer_version`]). `(peer,
+/// version)` for each peer that answered; a peer that holds no copy or is
+/// unreachable reports no version and is omitted — it cannot rank or justify a
+/// pull, though it is still asked in the pull search (it may hold a copy its
+/// header probe could not report).
 ///
-/// Only called for a **warm owner** — the one case that can serve a stale copy
-/// and so needs the robust answer. Settle rounds happen only on an ownership
+/// This per-peer form does two jobs (#654, #707):
+///
+/// - folded with the gossip advert it gives `best_peer` — the freshest version
+///   any peer holds — which [`decide_warm_settle`](crate::site_version::decide_warm_settle)
+///   compares against the local copy. The advert alone is insufficient for a
+///   **warm owner**: the interim owner stops advertising the instant it releases
+///   ownership and the advert lapses after `SITE_VERSION_TTL` (10 s), so a
+///   returning owner that settles a little later would see no fresher peer and
+///   serve stale (#654). Probing peers' *persisted* epoch directly over the
+///   channel closes that hole.
+/// - it ranks the ownership-handoff pull candidates freshest-first
+///   ([`rank_candidates_by_version`]) and gates the install
+///   ([`gate_probe_by_version`]), so a discard is only ever justified by a copy
+///   strictly newer than the local one — a reseeded owner-elect never installs a
+///   stale lower-generation peer's copy over its restore (#707).
+///
+/// Only called for an **owner** — the only role that pulls, and the warm-owner
+/// case that can serve a stale copy. Settle rounds happen only on an ownership
 /// change, so probing the candidates here is infrequent; each probe is bounded
 /// by [`HANDOFF_PROBE_TIMEOUT`], as the existing handoff probe already is.
-async fn best_peer_version_durable(
+async fn peer_versions_durable(
     channel: &ephpm_cluster::ChannelHandle,
     site: &str,
-    advert: Option<crate::site_version::SiteVersion>,
     candidates: &[NodeInfo],
-) -> Option<crate::site_version::SiteVersion> {
+) -> Vec<(NodeInfo, crate::site_version::SiteVersion)> {
     let mut peer_versions = Vec::new();
     for peer in candidates {
         if let Some(addr) = crate::sql_forward::member_channel_addr(peer)
             && let Some(v) = probe_peer_version(addr, channel, site).await
         {
-            peer_versions.push(v);
+            peer_versions.push((peer.clone(), v));
         }
     }
-    crate::site_version::fold_best_version(advert, peer_versions)
+    peer_versions
+}
+
+/// The [`SiteVersion`](crate::site_version::SiteVersion) a snapshot header
+/// carries: its reseed generation, ownership epoch and watermark (the stint
+/// head). Used to version-gate an ownership-handoff pull against the local copy.
+fn header_site_version(header: &SnapshotHeader) -> crate::site_version::SiteVersion {
+    crate::site_version::SiteVersion {
+        reseed_gen: header.reseed_gen,
+        epoch: header.epoch,
+        head: header.watermark,
+    }
+}
+
+/// Order handoff candidates so the peer advertising the **freshest** durable
+/// version (from [`peer_versions_durable`]) is asked for its snapshot first, then
+/// the rest. A candidate without a probed version keeps its HRW position *after*
+/// every versioned peer — deprioritised, never dropped, because it may still hold
+/// a copy its header probe could not report. `sort_by` is stable, so the HRW
+/// order the handoff already relies on is preserved within each group.
+fn rank_candidates_by_version(
+    candidates: &[NodeInfo],
+    peer_versions: &[(NodeInfo, crate::site_version::SiteVersion)],
+) -> Vec<NodeInfo> {
+    let version_of = |id: &str| peer_versions.iter().find(|(p, _)| p.id == id).map(|(_, v)| *v);
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|a, b| match (version_of(&a.id), version_of(&b.id)) {
+        (Some(va), Some(vb)) => vb.cmp(&va),         // freshest first
+        (Some(_), None) => std::cmp::Ordering::Less, // a versioned peer before an unversioned one
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal, // keep incoming HRW order
+    });
+    ranked
+}
+
+/// Version-gate an ownership-handoff probe against the local copy's version
+/// (#707). A discard-and-replace is only ever justified by a copy **strictly
+/// newer** than the one already held, so a [`PeerProbe::Data`] whose snapshot
+/// header is not newer than `own` is demoted to [`PeerProbe::NoCopy`]: the search
+/// keeps looking, and the round ends `Blocked` (refuse, WARN, retry) if no peer
+/// offers a newer copy — never replacing good local data (a fresh operator
+/// reseed, say) with a staler peer's that merely answered first. `NoCopy` and
+/// `Unreachable` pass through unchanged.
+///
+/// Applied **only to a warm owner replacing its data** (`discard_local`): that is
+/// the one case with local data to protect. A cold owner has nothing to protect
+/// and must pull from whichever peer holds the site — a held copy may carry the
+/// empty version `(0, 0, 0)` and a cold owner that gated it against its own empty
+/// version would serve empty — so the cold pull is version-ranked (freshest
+/// first) but not gated. See the caller in [`settle_round`].
+///
+/// This does **not** weaken [`snapshot_may_replace_local_data`]'s empty-snapshot
+/// refusal or the `__ephpm_cdc_source` lineage invariant — it is an additional
+/// filter on *which* peer may justify a discard, applied before the install,
+/// which still runs every one of those checks.
+fn gate_probe_by_version(probe: PeerProbe, own: crate::site_version::SiteVersion) -> PeerProbe {
+    match probe {
+        PeerProbe::Data { header, dump, received } => {
+            if header_site_version(&header) > own {
+                PeerProbe::Data { header, dump, received }
+            } else {
+                PeerProbe::NoCopy
+            }
+        }
+        other => other,
+    }
+}
+
+/// #707 item 4: whether a candidate that was **unreachable** during the pull is
+/// *known* (from the durable header probe, [`peer_versions_durable`]) to hold a
+/// copy **strictly newer** than the one the search chose — e.g. the reseeded node
+/// whose snapshot body timed out. The pull search ranks candidates freshest-first
+/// and stops at the first that answers with data, so every peer in `unreachable`
+/// was asked *before* — and ranked *above* — the chosen copy. Installing the
+/// chosen (staler) copy could then overwrite a reseed with pre-restore data, so
+/// the caller refuses and retries instead; the fresher peer is installed once it
+/// answers (refusing beats forking the tenant's data).
+///
+/// Returns the blocking peer's `(id, reason)` for the refusal message. Crucially
+/// this is **version-aware**, not "any unreachable blocks a lower copy": a peer
+/// with no probed version (an older node, or one unreachable for the version probe
+/// too) cannot be shown to be fresher and so never blocks — which is what keeps
+/// the ordinary hash-change handoff (take a lower-ranked copy past an unreachable
+/// peer that is not known to be fresher, #624) working.
+fn fresher_unreachable_outranks(
+    peer_versions: &[(NodeInfo, crate::site_version::SiteVersion)],
+    unreachable: &[(String, String)],
+    chosen: crate::site_version::SiteVersion,
+) -> Option<(String, String)> {
+    unreachable.iter().find_map(|(id, reason)| {
+        let v = peer_versions.iter().find(|(p, _)| p.id == *id).map(|(_, v)| *v)?;
+        (v > chosen).then(|| (id.clone(), reason.clone()))
+    })
 }
 
 /// What a cold owner does when no peer answered with data.
@@ -5513,8 +6205,22 @@ async fn settle_round(
     // adopts the epoch anyway (a cold owner's handoff), so the plain advert is
     // enough and the extra probe is skipped.
     let advert = read_advertised_site_version(cluster, site).await;
+    // Per-peer durable versions over the channel (header-only). Only an OWNER
+    // pulls, so these are probed only when this node owns the site. They do two
+    // jobs (#654, #707): (1) folded with the advert they give `best_peer`, which
+    // `decide_warm_settle` compares against this copy for the warm-owner block
+    // decision; (2) they rank the pull candidates freshest-first and gate the
+    // install, so a discard is only ever justified by a strictly newer copy — a
+    // reseeded owner-elect never installs a stale lower-generation peer's copy
+    // over its restore. A non-owner never pulls as owner and uses only the
+    // advert.
+    let peer_versions = if owner_is_self {
+        peer_versions_durable(channel, site, &candidates).await
+    } else {
+        Vec::new()
+    };
     let best_peer = if !cold && owner_is_self {
-        best_peer_version_durable(channel, site, advert, &candidates).await
+        crate::site_version::fold_best_version(advert, peer_versions.iter().map(|(_, v)| *v))
     } else {
         advert
     };
@@ -5551,18 +6257,56 @@ async fn settle_round(
         return SettleRound::NotOwner;
     }
 
-    let search = search_peers_for_copy(&candidates, |peer| {
+    // Rank the pull candidates freshest-first by their durable version (#707),
+    // so the owner-elect always prefers the newest copy a peer holds — a reseed
+    // out-ranks a stale higher-epoch copy, whatever HRW order they fall in.
+    //
+    // The strict version GATE, on the other hand, applies only to a WARM owner
+    // that is replacing its own data (`discard_local`): that copy must only ever
+    // be overwritten by one STRICTLY NEWER than it, so a stale peer can never
+    // silently clobber a fresh reseed. A COLD owner holds nothing to protect and
+    // must pull from whichever peer holds the site — a held copy may legitimately
+    // carry the empty version (epoch/head 0, e.g. seeded before it ever had a CDC
+    // log), and a cold owner that gated it out against its own empty version
+    // would serve an empty database and fork the tenant's data
+    // (`per_site_handoff_any_peer::a_cold_owner_pulls_from_whichever_peer_holds_the_site`).
+    // Ranking already makes the cold pull version-aware without that hazard.
+    let ranked = rank_candidates_by_version(&candidates, &peer_versions);
+    let search = search_peers_for_copy(&ranked, |peer| {
         let addr = crate::sql_forward::member_channel_addr(peer);
         async move {
-            match addr {
+            let probe = match addr {
                 Some(addr) => probe_peer(addr, channel, max_snapshot_bytes, site).await,
                 None => PeerProbe::Unreachable("its gossip address is unusable".to_string()),
-            }
+            };
+            if discard_local { gate_probe_by_version(probe, own) } else { probe }
         }
     })
     .await;
 
     if let Some((peer, header, dump, received)) = search.found {
+        // #707 item 4: a higher-ranked candidate that could not answer may hold a
+        // STRICTLY FRESHER copy than this one — the reseeded node whose snapshot
+        // body timed out is the canonical case. A cold owner does not version-gate
+        // the chosen copy (`gate_probe_by_version` guards only a warm owner), so
+        // without this it would install the next-ranked stale copy over a reseed
+        // it never saw. Refuse and retry while a *known-fresher* unreachable peer
+        // outranks the chosen copy; the fresher peer is installed once it answers.
+        // Version-aware on purpose — an unreachable peer with no probed version
+        // never blocks, so the ordinary hash-change handoff (#624) is unchanged.
+        if let Some((fresher_id, reason)) = fresher_unreachable_outranks(
+            &peer_versions,
+            &search.unreachable,
+            header_site_version(&header),
+        ) {
+            cdc_metrics::record_bootstrap("handoff_blocked");
+            return SettleRound::Blocked(format!(
+                "a peer that ranks above the copy on offer holds a fresher version but could not \
+                 be reached, so installing the lower-ranked copy might overwrite a newer one (an \
+                 operator reseed, say); refusing until the fresher peer answers — peer \
+                 {fresher_id}: {reason}"
+            ));
+        }
         let started = std::time::Instant::now();
         let installed = {
             let _seed = site_mgmt.seed.lock().await;
@@ -5588,7 +6332,7 @@ async fn settle_round(
                     site = %site,
                     source = %peer.id,
                     watermark = header.watermark,
-                    source_rank = candidates.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
+                    source_rank = ranked.iter().position(|c| c.id == peer.id).map_or(0, |i| i + 1),
                     caught_up = discard_local,
                     "ownership handoff complete: pulled the site's data from a peer before serving it"
                 );
@@ -5696,16 +6440,22 @@ async fn settle_owner_version(
                 crate::site_version::next_owner_epoch(current.max(own_epoch), best_peer_epoch);
             write_site_epoch(conn, target).await?;
             let head = current_max_change_id(conn).await?;
-            anyhow::Ok((target, head))
+            // Carry this copy's reseed generation (`ephpm db restore --reseed`)
+            // into the advertised version: it dominates the order, so a peer that
+            // later takes the site reads it and never serves a pre-restore copy
+            // over the reseed (#707). A handoff install just above may have
+            // adopted it, so read it here, after that install committed.
+            let reseed_gen = read_local_reseed_gen(conn).await?;
+            anyhow::Ok((target, head, reseed_gen))
         })
         .await
     };
     match persisted {
-        Ok((target, head)) => {
+        Ok((target, head, reseed_gen)) => {
             advertise_site_version(
                 cluster,
                 site,
-                crate::site_version::SiteVersion { epoch: target, head },
+                crate::site_version::SiteVersion { reseed_gen, epoch: target, head },
             );
         }
         Err(e) => tracing::warn!(
@@ -5868,8 +6618,12 @@ async fn replicate_site_once(
         .dial(owner, &cdc_stream_type(site))
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
-    // `whole_db = false`: per-site replicas never honor the reseed signal (F4).
-    subscribe_and_consume_site(&mut stream, factory, &conn, site, false).await
+    // `honor_reseed = true`: a per-site replica honors the owner's reseed signal
+    // (`ephpm db restore --reseed` on this site's `.db`, #707) and force-discards
+    // via a `ReseedRequired` error, which `run_site_replication` turns into a
+    // clean re-bootstrap (`force_reset`). The owner advertises a non-zero
+    // generation only on a file an operator actually reseeded.
+    subscribe_and_consume_site(&mut stream, factory, &conn, site, true).await
 }
 
 /// Fetch a snapshot for `site` from `source` and apply it locally, discarding
@@ -5908,6 +6662,13 @@ async fn bootstrap_site_from(
             .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
     }
     cdc_metrics::record_snapshot_received(received, started.elapsed());
+    // A per-site replica bootstrap (a fresh/cold replica, or a `--reseed`
+    // force-discard re-bootstrap — #707) records the same `outcome="ok"` the
+    // whole-database cold bootstrap does, so an operator can verify a per-site
+    // reseed convergence by watching `ephpm_cdc_bootstrap_total{outcome="ok"}`
+    // rise on each converging node. Owner-settle records `handoff_ok`
+    // separately; a reseeded replica never reaches that path.
+    cdc_metrics::record_bootstrap("ok");
     cdc_metrics::record_applied_watermark(site, header.watermark);
     Ok(header.watermark)
 }
@@ -5975,6 +6736,36 @@ async fn install_snapshot(
             .await
             .context("snapshot: roll back a transaction left open by an earlier attempt")?;
     }
+
+    // #707: a discard-and-replace (`discard_local`) must never install a copy at
+    // a STRICTLY LOWER reseed generation over data this node reseeded to a higher
+    // one. The window is a schema-collision `force_reset` → `install_snapshot(..,
+    // discard_local = true)` with a stale owner's header, or a handoff install
+    // that slipped past the version gate: `apply_snapshot` keeps max(local,
+    // header), so a lower header would leave the restore's high generation stamped
+    // on the owner's discarded-and-replaced STALE rows — stale data wearing a fresh
+    // version number, which then out-ranks the real restore cluster-wide. Refuse
+    // before touching anything local (autocommit read; any leftover transaction was
+    // rolled back above); the caller retries, by which time the fresher source is
+    // reachable or ownership has moved. A cold bootstrap (`discard_local = false`)
+    // holds nothing to protect and is unaffected, as is any install whose header is
+    // at or above the local generation — normal non-reseed replication (both `0`).
+    if discard_local {
+        let local = read_local_reseed_gen(conn)
+            .await
+            .context("snapshot: read local reseed generation for the discard guard")?;
+        anyhow::ensure!(
+            header.reseed_gen >= local,
+            "refusing to discard-and-replace this site's data with a snapshot at reseed \
+             generation {} below the local generation {}: `ephpm db restore --reseed` installed \
+             newer data on this node, and applying the peer's older copy would roll the site back \
+             to pre-restore rows stamped at the newer generation. Check that ownership moved to a \
+             node that holds the restore.",
+            header.reseed_gen,
+            local
+        );
+    }
+
     conn.execute("BEGIN IMMEDIATE", ()).await.context("snapshot: begin install transaction")?;
 
     let staged = async {
@@ -5982,6 +6773,22 @@ async fn install_snapshot(
             reset_local_user_tables(conn)
                 .await
                 .context("per-site replica: discard divergent local tables")?;
+            // #707 issue C: a `discard_local` install switches this site's data
+            // lineage but keeps the SAME `turso_cdc` log, which still holds the
+            // pre-switch rows `1..head`. Record that head as the log FLOOR (in the
+            // same transaction as the switch) so that if this node later serves
+            // CDC, a subscriber whose cursor is below the floor is sent to
+            // re-bootstrap instead of being shipped the stale pre-switch history.
+            // Read before `apply_snapshot` runs — the install is capture-off and
+            // never touches `turso_cdc`, so the head is identical before and after,
+            // but reading it first keeps the floor a pure function of the log as it
+            // was at the switch. A node that never captured (no `turso_cdc`) reads
+            // `0`, so a pure replica's floor stays `0`. `max()`-merged in
+            // `write_log_floor`, so it never moves backwards across re-bootstraps.
+            let floor = current_max_change_id(conn)
+                .await
+                .context("snapshot: read the CDC head for the log floor")?;
+            write_log_floor(conn, floor).await.context("snapshot: record the CDC log floor")?;
         }
         apply_snapshot(conn, header, dump).await
     }
@@ -6547,6 +7354,88 @@ mod tests {
         assert!(!reseed_decision(4, 4), "equal (promotion/failover) never reseeds");
         assert!(!reseed_decision(3, 4), "a stale/lower generation never reseeds");
         assert!(!reseed_decision(0, 0), "a never-reseeded cluster never reseeds");
+    }
+
+    /// **#707 replica-side protection.** A node that has adopted reseed generation
+    /// `T` (`ephpm db restore --reseed` ran here) must REFUSE to tail an owner that
+    /// advertises a generation below `T`: the owner still serves pre-reseed data,
+    /// and subscribing from change_id 0 would replay its whole history as
+    /// `INSERT OR REPLACE`, silently merging stale rows back over the restore. It
+    /// must return the typed [`StaleOwnerRefused`] and send **no** `Subscribe` —
+    /// the loop then backs off and retries instead of tailing or discarding.
+    ///
+    /// Fails without the guard: `subscribe_and_consume_site` would fall straight
+    /// through to `resolve_subscribe_watermark` (→ 0) and `write_frame(Subscribe)`.
+    #[tokio::test]
+    async fn a_newer_reseeded_replica_refuses_to_tail_a_stale_lower_generation_owner() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let factory = Turso::open(&path).await.unwrap();
+        let apply_conn = factory.raw_connection().unwrap();
+
+        // This node adopted a fresh reseed generation (the restore ran here).
+        write_local_reseed_gen(&apply_conn, 1_700_000_000_500).await.unwrap();
+
+        let (mut primary, mut replica) = tokio::io::duplex(1 << 16);
+        // The owner advertises a LOWER generation — it still holds pre-reseed data.
+        write_frame(
+            &mut primary,
+            &Frame::Hello {
+                log_id: "stale-owner-log".into(),
+                epoch: 9,
+                applied_acks: true,
+                reseed_gen: 1_700_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        let err =
+            subscribe_and_consume_site(&mut replica, &factory, &apply_conn, "shop.test", true)
+                .await
+                .expect_err("a newer-reseeded replica must refuse to tail a stale owner");
+        let refused = err
+            .downcast_ref::<StaleOwnerRefused>()
+            .expect("the refusal must be typed StaleOwnerRefused, not a generic stream error");
+        assert_eq!(refused.local, 1_700_000_000_500);
+        assert_eq!(refused.owner, 1_700_000_000_000);
+
+        // It refused BEFORE subscribing: nothing was written back to the owner. A
+        // timeout (nothing sent) or an EOF/error are both "no subscribe" — correct;
+        // only an actual Subscribe frame is a failure.
+        if let Ok(Ok(Frame::Subscribe { .. })) =
+            tokio::time::timeout(Duration::from_millis(100), read_frame(&mut primary)).await
+        {
+            panic!("the replica must not send Subscribe when it refuses a stale owner");
+        }
+
+        // Equal generation is NOT refused here (it is an ordinary tail): prove the
+        // guard is strict, matching `reseed_decision`'s strict-greater mirror.
+        let (mut primary2, mut replica2) = tokio::io::duplex(1 << 16);
+        write_frame(
+            &mut primary2,
+            &Frame::Hello {
+                log_id: "same-gen-log".into(),
+                epoch: 9,
+                applied_acks: true,
+                reseed_gen: 1_700_000_000_500,
+            },
+        )
+        .await
+        .unwrap();
+        // It gets past the reseed checks and sends a Subscribe (then blocks waiting
+        // for batches, which never arrive — we only need to see the Subscribe).
+        let consume = tokio::spawn(async move {
+            let _ =
+                subscribe_and_consume_site(&mut replica2, &factory, &apply_conn, "shop.test", true)
+                    .await;
+        });
+        let framed = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut primary2)).await;
+        assert!(
+            matches!(framed, Ok(Ok(Frame::Subscribe { .. }))),
+            "an equal-generation owner is tailed normally (Subscribe sent), not refused: {framed:?}"
+        );
+        consume.abort();
     }
 
     #[tokio::test(start_paused = true)]
@@ -7268,12 +8157,14 @@ mod tests {
 
     /// **v0.16.2 reseed-generation adoption.** A node installing an owner's
     /// snapshot adopts the owner's reseed generation ([`RESEED_GEN_TABLE`]) in
-    /// the same install transaction, `max(local, received)`: a higher generation
-    /// is taken, a lower one never lowers it, and a zero (pre-v0.16.2 / plain-
-    /// restored) header adopts nothing. This is the cold-bootstrap arm of the
-    /// reseed signal (the `Hello`-driven path persists the generation itself);
-    /// `__`-prefixed, so a `discard_local` install leaves the adopted value
-    /// intact across a re-bootstrap.
+    /// the same install transaction, `max(local, received)`: a header at or above
+    /// the local generation is taken, and a zero (pre-v0.16.2 / plain-restored)
+    /// header adopts nothing. (A header *below* the local generation can no longer
+    /// reach `apply_snapshot` on the destructive path — the #707 discard guard
+    /// refuses it before the transaction; that case is
+    /// [`install_snapshot_refuses_to_discard_a_reseed_for_a_lower_generation`].)
+    /// `__`-prefixed, so a `discard_local` install leaves the adopted value intact
+    /// across a re-bootstrap.
     #[tokio::test]
     async fn install_snapshot_adopts_the_reseed_generation_and_never_lowers_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -7292,6 +8183,15 @@ mod tests {
             reseed_gen,
         };
 
+        // A cold install (local generation 0) of a zero-generation header adopts
+        // nothing — a pre-v0.16.2 / plain-restored owner leaves it at 0.
+        install_snapshot(&conn, &header(0), dump, false).await.unwrap();
+        assert_eq!(
+            read_local_reseed_gen(&conn).await.unwrap(),
+            0,
+            "a zero reseed generation adopts nothing"
+        );
+
         install_snapshot(&conn, &header(1_700_000_000_500), dump, true).await.unwrap();
         assert_eq!(
             read_local_reseed_gen(&conn).await.unwrap(),
@@ -7299,20 +8199,114 @@ mod tests {
             "reseed generation adopted from the header"
         );
 
-        // A lower generation never lowers it.
-        install_snapshot(&conn, &header(1_700_000_000_000), dump, true).await.unwrap();
+        // A header at the SAME generation is accepted (a legitimate same-restore
+        // re-bootstrap) and leaves the generation unchanged.
+        install_snapshot(&conn, &header(1_700_000_000_500), dump, true).await.unwrap();
         assert_eq!(read_local_reseed_gen(&conn).await.unwrap(), 1_700_000_000_500);
 
-        // A higher one is adopted.
+        // A higher one is adopted (max).
         install_snapshot(&conn, &header(1_700_000_001_000), dump, true).await.unwrap();
         assert_eq!(read_local_reseed_gen(&conn).await.unwrap(), 1_700_000_001_000);
+    }
 
-        // A zero (plain-restored / pre-v0.16.2) header adopts nothing.
-        install_snapshot(&conn, &header(0), dump, true).await.unwrap();
+    /// **#707 item 2: the destructive install refuses a lower-generation header.**
+    /// A discard-and-replace (`discard_local = true`) must never replace data this
+    /// node reseeded (`ephpm db restore --reseed`) with a peer's copy at a strictly
+    /// LOWER reseed generation. Without the guard this path was the #707 (b)/(c)
+    /// data-loss window: a schema-collision `force_reset`, or a handoff that slipped
+    /// the version gate, would discard the restore and apply the stale owner's dump,
+    /// and `apply_snapshot`'s `max(local, header)` would leave the restore's high
+    /// generation stamped on the stale rows — stale data wearing a fresh version
+    /// number that then out-ranks the real restore cluster-wide. The guard refuses
+    /// before touching anything local; the restore's rows and generation survive.
+    #[tokio::test]
+    async fn install_snapshot_refuses_to_discard_a_reseed_for_a_lower_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // Live tenant data that an operator reseeded to a fresh generation.
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('restored')", ()).await.unwrap();
+        write_local_reseed_gen(&conn, 1_700_000_000_500).await.unwrap();
+
+        let dump = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'stale owner');\n";
+        let stale_header = SnapshotHeader {
+            watermark: 40,
+            total_len: 0,
+            log_id: "stale-owner-log".into(),
+            no_copy: false,
+            epoch: 99, // a far HIGHER ownership epoch — but a LOWER reseed generation
+            reseed_gen: 1_700_000_000_000,
+        };
+
+        let err = install_snapshot(&conn, &stale_header, dump, true).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("below the local generation"), "unexpected error: {msg}");
+
+        // The restore survived untouched — the row is still the reseeded one, not
+        // the stale owner's, and the generation did not move. Scope the read so its
+        // statement is dropped before the next install reopens the table (Turso
+        // holds a `posts` reader until the `Rows` is dropped).
+        assert_eq!(row_count(&conn, "posts").await, 1, "the restore's row survived");
+        {
+            let mut rows = conn.query("SELECT title FROM posts", ()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("one surviving row");
+            let turso::Value::Text(title) = row.get_value(0).unwrap() else {
+                panic!("title is text")
+            };
+            assert_eq!(title, "restored", "the stale owner's dump was refused, not applied");
+        }
         assert_eq!(
             read_local_reseed_gen(&conn).await.unwrap(),
-            1_700_000_001_000,
-            "a zero reseed generation adopts nothing"
+            1_700_000_000_500,
+            "the adopted reseed generation is unchanged"
+        );
+
+        // A header at the SAME generation is allowed (a sibling node that adopted
+        // the same restore re-bootstrapping this one is lossless).
+        let same_header = SnapshotHeader { reseed_gen: 1_700_000_000_500, ..stale_header };
+        install_snapshot(&conn, &same_header, dump, true).await.unwrap();
+    }
+
+    /// `read_site_version` carries the reseed generation (#707), and it dominates
+    /// the resulting `SiteVersion` order, so a per-site owner advertises a
+    /// restored copy as unconditionally fresher than any pre-restore peer — and
+    /// the advert encodes/decodes it without loss. This is the read half of the
+    /// per-site reseed wiring (the settle/sampler paths both read through here).
+    #[tokio::test]
+    async fn read_site_version_includes_the_reseed_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // A pre-reseed copy: some ownership epoch, no reseed generation.
+        write_site_epoch(&conn, 9).await.unwrap();
+        let before = read_site_version(&conn).await.unwrap();
+        assert_eq!(before.reseed_gen, 0, "no reseed stamped yet");
+        assert_eq!(before.epoch, 9);
+
+        // Stamp a reseed generation (what `ephpm db restore --reseed` writes).
+        write_local_reseed_gen(&conn, 1_700_000_000_500).await.unwrap();
+        let after = read_site_version(&conn).await.unwrap();
+        assert_eq!(after.reseed_gen, 1_700_000_000_500, "read_site_version surfaces it");
+        assert_eq!(after.epoch, 9, "the epoch is unchanged by the stamp");
+
+        // It dominates the order: the reseeded copy out-ranks the pre-reseed one
+        // even though they share an epoch, and a far-higher-epoch peer still loses.
+        assert!(after > before);
+        let stale_higher_epoch =
+            crate::site_version::SiteVersion { reseed_gen: 0, epoch: u64::MAX, head: i64::MAX };
+        assert!(after > stale_higher_epoch, "reseed dominance survives any peer epoch");
+
+        // And the gossip advert round-trips the generation.
+        assert_eq!(
+            crate::site_version::decode(&crate::site_version::encode(after)),
+            Some(after),
+            "the advertised site version carries the reseed generation"
         );
     }
 
@@ -7476,6 +8470,392 @@ mod tests {
         assert!(handoff_candidates(&before[..1], "ephpm-0", &moved).is_empty());
     }
 
+    /// **#707 (d), the 3-node ownership-handoff hazard this PR's headline feature
+    /// turned on.** A reseeded copy of a site must win the ownership-handoff pull
+    /// even when a *staler* peer that merely holds a higher ownership epoch sits
+    /// earlier in HRW order. Before the version ranking + gate, `settle_round`
+    /// installed the first HRW candidate that declared a table, ignoring its
+    /// `(reseed_gen, epoch, head)` — so a warm-but-behind owner discarded its copy
+    /// and replaced it with a stale, *non-reseeded* peer's, silently undoing an
+    /// operator restore. The prior tests only covered `decide_warm_settle` on 2
+    /// nodes, which never exercises the pull, which is why this slipped through.
+    ///
+    /// This drives the exact production pull: rank the candidates by their durable
+    /// version ([`rank_candidates_by_version`]), then probe + version-gate each
+    /// ([`gate_probe_by_version`]). The `old` witness at the end reproduces the
+    /// pre-fix behaviour (first HRW candidate wins) to pin what the fix prevents.
+    #[tokio::test]
+    async fn a_reseed_wins_the_handoff_pull_over_a_staler_higher_epoch_peer() {
+        use crate::site_version::SiteVersion;
+
+        // A snapshot-header probe answer carrying a given version, one table.
+        fn data(reseed_gen: u64, epoch: u64, head: i64) -> PeerProbe {
+            PeerProbe::Data {
+                header: SnapshotHeader {
+                    watermark: head,
+                    total_len: 0,
+                    log_id: "log-x".to_string(),
+                    no_copy: false,
+                    epoch,
+                    reseed_gen,
+                },
+                dump: "CREATE TABLE t (a);".to_string(),
+                received: 0,
+            }
+        }
+
+        // This owner-elect is WARM but behind: its copy predates the restore.
+        let own = SiteVersion { reseed_gen: 0, epoch: 2, head: 50 };
+
+        // `reseed` holds the operator restore (generation 5, a fresh low epoch).
+        // `stale_hi` holds a PRE-reseed copy at a far higher ownership epoch —
+        // newer than `own`, but not the restore. `empty` holds no copy. HRW order
+        // deliberately puts the stale peer FIRST, so a first-wins pull takes it.
+        let reseed = alive("ephpm-reseed", "10.0.0.2");
+        let stale_hi = alive("ephpm-stale", "10.0.0.1");
+        let empty = alive("ephpm-empty", "10.0.0.3");
+        let candidates = vec![stale_hi.clone(), reseed.clone(), empty.clone()];
+
+        let peer_versions = vec![
+            (stale_hi.clone(), SiteVersion { reseed_gen: 0, epoch: 9, head: 100 }),
+            (reseed.clone(), SiteVersion { reseed_gen: 5, epoch: 1, head: 3 }),
+        ];
+
+        // Ranking puts the reseed first — reseed_gen dominates epoch/head — even
+        // though the stale peer leads in HRW order.
+        let ranked = rank_candidates_by_version(&candidates, &peer_versions);
+        assert_eq!(ranked[0].id, "ephpm-reseed", "the reseed must be asked first");
+
+        let found = search_peers_for_copy(&ranked, |peer: &NodeInfo| {
+            let answer = match peer.id.as_str() {
+                "ephpm-reseed" => data(5, 1, 3),
+                "ephpm-stale" => data(0, 9, 100),
+                _ => PeerProbe::NoCopy,
+            };
+            async move { gate_probe_by_version(answer, own) }
+        })
+        .await
+        .found
+        .expect("a copy newer than our own must be found");
+        assert_eq!(
+            found.0.id, "ephpm-reseed",
+            "the reseed, not the stale higher-epoch peer, must win the pull"
+        );
+        assert_eq!(found.1.reseed_gen, 5, "the installed copy is the restore");
+
+        // The gate alone refuses a copy that is NOT strictly newer than ours: a
+        // lone peer at (or below) `own` is demoted to NoCopy, so the round ends
+        // with nothing to install (→ Blocked, never a silent downgrade).
+        let only_stale = vec![stale_hi.clone()];
+        let stale_versions =
+            vec![(stale_hi.clone(), SiteVersion { reseed_gen: 0, epoch: 1, head: 0 })];
+        let ranked_stale = rank_candidates_by_version(&only_stale, &stale_versions);
+        let search_older = search_peers_for_copy(&ranked_stale, |_: &NodeInfo| async move {
+            gate_probe_by_version(data(0, 1, 0), own)
+        })
+        .await;
+        assert!(
+            search_older.found.is_none(),
+            "a peer not strictly newer than our copy must never justify a discard"
+        );
+
+        // Regression witness: the OLD path — search the HRW-ordered candidates
+        // with no version gate — returns the stale higher-epoch peer that leads
+        // HRW order, silently overwriting the reseed. Exactly what the ranking +
+        // gate above prevent.
+        let old = search_peers_for_copy(&candidates, |peer: &NodeInfo| {
+            let answer = match peer.id.as_str() {
+                "ephpm-reseed" => data(5, 1, 3),
+                "ephpm-stale" => data(0, 9, 100),
+                _ => PeerProbe::NoCopy,
+            };
+            async move { answer }
+        })
+        .await;
+        assert_eq!(
+            old.found.expect("the first-wins pull finds the stale peer").0.id,
+            "ephpm-stale",
+            "pre-fix: the first HRW candidate with a table wins — the bug this closes"
+        );
+    }
+
+    /// **#707 item 4: a known-fresher unreachable peer blocks a lower-ranked
+    /// install.** The pull search ranks candidates freshest-first and stops at the
+    /// first that answers with data. A COLD owner does not version-gate the chosen
+    /// copy, so if the freshest (reseeded) peer's snapshot body times out while a
+    /// staler peer answers, the search returns the staler copy — and installing it
+    /// would overwrite a reseed the owner never saw. `fresher_unreachable_outranks`
+    /// is the guard: it refuses when a peer *known* (durable version probe) to be
+    /// strictly fresher than the chosen copy was unreachable during the pull.
+    ///
+    /// It is **version-aware** on purpose. A blanket "any unreachable blocks a
+    /// lower copy" would break the ordinary hash-change handoff (#624), where a
+    /// node must take a lower-ranked copy past an unreachable peer that is *not*
+    /// known to be fresher — see
+    /// [`the_search_takes_the_first_peer_with_data_not_the_runner_up`], which stays
+    /// green because that unreachable peer carries no probed version.
+    #[test]
+    fn a_known_fresher_unreachable_peer_blocks_a_lower_ranked_install() {
+        use crate::site_version::SiteVersion;
+
+        let reseed_peer = alive("ephpm-reseed", "10.0.0.2");
+        let stale_peer = alive("ephpm-stale", "10.0.0.1");
+        // Durable versions: the reseed peer is strictly fresher (reseed_gen 5
+        // dominates), the stale peer merely carries a higher ownership epoch.
+        let peer_versions = vec![
+            (reseed_peer, SiteVersion { reseed_gen: 5, epoch: 1, head: 3 }),
+            (stale_peer, SiteVersion { reseed_gen: 0, epoch: 9, head: 100 }),
+        ];
+        // The chosen (installed) copy is the stale one that answered first.
+        let chosen = SiteVersion { reseed_gen: 0, epoch: 9, head: 100 };
+
+        // The reseed peer timed out during the pull → block, naming it.
+        let unreachable =
+            vec![("ephpm-reseed".to_string(), "no snapshot chunk for 30s".to_string())];
+        let blocked = fresher_unreachable_outranks(&peer_versions, &unreachable, chosen)
+            .expect("a known-fresher unreachable peer must block installing the staler copy");
+        assert_eq!(blocked.0, "ephpm-reseed");
+
+        // #624 preserved: an unreachable peer whose version was never probed cannot
+        // be shown fresher, so it never blocks a lower-ranked install.
+        let unversioned = vec![("ephpm-unknown".to_string(), "connection refused".to_string())];
+        assert!(
+            fresher_unreachable_outranks(&peer_versions, &unversioned, chosen).is_none(),
+            "an unreachable peer with no probed version never blocks (keeps the #624 handoff)"
+        );
+
+        // A known-unreachable peer at or below the chosen version does not block.
+        let not_fresher = vec![("ephpm-stale".to_string(), "x".to_string())];
+        assert!(
+            fresher_unreachable_outranks(&peer_versions, &not_fresher, chosen).is_none(),
+            "an unreachable peer not strictly fresher than the chosen copy does not block"
+        );
+
+        // And once the chosen copy IS the reseed (it answered), a staler unreachable
+        // peer does not block it.
+        let chosen_reseed = SiteVersion { reseed_gen: 5, epoch: 1, head: 3 };
+        let stale_unreachable = vec![("ephpm-stale".to_string(), "x".to_string())];
+        assert!(
+            fresher_unreachable_outranks(&peer_versions, &stale_unreachable, chosen_reseed)
+                .is_none(),
+            "nothing blocks installing the freshest copy"
+        );
+    }
+
+    /// **#707 A: the snapshot-serve decision closes the empty-site deadlock.** A
+    /// settled copy serves the full snapshot; an unsettled **cold** copy must
+    /// answer `no_copy` (so an empty site whose owner changes still converges to
+    /// `NewSite` rather than every cold holder reading as Unreachable and the new
+    /// owner Blocking forever); an unsettled **warm** copy serves the version
+    /// header only (B).
+    #[test]
+    fn snapshot_serve_decision_cold_holder_answers_no_copy_not_unreachable() {
+        assert_eq!(snapshot_serve_decision(true, false), SnapshotServe::Full);
+        assert_eq!(snapshot_serve_decision(true, true), SnapshotServe::Full);
+        assert_eq!(
+            snapshot_serve_decision(false, true),
+            SnapshotServe::NoCopy,
+            "an unsettled COLD holder answers no_copy — the empty-site deadlock fix (A)"
+        );
+        assert_eq!(
+            snapshot_serve_decision(false, false),
+            SnapshotServe::HeaderOnly,
+            "an unsettled WARM holder exposes its version but refuses the body (B)"
+        );
+    }
+
+    /// **#707 B: a warm-but-unsettled copy still exposes its version.** The
+    /// header-only serve writes the real [`SnapshotHeader`] (epoch, head, reseed
+    /// generation) so a puller's version probe learns this node's
+    /// [`SiteVersion`](crate::site_version::SiteVersion) even while it is settling
+    /// — then sends no body, so a full snapshot probe reads EOF (→ Unreachable,
+    /// which `fresher_unreachable_outranks` can act on). Without this the stale
+    /// owner's version was hidden and `decide_warm_settle` saw `best_peer=None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unsettled_warm_copy_still_serves_its_version_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.db").to_str().unwrap().to_string();
+        let mgmt = Turso::open(&path).await.unwrap();
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            write_site_epoch(&conn, 7).await.unwrap();
+            write_local_reseed_gen(&conn, 1_700_000_000_500).await.unwrap();
+        }
+
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(async move {
+            serve_snapshot_version_header_only(&mut server, &mgmt, "site-log").await
+        });
+
+        // The puller's version probe reads the header and learns the version.
+        let header = read_snapshot_header(&mut client).await.unwrap();
+        assert!(!header.no_copy, "a warm holder does not answer no_copy");
+        assert_eq!(header.epoch, 7);
+        assert_eq!(header.reseed_gen, 1_700_000_000_500);
+        assert_eq!(header.log_id, "site-log");
+
+        // A full-body probe then reads EOF → Unreachable (no body followed).
+        let body = read_snapshot_body(&mut client, &header, 1 << 20).await;
+        assert!(
+            body.is_err(),
+            "the body is refused, so a full probe reads this peer as unreachable"
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    /// **#707 C: a `discard_local` install records the CDC log floor.** Installing
+    /// a snapshot with `discard_local` switches the site's data lineage but keeps
+    /// the same `turso_cdc` log, so the pre-switch head is recorded as the floor —
+    /// the value [`serve_site_subscriber`] later refuses subscribes below.
+    #[tokio::test]
+    async fn install_snapshot_discard_local_records_the_log_floor() {
+        use litewire::backend::Backend;
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+
+        // Capture some writes so turso_cdc holds change_ids (the pre-switch
+        // history a divergent replica must not be allowed to replay).
+        let wire = Turso::builder(&path).enable_cdc_on_connect(true).build().await.unwrap();
+        let session = wire.connect().await.unwrap();
+        session
+            .execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", &[])
+            .await
+            .unwrap();
+        session.execute("INSERT INTO posts (title) VALUES ('old 1')", &[]).await.unwrap();
+        session.execute("INSERT INTO posts (title) VALUES ('old 2')", &[]).await.unwrap();
+
+        let mgmt = Turso::open(&path).await.unwrap();
+        let conn = mgmt.raw_connection().unwrap();
+        let head = current_max_change_id(&conn).await.unwrap();
+        assert!(head > 0, "precondition: turso_cdc captured the writes (head {head})");
+        assert_eq!(read_log_floor(&conn).await.unwrap(), 0, "no floor before a lineage switch");
+
+        // A discard_local install switches lineage → records floor = head.
+        let header = SnapshotHeader {
+            watermark: head,
+            total_len: 0,
+            log_id: "owner-log".into(),
+            no_copy: false,
+            epoch: 0,
+            reseed_gen: 0,
+        };
+        let dump = "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'new');\n";
+        install_snapshot(&conn, &header, dump, true).await.unwrap();
+        assert_eq!(
+            read_log_floor(&conn).await.unwrap(),
+            head,
+            "the floor is the pre-switch CDC head"
+        );
+
+        // A cold bootstrap (discard_local = false) never sets a floor.
+        let db2 = tempfile::NamedTempFile::new().unwrap();
+        let path2 = db2.path().to_str().unwrap().to_string();
+        let mgmt2 = Turso::open(&path2).await.unwrap();
+        let conn2 = mgmt2.raw_connection().unwrap();
+        install_snapshot(&conn2, &header, dump, false).await.unwrap();
+        assert_eq!(read_log_floor(&conn2).await.unwrap(), 0, "a cold bootstrap sets no floor");
+        drop(session);
+        drop(wire);
+    }
+
+    /// **#707 C, the core data-loss test (owner side).** A subscriber whose cursor
+    /// is below the log floor is answered with [`Frame::RebootstrapRequired`] (so
+    /// it re-bootstraps instead of replaying the owner's pre-switch history);
+    /// a subscriber at or above the floor is NOT refused and tails normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_site_subscriber_refuses_a_subscribe_below_the_log_floor() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let mgmt = Arc::new(Turso::open(&path).await.unwrap());
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            write_log_floor(&conn, 5).await.unwrap();
+        }
+
+        // Below the floor → RebootstrapRequired.
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let mgmt2 = Arc::clone(&mgmt);
+        let task = tokio::spawn(async move {
+            serve_site_subscriber(server, &mgmt2, "owner-log", "shop.test").await
+        });
+        match read_frame(&mut client).await.unwrap() {
+            Frame::Hello { .. } => {}
+            o => panic!("expected Hello, got {o:?}"),
+        }
+        write_frame(&mut client, &Frame::Subscribe { from_change_id: 0 }).await.unwrap();
+        match read_frame(&mut client).await.unwrap() {
+            Frame::RebootstrapRequired { floor } => assert_eq!(floor, 5),
+            o => panic!("expected RebootstrapRequired for a below-floor subscribe, got {o:?}"),
+        }
+        task.await.unwrap().unwrap();
+
+        // At the floor → NOT refused (a cold log then just holds the stream open).
+        let (mut client2, server2) = tokio::io::duplex(1 << 16);
+        let mgmt3 = Arc::clone(&mgmt);
+        let task2 = tokio::spawn(async move {
+            serve_site_subscriber(server2, &mgmt3, "owner-log", "shop.test").await
+        });
+        match read_frame(&mut client2).await.unwrap() {
+            Frame::Hello { .. } => {}
+            o => panic!("expected Hello, got {o:?}"),
+        }
+        write_frame(&mut client2, &Frame::Subscribe { from_change_id: 5 }).await.unwrap();
+        if let Ok(Ok(Frame::RebootstrapRequired { .. })) =
+            tokio::time::timeout(Duration::from_millis(300), read_frame(&mut client2)).await
+        {
+            panic!("a subscribe AT the floor must not be refused");
+        }
+        task2.abort();
+    }
+
+    /// **#707 C, the replica side.** A replica that receives
+    /// [`Frame::RebootstrapRequired`] returns the typed [`RebootstrapRequired`]
+    /// error (which the replica loop turns into a force-discard re-bootstrap)
+    /// rather than tailing and replaying pre-switch rows.
+    #[tokio::test]
+    async fn a_replica_receiving_rebootstrap_required_returns_the_typed_error() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let factory = Turso::open(&path).await.unwrap();
+        let apply_conn = factory.raw_connection().unwrap();
+        // A production replica reaches `Subscribe` only after bootstrapping, so its
+        // watermark table exists; seed it so watermark resolution succeeds here.
+        seed_watermark(&apply_conn, 0).await.unwrap();
+
+        let (mut owner, mut replica) = tokio::io::duplex(1 << 16);
+        // Owner: Hello (gen 0 — no reseed signal) then RebootstrapRequired.
+        write_frame(
+            &mut owner,
+            &Frame::Hello {
+                log_id: "owner-log".into(),
+                epoch: 0,
+                applied_acks: true,
+                reseed_gen: 0,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut owner, &Frame::RebootstrapRequired { floor: 9 }).await.unwrap();
+
+        let err =
+            subscribe_and_consume_site(&mut replica, &factory, &apply_conn, "shop.test", true)
+                .await
+                .expect_err("the replica must not tail below the floor");
+        let req = err
+            .downcast_ref::<RebootstrapRequired>()
+            .expect("the error must be the typed RebootstrapRequired, not a generic stream error");
+        assert_eq!(req.floor, 9);
+
+        // The replica sent a Subscribe before it read the refusal (it resolved its
+        // watermark and asked to tail; the owner answered re-bootstrap).
+        match tokio::time::timeout(Duration::from_millis(100), read_frame(&mut owner)).await {
+            Ok(Ok(Frame::Subscribe { .. })) => {}
+            other => panic!("expected the replica's Subscribe, got {other:?}"),
+        }
+    }
+
     /// **#654 crash-restart, the hole 47ff6093 did not close.** A promotion must
     /// re-settle the site; the role already held must not.
     ///
@@ -7518,7 +8898,7 @@ mod tests {
         // local `change_id` head (a founder accumulates bookkeeping change_ids a
         // replica's rebuilt log does not), deliberately ABOVE the interim
         // owner's watermark to prove the head tie-break is what used to go wrong.
-        let a_stale = SiteVersion { epoch: 1, head: 120 };
+        let a_stale = SiteVersion { reseed_gen: 0, epoch: 1, head: 120 };
 
         // A is SIGKILLed. B (a warm replica that adopted A's epoch 1) is
         // promoted. The re-settle this fix adds runs `settle_round`'s owner
@@ -7527,7 +8907,7 @@ mod tests {
         // writes; its stint head is small (a rebuilt log), below A's stale head.
         let b_epoch = next_owner_epoch(1, 1);
         assert_eq!(b_epoch, 2);
-        let b_interim = SiteVersion { epoch: b_epoch, head: 40 };
+        let b_interim = SiteVersion { reseed_gen: 0, epoch: b_epoch, head: 40 };
 
         // A returns warm (epoch 1) and HRW re-homes the site to it. Its durable
         // probe reads B's persisted epoch 2 regardless of advert timing, so the
@@ -7541,7 +8921,7 @@ mod tests {
         // Regression guard for the exact bug: WITHOUT the promotion re-settle,
         // B keeps the dead owner's epoch 1, the epochs tie, and the head
         // tie-break (A's 120 > B's 40) lets the returning owner serve stale.
-        let b_never_bumped = SiteVersion { epoch: 1, head: 40 };
+        let b_never_bumped = SiteVersion { reseed_gen: 0, epoch: 1, head: 40 };
         assert_eq!(
             decide_warm_settle(true, true, a_stale, Some(b_never_bumped)),
             crate::site_version::WarmSettle::Settled,

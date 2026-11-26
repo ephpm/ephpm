@@ -548,7 +548,7 @@ including a worked `/kv-put` cache pre-warm.
 
 ```bash
 ephpm db restore --site <KEY> --config <FILE> [--from <s3://bucket[/prefix] | DIR | FILE>] [--at <TIME>] [--yes]
-ephpm db restore --site default --config <FILE> --reseed [--from …] [--yes]   # whole-DB clustered: auto-converge the cluster
+ephpm db restore --site <KEY> --config <FILE> --reseed [--from …] [--yes]   # clustered: auto-converge the cluster (whole-DB or per-site)
 ```
 
 Installs a backup written by [`[db.sqlite.backup]`](/reference/config/#dbsqlitebackup)
@@ -568,17 +568,24 @@ live database. It is a **file install**, not an SQL replay, and it is
    cluster installs the file on **one** node and is **experimental**: replicas do
    **not** auto-converge onto it — a replica restarted with its old database
    tails the restored log *on top of* its old rows. So the whole cluster must be
-   stopped, and convergence then needs one of two things. On **whole-database
-   clustered**, pass `--reseed` (every node on v0.16.2+): it stamps a reseed
-   generation into the restored image so every replica force-discards its own
-   data and cold re-bootstraps from the restored node automatically — restore on
-   the lowest-ordinal node, start it first, and the others converge. Without
-   `--reseed`, convergence is the manual wipe: every other node's
-   `.db`/`-wal`/`-shm` must be **deleted** so they cold-bootstrap. The command
-   prints the full procedure and asks you to confirm; it can only check the local
-   node and says so. **Per-site clustered** is still manual (no `--reseed` yet)
-   and adds a hazard: a returning peer with a higher `SiteVersion` epoch could
-   overwrite the restore silently. See the
+   stopped, and convergence then needs one of two things. Pass **`--reseed`** —
+   supported for **whole-database clustered** (every node on v0.16.2+) and
+   **per-site clustered** (every node on v0.20.0+): it stamps a reseed generation
+   into the restored image (for per-site, into that site's `.db`) so every peer
+   that sees it force-discards its own data and cold re-bootstraps from the
+   restored node automatically — restore on one node, start it first, and the
+   others converge. For per-site the generation **dominates the `SiteVersion`
+   order** in every direction, so a stale peer cannot overwrite the restore: a
+   replica with an older generation re-bootstraps, a replica that holds the
+   restore refuses to tail a staler owner, and the handoff pull and destructive
+   install only ever take a copy at the restore's generation or newer. (This
+   per-site convergence is implemented and unit-tested, but **not yet validated on
+   a live multi-node cluster** — Turso is Beta upstream.) Without `--reseed`,
+   convergence is the manual wipe:
+   every other node's `<key>.db`/`-wal`/`-shm` must be **deleted** so they
+   cold-bootstrap, and a *plain* per-site restore still carries the
+   higher-epoch-overwrite hazard. The command prints the full procedure and asks
+   you to confirm; it can only check the local node and says so. See the
    [clustered-backup design note](/roadmap/clustered-db-backups/).
 2. **Picks the object.** With a store source (`--from s3://bucket[/prefix]`, a
    local backup directory, or `--from` omitted to use the configured
@@ -628,7 +635,7 @@ live database. It is a **file install**, not an SQL replay, and it is
 | `--from <SOURCE>` | configured dest. | `s3://bucket[/prefix]` (the prefix is the configured `s3_path`), a local backup **directory**, or a local `.db` / `.db.gz` **file**. Omit to use the configured `[db.sqlite.backup]` destination (S3 bucket or local `dir`) |
 | `--at <TIME>` | newest | Restore the newest object taken at or before this UTC time; store sources (`s3://` or a directory) only |
 | `-y`, `--yes` | off | Skip the confirmation (required when stdin is not a terminal) |
-| `--reseed` | off | **Whole-database clustered only** (rejected in single-node and per-site modes): also stamp a reseed generation into the restored image so every replica force-discards its data and cold re-bootstraps from this node on restart — the automatic replacement for the manual "wipe every other node's `.db`" step. Requires every node on v0.16.2+ (an older replica ignores the signal and stays divergent — fail-safe, not corruption) |
+| `--reseed` | off | **Clustered only** (rejected in single-node mode — no replicas to reseed): also stamp a reseed generation into the restored image so every replica/peer force-discards its data and cold re-bootstraps from this node on restart — the automatic replacement for the manual "wipe every other node's `.db`" step. Works for **whole-database clustered** (every node on v0.16.2+) and **per-site clustered** (every node on v0.20.0+); an older peer ignores the signal and stays divergent — fail-safe, not corruption |
 
 ### Exit codes
 

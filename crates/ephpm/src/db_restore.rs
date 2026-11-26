@@ -54,12 +54,13 @@ pub struct RestoreRequest {
     pub at: Option<String>,
     /// Skip the confirmation.
     pub yes: bool,
-    /// Automatically converge a **whole-database clustered** cluster: stamp a
-    /// reseed generation into the restored image so every replica force-discards
-    /// its old data and cold re-bootstraps from this node on restart (v0.16.2),
-    /// instead of the manual "wipe every other node's `.db`" step. Rejected in
-    /// single-node and per-site modes (nothing to reseed / not yet built), and
-    /// requires every node on v0.16.2+.
+    /// Automatically converge a **clustered** restore: stamp a reseed generation
+    /// into the restored image so every replica force-discards its old data and
+    /// cold re-bootstraps from this node on restart, instead of the manual "wipe
+    /// every other node's `.db`" step. Works for whole-database clustered
+    /// (v0.16.2, every node on v0.16.2+) and per-site clustered (v0.20.0 / #707,
+    /// every node on v0.20.0+). Rejected only in single-node mode — a single,
+    /// non-clustered database has no replicas to reseed.
     pub reseed: bool,
 }
 
@@ -128,12 +129,59 @@ enum ClusterRestoreKind {
     /// (fail-safe, not corruption).
     WholeDb,
     /// Per-site clustered: an HRW owner per site. **Experimental** — the same
-    /// strip applies, but a per-site non-owner that still holds the site also
-    /// tails the restored log on top of its old rows (`plan_replica_attempt`
-    /// returns `TailOnly` while a lineage is recorded), and a returning peer
-    /// with a higher `SiteVersion` epoch could overwrite the restore silently.
-    /// Convergence needs the same wipe procedure as whole-database; the planned
-    /// `--reseed` mitigation is not yet implemented.
+    /// strip applies.
+    ///
+    /// Without `--reseed`, a per-site non-owner that still holds the site tails
+    /// the restored log on top of its old rows (`plan_replica_attempt` returns
+    /// `TailOnly` while a lineage is recorded), and a returning peer with a
+    /// higher `SiteVersion` epoch could overwrite the restore silently —
+    /// convergence then needs the manual wipe procedure.
+    ///
+    /// With `--reseed` (v0.20.0, #707), the restore stamps a monotonic reseed
+    /// generation into the site's `.db` (`db_backup::stamp_reseed_generation`),
+    /// which the site's owner advertises in its CDC `Hello`/snapshot header and
+    /// which **dominates** the per-site `SiteVersion` order. The generation is
+    /// the tie-break in every direction the restore could otherwise be lost:
+    /// - a replica that sees a **newer** generation force-discards and cold
+    ///   re-bootstraps from the owner (`run_site_replication` → `ReseedRequired`
+    ///   → `force_reset`);
+    /// - a replica that itself holds a **newer** generation than the owner
+    ///   refuses to tail it (tailing would merge the owner's pre-reseed rows back
+    ///   over the restore) and backs off until the owner, or HRW, catches up;
+    /// - a destructive snapshot install refuses a header at a **lower**
+    ///   generation, so a schema-collision re-bootstrap or a handoff that slipped
+    ///   the version gate cannot replace the restore with stale rows stamped at
+    ///   the high generation;
+    /// - the ownership-settle decision (reseed dominance), the version-ranked
+    ///   ownership-handoff pull (installs only a copy at or above the local
+    ///   generation, and refuses while a *known-fresher* peer is unreachable),
+    ///   and the serving gate (an owner ships no CDC/snapshot for a site it has
+    ///   not settled) keep a stale higher-epoch peer from out-ranking or
+    ///   clobbering the restore;
+    /// - and a **CDC log floor** closes the one remaining replay path: a node
+    ///   that installs the restore over its own data (`discard_local`) keeps its
+    ///   existing `turso_cdc` log, which still holds pre-switch rows, so it
+    ///   records the head at the switch as a floor and refuses any subscribe
+    ///   below it with a re-bootstrap signal — a replica with a stale cursor
+    ///   re-bootstraps from a fresh snapshot instead of being shipped and
+    ///   replaying that pre-switch history.
+    ///
+    /// So neither the tail-on-top mix, the higher-epoch silent overwrite, nor the
+    /// stale-CDC-replay can happen. This convergence is implemented and
+    /// unit-tested but **not yet live-cluster validated** (Turso is Beta
+    /// upstream). The procedure mirrors whole-database: stop every node, `ephpm db
+    /// restore --reseed --site <key>` on one node, start it first, then the others
+    /// (which auto-converge). Requires every node on v0.20.0+; until a node is
+    /// upgraded to v0.20.0 and the reseed re-run it does not honor the signal, and
+    /// an older HRW owner actively serves its stale copy (fail-safe against
+    /// corruption, but divergent).
+    ///
+    /// **A *plain* (gen-0) restore after a prior `--reseed` is refused loudly, not
+    /// silently merged.** A plain restore strips the reseed generation to `0`, so
+    /// a replica that already adopted the old generation now out-ranks the
+    /// restored owner and refuses to replicate from it (it will not merge its
+    /// higher-generation data away) until that replica's `.db` is wiped per the
+    /// manual procedure. Prefer `--reseed` for a reseeded deployment.
     PerSite,
 }
 
@@ -205,29 +253,20 @@ fn resolve_target(config: &Config, site: &str) -> anyhow::Result<Target> {
     }
 }
 
-/// `--reseed` automates convergence for **whole-database clustered** restores
-/// only. Everywhere else it is refused rather than silently ignored: a single,
-/// non-clustered database has no replicas to reseed, and per-site clustered does
-/// not yet have the automation. Fail-closed, pointing at the right path.
+/// `--reseed` automates convergence for a **clustered** restore — whole-database
+/// (v0.16.2) or per-site (v0.20.0, #707). It is refused, rather than silently
+/// ignored, only for a single, non-clustered database: there are no replicas to
+/// reseed. Fail-closed, pointing at the right path.
 ///
 /// # Errors
 ///
-/// `reseed` is set and the target is not whole-database clustered.
+/// `reseed` is set and the target is a single, non-clustered database.
 fn ensure_reseed_allowed(reseed: bool, cluster: Option<ClusterRestoreKind>) -> anyhow::Result<()> {
-    if reseed && cluster != Some(ClusterRestoreKind::WholeDb) {
-        let why = match cluster {
-            None => {
-                "this config serves a single, non-clustered database, which has no replicas \
-                     to reseed; restore without --reseed"
-            }
-            Some(ClusterRestoreKind::PerSite) => {
-                "per-site clustered restore does not yet support automatic reseed; follow the \
-                 manual procedure (stop every node, delete this site's <key>.db/-wal/-shm on every \
-                 other node, start this node first)"
-            }
-            Some(ClusterRestoreKind::WholeDb) => unreachable!("guarded by the condition above"),
-        };
-        bail!("--reseed only applies to a whole-database clustered restore: {why}.");
+    if reseed && cluster.is_none() {
+        bail!(
+            "--reseed only applies to a clustered restore: this config serves a single, \
+             non-clustered database, which has no replicas to reseed; restore without --reseed."
+        );
     }
     Ok(())
 }
@@ -478,20 +517,67 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
             "This installs an EXPERIMENTAL whole-database clustered restore on THIS node. Confirm \
              every node is stopped and you will wipe every replica's database before starting it."
         }
-        Some(ClusterRestoreKind::PerSite) => {
+        Some(ClusterRestoreKind::PerSite) if req.reseed => {
             println!(
-                "mode:    CLUSTERED (per-site) — EXPERIMENTAL, not yet validated on a live cluster."
+                "mode:    CLUSTERED (per-site) + RESEED — EXPERIMENTAL. This installs the backup \
+                 for THIS site on THIS node and stamps a per-site reseed generation so peers \
+                 converge automatically."
             );
             eprintln!(
-                "WARNING: per-site clustered restore is EXPERIMENTAL and does not reseed peers \
-                 automatically. The strip re-seeds the site as this node's origin, but a peer that \
-                 still holds the site tails the restored log ON TOP of its old rows (a mix), and a \
-                 peer returning with a higher SiteVersion epoch could OVERWRITE the restore with \
-                 no error. Required procedure, same as whole-database: (1) stop EVERY node; (2) \
-                 restore on this node; (3) DELETE this site's <key>.db and its -wal/-shm on EVERY \
-                 OTHER node so they cold-bootstrap from here; (4) start THIS node FIRST, then the \
-                 wiped peers; (5) verify each peer re-bootstrapped the site. The planned \
-                 `--reseed` (which performs step 3) is NOT YET IMPLEMENTED. \
+                "WARNING: per-site clustered restore is EXPERIMENTAL. With --reseed the site's \
+                 restored `.db` is stamped with a new reseed generation, which the site's owner \
+                 advertises and which dominates the per-site version order — so a peer that still \
+                 holds the site force-discards it and cold re-bootstraps from the owner, a peer \
+                 that itself holds the restore refuses to tail a staler owner, the \
+                 ownership-handoff pull and the destructive snapshot install only ever take a copy \
+                 at the restore's generation or newer, and a CDC log floor makes a replica with a \
+                 stale cursor re-bootstrap instead of replaying pre-switch history — so a stale \
+                 peer returning with a higher ownership epoch cannot overwrite the restore \
+                 (implemented and unit-tested, not yet live-cluster-validated). \
+                 Required procedure: (1) stop EVERY node; (2) run `ephpm db restore --reseed \
+                 --site <key>` on one node; (3) start that node FIRST, then the others — each peer \
+                 holding the site auto-discards and re-bootstraps; (4) verify each converged (its \
+                 log shows \"force-discarding local data and cold re-bootstrapping\" then \
+                 ephpm_cdc_bootstrap_total{{outcome=\"ok\"}}). --reseed requires EVERY node \
+                 on v0.20.0 or newer; until a node is upgraded to v0.20.0 and the reseed re-run it \
+                 does not honor the signal, and if it is the site's HRW owner it ACTIVELY SERVES \
+                 its stale copy (fail-safe against corruption, but divergent), so upgrade every \
+                 node first. See https://ephpm.dev/roadmap/clustered-db-backups/ ."
+            );
+            "This installs an EXPERIMENTAL per-site clustered restore on THIS node and stamps a \
+             reseed generation so peers auto-discard and re-bootstrap. Confirm every node is \
+             stopped and every node runs v0.20.0+ before starting the cluster."
+        }
+        Some(ClusterRestoreKind::PerSite) => {
+            // F5 (per-site): a PLAIN restore of a site that was reseeded before
+            // strips this copy back to generation 0 while an un-converged peer may
+            // keep the higher generation — a later ownership move to that peer
+            // then force-discards the restore. Warn and steer to --reseed.
+            if target.path.is_file()
+                && rt.block_on(db_backup::read_reseed_generation(&target.path)).unwrap_or(0) > 0
+            {
+                eprintln!(
+                    "WARNING: this site's database carries a reseed generation (it was reseeded \
+                     before). A PLAIN restore does not re-converge the site and can be silently \
+                     UNDONE by a later ownership move to a peer still holding the newer generation \
+                     — use --reseed instead."
+                );
+            }
+            println!(
+                "mode:    CLUSTERED (per-site) — EXPERIMENTAL. This installs the backup for THIS \
+                 site on THIS node only; peers do NOT auto-converge onto it (pass --reseed to \
+                 automate convergence)."
+            );
+            eprintln!(
+                "WARNING: per-site clustered restore is EXPERIMENTAL and, WITHOUT --reseed, does \
+                 not reseed peers automatically. The strip re-seeds the site as this node's origin, \
+                 but a peer that still holds the site tails the restored log ON TOP of its old rows \
+                 (a mix), and a peer returning with a higher SiteVersion epoch could OVERWRITE the \
+                 restore with no error. Required procedure, same as whole-database: (1) stop EVERY \
+                 node; (2) restore on this node; (3) DELETE this site's <key>.db and its -wal/-shm \
+                 on EVERY OTHER node so they cold-bootstrap from here; (4) start THIS node FIRST, \
+                 then the wiped peers; (5) verify each peer re-bootstrapped the site. Pass --reseed \
+                 (every node on v0.20.0+) to automate step 3. \
                  See https://ephpm.dev/roadmap/clustered-db-backups/ ."
             );
             "This installs an EXPERIMENTAL per-site clustered restore on THIS node. Confirm every \
@@ -541,11 +627,11 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // `--reseed` (whole-database clustered only, gated above): stamp a monotonic
-    // reseed generation so a replica force-discards its old data and cold
-    // re-bootstraps from this node. After the strip (which dropped any stale
-    // reseed table) and before verification, so the integrity check sees the
-    // final shape.
+    // `--reseed` (whole-database OR per-site clustered — both are gated and
+    // warned above): stamp a monotonic reseed generation so a replica/peer
+    // force-discards its old data and cold re-bootstraps from this node. After the
+    // strip (which dropped any stale reseed table) and before verification, so the
+    // integrity check sees the final shape.
     if req.reseed {
         let now_ms = u64::try_from(
             std::time::SystemTime::now()
@@ -576,9 +662,17 @@ pub fn run_restore(req: &RestoreRequest) -> anyhow::Result<ExitCode> {
             );
             return Ok(ExitCode::from(2));
         }
+        // The upgrade floor differs by topology: whole-database reseed shipped in
+        // v0.16.2, per-site reseed in v0.20.0 (#707). A node below the floor does
+        // not honor the signal — the restore is not applied cluster-wide until
+        // every node is upgraded past it and the reseed re-run.
+        let floor = match target.cluster {
+            Some(ClusterRestoreKind::PerSite) => "v0.20.0",
+            _ => "v0.16.2",
+        };
         println!(
-            "reseed:  stamped generation {generation} — replicas on v0.16.2+ will force-discard \
-             and cold re-bootstrap from this node on restart"
+            "reseed:  stamped generation {generation} — replicas/peers on {floor}+ will \
+             force-discard and cold re-bootstrap from this node on restart"
         );
     }
 
@@ -843,12 +937,12 @@ mod tests {
         assert!(resolve_target(&config, "ghost").is_err(), "unknown vhost still fail-closed");
     }
 
-    /// `--reseed` is accepted only for a whole-database clustered target, and the
-    /// gate reads the exact `cluster` kind `resolve_target` produces: refused in
-    /// single-node (nothing to reseed) and per-site clustered (not yet built),
-    /// and a no-op without `--reseed`.
+    /// `--reseed` is accepted for every clustered target (whole-database and
+    /// per-site), and the gate reads the exact `cluster` kind `resolve_target`
+    /// produces: refused only in single-node mode (nothing to reseed), and a
+    /// no-op without `--reseed`.
     #[test]
-    fn reseed_is_whole_db_clustered_only() {
+    fn reseed_is_clustered_only() {
         // Build each mode's target via resolve_target, then gate on its kind.
         let single = {
             let tmp = tempfile::tempdir().unwrap();
@@ -879,12 +973,13 @@ mod tests {
         assert_eq!(whole_db.0, Some(ClusterRestoreKind::WholeDb));
         ensure_reseed_allowed(true, whole_db.0).expect("whole-DB clustered accepts --reseed");
 
-        // Per-site clustered: refused, pointing at the manual procedure.
+        // Per-site clustered: now accepted (#707) — convergence is automated the
+        // same way as whole-database.
         let (config, _tmp) = per_site_clustered_config();
         let per_site = resolve_target(&config, "shop").unwrap();
         assert_eq!(per_site.cluster, Some(ClusterRestoreKind::PerSite));
-        let err = ensure_reseed_allowed(true, per_site.cluster).unwrap_err();
-        assert!(format!("{err:#}").contains("per-site"), "per-site refusal: {err:#}");
+        ensure_reseed_allowed(true, per_site.cluster)
+            .expect("per-site clustered accepts --reseed (#707)");
         assert!(ensure_reseed_allowed(false, per_site.cluster).is_ok());
     }
 
@@ -1154,5 +1249,70 @@ mod tests {
         let err = run_restore(&req).unwrap_err();
         assert!(format!("{err:#}").contains("--yes"), "{err:#}");
         assert!(!tmp.path().join("db").join("shop.db").exists());
+    }
+
+    /// Per-site clustered `--reseed` (#707) installs the site's backup AND stamps
+    /// a non-zero reseed generation into the installed `<key>.db`, so the site's
+    /// owner advertises it and peers converge. Proves the CLI accepts `--reseed`
+    /// in per-site clustered mode and that the stamp lands on the per-site file
+    /// (the server-side convergence itself is covered by the unit tests in
+    /// `ephpm-server` and the live e2e harness).
+    #[test]
+    fn per_site_reseed_stamps_the_site_db() {
+        let (config, tmp) = per_site_clustered_config();
+        assert_eq!(embedded_sqlite_mode(&config), EmbeddedSqliteMode::PerSiteClustered);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // A real snapshot of a source database for `shop`.
+        let source = tmp.path().join("source.db");
+        rt.block_on(async {
+            let db = litewire::Turso::open(source.to_str().unwrap()).await.unwrap();
+            let conn = db.raw_connection().unwrap();
+            conn.execute("CREATE TABLE t (v TEXT)", ()).await.unwrap();
+            conn.execute("INSERT INTO t VALUES ('reseeded')", ()).await.unwrap();
+        });
+        let snap = tmp.path().join("snap.db");
+        rt.block_on(db_backup::snapshot_into(&source, &snap)).unwrap();
+        let gz = tmp.path().join("snap.db.gz");
+        db_backup::gzip_file(&snap, &gz).unwrap();
+
+        // Pin the listeners to certainly-closed ports so `ensure_offline` passes.
+        let cfgpath = tmp.path().join("ephpm.toml");
+        let cfg = fs::read_to_string(&cfgpath).unwrap();
+        let free = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        fs::write(
+            &cfgpath,
+            cfg.replace("[server]\n", &format!("[server]\nlisten = \"127.0.0.1:{}\"\n", free()))
+                + &format!("[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:{}\"\n", free()),
+        )
+        .unwrap();
+
+        let live = tmp.path().join("db").join("shop.db");
+        let req = RestoreRequest {
+            site: "shop".into(),
+            config: cfgpath,
+            from: Some(gz.to_string_lossy().into_owned()),
+            at: None,
+            yes: true,
+            reseed: true,
+        };
+        assert_eq!(run_restore(&req).unwrap(), ExitCode::SUCCESS);
+
+        // The restored row is present AND the file carries a reseed generation.
+        rt.block_on(async {
+            let generation = db_backup::read_reseed_generation(&live).await.unwrap();
+            assert!(
+                generation > 0,
+                "per-site --reseed must stamp a non-zero generation, got {generation}"
+            );
+            let db = litewire::Turso::open(live.to_str().unwrap()).await.unwrap();
+            let conn = db.raw_connection().unwrap();
+            let mut rows = conn.query("SELECT v FROM t", ()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the restored row");
+            assert_eq!(format!("{:?}", row.get_value(0).unwrap()), "Text(\"reseeded\")");
+        });
     }
 }

@@ -889,6 +889,17 @@ struct ClusterFixtureNode {
     /// This node's `stderr.log` under the fixture tempdir, so a failing test
     /// can inline the node's own diagnostics (see [`ClusterFixture::stderr_tail`]).
     stderr_path: PathBuf,
+    /// The ephpm binary this node was spawned from — kept so a stopped node can
+    /// be [restarted](ClusterFixture::restart_node) and so a suite can run
+    /// offline CLI commands (`ephpm db …`) against it ([`ClusterFixture::run_cli`]).
+    binary: PathBuf,
+    /// This node's config file, for the same two uses.
+    config_path: PathBuf,
+    /// This node's scratch directory (config, logs, `data/`), so a restart's
+    /// logs append to the same files.
+    node_dir: PathBuf,
+    /// This node's HTTP port, for the restart health probe.
+    http_port: u16,
 }
 
 impl ClusterFixture {
@@ -963,6 +974,10 @@ impl ClusterFixture {
                 base_url: format!("http://127.0.0.1:{http_port}"),
                 mysql_addr: format!("127.0.0.1:{mysql_port}"),
                 stderr_path,
+                binary: ephpm_binary.to_path_buf(),
+                config_path,
+                node_dir,
+                http_port,
             });
         }
 
@@ -1055,6 +1070,65 @@ impl ClusterFixture {
         {
             hard_kill(&mut child);
         }
+    }
+
+    /// Node `index`'s config file path — for running offline `ephpm db …`
+    /// commands against the stopped node (see [`run_cli`](Self::run_cli)).
+    #[must_use]
+    pub fn config_path(&self, index: usize) -> Option<&Path> {
+        self.nodes.get(index).map(|n| n.config_path.as_path())
+    }
+
+    /// Node `index`'s scratch directory (`data/`, config, logs). The embedded
+    /// database lives at `<node_dir>/data/wordpress.db` (the fixture template).
+    #[must_use]
+    pub fn node_dir(&self, index: usize) -> Option<&Path> {
+        self.nodes.get(index).map(|n| n.node_dir.as_path())
+    }
+
+    /// Restart a previously [stopped](Self::stop_node) node on the same ports,
+    /// config and data directory, and wait for it to report healthy.
+    ///
+    /// The node must have been stopped first; restarting a running node is an
+    /// error (it would clash on its own ports). Used by the reseed-convergence
+    /// sub-test, which stops a node, runs `ephpm db restore --reseed` against its
+    /// config, then brings it back up.
+    ///
+    /// # Errors
+    ///
+    /// The index is out of range, the node is still running, or the restarted
+    /// process never becomes healthy within the cluster health timeout.
+    pub async fn restart_node(&mut self, index: usize) -> Result<()> {
+        let node = self.nodes.get_mut(index).ok_or_else(|| anyhow!("no node at index {index}"))?;
+        if node.child.is_some() {
+            return Err(anyhow!("node {index} is still running; stop it before restarting"));
+        }
+        let child =
+            spawn_serve(&node.binary, &node.config_path, &node.node_dir, node.http_port, &[])
+                .await?;
+        node.child = Some(child);
+        Ok(())
+    }
+
+    /// Run `ephpm <args…>` with node `index`'s binary, appending
+    /// `--config <node's config>`, and return the finished process output.
+    ///
+    /// For offline CLI commands against a **stopped** node — `ephpm db dump` /
+    /// `ephpm db restore` refuse to run while the node holds its database open,
+    /// so the caller must [`stop_node`](Self::stop_node) first. Not a server
+    /// spawn: the command runs to completion and its stdout/stderr are captured.
+    ///
+    /// # Errors
+    ///
+    /// The index is out of range or the process could not be spawned/waited on.
+    pub fn run_cli(&self, index: usize, args: &[&str]) -> Result<std::process::Output> {
+        let node = self.nodes.get(index).ok_or_else(|| anyhow!("no node at index {index}"))?;
+        Command::new(&node.binary)
+            .args(args)
+            .arg("--config")
+            .arg(&node.config_path)
+            .output()
+            .with_context(|| format!("run ephpm {args:?} for node {index}"))
     }
 
     /// The last `max_lines` lines of node `index`'s `stderr.log`, for inlining
