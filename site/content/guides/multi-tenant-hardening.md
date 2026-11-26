@@ -442,8 +442,9 @@ independent switch.
 
 Relax the RFC-1918 tier wholesale with `tcp_egress_deny_rfc1918 = false`, or
 permit a site a specific internal destination with
-`[server.tenant_network.tcp_egress_allow]` (an allowlist hit overrides every deny
-category, including IMDS — grant narrowly). Set `tcp_egress_policy = "required"`
+`[server.tenant_network.tcp_egress_allow]` (an allowlist hit overrides the
+loopback-floor and RFC-1918 denies — but **not IMDS**, which is un-allowlistable;
+grant narrowly). Set `tcp_egress_policy = "required"`
 to refuse startup if the fence cannot attach, or `"off"` to opt out.
 
 > **It needs `CAP_BPF` + `CAP_NET_ADMIN` + `LimitMEMLOCK` and fails OPEN without

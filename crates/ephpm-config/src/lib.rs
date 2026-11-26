@@ -1947,9 +1947,11 @@ pub struct TenantNetworkConfig {
     /// keyed by **canonical site key** (the vhost directory name). Each entry is
     /// an IPv4 address (`"10.1.2.3"`, treated as `/32`), an IPv4 CIDR
     /// (`"10.0.0.0/8"`), or an `ip:port` (`"10.1.2.3:8080"`, that exact port
-    /// only). A matching entry **overrides every deny category, including IMDS**
+    /// only). A matching entry overrides the loopback-floor and RFC-1918 denies
     /// — an explicit per-site allow is a deliberate operator decision — so grant
-    /// narrowly.
+    /// narrowly. **IMDS (`169.254.0.0/16`) is the one exception: it cannot be
+    /// allowlisted** (there is no legitimate tenant reason to reach cloud
+    /// metadata); the only way to reach it is `tcp_egress_policy = "off"`.
     ///
     /// IPv6 egress allowlisting is not supported (the deny ranges are IPv4
     /// concepts; a native-IPv6 destination is never fenced). Setting this while
@@ -2102,8 +2104,9 @@ impl TcpEgressPolicy {
 }
 
 /// One validated `tcp_egress_allow` destination (IPv4 only — the deny ranges
-/// the fence enforces are IPv4 concepts). A matching entry overrides every deny
-/// category the fence would otherwise apply.
+/// the fence enforces are IPv4 concepts). A matching entry overrides the
+/// loopback-floor and RFC-1918 denies, but **not** IMDS (`169.254.0.0/16`),
+/// which is un-allowlistable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpEgressTarget {
     /// An IPv4 network (`"10.0.0.0/8"`) or a bare address (treated as `/32`).

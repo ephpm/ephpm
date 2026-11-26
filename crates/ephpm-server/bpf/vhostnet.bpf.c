@@ -274,12 +274,16 @@ static __always_inline int egress_allowed(__u32 vhost, __u32 addr_be, __u32 dpor
 // internet stays allowed; this is an SSRF fence, not a deny-all egress wall.
 static __always_inline int egress_verdict4(__u32 vhost, __u32 addr_be, __u32 dport, __u32 flags)
 {
-    if (egress_allowed(vhost, addr_be, dport))
-        return 1; // explicit per-site allow overrides every deny below
+    // IMDS (169.254.0.0/16) is checked FIRST and is UN-ALLOWLISTABLE: there is
+    // no legitimate tenant reason to reach cloud metadata, so a per-site
+    // tcp_egress_allow entry must NOT re-open the instance-role-cred-theft path.
+    // The only way to reach it is tcp_egress_policy = "off".
     if (is_linklocal4_be(addr_be)) {
-        bump_deny(DENY_IMDS); // 169.254.0.0/16 — the critical IMDS block, always on
+        bump_deny(DENY_IMDS); // the critical IMDS block, always on
         return 0;
     }
+    if (egress_allowed(vhost, addr_be, dport))
+        return 1; // explicit per-site allow overrides the denies below (not IMDS)
     if ((flags & POL_DENY_RFC1918) && is_rfc1918_be(addr_be)) {
         bump_deny(DENY_RFC1918);
         return 0;

@@ -968,11 +968,13 @@ pub fn egress_verdict_model(
     if !egress {
         return EgressVerdict::Allow; // egress fence off
     }
-    if allowed {
-        return EgressVerdict::Allow; // explicit allow overrides every deny
-    }
+    // IMDS is checked FIRST and is UN-ALLOWLISTABLE — a per-site allow must not
+    // re-open the instance-role-cred-theft path (owner decision).
     if is_link_local(dst) {
         return EgressVerdict::Deny(EgressDenyReason::Imds); // 169.254.0.0/16, always
+    }
+    if allowed {
+        return EgressVerdict::Allow; // explicit allow overrides the denies below (not IMDS)
     }
     if deny_rfc1918 && is_rfc1918(dst) {
         return EgressVerdict::Deny(EgressDenyReason::Rfc1918);
@@ -1052,23 +1054,27 @@ mod tests {
         assert_eq!(v(false, false, false, "8.8.8.8"), EgressVerdict::Allow);
     }
 
-    /// An explicit allowlist hit overrides every deny category, IMDS included.
+    /// An explicit allowlist hit overrides the loopback-floor and RFC-1918
+    /// denies — but **NOT IMDS**: `169.254.0.0/16` is un-allowlistable (owner
+    /// decision), so a per-site allow can never re-open the metadata path.
     #[test]
-    fn allowlist_overrides_every_deny() {
-        for dst in ["169.254.169.254", "10.0.0.5", "127.0.0.1"] {
+    fn allowlist_overrides_everything_except_imds() {
+        let flags = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true };
+        // RFC-1918 and loopback: allowlist wins.
+        for dst in ["10.0.0.5", "127.0.0.1"] {
             let ip = dst.parse::<Ipv4Addr>().unwrap();
             assert_eq!(
-                egress_verdict_model(
-                    PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true },
-                    dst == "127.0.0.1",
-                    false,
-                    true,
-                    ip
-                ),
+                egress_verdict_model(flags, dst == "127.0.0.1", false, true, ip),
                 EgressVerdict::Allow,
                 "allowlisted {dst} must be allowed"
             );
         }
+        // IMDS: allowlisting it is STILL denied (checked before the allowlist).
+        assert_eq!(
+            egress_verdict_model(flags, false, false, true, "169.254.169.254".parse().unwrap()),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "allowlisting IMDS must NOT override the deny"
+        );
     }
 
     /// With RFC-1918 NOT denied, IMDS + loopback-floor still apply but RFC-1918

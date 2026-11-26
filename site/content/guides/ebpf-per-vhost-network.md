@@ -276,9 +276,11 @@ bucket (every tenant's snapshot) and other internal services. `open_basedir`,
 connect. The `connect4/6` hooks sit exactly there, and for a tagged tenant thread
 deny:
 
-- **`169.254.0.0/16` (link-local / IMDS) — always.** The critical fix; there is
-  no legitimate tenant reason to reach it. A v4-mapped `::ffff:169.254.x.x` is
-  caught the same way.
+- **`169.254.0.0/16` (link-local / IMDS) — always, and un-allowlistable.** The
+  critical fix; there is no legitimate tenant reason to reach it, so a
+  `tcp_egress_allow` entry can **not** override this deny — the only way to reach
+  IMDS is `tcp_egress_policy = "off"`. A v4-mapped `::ffff:169.254.x.x` is caught
+  the same way.
 - **Loopback (`127.0.0.0/8`, `::1`) except ePHPm's own service ports** — the
   stock `pdo_mysql` wire listener and the KV RESP listener, which `pdo_mysql` and
   phpredis legitimately use. Every *other* loopback connect (co-located services,
@@ -303,7 +305,8 @@ tcp_egress_policy = "required"       # default is "auto" (on where it can run);
 # tcp_egress_deny_rfc1918 = false    # keep IMDS + loopback fence, allow private networks
 
 # Per-site allowlist: let a site reach a specific internal API. A match overrides
-# EVERY deny category, including IMDS — grant narrowly.
+# the loopback-floor and RFC-1918 denies — but NOT IMDS (169.254.0.0/16), which
+# is un-allowlistable. Grant narrowly.
 [server.tenant_network.tcp_egress_allow]
 "shop.example" = ["10.20.0.0/16", "10.9.9.9:6379"]
 ```
