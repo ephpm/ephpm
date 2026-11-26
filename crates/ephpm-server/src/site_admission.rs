@@ -170,8 +170,11 @@ struct SiteState {
     in_flight_gauge: Gauge,
     /// `ephpm_php_site_queued{site}` — requests of this site waiting at the gate.
     queued_gauge: Gauge,
-    /// `ephpm_php_site_shed_total{site}` — requests of this site rejected at the
-    /// gate (over ceiling, no borrow, shed policy or waiter bound reached).
+    /// `ephpm_php_site_shed_total{site}` — requests of this site rejected `503` at
+    /// the gate (over ceiling with no idle slot to borrow) under the **shed**
+    /// policy, including when the per-site waiter bound was reached. Under the
+    /// default **wait** policy a gate rejection is a `504` counted by
+    /// `ephpm_http_timeouts_total{stage="site_admission"}` instead — not here.
     shed_counter: Counter,
 }
 
@@ -386,10 +389,11 @@ impl SiteAdmission {
                     .is_ok()
                 {
                     self.total_in_flight.fetch_add(1, Ordering::AcqRel);
-                    // If the slot taken sat within the reservation, that unmet
-                    // reservation is now met.
+                    // The slot taken sits at index `inf`; if that is within the
+                    // reservation it is now met. The CAS fixed `inf` as the real
+                    // index, so no stale-read drift here.
                     if inf < state.reserved.load(Ordering::Acquire) {
-                        self.unmet_reserved.fetch_sub(1, Ordering::AcqRel);
+                        self.dec_unmet();
                     }
                     return Some(self.grant(state));
                 }
@@ -398,7 +402,9 @@ impl SiteAdmission {
             // Clause 2 — over the ceiling: borrow an idle serving slot only if a
             // thread is free AND no site's unmet reservation is consumed. `total`
             // is the serialization point so two borrowers cannot both pass.
-            let total = self.total_in_flight.load(Ordering::Acquire);
+            // SeqCst so it joins the single total order with the waiter-skip pair
+            // in `release` (the lost-wakeup-avoidance Dekker pair).
+            let total = self.total_in_flight.load(Ordering::SeqCst);
             let headroom = self.unmet_reserved.load(Ordering::Acquire);
             if total.saturating_add(headroom) < self.serving_now() {
                 if self
@@ -406,9 +412,16 @@ impl SiteAdmission {
                     .compare_exchange_weak(total, total + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    // inf >= max >= reserved, so this slot is outside the
-                    // reservation — the unmet sum is unchanged.
-                    state.in_flight.fetch_add(1, Ordering::AcqRel);
+                    // Charge the site. The `inf` that routed us here is stale —
+                    // the site's own release may have landed in between — so use
+                    // the fetch_add RESULT as the real slot index: if it sits
+                    // within the reservation (possible when `reserved == max`),
+                    // that unmet reservation is now met. Guarding on the stale
+                    // `inf` would drift the sum +1 permanently.
+                    let actual = state.in_flight.fetch_add(1, Ordering::AcqRel);
+                    if actual < state.reserved.load(Ordering::Acquire) {
+                        self.dec_unmet();
+                    }
                     return Some(self.grant(state));
                 }
                 continue; // total changed under us; retry
@@ -421,6 +434,46 @@ impl SiteAdmission {
     fn grant(self: &Arc<Self>, state: &Arc<SiteState>) -> SitePermit {
         state.in_flight_gauge.increment(1.0);
         SitePermit { admission: Arc::clone(self), state: Arc::clone(state) }
+    }
+
+    /// Decrement the unmet-reservation sum, **saturating at 0**. A reservation
+    /// change racing a concurrent admit/release could otherwise order an admit's
+    /// decrement before the change's increment and wrap a `usize` to
+    /// `usize::MAX`, which would refuse every borrow box-wide until a slot freed —
+    /// a rare but nasty intermittent hard cap. Saturating closes it; the rare
+    /// reservation-change path then re-derives the exact sum (see
+    /// [`Self::sync_reserved`]).
+    fn dec_unmet(&self) {
+        let mut cur = self.unmet_reserved.load(Ordering::Acquire);
+        while cur > 0 {
+            match self.unmet_reserved.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Recompute [`Self::unmet_reserved`] from scratch by scanning every site —
+    /// `Σ max(0, reserved − in_flight)`. Used on the rare reservation-change path
+    /// instead of delta arithmetic, so a change racing in-flight updates can never
+    /// drift or wrap the sum. O(sites), off the hot path.
+    fn recompute_unmet(&self) {
+        let sum: usize = self
+            .sites
+            .iter()
+            .map(|e| {
+                let s = e.value();
+                s.reserved
+                    .load(Ordering::Acquire)
+                    .saturating_sub(s.in_flight.load(Ordering::Acquire))
+            })
+            .sum();
+        self.unmet_reserved.store(sum, Ordering::Release);
     }
 
     /// Get or create the per-site state, syncing its reservation (and the global
@@ -457,10 +510,11 @@ impl SiteAdmission {
 
     /// Fold a changed per-site `reserved` into [`Self::unmet_reserved`]. A no-op
     /// when unchanged (the overwhelmingly common case). On a change (a rare
-    /// override re-read) the unmet delta is computed against the current
-    /// in-flight count; a concurrent admit/release may make it momentarily
-    /// approximate, which only shifts a borrow decision slightly and self-corrects
-    /// as requests complete — the exact ceilings are unaffected.
+    /// override re-read) the whole sum is **re-derived by scanning sites**
+    /// ([`Self::recompute_unmet`]) rather than patched by a delta, so a change
+    /// racing concurrent in-flight updates can never drift or wrap the sum. The
+    /// exact ceilings are unaffected regardless (they are enforced by the per-site
+    /// and total CAS, not this advisory sum).
     fn sync_reserved(&self, state: &SiteState, reserved: usize) {
         if state.reserved.load(Ordering::Relaxed) == reserved {
             return;
@@ -469,18 +523,7 @@ impl SiteAdmission {
         if old == reserved {
             return;
         }
-        let inf = state.in_flight.load(Ordering::Acquire);
-        let old_unmet = old.saturating_sub(inf);
-        let new_unmet = reserved.saturating_sub(inf);
-        match new_unmet.cmp(&old_unmet) {
-            std::cmp::Ordering::Greater => {
-                self.unmet_reserved.fetch_add(new_unmet - old_unmet, Ordering::AcqRel);
-            }
-            std::cmp::Ordering::Less => {
-                self.unmet_reserved.fetch_sub(old_unmet - new_unmet, Ordering::AcqRel);
-            }
-            std::cmp::Ordering::Equal => {}
-        }
+        self.recompute_unmet();
     }
 
     /// Release one admitted slot: decrement the counters, restore any unmet
@@ -488,7 +531,11 @@ impl SiteAdmission {
     /// to one waiter. Called from [`SitePermit::drop`].
     fn release(&self, state: &SiteState) {
         let old = state.in_flight.fetch_sub(1, Ordering::AcqRel);
-        self.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+        // SeqCst so this decrement and the `total_waiting` load below form the
+        // single total order with the waiter's `total_waiting`-increment /
+        // `total_in_flight`-load pair in `acquire`/`try_admit` — the Dekker pair
+        // that makes the notify-skip lost-wakeup-free by the memory model.
+        self.total_in_flight.fetch_sub(1, Ordering::SeqCst);
         // If the freed slot sat within the reservation (`old - 1 < reserved`),
         // that reservation is unmet again.
         if old <= state.reserved.load(Ordering::Acquire) {
@@ -525,6 +572,13 @@ impl SiteAdmission {
 /// the *sum* of default ceilings near the pool size, so a tenant controlling
 /// several vhosts cannot default its way to the whole box; for one or two vhosts
 /// it is half the pool, as before.
+///
+/// `known_sites` is the vhost count at `Router::new`, so the derived ceiling is
+/// **fixed at startup**: a vhost discovered later uses the startup-derived value
+/// (the ceiling only *shrinks* as the count grows, so a late site is never
+/// under-served beyond the floor — low impact). An operator who grows the fleet
+/// substantially and wants the tighter division should restart the server, or set
+/// `[php] per_site_max_concurrency` explicitly.
 #[must_use]
 pub fn derive_max(configured: usize, pool_size: usize, known_sites: usize) -> usize {
     if configured > 0 {
@@ -719,6 +773,32 @@ mod tests {
         assert_eq!(a.total(), 9, "box filled except the VIP's 1 remaining unmet reserved slot");
         drop(v);
         drop(held);
+    }
+
+    /// A reservation *change* re-derives the unmet sum by scanning sites, so it
+    /// cannot drift or wrap even against in-flight updates (review LOW #2).
+    #[test]
+    fn reservation_change_recomputes_unmet_without_drift() {
+        let a = adm(10);
+        let vip = a.resolve_limits(Some(5), Some(3));
+        a.register_site(KEY_V, 3, vip);
+        assert_eq!(a.unmet_reserved.load(Ordering::Acquire), 3);
+
+        // VIP uses one reserved slot -> unmet falls to 2.
+        let _p = a.try_acquire(KEY_V, vip).expect("admit");
+        assert_eq!(a.unmet_reserved.load(Ordering::Acquire), 2);
+
+        // Raise the reservation to 5: sync_reserved recomputes from the scan
+        // (reserved 5, in_flight 1 -> unmet 4), not a delta that could drift.
+        let vip2 = a.resolve_limits(Some(6), Some(5));
+        a.register_site(KEY_V, 5, vip2);
+        assert_eq!(a.unmet_reserved.load(Ordering::Acquire), 4, "re-derived by scan, no drift");
+
+        // Lower it back to 0: unmet drops to 0 (no wrap).
+        let vip3 = a.resolve_limits(Some(6), Some(0));
+        a.register_site(KEY_V, 0, vip3);
+        assert_eq!(a.unmet_reserved.load(Ordering::Acquire), 0);
+        drop(_p);
     }
 
     /// Work-conserving: a lone busy site borrows every idle slot past its ceiling.
