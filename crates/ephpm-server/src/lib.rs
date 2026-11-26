@@ -3077,14 +3077,16 @@ fn start_tenant_ebpf(
     per_site_db_wire_listen: Option<&str>,
     dev_mode: bool,
 ) -> anyhow::Result<Option<Arc<tenant_ebpf::TenantEbpf>>> {
-    use ephpm_config::UnixSocketPolicy;
+    use ephpm_config::{TcpEgressPolicy, UnixSocketPolicy};
 
     let tn = &config.server.tenant_network;
     let raw_policy = tn
         .parse_unix_socket_policy()
         .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
-    // Resolve the secure default `auto` for this node. The fence can only run,
-    // and the secure default should only turn it on, where the per-thread
+    let raw_egress =
+        tn.parse_tcp_egress_policy().map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+    // Resolve the secure default `auto` for this node. The fences can only run,
+    // and the secure default should only turn them on, where the per-thread
     // tenant tag exists and the hooks are available: Linux, multi-tenant
     // (`sites_dir`), per-request mode, and not `ephpm dev`. Elsewhere `auto`
     // resolves to off so single-tenant / dev / non-Linux / worker nodes keep
@@ -3094,8 +3096,11 @@ fn start_tenant_ebpf(
         && !dev_mode
         && !config.php.is_worker_mode();
     let unix_policy = raw_policy.resolve(fenceable);
+    let egress_policy = raw_egress.resolve(fenceable);
     let opts = tenant_ebpf::LoadOptions {
         tcp_policy: tn.ebpf_policy,
+        tcp_egress: egress_policy.is_enabled(),
+        deny_rfc1918: egress_policy.is_enabled() && tn.tcp_egress_deny_rfc1918,
         unix_fence: unix_policy.is_enabled(),
     };
 
@@ -3117,13 +3122,23 @@ fn start_tenant_ebpf(
              \"warn\" on a fenceable node to enforce it, or remove the allowlist."
         );
     }
+    if !egress_policy.is_enabled() && !tn.tcp_egress_allow.is_empty() {
+        tracing::warn!(
+            policy = %tn.tcp_egress_policy,
+            sites = tn.tcp_egress_allow.len(),
+            "tenant_network: tcp_egress_allow is set but the TCP egress fence is OFF on this node \
+             (tcp_egress_policy resolved to \"off\" — worker mode, non-Linux, single-tenant, or \
+             `ephpm dev`), so the allowlist is IGNORED. Set tcp_egress_policy = \"required\" or \
+             \"warn\" on a fenceable node to enforce it, or remove the allowlist."
+        );
+    }
 
-    if !opts.tcp_policy && !opts.unix_fence {
-        // The fence is not active. Warn about the exposure only where the
-        // operator EXPLICITLY opted out (`"off"`) on a node where the secure
-        // default would otherwise have fenced — `fenceable` captures exactly
-        // that (Linux, multi-tenant, per-request, non-dev). `auto` resolving to
-        // off (non-Linux / worker) is the feature being inapplicable, not an
+    if !opts.tcp_policy && !opts.tcp_egress && !opts.unix_fence {
+        // No fence is active. Warn about the exposure only where the operator
+        // EXPLICITLY opted out (`"off"`) on a node where the secure default
+        // would otherwise have fenced — `fenceable` captures exactly that
+        // (Linux, multi-tenant, per-request, non-dev). `auto` resolving to off
+        // (non-Linux / worker) is the feature being inapplicable, not an
         // opt-out, so it does not nag.
         if raw_policy == UnixSocketPolicy::Off && fenceable {
             tracing::warn!(
@@ -3134,6 +3149,16 @@ fn start_tenant_ebpf(
                  the secure default, or set unix_socket_policy = \"required\" (Linux >= 6.7 with \
                  BTF, CAP_BPF + CAP_NET_ADMIN), to deny them all except an explicit per-site \
                  unix_socket_allow list."
+            );
+        }
+        if raw_egress == TcpEgressPolicy::Off && fenceable {
+            tracing::warn!(
+                "tenant_network: tcp_egress_policy = \"off\" on a multi-tenant node — tenant PHP \
+                 has UNRESTRICTED TCP egress and can reach 169.254.169.254 (cloud IMDS → \
+                 instance-role credentials → the S3 KV-snapshot bucket), the loopback \
+                 diagnostics/metrics/snapshot control ports, and internal RFC-1918 services \
+                 (SSRF). Remove this line for the secure default, or set tcp_egress_policy = \
+                 \"required\" (Linux with BTF, CAP_BPF + CAP_NET_ADMIN, raised RLIMIT_MEMLOCK)."
             );
         }
         return Ok(None);
@@ -3166,13 +3191,13 @@ fn start_tenant_ebpf(
     };
 
     // The best-effort posture (an explicit `"warn"`, or the secure default
-    // `"auto"` resolved on a node where the fence applies) covers the WHOLE
-    // fence setup chain when the fence is the only reason the object is being
-    // loaded: a failure anywhere in it (cgroup, object, verifier, attach) is
-    // logged at ERROR and the node runs unfenced. With `ebpf_policy = true` the
-    // base load stays fail-closed as it always was. The log names the
-    // configured policy string (`auto`/`warn`) so it is never misleading.
-    let warn_unfenced = |e: &anyhow::Error| {
+    // `"auto"` resolved on a node where a fence applies) covers the WHOLE object
+    // setup chain when NO fail-closed policy is on: a failure anywhere (cgroup,
+    // object, verifier, attach) is logged at ERROR and the node runs unfenced.
+    // With `ebpf_policy = true` or any `"required"` policy the base load stays
+    // fail-closed. The logs name the configured policy string so they are never
+    // misleading.
+    let warn_unix_unfenced = |e: &anyhow::Error| {
         // Machine-readable signal for a fleet: the fence was intended (auto on a
         // fenceable node, or explicit warn) but degraded to unfenced. `0` ==
         // degraded; the attach-success path below sets `1`. Lets an operator
@@ -3192,27 +3217,57 @@ fn start_tenant_ebpf(
              unix_socket_policy = \"required\" to refuse startup instead."
         );
     };
-    // `auto` resolved to `Warn` above, so this also covers the secure default.
-    let fence_only_warn = !opts.tcp_policy && unix_policy == UnixSocketPolicy::Warn;
-
-    let loaded = tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
-        .context(
-            "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
-             unix_socket_policy). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
-             CAP_NET_ADMIN. It also needs a raised RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the \
-             systemd unit): BPF maps are charged against memlock and the loader cannot raise the \
-             limit itself under NoNewPrivileges (no CAP_SYS_RESOURCE), so its absence surfaces as \
-             'failed to create map ... Operation not permitted' even when the capabilities are \
-             correct. Also confirm any external nft egress floor drops its blanket loopback-DROP \
-             for the ePHPm cgroup, or every sidecar connect will fail.",
+    let warn_egress_unfenced = |e: &anyhow::Error| {
+        ::metrics::gauge!(
+            "ephpm_tenant_tcp_egress_active",
+            "policy" => tn.tcp_egress_policy.clone()
+        )
+        .set(0.0);
+        tracing::error!(
+            error = %format!("{e:#}"),
+            policy = %tn.tcp_egress_policy,
+            "tenant_network: TCP egress fence could NOT be attached — starting UNFENCED on a \
+             multi-tenant node: tenant PHP has UNRESTRICTED TCP egress and can reach \
+             169.254.169.254 (cloud IMDS → instance-role credentials → the S3 KV-snapshot bucket) \
+             and internal services (audit finding F-SSRF-1). Needs Linux with BTF, CAP_BPF + \
+             CAP_NET_ADMIN and a raised RLIMIT_MEMLOCK; set tcp_egress_policy = \"required\" to \
+             refuse startup instead, or block 169.254.0.0/16 at the host firewall."
         );
+    };
+    // Fail closed if the sidecar feature is on (always has been) or ANY fence is
+    // explicitly `"required"`. Otherwise every active policy is best-effort
+    // (`auto` resolved to `Warn`, or explicit `warn`), so a base-load failure
+    // degrades to unfenced instead of refusing startup.
+    let base_required = opts.tcp_policy
+        || egress_policy == TcpEgressPolicy::Required
+        || unix_policy == UnixSocketPolicy::Required;
+
+    let loaded =
+        tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
+            .context(
+                "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
+             tcp_egress_policy / unix_socket_policy). Requires Linux >= 5.10 with \
+             CONFIG_CGROUP_BPF + BTF and CAP_BPF + CAP_NET_ADMIN. It also needs a raised \
+             RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the systemd unit): BPF maps are charged \
+             against memlock and the loader cannot raise the limit itself under NoNewPrivileges \
+             (no CAP_SYS_RESOURCE), so its absence surfaces as 'failed to create map ... Operation \
+             not permitted' even when the capabilities are correct. Also confirm any external nft \
+             egress floor drops its blanket loopback-DROP for the ePHPm cgroup, or every sidecar \
+             connect will fail.",
+            );
     let handle = match loaded {
         Ok(handle) => handle,
-        Err(e) if fence_only_warn => {
-            warn_unfenced(&e);
+        Err(e) if base_required => return Err(e),
+        Err(e) => {
+            // Best-effort: degrade to unfenced, warning per active policy.
+            if opts.tcp_egress {
+                warn_egress_unfenced(&e);
+            }
+            if opts.unix_fence {
+                warn_unix_unfenced(&e);
+            }
             return Ok(None);
         }
-        Err(e) => return Err(e),
     };
 
     if let Some(range) = range {
@@ -3223,6 +3278,41 @@ fn start_tenant_ebpf(
             max_per_vhost = tn.max_sidecar_ports_per_vhost,
             ?infra_ports,
             "tenant_network: eBPF per-vhost policy loaded and attached"
+        );
+    }
+
+    if opts.tcp_egress {
+        // The connect4/6 programs are already attached by load_and_attach (and
+        // POL_EGRESS is set), so the egress fence is live once the per-site
+        // allowlist is written. Write it BEFORE announcing the fence active so
+        // the first request never races the operator's own allowlist.
+        let allow = tn
+            .parse_tcp_egress_allow()
+            .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+        let mut entries = 0usize;
+        for (site, targets) in &allow {
+            handle.set_egress_allow(site, targets)?;
+            entries += targets.len();
+        }
+        // `1` == attached and enforcing; a degraded load set `0` above.
+        ::metrics::gauge!(
+            "ephpm_tenant_tcp_egress_active",
+            "policy" => tn.tcp_egress_policy.clone()
+        )
+        .set(1.0);
+        // Install the handle as the source of the per-reason deny counters,
+        // sampled on each Prometheus scrape.
+        tenant_ebpf::register_egress_source(&handle);
+        tracing::info!(
+            policy = %tn.tcp_egress_policy,
+            deny_rfc1918 = opts.deny_rfc1918,
+            sites_allowlisted = allow.len(),
+            allow_entries = entries,
+            ?infra_ports,
+            "tenant_network: TCP egress fence attached (cgroup/connect4+6) — tenant PHP is denied \
+             egress to 169.254.0.0/16 (IMDS), loopback except ePHPm's own service ports, and \
+             RFC-1918 (when deny_rfc1918); public egress and the per-site tcp_egress_allow list \
+             are permitted"
         );
     }
 
@@ -3270,10 +3360,12 @@ fn start_tenant_ebpf(
                 // unreachable here (`opts.unix_fence` is false for `Off`, and
                 // `resolve` never yields `Auto`); folded in for exhaustiveness.
                 UnixSocketPolicy::Warn | UnixSocketPolicy::Off | UnixSocketPolicy::Auto => {
-                    warn_unfenced(&e);
-                    if !opts.tcp_policy {
+                    warn_unix_unfenced(&e);
+                    if !opts.tcp_policy && !opts.tcp_egress {
                         // Nothing left for the tag to serve: drop the object
                         // rather than pay a per-request map write for no policy.
+                        // (If the sidecar feature or the TCP egress fence is on,
+                        // the connect programs still use the tag, so keep it.)
                         return Ok(None);
                     }
                 }

@@ -132,7 +132,8 @@ fn tenant_unix_connects_are_denied_unless_allowlisted_per_site() {
     dgram_srv.set_read_timeout(Some(Duration::from_millis(500))).ok();
 
     let cgroup = leaf.to_str().unwrap();
-    let opts = LoadOptions { tcp_policy: false, unix_fence: true };
+    let opts =
+        LoadOptions { tcp_policy: false, tcp_egress: false, deny_rfc1918: false, unix_fence: true };
     let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[], &opts)
         .expect("load vhostnet BPF (need CAP_BPF and a real, non-placeholder object)");
 

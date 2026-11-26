@@ -156,6 +156,150 @@ struct {
     __type(value, __u8);
 } infra_ports SEC(".maps");
 
+// ---- TCP egress fence (audit finding F-SSRF-1) -----------------------------
+//
+// Runtime policy flags, set once at load by ePHPm from the resolved
+// [server.tenant_network] config. [0] is a bitmask of POL_* below. The same
+// connect4/6 programs serve both the sidecar feature (ebpf_policy) and the
+// egress fence (tcp_egress_policy); which branches run is decided by these
+// flags, so one object covers every combination without a recompile.
+#define POL_SIDECAR      (1u << 0) // ebpf_policy: virtual-port rewrite + ownership + loopback floor
+#define POL_EGRESS       (1u << 1) // tcp_egress_policy: IMDS / loopback-except-infra / (opt) RFC-1918 deny
+#define POL_DENY_RFC1918 (1u << 2) // under POL_EGRESS, also deny RFC-1918
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} policy SEC(".maps");
+
+// Per-site egress CIDR allowlist (IPv4), an LPM trie. Key is {prefixlen, vhost
+// (network order), addr (network order)}: the top 32 bits (vhost) are always
+// matched exactly (every entry has prefixlen >= 32), the next up-to-32 bits are
+// the CIDR. A hit means "this vhost may reach this destination on ANY port",
+// and it OVERRIDES every deny category (including IMDS) — an explicit per-site
+// allow is a deliberate operator decision. ePHPm writes it at startup from
+// [server.tenant_network] tcp_egress_allow.
+struct egress_cidr_key_t {
+    __u32 prefixlen;
+    __u32 vhost; // network order, matched exactly (prefixlen >= 32)
+    __u32 addr;  // network order (user_ip4)
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 4096);
+    __type(key, struct egress_cidr_key_t);
+    __type(value, __u8);
+    __uint(map_flags, BPF_F_NO_PREALLOC); // required for LPM_TRIE
+} egress_cidr SEC(".maps");
+
+// Per-site exact ip:port egress allowlist. Same override semantics as
+// egress_cidr but for a specific destination port only.
+struct egress_hostport_key_t {
+    __u32 vhost; // host order (internal id)
+    __u32 addr;  // network order (user_ip4)
+    __u32 port;  // host order (dport)
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct egress_hostport_key_t);
+    __type(value, __u8);
+} egress_hostport SEC(".maps");
+
+// Count of denied tenant connects by reason, sampled by ePHPm for the
+// ephpm_tenant_tcp_egress_denied_total metric. Index = DENY_* below.
+#define DENY_IMDS     0
+#define DENY_LOOPBACK 1
+#define DENY_RFC1918  2
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 3);
+    __type(key, __u32);
+    __type(value, __u64);
+} egress_denied SEC(".maps");
+
+static __always_inline __u32 policy_flags(void)
+{
+    __u32 zero = 0;
+    __u32 *f = bpf_map_lookup_elem(&policy, &zero);
+    return f ? *f : 0;
+}
+
+static __always_inline void bump_deny(__u32 idx)
+{
+    __u64 *c = bpf_map_lookup_elem(&egress_denied, &idx);
+    if (c)
+        __sync_fetch_and_add(c, 1);
+}
+
+// 169.254.0.0/16 (link-local / cloud IMDS), network byte order.
+static __always_inline int is_linklocal4_be(__u32 ip_be)
+{
+    return (ip_be & bpf_htonl(0xffff0000)) == bpf_htonl(0xa9fe0000);
+}
+
+// RFC-1918 private ranges, network byte order.
+static __always_inline int is_rfc1918_be(__u32 ip_be)
+{
+    __u32 h = bpf_ntohl(ip_be);
+    if ((h & 0xff000000) == 0x0a000000) // 10.0.0.0/8
+        return 1;
+    if ((h & 0xfff00000) == 0xac100000) // 172.16.0.0/12
+        return 1;
+    if ((h & 0xffff0000) == 0xc0a80000) // 192.168.0.0/16
+        return 1;
+    return 0;
+}
+
+// Is (vhost, addr_be, dport) explicitly allowlisted? CIDR (any port) OR exact
+// ip:port. An allowlist hit overrides every deny category.
+static __always_inline int egress_allowed(__u32 vhost, __u32 addr_be, __u32 dport)
+{
+    struct egress_cidr_key_t ck = {
+        .prefixlen = 64,         // match vhost (32) + addr (32) fully; LPM picks the longest entry
+        .vhost = bpf_htonl(vhost),
+        .addr = addr_be,
+    };
+    if (bpf_map_lookup_elem(&egress_cidr, &ck))
+        return 1;
+    struct egress_hostport_key_t hk = {.vhost = vhost, .addr = addr_be, .port = dport};
+    if (bpf_map_lookup_elem(&egress_hostport, &hk))
+        return 1;
+    return 0;
+}
+
+// Egress verdict for a NON-loopback IPv4 destination of a tagged tenant thread
+// under POL_EGRESS: 1 = allow, 0 = deny (and a reason is counted). Public
+// internet stays allowed; this is an SSRF fence, not a deny-all egress wall.
+static __always_inline int egress_verdict4(__u32 vhost, __u32 addr_be, __u32 dport, __u32 flags)
+{
+    if (egress_allowed(vhost, addr_be, dport))
+        return 1; // explicit per-site allow overrides every deny below
+    if (is_linklocal4_be(addr_be)) {
+        bump_deny(DENY_IMDS); // 169.254.0.0/16 — the critical IMDS block, always on
+        return 0;
+    }
+    if ((flags & POL_DENY_RFC1918) && is_rfc1918_be(addr_be)) {
+        bump_deny(DENY_RFC1918);
+        return 0;
+    }
+    return 1; // public egress allowed
+}
+
+// Extract the embedded IPv4 of an ::ffff:a.b.c.d v4-mapped address; returns 1
+// and sets *v4 (network order) when mapped, else 0. A v4-mapped destination
+// reaches the IPv4 stack, so it must run the same egress rules as the bare v4
+// would — otherwise ::ffff:169.254.169.254 would bypass the IMDS block.
+static __always_inline int v4_mapped(const __u32 ip6[4], __u32 *v4)
+{
+    if (ip6[0] == 0 && ip6[1] == 0 && ip6[2] == bpf_htonl(0x0000ffff)) {
+        *v4 = ip6[3];
+        return 1;
+    }
+    return 0;
+}
+
 static __always_inline __u32 quota_max(void)
 {
     __u32 zero = 0;
@@ -222,52 +366,88 @@ int vhost_bind4(struct bpf_sock_addr *ctx) { return do_bind(ctx); }
 SEC("cgroup/bind6")
 int vhost_bind6(struct bpf_sock_addr *ctx) { return do_bind(ctx); }
 
-// ---- connect: rewrite virtual port, or authorize by ownership --------------
-
-static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback)
+// ---- connect: sidecar rewrite/ownership (POL_SIDECAR) + egress fence
+//      (POL_EGRESS) ---------------------------------------------------------
+//
+// `has_v4`/`v4_be` carry the destination's IPv4 address when one exists: the
+// bare v4 (connect4) or the embedded v4 of an ::ffff:a.b.c.d v4-mapped address
+// (connect6). Native IPv6 has has_v4 == 0. The egress-range rules are IPv4
+// concepts, so a native-IPv6 non-loopback destination is never fenced (a
+// documented limitation — IMDS/RFC-1918 are IPv4).
+static __always_inline int do_connect(struct bpf_sock_addr *ctx, int is_loopback,
+                                      int has_v4, __u32 v4_be)
 {
     __u32 *vhostp = current_vhost();
     if (!vhostp)
-        return 1; // untagged: connect unchanged
+        return 1; // untagged (an ePHPm thread, or a request that matched no vhost)
     __u32 vhost = *vhostp;
 
-    if (!is_loopback)
-        return 1; // non-loopback egress handled by the per-vhost allowlist layer
-
+    __u32 flags = policy_flags();
     __u32 dport = bpf_ntohs(ctx->user_port);
 
-    // 1) Virtual port for this vhost -> rewrite to its private real port.
-    __u64 key = ((__u64)vhost << 32) | dport;
-    __u32 *rport = bpf_map_lookup_elem(&assigned, &key);
-    if (rport) {
-        ctx->user_port = bpf_htons((__u16)*rport);
+    if (is_loopback) {
+        // 1) Sidecar virtual-port rewrite (ebpf_policy only).
+        if (flags & POL_SIDECAR) {
+            __u64 key = ((__u64)vhost << 32) | dport;
+            __u32 *rport = bpf_map_lookup_elem(&assigned, &key);
+            if (rport) {
+                ctx->user_port = bpf_htons((__u16)*rport);
+                return 1;
+            }
+        }
+
+        // 2) Shared ePHPm infra port (stock pdo_mysql wire, KV RESP) -> allow.
+        //    These are the loopback destinations a tenant is MEANT to reach.
+        if (bpf_map_lookup_elem(&infra_ports, &dport))
+            return 1;
+
+        // 3) Direct connect to an owned sidecar real port (ebpf_policy only).
+        if (flags & POL_SIDECAR) {
+            struct owner_t *o = bpf_map_lookup_elem(&port_owner, &dport);
+            if (o)
+                return (o->vhost == vhost) ? 1 : 0; // own sidecar allow; cross-vhost DENY
+        }
+
+        // 4) Explicit per-site allowlist may permit a specific loopback target.
+        if (has_v4 && egress_allowed(vhost, v4_be, dport))
+            return 1;
+
+        // 5) Loopback floor: any OTHER loopback connect is DENIED for a managed
+        //    vhost — co-located services, the diagnostics/metrics/snapshot
+        //    control ports, another process. Applies under EITHER the sidecar
+        //    feature (replacing the static nft loopback-drop) or the egress
+        //    fence. If neither governs loopback, leave it unchanged.
+        if (flags & (POL_SIDECAR | POL_EGRESS)) {
+            bump_deny(DENY_LOOPBACK);
+            return 0;
+        }
         return 1;
     }
 
-    // 2) Shared ePHPm infra port (MySQL wire, KV RESP) -> always allow.
-    if (bpf_map_lookup_elem(&infra_ports, &dport))
-        return 1;
+    // Non-loopback destination.
+    if (!(flags & POL_EGRESS))
+        return 1; // egress fence off: historical allow-all non-loopback egress
 
-    // 3) Direct connect to a real port -> authorize by ownership.
-    struct owner_t *o = bpf_map_lookup_elem(&port_owner, &dport);
-    if (o)
-        return (o->vhost == vhost) ? 1 : 0; // own sidecar allow; cross-vhost DENY
+    if (has_v4)
+        return egress_verdict4(vhost, v4_be, dport, flags);
 
-    // 4) Unowned loopback port: DENY for managed vhosts. This is the loopback
-    //    floor that REPLACES the static nft loopback-drop for tagged traffic.
-    return 0;
+    // Native IPv6 non-loopback: an explicit allowlist can never match (v4-only),
+    // and there is no v6 range fence, so allow.
+    return 1;
 }
 
 SEC("cgroup/connect4")
 int vhost_connect4(struct bpf_sock_addr *ctx)
 {
     // Whole 127.0.0.0/8, not just 127.0.0.1 — see is_loopback4_be().
-    return do_connect(ctx, is_loopback4_be(ctx->user_ip4));
+    return do_connect(ctx, is_loopback4_be(ctx->user_ip4), 1, ctx->user_ip4);
 }
 
 SEC("cgroup/connect6")
 int vhost_connect6(struct bpf_sock_addr *ctx)
 {
+    __u32 v4 = 0;
+    int has_v4 = v4_mapped(ctx->user_ip6, &v4);
     // ::1 and IPv4-mapped loopback (::ffff:127.x) — see is_loopback6().
-    return do_connect(ctx, is_loopback6(ctx->user_ip6));
+    return do_connect(ctx, is_loopback6(ctx->user_ip6), has_v4, v4);
 }

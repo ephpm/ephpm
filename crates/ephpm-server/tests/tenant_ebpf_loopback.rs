@@ -104,7 +104,8 @@ fn aliased_and_mapped_loopback_is_ownership_checked() {
     let _guard = scopeguard(move || leave_test_cgroup(&leaf_path));
 
     let cgroup = leaf.to_str().unwrap();
-    let opts = LoadOptions { tcp_policy: true, unix_fence: false };
+    let opts =
+        LoadOptions { tcp_policy: true, tcp_egress: false, deny_rfc1918: false, unix_fence: false };
     let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[3306, 6379], &opts)
         .expect("load+attach vhostnet BPF (need CAP_BPF and a real, non-placeholder object)");
     ebpf.fill_pool((20000, 20100), 8).expect("fill port pool");
@@ -216,6 +217,81 @@ fn aliased_and_mapped_loopback_is_ownership_checked() {
         Some(&format!("ALICE-SECRET-{alice_port}")[..]),
         "Alice must still reach her own sidecar, got {own:?}"
     );
+}
+
+/// Live attach + verdict test for the TCP egress fence (audit finding
+/// F-SSRF-1), egress-only (no sidecar). Needs root, like the test above.
+///
+/// Verifies the secure-by-default denies — IMDS (`169.254.169.254`), a
+/// non-infra loopback port, and an RFC-1918 destination — while the invariants
+/// the fence must NOT break hold: ePHPm's own infra port stays reachable and
+/// public egress is not denied by the fence. The cgroup/connect hook runs at
+/// `connect(2)` time, before routing, so a denied destination returns `EPERM`
+/// even when it would otherwise be unroutable.
+#[test]
+#[ignore = "needs root (CAP_BPF/CAP_NET_ADMIN) + writable cgroup v2; run manually"]
+fn egress_fence_denies_imds_loopback_and_rfc1918() {
+    let Some(leaf) = enter_test_cgroup() else {
+        return; // environment can't support the test; skip.
+    };
+    let leaf_path = leaf.clone();
+    let _guard = scopeguard(move || leave_test_cgroup(&leaf_path));
+    let cgroup = leaf.to_str().unwrap();
+
+    // Egress fence only — no sidecar. Deny IMDS / loopback-except-infra /
+    // RFC-1918; 3306 is ePHPm's own infra port.
+    let opts =
+        LoadOptions { tcp_policy: false, tcp_egress: true, deny_rfc1918: true, unix_fence: false };
+    let ebpf = TenantEbpf::load_and_attach(Some(cgroup), &[3306], &opts)
+        .expect("load+attach egress fence (need CAP_BPF and a real, non-placeholder object)");
+
+    // Infra listener on 3306 (untagged bind => not touched by the fence).
+    let infra = TcpListener::bind("127.0.0.1:3306").expect("bind infra 3306");
+    std::thread::spawn(move || {
+        for s in infra.incoming().flatten() {
+            let mut s = s;
+            let _ = s.write_all(b"INFRA-3306-OK");
+        }
+    });
+
+    // Probe as a tagged tenant thread (the fence only governs tagged threads).
+    let _tag = ebpf.tag_current_thread("alice");
+
+    let imds = probe(SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80)));
+    assert!(is_denied(&imds), "IMDS 169.254.169.254:80 must be EPERM, got {imds:?}");
+
+    let loopback = probe(SocketAddr::from((Ipv4Addr::LOCALHOST, 9999)));
+    assert!(
+        is_denied(&loopback),
+        "non-infra loopback 127.0.0.1:9999 must be EPERM, got {loopback:?}"
+    );
+
+    let rfc1918 = probe(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 9)));
+    assert!(is_denied(&rfc1918), "RFC-1918 10.0.0.5:9 must be EPERM, got {rfc1918:?}");
+
+    // --- Invariants the fence must NOT break ---
+
+    // ePHPm's own infra port stays reachable and serves its marker.
+    let infra_probe = probe(SocketAddr::from((Ipv4Addr::LOCALHOST, 3306)));
+    assert_eq!(
+        infra_probe.as_ref().ok().and_then(Clone::clone).as_deref(),
+        Some("INFRA-3306-OK"),
+        "infra port 3306 must stay reachable, got {infra_probe:?}"
+    );
+
+    // Public egress must NOT be denied by the fence. 192.0.2.1 (TEST-NET-1) is
+    // unroutable here, so expect a timeout/unreachable, never EPERM.
+    let public = probe(SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9)));
+    assert!(
+        !is_denied(&public),
+        "public egress must not be denied by the egress fence, got {public:?}"
+    );
+
+    // The per-reason deny counters incremented (imds, loopback, rfc1918 > 0).
+    let counts = ebpf.sample_egress_denied().expect("egress fence active");
+    assert!(counts[0] >= 1, "imds deny counter: {counts:?}");
+    assert!(counts[1] >= 1, "loopback deny counter: {counts:?}");
+    assert!(counts[2] >= 1, "rfc1918 deny counter: {counts:?}");
 }
 
 /// Minimal drop-guard so cgroup teardown runs even if an assertion panics

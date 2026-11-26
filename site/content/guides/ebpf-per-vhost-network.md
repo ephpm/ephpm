@@ -31,9 +31,14 @@ programs to ePHPm's cgroup. From that one per-thread tag it delivers:
 Untagged traffic (anything that is not a per-vhost request) passes through
 untouched.
 
-A separate switch in the same section, `unix_socket_policy`, fences tenant
-**AF_UNIX** connects behind a per-site allowlist (empty = deny all). It needs
-Linux ≥ 6.7 and is described in its own section below.
+Two separate switches in the same section harden tenant egress and are **on by
+default**, independent of `ebpf_policy`:
+
+- `tcp_egress_policy` — the **TCP egress fence** (audit finding F-SSRF-1): deny a
+  tenant thread's connect to cloud IMDS (`169.254.0.0/16`), loopback-except-infra,
+  and RFC-1918. Described in its own section below.
+- `unix_socket_policy` — fence tenant **AF_UNIX** connects behind a per-site
+  allowlist (empty = deny all). Needs Linux ≥ 6.7; described below.
 
 ## Requirements
 
@@ -256,6 +261,104 @@ database admin sockets).
   has been developed and exercised on **x86_64 only**; treat live enforcement on
   arm64 as experimental and verify it (`bpftool`, a denied connect, the health
   field above) before relying on it there.
+
+## TCP egress fence (`tcp_egress_policy`)
+
+**Status: Linux only, on by default (`tcp_egress_policy = "auto"`) on a
+multi-tenant node, independent of `ebpf_policy`.**
+
+Out of the box tenant PHP had **unrestricted TCP egress** (multi-tenant breakout
+audit finding F-SSRF-1). The dangerous consequence on a cloud host: a tenant can
+`connect()` to `169.254.169.254` — the instance metadata service (IMDS) — read
+the node's instance-role credentials, and with them reach the S3 KV-snapshot
+bucket (every tenant's snapshot) and other internal services. `open_basedir`,
+`disable_functions` and the AF_UNIX fence do nothing against a plain outbound TCP
+connect. The `connect4/6` hooks sit exactly there, and for a tagged tenant thread
+deny:
+
+- **`169.254.0.0/16` (link-local / IMDS) — always.** The critical fix; there is
+  no legitimate tenant reason to reach it. A v4-mapped `::ffff:169.254.x.x` is
+  caught the same way.
+- **Loopback (`127.0.0.0/8`, `::1`) except ePHPm's own service ports** — the
+  stock `pdo_mysql` wire listener and the KV RESP listener, which `pdo_mysql` and
+  phpredis legitimately use. Every *other* loopback connect (co-located services,
+  the diagnostics/metrics/snapshot control ports, another process) is denied.
+- **RFC-1918 (`10/8`, `172.16/12`, `192.168/16`)** — by default, closing
+  internal-network SSRF and cluster-peer reach. Relax this one tier with
+  `tcp_egress_deny_rfc1918 = false`, or permit specific destinations per site.
+
+**Public-internet egress stays allowed** — a tenant calling a public API is
+normal; this is an SSRF fence, not a deny-all egress wall. Denied connects fail
+with `EPERM` at the syscall (the hook runs before routing, so even an unroutable
+IMDS address returns `EPERM`, not a hang). ePHPm's own threads carry no tag and
+are never fenced.
+
+```toml
+[server]
+sites_dir = "/srv/ephpm/sites"
+
+[server.tenant_network]
+tcp_egress_policy = "required"       # default is "auto" (on where it can run);
+                                     # "warn" (start unfenced on failure), "off" to opt out
+# tcp_egress_deny_rfc1918 = false    # keep IMDS + loopback fence, allow private networks
+
+# Per-site allowlist: let a site reach a specific internal API. A match overrides
+# EVERY deny category, including IMDS — grant narrowly.
+[server.tenant_network.tcp_egress_allow]
+"shop.example" = ["10.20.0.0/16", "10.9.9.9:6379"]
+```
+
+Allowlist entries are an IPv4 address (treated as `/32`), an IPv4 CIDR (any
+port), or `ip:port` (that exact port). IPv6 allowlisting is unsupported — the
+deny ranges are IPv4 concepts, and a native-IPv6 destination is never fenced (a
+documented gap; a tenant on a v6-routed internal network is not covered).
+
+### Fail-closed behaviour
+
+Same four values and failure policy as `unix_socket_policy`:
+
+| Value | Fence attaches | Fence cannot attach (missing `CAP_BPF`/`CAP_NET_ADMIN`, `LimitMEMLOCK` too low, no BTF) |
+|---|---|---|
+| `"auto"` (default) | tenant TCP egress fenced on a node where the fence can run; inert elsewhere | ERROR logged, node starts **unfenced** — same as `"warn"` |
+| `"required"` | tenant TCP egress fenced | **startup refused** — the hard-guarantee posture for a node that must never leak IMDS |
+| `"warn"` | tenant TCP egress fenced | ERROR logged, node starts **unfenced** |
+| `"off"` | nothing loaded (explicit opt-out) | a node where the fence would otherwise run logs one WARN naming the IMDS exposure |
+
+> **It fails OPEN without privileges.** Like every eBPF fence here, this needs
+> `CAP_BPF` + `CAP_NET_ADMIN` + `LimitMEMLOCK=infinity`. Under an unprivileged
+> service user BPF map creation returns `EPERM`, so on `"auto"`/`"warn"` the
+> fence logs an ERROR and **serves with tenant IMDS egress wide open**. For a
+> security-sensitive deploy use `"required"` (refuse to serve without the fence),
+> grant the capabilities (systemd / container settings above), **and** block
+> `169.254.0.0/16` at the host firewall or require IMDSv2 with a hop limit of 1
+> as defence-in-depth — the single most important mitigation if you cannot grant
+> the capabilities.
+
+### Verifying it is on
+
+The startup log carries `tenant_network: TCP egress fence attached
+(cgroup/connect4+6)`. The gauge
+[`ephpm_tenant_tcp_egress_active{policy}`](/reference/metrics/) is `1` when
+enforcing and `0` when intended but degraded to unfenced — **alert on `== 0`**,
+since the ordinary systemd hardening (a `CapabilityBoundingSet` without
+`CAP_BPF`/`CAP_NET_ADMIN`) trips the degrade path on day one. The counter
+`ephpm_tenant_tcp_egress_denied_total{reason="imds"|"loopback"|"rfc1918"}` shows
+what is being blocked; a rising `imds` rate is a tenant probing the metadata
+service.
+
+### Caveats
+
+- **IPv6 is not fenced.** Only IPv4 (and v4-mapped IPv6) destinations are
+  classified; a native-IPv6 egress is allowed. IMDS and RFC-1918 are IPv4
+  concepts, but an internal service on a v6 ULA is not covered here — use the
+  host firewall for v6.
+- **Scope is the server's request path.** `ephpm php --site` and the distributed
+  cron run tenant code in a process ePHPm does not tag; worker mode is not
+  supported.
+- **The allowlist matches the connect address, not a hostname.** A tenant
+  resolving `metadata.google.internal` still hits the fence at the *resolved*
+  `169.254.169.254`, so DNS tricks do not bypass it — but an allowlist entry must
+  be the IP/CIDR, not a name.
 
 ## Known limitation
 
