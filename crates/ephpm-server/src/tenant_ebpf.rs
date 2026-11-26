@@ -63,24 +63,38 @@
 //! a previous request's vhost identity into the next request (a cross-tenant
 //! leak of exactly the kind the per-site DB/KV/WS scoping already guards against).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
-use ephpm_config::UnixSocketTarget;
+use ephpm_config::{TcpEgressTarget, UnixSocketTarget};
 
 /// Which policies [`TenantEbpf::load_and_attach`] attaches. The `vhostnet`
 /// object (and its maps, including the per-thread `tag`) is loaded whenever
-/// either is on; the programs are attached per switch.
+/// any is on; the programs are attached per switch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadOptions {
-    /// `[server.tenant_network] ebpf_policy`: `cgroup/bind4+6` + `connect4+6`
-    /// (loopback authorization, sidecar port-rewrite, per-vhost quota).
+    /// `[server.tenant_network] ebpf_policy`: the sidecar feature —
+    /// `cgroup/bind4+6` transparent port-rewrite + per-vhost quota, and the
+    /// `cgroup/connect4+6` loopback-authorization / ownership path.
     pub tcp_policy: bool,
+    /// `[server.tenant_network] tcp_egress_policy` is on (audit finding
+    /// F-SSRF-1): attach `cgroup/connect4+6` and deny tagged-tenant TCP egress
+    /// to IMDS / loopback-except-infra / (optionally) RFC-1918. Shares the
+    /// connect programs with [`tcp_policy`](Self::tcp_policy).
+    pub tcp_egress: bool,
+    /// Under [`tcp_egress`](Self::tcp_egress), also deny RFC-1918
+    /// (`10/8`, `172.16/12`, `192.168/16`).
+    pub deny_rfc1918: bool,
     /// `[server.tenant_network] unix_socket_policy != "off"`: reserve the
     /// shared-map fds the AF_UNIX fence needs so
     /// [`TenantEbpf::attach_unix_fence`] can be called afterwards.
     pub unix_fence: bool,
 }
+
+/// Index of a TCP-egress deny reason in the kernel `egress_denied` counter
+/// array (kept in sync with `DENY_*` in `bpf/vhostnet.bpf.c`). Used to label
+/// the `ephpm_tenant_tcp_egress_denied_total` metric.
+pub const EGRESS_DENY_REASONS: [&str; 3] = ["imds", "loopback", "rfc1918"];
 
 /// One numeric id per canonical site key. The kernel `tag`/`assigned`/
 /// `port_owner` maps key on `u32` vhost ids, not strings; this assigns a stable
@@ -120,11 +134,12 @@ mod imp {
     use std::sync::Mutex;
 
     use anyhow::{Context, anyhow};
+    use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie};
     use aya::maps::{Array, HashMap as AyaHashMap, MapData, Queue};
     use aya::programs::{CgroupAttachMode, CgroupSockAddr};
     use ephpm_config::UNIX_PATH_MAX;
 
-    use super::{Arc, LoadOptions, Result, SiteIdRegistry, UnixSocketTarget};
+    use super::{Arc, LoadOptions, Result, SiteIdRegistry, TcpEgressTarget, UnixSocketTarget};
     use crate::tenant_unix_fence::{MapFds, UnixFence};
 
     /// Compiled BPF object, produced by `build.rs` (`clang -target bpf`) and
@@ -168,6 +183,45 @@ mod imp {
     // valid for any bit pattern — matching `struct unix_allow_key_t` exactly.
     unsafe impl aya::Pod for UnixAllowKey {}
 
+    /// Data portion of the `egress_cidr` LPM-trie key — the 8 bytes after the
+    /// prefix length. `vhost` is matched exactly (every entry has `prefix_len >=
+    /// 32`); `addr` is the IPv4 destination. Both are stored **big-endian** so
+    /// the kernel's MSB-first prefix match treats the vhost id as the high 32
+    /// bits and the address as the next 32. Matches the fields after `prefixlen`
+    /// in `struct egress_cidr_key_t`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CidrData {
+        vhost: u32, // big-endian
+        addr: u32,  // network order (big-endian)
+    }
+    // SAFETY: `CidrData` is `#[repr(C)]`, two `u32`s only — 8 bytes, no padding,
+    // no pointers, valid for any bit pattern — the invariants `aya::Pod`
+    // requires. It is the trie key's data half (`Key<CidrData>` prepends the
+    // `u32` prefix length), matching `struct egress_cidr_key_t`.
+    unsafe impl aya::Pod for CidrData {}
+
+    /// Key of the `egress_hostport` exact-match allowlist. `vhost` and `port`
+    /// are host order (hashed as raw bytes, same byte order both sides); `addr`
+    /// is network order. Matches `struct egress_hostport_key_t`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct EgressHostPortKey {
+        vhost: u32, // host order (internal id)
+        addr: u32,  // network order
+        port: u32,  // host order
+    }
+    // SAFETY: `EgressHostPortKey` is `#[repr(C)]`, three `u32`s — 12 bytes, no
+    // padding, no pointers, valid for any bit pattern — matching `struct
+    // egress_hostport_key_t` exactly.
+    unsafe impl aya::Pod for EgressHostPortKey {}
+
+    /// Runtime policy bitmask written to the kernel `policy[0]` array at load.
+    /// Kept in sync with the `POL_*` macros in `bpf/vhostnet.bpf.c`.
+    const POL_SIDECAR: u32 = 1 << 0;
+    const POL_EGRESS: u32 = 1 << 1;
+    const POL_DENY_RFC1918: u32 = 1 << 2;
+
     /// Live handle: owns the loaded programs + their fd-links (via the retained
     /// [`aya::Ebpf`]) and the maps the request path and provisioning write.
     pub struct TenantEbpf {
@@ -186,6 +240,18 @@ mod imp {
         /// Per-site AF_UNIX destination allowlist, written at startup by
         /// [`Self::set_unix_allow`]. Read by the fence programs only.
         unix_allow: Mutex<AyaHashMap<MapData, UnixAllowKey, u8>>,
+        /// Per-site TCP egress CIDR allowlist (LPM trie), written at startup by
+        /// [`Self::set_egress_allow`]. Read by `connect4/6` only.
+        egress_cidr: Mutex<LpmTrie<MapData, CidrData, u8>>,
+        /// Per-site TCP egress exact `ip:port` allowlist, written at startup by
+        /// [`Self::set_egress_allow`]. Read by `connect4/6` only.
+        egress_hostport: Mutex<AyaHashMap<MapData, EgressHostPortKey, u8>>,
+        /// Per-reason TCP-egress deny counter (`DENY_*`), incremented in-kernel
+        /// and sampled by [`Self::sample_egress_denied`] for the metric.
+        egress_denied: Mutex<Array<MapData, u64>>,
+        /// Whether the TCP egress fence (`connect4/6` + `POL_EGRESS`) is active
+        /// on this handle — set once at construction from [`LoadOptions`].
+        tcp_egress: bool,
         /// The cgroup every program attaches to, kept so the fence can be
         /// attached after the base load (its failure policy is the caller's).
         cgroup: File,
@@ -239,20 +305,51 @@ mod imp {
             let cgroup = std::fs::File::open(&cg_path)
                 .with_context(|| format!("opening cgroup {cg_path} for BPF attach"))?;
 
-            // sockaddr programs (bind/connect rewrite + authorize).
-            if opts.tcp_policy {
-                for name in ["vhost_bind4", "vhost_bind6", "vhost_connect4", "vhost_connect6"] {
-                    let prog: &mut CgroupSockAddr = bpf
-                        .program_mut(name)
-                        .ok_or_else(|| anyhow!("BPF program {name} missing from object"))?
-                        .try_into()
-                        .with_context(|| {
-                            format!("program {name} is not a cgroup/sockaddr program")
-                        })?;
-                    prog.load().with_context(|| format!("verifier rejected {name}"))?;
-                    prog.attach(&cgroup, CgroupAttachMode::Single)
-                        .with_context(|| format!("attaching {name} to {cg_path}"))?;
+            // Runtime policy flags the connect programs read (which branches
+            // run). Written BEFORE attach: the programs must never observe the
+            // zero-initialised default, which clears POL_EGRESS and so would
+            // fail OPEN (allow-all non-loopback) for the window between attach
+            // and this write. Written once; never changes after load.
+            {
+                let mut flags = 0u32;
+                if opts.tcp_policy {
+                    flags |= POL_SIDECAR;
                 }
+                if opts.tcp_egress {
+                    flags |= POL_EGRESS;
+                    if opts.deny_rfc1918 {
+                        flags |= POL_DENY_RFC1918;
+                    }
+                }
+                let mut policy: Array<_, u32> = bpf
+                    .map_mut("policy")
+                    .ok_or_else(|| anyhow!("policy map missing"))?
+                    .try_into()
+                    .context("policy map is not an ARRAY")?;
+                policy.set(0, flags, 0).context("writing policy flags")?;
+            }
+
+            // sockaddr programs. `bind4/6` (sidecar port-rewrite) attach only
+            // for the sidecar feature; `connect4/6` attach for EITHER the
+            // sidecar feature or the egress fence, which share them. Attaching
+            // `bind` for an egress-only node would wrongly rewrite every tenant
+            // bind to a sidecar port.
+            let mut to_attach: Vec<&str> = Vec::new();
+            if opts.tcp_policy {
+                to_attach.extend_from_slice(&["vhost_bind4", "vhost_bind6"]);
+            }
+            if opts.tcp_policy || opts.tcp_egress {
+                to_attach.extend_from_slice(&["vhost_connect4", "vhost_connect6"]);
+            }
+            for name in to_attach {
+                let prog: &mut CgroupSockAddr = bpf
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow!("BPF program {name} missing from object"))?
+                    .try_into()
+                    .with_context(|| format!("program {name} is not a cgroup/sockaddr program"))?;
+                prog.load().with_context(|| format!("verifier rejected {name}"))?;
+                prog.attach(&cgroup, CgroupAttachMode::Single)
+                    .with_context(|| format!("attaching {name} to {cg_path}"))?;
             }
 
             // Write nscfg[0] = {dev, ino} of /proc/self/ns/pid so the kernel can
@@ -327,6 +424,21 @@ mod imp {
                 .ok_or_else(|| anyhow!("unix_allow map missing"))?
                 .try_into()
                 .context("unix_allow map is not a HASH")?;
+            let egress_cidr: LpmTrie<_, CidrData, u8> = bpf
+                .take_map("egress_cidr")
+                .ok_or_else(|| anyhow!("egress_cidr map missing"))?
+                .try_into()
+                .context("egress_cidr map is not an LPM_TRIE")?;
+            let egress_hostport: AyaHashMap<_, EgressHostPortKey, u8> = bpf
+                .take_map("egress_hostport")
+                .ok_or_else(|| anyhow!("egress_hostport map missing"))?
+                .try_into()
+                .context("egress_hostport map is not a HASH")?;
+            let egress_denied: Array<_, u64> = bpf
+                .take_map("egress_denied")
+                .ok_or_else(|| anyhow!("egress_denied map missing"))?
+                .try_into()
+                .context("egress_denied map is not an ARRAY")?;
 
             Ok(Arc::new(Self {
                 _bpf: bpf,
@@ -334,6 +446,10 @@ mod imp {
                 port_pool: Mutex::new(port_pool),
                 quota: Mutex::new(quota),
                 unix_allow: Mutex::new(unix_allow),
+                egress_cidr: Mutex::new(egress_cidr),
+                egress_hostport: Mutex::new(egress_hostport),
+                egress_denied: Mutex::new(egress_denied),
+                tcp_egress: opts.tcp_egress,
                 cgroup,
                 shared_fds,
                 unix_fence: Mutex::new(None),
@@ -404,6 +520,83 @@ mod imp {
                 })?;
             }
             Ok(())
+        }
+
+        /// Allow `site_key` to reach every TCP destination in `targets` even
+        /// while the egress fence would otherwise deny it (audit finding
+        /// F-SSRF-1). A CIDR/bare-IP entry goes into the `egress_cidr` LPM trie
+        /// (any port); an `ip:port` entry into the `egress_hostport` exact map.
+        /// The site's vhost id is allocated now so the id the connect program
+        /// sees at request time is the same one. An allowlist hit overrides the
+        /// loopback-floor and RFC-1918 denies, but **not** IMDS
+        /// (`169.254.0.0/16`), which the connect program checks first and is
+        /// un-allowlistable.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if a map write (`bpf_map_update_elem`) fails — e.g.
+        /// the map is full (4096 entries).
+        ///
+        /// # Panics
+        ///
+        /// Panics if a map mutex is poisoned, which can only follow a panic in a
+        /// prior map write; in practice this runs once at startup before any
+        /// concurrent access.
+        pub fn set_egress_allow(&self, site_key: &str, targets: &[TcpEgressTarget]) -> Result<()> {
+            let vhost = self.site_ids.id_for(site_key);
+            for target in targets {
+                match *target {
+                    TcpEgressTarget::Cidr { addr, prefix } => {
+                        // vhost is matched exactly (32 bits) before the CIDR.
+                        // Both halves stored big-endian so the kernel's
+                        // MSB-first LPM match treats vhost as the high 32 bits.
+                        let data = CidrData { vhost: vhost.to_be(), addr: u32::from(addr).to_be() };
+                        let key = LpmKey::new(32 + u32::from(prefix), data);
+                        let mut map = self.egress_cidr.lock().expect("egress_cidr mutex poisoned");
+                        map.insert(&key, 1u8, 0).with_context(|| {
+                            format!("writing egress_cidr {addr}/{prefix} for site {site_key:?}")
+                        })?;
+                    }
+                    TcpEgressTarget::HostPort { addr, port } => {
+                        let key = EgressHostPortKey {
+                            vhost,
+                            addr: u32::from(addr).to_be(),
+                            port: u32::from(port),
+                        };
+                        let mut map =
+                            self.egress_hostport.lock().expect("egress_hostport mutex poisoned");
+                        map.insert(key, 1u8, 0).with_context(|| {
+                            format!("writing egress_hostport {addr}:{port} for site {site_key:?}")
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Whether the TCP egress fence is active on this handle (the
+        /// `connect4/6` programs attached with `POL_EGRESS` set).
+        #[must_use]
+        pub fn tcp_egress_active(&self) -> bool {
+            self.tcp_egress
+        }
+
+        /// Snapshot the per-reason TCP-egress deny counters (`[imds, loopback,
+        /// rfc1918]`), or `None` if the egress fence is not active. Read on
+        /// demand (a Prometheus scrape); a failed read of any slot yields `0`
+        /// for that reason rather than failing the whole snapshot.
+        #[must_use]
+        pub fn sample_egress_denied(&self) -> Option<[u64; 3]> {
+            if !self.tcp_egress {
+                return None;
+            }
+            let map = self.egress_denied.lock().ok()?;
+            let mut out = [0u64; 3];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let idx = u32::try_from(i).unwrap_or(0);
+                *slot = map.get(&idx, 0).unwrap_or(0);
+            }
+            Some(out)
         }
 
         /// Fill `port_pool` with every port in the (validated) `range` and set
@@ -560,7 +753,7 @@ mod imp {
 // ===========================================================================
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use super::{Arc, LoadOptions, Result, SiteIdRegistry, UnixSocketTarget};
+    use super::{Arc, LoadOptions, Result, SiteIdRegistry, TcpEgressTarget, UnixSocketTarget};
 
     /// Inert non-Linux placeholder with the same public surface as the Linux
     /// [`TenantEbpf`](super::TenantEbpf).
@@ -613,6 +806,31 @@ mod imp {
         /// # Errors
         ///
         /// Never returns an error on non-Linux.
+        pub fn set_egress_allow(
+            &self,
+            _site_key: &str,
+            _targets: &[TcpEgressTarget],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        /// Always `false` on non-Linux.
+        #[must_use]
+        pub fn tcp_egress_active(&self) -> bool {
+            false
+        }
+
+        /// Always `None` on non-Linux.
+        #[must_use]
+        pub fn sample_egress_denied(&self) -> Option<[u64; 3]> {
+            None
+        }
+
+        /// No-op on non-Linux.
+        ///
+        /// # Errors
+        ///
+        /// Never returns an error on non-Linux.
         pub fn fill_pool(&self, _range: (u16, u16), _max_per_vhost: u32) -> Result<()> {
             Ok(())
         }
@@ -638,3 +856,487 @@ mod imp {
 }
 
 pub use imp::{TagGuard, TenantEbpf};
+
+// ===========================================================================
+// TCP-egress deny counters: on-scrape injection (no background task).
+// ===========================================================================
+
+/// The live fence handle whose kernel deny-counters the metrics scrape reads.
+/// A `Weak` so registering it never keeps the handle alive past `serve()`; the
+/// render path upgrades it per scrape. One server per process, mirroring the
+/// `turso_cdc_metrics` global-registry pattern.
+static EGRESS_SOURCE: OnceLock<Mutex<Weak<TenantEbpf>>> = OnceLock::new();
+
+/// Register `handle` as the source of the `ephpm_tenant_tcp_egress_denied_total`
+/// counters. Called by `serve()` once the fence is loaded. Replacing an earlier
+/// registration (e.g. a second server in-process) is fine.
+pub fn register_egress_source(handle: &Arc<TenantEbpf>) {
+    let slot = EGRESS_SOURCE.get_or_init(|| Mutex::new(Weak::new()));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Arc::downgrade(handle);
+    }
+}
+
+/// Append the `ephpm_tenant_tcp_egress_denied_total{reason=...}` counter family
+/// to a rendered Prometheus scrape, sampled live from the kernel `egress_denied`
+/// map. Emits nothing when the fence is not active (an absent series, not a
+/// zero), matching how `render_site_gauges` handles inactive families.
+pub fn render_egress_deny_counters(out: &mut String) {
+    let Some(slot) = EGRESS_SOURCE.get() else { return };
+    let Some(handle) = slot.lock().ok().and_then(|g| g.upgrade()) else { return };
+    let Some(counts) = handle.sample_egress_denied() else { return };
+    out.push_str(
+        "# HELP ephpm_tenant_tcp_egress_denied_total Tenant TCP connects denied by the egress \
+         fence, by reason.\n",
+    );
+    out.push_str("# TYPE ephpm_tenant_tcp_egress_denied_total counter\n");
+    for (reason, count) in EGRESS_DENY_REASONS.iter().zip(counts.iter()) {
+        use std::fmt::Write as _;
+        // Writing to a String is infallible; the result is ignored deliberately.
+        let _ =
+            writeln!(out, "ephpm_tenant_tcp_egress_denied_total{{reason=\"{reason}\"}} {count}");
+    }
+}
+
+// ===========================================================================
+// Pure-Rust model of the connect-side egress verdict.
+// ===========================================================================
+
+/// A connect verdict, mirroring the return of `do_connect` in
+/// `bpf/vhostnet.bpf.c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressVerdict {
+    /// Allow the connect (possibly after a sidecar port rewrite, not modelled).
+    Allow,
+    /// Deny the connect; the field is the `DENY_*` reason index.
+    Deny(EgressDenyReason),
+}
+
+/// Why the egress fence denied a connect. Indices match `DENY_*` in the BPF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressDenyReason {
+    /// Link-local `169.254.0.0/16` (cloud IMDS).
+    Imds,
+    /// A loopback destination that is neither an ePHPm infra port nor
+    /// allowlisted.
+    Loopback,
+    /// An RFC-1918 destination, denied under `POL_DENY_RFC1918`.
+    Rfc1918,
+}
+
+/// The `POL_*` runtime flags that steer the connect verdict (mirrors the
+/// `policy[0]` bitmask in `bpf/vhostnet.bpf.c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyFlags {
+    /// `POL_SIDECAR` — the `ebpf_policy` sidecar feature is on.
+    pub sidecar: bool,
+    /// `POL_EGRESS` — the TCP egress fence is on.
+    pub egress: bool,
+    /// `POL_DENY_RFC1918` — deny RFC-1918 under the egress fence.
+    pub deny_rfc1918: bool,
+}
+
+/// Per-connection facts the v4 connect verdict depends on (mirrors the inputs
+/// `do_connect` reads in `bpf/vhostnet.bpf.c`). Bundled into a struct so the
+/// model's signature stays under the bool-parameter lint.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnFacts {
+    /// `ctx->type == SOCK_STREAM`. UDP (and anything non-TCP) is not fenced.
+    pub is_tcp: bool,
+    /// The destination classified as loopback (`is_loopback4_be`, incl. the
+    /// all-zero address `0.0.0.0`).
+    pub is_loopback: bool,
+    /// The destination port is one of ePHPm's own infra ports.
+    pub infra: bool,
+    /// The per-site `tcp_egress_allow` matches this destination.
+    pub allowed: bool,
+    /// The destination port (host order). Port 53 — DNS-over-TCP — is exempt.
+    pub dport: u16,
+    /// The IPv4 destination (for `connect6`, the embedded v4 of a v4-mapped
+    /// address).
+    pub dst: std::net::Ipv4Addr,
+}
+
+/// **Pure-Rust mirror of the egress decision in `bpf/vhostnet.bpf.c`
+/// `do_connect`** for an IPv4 (or v4-mapped-IPv6) destination of a *tagged*
+/// tenant thread, covering the branches the TCP egress fence governs (the
+/// sidecar virtual-port rewrite and ownership branches are omitted — they only
+/// reorder ALLOW outcomes). This is the unit-tested model; the live BPF is
+/// exercised by the `#[ignore]` attach test. **KEEP IN SYNC with the C** — the
+/// two must agree branch for branch.
+#[must_use]
+pub fn egress_verdict_model(flags: PolicyFlags, c: ConnFacts) -> EgressVerdict {
+    // TCP-only fence: UDP (DNS, QUIC, ...) is never touched.
+    if !c.is_tcp {
+        return EgressVerdict::Allow;
+    }
+    // DNS-over-TCP (port 53) is never fenced — a resolver is not an
+    // IMDS/control-plane/credential target.
+    if c.dport == 53 {
+        return EgressVerdict::Allow;
+    }
+    let PolicyFlags { sidecar, egress, deny_rfc1918 } = flags;
+    if c.is_loopback {
+        // (sidecar virtual-port rewrite + ownership omitted — ALLOW reorderings)
+        if c.infra {
+            return EgressVerdict::Allow; // ePHPm infra port (mysql wire, KV RESP)
+        }
+        if c.allowed {
+            return EgressVerdict::Allow; // explicit per-site allowlist
+        }
+        if sidecar || egress {
+            return EgressVerdict::Deny(EgressDenyReason::Loopback); // loopback floor
+        }
+        return EgressVerdict::Allow;
+    }
+    // Non-loopback.
+    if !egress {
+        return EgressVerdict::Allow; // egress fence off
+    }
+    // IMDS is checked FIRST and is UN-ALLOWLISTABLE — a per-site allow must not
+    // re-open the instance-role-cred-theft path (owner decision).
+    if is_link_local(c.dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Imds); // 169.254.0.0/16, always
+    }
+    if c.allowed {
+        return EgressVerdict::Allow; // explicit allow overrides the denies below (not IMDS)
+    }
+    if deny_rfc1918 && is_rfc1918(c.dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Rfc1918);
+    }
+    EgressVerdict::Allow // public egress
+}
+
+/// **Pure-Rust mirror of the NATIVE-IPv6 (non-v4-mapped) egress decision** in
+/// `connect6` / `egress_verdict6`. v6 is not allowlistable (the allowlist is
+/// IPv4 only). KEEP IN SYNC with the C.
+#[must_use]
+pub fn egress_verdict6_model(
+    flags: PolicyFlags,
+    is_tcp: bool,
+    is_loopback: bool,
+    dport: u16,
+    dst: std::net::Ipv6Addr,
+) -> EgressVerdict {
+    if !is_tcp {
+        return EgressVerdict::Allow;
+    }
+    if dport == 53 {
+        return EgressVerdict::Allow; // DNS-over-TCP
+    }
+    if is_loopback {
+        // `::` and `::1`; the loopback floor applies under either policy.
+        if flags.sidecar || flags.egress {
+            return EgressVerdict::Deny(EgressDenyReason::Loopback);
+        }
+        return EgressVerdict::Allow;
+    }
+    if !flags.egress {
+        return EgressVerdict::Allow;
+    }
+    // Link-local (fe80::/10) and the AWS v6 IMDS are metadata-class, always
+    // denied and un-allowlistable.
+    if is_link_local6(dst) || is_imds6(dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Imds);
+    }
+    if flags.deny_rfc1918 && is_ula6(dst) {
+        return EgressVerdict::Deny(EgressDenyReason::Rfc1918);
+    }
+    EgressVerdict::Allow
+}
+
+/// `127.0.0.0/8` or the all-zero address — mirrors `is_loopback4_be` in the
+/// BPF. `0.0.0.0` is loopback because the kernel rewrites a connect to it into
+/// `127.0.0.1`.
+#[must_use]
+pub fn classify_loopback4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_unspecified() || ip.octets()[0] == 127
+}
+
+/// `::`, `::1`, or `::ffff:a.b.c.d` with a loopback embedded v4 — mirrors
+/// `is_loopback6` in the BPF.
+#[must_use]
+pub fn classify_loopback6(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip == std::net::Ipv6Addr::LOCALHOST {
+        return true;
+    }
+    match ip.to_ipv4_mapped() {
+        Some(v4) => classify_loopback4(v4),
+        None => false,
+    }
+}
+
+/// `169.254.0.0/16` — mirrors `is_linklocal4_be` in the BPF.
+#[must_use]
+fn is_link_local(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 169 && o[1] == 254
+}
+
+/// RFC-1918 private ranges — mirrors `is_rfc1918_be` in the BPF.
+#[must_use]
+fn is_rfc1918(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+}
+
+/// `fe80::/10` link-local — mirrors `is_linklocal6` in the BPF.
+#[must_use]
+fn is_link_local6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] & 0xffc0) == 0xfe80
+}
+
+/// The AWS IPv6 IMDS address `fd00:ec2::254` — mirrors `is_imds6` in the BPF.
+#[must_use]
+fn is_imds6(ip: std::net::Ipv6Addr) -> bool {
+    ip.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+}
+
+/// `fc00::/7` unique-local (the IPv6 analogue of RFC-1918) — mirrors `is_ula6`.
+#[must_use]
+fn is_ula6(ip: std::net::Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::{
+        ConnFacts, EgressDenyReason, EgressVerdict, PolicyFlags, classify_loopback4,
+        classify_loopback6, egress_verdict_model, egress_verdict6_model,
+    };
+
+    /// Egress fence on, sidecar off — the F-SSRF-1 secure default.
+    const FENCE: PolicyFlags = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: true };
+
+    /// A TCP connect to `dst` on a non-DNS port (9999), using the real loopback
+    /// classifier, with the given `infra`/`allowed` flags.
+    fn tcp(dst: &str, infra: bool, allowed: bool) -> ConnFacts {
+        let ip: Ipv4Addr = dst.parse().unwrap();
+        ConnFacts {
+            is_tcp: true,
+            is_loopback: classify_loopback4(ip),
+            infra,
+            allowed,
+            dport: 9999,
+            dst: ip,
+        }
+    }
+
+    #[test]
+    fn egress_fence_default_decisions() {
+        let v = |dst: &str, infra: bool, allowed: bool| {
+            egress_verdict_model(FENCE, tcp(dst, infra, allowed))
+        };
+
+        // IMDS always denied.
+        assert_eq!(v("169.254.169.254", false, false), EgressVerdict::Deny(EgressDenyReason::Imds));
+
+        // Loopback: infra port allowed; any other loopback port denied.
+        assert_eq!(v("127.0.0.1", true, false), EgressVerdict::Allow, "infra port allowed");
+        assert_eq!(
+            v("127.0.0.1", false, false),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+            "non-infra 127.0.0.1:9999 denied"
+        );
+
+        // RFC-1918 denied by default.
+        for dst in ["10.0.0.5", "172.16.3.4", "192.168.1.1"] {
+            assert_eq!(
+                v(dst, false, false),
+                EgressVerdict::Deny(EgressDenyReason::Rfc1918),
+                "{dst}"
+            );
+        }
+        // 172.15/172.32 are NOT in 172.16/12.
+        assert_eq!(v("172.15.0.1", false, false), EgressVerdict::Allow);
+        assert_eq!(v("172.32.0.1", false, false), EgressVerdict::Allow);
+
+        // Public egress stays allowed.
+        assert_eq!(v("1.1.1.1", false, false), EgressVerdict::Allow);
+        assert_eq!(v("8.8.8.8", false, false), EgressVerdict::Allow);
+    }
+
+    /// Finding 1: the fence is TCP-only — a UDP (non-TCP) connect is never
+    /// fenced, even to IMDS / loopback / RFC-1918 (so DNS keeps working).
+    #[test]
+    fn udp_is_never_fenced() {
+        for dst in ["169.254.169.254", "127.0.0.53", "10.0.0.53", "127.0.0.11"] {
+            let ip: Ipv4Addr = dst.parse().unwrap();
+            let udp = ConnFacts {
+                is_tcp: false,
+                is_loopback: classify_loopback4(ip),
+                infra: false,
+                allowed: false,
+                dport: 53,
+                dst: ip,
+            };
+            assert_eq!(egress_verdict_model(FENCE, udp), EgressVerdict::Allow, "UDP {dst}");
+        }
+    }
+
+    /// RESIDUAL-1: DNS-over-TCP (destination port 53) is never fenced, even to a
+    /// loopback resolver (`127.0.0.53`) or an RFC-1918 one (k8s CoreDNS) that the
+    /// deny tiers would otherwise block.
+    #[test]
+    fn dns_over_tcp_is_never_fenced() {
+        for dst in ["127.0.0.53", "10.0.0.53", "169.254.169.253", "::ffff:127.0.0.53"] {
+            let ip: Ipv4Addr = match dst.parse::<std::net::Ipv6Addr>() {
+                Ok(v6) => v6.to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED),
+                Err(_) => dst.parse().unwrap(),
+            };
+            let dns = ConnFacts {
+                is_tcp: true,
+                is_loopback: classify_loopback4(ip),
+                infra: false,
+                allowed: false,
+                dport: 53,
+                dst: ip,
+            };
+            assert_eq!(egress_verdict_model(FENCE, dns), EgressVerdict::Allow, "TCP-53 {dst}");
+        }
+        // Native-v6 DNS-over-TCP to a ULA resolver is likewise allowed.
+        assert_eq!(
+            egress_verdict6_model(FENCE, true, false, 53, "fd12:3456::53".parse().unwrap()),
+            EgressVerdict::Allow,
+            "native v6 TCP-53"
+        );
+    }
+
+    /// Finding 2: `0.0.0.0` routes to loopback (the kernel rewrites it to
+    /// 127.0.0.1), so it must classify as loopback and hit the floor — not slip
+    /// through the non-loopback allow branch onto a control-plane port.
+    #[test]
+    fn zero_address_is_loopback() {
+        assert!(classify_loopback4("0.0.0.0".parse().unwrap()), "0.0.0.0 is loopback");
+        assert!(classify_loopback4("127.0.0.1".parse().unwrap()));
+        assert!(classify_loopback4("127.1.2.3".parse().unwrap()));
+        assert!(
+            !classify_loopback4("0.0.0.5".parse().unwrap()),
+            "0.0.0.5 does NOT route to loopback"
+        );
+        assert!(!classify_loopback4("1.1.1.1".parse().unwrap()));
+        // A connect to 0.0.0.0:<control-plane port> is denied by the floor.
+        assert_eq!(
+            egress_verdict_model(FENCE, tcp("0.0.0.0", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+            "0.0.0.0 must be floored, not allowed"
+        );
+
+        // v6: `::` and `::ffff:0.0.0.0` are loopback; `::ffff:1.1.1.1` is not.
+        assert!(classify_loopback6("::".parse().unwrap()), ":: is loopback");
+        assert!(classify_loopback6("::1".parse().unwrap()));
+        assert!(classify_loopback6("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(
+            classify_loopback6("::ffff:0.0.0.0".parse().unwrap()),
+            "::ffff:0.0.0.0 is loopback"
+        );
+        assert!(!classify_loopback6("::ffff:1.1.1.1".parse().unwrap()));
+        assert!(!classify_loopback6("2606:4700::1111".parse().unwrap()));
+    }
+
+    /// Finding 5: native-IPv6 metadata/link-local/ULA.
+    #[test]
+    fn ipv6_egress_ranges() {
+        let v = |dst: &str, lp: bool| {
+            egress_verdict6_model(FENCE, true, lp, 443, dst.parse::<Ipv6Addr>().unwrap())
+        };
+        // Link-local fe80::/10 and the AWS v6 IMDS fd00:ec2::254 are IMDS-class.
+        assert_eq!(v("fe80::1", false), EgressVerdict::Deny(EgressDenyReason::Imds), "fe80::/10");
+        assert_eq!(
+            v("febf::1", false),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "fe80::/10 top"
+        );
+        assert_eq!(
+            v("fd00:ec2::254", false),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "aws v6 imds"
+        );
+        // Other ULA (fc00::/7) is RFC-1918-class (under the flag).
+        assert_eq!(v("fd12:3456::1", false), EgressVerdict::Deny(EgressDenyReason::Rfc1918), "ula");
+        assert_eq!(v("fc00::1", false), EgressVerdict::Deny(EgressDenyReason::Rfc1918));
+        // Public v6 allowed; v6 loopback floored.
+        assert_eq!(v("2606:4700::1111", false), EgressVerdict::Allow, "public v6");
+        assert_eq!(
+            v("::1", true),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+            "v6 loopback floor"
+        );
+        // UDP v6 and ULA with the RFC-1918 toggle off.
+        assert_eq!(
+            egress_verdict6_model(FENCE, false, false, 443, "fe80::1".parse().unwrap()),
+            EgressVerdict::Allow,
+            "UDP v6 not fenced"
+        );
+        let no_rfc = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: false };
+        assert_eq!(
+            egress_verdict6_model(no_rfc, true, false, 443, "fd12:3456::1".parse().unwrap()),
+            EgressVerdict::Allow,
+            "ULA allowed when RFC-1918 toggle off"
+        );
+        // But the AWS v6 IMDS is STILL denied with the RFC-1918 toggle off.
+        assert_eq!(
+            egress_verdict6_model(no_rfc, true, false, 443, "fd00:ec2::254".parse().unwrap()),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "v6 IMDS denied regardless of RFC-1918 toggle"
+        );
+    }
+
+    /// An explicit allowlist hit overrides the loopback-floor and RFC-1918
+    /// denies — but **NOT IMDS** (un-allowlistable, owner decision).
+    #[test]
+    fn allowlist_overrides_everything_except_imds() {
+        // RFC-1918 and loopback: allowlist wins.
+        assert_eq!(egress_verdict_model(FENCE, tcp("10.0.0.5", false, true)), EgressVerdict::Allow);
+        assert_eq!(
+            egress_verdict_model(FENCE, tcp("127.0.0.1", false, true)),
+            EgressVerdict::Allow
+        );
+        // IMDS: allowlisting it is STILL denied.
+        assert_eq!(
+            egress_verdict_model(FENCE, tcp("169.254.169.254", false, true)),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+            "allowlisting IMDS must NOT override the deny"
+        );
+    }
+
+    /// With RFC-1918 NOT denied, IMDS + loopback-floor still apply.
+    #[test]
+    fn rfc1918_toggle_off_keeps_imds_and_loopback() {
+        let no_rfc = PolicyFlags { sidecar: false, egress: true, deny_rfc1918: false };
+        assert_eq!(
+            egress_verdict_model(no_rfc, tcp("10.0.0.5", false, false)),
+            EgressVerdict::Allow
+        );
+        assert_eq!(
+            egress_verdict_model(no_rfc, tcp("169.254.169.254", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Imds),
+        );
+        assert_eq!(
+            egress_verdict_model(no_rfc, tcp("127.0.0.1", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Loopback),
+        );
+    }
+
+    /// Egress fence OFF (sidecar-only or neither): non-loopback egress is
+    /// unrestricted — preserving the historical `ebpf_policy` behavior.
+    #[test]
+    fn egress_off_allows_all_non_loopback() {
+        let sidecar_only = PolicyFlags { sidecar: true, egress: false, deny_rfc1918: false };
+        for dst in ["169.254.169.254", "10.0.0.5", "1.1.1.1"] {
+            assert_eq!(
+                egress_verdict_model(sidecar_only, tcp(dst, false, false)),
+                EgressVerdict::Allow,
+                "egress off must not fence {dst}"
+            );
+        }
+        // Sidecar loopback floor still denies non-infra loopback.
+        assert_eq!(
+            egress_verdict_model(sidecar_only, tcp("127.0.0.1", false, false)),
+            EgressVerdict::Deny(EgressDenyReason::Loopback)
+        );
+    }
+}

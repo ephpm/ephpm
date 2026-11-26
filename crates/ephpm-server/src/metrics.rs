@@ -173,6 +173,19 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
          unfenced (0) on a node where it was intended."
     );
 
+    // TCP egress fence state (audit finding F-SSRF-1). Same intent as the
+    // AF_UNIX gauge above: `1` = `cgroup/connect4+6` attached and denying tenant
+    // egress to IMDS / loopback-except-infra / RFC-1918, `0` = degraded to
+    // unfenced. Absent where the fence does not apply. The per-reason deny
+    // counter (`ephpm_tenant_tcp_egress_denied_total`) is injected on scrape
+    // from the kernel map by `tenant_ebpf::render_egress_deny_counters`, so it
+    // is not described through the facade here.
+    describe_gauge!(
+        "ephpm_tenant_tcp_egress_active",
+        "Whether the TCP egress fence is attached and enforcing (1) or degraded to unfenced (0) \
+         on a node where it was intended."
+    );
+
     Ok(handle)
 }
 
@@ -184,6 +197,7 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
 pub fn render_text(handle: &PrometheusHandle) -> String {
     let mut body = handle.render();
     crate::turso_cdc_metrics::render_site_gauges(&mut body);
+    crate::tenant_ebpf::render_egress_deny_counters(&mut body);
     body
 }
 

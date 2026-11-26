@@ -665,6 +665,28 @@ per-request node. See the [eBPF guide](/guides/ebpf-per-vhost-network/#af_unix-c
 ephpm_tenant_unix_fence_active == 0
 ```
 
+## Tenant network (TCP egress fence)
+
+The TCP egress fence ([`[server.tenant_network] tcp_egress_policy`](/reference/config/#server-tenant_network),
+audit finding F-SSRF-1) is on by default (`"auto"`) on a multi-tenant Linux
+per-request node. It denies a tenant thread's TCP connect to cloud IMDS
+(`169.254.0.0/16`), loopback-except-infra, and RFC-1918. See the
+[eBPF guide](/guides/ebpf-per-vhost-network/#tcp-egress-fence-tcp_egress_policy).
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ephpm_tenant_tcp_egress_active` | gauge | `policy` | `1` when the TCP egress fence is attached and enforcing, `0` when it was intended but **degraded to unfenced** (missing `CAP_BPF`/`CAP_NET_ADMIN`, `LimitMEMLOCK` too low, no BTF). `policy` is the configured `tcp_egress_policy` string. The series is **absent** where the fence does not apply (single-tenant, worker mode, non-Linux, or an explicit `off`) — so **alert on `== 0`** to catch the secure default silently not taking (an unprivileged container leaves tenant egress to IMDS wide open). |
+| `ephpm_tenant_tcp_egress_denied_total` | counter | `reason` | Tenant TCP connects denied by the fence, sampled live from the kernel on each scrape. `reason` is one of `imds` (`169.254.0.0/16`), `loopback` (a non-infra loopback port), `rfc1918`. Absent when the fence is not active. |
+
+```promql
+# The on-by-default TCP egress fence intended to run but is NOT enforcing
+# (tenant PHP can reach 169.254.169.254 → instance-role credentials).
+ephpm_tenant_tcp_egress_active == 0
+
+# Rate of blocked tenant IMDS reach attempts — a spike is a tenant probing it.
+rate(ephpm_tenant_tcp_egress_denied_total{reason="imds"}[5m])
+```
+
 ## Cardinality notes
 
 The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.

@@ -469,6 +469,51 @@ plane as its own uid, kept out of every socket's group/ACL) and, where
 available, a `CONFIG_BPF_LSM` policy. (This qualification is the same one §8/§9
 carry for their cross-tenant IP controls.)
 
+### 12. TCP egress fence (IMDS/SSRF, on by default)
+
+§8 (nftables) and §9 (eBPF sidecar policy) are operator-supplied or opt-in, so
+**out of the box tenant PHP had unrestricted TCP egress** (audit finding
+F-SSRF-1). The sharp edge on a cloud host: a tenant `connect()`s to
+`169.254.169.254` (the instance metadata service), reads the node's instance-role
+credentials, and uses them to reach the S3 KV-snapshot bucket — every tenant's
+snapshot — and other internal services. This is the classic SSRF-to-IMDS
+credential-theft path, and nothing in §1–§4 closes it (they are function- and
+filesystem-granular, not address-granular).
+
+`tcp_egress_policy` is the in-kernel fix and is **on by default** (`"auto"`). On
+a multi-tenant Linux per-request node the `cgroup/connect4+6` programs deny a
+tagged tenant's connect to **`169.254.0.0/16` (IMDS, always)**, **loopback except
+ePHPm's own `pdo_mysql`/KV service ports**, and **RFC-1918** (`10/8`,
+`172.16/12`, `192.168/16`). **Public egress stays allowed** — a tenant calling a
+public API is normal. It rides the same per-thread tag as §9/§11 and is an
+independent switch.
+
+Relax the RFC-1918 tier wholesale with `tcp_egress_deny_rfc1918 = false`, or
+permit a site a specific internal destination with
+`[server.tenant_network.tcp_egress_allow]` (an allowlist hit overrides the
+loopback-floor and RFC-1918 denies — but **not IMDS**, which is un-allowlistable;
+grant narrowly). Set `tcp_egress_policy = "required"`
+to refuse startup if the fence cannot attach, or `"off"` to opt out.
+
+> **It needs `CAP_BPF` + `CAP_NET_ADMIN` + `LimitMEMLOCK` and fails OPEN without
+> them.** Under an unprivileged service user the fence cannot attach, so on
+> `"auto"`/`"warn"` it logs a loud ERROR and serves with tenant IMDS egress still
+> open (the gauge `ephpm_tenant_tcp_egress_active` reads `0` — alert on it). If
+> you cannot grant the capabilities, use `"required"` to fail closed and, the
+> single most important mitigation, **block `169.254.0.0/16` at the host
+> firewall / require IMDSv2 with a hop limit of 1**. The same §11 "reach control,
+> not a breakout backstop" qualification applies. See the
+> [eBPF guide](/guides/ebpf-per-vhost-network/#tcp-egress-fence-tcp_egress_policy)
+> for the capabilities, the IPv6 coverage, and the fail-closed modes.
+
+Two scope gaps to know about. **The fence is TCP-only** — UDP (including DNS) is
+never touched, so tenant DNS keeps working; the IMDS / control-plane / cluster
+destinations it protects are all TCP. And **the distributed cron / `ephpm php
+--site` lane is NOT fenced** — it runs tenant code in a separate, untagged
+process, so a cron-scheduled tenant script can reach IMDS (Landlock on that lane
+restricts by port, not IP). Until that lane is tagged (a v0.21 roadmap item),
+**block `169.254.0.0/16` at the host firewall if you schedule tenant cron.**
+
 ## What ePHPm self-enforces
 
 The layers above confine what a tenant's PHP *can express*. This section is
@@ -607,6 +652,7 @@ The layers divide into two groups, and it matters which is which:
 | §7–§8 — the two-uid split, the systemd sandbox extras (`PrivateTmp`, `IPAddressDeny`), the nftables egress table | **You**, on the host | Not shipped, not written by `ephpm install`, not on by default |
 | §9 — eBPF per-vhost network policy | ePHPm (Linux only) | Off by default, opt in with `ebpf_policy = true`, plus host prerequisites |
 | §11 — AF_UNIX connect fence | ePHPm (Linux ≥ 6.7 only) | **On by default** (`unix_socket_policy = "auto"`) on a multi-tenant node; allowlist the sockets a site needs, set `"required"` to also fail closed, or `"off"` to opt out |
+| §12 — TCP egress fence (IMDS/SSRF) | ePHPm (Linux only) | **On by default** (`tcp_egress_policy = "auto"`) on a multi-tenant node — denies IMDS / loopback-except-infra / RFC-1918; needs `CAP_BPF` + `CAP_NET_ADMIN` + `LimitMEMLOCK` or it **fails open** (set `"required"` to fail closed, allowlist per site, or `"off"` to opt out) |
 
 A recommended production config makes the ePHPm-side intent explicit:
 

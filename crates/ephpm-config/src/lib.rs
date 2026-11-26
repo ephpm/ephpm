@@ -1876,6 +1876,91 @@ pub struct TenantNetworkConfig {
     /// hard startup error (never a silent no-op).
     #[serde(default)]
     pub unix_socket_allow: BTreeMap<String, Vec<String>>,
+
+    /// TCP egress fence for tenant PHP (multi-tenant breakout audit finding
+    /// **F-SSRF-1**): `"auto"` (default, **on** where it can run), `"off"`,
+    /// `"required"`, or `"warn"`.
+    ///
+    /// ePHPm is one process and one uid, so by default tenant PHP had
+    /// unrestricted TCP egress and could reach `169.254.169.254` (cloud instance
+    /// metadata → instance-role credentials → the S3 KV-snapshot bucket), the
+    /// loopback diagnostics/metrics/snapshot control ports, and internal
+    /// RFC-1918 services — classic SSRF. When on, ePHPm's `cgroup/connect4+6`
+    /// programs deny, for a tagged tenant thread:
+    ///
+    /// * **link-local `169.254.0.0/16`** (cloud IMDS) — always, the critical fix;
+    /// * **loopback `127.0.0.0/8` + `::1`** except ePHPm's own service ports
+    ///   (the stock `pdo_mysql` wire listener and the KV RESP listener, which
+    ///   `pdo_mysql`/phpredis legitimately use);
+    /// * **RFC-1918 `10/8`, `172.16/12`, `192.168/16`** — by default (closes
+    ///   internal-network SSRF + cluster-peer reach). A tenant that must reach a
+    ///   specific internal API is permitted via
+    ///   [`tcp_egress_allow`](Self::tcp_egress_allow).
+    ///
+    /// **Public-internet egress stays allowed** — this is an SSRF fence, not a
+    /// deny-all egress firewall. ePHPm's own threads are never fenced.
+    ///
+    /// Shares the per-thread tenant tag and the `cgroup/connect4+6` programs
+    /// with [`ebpf_policy`](Self::ebpf_policy) (the sidecar port feature); the
+    /// two are independent switches and either one turns the connect programs on.
+    ///
+    /// **Requires `CAP_BPF` + `CAP_NET_ADMIN` and a raised `RLIMIT_MEMLOCK`.**
+    /// Under an unprivileged service user BPF map creation returns `EPERM`, so
+    /// the fence cannot attach. The posture mirrors
+    /// [`unix_socket_policy`](Self::unix_socket_policy):
+    ///
+    /// * `"auto"` (default) — **secure by default**: behaves as `"warn"` on a
+    ///   node where the fence can run (Linux, multi-tenant, per-request mode, not
+    ///   `ephpm dev`) and is otherwise inert, so single-tenant / dev / non-Linux /
+    ///   worker nodes are never broken by the default. Resolved by
+    ///   [`TcpEgressPolicy::resolve`] at startup.
+    /// * `"required"` — the fence must load and attach; if it cannot (missing
+    ///   caps, kernel too old, no BTF) startup is **refused**. The hard-guarantee
+    ///   posture for a multi-tenant node that must never leak IMDS.
+    /// * `"warn"` — try; on failure log an ERROR naming the IMDS exposure and
+    ///   start anyway, with tenant TCP egress unfenced.
+    /// * `"off"` — nothing loaded (the explicit opt-out). On a node where the
+    ///   fence would otherwise run, startup logs a WARN naming the exposure.
+    ///
+    /// `"auto"` is valid on every platform (it self-disables where the fence
+    /// cannot run). An explicit `"required"`/`"warn"` off Linux, without
+    /// `[server] sites_dir`, or in worker mode is a hard startup error, as is
+    /// any unrecognised value.
+    #[serde(default = "default_tcp_egress_policy")]
+    pub tcp_egress_policy: String,
+
+    /// Whether [`tcp_egress_policy`](Self::tcp_egress_policy), when on, also
+    /// denies **RFC-1918** (`10/8`, `172.16/12`, `192.168/16`). Default `true`
+    /// (secure by default — closes internal-network SSRF and cluster-peer
+    /// reach). This is the deny tier most likely to block a legitimate tenant
+    /// that calls an internal API directly: set it `false` to keep the IMDS +
+    /// loopback-except-infra fence while leaving private-network egress open, or
+    /// leave it `true` and permit the specific destinations a site needs via
+    /// [`tcp_egress_allow`](Self::tcp_egress_allow). IMDS (`169.254.0.0/16`) is
+    /// denied regardless of this knob. Only applies while the fence is on; inert
+    /// (but harmless) when `tcp_egress_policy = "off"`.
+    #[serde(default = "default_true")]
+    pub tcp_egress_deny_rfc1918: bool,
+
+    /// Per-site allowlist of TCP destinations tenant PHP may reach even while
+    /// [`tcp_egress_policy`](Self::tcp_egress_policy) would otherwise deny them,
+    /// keyed by **canonical site key** (the vhost directory name). Each entry is
+    /// an IPv4 address (`"10.1.2.3"`, treated as `/32`), an IPv4 CIDR
+    /// (`"10.0.0.0/8"`), or an `ip:port` (`"10.1.2.3:8080"`, that exact port
+    /// only). A matching entry overrides the loopback-floor and RFC-1918 denies
+    /// — an explicit per-site allow is a deliberate operator decision — so grant
+    /// narrowly. **IMDS (`169.254.0.0/16`) is the one exception: it cannot be
+    /// allowlisted** (there is no legitimate tenant reason to reach cloud
+    /// metadata); the only way to reach it is `tcp_egress_policy = "off"`.
+    ///
+    /// IPv6 egress allowlisting is not supported: native-IPv6 metadata/
+    /// link-local (`fe80::/10`, `fd00:ec2::254`) is denied unconditionally and
+    /// `fc00::/7` ULA under `tcp_egress_deny_rfc1918`, but neither can be
+    /// allowlisted. The fence is TCP-only (UDP, including DNS, is never
+    /// touched). Setting this while `tcp_egress_policy = "off"` is a hard
+    /// startup error (never a silent no-op).
+    #[serde(default)]
+    pub tcp_egress_allow: BTreeMap<String, Vec<String>>,
 }
 
 fn default_sidecar_port_range() -> String {
@@ -1895,6 +1980,14 @@ fn default_unix_socket_policy() -> String {
     "auto".to_string()
 }
 
+fn default_tcp_egress_policy() -> String {
+    // Secure by default: `"auto"` fences tenant TCP egress (deny IMDS /
+    // loopback-except-infra / RFC-1918) on a Linux multi-tenant per-request
+    // node, and is inert on every other deployment. See
+    // `TcpEgressPolicy::resolve`. `"off"` is the explicit opt-out.
+    "auto".to_string()
+}
+
 impl Default for TenantNetworkConfig {
     fn default() -> Self {
         Self {
@@ -1904,6 +1997,9 @@ impl Default for TenantNetworkConfig {
             max_sidecar_ports_per_vhost: default_max_sidecar_ports_per_vhost(),
             unix_socket_policy: default_unix_socket_policy(),
             unix_socket_allow: BTreeMap::new(),
+            tcp_egress_policy: default_tcp_egress_policy(),
+            tcp_egress_deny_rfc1918: default_true(),
+            tcp_egress_allow: BTreeMap::new(),
         }
     }
 }
@@ -1958,6 +2054,126 @@ impl UnixSocketPolicy {
             other => other,
         }
     }
+}
+
+/// Parsed `[server.tenant_network] tcp_egress_policy` (audit finding
+/// F-SSRF-1). Same four-posture shape as [`UnixSocketPolicy`], applied to the
+/// `cgroup/connect4+6` TCP egress fence instead of the AF_UNIX fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpEgressPolicy {
+    /// The context-sensitive **secure default**: a deny fence (IMDS,
+    /// loopback-except-infra, RFC-1918) on a node where it can meaningfully run
+    /// — Linux, multi-tenant (`sites_dir` set), per-request mode, not `ephpm
+    /// dev` — and inert everywhere else, so single-tenant, dev, non-Linux and
+    /// worker nodes are never broken by the default. See [`Self::resolve`]; this
+    /// value never survives resolution.
+    Auto,
+    /// No fence loaded (explicit opt-out).
+    Off,
+    /// Load and attach the fence; refuse startup if that fails.
+    Required,
+    /// Load and attach the fence; log an ERROR and run unfenced if that fails.
+    Warn,
+}
+
+impl TcpEgressPolicy {
+    /// `true` for every mode that intends to load the fence. Call only on a
+    /// value returned by [`resolve`](Self::resolve) ([`Auto`](Self::Auto) is
+    /// context-sensitive).
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Resolve the secure default [`Auto`](Self::Auto) into a concrete posture
+    /// for this deployment. Every explicit value passes through unchanged.
+    ///
+    /// `fenceable` must be `true` only where the fence can meaningfully run:
+    /// Linux, multi-tenant (`sites_dir` set), per-request PHP mode, and not
+    /// `ephpm dev`. In a fenceable context `Auto` becomes [`Warn`](Self::Warn)
+    /// (best-effort; logs an ERROR and continues unfenced if the kernel/caps
+    /// cannot host it — the same posture `unix_socket_policy = "auto"` takes).
+    /// Elsewhere `Auto` becomes [`Off`](Self::Off). An operator who needs a hard
+    /// guarantee sets `"required"` (fail-closed); one who opts out sets `"off"`.
+    #[must_use]
+    pub fn resolve(self, fenceable: bool) -> Self {
+        match self {
+            Self::Auto if fenceable => Self::Warn,
+            Self::Auto => Self::Off,
+            other => other,
+        }
+    }
+}
+
+/// One validated `tcp_egress_allow` destination (IPv4 only — the deny ranges
+/// the fence enforces are IPv4 concepts). A matching entry overrides the
+/// loopback-floor and RFC-1918 denies, but **not** IMDS (`169.254.0.0/16`),
+/// which is un-allowlistable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpEgressTarget {
+    /// An IPv4 network (`"10.0.0.0/8"`) or a bare address (treated as `/32`).
+    /// Matches any destination port. `addr` is already masked to `prefix` bits.
+    Cidr {
+        /// Network address, masked to `prefix` significant bits.
+        addr: std::net::Ipv4Addr,
+        /// Prefix length in bits (`0..=32`).
+        prefix: u8,
+    },
+    /// An exact `ip:port` destination.
+    HostPort {
+        /// The permitted IPv4 address.
+        addr: std::net::Ipv4Addr,
+        /// The permitted destination port.
+        port: u16,
+    },
+}
+
+impl TcpEgressTarget {
+    /// Parse one allowlist entry: an IPv4 address, an IPv4 CIDR, or `ip:port`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message for an empty entry, a bad CIDR prefix,
+    /// an IPv6 entry, or anything that is none of the three accepted forms.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("empty entry".to_string());
+        }
+        if let Some((net, bits)) = spec.split_once('/') {
+            let addr: std::net::Ipv4Addr = net.parse().map_err(|_| {
+                format!("{spec:?}: CIDR network must be an IPv4 address (IPv6 is not supported)")
+            })?;
+            let prefix: u8 =
+                bits.parse().map_err(|_| format!("{spec:?}: CIDR prefix must be a number 0-32"))?;
+            if prefix > 32 {
+                return Err(format!("{spec:?}: CIDR prefix must be 0-32, got {prefix}"));
+            }
+            return Ok(Self::Cidr { addr: mask_ipv4(addr, prefix), prefix });
+        }
+        if let Ok(sa) = spec.parse::<std::net::SocketAddrV4>() {
+            return Ok(Self::HostPort { addr: *sa.ip(), port: sa.port() });
+        }
+        if let Ok(addr) = spec.parse::<std::net::Ipv4Addr>() {
+            return Ok(Self::Cidr { addr, prefix: 32 });
+        }
+        Err(format!(
+            "{spec:?}: must be an IPv4 address (\"10.1.2.3\"), an IPv4 CIDR (\"10.0.0.0/8\"), or \
+             \"ip:port\" (\"10.1.2.3:8080\"). IPv6 egress allowlisting is not supported."
+        ))
+    }
+}
+
+/// Mask an IPv4 address to its first `prefix` bits (`prefix <= 32`).
+#[must_use]
+fn mask_ipv4(addr: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
+    if prefix == 0 {
+        return std::net::Ipv4Addr::UNSPECIFIED;
+    }
+    let bits = u32::from(addr);
+    // `prefix` is 1..=32 here, so the shift is well-defined.
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    std::net::Ipv4Addr::from(bits & mask)
 }
 
 /// `sizeof(sockaddr_un.sun_path)` — the kernel's `UNIX_PATH_MAX`.
@@ -2081,6 +2297,46 @@ impl TenantNetworkConfig {
             for entry in entries {
                 let target = UnixSocketTarget::parse(entry)
                     .map_err(|e| format!("unix_socket_allow.{site:?}: {e}"))?;
+                targets.push(target);
+            }
+            out.insert(site.clone(), targets);
+        }
+        Ok(out)
+    }
+
+    /// Parse `tcp_egress_policy`.
+    ///
+    /// # Errors
+    /// Returns a human-readable message naming the accepted values for
+    /// anything but `"auto"`, `"off"`, `"required"` or `"warn"`.
+    pub fn parse_tcp_egress_policy(&self) -> Result<TcpEgressPolicy, String> {
+        match self.tcp_egress_policy.as_str() {
+            "auto" => Ok(TcpEgressPolicy::Auto),
+            "off" => Ok(TcpEgressPolicy::Off),
+            "required" => Ok(TcpEgressPolicy::Required),
+            "warn" => Ok(TcpEgressPolicy::Warn),
+            other => Err(format!(
+                "tcp_egress_policy must be \"auto\", \"off\", \"required\" or \"warn\", got \
+                 {other:?}"
+            )),
+        }
+    }
+
+    /// Parse and validate every `tcp_egress_allow` entry, keyed by site.
+    ///
+    /// # Errors
+    /// Returns a message naming the site and the offending entry for an empty
+    /// site key or any entry [`TcpEgressTarget::parse`] rejects.
+    pub fn parse_tcp_egress_allow(&self) -> Result<BTreeMap<String, Vec<TcpEgressTarget>>, String> {
+        let mut out = BTreeMap::new();
+        for (site, entries) in &self.tcp_egress_allow {
+            if site.trim().is_empty() {
+                return Err("tcp_egress_allow: empty site key".to_string());
+            }
+            let mut targets = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let target = TcpEgressTarget::parse(entry)
+                    .map_err(|e| format!("tcp_egress_allow.{site:?}: {e}"))?;
                 targets.push(target);
             }
             out.insert(site.clone(), targets);
@@ -6481,6 +6737,60 @@ impl Config {
                 ));
             }
             tn.parse_unix_socket_allow()
+                .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
+        }
+
+        // [server.tenant_network] tcp_egress_policy — the TCP egress fence
+        // (audit finding F-SSRF-1). Same shape as unix_socket_policy above: the
+        // mode string is parsed fail-closed, the allowlist entries are always
+        // validated, and the context-sensitive `"auto"` default self-disables
+        // where the fence cannot run so it is valid on every platform. Only an
+        // operator who EXPLICITLY asked for the fence (`"required"`/`"warn"`)
+        // hard-errors on an inapplicable deployment; an allowlist with the
+        // fence explicitly `"off"` is an error rather than a silent no-op.
+        // Whether the running kernel/caps can host the hooks is decided in
+        // serve() at load time.
+        {
+            let tn = &self.server.tenant_network;
+            let policy = tn
+                .parse_tcp_egress_policy()
+                .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
+            let explicitly_required =
+                matches!(policy, TcpEgressPolicy::Required | TcpEgressPolicy::Warn);
+            if explicitly_required {
+                if !cfg!(target_os = "linux") {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] tcp_egress_policy = {:?} is Linux-only \
+                         (cgroup/connect4+6 BPF hooks). Remove it on this platform.",
+                        tn.tcp_egress_policy
+                    )));
+                }
+                if self.server.sites_dir.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] tcp_egress_policy = {:?} requires [server] \
+                         sites_dir (multi-tenant mode) — there are no tenant threads to fence \
+                         in single-site mode.",
+                        tn.tcp_egress_policy
+                    )));
+                }
+                if self.php.is_worker_mode() {
+                    return Err(ConfigError::Validation(format!(
+                        "[server.tenant_network] tcp_egress_policy = {:?} is not supported \
+                         with [php] mode = \"worker\" (per-request mode only: the per-thread \
+                         tenant tag is written on the per-request path).",
+                        tn.tcp_egress_policy
+                    )));
+                }
+            } else if policy == TcpEgressPolicy::Off && !tn.tcp_egress_allow.is_empty() {
+                return Err(ConfigError::Validation(
+                    "[server.tenant_network] tcp_egress_allow is set but tcp_egress_policy = \
+                     \"off\": the allowlist would never be enforced. Set tcp_egress_policy = \
+                     \"required\" (or leave it unset for the secure default), or remove the \
+                     allowlist."
+                        .to_string(),
+                ));
+            }
+            tn.parse_tcp_egress_allow()
                 .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
         }
 
@@ -15828,5 +16138,163 @@ log_failed_sql = true
         assert!(UnixSocketTarget::parse("@").is_err());
         assert!(UnixSocketTarget::parse("relative.sock").is_err());
         assert!(UnixSocketTarget::parse("/has\0nul").is_err());
+    }
+
+    // ── [server.tenant_network] tcp_egress_policy (TCP egress fence, F-SSRF-1) ──
+
+    #[test]
+    fn test_tcp_egress_policy_defaults_to_secure_auto_with_empty_allowlist() {
+        // Secure by default: the policy is `"auto"` (not `"off"`) so tenant TCP
+        // egress to IMDS / loopback-except-infra / RFC-1918 is denied once the
+        // fence is active, and the empty allowlist grants no exceptions.
+        let config = Config::default_config().unwrap();
+        let tn = &config.server.tenant_network;
+        assert_eq!(tn.tcp_egress_policy, "auto", "default must be the secure `auto`, not `off`");
+        assert_eq!(tn.parse_tcp_egress_policy().unwrap(), TcpEgressPolicy::Auto);
+        assert!(tn.tcp_egress_allow.is_empty(), "default allowlist is empty");
+        assert!(tn.tcp_egress_deny_rfc1918, "RFC-1918 is denied by default (secure)");
+    }
+
+    #[test]
+    fn test_tcp_egress_policy_auto_resolution() {
+        use TcpEgressPolicy::{Auto, Off, Required, Warn};
+        assert_eq!(Auto.resolve(true), Warn, "auto on a fenceable node loads the deny fence");
+        assert_eq!(Auto.resolve(false), Off, "auto is inert where the fence cannot run");
+        for p in [Off, Required, Warn] {
+            assert_eq!(p.resolve(true), p);
+            assert_eq!(p.resolve(false), p);
+        }
+        assert!(!Off.is_enabled());
+        assert!(Required.is_enabled() && Warn.is_enabled());
+    }
+
+    #[test]
+    fn test_tcp_egress_policy_rejects_unknown_mode() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"on\"\n",
+        )
+        .expect_err("typo'd mode must not fall through to a silent posture");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("tcp_egress_policy")));
+    }
+
+    #[test]
+    fn test_tcp_egress_allow_with_explicit_off_is_an_error() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"off\"\n\n[server.tenant_network.tcp_egress_allow]\n\"a.test\" = [\"10.0.0.0/8\"]\n",
+        )
+        .expect_err("allowlist with the fence explicitly off is a silent no-op");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("tcp_egress_allow")));
+    }
+
+    #[test]
+    fn test_tcp_egress_allow_under_default_auto_is_accepted() {
+        validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network.tcp_egress_allow]\n\"a.test\" = [\"10.0.0.0/8\"]\n",
+        )
+        .expect("allowlist under the default auto policy is valid");
+    }
+
+    #[test]
+    fn test_tcp_egress_policy_auto_is_valid_on_single_site() {
+        // The secure default must never break a single-tenant node.
+        validate_unix_toml("[server]\nlisten = \"127.0.0.1:8080\"\n")
+            .expect("default auto policy must validate on a single-site node");
+    }
+
+    #[test]
+    fn test_tcp_egress_policy_auto_validates_everywhere() {
+        validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"auto\"\n",
+        )
+        .expect("explicit auto must validate on any platform");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_tcp_egress_policy_rejected_off_linux() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"required\"\n",
+        )
+        .expect_err("fence is Linux-only");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("Linux-only")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_egress_policy_requires_sites_dir() {
+        let err = validate_unix_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[server.tenant_network]\ntcp_egress_policy = \"required\"\n",
+        )
+        .expect_err("fence needs tenants");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("sites_dir")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_egress_policy_rejects_worker_mode() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[php]\nmode = \"worker\"\n\n[server.tenant_network]\ntcp_egress_policy = \"required\"\n",
+        )
+        .expect_err("worker mode has no per-request tag");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("worker")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_egress_policy_accepts_valid_allowlist() {
+        validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"warn\"\n\n[server.tenant_network.tcp_egress_allow]\n\"a.test\" = [\"10.0.0.0/8\", \"192.168.1.5:6379\", \"172.16.3.4\"]\n\"b.test\" = []\n",
+        )
+        .expect("valid config");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_egress_allow_rejects_ipv6_and_bad_cidr() {
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"required\"\n\n[server.tenant_network.tcp_egress_allow]\n\"a.test\" = [\"fd00::1\"]\n",
+        )
+        .expect_err("ipv6 unsupported");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("tcp_egress_allow")));
+        let err = validate_unix_toml(
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\ntcp_egress_policy = \"required\"\n\n[server.tenant_network.tcp_egress_allow]\n\"a.test\" = [\"10.0.0.0/40\"]\n",
+        )
+        .expect_err("prefix > 32");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("tcp_egress_allow")));
+    }
+
+    #[test]
+    fn test_tcp_egress_target_parse() {
+        use std::net::Ipv4Addr;
+        // Bare IP = /32.
+        assert_eq!(
+            TcpEgressTarget::parse("10.1.2.3").unwrap(),
+            TcpEgressTarget::Cidr { addr: Ipv4Addr::new(10, 1, 2, 3), prefix: 32 }
+        );
+        // CIDR is masked to the network address.
+        assert_eq!(
+            TcpEgressTarget::parse("10.5.6.7/8").unwrap(),
+            TcpEgressTarget::Cidr { addr: Ipv4Addr::new(10, 0, 0, 0), prefix: 8 }
+        );
+        assert_eq!(
+            TcpEgressTarget::parse("169.254.0.0/16").unwrap(),
+            TcpEgressTarget::Cidr { addr: Ipv4Addr::new(169, 254, 0, 0), prefix: 16 }
+        );
+        // ip:port.
+        assert_eq!(
+            TcpEgressTarget::parse("192.168.1.5:6379").unwrap(),
+            TcpEgressTarget::HostPort { addr: Ipv4Addr::new(192, 168, 1, 5), port: 6379 }
+        );
+        // 0.0.0.0/0 masks to the unspecified address.
+        assert_eq!(
+            TcpEgressTarget::parse("10.1.2.3/0").unwrap(),
+            TcpEgressTarget::Cidr { addr: Ipv4Addr::UNSPECIFIED, prefix: 0 }
+        );
+        // Rejections.
+        assert!(TcpEgressTarget::parse("").is_err());
+        assert!(TcpEgressTarget::parse("fd00::1").is_err(), "ipv6");
+        assert!(TcpEgressTarget::parse("[::1]:80").is_err(), "ipv6 host:port");
+        assert!(TcpEgressTarget::parse("10.0.0.0/33").is_err(), "prefix > 32");
+        assert!(TcpEgressTarget::parse("notanip").is_err());
     }
 }

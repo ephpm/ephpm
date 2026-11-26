@@ -1359,11 +1359,17 @@ async fn bind_listeners(
     // overlap failure aborts startup; with unix_socket_policy = "required" a
     // fence failure does too — ePHPm must never come up with a policy the
     // operator asked for silently absent (docs-must-match-code).
-    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> = start_tenant_ebpf(
+    // Loopback service ports a tagged tenant is meant to reach — every bound
+    // SQL wire listener + the KV RESP listener — so the egress fence's loopback
+    // floor exempts exactly them (F-SSRF-1 review F-NEW-1). Computed here, where
+    // the per-site wire listener and the cluster state are both known.
+    let infra_ports = tenant_infra_ports(
         config,
+        config.cluster.enabled,
         per_site_db_wire.as_ref().map(|(_, listen)| listen.as_str()),
-        dev_mode,
-    )?;
+    );
+    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> =
+        start_tenant_ebpf(config, &infra_ports, dev_mode)?;
 
     // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
     // request that created it and keeps dispatching PHP events through this
@@ -2763,6 +2769,74 @@ fn db_listen_exposure(addr: &str) -> Option<&'static str> {
 /// port is a configuration error, and the previous behavior (log, continue,
 /// leave the port dead) is precisely the failure mode this function is being
 /// fixed for.
+/// Every loopback service port a *tagged tenant thread* is legitimately meant
+/// to reach — ePHPm's own SQL wire listeners and the KV RESP listener — so the
+/// TCP egress fence's loopback floor ([`start_tenant_ebpf`]) exempts exactly
+/// them. Mirrors the listeners [`start_db_proxies`] actually binds for this
+/// config (plus the per-site stock-`pdo_mysql` listener passed in and the KV
+/// RESP port), computed from config because the fence is loaded before the
+/// proxies bind.
+///
+/// This is the F-SSRF-1 review fix for F-NEW-1: a `sites_dir` node with a
+/// **shared** SQL listener (`[db.mysql]`, `[db.postgres]`, or single-node /
+/// whole-database clustered `[db.sqlite]`) must keep its tenant DB path
+/// (`pdo_mysql` to `127.0.0.1:3306`) working under `tcp_egress_policy = "auto"`.
+/// The security consequence is nil: those are the tenant's intended DB path,
+/// and a shared listener already warns about the isolation trade (see
+/// `shared_db_wire_present`).
+fn tenant_infra_ports(
+    config: &Config,
+    cluster_enabled: bool,
+    per_site_db_wire_listen: Option<&str>,
+) -> Vec<u16> {
+    fn port_of(addr: &str) -> Option<u16> {
+        addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
+    }
+
+    // Every loopback address `start_db_proxies` (and the per-site/KV wiring)
+    // actually binds for this config.
+    let mut addrs: Vec<&str> = Vec::new();
+    // [db.mysql] proxy (default 127.0.0.1:3306).
+    if let Some(mysql) = &config.db.mysql {
+        addrs.push(mysql.listen.as_deref().unwrap_or("127.0.0.1:3306"));
+    }
+    // [db.postgres] proxy (default 127.0.0.1:5432).
+    if let Some(pg) = &config.db.postgres {
+        addrs.push(pg.listen.as_deref().unwrap_or("127.0.0.1:5432"));
+    }
+    // Shared [db.sqlite] proxy (single-node or whole-database clustered): the
+    // mysql_listen always, plus each optional frontend that is set. Per-site
+    // modes bind no shared listener (covered by `per_site_db_wire_listen`).
+    if let Some(sqlite) = &config.db.sqlite
+        && !is_per_site_sqlite(config, cluster_enabled)
+        && !is_per_site_clustered(config, cluster_enabled)
+    {
+        addrs.push(&sqlite.proxy.mysql_listen);
+        if let Some(a) = &sqlite.proxy.hrana_listen {
+            addrs.push(a);
+        }
+        if let Some(a) = &sqlite.proxy.postgres_listen {
+            addrs.push(a);
+        }
+        if let Some(a) = &sqlite.proxy.tds_listen {
+            addrs.push(a);
+        }
+    }
+    // Per-site stock pdo_mysql wire listener (per-site single / clustered).
+    if let Some(a) = per_site_db_wire_listen {
+        addrs.push(a);
+    }
+    // KV RESP listener.
+    if config.kv.redis_compat.enabled {
+        addrs.push(&config.kv.redis_compat.listen);
+    }
+
+    let mut ports: Vec<u16> = addrs.iter().filter_map(|a| port_of(a)).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
@@ -3066,25 +3140,29 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
 ///   ERROR and startup continues with tenant unix connects **unfenced** (the
 ///   TCP policy, if on, still applies).
 ///
-/// `per_site_db_wire_listen` is the stock-`pdo_mysql` listener address in
-/// per-site mode (an infra port every tagged vhost may reach).
+/// `infra_ports` are ePHPm's own loopback service ports a tagged tenant is
+/// meant to reach (every bound SQL wire listener + the KV RESP listener),
+/// computed by [`tenant_infra_ports`] from the config so the egress fence's
+/// loopback floor exempts exactly them.
 ///
 /// When an operator **explicitly** sets the fence `"off"` on a node where the
 /// secure default would otherwise fence, logs one WARN naming the exposure
 /// (audit finding F2), so the opt-out never passes silently.
 fn start_tenant_ebpf(
     config: &Config,
-    per_site_db_wire_listen: Option<&str>,
+    infra_ports: &[u16],
     dev_mode: bool,
 ) -> anyhow::Result<Option<Arc<tenant_ebpf::TenantEbpf>>> {
-    use ephpm_config::UnixSocketPolicy;
+    use ephpm_config::{TcpEgressPolicy, UnixSocketPolicy};
 
     let tn = &config.server.tenant_network;
     let raw_policy = tn
         .parse_unix_socket_policy()
         .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
-    // Resolve the secure default `auto` for this node. The fence can only run,
-    // and the secure default should only turn it on, where the per-thread
+    let raw_egress =
+        tn.parse_tcp_egress_policy().map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+    // Resolve the secure default `auto` for this node. The fences can only run,
+    // and the secure default should only turn them on, where the per-thread
     // tenant tag exists and the hooks are available: Linux, multi-tenant
     // (`sites_dir`), per-request mode, and not `ephpm dev`. Elsewhere `auto`
     // resolves to off so single-tenant / dev / non-Linux / worker nodes keep
@@ -3094,8 +3172,11 @@ fn start_tenant_ebpf(
         && !dev_mode
         && !config.php.is_worker_mode();
     let unix_policy = raw_policy.resolve(fenceable);
+    let egress_policy = raw_egress.resolve(fenceable);
     let opts = tenant_ebpf::LoadOptions {
         tcp_policy: tn.ebpf_policy,
+        tcp_egress: egress_policy.is_enabled(),
+        deny_rfc1918: egress_policy.is_enabled() && tn.tcp_egress_deny_rfc1918,
         unix_fence: unix_policy.is_enabled(),
     };
 
@@ -3117,13 +3198,23 @@ fn start_tenant_ebpf(
              \"warn\" on a fenceable node to enforce it, or remove the allowlist."
         );
     }
+    if !egress_policy.is_enabled() && !tn.tcp_egress_allow.is_empty() {
+        tracing::warn!(
+            policy = %tn.tcp_egress_policy,
+            sites = tn.tcp_egress_allow.len(),
+            "tenant_network: tcp_egress_allow is set but the TCP egress fence is OFF on this node \
+             (tcp_egress_policy resolved to \"off\" — worker mode, non-Linux, single-tenant, or \
+             `ephpm dev`), so the allowlist is IGNORED. Set tcp_egress_policy = \"required\" or \
+             \"warn\" on a fenceable node to enforce it, or remove the allowlist."
+        );
+    }
 
-    if !opts.tcp_policy && !opts.unix_fence {
-        // The fence is not active. Warn about the exposure only where the
-        // operator EXPLICITLY opted out (`"off"`) on a node where the secure
-        // default would otherwise have fenced — `fenceable` captures exactly
-        // that (Linux, multi-tenant, per-request, non-dev). `auto` resolving to
-        // off (non-Linux / worker) is the feature being inapplicable, not an
+    if !opts.tcp_policy && !opts.tcp_egress && !opts.unix_fence {
+        // No fence is active. Warn about the exposure only where the operator
+        // EXPLICITLY opted out (`"off"`) on a node where the secure default
+        // would otherwise have fenced — `fenceable` captures exactly that
+        // (Linux, multi-tenant, per-request, non-dev). `auto` resolving to off
+        // (non-Linux / worker) is the feature being inapplicable, not an
         // opt-out, so it does not nag.
         if raw_policy == UnixSocketPolicy::Off && fenceable {
             tracing::warn!(
@@ -3136,23 +3227,17 @@ fn start_tenant_ebpf(
                  unix_socket_allow list."
             );
         }
+        if raw_egress == TcpEgressPolicy::Off && fenceable {
+            tracing::warn!(
+                "tenant_network: tcp_egress_policy = \"off\" on a multi-tenant node — tenant PHP \
+                 has UNRESTRICTED TCP egress and can reach 169.254.169.254 (cloud IMDS → \
+                 instance-role credentials → the S3 KV-snapshot bucket), the loopback \
+                 diagnostics/metrics/snapshot control ports, and internal RFC-1918 services \
+                 (SSRF). Remove this line for the secure default, or set tcp_egress_policy = \
+                 \"required\" (Linux with BTF, CAP_BPF + CAP_NET_ADMIN, raised RLIMIT_MEMLOCK)."
+            );
+        }
         return Ok(None);
-    }
-
-    let port_of = |addr: &str| -> Option<u16> {
-        addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
-    };
-    // ePHPm's own loopback infra ports every tagged vhost may reach: the stock
-    // pdo_mysql wire listener and the KV RESP listener. Consulted by the TCP
-    // policy only, but harmless to populate regardless.
-    let mut infra_ports: Vec<u16> = Vec::new();
-    if let Some(p) = per_site_db_wire_listen.and_then(port_of) {
-        infra_ports.push(p);
-    }
-    if config.kv.redis_compat.enabled
-        && let Some(p) = port_of(&config.kv.redis_compat.listen)
-    {
-        infra_ports.push(p);
     }
 
     let range = if opts.tcp_policy {
@@ -3166,13 +3251,13 @@ fn start_tenant_ebpf(
     };
 
     // The best-effort posture (an explicit `"warn"`, or the secure default
-    // `"auto"` resolved on a node where the fence applies) covers the WHOLE
-    // fence setup chain when the fence is the only reason the object is being
-    // loaded: a failure anywhere in it (cgroup, object, verifier, attach) is
-    // logged at ERROR and the node runs unfenced. With `ebpf_policy = true` the
-    // base load stays fail-closed as it always was. The log names the
-    // configured policy string (`auto`/`warn`) so it is never misleading.
-    let warn_unfenced = |e: &anyhow::Error| {
+    // `"auto"` resolved on a node where a fence applies) covers the WHOLE object
+    // setup chain when NO fail-closed policy is on: a failure anywhere (cgroup,
+    // object, verifier, attach) is logged at ERROR and the node runs unfenced.
+    // With `ebpf_policy = true` or any `"required"` policy the base load stays
+    // fail-closed. The logs name the configured policy string so they are never
+    // misleading.
+    let warn_unix_unfenced = |e: &anyhow::Error| {
         // Machine-readable signal for a fleet: the fence was intended (auto on a
         // fenceable node, or explicit warn) but degraded to unfenced. `0` ==
         // degraded; the attach-success path below sets `1`. Lets an operator
@@ -3192,27 +3277,57 @@ fn start_tenant_ebpf(
              unix_socket_policy = \"required\" to refuse startup instead."
         );
     };
-    // `auto` resolved to `Warn` above, so this also covers the secure default.
-    let fence_only_warn = !opts.tcp_policy && unix_policy == UnixSocketPolicy::Warn;
-
-    let loaded = tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), &infra_ports, &opts)
-        .context(
-            "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
-             unix_socket_policy). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
-             CAP_NET_ADMIN. It also needs a raised RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the \
-             systemd unit): BPF maps are charged against memlock and the loader cannot raise the \
-             limit itself under NoNewPrivileges (no CAP_SYS_RESOURCE), so its absence surfaces as \
-             'failed to create map ... Operation not permitted' even when the capabilities are \
-             correct. Also confirm any external nft egress floor drops its blanket loopback-DROP \
-             for the ePHPm cgroup, or every sidecar connect will fail.",
+    let warn_egress_unfenced = |e: &anyhow::Error| {
+        ::metrics::gauge!(
+            "ephpm_tenant_tcp_egress_active",
+            "policy" => tn.tcp_egress_policy.clone()
+        )
+        .set(0.0);
+        tracing::error!(
+            error = %format!("{e:#}"),
+            policy = %tn.tcp_egress_policy,
+            "tenant_network: TCP egress fence could NOT be attached — starting UNFENCED on a \
+             multi-tenant node: tenant PHP has UNRESTRICTED TCP egress and can reach \
+             169.254.169.254 (cloud IMDS → instance-role credentials → the S3 KV-snapshot bucket) \
+             and internal services (audit finding F-SSRF-1). Needs Linux with BTF, CAP_BPF + \
+             CAP_NET_ADMIN and a raised RLIMIT_MEMLOCK; set tcp_egress_policy = \"required\" to \
+             refuse startup instead, or block 169.254.0.0/16 at the host firewall."
         );
+    };
+    // Fail closed if the sidecar feature is on (always has been) or ANY fence is
+    // explicitly `"required"`. Otherwise every active policy is best-effort
+    // (`auto` resolved to `Warn`, or explicit `warn`), so a base-load failure
+    // degrades to unfenced instead of refusing startup.
+    let base_required = opts.tcp_policy
+        || egress_policy == TcpEgressPolicy::Required
+        || unix_policy == UnixSocketPolicy::Required;
+
+    let loaded =
+        tenant_ebpf::TenantEbpf::load_and_attach(tn.cgroup_path.as_deref(), infra_ports, &opts)
+            .context(
+                "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy / \
+             tcp_egress_policy / unix_socket_policy). Requires Linux >= 5.10 with \
+             CONFIG_CGROUP_BPF + BTF and CAP_BPF + CAP_NET_ADMIN. It also needs a raised \
+             RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the systemd unit): BPF maps are charged \
+             against memlock and the loader cannot raise the limit itself under NoNewPrivileges \
+             (no CAP_SYS_RESOURCE), so its absence surfaces as 'failed to create map ... Operation \
+             not permitted' even when the capabilities are correct. Also confirm any external nft \
+             egress floor drops its blanket loopback-DROP for the ePHPm cgroup, or every sidecar \
+             connect will fail.",
+            );
     let handle = match loaded {
         Ok(handle) => handle,
-        Err(e) if fence_only_warn => {
-            warn_unfenced(&e);
+        Err(e) if base_required => return Err(e),
+        Err(e) => {
+            // Best-effort: degrade to unfenced, warning per active policy.
+            if opts.tcp_egress {
+                warn_egress_unfenced(&e);
+            }
+            if opts.unix_fence {
+                warn_unix_unfenced(&e);
+            }
             return Ok(None);
         }
-        Err(e) => return Err(e),
     };
 
     if let Some(range) = range {
@@ -3223,6 +3338,41 @@ fn start_tenant_ebpf(
             max_per_vhost = tn.max_sidecar_ports_per_vhost,
             ?infra_ports,
             "tenant_network: eBPF per-vhost policy loaded and attached"
+        );
+    }
+
+    if opts.tcp_egress {
+        // The connect4/6 programs are already attached by load_and_attach (and
+        // POL_EGRESS is set), so the egress fence is live once the per-site
+        // allowlist is written. Write it BEFORE announcing the fence active so
+        // the first request never races the operator's own allowlist.
+        let allow = tn
+            .parse_tcp_egress_allow()
+            .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+        let mut entries = 0usize;
+        for (site, targets) in &allow {
+            handle.set_egress_allow(site, targets)?;
+            entries += targets.len();
+        }
+        // `1` == attached and enforcing; a degraded load set `0` above.
+        ::metrics::gauge!(
+            "ephpm_tenant_tcp_egress_active",
+            "policy" => tn.tcp_egress_policy.clone()
+        )
+        .set(1.0);
+        // Install the handle as the source of the per-reason deny counters,
+        // sampled on each Prometheus scrape.
+        tenant_ebpf::register_egress_source(&handle);
+        tracing::info!(
+            policy = %tn.tcp_egress_policy,
+            deny_rfc1918 = opts.deny_rfc1918,
+            sites_allowlisted = allow.len(),
+            allow_entries = entries,
+            ?infra_ports,
+            "tenant_network: TCP egress fence attached (cgroup/connect4+6) — tenant PHP is denied \
+             egress to 169.254.0.0/16 (IMDS), loopback except ePHPm's own service ports, and \
+             RFC-1918 (when deny_rfc1918); public egress and the per-site tcp_egress_allow list \
+             are permitted"
         );
     }
 
@@ -3270,10 +3420,12 @@ fn start_tenant_ebpf(
                 // unreachable here (`opts.unix_fence` is false for `Off`, and
                 // `resolve` never yields `Auto`); folded in for exhaustiveness.
                 UnixSocketPolicy::Warn | UnixSocketPolicy::Off | UnixSocketPolicy::Auto => {
-                    warn_unfenced(&e);
-                    if !opts.tcp_policy {
+                    warn_unix_unfenced(&e);
+                    if !opts.tcp_policy && !opts.tcp_egress {
                         // Nothing left for the tag to serve: drop the object
                         // rather than pay a per-request map write for no policy.
+                        // (If the sidecar feature or the TCP egress fence is on,
+                        // the connect programs still use the tag, so keep it.)
                         return Ok(None);
                     }
                 }
@@ -4547,6 +4699,61 @@ mod lib_tests {
         ));
         // No database → nothing to gate.
         assert!(!shared_db_wire_present(&cfg_from(""), false));
+    }
+
+    // ── F-SSRF-1 review F-NEW-1: every bound SQL listener is an infra port ──
+
+    #[test]
+    fn infra_ports_cover_every_bound_sql_listener() {
+        // [db.mysql] proxy on the default 3306 — the signature regression: a
+        // sites_dir + [db.mysql] node must keep pdo_mysql to 127.0.0.1:3306.
+        let cfg = cfg_from(
+            "[server]\nsites_dir = \"/srv/sites\"\n[db.mysql]\nurl = \"mysql://u:p@db:3306/d\"\n",
+        );
+        assert!(
+            tenant_infra_ports(&cfg, false, None).contains(&3306),
+            "[db.mysql] listener 3306 must be an infra port"
+        );
+
+        // [db.mysql] with a custom listen port.
+        let cfg =
+            cfg_from("[db.mysql]\nurl = \"mysql://u:p@db:3306/d\"\nlisten = \"127.0.0.1:3310\"\n");
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&3310));
+
+        // [db.postgres] proxy on the default 5432 (shared_db_wire_present omits
+        // postgres, but the listener still binds — it must be an infra port).
+        let cfg = cfg_from("[db.postgres]\nurl = \"postgres://u:p@db:5432/d\"\n");
+        assert!(
+            tenant_infra_ports(&cfg, false, None).contains(&5432),
+            "[db.postgres] listener 5432 must be an infra port"
+        );
+
+        // Shared single-node [db.sqlite]: the proxy mysql_listen binds.
+        let cfg = cfg_from(
+            "[db.sqlite]\npath = \"app.db\"\n[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:3399\"\n",
+        );
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&3399));
+
+        // Whole-database clustered [db.sqlite] (cluster_enabled): still shared,
+        // proxy mysql_listen binds.
+        let cfg = cfg_from(
+            "[cluster]\nenabled = true\n[db.sqlite]\npath = \"app.db\"\n[db.sqlite.proxy]\nmysql_listen = \"127.0.0.1:3401\"\n",
+        );
+        assert!(
+            tenant_infra_ports(&cfg, true, None).contains(&3401),
+            "whole-DB clustered sqlite listener must be an infra port"
+        );
+
+        // Per-site [db.sqlite]: no SHARED listener binds; the per-site wire
+        // listener (passed in) is the infra port instead.
+        let cfg =
+            cfg_from("[server]\nsites_dir = \"/srv/sites\"\n[db.sqlite]\ndir = \"/srv/dbs\"\n");
+        let ports = tenant_infra_ports(&cfg, false, Some("127.0.0.1:3306"));
+        assert!(ports.contains(&3306), "per-site wire listener must be an infra port");
+
+        // KV RESP listener is always included when enabled.
+        let cfg = cfg_from("[kv.redis_compat]\nenabled = true\nlisten = \"127.0.0.1:6380\"\n");
+        assert!(tenant_infra_ports(&cfg, false, None).contains(&6380));
     }
 
     #[test]

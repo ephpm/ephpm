@@ -228,8 +228,13 @@ Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, exper
 | `max_sidecar_ports_per_vhost` | u32 | `8` | Maximum concurrent sidecar real ports one vhost may hold. Enforced **in-kernel** at `bind4` against the un-forgeable ePHPm-set vhost tag, so a tenant cannot bypass it and cannot starve siblings out of the shared pool. |
 | `unix_socket_policy` | string | `"auto"` | AF_UNIX connect fence for tenant PHP (multi-tenant breakout audit finding F2). **On by default**: `"auto"` fences tenant unix connects on a node where the fence can run (**Linux ≥ 6.7**, multi-tenant, per-request mode, not `ephpm dev`) and is inert everywhere else, so single-tenant / dev / non-Linux / worker nodes are unaffected — where it applies it behaves as `"warn"`. `"required"`: attach `cgroup/connect_unix` + `cgroup/sendmsg_unix` programs so a tenant thread can `connect()`/`sendto()` only the unix sockets listed for its site in `unix_socket_allow` — **a site with no entry can reach no unix socket at all** — and **refuse to start** if the fence cannot be attached (the hard-guarantee posture). `"warn"`: same fence, but on failure log an ERROR and start **unfenced**. `"off"`: the explicit opt-out — nothing loaded; a node where the fence would otherwise run logs one WARN naming the exposure. Needs BTF and `CAP_BPF` + `CAP_NET_ADMIN`; `"auto"` is valid on every platform (it self-disables), but an explicit `"required"`/`"warn"` off Linux, without `[server] sites_dir`, or in worker mode is a hard startup error, as is any unrecognised value. Independent of `ebpf_policy` (either switch alone loads the per-thread tag). ePHPm's own threads are never fenced. |
 | `unix_socket_allow` | table | `{}` | Per-site allowlist for `unix_socket_policy`, keyed by **canonical site key** (vhost directory name): `"a.example" = ["/run/a/app.sock", "@a-bus"]`. Entries are absolute pathname sockets or abstract-namespace sockets written `@name`; a relative path, an embedded NUL, or a path over 108 bytes is a startup error, as is setting this while `unix_socket_policy = "off"`. Matched on the literal destination *before* the kernel resolves it, so list only paths in directories the tenant cannot write (a tenant-writable path can be swapped for a symlink to any other socket). |
+| `tcp_egress_policy` | string | `"auto"` | TCP egress fence for tenant PHP (multi-tenant breakout audit finding F-SSRF-1). **On by default**, same four postures as `unix_socket_policy`: `"auto"` fences tenant TCP egress where the fence can run (Linux, multi-tenant, per-request mode, not `ephpm dev`; behaves as `"warn"` there) and is inert everywhere else; `"required"` refuses to start if the fence cannot attach; `"warn"` logs an ERROR and starts **unfenced** on failure; `"off"` is the explicit opt-out (a node where it would otherwise run logs a WARN naming the exposure). When on, the `cgroup/connect4+6` programs deny a tagged tenant thread's connect to **`169.254.0.0/16` (cloud IMDS — always)**, **loopback except ePHPm's own service ports** (the stock `pdo_mysql` wire listener and the KV RESP listener, which `pdo_mysql`/phpredis use), and **RFC-1918** (`10/8`, `172.16/12`, `192.168/16`; see `tcp_egress_deny_rfc1918`). **Public-internet egress stays allowed** — this is an SSRF fence, not a deny-all egress wall. The fence is **TCP-only**: all UDP (incl. DNS) and **TCP destination port 53** (DNS-over-TCP) are exempt, as is SCTP. Shares the `cgroup/connect4+6` programs and per-thread tag with `ebpf_policy`; needs `CAP_BPF` + `CAP_NET_ADMIN` + `LimitMEMLOCK` (see below). `"auto"` is valid on every platform; explicit `"required"`/`"warn"` off Linux, without `[server] sites_dir`, or in worker mode is a hard startup error, as is any unrecognised value. ePHPm's own threads are never fenced. |
+| `tcp_egress_deny_rfc1918` | bool | `true` | Whether `tcp_egress_policy`, when on, **also denies RFC-1918** (`10/8`, `172.16/12`, `192.168/16`). This is the deny tier most likely to block a legitimate tenant that calls an internal API directly. Leave `true` (secure) and permit specific internal destinations per site via `tcp_egress_allow`, or set `false` to keep the IMDS + loopback-except-infra fence while leaving private-network egress open. IMDS (`169.254.0.0/16`) is denied regardless of this knob. Only applies while the fence is on. |
+| `tcp_egress_allow` | table | `{}` | Per-site TCP egress allowlist for `tcp_egress_policy`, keyed by **canonical site key**: `"a.example" = ["10.0.0.0/8", "10.1.2.3:8080", "172.16.3.4"]`. Each entry is an IPv4 address (treated as `/32`), an IPv4 CIDR (any port), or `ip:port` (that exact port). A matching entry overrides the loopback-floor and RFC-1918 denies — an explicit per-site allow is a deliberate operator decision, so grant narrowly. **IMDS (`169.254.0.0/16`) cannot be allowlisted** — there is no legitimate tenant reason to reach cloud metadata, so an allow entry never re-opens it; the only way to reach IMDS is `tcp_egress_policy = "off"`. IPv6 allowlisting is unsupported — native-IPv6 metadata/link-local (`fe80::/10`, `fd00:ec2::254`) is denied unconditionally and `fc00::/7` ULA under `tcp_egress_deny_rfc1918`, but neither can be allowlisted; relax the v6 ULA tier with `tcp_egress_deny_rfc1918 = false` or use the host firewall. The fence is **TCP-only** (UDP, incl. DNS, is never touched). Setting this while `tcp_egress_policy = "off"` is a startup error. |
 
 > **Known limitation.** Closed sidecar ports return to the pool only on ePHPm restart — the close-time reclaim path is not implemented (see the guide). A vhost re-binding the *same* virtual port reuses its existing real port, so a restarting sidecar does not consume a second slot; an app that opens many *different* sidecar ports over one process lifetime can reach `max_sidecar_ports_per_vhost` until restart.
+
+> **Requires privileges — and fails open without them.** Both the AF_UNIX fence and the TCP egress fence attach eBPF programs, which needs `CAP_BPF` + `CAP_NET_ADMIN` and a raised `RLIMIT_MEMLOCK` (`LimitMEMLOCK=infinity` / `--ulimit memlock=-1`). Under an unprivileged service user BPF map creation returns `EPERM`, so on the `"auto"`/`"warn"` postures the fence logs an ERROR and **serves UNFENCED** — tenant TCP egress to IMDS stays open. Use `tcp_egress_policy = "required"` to refuse startup instead, grant the capabilities (see the [eBPF guide](/guides/ebpf-per-vhost-network/)), and/or block `169.254.0.0/16` at the host firewall as defence-in-depth.
 
 The fence is **on by default** (`unix_socket_policy = "auto"`), so a multi-tenant
 Linux ≥ 6.7 node already denies tenant unix connects — you only need a
@@ -249,6 +254,26 @@ unix_socket_policy = "required"          # Linux >= 6.7 + BTF, CAP_BPF + CAP_NET
 [server.tenant_network.unix_socket_allow]
 "shop.example"  = ["/run/ephpm/shop/php-worker.sock"]
 "blog.example"  = []                     # same as absent: no unix socket at all
+```
+
+The TCP egress fence is also **on by default** (`tcp_egress_policy = "auto"`), so
+a multi-tenant Linux node already denies tenant PHP's reach to cloud IMDS,
+loopback-except-infra, and RFC-1918. Permit the specific internal destinations a
+site needs with `[server.tenant_network.tcp_egress_allow]`; relax the RFC-1918
+tier wholesale with `tcp_egress_deny_rfc1918 = false`; or opt out with
+`tcp_egress_policy = "off"`:
+
+```toml
+[server.tenant_network]
+# tcp_egress_policy defaults to "auto"; use "required" to refuse startup if the
+# fence cannot attach (so an unprivileged container never silently runs open).
+tcp_egress_policy = "required"           # Linux + BTF, CAP_BPF + CAP_NET_ADMIN, LimitMEMLOCK
+# tcp_egress_deny_rfc1918 = false        # keep IMDS + loopback fence, allow private networks
+# tcp_egress_policy = "off"              # opt out: unrestricted tenant TCP egress
+
+[server.tenant_network.tcp_egress_allow]
+# Let one tenant reach a specific internal API; everything else stays denied.
+"shop.example" = ["10.20.0.0/16", "10.9.9.9:6379"]
 ```
 
 ### `[server.logging]`
