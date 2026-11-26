@@ -1,0 +1,126 @@
+# ===========================================================================
+# ePHPm — a per-site CLUSTERED embedded-database node (EXPERIMENTAL)
+# ===========================================================================
+#
+# Multi-tenant vhosting where each site's embedded Turso database REPLICATES
+# across every node, instead of every tenant sharing one clustered database.
+# Any node can serve any site's reads; writes for a site are forwarded to that
+# site's rendezvous-hash (HRW) owner, captured into CDC, and replicated
+# everywhere. On a node death only that node's sites move — each to a node
+# already holding a warm replica.
+#
+# Run THIS SAME CONFIG on every node (only [cluster] node_id, if you pin it,
+# and the listen addresses differ). Mode is auto-detected: [cluster] enabled +
+# [db.sqlite] dir + [db.sqlite.replication] per_site = true selects per-site
+# clustered. The startup log prints `embedded SQLite mode selected mode=...`;
+# expect `per-site-clustered`.
+#
+# EXPERIMENTAL: the Turso engine is Beta upstream and this layers per-site CDC
+# on top of it. Multi-node ownership churn is unit-tested, not live-cluster
+# validated. Treat as Linux/macOS.
+#
+# Guides: site/content/guides/clustering-setup.md
+#         site/content/architecture/database/  (per-site CDC design)
+#
+# Every key is real (crates/ephpm-config/src/lib.rs); defaults are noted.
+# ===========================================================================
+
+[server]
+listen    = "0.0.0.0:8080"
+sites_dir = "/srv/ephpm/sites"       # multi-tenant: one subdirectory per vhost
+
+# ---------------------------------------------------------------------------
+# Embedded database + per-site clustered replication.
+# ---------------------------------------------------------------------------
+[db.sqlite]
+# Per-site DB files live here as <dir>/<site-key>.db. REQUIRED in this mode.
+dir          = "/srv/ephpm/db"
+max_open_dbs = 256                   # default 256 (serving LRU; does NOT bound replication)
+
+[db.sqlite.replication]
+# "auto" (default): elected via gossip when [cluster] enabled. With per_site
+# below, each site has its own HRW owner rather than one cluster-wide primary.
+# Other values: "primary" / "replica" (force), "single"/"none" (force
+# single-node even with clustering on). Exact, case-sensitive; a typo is a
+# startup error.
+role = "auto"
+
+# THE switch for this mode. Default: false (a clustered multi-site config would
+# otherwise put ALL vhosts in one shared clustered database, with a startup
+# warning). true => one replicated database per site, HRW-owned writes.
+per_site = true
+
+# Largest snapshot a cold replica will accept when bootstrapping a site from a
+# peer. Default: 1 GiB. Raise if a legitimate site database is larger; a
+# bootstrap that hits it fails with a message naming this knob.
+# max_snapshot_bytes = 1073741824
+
+# ---------------------------------------------------------------------------
+# Scheduled backups (optional) — back up from a non-owner to spare writers.
+# ---------------------------------------------------------------------------
+# In clustered modes each database is snapshotted by exactly one node. source
+# = "replica" runs VACUUM INTO on a non-write holder (recovery point lags by
+# interval + replication lag) instead of the HRW owner. See
+# examples/config/db-backup-minio for the S3 addressing knobs.
+# [db.sqlite.backup]
+# enabled   = true
+# s3_bucket = "ephpm-backups"
+# interval  = "15m"                  # default 15m
+# retention = "14d"                  # default 14d
+# source    = "replica"              # default "primary" (freshest, but taxes the writer)
+
+# ---------------------------------------------------------------------------
+# Gossip clustering.
+# ---------------------------------------------------------------------------
+[cluster]
+enabled = true
+
+# Gossip UDP listen address. Default: "0.0.0.0:7946".
+bind = "0.0.0.0:7946"
+
+# Seed node addresses for the initial join (gossip ports of other nodes). A
+# fresh node contacts these to join; omit on the very first node.
+join = ["node-a.internal:7946", "node-b.internal:7946"]
+
+# Shared secret — REQUIRED. All inter-node traffic (gossip UDP + the KV TCP
+# data plane + the cluster channel) is authenticated+encrypted with keys
+# derived from this (ChaCha20-Poly1305 via HKDF-SHA256). With it empty,
+# clustering REFUSES to start unless allow_insecure_no_auth = true (fail
+# closed). Generate with `openssl rand -base64 32`; load from a secret store.
+secret = "change-me-openssl-rand-base64-32"
+# allow_insecure_no_auth = false     # default false; true only on a fully trusted net
+
+# Cluster identifier — nodes with different IDs ignore each other. Default:
+# "ephpm". Node identifier — auto-generated when empty; pin it (e.g. to the
+# StatefulSet pod name) for stable election ordering and snapshot identity.
+cluster_id = "ephpm"
+# node_id  = "node-a"                # default: auto-generated
+
+# KV data-plane + replication tuning. Defaults are sensible; shown for clarity.
+[cluster.kv]
+small_key_threshold = 512            # bytes; <= goes on the gossip tier (default 512)
+replication_factor  = 2              # copies of each large key (default 2; clamped to cluster size)
+replication_mode    = "async"        # "async" (default) | "sync" (await reachable replicas)
+data_port           = 7947           # KV data-plane TCP port (default 7947)
+
+# The multiplexed cluster channel (carries Turso CDC replication). Only bound
+# because per-site clustered replication asks for it. listen defaults to
+# <cluster.bind IP>:<port+2> (7948 with defaults); the secret falls back to
+# [cluster] secret. Usually leave this block out entirely.
+# [cluster.channel]
+# listen = "0.0.0.0:7948"
+
+# ---------------------------------------------------------------------------
+# KV store — secret required, warm-restart handoff on by default on a cluster.
+# ---------------------------------------------------------------------------
+[kv]
+# Required for stable per-site RESP/wire-auth credentials across restarts (see
+# the hardened example). Distinct from [cluster] secret.
+secret = "change-me-load-from-a-secret-store"
+
+# On a clustered node, peer_handoff (default true) warms this node's KV share
+# from its peers on startup and pushes its large values to the takeover nodes
+# on drain — no file or bucket needed. See examples/config/kv-snapshots.toml
+# for file/object snapshots, which are complementary.
+[kv.snapshot]
+peer_handoff = true                  # default true (clustered nodes only)

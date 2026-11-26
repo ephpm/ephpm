@@ -871,11 +871,13 @@ impl DbBackupService {
             ),
             BackupGate::PerSiteClustered { .. } => tracing::warn!(
                 "clustered database backup: PER-SITE mode is EXPERIMENTAL and lab-pending. Each \
-                 site is snapshotted once by its owner (or a replica), but RESTORE convergence is \
-                 NOT yet validated on a live cluster — it relies on this node settling with a \
-                 dominating version epoch across a whole-cluster restart, and a returning peer \
-                 with a higher epoch could overwrite a restore silently (the planned `--reseed` \
-                 mitigation is not yet implemented). The SUPPORTED clustered backup path is \
+                 site is snapshotted once by its owner (or a replica). A PLAIN restore converges \
+                 only this node — it relies on this node settling with a dominating version epoch \
+                 across a whole-cluster restart, and a returning peer with a higher epoch could \
+                 overwrite it silently; use `ephpm db restore --reseed --site <key>` (every node \
+                 on v0.20.0+) to stamp a per-site reseed generation so the site's owner reseeds \
+                 the cluster onto the restored copy automatically. RESTORE convergence is not yet \
+                 validated on a live cluster. The SUPPORTED clustered backup path is \
                  whole-database clustered mode. This runs only because you enabled the \
                  experimental [db.sqlite.replication] per_site = true. See the clustered-backup \
                  design note."

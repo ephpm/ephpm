@@ -1,0 +1,340 @@
+# ===========================================================================
+# ePHPm — a hardened multi-tenant (virtual-hosting) node
+# ===========================================================================
+#
+# One ePHPm process serving many independent tenants, each in its own vhost
+# directory, with the isolation controls ePHPm ships today turned on and
+# explained. Every key below is a real key in crates/ephpm-config/src/lib.rs;
+# defaults are stated so you can see what you are (and aren't) changing.
+#
+# The tenant boundary in ePHPm is NOT a per-tenant OS user — all tenants share
+# one process and one uid. Isolation rests on the layers below, all shown here:
+#   1. one database file per site           ([db.sqlite] dir)
+#   2. per-request open_basedir + a PHP      ([server.security])
+#      function denylist
+#   3. a scrubbed process environment so a    ([php] scrub_environment /
+#      tenant's PHP cannot read operator       env_allowlist — F1)
+#      secrets via getenv()/$_ENV
+#   4. a per-PHP-thread Landlock filesystem    ([server] self_sandbox /
+#      sandbox + a fatal privilege-drop         require_privilege_drop — F3)
+#      assertion
+#   5. (Linux) per-vhost kernel network        ([server.tenant_network]
+#      policy: AF_INET eBPF + an AF_UNIX         ebpf_policy / unix_socket_policy
+#      connect fence                             — F2)
+#   6. authenticated SQL wire listeners        ([db.wire_auth] — F4)
+#   7. CPU/memory ceilings on cron children    ([cron] cpu_max/memory_max — F5)
+#   8. dropping root after bind                ([server] run_as_user)
+#
+# Layers 3-7 are the F1-F5 multi-tenant breakout-audit hardening. They are
+# SECURE BY DEFAULT: once [server] sites_dir is set they turn themselves on
+# (the eBPF AF_INET policy in layer 5 is the one exception — it stays opt-in
+# because it needs an nftables handoff). Each is spelled out below with its
+# default and how to loosen or opt out of it.
+#
+# Full write-up: site/content/guides/multi-tenant-hardening.md
+# ===========================================================================
+
+[server]
+listen = "0.0.0.0:443"
+
+# Fallback document root for any Host that matches no vhost directory below.
+# Keep it a near-empty "no such site" root; real traffic goes to a vhost.
+document_root = "/srv/ephpm/_default"
+
+# Multi-tenant mode: each subdirectory of sites_dir is one virtual host, named
+# for the FQDN it serves. The directory NAME is the canonical "site key" from
+# which the database file, temp/session root, KV keyspace and DB_* credentials
+# are all derived. Setting this is what turns on every multi-tenant code path
+# (including the security defaults below). Default: unset (single-site mode).
+sites_dir = "/srv/ephpm/sites"
+#   /srv/ephpm/sites/blog.example.com/
+#   /srv/ephpm/sites/shop.example.com/
+
+# Optional suffix stripped from Host before the vhost lookup, so a directory
+# named "blog" answers "blog.example.com". MUST begin with a dot (a dotless
+# suffix is a startup error). Production usually leaves this unset and names
+# directories with the full FQDN. Default: unset.
+# sites_domain_suffix = ".example.com"
+
+# Operator-owned per-site overrides, one <site-key>.toml per vhost. This is how
+# you point a framework vhost at its real web root ("public"/"web") so the rest
+# of the checkout (vendor/, .env, config/) is never served, and optionally set
+# an auto_prepend_file. MUST live OUTSIDE sites_dir (startup fails closed if it
+# is inside) — a file inside a tenant container is tenant-writable. The whole
+# schema is document_root + auto_prepend_file + an optional [preview_auth].
+# Default: unset (each vhost directory is its own document root).
+site_overrides_dir = "/srv/ephpm/site-overrides"
+
+# Privilege drop (Unix only). Start as root so ePHPm can bind :443 and open
+# root-owned files/certs, then permanently setgroups+setgid+setuid to this
+# unprivileged user before serving. The drop is process-wide and irreversible;
+# startup fails closed if euid is still 0 afterwards. This shrinks the
+# root-escalation blast radius — it is NOT per-tenant isolation (every tenant
+# still shares this one uid). Ignored (with a warning) on Windows or when not
+# started as root. Default: unset (keep the starting uid).
+run_as_user  = "www-data"
+run_as_group = "www-data"           # default: the user's primary group
+
+# F3 — fatal privilege-drop assertion. In multi-tenant mode a root process with
+# no run_as_user is a fatal startup error (not just a warning), so you cannot
+# accidentally serve tenants as root. Default (unset) resolves to TRUE in
+# multi-tenant mode. To deliberately run as root (e.g. an external sandbox
+# already confines the process) set require_privilege_drop = false to downgrade
+# it back to a WARN. Unix only; ignored in `ephpm dev`.
+require_privilege_drop = true
+
+# F3 — per-PHP-thread Landlock filesystem sandbox (Linux >= 5.13). Even after
+# the privilege drop, the shared-uid PHP engine could open any file the uid can;
+# this pins every tenant-PHP thread to just the paths ePHPm needs (site trees,
+# per-vhost state, the DB dir, read-only system dirs) and makes /etc/ephpm,
+# TLS keys, /etc/shadow, other tenants' homes unreachable — enforced by the
+# kernel even against root. Values: "auto" | "enforce" | "off".
+# Default is "auto" = ON in multi-tenant mode and FAIL-CLOSED if the kernel
+# can't enforce Landlock (there is deliberately no "warn and serve unsandboxed"
+# tier). Set self_sandbox = "off" to opt out (startup then logs a loud WARN).
+# Ignored on non-Linux and in `ephpm dev`.
+self_sandbox = "auto"
+
+# Exact-host ALIASES: extra hostnames a vhost answers to, mapped to the
+# canonical site key (the directory name). Consulted first, before any
+# sites_domain_suffix strip. The resolved identity stays canonical (the alias
+# never becomes the DB/KV key); PHP still sees the real Host in
+# $_SERVER['HTTP_HOST']. Requires sites_dir. Default: empty.
+[server.host_map]
+"www.shop.example.com" = "shop.example.com"
+"api.example.com"      = "blog.example.com"
+
+# Static-file serving. Dot-prefixed paths (.env, .git, .htaccess) are blocked
+# by default; shown here for visibility. Values: "deny" (403) | "ignore" (404)
+# | "allow". Default: "deny".
+[server.static]
+hidden_files = "deny"
+
+# ---------------------------------------------------------------------------
+# Security / tenant isolation.
+# ---------------------------------------------------------------------------
+# IMPORTANT: once [server] sites_dir is set, the three isolation flags below
+# (open_basedir, disable_shell_exec, multi_tenant_hardening) already DEFAULT to
+# true — just having this section present or a sites_dir set turns them on.
+# They are spelled out here so the posture is explicit and reviewable. Set any
+# to false to opt out. In single-site mode (no sites_dir) they are inert and
+# each logs a startup warning.
+[server.security]
+
+# Trusted reverse proxies (CIDR). When a request comes from one of these,
+# X-Forwarded-For sets REMOTE_ADDR and X-Forwarded-Proto drives HTTPS
+# detection. Leave empty if ePHPm faces clients directly. Default: [].
+trusted_proxies = ["10.0.0.0/8"]
+
+# Always-403 path globs (in addition to hidden_files). `*` is a single-segment
+# wildcard; `**` is not supported. Default: [].
+blocked_paths = ["/wp-config.php", "/vendor/*", "/.git/*"]
+
+# PHP execution allowlist. When NON-EMPTY, only matching PHP paths may run;
+# everything else gets 403 — this is what stops code execution from an upload
+# directory. Empty = every .php runs. Default: []. (Leave empty unless you can
+# enumerate every entrypoint; a WordPress set is shown commented.)
+# allowed_php_paths = ["/index.php", "/wp-login.php", "/wp-admin/*.php", "/wp-cron.php"]
+allowed_php_paths = []
+
+# Per-request open_basedir confining PHP to each site container + its private
+# temp/session root. Multi-tenant only. Default in multi-tenant mode: true.
+open_basedir = true
+
+# Disable exec/shell_exec/system/passthru/proc_open/popen/pcntl_exec via
+# disable_functions. Multi-tenant only. Default in multi-tenant mode: true.
+disable_shell_exec = true
+
+# The full hostile-tenant hardening preset: extends disable_functions with the
+# pcntl_*/posix_set*/pfsockopen/fsockopen/SysV-IPC/opcache_reset/dl/mail
+# families, sets mysqli.allow_persistent=0, and locks down the OPcache API.
+# COST: persistent DB/socket connections (Redis pconnect, mysqli `p:`,
+# pfsockopen) stop working; non-persistent ones (PDO, curl) are unaffected.
+# Multi-tenant only. Default in multi-tenant mode: true.
+multi_tenant_hardening = true
+
+# Assert that network egress is enforced BELOW PHP (nftables / eBPF cgroup /
+# systemd IPAddressDeny / security group). When true AND the hardening preset
+# is active, ePHPm drops the reachability-only fsockopen block (pfsockopen and
+# the persistence locks stay). Default: false (safe — ePHPm cannot verify an
+# external control exists). Only set this true if you really do enforce egress
+# in the kernel/network (e.g. with the tenant_network policy below).
+# network_egress_externally_managed = false
+
+# ---------------------------------------------------------------------------
+# Per-vhost kernel network policy — eBPF (LINUX ONLY, opt-in).
+# ---------------------------------------------------------------------------
+# When enabled, ePHPm attaches cgroup/bind4+6 and cgroup/connect4+6 BPF
+# programs to its own cgroup and tags each serving thread with the site key it
+# is running, so the kernel can enforce per-vhost loopback authorization and
+# give each vhost a private view of a shared loopback port. Off by default =
+# literally zero cost (no BPF loaded, no per-request tag). Setting ebpf_policy
+# = true on any non-Linux platform is a HARD startup error, never a silent
+# no-op. When on, a static nftables loopback floor must hand loopback off to
+# BPF for tagged traffic — the two ship together; see the guide.
+# Guide: site/content/guides/ebpf-per-vhost-network.md
+[server.tenant_network]
+ebpf_policy = false     # flip to true on Linux once nftables handoff is in place
+
+# Cgroup to attach to. Default (unset): the process's own cgroup, read from
+# /proc/self/cgroup — the right choice unless you have an unusual slice layout.
+# cgroup_path = "/sys/fs/cgroup/system.slice/ephpm.service"
+
+# Inclusive range of REAL sidecar ports ePHPm hands out. HARD CONSTRAINT: it
+# must NOT overlap the kernel ephemeral range (net.ipv4.ip_local_port_range,
+# default 32768-60999) — ePHPm reads that at load time and refuses to start on
+# overlap. Default: "20000-32767" (below the ephemeral floor; ~12.7k ports).
+sidecar_port_range = "20000-32767"
+
+# Max concurrent sidecar real ports a single vhost may hold (anti-port-bomb,
+# enforced in-kernel against the un-forgeable vhost tag). Default: 8.
+max_sidecar_ports_per_vhost = 8
+
+# F2 — AF_UNIX connect fence (Linux >= 6.7 with BTF). Independent of the
+# AF_INET ebpf_policy above: this one governs tenant unix-socket connects
+# (unix:// streams, PDO unix_socket=, curl CURLOPT_UNIX_SOCKET_PATH). When on it
+# is DENY-ALL — a site may reach only the sockets listed for it in
+# unix_socket_allow below; an unlisted site reaches no unix socket at all.
+# Values: "auto" | "off" | "required" | "warn".
+# Default is "auto" = SECURE BY DEFAULT: on a fenceable node (Linux, multi-
+# tenant, per-request, not `ephpm dev`) it behaves as "warn" (load the fence;
+# if the kernel is < 6.7 / lacks BTF / lacks CAP_BPF, log an ERROR and continue
+# unfenced), and is inert everywhere else. Set unix_socket_policy = "required"
+# for a hard fail-closed guarantee, or = "off" to opt out (startup then logs a
+# WARN naming the exposure).
+unix_socket_policy = "auto"
+
+# Per-site unix-socket allowlist, keyed by canonical site key (the vhost
+# directory name). Each entry is an absolute socket path or an abstract socket
+# "@name". Only allowlist paths in directories the tenant CANNOT write, or a
+# tenant can swap the socket for a symlink. Setting this while
+# unix_socket_policy = "off" is a hard startup error. Default: empty (deny-all).
+[server.tenant_network.unix_socket_allow]
+# "shop.example.com" = ["/run/php-redis/shop.sock"]
+
+# ---------------------------------------------------------------------------
+# PHP execution.
+# ---------------------------------------------------------------------------
+[php]
+# "per_request" (default, php-fpm-shaped, no state leak across requests) or
+# "worker" (persistent, 5-20x for heavy frameworks; needs [php.worker]).
+mode = "per_request"
+
+# Size of the PHP execution pool. 0 (default) derives it from the cgroup CPU
+# quota (Linux) or host parallelism, clamped to [2, 32]. Set a number to pin
+# it. The floor is 2 (a 1-thread pool deadlocks loopback subrequests).
+concurrency = 0
+
+# Wall-clock per-script limit in seconds (0 = unlimited). Natively enforced on
+# Linux ZTS builds with per-thread timers; keep it below [server.timeouts]
+# request. Default: 30.
+max_execution_time = 30
+
+# Per-request memory_limit each request starts with. Default: unset (derived
+# in serve mode). A script may lower it and raise it back up to
+# memory_limit_max; a raise above the ceiling is refused — which is what keeps
+# PHP's hard memory limit meaningful for a tenant that tries memory_limit=-1.
+memory_limit     = "256M"
+memory_limit_max = "512M"           # default: the memory_limit it started with
+
+# F1 — environment scrub. A tenant's PHP reads the process environment through
+# getenv()/$_ENV/phpinfo(), which in a multi-tenant deployment holds the
+# operator's secrets (EPHPM_KV__SECRET, EPHPM_CLUSTER__SECRET, AWS_* ...). By
+# DEFAULT (scrub_environment = true) ePHPm clears every variable not on the
+# allowlist once at startup, before php_embed_init(), so getenv()/$_ENV are
+# clean at the source. It CANNOT be disabled under sites_dir (startup fails
+# closed) — in single-site mode only may you set scrub_environment = false.
+scrub_environment = true
+
+# Variables a tenant's PHP may still see after the scrub. A trailing "*" is a
+# prefix glob. Default is the four safe families ["PATH", "TZ", "LANG", "LC_*"]
+# (none can carry a secret). Widen it to the exact non-secret vars YOUR apps
+# read from getenv()/$_ENV — never add a secret here. A small internal keep-set
+# ePHPm itself needs is preserved regardless and need not be listed.
+env_allowlist = ["PATH", "TZ", "LANG", "LC_*"]
+# e.g. a single-tenant app that reads its own var:
+# env_allowlist = ["PATH", "TZ", "LANG", "LC_*", "APP_RELEASE"]
+
+# ---------------------------------------------------------------------------
+# Per-site embedded databases (the tenant data boundary).
+# ---------------------------------------------------------------------------
+# Each vhost gets its OWN Turso database at <dir>/<site-key>.db — the only
+# cross-tenant data boundary (Turso has no per-schema ACL). `dir` is REQUIRED
+# in multi-tenant mode (startup fails closed without it). PHP reaches it via
+# the db-* Composer packages / ephpm_db_* with no socket. For CLUSTERED
+# per-site replication see examples/config/per-site-clustered.toml.
+[db.sqlite]
+dir          = "/srv/ephpm/db"
+max_open_dbs = 256                  # soft fd bound (LRU of open site DBs); default 256
+
+# ---------------------------------------------------------------------------
+# F4 — authenticated SQL wire listeners.
+# ---------------------------------------------------------------------------
+# The shared pdo_mysql wire listener authenticates clients BY DEFAULT: in
+# per-site mode each vhost's credential is DB_USER = site key, DB_PASSWORD =
+# HMAC-SHA256([kv] secret, site_key), so a connection's database is fixed by the
+# credential it proves, not by anything it claims. With the [kv] secret set
+# above, this already works with no keys here. allow_insecure_no_auth defaults
+# to false; set it to true ONLY to restore the old credential-free listeners
+# (intended for a firewalled-off port an external tool must reach without the
+# injected credential) — startup then logs a loud WARN.
+[db.wire_auth]
+allow_insecure_no_auth = false
+# password = "..."                  # optional explicit shared password; default: derive from [kv] secret
+
+# ---------------------------------------------------------------------------
+# KV store secret — REQUIRED for stable per-site credentials.
+# ---------------------------------------------------------------------------
+# With a stable [kv] secret the per-site RESP AUTH password and the per-site
+# pdo_mysql wire-auth password are derived as HMAC-SHA256(secret, site_key) and
+# stay stable across restarts (this is also what lets a co-located
+# `ephpm php --site` / cron job authenticate as a tenant). Load it from a file
+# or secret store in production — anyone who can read it can impersonate ANY
+# tenant's DB/KV. Without it, per-site credentials rotate per restart.
+[kv]
+secret = "change-me-load-from-a-secret-store"
+
+# ---------------------------------------------------------------------------
+# Observability — gate it on a multi-tenant node.
+# ---------------------------------------------------------------------------
+# On a multi-site node the /metrics and /_ephpm/requests endpoints are only
+# served when a token (or an mTLS metrics listener) is set — fail closed. Serve
+# them on a separate internal listener so they never touch tenant traffic.
+[server.metrics]
+enabled = true
+listen  = "127.0.0.1:9100"          # default: unset (served on the main listener)
+token   = "change-me-metrics-bearer"
+allow   = ["127.0.0.1/32"]
+
+[server.diagnostics]
+token = "change-me-diagnostics-bearer"
+
+# ---------------------------------------------------------------------------
+# F5 — cron resource ceilings (availability hardening).
+# ---------------------------------------------------------------------------
+# Cron is off by default; this section only documents the F5 ceilings that
+# apply to every forked per-site cron child once you enable it (see
+# examples/cron for a full worked cron config). The ceilings stop one tenant's
+# cron script from exhausting host CPU or memory. They are SECURE BY DEFAULT:
+# when unset, memory_max resolves to ~33% of ePHPm's detected memory budget
+# divided across max_concurrent slots, and cpu_max to half the detected CPU
+# (floored at 1 core). A per-site PHP cron child cannot lift memory_max with
+# ini_set('memory_limit','-1'). Set either to "0"/unlimited (memory_max) or 0.0
+# (cpu_max) to remove the ceiling; [[cron.jobs]] may override per job.
+[cron]
+enabled = false
+# memory_max = "256M"               # default (unset): ~33% of budget / max_concurrent
+# cpu_max    = 1.0                   # CPU cores; default (unset): half detected CPU, min 1.0
+
+# ---------------------------------------------------------------------------
+# Native WebSockets (experimental, off by default) — uncomment to enable.
+# ---------------------------------------------------------------------------
+# Each vhost gets its own handler: the first [server] websocket_files entry
+# that exists in the resolved document root (default ["websocket.php"]) handles
+# connect/message/disconnect. A vhost with no such file 404s the upgrade.
+# Guide: site/content/guides/websockets.md
+# [server.websocket]
+# enabled                   = true
+# max_connections           = 10000   # across all vhosts; 0 = unlimited (default 10000)
+# max_connections_per_site  = 1000    # per vhost (default 1000)
+# idle_timeout_secs         = 120     # default 120; keep > ping_interval_secs (30)
